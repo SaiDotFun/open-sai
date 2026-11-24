@@ -131,6 +131,8 @@ def json_requested(argv: Sequence[str]) -> bool:
 
 
 def cli_failure(exc: Exception) -> SaiError:
+    if isinstance(exc, sai_settings.InvalidEndpoint):
+        return SaiError(str(exc), Code.INVALID_REQUEST, exit_code=ExitCode.USAGE)
     if isinstance(exc, click.ClickException):
         return SaiError(
             exc.format_message(),
@@ -232,13 +234,28 @@ class LoggedGroup(SaiGroup):
         started = time.monotonic()
         exit_code: int = ExitCode.OK
         failure: SaiError | None = None
+        start_logged = False
+
+        def log_start() -> None:
+            nonlocal start_logged
+            if not quiet and not start_logged:
+                log.event("command.start", argv=log.argv(argv[:64]))
+                start_logged = True
+
         with (
             log.silenced()
             if quiet
             else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
         ):
-            if not quiet:
-                log.event("command.start", argv=log.argv(argv[:64]))
+            if command == "doctor" and not quiet:
+                # Let doctor report directory creation before logging creates
+                # the profile to record its first event.
+                extra["obj"] = {
+                    **(extra.get("obj") or {}),
+                    "doctor_log_start": log_start,
+                }
+            else:
+                log_start()
             try:
                 result = super().main(
                     args,
@@ -262,6 +279,7 @@ class LoggedGroup(SaiGroup):
                     return result
             finally:
                 if not quiet:
+                    log_start()
                     log.event(
                         "command.end",
                         "info" if exit_code == ExitCode.OK else "warn",
@@ -1131,7 +1149,8 @@ def doctor_command(
     """Check the install, config, MCP registrations, session, intent ledger,
     and endpoints.
 
-    With fixes enabled, doctor makes trader and log files private, repairs
+    With fixes enabled, doctor creates private Sai directories, tightens
+    permissions on managed files, repairs
     stale Codex and Cursor MCP registrations, migrates the intent ledger,
     and reconciles unknown intents for the signed-in account with Keeper.
     It reports stale Claude Code registrations with a command to repair
@@ -1146,12 +1165,15 @@ def doctor_command(
         ("keeper.ws_endpoint", ws_endpoint),
         ("lcd.endpoint", lcd_endpoint),
     ):
-        if value:
+        if value is not None:
             flags[key] = value
     config_check, config = doctor.check_config(flags)
     checks = [
         config_check,
-        *doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline)),
+        *doctor.run_checks(
+            doctor.context(config, fix=not no_fix, offline=offline),
+            after_home=ctx.obj.get("doctor_log_start"),
+        ),
     ]
     overall = doctor.overall(checks)
     code = (
@@ -1177,7 +1199,10 @@ def doctor_command(
                 if check.status == "fail"
             )
         raise SaiError(
-            report, code, details=doctor.report(checks) if ctx.obj["json"] else None
+            report,
+            code,
+            details=doctor.report(checks) if ctx.obj["json"] else None,
+            exit_code=ExitCode.USAGE if config_check.invalid_endpoint else None,
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
@@ -1231,12 +1256,18 @@ def watch_price(ctx: click.Context, token_id: int, ws_endpoint: str | None) -> N
 
 def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
     """The command's --ws-endpoint, else the resolved WebSocket setting."""
-    return ws_endpoint or settings(ctx).ws_endpoint
+    if ws_endpoint is not None:
+        sai_settings.check_value("keeper.ws_endpoint", ws_endpoint)
+        return ws_endpoint
+    return settings(ctx).ws_endpoint
 
 
 def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
     """The command's --lcd-endpoint, else the resolved LCD setting."""
-    return lcd_endpoint or settings(ctx).lcd_endpoint
+    if lcd_endpoint is not None:
+        sai_settings.check_value("lcd.endpoint", lcd_endpoint)
+        return lcd_endpoint
+    return settings(ctx).lcd_endpoint
 
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
@@ -1841,7 +1872,7 @@ def print_log_limit(report: dict[str, Any]) -> None:
     if report.get("truncated"):
         click.echo("Report truncated. " + report["more"])
         if before := report.get("nextBefore"):
-            click.echo(f"Earlier timestamps  --before {before}")
+            click.echo(f"Continue with --before {before}")
 
 
 @logs_group.command("intent")
@@ -1855,6 +1886,8 @@ def logs_intent(
 ) -> None:
     """Show an intent's CLI and MCP trail and its current Keeper record."""
     endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
+    if offline and endpoint is not None:
+        sai_settings.check_value("keeper.endpoint", endpoint)
     account = addr if addr is not None else ctx.obj["as_addr"]
     report = log_queries.intent(
         key, endpoint=endpoint, addr=account, offline=offline, before=before
@@ -1874,7 +1907,7 @@ def logs_intent(
 
 @logs_group.command("run")
 @click.argument("id")
-@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
     """Show one process run or one MCP call by ID."""
@@ -1885,7 +1918,7 @@ def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
 @click.option(
     "--since", metavar="DURATION", help="Look back by a duration such as 24h."
 )
-@click.option("--before", help="Use events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_stats(ctx: click.Context, since: str | None, before: str | None) -> None:
     """Summarize Keeper latency and error codes in the retained logs."""

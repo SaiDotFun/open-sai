@@ -134,6 +134,16 @@ def describe(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.PositionChanged):
+        if exc.preview is None:
+            return error(failure.message, Code.PREVIEW_MISMATCH)
+        return error(
+            "The position or quote changed during confirmation, so nothing was"
+            " submitted. Show the user the latest preview, get their confirmation"
+            " again, then retry with its previewDigest.",
+            Code.PREVIEW_MISMATCH,
+            preview=with_digest(exc.preview),
+        )
     if failure.code == Code.INTERNAL_ERROR:
         trace = "".join(traceback.format_exception(exc))
         log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
@@ -400,7 +410,7 @@ def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
     """Return the parts of PREVIEW the user confirms.
 
     That is the account the trade would be submitted under, the intent, and
-    the margin quote when there is one. A market open leaves out its intent
+    the position quote when there is one. A market open leaves out its intent
     price, which is refreshed at submit, and binds the referencePrice the
     user confirmed instead.
     """

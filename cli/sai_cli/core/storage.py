@@ -23,7 +23,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import log
+from . import log, paths
 from .errors import Code, SaiError, SessionError
 
 
@@ -51,14 +51,13 @@ class RecentOpenPending(UnresolvedIntent):
 
 
 def home() -> Path:
-    return Path(os.environ.get("SAI_HOME", Path.home() / ".sai")) / "trader"
+    return paths.sai_home() / "trader"
 
 
 def directory() -> Path:
     path = home()
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.chmod(0o700)
-    return path
+    paths.private_directory(path.parent, profile_root=True)
+    return paths.private_directory(path)
 
 
 # Sessions are encrypted with this fixed key, which ships in the source, like
@@ -390,11 +389,15 @@ def busy_timeout(seconds: float) -> Generator[None]:
 
 def db() -> sqlite3.Connection:
     path = directory() / "intents.sqlite3"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    os.close(fd)
-    path.chmod(0o600)
     connection = sqlite3.connect(path, timeout=_BUSY_TIMEOUT.get())
-    _migrate(connection)
+    try:
+        # Closing a separate file descriptor would release any POSIX locks
+        # that another connection in this process holds on the ledger.
+        path.chmod(0o600)
+        _migrate(connection)
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 

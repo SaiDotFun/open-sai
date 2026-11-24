@@ -520,16 +520,47 @@ def markets(price: float = 100.5) -> dict[str, Any]:
 
 
 def snapshots(monkeypatch, *collaterals: str) -> None:
-    """Make margin.snapshot return one position state per call, in order."""
+    """Supply each indexed snapshot and repeat its contract state on recheck."""
+    current: margin.PositionSnapshot | None = None
     states = iter(
-        (
-            {"collateral_amount": amount, "leverage": "2"},
+        margin.PositionSnapshot(
+            {
+                "user": "nibi1trader",
+                "user_trade_index": "UserTradeIndex(7)",
+                "is_open": True,
+                "trade_type": "trade",
+                "collateral_amount": amount,
+                "leverage": "2",
+                "market_index": "MarketIndex(0)",
+                "collateral_index": "TokenIndex(1)",
+            },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
+            "test-contract",
         )
         for amount in collaterals
     )
-    monkeypatch.setattr(margin, "snapshot", lambda *args: next(states))
+
+    def snapshot(*args: Any) -> margin.PositionSnapshot:
+        nonlocal current
+        current = next(states)
+        return current
+
+    def contract_reply(
+        lcd: str, contract: str, query: dict[str, Any], **kwargs: Any
+    ) -> Any:
+        if "get_trade_raw" in query:
+            assert current is not None
+            return current.raw
+        return "1" if "get_collateral_price" in query else False
+
+    monkeypatch.setattr(margin, "snapshot", snapshot)
+    monkeypatch.setattr(margin, "smart_value", contract_reply)
+    monkeypatch.setattr(
+        margin,
+        "_latest_position",
+        lambda *args: (contract_reply("", "", {"get_trade_raw": {}}), "120"),
+    )
 
 
 def confirm(
@@ -1264,7 +1295,7 @@ def test_logged_and_returned_errors_redact_the_session_token(mcp, monkeypatch, c
 
 
 def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
-    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s#f")
+    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s")
     monkeypatch.setenv("SAI_LCD_ENDPOINT", "https://lcd.example/?apikey=s")
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")

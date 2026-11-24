@@ -12,6 +12,7 @@ the text with tomlkit, so comments the person adds survive.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 import tomllib
@@ -23,11 +24,14 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import Comment, Null, Table, Trivia
+from websockets.exceptions import InvalidURI
+from websockets.uri import parse_uri
 
-from . import keeper, log, margin, stream
+from . import keeper, log, margin, paths, stream
 
 FILE_NAME = "config.toml"
 LOCK_NAME = ".config.lock"
@@ -39,6 +43,7 @@ LENIENT_SECTIONS = frozenset({"logs"})
 _RANK = {"flag": 0, "env": 1, "file": 2, "default": 3}
 _TRUE = ("true", "1", "yes", "on")
 _FALSE = ("false", "0", "no", "off")
+_URL_WHITESPACE_OR_CONTROL = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
 
 
 class SettingsError(ValueError):
@@ -51,6 +56,13 @@ class ConfigError(SettingsError):
     def __init__(self, diagnostic: str, detail: str) -> None:
         super().__init__(detail)
         self.diagnostic = diagnostic
+
+
+class InvalidEndpoint(ConfigError):
+    """An endpoint setting contains a malformed URL."""
+
+    def __init__(self, diagnostic: str, detail: str | None = None) -> None:
+        super().__init__(diagnostic, diagnostic if detail is None else detail)
 
 
 @dataclass(frozen=True)
@@ -205,7 +217,7 @@ def parse_value(key: str, raw: str) -> str | bool | int:
                 f"Invalid value {raw!r} for {key}: expected a whole number, 1 or more"
             )
         return check_value(key, int(text))
-    return check_value(key, text)
+    return check_value(key, raw)
 
 
 def check_value(key: str, value: Any) -> str | bool | int:
@@ -222,25 +234,52 @@ def check_value(key: str, value: Any) -> str | bool | int:
             )
         return value
     if not isinstance(value, str):
-        raise SettingsError(f"Invalid value for {key}: expected a URL string")
+        raise InvalidEndpoint(f"Invalid value for {key}: expected a URL string")
+    if spec.section == "keeper" and "#" in value:
+        raise InvalidEndpoint(f"Invalid value for {key}: remove the URL fragment")
+    if _URL_WHITESPACE_OR_CONTROL.search(value):
+        raise InvalidEndpoint(
+            f"Invalid value for {key}: URL contains whitespace or control characters"
+        )
     try:
         parts = urlsplit(value)
         hostname = parts.hostname
         # urlsplit defers port validation until the property is read.
         _ = parts.port
-    except ValueError:
-        raise SettingsError(f"Invalid URL for {key}") from None
-    if parts.scheme not in spec.schemes or not hostname:
-        raise SettingsError(
-            f"Invalid value for {key}: expected a URL starting with"
-            f" {' or '.join(s + '://' for s in spec.schemes)}"
-        )
-    return value
+        # Older urlsplit versions ignore text around a bracketed host.
+        if "[" in parts.netloc or "]" in parts.netloc:
+            host_port = parts.netloc.rpartition("@")[2]
+            host, bracket, suffix = host_port.partition("]")
+            if (
+                not host.startswith("[")
+                or not bracket
+                or (suffix and not suffix.startswith(":"))
+            ):
+                hostname = None
+        scheme, separator, _ = value.partition("://")
+        if (
+            separator
+            and scheme.lower() == parts.scheme
+            and parts.scheme in spec.schemes
+            and hostname
+            and "\\" not in parts.netloc
+        ):
+            if parts.scheme in ("ws", "wss"):
+                parse_uri(value)
+                return value
+            if httpx.URL(value).is_absolute_url:
+                return value
+    except (ValueError, httpx.InvalidURL, InvalidURI):
+        pass
+    raise InvalidEndpoint(
+        f"Invalid value for {key}: expected a URL starting with"
+        f" {' or '.join(s + '://' for s in spec.schemes)}"
+    )
 
 
 def sai_home(env: Mapping[str, str]) -> Path:
     """The Sai home directory, as core.storage finds it."""
-    return Path(env.get("SAI_HOME", Path.home() / ".sai"))
+    return paths.sai_home(env)
 
 
 def config_path(env: Mapping[str, str]) -> Path:
@@ -287,6 +326,8 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
                 continue
             try:
                 values[key] = check_value(key, value)
+            except InvalidEndpoint as exc:
+                raise InvalidEndpoint(exc.diagnostic, f"{path}: {exc}") from None
             except SettingsError as exc:
                 if section not in LENIENT_SECTIONS:
                     raise ConfigError(str(exc), f"{path}: {exc}") from None
@@ -364,6 +405,8 @@ def resolve(
                 sources[spec.key] = layer if off else "invalid"
                 continue
             origin = spec.flag or spec.key if raw_flag is not None else spec.env
+            if isinstance(exc, InvalidEndpoint):
+                raise InvalidEndpoint(exc.diagnostic, f"{origin}: {exc}") from None
             raise SettingsError(f"{origin}: {exc}") from None
     logs_valid = "invalid" not in (sources["logs.enabled"], sources["logs.keep_days"])
     ws_key, http_key = "keeper.ws_endpoint", "keeper.endpoint"
@@ -624,8 +667,7 @@ def unset_value(
 
 def write_file(path: Path, text: str) -> None:
     """Write TEXT to PATH atomically, mode 0600 in a 0700 directory."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    paths.private_directory(path.parent, profile_root=True)
     # mkstemp creates the file with mode 0600.
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".config-")
     try:
@@ -640,8 +682,7 @@ def write_file(path: Path, text: str) -> None:
 def _locked(path: Path) -> Generator[None]:
     """Hold an exclusive lock on PATH's sibling `.config.lock` file, so
     concurrent edits run one after another instead of losing changes."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    paths.private_directory(path.parent, profile_root=True)
     fd = os.open(path.parent / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         if sys.platform == "win32":
@@ -673,3 +714,7 @@ def edit_file(path: Path, edit: Callable[[str | None], str | None]) -> None:
         new = edit(text)
         if new is not None:
             write_file(path, new)
+    if new is not None:
+        from . import log
+
+        log.invalidate_config()

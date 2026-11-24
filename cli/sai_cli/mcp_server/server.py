@@ -34,7 +34,7 @@ from pydantic import ConfigDict, ValidationError
 from ..core import log as sai_log
 from ..core import log_queries
 from ..core import settings as sai_settings
-from ..core.errors import Code, McpStdioError, SaiError, describe
+from ..core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
 
@@ -566,9 +566,11 @@ async def preview_margin(
     """Quote adding or removing margin from exact contract state.
 
     The change is a target-leverage intent: the amount is a quote, not a
-    cap, and the actual change may differ if the position moves first.
-    Needs a signed-in session to read the position. Show the user the quote;
-    trade_margin needs its previewDigest.
+    cap, and the actual change may differ at execution. Uses effective
+    leverage after any applicable after-hours cap. If
+    quote.marginChangeIsEstimate is true, tell the user that the guard can
+    deduct fees first. A signed-in session is required. trade_margin needs
+    the previewDigest the user confirms.
 
     Args:
         trade_id: Trade id from account_positions.
@@ -625,9 +627,11 @@ async def preview_partial_close(
 ) -> str:
     """Preview reducing an open USDC position by a whole percentage.
 
-    Sized from contract state and checked against the market minimum.
-    Needs a signed-in session to read the position. Show the user the
-    result; trade_partial_close needs its previewDigest.
+    Sizes the reduction from contract state, checks the market minimum, and
+    quotes the closed notional. Needs a signed-in session to read the
+    position. Show the user the quoted notional and collateral reduction.
+    When quote.closedNotionalIsEstimate is true, say that the notional is
+    an estimate. trade_partial_close needs the previewDigest they confirm.
 
     Args:
         trade_id: Trade id from account_positions.
@@ -1008,7 +1012,13 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
     try:
         settings = sai_settings.load(flags, warn=log.warning)
     except sai_settings.SettingsError as exc:
-        raise SaiError(f"sai mcp serve: {exc}", Code.INVALID_REQUEST) from exc
+        raise SaiError(
+            f"sai mcp serve: {exc}",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE
+            if isinstance(exc, sai_settings.InvalidEndpoint)
+            else None,
+        ) from exc
     with sai_log.bind(surface="mcp"):
         sai_log.event(
             "mcp.server_start",
