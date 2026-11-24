@@ -1310,6 +1310,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "percent-encoding",
  "reqwest",
  "sai-core",
  "semver",

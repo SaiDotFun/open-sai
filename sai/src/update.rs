@@ -62,7 +62,7 @@ impl UpdateCommand {
             .enable_all()
             .build()
             .map_err(|_| SaiError::internal())?;
-        let install = Install::discover(&env.home);
+        let install = Install::discover(&env.home, &self.web_base);
         let releases = Releases::new(&self.api_base, &self.web_base);
         if self.check {
             return runtime.block_on(check(releases, &install, &env.home, json_output, events));
@@ -301,7 +301,7 @@ async fn latest(
 
 fn guidance(install: &Install) -> &'static str {
     match install {
-        Install::Other(_) => "This launcher is managed outside sai. Use its installer to update.",
+        Install::Other(..) => "This launcher is managed outside sai. Use its installer to update.",
         _ => "Run `sai update` to install it.",
     }
 }
@@ -487,7 +487,7 @@ pub(crate) fn tick(command: &str, json: bool, home: &Path, events: EventContext<
     {
         return;
     }
-    let install = Install::discover(home);
+    let install = Install::discover(home, WEB);
     let Some(launcher) = install.launcher().filter(|_| install.owner(false).is_ok()) else {
         return;
     };

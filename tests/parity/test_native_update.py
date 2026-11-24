@@ -24,6 +24,7 @@ from urllib.parse import urlsplit
 
 import pytest
 from reference_uv import resolve_uv
+from sai_cli.core import update as python_update
 from sai_cli.tests.loopback import http_server
 
 fcntl = pytest.importorskip("fcntl")
@@ -585,10 +586,89 @@ def uv_install(standalone: NativeInstall, tmp_path: Path) -> tuple[NativeInstall
         check=False,
     )
     assert result.returncode == 0, result.stderr
+    prefix = tools / "sai-cli"
+    (record_file,) = prefix.glob("lib/python*/site-packages/sai_cli-*.dist-info/RECORD")
+    (tools / ".sai-cli-release.json").write_text(
+        json.dumps(
+            {
+                "schema": 1,
+                "tag": f"sai-cli/v{standalone.installed}",
+                "sha256": hashlib.sha256(initial.read_bytes()).hexdigest(),
+                "installed": hashlib.sha256(record_file.read_bytes()).hexdigest(),
+                "wheel": str(initial),
+            }
+        ),
+        encoding="utf-8",
+    )
     launcher = bins / "sai"
     return NativeInstall(
         launcher, candidate, standalone.home, env, standalone.installed
     ), initial
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("provenance", ["missing", "stale"])
+def test_uv_custom_wheel_is_reported_and_left_to_its_installer(
+    standalone: NativeInstall, tmp_path: Path, provenance: str
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    tools = Path(install.env["UV_TOOL_DIR"])
+    record = tools / ".sai-cli-release.json"
+    if provenance == "missing":
+        record.unlink()
+    else:
+        saved = json.loads(record.read_text(encoding="utf-8"))
+        saved["installed"] = "c" * 64
+        record.write_text(json.dumps(saved), encoding="utf-8")
+    link = install.launcher.readlink()
+    replacement = wheel(tmp_path, NEW)
+    local_assets = {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **assets(NEW, replacement.name, replacement.read_bytes()),
+    }
+    with releases(local_assets) as server:
+        prefix = tools / "sai-cli"
+        reference = python_update.install_kind(prefix, server.base)
+        assert reference.kind == "uv-tool-other"
+        checked = install.update(server, "--check")
+        assert checked.returncode == 0, checked.stdout
+        assert json.loads(checked.stdout)["install"]["kind"] == reference.kind
+        before = server.reads.copy()
+        changed = install.update(server, "--to", NEW)
+        assert changed.returncode == 3, changed.stdout
+        assert server.reads == before
+    assert install.launcher.readlink() == link
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("authority", ["github.com", "github.com:443", "GITHUB.COM"])
+def test_uv_release_url_uses_python_authority_matching(
+    standalone: NativeInstall, tmp_path: Path, authority: str
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
+    (origin,) = prefix.glob(
+        "lib/python*/site-packages/sai_cli-*.dist-info/direct_url.json"
+    )
+    origin.write_text(
+        json.dumps(
+            {
+                "url": f"https://{authority}{asset_key(install.installed, initial.name)}",
+                "archive_info": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    with releases({}) as server:
+        result = install.invoke(
+            "--json", "update", "--check", "--api-base", server.base
+        )
+    assert result.returncode == 0, result.stdout
+    assert (
+        json.loads(result.stdout)["install"]["kind"]
+        == python_update.install_kind(prefix).kind
+    )
 
 
 def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
@@ -610,6 +690,59 @@ def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
         encoding="utf-8",
     )
     return pending
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("occupied", [False, True])
+def test_uv_pending_recovery_distinguishes_partial_metadata_from_another_package(
+    standalone: NativeInstall, tmp_path: Path, occupied: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
+    record = interrupted_uv_install(install, initial)
+    if occupied:
+        custom = tmp_path / "custom wheel"
+        custom.mkdir()
+        replacement = wheel(custom, install.installed, fail="installed", forward=True)
+        result = subprocess.run(
+            [
+                install.launcher.parent / "uv",
+                "tool",
+                "install",
+                "--force",
+                "--offline",
+                "--python",
+                sys.executable,
+                replacement,
+            ],
+            env=install.env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert result.returncode == 0, result.stderr
+    else:
+        (prefix / "uv-receipt.toml").unlink()
+        (origin,) = prefix.glob(
+            "lib/python*/site-packages/sai_cli-*.dist-info/direct_url.json"
+        )
+        origin.unlink()
+    with releases({}) as server:
+        result = install.invoke(
+            "--json",
+            "update",
+            *server.args,
+            "--to",
+            install.installed,
+            exe=install.executable,
+            SAI_NATIVE_UV_PREFIX=str(prefix),
+        )
+        assert not server.reads
+    assert result.returncode == (3 if occupied else 0), result.stdout + result.stderr
+    assert record.exists() is occupied
+    expected = "uv-tool-other" if occupied else "uv-tool-release"
+    assert python_update.install_kind(prefix).kind == expected
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
@@ -728,6 +861,7 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
     assert launcher.is_symlink() and launcher.readlink() == link
     assert (tools / "sai-cli" / "uv-receipt.toml").is_file()
     assert not (tools / ".sai-cli-native-pending.json").exists()
+    assert python_update.install_kind(tools / "sai-cli").kind == "uv-tool-release"
     if fail:
         assert changed.returncode == 1
         assert "Rolled back" in json.loads(changed.stdout)["error"]["message"]

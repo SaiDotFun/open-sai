@@ -17,7 +17,7 @@ pub(super) type Result<T> = std::result::Result<T, String>;
 pub(super) enum Install {
     Standalone(standalone::Standalone),
     Uv(uv::Uv),
-    Other(PathBuf),
+    Other(PathBuf, &'static str),
 }
 
 #[derive(Serialize)]
@@ -46,24 +46,27 @@ impl Change {
 }
 
 impl Install {
-    pub(super) fn discover(home: &Path) -> Self {
+    pub(super) fn discover(home: &Path, web_base: &str) -> Self {
         let bin = env::current_exe()
             .and_then(fs::canonicalize)
             .unwrap_or_default();
         if let Some(install) = standalone::Standalone::discover(&bin) {
             return Self::Standalone(install);
         }
-        if let Some(install) = uv::Uv::discover(&bin, home) {
+        if let Some(install) = uv::Uv::discover(&bin, home, web_base) {
             return Self::Uv(install);
         }
-        Self::Other(bin.parent().unwrap_or(&bin).to_owned())
+        uv::unmanaged(&bin, home, web_base).map_or_else(
+            || Self::Other(bin.parent().unwrap_or(&bin).to_owned(), "other"),
+            |(prefix, kind)| Self::Other(prefix, kind),
+        )
     }
 
     pub(super) fn report(&self) -> InstallReport<'_> {
         let (kind, prefix) = match self {
             Self::Standalone(install) => ("standalone", install.root()),
-            Self::Uv(install) => ("uv-tool-release", install.prefix()),
-            Self::Other(prefix) => ("other", prefix.as_path()),
+            Self::Uv(install) => (install.kind(), install.prefix()),
+            Self::Other(prefix, kind) => (*kind, prefix.as_path()),
         };
         InstallReport {
             kind,
@@ -82,7 +85,7 @@ impl Install {
         match self {
             Self::Standalone(install) => Some(install.launcher()),
             Self::Uv(install) => Some(install.launcher()),
-            Self::Other(_) => None,
+            Self::Other(..) => None,
         }
     }
 
@@ -90,7 +93,7 @@ impl Install {
         match self {
             Self::Standalone(install) => Some(install.lock_path()),
             Self::Uv(install) => Some(install.lock_path()),
-            Self::Other(_) => None,
+            Self::Other(..) => None,
         }
     }
 
@@ -101,7 +104,7 @@ impl Install {
             );
         };
         let pending = match self {
-            Self::Uv(install) if recover => install.can_recover()?,
+            Self::Uv(install) => install.authorized(recover)?,
             _ => false,
         };
         // When the launcher is missing, PATH may fall through to another
@@ -123,7 +126,7 @@ impl Install {
         match self {
             Self::Standalone(install) => install.active().map(|_| ()),
             Self::Uv(install) => install.owner(pending),
-            Self::Other(_) => unreachable!(),
+            Self::Other(..) => unreachable!(),
         }
     }
 
@@ -131,7 +134,7 @@ impl Install {
         match self {
             Self::Standalone(install) => install.recover(),
             Self::Uv(install) => install.recover(home).await,
-            Self::Other(_) => unreachable!(),
+            Self::Other(..) => unreachable!(),
         }
     }
 
@@ -145,7 +148,7 @@ impl Install {
         match self {
             Self::Standalone(install) => install.change(releases, installed, target, allowed).await,
             Self::Uv(install) => install.change(releases, installed, target, allowed).await,
-            Self::Other(_) => unreachable!(),
+            Self::Other(..) => unreachable!(),
         }
     }
 }

@@ -11,6 +11,7 @@ publish = false
 chrono.workspace = true
 clap.workspace = true
 flate2.workspace = true
+percent-encoding = "2"
 reqwest.workspace = true
 sai-core = { path = "../sai-core" }
 semver.workspace = true

@@ -1,3 +1,5 @@
+mod provenance;
+
 use std::{
     env,
     ffi::OsStr,
@@ -28,9 +30,10 @@ const RECORD: &str = ".sai-cli-native-pending.json";
 pub(in crate::update) struct Uv {
     prefix: PathBuf,
     launcher: PathBuf,
+    web_base: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 struct Wheel {
     version: String,
     digest: String,
@@ -42,16 +45,17 @@ struct Pending {
     wheel: Wheel,
     launcher: PathBuf,
     python: PathBuf,
+    #[serde(default)]
+    next: Option<Wheel>,
+    #[serde(default)]
+    original_record: Option<String>,
 }
 
 impl Uv {
-    pub(super) fn discover(exe: &Path, home: &Path) -> Option<Self> {
+    pub(super) fn discover(exe: &Path, home: &Path, web_base: &str) -> Option<Self> {
         // uvx may share the same native cache. The shim supplies its actual
         // sys.prefix, and only an installed tool has a receipt and launcher.
-        let prefix = PathBuf::from(env::var_os(SHIM_PREFIX)?);
-        if !prefix.is_absolute() || !exe.starts_with(home.join("bin").canonicalize().ok()?) {
-            return None;
-        }
+        let prefix = shim_prefix(exe, home)?;
         if prefix.file_name()? != TOOL {
             return None;
         }
@@ -65,7 +69,11 @@ impl Uv {
                 serde_json::from_slice(&fs::read(tools.join(RECORD)).ok()?).ok()?;
             pending_launcher(&pending)
         })?;
-        Some(Self { prefix, launcher })
+        Some(Self {
+            prefix,
+            launcher,
+            web_base: web_base.into(),
+        })
     }
 
     pub(super) fn prefix(&self) -> &Path {
@@ -110,8 +118,52 @@ impl Uv {
         Ok(Some(record))
     }
 
-    pub(super) fn can_recover(&self) -> Result<bool> {
-        Ok(self.pending()?.is_some())
+    pub(super) fn kind(&self) -> &'static str {
+        provenance::kind(&self.prefix, &self.web_base)
+    }
+
+    pub(super) fn authorized(&self, recover: bool) -> Result<bool> {
+        if recover && let Some(record) = self.pending()? {
+            self.check_recoverable_package(&record)?;
+            return Ok(true);
+        }
+        if self.kind() != "uv-tool-release" {
+            return Err("This uv tool was not installed from an official Sai release. Use its installer to update.".into());
+        }
+        Ok(false)
+    }
+
+    fn check_recoverable_package(&self, record: &Pending) -> Result<()> {
+        let current = provenance::installed_version(&self.prefix);
+        let original = current
+            .as_ref()
+            .is_some_and(|version| version.to_string() == record.wheel.version)
+            && record.original_record.as_ref().is_none_or(|digest| {
+                provenance::installed_digest(&self.prefix).as_ref() == Some(digest)
+            })
+            && provenance::is_release(&self.prefix, &self.web_base);
+        let expected = || std::iter::once(&record.wheel).chain(record.next.as_ref());
+        let matches_version = |wheel: &Wheel| {
+            current
+                .as_ref()
+                .is_some_and(|version| version.to_string() == wheel.version)
+        };
+        let incomplete = !self.prefix.join("uv-receipt.toml").is_file()
+            && !provenance::has_origin(&self.prefix)
+            && (current.is_none() || expected().any(matches_version));
+        if original || incomplete {
+            return Ok(());
+        }
+        let file = provenance::file_origin(&self.prefix);
+        if expected().any(|wheel| {
+            matches_version(wheel)
+                && self
+                    .verify_wheel(wheel)
+                    .is_ok_and(|path| Some(&path) == file.as_ref())
+        }) {
+            return Ok(());
+        }
+        Err("A different package now occupies the pending uv installation.".into())
     }
 
     pub(super) fn owner(&self, allow_missing: bool) -> Result<()> {
@@ -268,19 +320,22 @@ impl Uv {
         &self,
         uv: &Path,
         python: &Path,
-        wheel: &Wheel,
+        pending: &Pending,
         home: &Path,
         shim_base: Option<&str>,
     ) -> Result<Version> {
+        let wheel = &pending.wheel;
         let version = release::version(&wheel.version)
             .ok_or_else(|| "the rollback wheel record has an invalid version".to_owned())?;
         self.owner(true)?;
+        self.check_recoverable_package(pending)?;
         self.install(uv, python, wheel, home, None).await?;
         self.owner(false)?;
         if smoke::version(&self.launcher, home, shim_base).await? != version {
             return Err(format!("the restored launcher did not report {version}"));
         }
-        remove_record(&self.tools().join(RECORD))?;
+        provenance::record(&self.prefix, wheel, &self.wheel_path(wheel)?)?;
+        remove_record(&self.pending_path())?;
         Ok(version)
     }
 
@@ -289,7 +344,7 @@ impl Uv {
             let scratch = TempDir::new().map_err(io_error)?;
             let uv = find_uv()?;
             self.check_destination(&uv, scratch.path()).await?;
-            self.restore(&uv, &pending.python, &pending.wheel, home, None)
+            self.restore(&uv, &pending.python, &pending, home, None)
                 .await
         } else {
             smoke::version(&self.launcher, home, None).await
@@ -347,17 +402,23 @@ impl Uv {
                 return Ok(Change::Available);
             }
             self.owner(false)?;
+            if let Err(reason) = self.authorized(false) {
+                return Ok(Change::Unsupported(reason));
+            }
             let record = self.pending_path();
             let pending = Pending {
                 wheel: previous,
                 launcher: self.launcher.clone(),
                 python: python.clone(),
+                next: Some(next.clone()),
+                original_record: provenance::installed_digest(&self.prefix),
             };
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let changed = async {
                 self.install(&uv, &python, &next, home.path(), None).await?;
                 self.owner(false)?;
                 smoke::verify(&self.launcher, home.path(), target, shim_base).await?;
+                provenance::record(&self.prefix, &next, &self.wheel_path(&next)?)?;
                 remove_record(&record)
             }
             .await;
@@ -373,7 +434,7 @@ impl Uv {
                         return Ok(Change::unchanged(reason, installed));
                     }
                     let (reason, rolled_back) = match self
-                        .restore(&uv, &python, &pending.wheel, home.path(), shim_base)
+                        .restore(&uv, &python, &pending, home.path(), shim_base)
                         .await
                     {
                         Ok(_) => (format!("{reason}. Rolled back to sai {installed}."), true),
@@ -429,4 +490,20 @@ fn find_uv() -> Result<PathBuf> {
 fn wheel_name(version: &Version) -> Result<String> {
     release::wheel_name(version)
         .ok_or_else(|| "the shim supports stable versions and release candidates".into())
+}
+
+fn shim_prefix(exe: &Path, home: &Path) -> Option<PathBuf> {
+    let prefix = PathBuf::from(env::var_os(SHIM_PREFIX)?);
+    (prefix.is_absolute() && exe.starts_with(home.join("bin").canonicalize().ok()?))
+        .then_some(prefix)
+}
+
+pub(super) fn unmanaged(
+    exe: &Path,
+    home: &Path,
+    web_base: &str,
+) -> Option<(PathBuf, &'static str)> {
+    let prefix = shim_prefix(exe, home)?;
+    let kind = provenance::kind(&prefix, web_base);
+    Some((prefix, kind))
 }
