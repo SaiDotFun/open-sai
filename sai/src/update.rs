@@ -151,7 +151,7 @@ impl UpdateCommand {
                 );
             }
         };
-        if let Err(reason) = install.owner() {
+        if let Err(reason) = install.owner(true) {
             return Outcome::new("unsupported", reason, RUNNING, None);
         }
         if self.source {
@@ -488,7 +488,7 @@ pub(crate) fn tick(command: &str, json: bool, home: &Path, events: EventContext<
         return;
     }
     let install = Install::discover(home);
-    let Some(launcher) = install.launcher().filter(|_| install.owner().is_ok()) else {
+    let Some(launcher) = install.launcher().filter(|_| install.owner(false).is_ok()) else {
         return;
     };
     let Ok(Some(lock)) = state::try_state_lock(home) else {

@@ -553,11 +553,7 @@ def test_shadowing_reports_both_paths_without_fetching(
     assert standalone.launcher.resolve() == standalone.executable
 
 
-@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
-@pytest.mark.parametrize("fail", ["", "installed"])
-def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
-    standalone: NativeInstall, tmp_path: Path, fail: str
-) -> None:
+def uv_install(standalone: NativeInstall, tmp_path: Path) -> tuple[NativeInstall, Path]:
     uv = shutil.which(os.environ.get("UV", "uv")) or resolve_uv()
     if Path(uv).resolve().name == "mise":
         uv = resolve_uv()
@@ -580,7 +576,6 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
         "FIXTURE_STABLE_UV_PREFIX": str(tools / "sai-cli"),
     }
     initial = wheel(tmp_path, standalone.installed, forward=True)
-    replacement = wheel(tmp_path, NEW, fail=fail)
     result = subprocess.run(
         [uv, "tool", "install", "--offline", "--python", sys.executable, initial],
         env=env,
@@ -591,9 +586,97 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
     )
     assert result.returncode == 0, result.stderr
     launcher = bins / "sai"
-    install = NativeInstall(
+    return NativeInstall(
         launcher, candidate, standalone.home, env, standalone.installed
+    ), initial
+
+
+def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
+    tools = Path(install.env["UV_TOOL_DIR"])
+    digest = hashlib.sha256(initial.read_bytes()).hexdigest()
+    cached = tools / ".sai-cli-native-wheels" / digest / initial.name
+    cached.parent.mkdir(parents=True, mode=0o700)
+    shutil.copyfile(initial, cached)
+    pending = tools / ".sai-cli-native-pending.json"
+    pending.write_text(
+        json.dumps(
+            {
+                "version": install.installed,
+                "digest": digest,
+                "launcher": str(install.launcher),
+                "python": str(Path(sys.executable).resolve()),
+            }
+        ),
+        encoding="utf-8",
     )
+    return pending
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize(
+    "interrupted",
+    [
+        "launcher",
+        "receipt",
+        "environment",
+        "dangling-with-path-fallback",
+        "foreign-launcher",
+    ],
+)
+def test_uv_recovers_an_interrupted_install(
+    standalone: NativeInstall, tmp_path: Path, interrupted: str
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
+    record = interrupted_uv_install(install, initial)
+    link = install.launcher.readlink()
+    if interrupted in {"launcher", "environment", "foreign-launcher"}:
+        install.launcher.unlink()
+    if interrupted == "receipt":
+        (prefix / "uv-receipt.toml").unlink()
+    if interrupted in {"environment", "dangling-with-path-fallback"}:
+        shutil.rmtree(prefix)
+    if interrupted == "foreign-launcher":
+        install.launcher.symlink_to(standalone.executable)
+
+    search_path = install.env["PATH"]
+    if interrupted == "dangling-with-path-fallback":
+        search_path += f":{standalone.launcher.parent}"
+    with releases({}) as server:
+        result = install.invoke(
+            "--json",
+            "update",
+            *server.args,
+            "--to",
+            install.installed,
+            exe=install.executable,
+            SAI_NATIVE_UV_PREFIX=str(prefix),
+            PATH=search_path,
+        )
+        assert not server.reads
+    if interrupted == "foreign-launcher":
+        assert result.returncode == 3, result.stdout
+        assert install.launcher.resolve() == standalone.executable
+        assert record.exists()
+    else:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["status"] == "current"
+        assert install.launcher.readlink() == link
+        assert (prefix / "uv-receipt.toml").is_file()
+        assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+        assert not record.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("fail", ["", "installed"])
+def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
+    standalone: NativeInstall, tmp_path: Path, fail: str
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    uv = str(install.launcher.parent / "uv")
+    launcher, env = install.launcher, install.env
+    tools = Path(env["UV_TOOL_DIR"])
+    replacement = wheel(tmp_path, NEW, fail=fail)
     link = launcher.readlink()
     local_assets = {
         **assets(standalone.installed, initial.name, initial.read_bytes()),

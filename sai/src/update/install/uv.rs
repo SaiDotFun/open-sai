@@ -36,6 +36,14 @@ struct Wheel {
     digest: String,
 }
 
+#[derive(Deserialize, Serialize)]
+struct Pending {
+    #[serde(flatten)]
+    wheel: Wheel,
+    launcher: PathBuf,
+    python: PathBuf,
+}
+
 impl Uv {
     pub(super) fn discover(exe: &Path, home: &Path) -> Option<Self> {
         // uvx may share the same native cache. The shim supplies its actual
@@ -44,11 +52,19 @@ impl Uv {
         if !prefix.is_absolute() || !exe.starts_with(home.join("bin").canonicalize().ok()?) {
             return None;
         }
-        let prefix = prefix.canonicalize().ok()?;
         if prefix.file_name()? != TOOL {
             return None;
         }
-        let launcher = registered_launcher(&prefix)?;
+        let tools = prefix.parent()?.canonicalize().ok()?;
+        let prefix = tools.join(TOOL);
+        if prefix.symlink_metadata().is_ok() && prefix.canonicalize().ok()? != prefix {
+            return None;
+        }
+        let launcher = registered_launcher(&prefix).or_else(|| {
+            let pending: Pending =
+                serde_json::from_slice(&fs::read(tools.join(RECORD)).ok()?).ok()?;
+            pending_launcher(&pending)
+        })?;
         Some(Self { prefix, launcher })
     }
 
@@ -66,6 +82,36 @@ impl Uv {
 
     pub(super) fn lock_path(&self) -> PathBuf {
         self.tools().join(LOCK)
+    }
+
+    fn pending_path(&self) -> PathBuf {
+        self.tools().join(RECORD)
+    }
+
+    fn pending(&self) -> Result<Option<Pending>> {
+        let bytes = match fs::read(self.pending_path()) {
+            Ok(bytes) => bytes,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(err) => return Err(io_error(err)),
+        };
+        let record: Pending = serde_json::from_slice(&bytes)
+            .map_err(|_| "could not read the pending uv install record".to_owned())?;
+        if pending_launcher(&record).as_deref() != Some(self.launcher())
+            || !record.python.is_absolute()
+            || record.python.canonicalize().ok().as_deref() != Some(record.python.as_path())
+            || !record.python.is_file()
+            || record.python.starts_with(&self.prefix)
+        {
+            return Err(
+                "the pending uv install record names a different launcher or invalid interpreter"
+                    .into(),
+            );
+        }
+        Ok(Some(record))
+    }
+
+    pub(super) fn can_recover(&self) -> Result<bool> {
+        Ok(self.pending()?.is_some())
     }
 
     pub(super) fn owner(&self, allow_missing: bool) -> Result<()> {
@@ -125,10 +171,15 @@ impl Uv {
     }
 
     fn python(&self) -> Result<PathBuf> {
-        self.prefix
+        let python = self
+            .prefix
             .join("bin/python")
             .canonicalize()
-            .map_err(io_error)
+            .map_err(io_error)?;
+        if !python.is_file() || python.starts_with(&self.prefix) {
+            return Err("uv's base Python interpreter must be outside the tool environment".into());
+        }
+        Ok(python)
     }
 
     fn wheel_path(&self, wheel: &Wheel) -> Result<PathBuf> {
@@ -234,20 +285,14 @@ impl Uv {
     }
 
     pub(super) async fn recover(&self, home: &Path) -> Result<Version> {
-        match fs::read(self.tools().join(RECORD)) {
-            Ok(bytes) => {
-                let wheel = serde_json::from_slice(&bytes)
-                    .map_err(|_| "could not read the pending uv install record".to_owned())?;
-                let scratch = TempDir::new().map_err(io_error)?;
-                let uv = find_uv()?;
-                self.check_destination(&uv, scratch.path()).await?;
-                let python = self.python()?;
-                self.restore(&uv, &python, &wheel, home, None).await
-            }
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                smoke::version(&self.launcher, home, None).await
-            }
-            Err(err) => Err(io_error(err)),
+        if let Some(pending) = self.pending()? {
+            let scratch = TempDir::new().map_err(io_error)?;
+            let uv = find_uv()?;
+            self.check_destination(&uv, scratch.path()).await?;
+            self.restore(&uv, &pending.python, &pending.wheel, home, None)
+                .await
+        } else {
+            smoke::version(&self.launcher, home, None).await
         }
     }
 
@@ -302,8 +347,13 @@ impl Uv {
                 return Ok(Change::Available);
             }
             self.owner(false)?;
-            let record = self.tools().join(RECORD);
-            state::atomic_json(&record, &previous).map_err(io_error)?;
+            let record = self.pending_path();
+            let pending = Pending {
+                wheel: previous,
+                launcher: self.launcher.clone(),
+                python: python.clone(),
+            };
+            state::atomic_json(&record, &pending).map_err(io_error)?;
             let changed = async {
                 self.install(&uv, &python, &next, home.path(), None).await?;
                 self.owner(false)?;
@@ -323,7 +373,7 @@ impl Uv {
                         return Ok(Change::unchanged(reason, installed));
                     }
                     let (reason, rolled_back) = match self
-                        .restore(&uv, &python, &previous, home.path(), shim_base)
+                        .restore(&uv, &python, &pending.wheel, home.path(), shim_base)
                         .await
                     {
                         Ok(_) => (format!("{reason}. Rolled back to sai {installed}."), true),
@@ -344,6 +394,12 @@ impl Uv {
         .await;
         result.unwrap_or_else(|reason: String| Change::unchanged(reason, installed))
     }
+}
+
+fn pending_launcher(record: &Pending) -> Option<PathBuf> {
+    (record.launcher.is_absolute() && record.launcher.file_name()? == "sai")
+        .then(|| launcher_path(&record.launcher))
+        .flatten()
 }
 
 fn registered_launcher(prefix: &Path) -> Option<PathBuf> {

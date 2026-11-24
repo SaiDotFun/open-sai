@@ -94,13 +94,24 @@ impl Install {
         }
     }
 
-    pub(super) fn owner(&self) -> Result<()> {
+    pub(super) fn owner(&self, recover: bool) -> Result<()> {
         let Some(launcher) = self.launcher() else {
             return Err(
                 "This launcher is managed outside sai. Use its installer to update.".into(),
             );
         };
-        if let Some(on_path) = smoke::find_executable(OsStr::new("sai"))
+        let pending = match self {
+            Self::Uv(install) if recover => install.can_recover()?,
+            _ => false,
+        };
+        // When the launcher is missing, PATH may fall through to another
+        // install. The recorded launcher and uv destination guard recovery.
+        let missing = pending
+            && launcher
+                .metadata()
+                .is_err_and(|err| err.kind() == std::io::ErrorKind::NotFound);
+        if !missing
+            && let Some(on_path) = smoke::find_executable(OsStr::new("sai"))
             && launcher_path(&on_path).as_deref() != Some(launcher)
         {
             return Err(format!(
@@ -111,7 +122,7 @@ impl Install {
         }
         match self {
             Self::Standalone(install) => install.active().map(|_| ()),
-            Self::Uv(install) => install.owner(false),
+            Self::Uv(install) => install.owner(pending),
             Self::Other(_) => unreachable!(),
         }
     }
