@@ -910,7 +910,9 @@ def warn(message: str) -> None:
 @click.option(
     "--allow-concurrent-open",
     is_flag=True,
-    help="Allow another open while an earlier open is unknown or accepted.",
+    help="Allow another open while an earlier open is unknown or accepted."
+    " Any locally pending open on the same account and Keeper still blocks,"
+    " including a late acknowledgement.",
 )
 @click.option("--dry-run", is_flag=True)
 @click.pass_context

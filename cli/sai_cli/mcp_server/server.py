@@ -326,7 +326,9 @@ async def trade_open(
             required for market orders only.
         allow_concurrent_open: True to submit while an earlier open is unknown
             or accepted, after checking its status and getting confirmation for
-            another position. A known pending fill still blocks submission.
+            another position. Any locally pending open on the same account and
+            Keeper still blocks submission, including a late acknowledgement
+            or an outcome that is still waiting to be indexed.
         addr: Connected account to act as (0x...). Defaults to the
             active account.
     """
