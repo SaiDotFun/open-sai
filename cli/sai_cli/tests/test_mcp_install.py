@@ -154,6 +154,8 @@ def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
     for name in (
         "SAI_HOME",
         "CLAUDE_CONFIG_DIR",
+        "CLAUDECODE",
+        "WSL_DISTRO_NAME",
         "UV_CACHE_DIR",
         "XDG_CACHE_HOME",
         "LOCALAPPDATA",
@@ -370,7 +372,6 @@ def test_doctor_preserves_denied_registration_names(env: Env):
         ("user", "exact", True),
         ("project", "exact", True),
         ("local", "exact", True),
-        ("managed-cache", "exact", True),
         ("git-root", "exact", True),
         ("git-worktree", "exact", True),
         ("another-project", "exact", True),
@@ -406,7 +407,6 @@ def test_doctor_respects_claude_deny_rules(env, monkeypatch, source, match, bloc
         "user": env.home / ".claude/settings.json",
         "project": env.project / ".claude/settings.json",
         "local": env.project / ".claude/settings.local.json",
-        "managed-cache": env.home / ".claude/remote-settings.json",
         "git-root": env.project / ".claude/settings.local.json",
         "git-worktree": other_project / ".claude/settings.local.json",
         "another-project": other_project / ".claude/settings.json",
@@ -448,22 +448,76 @@ def test_doctor_respects_claude_deny_rules(env, monkeypatch, source, match, bloc
     assert "private.example" not in result.output
 
 
-def test_claude_reads_managed_policy_files_and_visible_json_drop_ins(tmp_path):
+def test_claude_detects_managed_policy_files_and_visible_json_drop_ins(tmp_path):
     main = tmp_path / "managed-settings.json"
-    main.write_text(json.dumps({"deniedMcpServers": [{"serverName": "sai"}]}))
     drop_ins = tmp_path / "managed-settings.d"
     drop_ins.mkdir()
-    command = [OLD_COMMAND, "--json"]
-    drop_in = drop_ins / "98-company.json"
-    drop_in.write_text(json.dumps({"deniedMcpServers": [{"serverCommand": command}]}))
     (drop_ins / ".hidden.json").write_text("invalid")
     (drop_ins / "README").write_text("invalid")
+    assert not mcp_install.has_claude_managed_files(tmp_path)
+    drop_in = drop_ins / "98-company.json"
+    drop_in.write_text("{}")
+    assert mcp_install.has_claude_managed_files(tmp_path)
+    drop_in.unlink()
+    main.write_text(json.dumps({"policyHelper": {"path": "/some/helper"}}))
+    assert mcp_install.has_claude_managed_files(tmp_path)
+    main.unlink()
+    main.symlink_to(tmp_path / "missing.json")
+    assert mcp_install.has_claude_managed_files(tmp_path)
 
-    files = mcp_install.managed_claude_files(tmp_path)
-    assert files == [main, drop_in]
-    assert mcp_install.claude_denied(files, "user", "sai", ["sai", "mcp", "serve"])
-    assert mcp_install.claude_denied(files, "user", OLD_COMMAND, command)
-    assert not mcp_install.claude_denied(files, "user", OLD_COMMAND, command[:1])
+
+@pytest.mark.parametrize(
+    "source", ["managed-cache", "claude-session", "windows", "wsl"]
+)
+def test_claude_repair_requires_verifiable_policy(env, monkeypatch, source):
+    config = env.home / ".claude.json"
+    original = json.dumps({"mcpServers": {"sai": claude_entry([OLD_COMMAND], {})}})
+    config.write_text(original)
+    if source == "managed-cache":
+        cache = env.home / ".claude/remote-settings.json"
+        cache.parent.mkdir()
+        cache.write_text(json.dumps({"policyHelper": {"path": SECRET}}))
+    elif source == "claude-session":
+        monkeypatch.setenv("CLAUDECODE", "1")
+    elif source == "wsl":
+        monkeypatch.setenv("WSL_DISTRO_NAME", SECRET)
+    client = mcp_install.Claude(env.home, os.environ, env.project)
+    with monkeypatch.context() as runtime:
+        if source == "windows":
+            runtime.setattr(sys, "platform", "win32")
+        check = mcp_install.check_registration(
+            client,
+            mcp_install.Target(serve(env)),
+            fix=True,
+            compare_profile=False,
+            policy_cwd=None,
+        )
+    assert check.status == "warn" and check.policy_blocked
+    assert check.fix and "sai mcp install claude" in check.fix
+    assert not check.changes
+    assert config.read_text() == original
+    assert not env.calls()
+    assert SECRET not in check.summary
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stderr", "present"),
+    [
+        (0, b"", True),
+        (1, b"Domain com.anthropic.claudecode does not exist", False),
+        (1, b"Could not read preferences", True),
+    ],
+)
+def test_claude_probes_macos_preference_domain_without_reading_values(
+    tmp_path, monkeypatch, returncode, stderr, present
+):
+    def defaults(argv, **kwargs):
+        assert argv == ["/usr/bin/defaults", "read", "com.anthropic.claudecode"]
+        assert kwargs["stdout"] == subprocess.DEVNULL
+        return subprocess.CompletedProcess(argv, returncode, stderr=stderr)
+
+    monkeypatch.setattr(subprocess, "run", defaults)
+    assert mcp_install.has_claude_managed_preferences(tmp_path) is present
 
 
 @pytest.mark.parametrize("canonical_exists", [False, True])

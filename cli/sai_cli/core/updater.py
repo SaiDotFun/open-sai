@@ -600,7 +600,14 @@ class Outcome:
                 "status": check.status,
                 "changes": list(check.changes),
                 **({"pinned": True} if check.pinned else {}),
-                **({"policyBlocked": True} if check.policy_blocked else {}),
+                **(
+                    {
+                        "policyBlocked": True,
+                        "fix": mcp_install.CLAUDE_POLICY_REPAIR_HINT,
+                    }
+                    if check.policy_blocked
+                    else {}
+                ),
                 **(
                     {"legacyName": mcp_install.RETIRED_NAME}
                     if check.legacy_name
@@ -1186,8 +1193,8 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
     if claude_policy_blocked:
         messages.append(
-            "Skipped a Claude Code MCP repair because of deny rules."
-            " Run `sai doctor` for details."
+            "Skipped a Claude Code MCP repair because of policy. "
+            + mcp_install.CLAUDE_POLICY_REPAIR_HINT
         )
     if legacy:
         messages.append(

@@ -34,6 +34,11 @@ from .core import settings
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
 SERVER_NAMES = (NAME, RETIRED_NAME)
+CLAUDE_POLICY_REPAIR_HINT = (
+    "Review the Claude Code policy. Run `sai mcp install claude` for a user"
+    " registration named sai, or use `claude mcp --help` to repair the"
+    " existing entry in its original scope and under its original name."
+)
 HIDDEN = "<hidden>"
 CODEX_TOOL_FILTERS = ("enabled_tools", "disabled_tools")
 STILL_ACTIVE = "a project .codex/config.toml entry is still active"
@@ -307,18 +312,54 @@ def load_json(path: Path) -> dict[str, Any] | None:
     return data
 
 
-def managed_claude_files(directory: Path) -> list[Path]:
-    """The system policy file and visible JSON drop-ins."""
-    files = [directory / "managed-settings.json"]
+def file_present(path: Path) -> bool:
+    """Treat dangling links and unreadable files conservatively."""
     try:
-        files.extend(
-            path
-            for path in (directory / "managed-settings.d").iterdir()
-            if path.suffix == ".json" and not path.name.startswith(".")
-        )
+        path.lstat()
     except FileNotFoundError:
-        pass
-    return files
+        return False
+    return True
+
+
+def has_claude_managed_files(directory: Path) -> bool:
+    """Detect the system policy file or a visible JSON drop-in."""
+    if file_present(directory / "managed-settings.json"):
+        return True
+    drop_ins = directory / "managed-settings.d"
+    return file_present(drop_ins) and any(
+        path.suffix == ".json" and not path.name.startswith(".")
+        for path in drop_ins.iterdir()
+    )
+
+
+def has_claude_managed_preferences(home: Path) -> bool:
+    """Check the macOS policy domain without keeping any preference values."""
+    import pwd
+
+    domain = "com.anthropic.claudecode"
+    managed = Path("/Library/Managed Preferences")
+    username = pwd.getpwuid(os.getuid()).pw_name
+    preferences = (
+        managed,
+        managed / username,
+        home / "Library/Managed Preferences",
+        Path("/Library/Preferences"),
+    )
+    if any(file_present(path / f"{domain}.plist") for path in preferences):
+        return True
+    result = subprocess.run(
+        ["/usr/bin/defaults", "read", domain],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        env={**os.environ, "LC_ALL": "C"},
+        timeout=5,
+        check=False,
+    )
+    return (
+        result.returncode != 1
+        or f"Domain {domain} does not exist".encode() not in result.stderr
+    )
 
 
 def main_checkout(root: Path) -> Path | None:
@@ -574,7 +615,7 @@ class Claude(Client):
 
     def deny_settings_paths(self, scope: str, cwd: Path | None) -> list[Path]:
         config = self.home_dir()
-        paths = [config / "settings.json", config / "remote-settings.json"]
+        paths = [config / "settings.json"]
         projects = {cwd} if cwd is not None else set()
         if scope == "user":
             # A shared registration can be denied in another Claude project.
@@ -607,32 +648,40 @@ class Claude(Client):
         paths.extend(
             project / ".claude/settings.local.json" for project in shared_local
         )
-        if sys.platform == "darwin":
-            directories = [Path("/Library/Application Support/ClaudeCode")]
-        elif sys.platform == "win32":
-            directories = [
-                Path(self.environ.get("ProgramFiles", r"C:\Program Files"))
-                / "ClaudeCode"
-            ]
-        else:
-            directories = [Path("/etc/claude-code")]
-            if self.environ.get("WSL_DISTRO_NAME"):
-                directories.append(Path("/mnt/c/Program Files/ClaudeCode"))
-        for directory in directories:
-            paths.extend(managed_claude_files(directory))
         return paths
+
+    def opaque_policy_source(self) -> str | None:
+        if sys.platform not in ("linux", "darwin") or self.environ.get(
+            "WSL_DISTRO_NAME"
+        ):
+            return "Sai cannot verify Claude Code's platform policy"
+        # A Claude invocation can add private settings that are not on disk.
+        if self.environ.get("CLAUDECODE"):
+            return "Sai cannot verify settings for the current Claude Code session"
+        if file_present(self.home_dir() / "remote-settings.json"):
+            return "A Claude Code server-managed settings cache exists"
+        if sys.platform == "darwin":
+            managed = Path("/Library/Application Support/ClaudeCode")
+            if has_claude_managed_preferences(self.home):
+                return "A macOS Claude Code managed preference domain may be active"
+        else:
+            managed = Path("/etc/claude-code")
+        if has_claude_managed_files(managed):
+            return "A Claude Code managed settings file exists"
+        return None
 
     def check_repair_policy(
         self, scope: str, name: str, argv: list[str], policy_cwd: Path | None
     ) -> None:
         try:
-            denied = claude_denied(
+            opaque = self.opaque_policy_source()
+            denied = opaque is None and claude_denied(
                 self.deny_settings_paths(scope, policy_cwd or self.cwd),
                 scope,
                 name,
                 argv,
             )
-        except (ClientError, OSError, ValueError):
+        except (ClientError, OSError, ValueError, KeyError, subprocess.TimeoutExpired):
             raise ClaudeMcpPolicyError(
                 "Could not check Claude Code MCP deny rules"
             ) from None
@@ -640,6 +689,8 @@ class Claude(Client):
             raise ClaudeMcpPolicyError(
                 "A Claude Code MCP deny rule matches the existing entry"
             )
+        if opaque:
+            raise ClaudeMcpPolicyError(opaque)
 
     def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
@@ -1410,7 +1461,7 @@ def check_registration(
             name,
             "fail",
             summary,
-            hint,
+            CLAUDE_POLICY_REPAIR_HINT if blocked else hint,
             tuple(changes),
             legacy_name=legacy_name,
             policy_blocked=bool(blocked),
@@ -1427,7 +1478,13 @@ def check_registration(
             name,
             "warn",
             ". ".join(warnings),
-            "Check SAI_HOME in the client registration" if different_profile else None,
+            CLAUDE_POLICY_REPAIR_HINT
+            if blocked
+            else (
+                "Check SAI_HOME in the client registration"
+                if different_profile
+                else None
+            ),
             changes=tuple(changes),
             pinned=pinned,
             legacy_name=legacy_name,

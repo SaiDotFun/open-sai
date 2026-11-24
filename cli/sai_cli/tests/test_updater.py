@@ -149,6 +149,7 @@ BROKEN_WHEN_INSTALLED = (
         "deleted-cwd-relative",
         "denied-project",
         "command-denied-background",
+        "opaque-policy-background",
     ],
 )
 def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
@@ -158,12 +159,16 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CLAUDECODE", raising=False)
+    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
     monkeypatch.setenv("FAKE_LOG", str(uv_dirs / "client-calls.jsonl"))
     project = uv_dirs / "project"
     project.mkdir()
     denied = mode == "denied-project"
     background_denied = mode == "command-denied-background"
-    background = mode == "background" or background_denied
+    opaque = mode == "opaque-policy-background"
+    background = mode == "background" or background_denied or opaque
+    policy_blocked = denied or background_denied or opaque
     name = OLD_COMMAND if denied else "sai"
     config = project / ".mcp.json" if denied else home / ".claude.json"
     entry = {
@@ -211,6 +216,10 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
                 {"deniedMcpServers": [{"serverCommand": [OLD_COMMAND, *entry["args"]]}]}
             )
         )
+    if opaque:
+        cache = home / ".claude/remote-settings.json"
+        cache.parent.mkdir()
+        cache.write_text(json.dumps({"policyHelper": {"path": SECRET}}))
     wheels = {
         "0.1.0": build_wheel("0.1.0"),
         "0.2.0": build_wheel("0.2.0", server_body),
@@ -261,7 +270,7 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             },
             OTHER: other,
         }
-        if denied or background_denied:
+        if policy_blocked:
             assert config.read_text() == original
         else:
             assert json.loads(config.read_text())["mcpServers"] == expected
@@ -295,10 +304,11 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         assert repair[0]["background"] is background
         claude = repair[0]["clients"][0]
         assert claude["client"] == "claude"
-        if denied or background_denied:
+        if policy_blocked:
             assert claude["status"] == "warn"
             assert claude["policyBlocked"] is True
             assert claude["changes"] == []
+            assert "sai mcp install claude" in claude["fix"]
             assert state["result"]["mcp"] == repair[0]["clients"]
         else:
             assert claude["status"] == "fixed"
@@ -308,8 +318,8 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             assert all(client["legacyName"] == name for client in clients.values())
             assert f"kept the existing {name} name" in result.stdout
         message = (
-            "Skipped a Claude Code MCP repair because of deny rules."
-            if denied or background_denied
+            "Skipped a Claude Code MCP repair because of policy."
+            if policy_blocked
             else "Repaired Sai MCP registrations for claude"
         )
         if background:
@@ -321,6 +331,8 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             updater.tick(notices.append, prefix=tool.prefix)
             assert len(notices) == 1 and message in notices[0]
             assert "sai doctor" in notices[0]
+            if policy_blocked:
+                assert "sai mcp install claude" in notices[0]
             assert "project registrations" in notices[0]
             assert state["result"]["mcpNotes"] == ["background"]
         elif mode == "deleted-cwd":
