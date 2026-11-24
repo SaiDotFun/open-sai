@@ -20,7 +20,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
-from sai_cli.core import keeper, storage
+from sai_cli.core import keeper, log, storage
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import serve
 from websockets.typing import Subprotocol
@@ -866,3 +866,39 @@ def test_repl_survives_a_failing_command_and_shows_help(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "Error: Stored session is passphrase-encrypted" in result.stderr
     assert "Usage: sai" in result.stdout
+
+
+@pytest.mark.parametrize("in_repl", [False, True], ids=["cli", "repl"])
+def test_bare_command_help_reports_usage_exit_in_process_and_log(
+    tmp_path: Path, in_repl: bool
+) -> None:
+    command = [] if in_repl else ["trade", "open"]
+    result = subprocess.run(
+        [*_resolve_cli(), *command],
+        input="trade open\nhelp config\nexit\n" if in_repl else "",
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=20,
+        env={**os.environ, "SAI_HOME": str(tmp_path)},
+    )
+    assert "Options:" in result.stderr
+    assert "--slippage" in result.stderr
+    if in_repl:
+        assert result.returncode == 0
+        assert "Usage: sai config" in result.stdout
+    else:
+        assert result.returncode == 2
+        assert result.stdout == ""
+
+    command_events = []
+    for _, _, path in log.log_files(tmp_path / "logs"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            event = json.loads(line)
+            if event.get("command") == "trade open":
+                command_events.append(event)
+    assert [event["event"] for event in command_events] == [
+        "command.start",
+        "command.end",
+    ]
+    assert command_events[-1]["exitCode"] == 2
