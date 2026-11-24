@@ -17,6 +17,7 @@ import sys
 import threading
 import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1195,6 +1196,27 @@ print(reads)
     )
     assert len(events(home, "test.config")) == 20
     assert int(result.stdout) == 1
+
+
+def test_config_edits_finish_while_log_writer_is_stalled(home):
+    path = home / "config.toml"
+    with ThreadPoolExecutor(max_workers=1) as pool, log._io_lock:
+        log.event("test.config")
+        for key, value in (("logs.enabled", "false"), ("logs.keep_days", "3")):
+            edit = pool.submit(
+                settings.edit_file,
+                path,
+                lambda text, key=key, value=value: settings.set_value(
+                    text, key, value, path
+                )[0],
+            )
+            edit.result(timeout=5)
+
+    assert settings.read_file(path)[0] == {
+        "logs.enabled": False,
+        "logs.keep_days": 3,
+    }
+    assert log.flush(10)
 
 
 def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):

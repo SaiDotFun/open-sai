@@ -199,6 +199,7 @@ def _off(raw: str | None) -> bool:
 
 _ConfigStat = tuple[int, int, int, int, int]
 _config_cache: dict[tuple[Any, ...], tuple[float, tuple[bool, int]]] = {}
+_config_generation = object()
 
 
 def _config_stat(path: Path) -> _ConfigStat | None:
@@ -211,9 +212,11 @@ def _config_stat(path: Path) -> _ConfigStat | None:
 
 def invalidate_config() -> None:
     """Refresh the writer after a successful config edit."""
-    with _io_lock:
-        _config_cache.clear()
-        _skip.clear()
+    global _config_generation
+    # An in-flight read or write can still finish under its previous generation.
+    _config_generation = object()
+    _config_cache.clear()
+    _skip.clear()
 
 
 def resolve_config(
@@ -229,12 +232,13 @@ def resolve_config(
     """
     from . import settings
 
+    generation = _config_generation
     path = root / settings.FILE_NAME
     try:
         signature = _config_stat(path)
     except OSError:
         return (False, DEFAULT_KEEP_DAYS)
-    key = (str(path), signature, raw_enabled, raw_keep)
+    key = (str(path), signature, raw_enabled, raw_keep, generation)
     checked_at = time.monotonic()
     cached = _config_cache.get(key)
     # Expire unchanged entries too, for filesystems with coarse timestamps
@@ -913,7 +917,7 @@ _dropped = 0
 _queued_chars = 0
 _size_lock = threading.Lock()
 # Homes whose logging is off or failing, with when the writer last looked.
-_skip: dict[tuple[str, str | None, str | None], float] = {}
+_skip: dict[tuple[str, str | None, str | None], tuple[object, float]] = {}
 # The UTC day each home was last checked for old files.
 _pruned: dict[str, date] = {}
 
@@ -934,13 +938,14 @@ def _write(item: _Item) -> None:
     global _dropped
     key = (item.root, item.on, item.keep)
     root = Path(item.root)
+    generation = _config_generation
     on, keep_days = resolve_config(root, item.on, item.keep)
     if not on:
-        _skip[key] = time.monotonic()
+        _skip[key] = (generation, time.monotonic())
         return
     opened = LogDir.open(root / DIR_NAME, create=True)
     if opened is None:
-        _skip[key] = time.monotonic()
+        _skip[key] = (generation, time.monotonic())
         return
     with opened:
         _skip.pop(key, None)
@@ -1012,7 +1017,11 @@ def _target() -> tuple[str, str | None, str | None] | None:
         return None
     key = (str(home()), raw_on, os.environ.get("SAI_LOG_KEEP_DAYS"))
     skipped = _skip.get(key)
-    if skipped is not None and time.monotonic() - skipped < RECHECK_SECONDS:
+    if (
+        skipped is not None
+        and skipped[0] is _config_generation
+        and time.monotonic() - skipped[1] < RECHECK_SECONDS
+    ):
         return None
     return key
 
@@ -1107,8 +1116,7 @@ def reset() -> None:
     _token_key = None
     with _token_lock:
         _known.clear()
-    _config_cache.clear()
-    _skip.clear()
+    invalidate_config()
     _pruned.clear()
 
 
