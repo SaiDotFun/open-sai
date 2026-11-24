@@ -108,6 +108,44 @@ def run_cli(*args: str) -> tuple[int, str]:
     return result.exit_code, result.output
 
 
+@pytest.mark.parametrize(
+    ("content", "expected", "summary"),
+    [
+        (b"[update]\nauto = false\n", "pass", "Config file settings are valid"),
+        (b"[future]\nprivate_setting = 'private_value'\n", "warn", "unknown settings"),
+        (b"[update\n", "fail", "not valid TOML"),
+        (b"[keeper]\nendpoint = 'https://[private_value'\n", "fail", "keeper.endpoint"),
+        (b"[update]\nauto = 'private_value'\n", "fail", "update.auto"),
+        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", "logs.keep_days"),
+        (b"\xff", "fail", "UTF-8"),
+    ],
+)
+def test_config_check_reports_file_errors_without_echoing_values(
+    isolated_home, monkeypatch, content, expected, summary
+):
+    path = isolated_home / "config.toml"
+    path.write_bytes(content)
+    # File validation still applies to keys shadowed by an environment value.
+    monkeypatch.setenv("SAI_UPDATE_AUTO", "false")
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    checks = {check["id"]: check for check in json.loads(output)["checks"]}
+    assert checks["config"]["status"] == expected
+    assert summary in checks["config"]["summary"]
+    assert "home" in checks
+    assert code == (1 if expected == "fail" else 0)
+    assert "private_setting" not in output and "private_value" not in output
+    assert path.read_bytes() == content
+
+
+def test_unusable_config_skips_checks_that_need_resolved_settings(isolated_home):
+    (isolated_home / "config.toml").write_text("[keeper\n")
+    code, output = run_cli("--json", "doctor", "--no-fix")
+    checks = {check["id"]: check for check in json.loads(output)["checks"]}
+    assert code == 1
+    for name in ("session", "intents", "keeper", "websocket", "lcd"):
+        assert checks[name]["status"] == "skipped"
+
+
 # Session
 
 

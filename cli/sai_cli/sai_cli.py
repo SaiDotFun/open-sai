@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import json
 import os
 import shlex
@@ -1069,24 +1068,29 @@ def doctor_command(
     ws_endpoint: str | None,
     lcd_endpoint: str | None,
 ) -> None:
-    """Check the install, session, intent ledger, and endpoints, and fix what
-    is safe to fix.
+    """Check the install, config, session, intent ledger, and endpoints.
 
     Fixes: create $SAI_HOME/trader, make it, $SAI_HOME/logs, and their files
-    private, migrate the intent ledger, and reconcile unknown intents for the signed-in
-    account with Keeper (a read; no trade is placed or cancelled). It never
+    private, migrate the intent ledger, and reconcile unknown intents for
+    the signed-in account with Keeper (a read; no trade is placed or cancelled). It never
     deletes or rewrites the session, and never prints its token. Each check
     prints pass, fixed, warn, fail, or skipped, with a fix for the rest. Exits
     1 if any check still fails.
     """
     from . import doctor
 
-    config = dataclasses.replace(
-        settings(ctx),
-        ws_endpoint=ws_url(ctx, ws_endpoint),
-        lcd_endpoint=lcd_url(ctx, lcd_endpoint),
-    )
-    checks = doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline))
+    flags = dict(ctx.find_root().obj["flags"])
+    for key, value in (
+        ("keeper.ws_endpoint", ws_endpoint),
+        ("lcd.endpoint", lcd_endpoint),
+    ):
+        if value:
+            flags[key] = value
+    config_check, config = doctor.check_config(flags)
+    checks = [
+        config_check,
+        *doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline)),
+    ]
     log.event(
         "doctor.result",
         "info" if doctor.overall(checks) == "pass" else "warn",
