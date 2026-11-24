@@ -805,7 +805,8 @@ def test_logs_commands_never_start_an_update():
     assert auto_update_applies("market", False, {}, True) is True
 
 
-def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home):
+def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home, monkeypatch):
+    monkeypatch.setenv("PATH", "")
     assert run_cli("doctor", "--offline", "--no-fix")[0] == 0
     assert list(home.iterdir()) == []
     assert run_cli("doctor", "--offline")[0] == 0
@@ -813,6 +814,7 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home):
     assert result["overall"] == "warn" and result["offline"] is True
     by_id = {check["id"]: check for check in result["checks"]}
     assert list(by_id) == [
+        "config",
         "install",
         "version",
         "home",
@@ -823,6 +825,7 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home):
         "websocket",
         "lcd",
     ]
+    assert by_id["config"]["status"] == "pass"
     assert by_id["home"]["status"] == "fixed" and by_id["home"]["changes"]
     assert set(by_id["logs"]) == {"id", "status", "durationMs"}
     assert by_id["logs"]["status"] == "pass"
