@@ -131,11 +131,17 @@ fn certificate_entry(mut der: Vec<u8>, trusted: bool) -> der::Result<CaCertifica
         _ if eligible_for_default_trust(&certificate)? => ServerTrust::Anchor,
         _ => ServerTrust::Untrusted,
     };
+    // OpenSSL's full-chain verifier skips the dates of an explicitly trusted
+    // terminal intermediate. It still checks dates on a self-issued anchor.
+    let trusted_pem_validity = (trusted
+        && matches!(trust, ServerTrust::Anchor)
+        && eligible_for_default_trust(&certificate)?)
+    .then_some(certificate.tbs_certificate.validity);
     der.truncate(certificate_len);
     Ok(CaCertificate {
         der: der.into(),
         trust,
-        trusted_pem_validity: trusted.then_some(certificate.tbs_certificate.validity),
+        trusted_pem_validity,
     })
 }
 

@@ -1389,27 +1389,36 @@ def test_default_trust_requires_an_issuer(
 
 
 @pytest.mark.parametrize("store", ["file", "dir"])
-def test_expired_trusted_ca_fails_tls_handshake(
+@pytest.mark.parametrize("terminal_intermediate", [False, True])
+def test_expired_trusted_ca_matches_httpx(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
     store: str,
+    terminal_intermediate: bool,
 ) -> None:
-    context, certs = keeper_certificate
-    root = x509.load_pem_x509_certificate((certs / "keeper-ca.pem").read_bytes())
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    ca_name, signer = (
+        ("cross-signed", "other-ca")
+        if terminal_intermediate
+        else ("keeper-ca", "keeper-ca")
+    )
+    ca = x509.load_pem_x509_certificate((certs / f"{ca_name}.pem").read_bytes())
     key = serialization.load_pem_private_key(
-        (certs / "keeper-ca.key").read_bytes(), None
+        (certs / f"{signer}.key").read_bytes(), None
     )
     builder = (
         x509.CertificateBuilder()
-        .subject_name(root.subject)
-        .issuer_name(root.issuer)
-        .public_key(root.public_key())
-        .serial_number(root.serial_number)
+        .subject_name(ca.subject)
+        .issuer_name(ca.issuer)
+        .public_key(ca.public_key())
+        .serial_number(ca.serial_number)
         .not_valid_before(datetime(2020, 1, 1, tzinfo=UTC))
         .not_valid_after(datetime(2021, 1, 1, tzinfo=UTC))
     )
-    for extension in root.extensions:
+    for extension in ca.extensions:
         builder = builder.add_extension(extension.value, extension.critical)
     expired = builder.sign(key, hashes.SHA256())
     (tmp_path / "expired.pem").write_bytes(
@@ -1426,7 +1435,7 @@ def test_expired_trusted_ca_fails_tls_handshake(
         "trusted.pem",
     )
     trust = ca_store_overrides(tmp_path, store, tmp_path / "trusted.pem")
-    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, False)
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, terminal_intermediate)
 
 
 @pytest.mark.parametrize("store", ["file", "dir"])
