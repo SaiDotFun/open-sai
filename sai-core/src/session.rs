@@ -1,6 +1,7 @@
 //! Endpoint and expiry checks shared by the CLI and other front ends.
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
+use serde::Serialize;
 
 use crate::{
     errors::{Code, SaiError},
@@ -12,11 +13,29 @@ pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionErr
     Ok(session_expiry(session)? <= now)
 }
 
-pub(crate) fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> {
+pub fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> {
     parse_expiry(session.expires_at()).ok_or_else(|| {
         SessionError::new(
             "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again",
         )
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpiryNotice {
+    pub expiry_warning: String,
+    pub renewal_command: String,
+}
+
+fn expiry_warning_time(left: TimeDelta) -> Option<String> {
+    if left <= TimeDelta::zero() || left >= TimeDelta::days(3) {
+        return None;
+    }
+    Some(match left.num_minutes() {
+        0 => "under 1 min".into(),
+        minutes @ 1..120 => format!("{minutes} min"),
+        minutes => format!("{} h", minutes / 60),
     })
 }
 
@@ -177,7 +196,18 @@ impl Storage<'_> {
 
     pub fn keeper_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
         let origin = keeper_origin(endpoint);
-        let flag = if origin.as_deref() == Some(endpoint)
+        let location = keeper_location(origin.as_deref());
+        self.keeper_command(endpoint, origin.as_deref(), &location, args)
+    }
+
+    fn keeper_command(
+        &self,
+        endpoint: &str,
+        origin: Option<&str>,
+        location: &str,
+        args: &[&str],
+    ) -> String {
+        let flag = if origin == Some(endpoint)
             && self
                 .trader
                 .parent()
@@ -185,7 +215,6 @@ impl Storage<'_> {
         {
             shell_quote(endpoint)
         } else {
-            let location = keeper_location(origin.as_deref());
             format!(
                 r#""${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL{location}}}""#
             )
@@ -214,15 +243,42 @@ impl Storage<'_> {
                 ),
             ),
         };
-        if session.key_name().is_some() {
-            format!(
-                "{prefix} auth renew {}{suffix}",
-                shell_quote(session.addr())
-            )
-        } else if session.is_imported() {
-            format!("{prefix} auth import{suffix}")
+        let command =
+            renewal_instructions(session, |args| format!("{prefix} {}", shell_join(args)));
+        format!("{command}{suffix}")
+    }
+
+    pub fn expiry_notice(&self, session: &Session, left: TimeDelta) -> Option<ExpiryNotice> {
+        let when = expiry_warning_time(left)?;
+        let expiry_warning = format!("Sai session for {} expires in {when}.", session.addr());
+        let endpoint = session.endpoint().filter(|value| !value.is_empty());
+        let origin = endpoint.and_then(keeper_origin);
+        let mut renewal_command = renewal_instructions(session, |args| match endpoint {
+            Some(endpoint) => self.keeper_command(endpoint, origin.as_deref(), "", args),
+            None => format!("sai {}", shell_join(args)),
+        });
+        if endpoint.is_none() || endpoint != origin.as_deref() {
+            let location = keeper_location(origin.as_deref());
+            renewal_command.push_str(&format!(
+                " (reuse the Keeper endpoint{location} configured when this session was stored)"
+            ));
+        }
+        Some(ExpiryNotice {
+            expiry_warning,
+            renewal_command,
+        })
+    }
+}
+
+fn renewal_instructions(session: &Session, command: impl Fn(&[&str]) -> String) -> String {
+    if session.key_name().is_some() {
+        command(&["auth", "renew", session.addr()])
+    } else {
+        let import = command(&["auth", "import"]);
+        if session.is_imported() {
+            import
         } else {
-            format!("{prefix} auth login NAME or {prefix} auth import{suffix}")
+            format!("{} or {import}", command(&["auth", "login", "NAME"]))
         }
     }
 }
@@ -258,6 +314,27 @@ fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_warning_window_and_display_thresholds() {
+        for (seconds, expected) in [
+            (-1, None),
+            (0, None),
+            (1, Some("under 1 min")),
+            (59, Some("under 1 min")),
+            (60, Some("1 min")),
+            (120 * 60 - 1, Some("119 min")),
+            (120 * 60, Some("2 h")),
+            (3 * 24 * 3600 - 1, Some("71 h")),
+            (3 * 24 * 3600, None),
+            (3 * 24 * 3600 + 1, None),
+        ] {
+            assert_eq!(
+                expiry_warning_time(TimeDelta::seconds(seconds)).as_deref(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn python_iso_expiry_variants_compare_as_utc() {

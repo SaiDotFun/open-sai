@@ -4,7 +4,7 @@ use std::{
     os::fd::{AsFd, BorrowedFd},
 };
 
-use chrono::Utc;
+use chrono::{TimeDelta, Utc};
 use clap::Subcommand;
 use rustix::{
     fs::{OFlags, fcntl_getfl, fcntl_setfl},
@@ -15,7 +15,7 @@ use sai_core::{
     errors::{Code, ExitCode, SaiError},
     keeper::Keeper,
     log::{self, EventContext},
-    session::expired,
+    session::{ExpiryNotice, session_expiry},
     settings::{Environment, Flags},
     storage::{RemovedSession, SessionSummary, Storage, StorageError, StorageEvent},
 };
@@ -56,6 +56,14 @@ pub enum AuthCommand {
 }
 
 #[derive(Serialize)]
+struct AccountStatus<'a> {
+    #[serde(flatten)]
+    summary: SessionSummary<'a>,
+    #[serde(flatten)]
+    expiry_notice: Option<ExpiryNotice>,
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct AccountRow<'a> {
     #[serde(flatten)]
@@ -65,6 +73,8 @@ struct AccountRow<'a> {
     expired: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     endpoint_matches: Option<bool>,
+    #[serde(flatten)]
+    expiry_notice: Option<ExpiryNotice>,
 }
 
 #[derive(Serialize)]
@@ -164,7 +174,16 @@ pub fn dispatch(
         AuthCommand::Status => {
             let settings = load_settings(flags, env)?;
             let session = storage.load_active_session(settings.endpoint(), as_addr)?;
-            emit(&session.summary(), json)
+            let left = session_expiry(&session)? - Utc::now();
+            let expiry_notice = storage.expiry_notice(&session, left);
+            show_expiry_notice(expiry_notice.as_ref(), json);
+            emit(
+                &AccountStatus {
+                    summary: session.summary(),
+                    expiry_notice,
+                },
+                json,
+            )
         }
         AuthCommand::List => {
             let settings = load_settings(flags, env)?;
@@ -173,14 +192,22 @@ pub fn dispatch(
             let accounts = accounts
                 .iter()
                 .map(|(session, active)| {
+                    let left = session_expiry(session)? - now;
                     Ok(AccountRow {
                         summary: session.summary(),
                         active,
-                        expired: Some(expired(session, now)?),
+                        expired: Some(left <= TimeDelta::zero()),
                         endpoint_matches: Some(session.endpoint() == Some(settings.endpoint())),
+                        expiry_notice: storage.expiry_notice(session, left),
                     })
                 })
-                .collect::<Result<_, sai_core::storage::StorageError>>()?;
+                .collect::<Result<Vec<_>, StorageError>>()?;
+            if let Some(active) = accounts
+                .iter()
+                .find(|account| account.active && account.endpoint_matches == Some(true))
+            {
+                show_expiry_notice(active.expiry_notice.as_ref(), json);
+            }
             emit(&AccountList { accounts }, json)
         }
         AuthCommand::Use { addr } => {
@@ -191,6 +218,7 @@ pub fn dispatch(
                     active: true,
                     expired: None,
                     endpoint_matches: None,
+                    expiry_notice: None,
                 },
                 json,
             )
@@ -211,6 +239,16 @@ pub fn dispatch(
                 json,
             )
         }
+    }
+}
+
+fn show_expiry_notice(notice: Option<&ExpiryNotice>, json: bool) {
+    if let Some(notice) = notice
+        && !json
+        && io::stdin().is_terminal()
+        && io::stderr().is_terminal()
+    {
+        eprintln!("{} Run {}.", notice.expiry_warning, notice.renewal_command);
     }
 }
 
