@@ -11,6 +11,7 @@ import select
 import shlex
 import shutil
 import signal
+import socket
 import sqlite3
 import subprocess
 import sys
@@ -88,6 +89,24 @@ with serve(handshake, "127.0.0.1", 0, subprotocols=["graphql-transport-ws"]) as 
     thread.join()
 """
 
+# The reserved proxy port never listens. Probe with an unresolvable test name.
+CHECK_NETWORK = """
+import sys
+from urllib.error import URLError
+from urllib.request import urlopen
+
+with urlopen(sys.argv[1], timeout=3) as response:
+    if response.status != 200:
+        sys.exit(1)
+for scheme in ("http", "https"):
+    try:
+        with urlopen(f"{scheme}://release-rehearsal.invalid/", timeout=3):
+            sys.exit(1)
+    except URLError as error:
+        if not isinstance(error.reason, ConnectionRefusedError):
+            sys.exit(1)
+"""
+
 
 class RehearsalError(RuntimeError):
     pass
@@ -151,18 +170,39 @@ def owned_process(
             process.wait()
 
 
+def loopback_env(base: str, proxy_port: int) -> dict[str, str]:
+    proxy = f"http://127.0.0.1:{proxy_port}"
+    return {
+        "SAI_ENDPOINT": f"{base}/query",
+        "SAI_WS_ENDPOINT": f"ws://{base.removeprefix('http://')}/query",
+        "SAI_LCD_ENDPOINT": base,
+        "HTTP_PROXY": proxy,
+        "HTTPS_PROXY": proxy,
+        "WS_PROXY": proxy,
+        "WSS_PROXY": proxy,
+        "ALL_PROXY": proxy,
+        "NO_PROXY": "127.0.0.1",
+        "UV_OFFLINE": "1",
+    }
+
+
 class Replay:
     def __init__(self, wheel: Path, version: str) -> None:
         fixture = json.loads((TESTS / "fixtures" / "intent_outcomes.json").read_text())
         self.addr = fixture["address"]
         self.responses = {**fixture["recorded"], **fixture["replays"]}
-        self.wheel = wheel.read_bytes()
-        self.sums = f"{hashlib.sha256(self.wheel).hexdigest()}  {wheel.name}\n".encode()
+        self.assets: dict[str, tuple[bytes, str]] = {}
+        self.add_release(wheel, version)
         self.latest = BASELINE
-        self.release_path = f"/{REPO}/releases/download/sai-cli/v{version}/"
-        self.wheel_name = wheel.name
         self.submitted: list[str] = []
         self.lifecycle = "outcome_not_indexed"
+
+    def add_release(self, wheel: Path, version: str) -> None:
+        payload = wheel.read_bytes()
+        sums = f"{hashlib.sha256(payload).hexdigest()}  {wheel.name}\n".encode()
+        path = f"/{REPO}/releases/download/sai-cli/v{version}"
+        self.assets[f"{path}/{wheel.name}"] = payload, "application/octet-stream"
+        self.assets[f"{path}/SHA256SUMS"] = sums, "text/plain"
 
     def handler(self) -> type[KeeperHandler]:
         replay = self
@@ -171,10 +211,8 @@ class Replay:
             def do_GET(self) -> None:
                 if self.path.startswith(f"/repos/{REPO}/releases?"):
                     self.reply([{"tag_name": f"sai-cli/v{replay.latest}"}])
-                elif self.path == replay.release_path + replay.wheel_name:
-                    self.send_body(replay.wheel, "application/octet-stream")
-                elif self.path == replay.release_path + "SHA256SUMS":
-                    self.send_body(replay.sums, "text/plain")
+                elif asset := replay.assets.get(self.path):
+                    self.send_body(*asset)
                 elif self.path == "/cosmos/base/tendermint/v1beta1/node_info":
                     self.reply({"default_node_info": {"network": CHAIN}})
                 else:
@@ -494,6 +532,8 @@ def check_doctor(tool: Install, base: str, key: str, *, pending: bool) -> None:
         result = tool.run(
             "Run sai doctor",
             tool.sai,
+            "--endpoint",
+            f"{base}/query",
             "--json",
             "doctor",
             "--ws-endpoint",
@@ -554,7 +594,10 @@ def probe_retry(tool: Install, replay: Replay, key: str) -> bool:
 def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) -> None:
     tool = Install(root, diagnostics)
     replay = Replay(wheel, version)
-    with keeper_server(replay.handler()) as base:
+    with (
+        keeper_server(replay.handler()) as base,
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as dead_proxy,
+    ):
         endpoint = f"{base}/query"
         tool.run(
             "Install the published release",
@@ -563,6 +606,32 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
             INSTALLER,
             "--api-base",
             base,
+        )
+        baseline_wheel = (
+            tool.sai_home / "cache/wheels" / f"sai_cli-{BASELINE}-py3-none-any.whl"
+        )
+        replay.add_release(baseline_wheel, BASELINE)
+        # uv caches the candidate's dependencies without running candidate commands.
+        tool.run(
+            "Cache candidate dependencies",
+            tool.uv,
+            "pip",
+            "install",
+            "--python",
+            tool.python,
+            "--target",
+            root / "dependency-cache",
+            wheel,
+        )
+        dead_proxy.bind(("127.0.0.1", 0))
+        tool.env.update(loopback_env(base, dead_proxy.getsockname()[1]))
+        tool.run(
+            "Check loopback network settings",
+            tool.python,
+            "-I",
+            "-c",
+            CHECK_NETWORK,
+            f"{base}/repos/{REPO}/releases?per_page=100",
         )
         tool.verify_version(BASELINE)
         print(f"Installed published sai {BASELINE} at {tool.sai}", flush=True)
@@ -657,7 +726,14 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
             flush=True,
         )
 
-        tool.json("Downgrade through sai update", "update", "--to", BASELINE)
+        tool.json(
+            "Downgrade through sai update",
+            "update",
+            "--to",
+            BASELINE,
+            "--web-base",
+            base,
+        )
         tool.verify_version(BASELINE)
         require(config.read_bytes() == configured, "Downgrade changed the user config")
         tool.verify_session(session)

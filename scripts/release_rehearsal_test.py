@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import runpy
+import socket
 import subprocess
 import sys
 import tempfile
@@ -76,6 +77,33 @@ class DiagnosticsTest(unittest.TestCase):
                         self.assertEqual(log.read_text().count(diagnostic), 2)
                     else:
                         self.assertFalse(log.exists())
+
+
+class NetworkTest(unittest.TestCase):
+    def test_direct_loopback_works_and_external_http_uses_the_dead_proxy(self) -> None:
+        class Handler(REHEARSAL["KeeperHandler"]):
+            def do_GET(self) -> None:
+                self.reply({"fixture": True})
+
+        with (
+            REHEARSAL["keeper_server"](Handler) as base,
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM) as proxy,
+        ):
+            proxy.bind(("127.0.0.1", 0))
+            env = REHEARSAL["loopback_env"](base, proxy.getsockname()[1])
+            self.assertEqual(env["SAI_ENDPOINT"], f"{base}/query")
+            self.assertEqual(env["SAI_LCD_ENDPOINT"], base)
+            self.assertEqual(
+                env["SAI_WS_ENDPOINT"], f"ws://{base.removeprefix('http://')}/query"
+            )
+            self.assertEqual(env["UV_OFFLINE"], "1")
+            subprocess.run(
+                [sys.executable, "-I", "-c", REHEARSAL["CHECK_NETWORK"], base],
+                env=env,
+                check=True,
+                timeout=10,
+                capture_output=True,
+            )
 
 
 class ProcessTest(unittest.TestCase):
