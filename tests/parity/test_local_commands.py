@@ -1097,13 +1097,32 @@ def test_repl_history_matches_typed_prefix(
                 os.close(master)
 
 
+def wait_for_open_path(
+    process: subprocess.Popen[bytes],
+    path: Path,
+    master: int,
+    pending: bytearray,
+    command: bytes,
+) -> None:
+    import time
+
+    fds = Path(f"/proc/{process.pid}/fd")
+    if not fds.is_dir():
+        read_terminal(master, pending, command)
+        time.sleep(0.25)
+        return
+    deadline = time.monotonic() + 5
+    while not any(fd.resolve() == path for fd in fds.iterdir()):
+        assert time.monotonic() < deadline, path
+        time.sleep(0.01)
+
+
 def test_repl_interrupt_cancels_config_lock_wait_after_lookup(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:
     import fcntl
     import pty
     import signal
-    import time
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     from threading import Event, Thread
 
@@ -1158,22 +1177,9 @@ def test_repl_interrupt_cancels_config_lock_wait_after_lookup(
                             fcntl.flock(lock, fcntl.LOCK_EX)
                             command = b"config set logs.keep_days 30"
                             os.write(master, command + b"\r")
-                            fds = Path(f"/proc/{process.pid}/fd")
-                            if fds.is_dir():
-                                # Observe the actual settings lock open while our
-                                # exclusive lock still prevents the edit.
-                                deadline = time.monotonic() + 5
-                                while True:
-                                    if any(
-                                        fd.resolve() == lock_path
-                                        for fd in fds.iterdir()
-                                    ):
-                                        break
-                                    assert time.monotonic() < deadline
-                                    time.sleep(0.01)
-                            else:
-                                read_terminal(master, pending, command)
-                                time.sleep(0.25)
+                            wait_for_open_path(
+                                process, lock_path, master, pending, command
+                            )
                             process.send_signal(signal.SIGINT)
                             read_terminal(master, pending, b"Interrupted")
                             read_terminal(master, pending, prompt)
@@ -1191,6 +1197,62 @@ def test_repl_interrupt_cancels_config_lock_wait_after_lookup(
         finally:
             server.shutdown()
             thread.join(timeout=5)
+
+
+@pytest.mark.parametrize("mode", ["install", "source"])
+def test_repl_interrupt_cancels_skill_lock_wait(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path, mode: str
+) -> None:
+    import fcntl
+    import pty
+    import signal
+
+    _, rust = local_pair
+    if mode == "install":
+        parent = tmp_path / "skills"
+        command = b"skill install --dir skills/sai"
+        output = b"Installed the sai skill"
+    else:
+        parent = tmp_path / ".cache/sai/skills"
+        command = b"skill source"
+        output = b"Skill:"
+    parent.mkdir(parents=True)
+    prompt = "❯".encode()
+    master, slave = pty.openpty()
+    with subprocess.Popen(
+        rust,
+        cwd=tmp_path,
+        env={**case_env(tmp_path, logging="0"), "TERM": "xterm-256color"},
+        stdin=slave,
+        stdout=slave,
+        stderr=slave,
+    ) as process:
+        os.close(slave)
+        pending = bytearray()
+        try:
+            read_terminal(master, pending, prompt)
+            lock = os.open(parent, os.O_RDONLY)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                os.write(master, command + b"\r")
+                wait_for_open_path(process, parent, master, pending, command)
+                process.send_signal(signal.SIGINT)
+                read_terminal(master, pending, b"Interrupted")
+                read_terminal(master, pending, prompt)
+            finally:
+                os.close(lock)
+            assert list(parent.iterdir()) == []
+            os.write(master, command + b"\r")
+            read_terminal(master, pending, output)
+            read_terminal(master, pending, prompt)
+            os.write(master, b"quit\r")
+            assert process.wait(timeout=8) == 0
+        finally:
+            if process.poll() is None:
+                process.kill()
+            os.close(master)
+    [target] = parent.iterdir()
+    assert (target / "SKILL.md").read_bytes() == (SKILL / "SKILL.md").read_bytes()
 
 
 def test_repl_commands_share_run_but_keep_command_ids(

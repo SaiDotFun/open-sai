@@ -4,11 +4,13 @@ use std::{
     fs::{self, File},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::atomic::AtomicBool,
 };
 
 use clap::Subcommand;
 use sai_core::{
     errors::{Code, SaiError},
+    interrupt,
     settings::repr,
 };
 use serde_json::{Value, json};
@@ -69,6 +71,14 @@ fn skill_error(message: impl Into<String>) -> SaiError {
 
 fn io_error(_: io::Error) -> SaiError {
     SaiError::internal()
+}
+
+fn install_error(error: io::Error) -> SaiError {
+    if error.kind() == io::ErrorKind::Interrupted {
+        skill_error("Aborted")
+    } else {
+        io_error(error)
+    }
 }
 
 fn pages() -> Vec<&'static str> {
@@ -236,7 +246,11 @@ fn is_sai_skill(target: &Path) -> io::Result<bool> {
         .starts_with("---\nname: sai\n"))
 }
 
-fn replace_dir(target: &Path, force: bool) -> Result<&'static str, SaiError> {
+fn replace_dir(
+    target: &Path,
+    force: bool,
+    flag: Option<&AtomicBool>,
+) -> Result<&'static str, SaiError> {
     let parent = target.parent().ok_or_else(SaiError::internal)?;
     let staging = tempfile::Builder::new()
         .prefix(if force { ".sai-previous-" } else { ".sai-new-" })
@@ -255,6 +269,7 @@ fn replace_dir(target: &Path, force: bool) -> Result<&'static str, SaiError> {
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(io_error)?;
     }
     let outcome = action(target, force)?;
+    interrupt::check(flag).map_err(install_error)?;
     match outcome {
         "unchanged" => {}
         "installed" => {
@@ -373,18 +388,21 @@ fn action(target: &Path, force: bool) -> Result<&'static str, SaiError> {
 }
 
 fn install_dir(target: &Path, force: bool) -> Result<&'static str, SaiError> {
+    let flag = crate::repl::interrupt_flag();
+    let flag = flag.as_deref();
+    interrupt::check(flag).map_err(install_error)?;
     let parent = target.parent().ok_or_else(SaiError::internal)?;
     fs::create_dir_all(parent).map_err(io_error)?;
     #[cfg(unix)]
     let _lock = {
         let directory = File::open(parent).map_err(io_error)?;
-        directory.lock().map_err(io_error)?;
+        interrupt::lock(&directory, flag).map_err(install_error)?;
         directory
     };
     if action(target, force)? == "unchanged" {
         Ok("unchanged")
     } else {
-        replace_dir(target, force)
+        replace_dir(target, force, flag)
     }
 }
 
