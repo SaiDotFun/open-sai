@@ -1172,6 +1172,152 @@ def test_hashed_store_continues_after_malformed_aux(
     )
 
 
+@pytest.mark.parametrize("store", ["file", "dir"])
+def test_default_trust_compares_canonical_issuer_and_subject_names(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+) -> None:
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    (tmp_path / "printable.cnf").write_text(
+        "[req]\ndistinguished_name = dn\nstring_mask = pkix\n[dn]\n",
+        encoding="ascii",
+    )
+    key = str(certs / "keeper-ca.key")
+    openssl_in(
+        tmp_path,
+        "req",
+        "-x509",
+        "-new",
+        "-key",
+        key,
+        "-config",
+        "printable.cnf",
+        "-days",
+        "2",
+        "-subj",
+        "/CN=keeper-ca   Root/O=Fixture CA",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "subjectKeyIdentifier=hash",
+        "-out",
+        "issuer.pem",
+    )
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-req",
+        "-in",
+        str(certs / "cross-signed.csr"),
+        "-CA",
+        "issuer.pem",
+        "-CAkey",
+        key,
+        "-set_serial",
+        "1",
+        "-days",
+        "2",
+        "-extfile",
+        str(certs / "cross-signed.ext"),
+        "-out",
+        "different-encoding.pem",
+    )
+    names = openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        "different-encoding.pem",
+        "-noout",
+        "-subject",
+        "-issuer",
+        "-nameopt",
+        "show_type,sep_comma_plus",
+    )
+    subject, issuer = names.splitlines()
+    assert "UTF8STRING:" in subject and "PRINTABLESTRING:" in issuer
+    trust = ca_store_overrides(tmp_path, store, tmp_path / "different-encoding.pem")
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
+
+
+@pytest.mark.skipif(
+    bool(ssl.create_default_context().verify_flags & ssl.VERIFY_X509_PARTIAL_CHAIN),
+    reason="Requires the C4 Python reference with full-chain verification",
+)
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("kind", ["rollover", "plain"])
+def test_default_trust_requires_an_issuer(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+    kind: str,
+) -> None:
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    intermediate = certs / "cross-signed.pem"
+    if kind == "rollover":
+        openssl_in(
+            tmp_path,
+            "req",
+            "-x509",
+            "-newkey",
+            "ec",
+            "-pkeyopt",
+            "ec_paramgen_curve:P-256",
+            "-nodes",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=keeper-ca   Root/O=Fixture CA",
+            "-keyout",
+            "issuer.key",
+            "-out",
+            "issuer.pem",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "subjectKeyIdentifier=hash",
+        )
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-req",
+            "-in",
+            str(certs / "cross-signed.csr"),
+            "-CA",
+            "issuer.pem",
+            "-CAkey",
+            "issuer.key",
+            "-set_serial",
+            "1",
+            "-days",
+            "2",
+            "-extfile",
+            str(certs / "cross-signed.ext"),
+            "-out",
+            "rollover.pem",
+        )
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-in",
+            "rollover.pem",
+            "-setalias",
+            "Rollover CA",
+            "-out",
+            "alias.pem",
+        )
+        intermediate = tmp_path / "alias.pem"
+
+    trust = ca_store_overrides(tmp_path, store, intermediate)
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, False)
+
+
 def assert_keeper_tls_trust(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
