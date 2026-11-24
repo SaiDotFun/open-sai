@@ -115,12 +115,19 @@ impl LogDir {
             }
             Err(error) => return Err(error),
         };
+        let modified = || {
+            marker
+                .metadata()?
+                .modified()
+                .map(|time| DateTime::<Utc>::from(time).date_naive())
+        };
+        if !created && modified()? >= today {
+            return Ok(());
+        }
         let Ok(()) = marker.try_lock() else {
             return Ok(());
         };
-        let modified =
-            DateTime::<Utc>::from(marker.metadata()?.modified()?).date_naive();
-        if !created && modified >= today {
+        if !created && modified()? >= today {
             return Ok(());
         }
         self.remove_expired(keep_days, today)?;

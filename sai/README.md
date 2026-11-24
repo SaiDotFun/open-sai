@@ -3,8 +3,9 @@
 The root Cargo workspace contains `sai-core/` for shared behavior and
 `sai/` for the clap CLI and stdio MCP server. The Python package under
 `cli/sai_cli/` remains the released implementation while Rust gains parity.
-The scaffold exposes `sai --version` and a read-only `sai config list --json`
-that reports the config path and which recognized keys are present.
+The Rust binary exposes `sai --version` and `sai config list|get|set|unset`.
+Use `sai --json config list` to inspect settings and their sources. The CLI
+writes command events to `$SAI_HOME/logs` when logging is enabled.
 
 ## Port Order
 

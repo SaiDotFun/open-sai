@@ -1,94 +1,311 @@
-use std::{fs, process::Command};
+use std::{
+    fs,
+    path::Path,
+    process::{Command, Output},
+};
 
 use serde_json::{Value, json};
 use tempfile::tempdir;
 
-fn sai() -> Command {
-    Command::new(env!("CARGO_BIN_EXE_sai"))
+fn sai(home: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_sai"));
+    command.env("SAI_HOME", home);
+    for name in [
+        "SAI_ENDPOINT",
+        "SAI_WS_ENDPOINT",
+        "SAI_LCD_ENDPOINT",
+        "SAI_UPDATE_AUTO",
+        "SAI_LOG",
+        "SAI_LOG_KEEP_DAYS",
+    ] {
+        command.env_remove(name);
+    }
+    command
+}
+
+fn read_json(output: &Output) -> Value {
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 #[test]
 fn prints_workspace_version_without_reading_config() {
     let root = tempdir().unwrap();
     fs::write(root.path().join("config.toml"), "invalid TOML").unwrap();
-    let output = sai()
-        .env("SAI_HOME", root.path())
-        .arg("--version")
-        .output()
-        .unwrap();
-
+    let output = sai(root.path()).arg("--version").output().unwrap();
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).unwrap(),
         format!("sai {}\n", env!("CARGO_PKG_VERSION"))
     );
+    assert!(!root.path().join("logs").exists());
 }
 
 #[test]
-fn lists_recognized_keys_without_values() {
+fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     let root = tempdir().unwrap();
     let path = root.path().join("config.toml");
-    let contents = r#"
-[keeper]
-endpoint = "https://example.invalid/query?token=fixture"
-future_setting = "fixture"
-[update]
-auto = false
-"#;
+    let contents = "[keeper]\nendpoint = \"https://who:fixture@EXAMPLE.invalid:443/query?token=fixture\"\nfuture_setting = 1\n[update]\nauto = false\n";
     fs::write(&path, contents).unwrap();
-    let output = sai()
-        .env("SAI_HOME", root.path())
-        .args(["config", "list", "--json"])
+    let output = sai(root.path())
+        .args(["--json", "config", "list"])
         .output()
         .unwrap();
-
-    assert!(output.status.success());
+    let result = read_json(&output);
+    assert_eq!(result["path"], json!(path));
     assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({"path": path, "configuredKeys": ["keeper.endpoint", "update.auto"]})
+        result["settings"]["keeper.endpoint"],
+        json!({
+            "value": "https://example.invalid:443/query",
+            "source": "file",
+            "env": "SAI_ENDPOINT",
+            "default": "https://sai-keeper.nibiru.fi/query",
+        })
     );
-    assert!(output.stderr.is_empty());
+    assert_eq!(
+        result["settings"]["keeper.ws_endpoint"]["value"],
+        "wss://example.invalid:443/query"
+    );
+    assert_eq!(
+        result["settings"]["keeper.ws_endpoint"]["source"],
+        "derived"
+    );
+    assert_eq!(result["settings"]["update.auto"]["value"], false);
+    assert_eq!(result["settings"]["logs.keep_days"]["value"], 14);
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("ignoring unknown setting 'keeper.future_setting'")
+    );
     assert_eq!(fs::read_to_string(path).unwrap(), contents);
 }
 
 #[test]
-fn missing_relative_config_leaves_sai_home_absent() {
+fn missing_relative_config_leaves_home_absent_with_logging_disabled() {
     let root = tempdir().unwrap();
-    let output = sai()
+    let output = sai(Path::new("relative-home"))
         .current_dir(root.path())
-        .env("SAI_HOME", "relative-home")
+        .env("SAI_LOG", "off")
         .args(["--json", "config", "list"])
         .output()
         .unwrap();
-
-    assert!(output.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
-        json!({
-            "path": std::path::Path::new("relative-home").join("config.toml"),
-            "configuredKeys": [],
-        })
-    );
+    let result = read_json(&output);
+    assert_eq!(result["path"], "relative-home/config.toml");
+    assert_eq!(result["settings"]["keeper.endpoint"]["source"], "default");
     assert!(!root.path().join("relative-home").exists());
 }
 
 #[test]
-fn malformed_config_fails_without_echoing_file_contents() {
+fn malformed_config_fails_without_echoing_file_contents_or_logging() {
     let root = tempdir().unwrap();
-    fs::write(
-        root.path().join("config.toml"),
-        "[keeper]\nendpoint = fixture_secret\n",
-    )
-    .unwrap();
-    let output = sai()
-        .env("SAI_HOME", root.path())
-        .args(["config", "list", "--json"])
+    let path = root.path().join("config.toml");
+    fs::write(&path, "[keeper]\nendpoint = fixture_secret\n").unwrap();
+    let output = sai(root.path())
+        .args(["--json", "config", "list"])
         .output()
         .unwrap();
-
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stdout.is_empty());
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(stderr.contains("config.toml"));
-    assert!(!stderr.contains("fixture_secret"));
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .starts_with(&format!("Error: Cannot parse {}:", path.display()))
+    );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture_secret"));
+    assert!(!root.path().join("logs").exists());
+}
+
+#[test]
+fn get_set_and_unset_use_click_envelopes_and_text() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let output = sai(root.path())
+        .env("SAI_UPDATE_AUTO", "yes")
+        .args(["--json", "config", "set", "update.auto", "off"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        read_json(&output),
+        json!({"key": "update.auto", "value": false, "path": path})
+    );
+    assert_eq!(output.stderr, b"Warning: SAI_UPDATE_AUTO is set and overrides update.auto in the file\n");
+
+    let output = sai(root.path())
+        .args(["config", "get", "update.auto"])
+        .output()
+        .unwrap();
+    assert_eq!(output.stdout, b"false\n");
+    let output = sai(root.path())
+        .args(["--json", "config", "unset", "update.auto"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        read_json(&output),
+        json!({"key": "update.auto", "removed": true, "path": path})
+    );
+    let output = sai(root.path())
+        .args(["config", "unset", "update.auto"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.stdout,
+        format!("Already unset: update.auto in {}\n", path.display()).as_bytes()
+    );
+}
+
+#[test]
+fn invalid_value_and_unknown_key_are_usage_errors() {
+    let root = tempdir().unwrap();
+    for args in [
+        &["config", "set", "logs.keep_days", "0"][..],
+        &["config", "get", "fixture.unknown"],
+    ] {
+        let output = sai(root.path()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stdout.is_empty());
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.starts_with("Usage: sai config "));
+        assert!(
+            stderr.contains("Valid keys: keeper.endpoint, keeper.ws_endpoint")
+        );
+    }
+    assert!(!root.path().join("config.toml").exists());
+    assert!(!root.path().join(".config.lock").exists());
+}
+
+#[cfg(unix)]
+fn logs(home: &Path) -> Vec<Value> {
+    let path = fs::read_dir(home.join("logs"))
+        .unwrap()
+        .flatten()
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".jsonl"))
+        .unwrap()
+        .path();
+    fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+
+#[cfg(unix)]
+#[test]
+fn command_logs_scrub_argv_and_record_exit_errors() {
+    let root = tempdir().unwrap();
+    let args = [
+        "--endpoint=https://user:pw@keeper.example:443/private?q=hidden#also",
+        "config",
+        "set",
+        "logs.keep_days",
+        "0",
+    ];
+    let output = sai(root.path()).args(args).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let events = logs(root.path());
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["event"], "command.start");
+    assert_eq!(events[0]["command"], "config set");
+    assert_eq!(
+        events[0]["argv"][0],
+        "--endpoint=https://keeper.example:443"
+    );
+    assert_eq!(events[1]["event"], "command.end");
+    assert_eq!(events[1]["level"], "warn");
+    assert_eq!(events[1]["exitCode"], 2);
+    assert_eq!(events[1]["seq"], 2);
+    assert_eq!(events[0]["runId"], events[1]["runId"]);
+    assert!(
+        events[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Invalid value for logs.keep_days")
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn multiple_processes_append_whole_json_lines() {
+    let root = tempdir().unwrap();
+    let children: Vec<_> = (0..8)
+        .map(|_| {
+            sai(root.path())
+                .args(["config", "get", "logs.enabled"])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap()
+        })
+        .collect();
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+
+    let events = logs(root.path());
+    assert_eq!(events.len(), 16);
+    let mut by_run = std::collections::BTreeMap::<&str, Vec<u64>>::new();
+    for event in &events {
+        let run = event["runId"].as_str().unwrap();
+        by_run
+            .entry(run)
+            .or_default()
+            .push(event["seq"].as_u64().unwrap());
+    }
+    assert_eq!(by_run.len(), 8);
+    assert!(by_run.values().all(|seqs| seqs == &[1, 2]));
+}
+
+#[cfg(unix)]
+#[test]
+fn inaccessible_logs_do_not_change_command_output() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempdir().unwrap();
+    let external = tempdir().unwrap();
+    symlink(external.path(), root.path().join("logs")).unwrap();
+    let output = sai(root.path())
+        .args(["config", "get", "logs.enabled"])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"true\n");
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read_dir(external.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn multiline_inline_table_is_invalid_in_toml_1_0() {
+    let home = tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    fs::write(
+        &path,
+        include_str!("fixtures/config-multiline-inline-table.toml"),
+    )
+    .unwrap();
+    let output = sai(home.path())
+        .args(["--json", "config", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot parse"));
+}
+
+#[test]
+fn oversized_unknown_integers_do_not_hide_known_keys() {
+    let home = tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let contents =
+        include_str!("fixtures/config-oversized-unknown-integer.toml");
+    fs::write(&path, contents).unwrap();
+    let output = sai(home.path())
+        .args(["--json", "config", "list"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        read_json(&output)["settings"]["update.auto"]["source"],
+        "file"
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), contents);
 }

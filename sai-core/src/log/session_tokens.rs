@@ -79,9 +79,11 @@ fn read_tokens(current: &Path, legacy: &Path) -> Option<Vec<String>> {
         let session = decrypt(&old, b"sai-session-v2-test")?;
         return Some(vec![token(&session)?]);
     }
-    let Some(current) =
-        current_envelope.or_else(|| read(current).ok().flatten())
-    else {
+    let current = match current_envelope {
+        Some(envelope) => Some(envelope),
+        None => read(current).ok()?,
+    };
+    let Some(current) = current else {
         return Some(Vec::new());
     };
     if current.get("version")?.as_u64()? != 3 {
@@ -106,13 +108,9 @@ fn read(path: &Path) -> io::Result<Option<Value>> {
     #[cfg(unix)]
     let file = {
         use rustix::fs::{Mode, OFlags, open};
-        open(
-            path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .map(File::from)
-        .map_err(io::Error::from)
+        open(path, OFlags::RDONLY | OFlags::NONBLOCK, Mode::empty())
+            .map(File::from)
+            .map_err(io::Error::from)
     };
     #[cfg(not(unix))]
     let file = File::open(path);
@@ -152,4 +150,72 @@ fn decrypt(envelope: &Value, aad: &[u8]) -> Option<Value> {
         )
         .ok()?;
     serde_json::from_slice(&clear).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        log::{Field, Level, LogWriter, Surface},
+        settings::Environment,
+    };
+    use serde_json::json;
+    use std::time::Duration;
+
+    fn envelope(version: u8, payload: &Value, aad: &[u8]) -> Value {
+        let nonce = [1; 12];
+        let cipher = Aes256Gcm::new_from_slice(KEY.as_ref()).unwrap();
+        let message = serde_json::to_vec(payload).unwrap();
+        let ciphertext = cipher
+            .encrypt(&nonce.into(), Payload { msg: &message, aad })
+            .unwrap();
+        json!({
+            "version": version,
+            "backend": "test",
+            "nonce": STANDARD.encode(nonce),
+            "ciphertext": STANDARD.encode(ciphertext),
+        })
+    }
+
+    #[test]
+    fn writer_scrubs_tokens_from_current_and_legacy_session_files() {
+        for version in [2, 3] {
+            let home = tempfile::tempdir().unwrap();
+            let trader = home.path().join("trader");
+            fs::create_dir(&trader).unwrap();
+            let token = format!("fixture-opaque-log-session-v{version}");
+            let session = json!({"token": token, "evmAddress": "fixture", "expiresAt": "fixture"});
+            let (name, payload, aad) = if version == 2 {
+                ("session.json", session, b"sai-session-v2-test".as_slice())
+            } else {
+                (
+                    "sessions.json",
+                    json!({"active": "fixture", "sessions": {"fixture": session}}),
+                    b"sai-sessions-v3".as_slice(),
+                )
+            };
+            fs::write(
+                trader.join(name),
+                envelope(version, &payload, aad).to_string(),
+            )
+            .unwrap();
+            let env = Environment::new(home.path().into(), |_| None);
+            let logger = LogWriter::start(env).unwrap();
+            logger.event(
+                Surface::Cli,
+                "fixture",
+                Level::Info,
+                [("field", Field::Arg(token.clone()))],
+            );
+            assert!(logger.finish(Duration::from_secs(5)));
+
+            let log_path = home
+                .path()
+                .join("logs")
+                .join(format!("cli-{}.jsonl", chrono::Utc::now().date_naive()));
+            let text = fs::read_to_string(log_path).unwrap();
+            assert!(!text.contains(&token));
+            assert!(text.contains("[redacted session token]"));
+        }
+    }
 }

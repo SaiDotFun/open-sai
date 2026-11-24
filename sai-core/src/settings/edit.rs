@@ -6,8 +6,9 @@ use std::{
 };
 
 use serde_json::Value;
-use toml_edit::{Document, Item, Table};
+use toml_edit::{Item, Table};
 
+use super::toml::ParsedDocument;
 use super::{
     Key, MAINNET_WS, SettingsError, os_message, parse_error, read_text,
     table_error,
@@ -64,11 +65,7 @@ fn edit_file(
     let lock = options.open(parent.join(LOCK_NAME)).map_err(writing)?;
     lock.lock().map_err(writing)?;
     let text = read_text(path)?;
-    let normalized = text
-        .as_ref()
-        .filter(|text| text.contains('\r'))
-        .map(|text| text.replace("\r\n", "\n").replace('\r', "\n"));
-    let Some(new) = edit(normalized.as_deref().or(text.as_deref()))? else {
+    let Some(new) = edit(text.as_deref())? else {
         return Ok(false);
     };
 
@@ -88,8 +85,9 @@ fn edit(
     new: Option<&Value>,
 ) -> Result<Option<String>, SettingsError> {
     let text = text.unwrap_or(TEMPLATE);
-    let document = Document::parse(text)
+    let parsed = ParsedDocument::parse(text)
         .map_err(|error| parse_error(path, text, &error, true))?;
+    let document = &parsed.document;
     let (section, name) = key.section_and_name();
     let new_line = |value: &Value| format!("{name} = {}", toml_value(value));
     let Some(item) = document.get(section) else {
@@ -136,7 +134,7 @@ fn edit(
     {
         return Err(uneditable(section, path));
     }
-    let body_start = line_end(text, header.end);
+    let body_start = line_end(text, header.start);
     let body_end = headers
         .into_iter()
         .filter(|&offset| offset > header.start)
@@ -146,7 +144,8 @@ fn edit(
 
     if let Some((key, item)) = table.get_key_value(name) {
         if let Some(value) = item.as_value() {
-            let range = value.span().expect("parsed value has a span");
+            let range = parsed
+                .value_span(value.span().expect("parsed value has a span"));
             if let Some(new) = new {
                 return Ok(Some(replace(text, range, &toml_value(new))));
             }

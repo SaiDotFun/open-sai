@@ -1,6 +1,8 @@
 //! Resolve settings shared by the CLI and MCP server.
 
 mod edit;
+mod home;
+mod toml;
 
 use std::{
     env, fmt, fs, io,
@@ -8,9 +10,10 @@ use std::{
 };
 
 use serde_json::{Value, json};
-use toml_edit::{Document, Item, TomlError};
+use toml_edit::{Item, TomlError};
 
 use crate::endpoint::Endpoint;
+use toml::ParsedDocument;
 
 pub const FILE_NAME: &str = "config.toml";
 const MAINNET_HTTP: &str = "https://sai-keeper.nibiru.fi/query";
@@ -156,13 +159,6 @@ impl Key {
                 Ok(Some(port)) => format!("{host}:{port}"),
                 _ => host,
             };
-            if authority.is_empty() {
-                return json!(format!(
-                    "{}://{}",
-                    endpoint.scheme,
-                    ensure_slash(&endpoint.path)
-                ));
-            }
             return json!(format!(
                 "{}://{authority}{}",
                 endpoint.scheme, endpoint.path
@@ -204,7 +200,11 @@ impl Key {
         )))
     }
 
-    fn read_value(self, item: &Item) -> Result<Value, SettingsError> {
+    fn read_value(
+        self,
+        item: &Item,
+        document: &ParsedDocument,
+    ) -> Result<Value, SettingsError> {
         match self.spec().kind {
             Kind::Url(_) => self.check_url(
                 item.as_str().ok_or_else(|| self.expected("a URL string"))?,
@@ -213,20 +213,20 @@ impl Key {
                 .as_bool()
                 .map(Value::Bool)
                 .ok_or_else(|| self.expected("true or false")),
-            Kind::Days => item
-                .as_integer()
-                .filter(|&value| value >= 1)
-                .map(|value| json!(value))
-                .ok_or_else(|| self.expected("a whole number, 1 or more")),
+            Kind::Days => {
+                let oversized = item
+                    .span()
+                    .and_then(|span| document.oversized_number(&span));
+                oversized
+                    .filter(|value| !value.to_string().starts_with('-'))
+                    .or_else(|| {
+                        item.as_integer()
+                            .filter(|&value| value >= 1)
+                            .map(|value| json!(value))
+                    })
+                    .ok_or_else(|| self.expected("a whole number, 1 or more"))
+            }
         }
-    }
-}
-
-fn ensure_slash(path: &str) -> String {
-    if path.is_empty() || path.starts_with('/') {
-        path.into()
-    } else {
-        format!("/{path}")
     }
 }
 
@@ -338,36 +338,20 @@ pub struct Environment {
 impl Environment {
     pub fn new(home: PathBuf, get: impl Fn(&str) -> Option<String>) -> Self {
         Self {
-            home,
+            home: home::normalize(&home),
             values: KEYS.map(|key| get(key.spec().env)),
         }
     }
 
     pub fn from_process() -> Result<Self, SettingsError> {
-        let home = env::var_os("SAI_HOME")
-            .map(|path| {
-                let path = PathBuf::from(path);
-                // Path("") in Python is the current directory.
-                if path.as_os_str().is_empty() {
-                    ".".into()
-                } else {
-                    path
-                }
-            })
-            .or_else(|| env::home_dir().map(|path| path.join(".sai")))
-            .ok_or_else(|| {
-                SettingsError::invalid("Cannot find the home directory".into())
-            })?;
+        let home = home::from_process().ok_or_else(|| {
+            SettingsError::invalid("Cannot find the home directory".into())
+        })?;
         Ok(Self::new(home, |name| env::var(name).ok()))
     }
 
     pub fn path(&self) -> PathBuf {
-        let home: PathBuf = self.home.components().collect();
-        if home == Path::new(".") {
-            FILE_NAME.into()
-        } else {
-            home.join(FILE_NAME)
-        }
+        self.home.join(FILE_NAME)
     }
 
     pub fn value(&self, key: Key) -> Option<&str> {
@@ -501,11 +485,11 @@ impl FileSettings {
         let Some(text) = read_text(path)? else {
             return Ok(Self::default());
         };
-        let document = Document::parse(text.as_str())
+        let parsed = ParsedDocument::parse(&text)
             .map_err(|error| parse_error(path, &text, &error, false))?;
         let mut file = Self::default();
         let path = path.display();
-        for (section, item) in document.iter() {
+        for (section, item) in parsed.document.iter() {
             if let Some(table) = item.as_table_like() {
                 for (name, item) in table.iter() {
                     let name = format!("{section}.{name}");
@@ -516,7 +500,7 @@ impl FileSettings {
                         ));
                         continue;
                     };
-                    let entry = key.read_value(item);
+                    let entry = key.read_value(item, &parsed);
                     if let Err(ref error) = entry {
                         if !key.is_log() {
                             return Err(SettingsError::invalid(format!(
@@ -603,7 +587,11 @@ pub(crate) fn log_disabled_in_env(env: &Environment) -> bool {
 
 fn read_text(path: &Path) -> Result<Option<String>, SettingsError> {
     match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
+        Ok(text) => Ok(Some(if text.contains('\r') {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text
+        })),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(SettingsError::invalid(format!(
             "Cannot read {}: {}",
