@@ -155,7 +155,31 @@ def read_events(home: Path) -> list[dict[str, Any]]:
     for event in events:
         groups.setdefault(event["runId"], []).append(event["seq"])
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
-    return Normalize(home).log_records(events)
+    normalize = Normalize(home)
+    # The request and ledger assertions use this fixed fixture key.
+    normalize.identity("intentKey", KEY)
+    return normalize.log_records(events)
+
+
+def test_log_events_detect_wrong_fixture_intent_key(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    path = logs / "cli-2026-11-20.jsonl"
+    event = {
+        "ts": "2026-11-20T15:43:31.123Z",
+        "runId": "a" * 32,
+        "seq": 1,
+        "event": "intent.keeper",
+        "intentKey": KEY,
+    }
+    path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    reference = read_events(tmp_path)
+
+    path.write_text(
+        json.dumps({**event, "intentKey": "20261120T154331123Z_" + "A" * 16}) + "\n",
+        encoding="utf-8",
+    )
+    assert read_events(tmp_path) != reference
 
 
 def read_state(home: Path) -> tuple[Any, ...]:
