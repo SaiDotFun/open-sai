@@ -164,11 +164,15 @@ A stop can miss its fill when a gap takes the price outside that bound.
 [trading-safety.md](trading-safety.md) rule 3 has the full rule.
 
 On `PREVIEW_MISMATCH` or `PRICE_MOVED`, nothing was submitted. Use the
-replacement `preview` if present. Otherwise, wait until Sai can verify the
-quote, then call the matching `preview_*` tool again. For a partial close,
-that includes verifying the collateral price. Show the fresh quote and get
-confirmation again. Discard the old digest and submit with the new
-`preview_digest` and, for a market open, the new `reference_price`.
+replacement `preview` only if Sai can verify the quote. For a partial
+close, check that `quote.collateralPriceUsd` has a value. A USDC estimate
+can still have a digest when that field is `null`.
+
+If the replacement is missing or lacks a verifiable quote, wait until Sai
+can verify the quote and call the matching `preview_*` tool again. Ask for
+confirmation only when the preview shows a verifiable quote, including the
+collateral price for a partial close. Discard the old digest and submit with
+the new `preview_digest` and, for a market open, the new `reference_price`.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Both check that the order is pending. If it fills after the
