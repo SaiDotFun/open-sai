@@ -1143,7 +1143,9 @@ def test_doctor_does_not_echo_an_lcd_request_target(http_stub, isolated_home):
         stop()
     assert state.lcd_paths == [target, target]
     assert log.flush(5)
-    logs = "".join(path.read_text() for path in (isolated_home / "logs").glob("*.jsonl"))
+    logs = "".join(
+        path.read_text() for path in (isolated_home / "logs").glob("*.jsonl")
+    )
     assert '"event":"doctor.result"' in logs
     assert path_key not in logs and query_key not in logs
 
