@@ -383,9 +383,12 @@ class Install:
         input_text: str = "",
         check: bool = True,
         timeout: float = 300,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            with owned_process(command, self.home, self.env) as process:
+            with owned_process(
+                command, self.home, self.env if env is None else env
+            ) as process:
                 out, err = process.communicate(input_text.encode(), timeout=timeout)
                 result = subprocess.CompletedProcess(
                     command,
@@ -416,6 +419,24 @@ class Install:
         result = self.run("Run the launcher", self.sai, "--version")
         require(
             result.stdout.strip().endswith(f" {version}"), f"Expected sai {version}"
+        )
+
+    def verify_saved_endpoint(self, endpoint: str) -> None:
+        env = self.env.copy()
+        env.pop("SAI_ENDPOINT", None)
+        result = self.run(
+            "Read the saved Keeper endpoint",
+            self.sai,
+            "--json",
+            "config",
+            "get",
+            "keeper.endpoint",
+            env=env,
+        )
+        require(
+            json.loads(result.stdout)
+            == {"key": "keeper.endpoint", "value": endpoint, "source": "file"},
+            "Candidate did not resolve the saved Keeper endpoint from the config file",
         )
 
     def verify_session(self, original: dict[str, str]) -> None:
@@ -694,6 +715,7 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
             "The original open must still be unknown before reconciliation",
         )
         require(config.read_bytes() == configured, "Update changed the user config")
+        tool.verify_saved_endpoint(endpoint)
         tool.verify_session(session)
         tool.verify_mcp(version)
         args = ("intent", "status", replay.addr, "--key", key)
