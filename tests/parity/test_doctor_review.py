@@ -282,3 +282,17 @@ sys.exit(run.returncode)
         pytest.skip("a private mount with a foreign profile owner is unavailable")
     home = checks(result)["home"]
     assert home["status"] == "fail" and "belongs to another user" in home["summary"]
+
+
+def test_doctor_respects_read_only_cursor_config(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    seed_clients(tmp_path, fixture_env, "retired")
+    path = tmp_path / ".cursor/mcp.json"
+    path.chmod(0o444)
+    before = path.read_bytes()
+    result = invoke(candidate, tmp_path, fixture_env, "doctor", "--offline")
+    cursor = checks(result)["mcp.cursor"]
+    assert cursor["status"] == "fail"
+    assert "read-only" in cursor["summary"]
+    assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444

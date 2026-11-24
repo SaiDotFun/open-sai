@@ -14,6 +14,7 @@ use serde_json::{Map, Value};
 use super::{Client, Registration, Scope, Target};
 
 pub(super) type Result<T> = std::result::Result<T, String>;
+pub(super) const READ_ONLY_CONFIG: &str = "The client config is read-only";
 
 enum JsonUpdate<'a> {
     Install(Option<&'a Registration>),
@@ -670,6 +671,12 @@ fn replace_if_current(
     original_metadata: Option<&Metadata>,
     deadline: Instant,
 ) -> Result<Option<Metadata>> {
+    if let Some(meta) = original_metadata
+        && (meta.permissions().readonly()
+            || rustix::fs::access(destination, rustix::fs::Access::WRITE_OK).is_err())
+    {
+        return Err(READ_ONLY_CONFIG.into());
+    }
     let parent = destination.parent().ok_or("Missing config directory")?;
     fs::create_dir_all(parent).map_err(io_kind)?;
     let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(io_kind)?;

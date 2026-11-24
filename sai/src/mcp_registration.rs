@@ -787,7 +787,13 @@ impl Clients {
             return Err((issue.reason.into(), "Run `sai doctor` with fixes enabled"));
         }
         let target = target.repair(args.clone(), client == Client::Codex);
-        let problem = |_| {
+        let problem = |error: String| {
+            if error == client::READ_ONLY_CONFIG {
+                return (
+                    format!("{}. {error}", issue.reason),
+                    "Edit the Sai registration in this client's config",
+                );
+            }
             (
                 format!(
                     "{}. Could not repair the {} registration",
