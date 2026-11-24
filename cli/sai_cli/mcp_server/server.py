@@ -1056,7 +1056,7 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             f"sai mcp serve: {exc}",
             Code.INVALID_REQUEST,
             exit_code=ExitCode.USAGE
-            if isinstance(exc, sai_settings.InvalidEndpoint)
+            if isinstance(exc, sai_settings.InvalidSetting)
             else None,
         ) from exc
     with sai_log.bind(surface="mcp"):

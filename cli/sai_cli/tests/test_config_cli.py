@@ -161,6 +161,38 @@ def test_unknown_key_or_bad_value_exits_2_listing_keys(args, tmp_path):
     assert not (tmp_path / "config.toml").exists()
 
 
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize(
+    ("key", "expected"),
+    [
+        ("update.auto", "true or false"),
+        ("logs.keep_days", "a whole number, 1 or more"),
+    ],
+)
+def test_config_set_reports_invalid_values_without_echoing_them(
+    tmp_path, key, expected, json_output
+):
+    args = ["--json"] if json_output else []
+    value = "fixture-private-setting-value"
+    result = sai(*args, "config", "set", key, value)
+
+    assert result.exit_code == 2
+    message = f"Invalid value for {key}: expected {expected}"
+    if json_output:
+        assert json.loads(result.stdout)["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": f"{message}. Valid keys: {', '.join(settings.KEYS)}",
+            "retryable": False,
+        }
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+    assert value not in result.output
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
 @pytest.mark.parametrize("authority", ["[::1]suffix", "prefix[::1]", "[::1"])
 def test_config_set_rejects_malformed_ipv6_authority(tmp_path, authority):
     result = sai(
@@ -414,13 +446,50 @@ def test_malformed_endpoint_during_resolution_is_a_usage_error(
         assert "Traceback" not in result.stderr
 
 
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("source", ["env", "file"])
+@pytest.mark.parametrize("command", [("config", "list"), ("mcp", "serve")])
+def test_invalid_update_override_exits_2(
+    tmp_path, monkeypatch, json_output, source, command
+):
+    value = "fixture-private-update-value"
+    if source == "env":
+        origin = "SAI_UPDATE_AUTO"
+        monkeypatch.setenv(origin, value)
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f'[update]\nauto = "{value}"\n')
+        origin = str(path)
+    args = ["--json"] if json_output else []
+    result = sai(*args, *command)
+
+    assert result.exit_code == 2
+    message = f"{origin}: Invalid value for update.auto: expected true or false"
+    if command == ("mcp", "serve"):
+        message = f"sai mcp serve: {message}"
+    if json_output:
+        assert json.loads(result.stdout) == {
+            "error": {"code": "INVALID_REQUEST", "message": message, "retryable": False}
+        }
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+    assert value not in result.output
+
+
 @pytest.mark.parametrize(
-    ("args", "key"),
+    ("args", "key", "flag"),
     [
-        (("mcp", "serve", "--endpoint", "https://[::1]:oops/path"), "keeper.endpoint"),
+        (
+            ("mcp", "serve", "--endpoint", "https://[::1]:oops/path"),
+            "keeper.endpoint",
+            "--endpoint",
+        ),
         (
             ("watch", "price", "1", "--ws-endpoint", "wss://[::1]:oops/path"),
             "keeper.ws_endpoint",
+            "--ws-endpoint",
         ),
         (
             (
@@ -432,15 +501,16 @@ def test_malformed_endpoint_during_resolution_is_a_usage_error(
                 "--offline",
             ),
             "keeper.endpoint",
+            "--endpoint",
         ),
     ],
 )
-def test_malformed_command_endpoint_is_a_usage_error(args, key):
+def test_malformed_command_endpoint_is_a_usage_error(args, key, flag):
     result = sai("--json", *args)
     assert result.exit_code == 2
     error = json.loads(result.stdout)["error"]
     assert error["code"] == "INVALID_REQUEST"
-    assert key in error["message"]
+    assert f"{flag}: Invalid value for {key}" in error["message"]
     assert result.stderr == ""
 
 
@@ -492,7 +562,7 @@ def test_malformed_file_fails_commands_but_can_be_fixed(tmp_path):
     path = tmp_path / "config.toml"
     path.write_text('[update]\nauto = "sometimes"  # oops\n')
     result = sai("market", "prices")
-    assert result.exit_code == 1
+    assert result.exit_code == 2
     assert f"{path}: Invalid value for update.auto" in result.stderr
     assert sai("config", "unset", "update.auto").exit_code == 0
     assert listed()["settings"]["update.auto"]["source"] == "default"

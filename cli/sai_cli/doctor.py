@@ -75,7 +75,7 @@ class Check:
     details: dict[str, Any] = field(default_factory=dict)
     duration_ms: int = 0
     changes: list[str] = field(default_factory=list)
-    invalid_endpoint: bool = False
+    invalid_setting: bool = False
     _lcd_chain_id: str | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, Any]:
@@ -114,40 +114,31 @@ def check_config(
 ) -> tuple[Check, Settings | None]:
     """Validate file settings before resolving flag and environment overrides."""
     path = settings.config_path(os.environ)
-    fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
+    file_fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
+    fix = file_fix
     try:
         values, warnings = settings.read_file(path)
-    except settings.ConfigError as exc:
-        return Check(
-            "config",
-            "fail",
-            exc.diagnostic,
-            fix,
-            invalid_endpoint=isinstance(exc, settings.InvalidEndpoint),
-        ), None
-    try:
+        fix = "Check the settings listed by `sai config --help`"
         config = settings.resolve(flags, os.environ, values)
-    except settings.InvalidEndpoint as exc:
+    except settings.ConfigError as exc:
+        return Check("config", "fail", exc.diagnostic, fix), None
+    except settings.InvalidSetting as exc:
         return Check(
             "config",
             "fail",
             str(exc),
-            "Check the settings listed by `sai config --help`",
-            invalid_endpoint=True,
-        ), None
-    except ValueError:
-        return Check(
-            "config",
-            "fail",
-            "A flag or environment setting is invalid",
-            "Check the settings listed by `sai config --help`",
+            fix,
+            invalid_setting=True,
         ), None
     invalid = [
         key for key, value in values.items() if isinstance(value, settings.Invalid)
     ]
     if invalid:
         return Check(
-            "config", "fail", f"Invalid config.toml settings: {', '.join(invalid)}", fix
+            "config",
+            "fail",
+            f"Invalid config.toml settings: {', '.join(invalid)}",
+            file_fix,
         ), config
     invalid_env = [
         f"{spec.env} ({spec.key})"
@@ -164,7 +155,7 @@ def check_config(
         ), config
     if warnings:
         return Check(
-            "config", "warn", "config.toml contains unknown settings", fix
+            "config", "warn", "config.toml contains unknown settings", file_fix
         ), config
     return Check("config", "pass", "Config file settings are valid"), config
 

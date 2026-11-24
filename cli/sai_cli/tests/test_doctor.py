@@ -129,7 +129,7 @@ def run_cli(*args: str) -> tuple[int, str]:
             2,
             "keeper.endpoint",
         ),
-        (b"[update]\nauto = 'private_value'\n", "fail", 1, "update.auto"),
+        (b"[update]\nauto = 'private_value'\n", "fail", 2, "update.auto"),
         (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", 1, "logs.keep_days"),
         (b"\xff", "fail", 1, "UTF-8"),
         pytest.param(
@@ -156,10 +156,37 @@ def test_config_check_reports_file_errors_without_echoing_values(
     checks = {check["id"]: check for check in report["checks"]}
     assert checks["config"]["status"] == expected
     assert summary in checks["config"]["summary"]
+    if exit_code == 2:
+        assert str(path) in checks["config"]["summary"]
     assert "home" in checks
     assert code == exit_code
     assert "private_setting" not in output and "private_value" not in output
     assert path.read_bytes() == content
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_config_check_names_invalid_environment_override(monkeypatch, json_output):
+    value = "fixture-private-update-value"
+    monkeypatch.setenv("SAI_UPDATE_AUTO", value)
+    args = ["--json"] if json_output else []
+    result = CliRunner().invoke(main, [*args, "doctor", "--offline", "--no-fix"])
+
+    assert result.exit_code == 2
+    message = "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
+    if json_output:
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert error["retryable"] is False
+        assert message in error["message"]
+        config = next(
+            check for check in error["details"]["checks"] if check["id"] == "config"
+        )
+        assert config["summary"] == message
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+    assert value not in result.output
 
 
 def test_unusable_config_skips_checks_that_need_resolved_settings(isolated_home):

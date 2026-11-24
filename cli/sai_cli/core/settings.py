@@ -58,11 +58,8 @@ class ConfigError(SettingsError):
         self.diagnostic = diagnostic
 
 
-class InvalidEndpoint(ConfigError):
-    """An endpoint setting contains a malformed URL."""
-
-    def __init__(self, diagnostic: str, detail: str | None = None) -> None:
-        super().__init__(diagnostic, diagnostic if detail is None else detail)
+class InvalidSetting(SettingsError):
+    """A known setting or section has an invalid value."""
 
 
 @dataclass(frozen=True)
@@ -201,45 +198,46 @@ def setting(key: str) -> Setting:
         ) from None
 
 
-def parse_value(key: str, raw: str) -> str | bool | int:
+def parse_value(key: str, raw: str, *, source: str | None = None) -> str | bool | int:
     """Parse RAW, as typed in a flag, variable, or `sai config set`."""
     spec = setting(key)
     text = raw.strip()
+    value: str | bool | int = raw
     if spec.kind == "bool":
         if text.lower() in _TRUE:
-            return True
-        if text.lower() in _FALSE:
-            return False
-        raise SettingsError(f"Invalid value {raw!r} for {key}: expected true or false")
-    if spec.kind == "int":
-        if not text.isascii() or not text.isdigit():
-            raise SettingsError(
-                f"Invalid value {raw!r} for {key}: expected a whole number, 1 or more"
-            )
-        return check_value(key, int(text))
-    return check_value(key, raw)
+            value = True
+        elif text.lower() in _FALSE:
+            value = False
+    elif spec.kind == "int" and text.isascii() and text.isdigit():
+        try:
+            value = int(text)
+        except ValueError:
+            # Python limits integer string conversion. Reject it like other bad values.
+            pass
+    return check_value(key, value, source=source)
 
 
-def check_value(key: str, value: Any) -> str | bool | int:
+def check_value(key: str, value: Any, *, source: str | None = None) -> str | bool | int:
     """Return VALUE when it has the right type and form for KEY."""
     spec = setting(key)
+    message = f"Invalid value for {key}"
+    if source is not None:
+        message = f"{source}: {message}"
     if spec.kind == "bool":
         if not isinstance(value, bool):
-            raise SettingsError(f"Invalid value for {key}: expected true or false")
+            raise InvalidSetting(f"{message}: expected true or false")
         return value
     if spec.kind == "int":
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            raise SettingsError(
-                f"Invalid value for {key}: expected a whole number, 1 or more"
-            )
+            raise InvalidSetting(f"{message}: expected a whole number, 1 or more")
         return value
     if not isinstance(value, str):
-        raise InvalidEndpoint(f"Invalid value for {key}: expected a URL string")
+        raise InvalidSetting(f"{message}: expected a URL string")
     if spec.section == "keeper" and "#" in value:
-        raise InvalidEndpoint(f"Invalid value for {key}: remove the URL fragment")
+        raise InvalidSetting(f"{message}: remove the URL fragment")
     if _URL_WHITESPACE_OR_CONTROL.search(value):
-        raise InvalidEndpoint(
-            f"Invalid value for {key}: URL contains whitespace or control characters"
+        raise InvalidSetting(
+            f"{message}: URL contains whitespace or control characters"
         )
     try:
         parts = urlsplit(value)
@@ -271,9 +269,8 @@ def check_value(key: str, value: Any) -> str | bool | int:
                 return value
     except (ValueError, httpx.InvalidURL, InvalidURI):
         pass
-    raise InvalidEndpoint(
-        f"Invalid value for {key}: expected a URL starting with"
-        f" {' or '.join(s + '://' for s in spec.schemes)}"
+    raise InvalidSetting(
+        f"{message}: expected a URL starting with {' or '.join(s + '://' for s in spec.schemes)}"
     )
 
 
@@ -316,7 +313,7 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
                 # A known section that is not a table would otherwise fall back
                 # to the default and quietly select another Keeper.
                 message = f"{section!r} must be a table, such as [{section}]"
-                raise ConfigError(message, f"{path}: {message}")
+                raise InvalidSetting(f"{path}: {message}")
             warnings.append(f"{path}: ignoring unknown setting {section!r}")
             continue
         for name, value in table.items():
@@ -326,11 +323,9 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
                 continue
             try:
                 values[key] = check_value(key, value)
-            except InvalidEndpoint as exc:
-                raise InvalidEndpoint(exc.diagnostic, f"{path}: {exc}") from None
-            except SettingsError as exc:
+            except InvalidSetting as exc:
                 if section not in LENIENT_SECTIONS:
-                    raise ConfigError(str(exc), f"{path}: {exc}") from None
+                    raise InvalidSetting(f"{path}: {exc}") from None
                 values[key] = Invalid(str(exc))
                 warnings.append(f"{path}: {exc}; logging is off until it is fixed")
     return values, warnings
@@ -378,24 +373,24 @@ def resolve(
         try:
             if raw_flag is not None:
                 values[spec.key], sources[spec.key] = (
-                    parse_value(spec.key, raw_flag),
+                    parse_value(spec.key, raw_flag, source=spec.flag or spec.key),
                     "flag",
                 )
             elif raw_env.strip():
                 values[spec.key], sources[spec.key] = (
-                    parse_value(spec.key, raw_env),
+                    parse_value(spec.key, raw_env, source=spec.env),
                     "env",
                 )
             elif spec.key in file:
                 if isinstance(file[spec.key], Invalid):
-                    raise SettingsError(file[spec.key].message)
+                    raise InvalidSetting(file[spec.key].message)
                 values[spec.key], sources[spec.key] = (
-                    check_value(spec.key, file[spec.key]),
+                    check_value(spec.key, file[spec.key], source=FILE_NAME),
                     "file",
                 )
             else:
                 values[spec.key], sources[spec.key] = spec.default, "default"
-        except SettingsError as exc:
+        except InvalidSetting:
             if spec.section in LENIENT_SECTIONS:
                 # With logging turned off by a valid setting, the other
                 # logs values are not validated: they change nothing.
@@ -404,10 +399,7 @@ def resolve(
                 values[spec.key] = spec.default
                 sources[spec.key] = layer if off else "invalid"
                 continue
-            origin = spec.flag or spec.key if raw_flag is not None else spec.env
-            if isinstance(exc, InvalidEndpoint):
-                raise InvalidEndpoint(exc.diagnostic, f"{origin}: {exc}") from None
-            raise SettingsError(f"{origin}: {exc}") from None
+            raise
     logs_valid = "invalid" not in (sources["logs.enabled"], sources["logs.keep_days"])
     ws_key, http_key = "keeper.ws_endpoint", "keeper.endpoint"
     ws_rank = _RANK[sources[ws_key]]
@@ -565,7 +557,7 @@ def _table(
     if _is_standard(doc, spec.section, item):
         return item
     if not isinstance(getattr(item, "unwrap", lambda: None)(), dict):
-        raise SettingsError(
+        raise InvalidSetting(
             f"{path}: {spec.section!r} must be a table, such as [{spec.section}]"
         )
     raise UneditableSection(

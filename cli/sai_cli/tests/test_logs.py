@@ -1432,7 +1432,8 @@ def test_invalid_logs_settings_never_stop_a_command_or_the_server(
     the MCP server still start, with or without logging turned off."""
     base, _state = keeper_stub
     for on in ("0", "1", None):
-        monkeypatch.setenv("SAI_LOG_KEEP_DAYS", "fourteen")
+        bad_retention = "9" * 5000 if on == "1" else "fourteen"
+        monkeypatch.setenv("SAI_LOG_KEEP_DAYS", bad_retention)
         if on is None:
             monkeypatch.delenv("SAI_LOG", raising=False)
         else:
@@ -1447,6 +1448,7 @@ def test_invalid_logs_settings_never_stop_a_command_or_the_server(
         assert json.loads(result.stdout) == {"oracle": {"tokenPricesUsd": []}}
         # Off by choice: the other value is not looked at, so no warning.
         assert ("logging is off" in result.stderr) == (on != "0")
+        assert bad_retention not in result.stderr
         mcp = server.create_server(resolved)
         assert "oracle" in call(mcp, "market_prices")
     monkeypatch.delenv("SAI_LOG_KEEP_DAYS")

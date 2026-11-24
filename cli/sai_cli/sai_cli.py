@@ -141,7 +141,7 @@ def json_requested(argv: Sequence[str]) -> bool:
 
 
 def cli_failure(exc: Exception) -> SaiError:
-    if isinstance(exc, sai_settings.InvalidEndpoint):
+    if isinstance(exc, sai_settings.InvalidSetting):
         return SaiError(str(exc), Code.INVALID_REQUEST, exit_code=ExitCode.USAGE)
     if isinstance(exc, click.ClickException):
         return SaiError(
@@ -1510,7 +1510,7 @@ def doctor_command(
     It reports stale Claude Code registrations with a command to repair
     each existing entry. It never deletes or rewrites the session, and
     never prints its token. Each check prints pass, fixed, warn, fail, or
-    skipped. Doctor exits 1 if any check still fails.
+    skipped. Doctor exits 2 for invalid settings and 1 for other failed checks.
     """
     from . import doctor
 
@@ -1556,7 +1556,7 @@ def doctor_command(
             report,
             code,
             details=doctor.report(checks) if ctx.obj["json"] else None,
-            exit_code=ExitCode.USAGE if config_check.invalid_endpoint else None,
+            exit_code=ExitCode.USAGE if config_check.invalid_setting else None,
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
@@ -1611,7 +1611,9 @@ def watch_price(ctx: click.Context, token_id: int, ws_endpoint: str | None) -> N
 def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
     """The command's --ws-endpoint, else the resolved WebSocket setting."""
     if ws_endpoint is not None:
-        sai_settings.check_value("keeper.ws_endpoint", ws_endpoint)
+        sai_settings.check_value(
+            "keeper.ws_endpoint", ws_endpoint, source="--ws-endpoint"
+        )
         return ws_endpoint
     return settings(ctx).ws_endpoint
 
@@ -1619,7 +1621,7 @@ def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
 def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
     """The command's --lcd-endpoint, else the resolved LCD setting."""
     if lcd_endpoint is not None:
-        sai_settings.check_value("lcd.endpoint", lcd_endpoint)
+        sai_settings.check_value("lcd.endpoint", lcd_endpoint, source="--lcd-endpoint")
         return lcd_endpoint
     return settings(ctx).lcd_endpoint
 
@@ -2249,7 +2251,7 @@ def logs_intent(
     """Show an intent's CLI and MCP trail and its current Keeper record."""
     endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
     if offline and endpoint is not None:
-        sai_settings.check_value("keeper.endpoint", endpoint)
+        sai_settings.check_value("keeper.endpoint", endpoint, source="--endpoint")
     account = addr if addr is not None else ctx.obj["as_addr"]
     report = log_queries.intent(
         key, endpoint=endpoint, addr=account, offline=offline, before=before

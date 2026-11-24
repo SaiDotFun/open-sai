@@ -30,7 +30,10 @@ sai config unset keeper.endpoint
 "source", "env", "default"}}}`, where `source` is `flag`, `env`, `file`,
 `default`, `derived`, or `invalid` (a `logs.*` value sai could not read,
 which turns logging off). `list` drops credentials from URLs; `get` prints the
-exact value. An unknown key or invalid value exits 2 and lists the valid keys.
+exact value. Invalid settings exit 2. The diagnostic names the key and, for
+overrides, the flag, environment variable, or config file path. JSON errors
+use code `INVALID_REQUEST`. The diagnostic omits the invalid value. The
+`config` commands list the valid keys for an unknown key or invalid `set` value.
 
 The first `set`, or an `unset` that removes a value, writes the whole file
 with every key commented out and explained, at mode 0600 in a 0700
@@ -487,8 +490,9 @@ includes `--reset-args`, it uses default server arguments.
 
 Each check prints pass, fixed, warn, fail, or skipped, with what changed or
 the command that fixes it. `sai --json doctor` prints a structured report on
-success. If a check fails, doctor exits 1 and the JSON error message lists the
-failed checks and their fixes. `--no-fix` reports without changing anything,
+success. Doctor exits 2 for a setting with an invalid value and 1 for other
+failed checks. The JSON error message lists the failed checks and their
+fixes. `--no-fix` reports without changing anything,
 log lines included, and `--offline` skips the network checks, which
 otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
@@ -538,7 +542,7 @@ starts the stdio transport, stdout carries MCP protocol traffic. Without
 | --- | --- | --- |
 | 0 | Success | Read the result. |
 | 1 | Other failure | Read `error.code` and the message before deciding what to do. |
-| 2 | Command usage error | Check the command's `--help`. |
+| 2 | Command usage error or invalid settings | Correct the indicated setting or check the command's `--help`. |
 | 3 | Unsupported install or environment | Follow the error's installation or terminal instructions. |
 | 4 | Request rejected or never sent | The request executed nothing. Review the error before retrying. |
 | 5 | Outcome unknown | Keep the intent key and reconcile it. Do not resubmit. |
