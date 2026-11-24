@@ -47,14 +47,14 @@ about the server. Call `mcp_info`.
 ## Tools
 
 Call `mcp_info` first. It reports the version, endpoints, the active account,
-and `trading`, which says whether trades can submit. `restartNeeded` is true
+and `trading`, which reports the active account's session readiness. `restartNeeded` is true
 when sai was updated and this server still runs the old code; ask the person
 to restart the client. `logs.dir` is where sai logs every tool call, and `sai
 logs tail --surface mcp` in a terminal reads them ([cli.md](cli.md#logs)).
 
 | Tool | Use |
 | --- | --- |
-| `mcp_info` | Version, endpoints, active account, and whether trading is available |
+| `mcp_info` | Version, endpoints, and the active account's session readiness |
 | `auth_status`, `auth_list` | The active account, and every connected account |
 | `auth_use` | Switch the active account. Also switches it for the CLI. |
 | `market_list`, `market_prices` | Markets and current indexed prices |
@@ -83,12 +83,16 @@ If `mcp_info.session.expiryWarning` is present, tell the person when the
 session expires. To renew, use the same Keeper endpoint. The v0.1.2
 `renewalCommand` can include explanatory text after the command.
 
-| `mcp_info.trading.reason` | A `trade_*` call returns | Meaning |
-| --- | --- | --- |
-| `signed-in` | the trade result | Trades can submit. |
-| `signed-out` | `SIGNED_OUT` or `SESSION_UNAVAILABLE` | No account is connected, or Sai could not load the selected session. |
-| `expired` | `SESSION_EXPIRED` | The session ran out. |
-| `other-endpoint` | `SESSION_UNAVAILABLE` | The session belongs to another Keeper endpoint. |
+| `mcp_info.trading.reason` | What It Means for the Active Account |
+| --- | --- |
+| `signed-in` | The session is valid for this Keeper endpoint. |
+| `signed-out` | There is no active account, or Sai could not load its session. |
+| `expired` | The session ran out. |
+| `other-endpoint` | The session belongs to another Keeper endpoint. |
+
+Use the requested trade's `code` to diagnose its session. It can return
+`SIGNED_OUT`, `SESSION_EXPIRED`, or `SESSION_UNAVAILABLE` even when
+`mcp_info` reports `signed-in` for a different account.
 
 A refused call submits nothing. Ask the person to run `sai auth import`, or
 `sai auth login NAME` with their Foundry keystore name, in their own

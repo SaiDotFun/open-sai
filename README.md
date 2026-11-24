@@ -209,9 +209,10 @@ longer matches:
 - `trade_close`, `trade_tpsl`, and `trade_leverage`: nothing beyond the
   account and arguments.
 
-Ask the agent to call `mcp_info` to see the version, endpoints, active
-account, and `trading`, which reports whether trades can submit and why not
-(`signed-out`, `expired`, or `other-endpoint`).
+Ask the agent to call `mcp_info` to see the version, endpoints, and active
+account. Its `trading` field reports the active account's session readiness.
+Each trade checks the account it targets. If that trade fails a session
+check, use its error code to diagnose the requested account.
 
 With several accounts connected, `auth_list` shows them, `auth_use` switches
 the active one (for the CLI too), and preview and trade tools take an
