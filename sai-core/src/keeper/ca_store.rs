@@ -8,8 +8,10 @@ use rustls::{
         WebPkiServerVerifier,
         danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
     },
+    crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use x509_cert::time::Validity;
 
 use super::ca_pem::{CaCertificate, ServerTrust};
 
@@ -19,6 +21,7 @@ pub(super) struct CaStore {
     rejected: HashSet<CertificateDer<'static>>,
     rejected_anchors: RootCertStore,
     intermediates: Vec<CertificateDer<'static>>,
+    dated_anchors: Vec<(usize, Validity)>,
 }
 
 impl CaStore {
@@ -29,6 +32,7 @@ impl CaStore {
             rejected: HashSet::new(),
             rejected_anchors: RootCertStore::empty(),
             intermediates: Vec::new(),
+            dated_anchors: Vec::new(),
         }
     }
 
@@ -38,7 +42,13 @@ impl CaStore {
             return Ok(());
         }
         match cert.trust {
-            ServerTrust::Anchor => self.roots.add(cert.der.clone())?,
+            ServerTrust::Anchor => {
+                let index = self.roots.len();
+                self.roots.add(cert.der.clone())?;
+                if let Some(validity) = cert.trusted_pem_validity {
+                    self.dated_anchors.push((index, validity));
+                }
+            }
             ServerTrust::Rejected => {
                 self.rejected_anchors.add(cert.der.clone())?;
                 self.rejected.insert(cert.der.clone());
@@ -63,20 +73,29 @@ impl CaStore {
         let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .expect("valid Rustls protocol versions");
-        let builder = if (self.rejected.is_empty() && self.intermediates.is_empty())
+        let builder = if (self.rejected.is_empty()
+            && self.intermediates.is_empty()
+            && self.dated_anchors.is_empty())
             || self.roots.is_empty()
         {
             builder.with_root_certificates(self.roots)
         } else {
-            let verifier = WebPkiServerVerifier::builder_with_provider(self.roots.into(), provider)
-                .build()
-                .expect("nonempty root store and no CRLs");
+            let roots = Arc::new(self.roots);
+            let verifier = WebPkiServerVerifier::builder_with_provider(
+                Arc::clone(&roots),
+                Arc::clone(&provider),
+            )
+            .build()
+            .expect("nonempty root store and no CRLs");
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(StoreVerifier {
                     verifier,
                     rejected: self.rejected,
                     intermediates: self.intermediates,
+                    roots,
+                    provider,
+                    dated_anchors: self.dated_anchors,
                 }))
         };
         let mut config = builder.with_no_client_auth();
@@ -90,6 +109,39 @@ struct StoreVerifier {
     verifier: Arc<WebPkiServerVerifier>,
     rejected: HashSet<CertificateDer<'static>>,
     intermediates: Vec<CertificateDer<'static>>,
+    roots: Arc<RootCertStore>,
+    provider: Arc<CryptoProvider>,
+    dated_anchors: Vec<(usize, Validity)>,
+}
+
+impl StoreVerifier {
+    fn verifier_at(&self, now: UnixTime) -> Result<Arc<WebPkiServerVerifier>, Error> {
+        // WebPKI anchors omit validity. Use each certificate's position in the
+        // root store so a different certificate with the same key stays eligible.
+        let invalid: HashSet<_> = self
+            .dated_anchors
+            .iter()
+            .filter_map(|(index, validity)| {
+                let start = validity.not_before.to_unix_duration().as_secs();
+                let end = validity.not_after.to_unix_duration().as_secs();
+                (!(start..end).contains(&now.as_secs())).then_some(*index)
+            })
+            .collect();
+        if invalid.is_empty() {
+            return Ok(Arc::clone(&self.verifier));
+        }
+        let roots = RootCertStore::from_iter(
+            self.roots
+                .roots
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !invalid.contains(index))
+                .map(|(_, root)| root.clone()),
+        );
+        WebPkiServerVerifier::builder_with_provider(roots.into(), Arc::clone(&self.provider))
+            .build()
+            .map_err(|_| CertificateError::UnknownIssuer.into())
+    }
 }
 
 impl ServerCertVerifier for StoreVerifier {
@@ -111,7 +163,7 @@ impl ServerCertVerifier for StoreVerifier {
             .chain(&self.intermediates)
             .cloned()
             .collect();
-        self.verifier.verify_server_cert(
+        self.verifier_at(now)?.verify_server_cert(
             end_entity,
             &intermediates,
             server_name,

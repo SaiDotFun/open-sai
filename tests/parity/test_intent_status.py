@@ -18,11 +18,14 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
 from sai_cli.core import keeper, log, storage
 from sai_cli.mcp_server.tools import _reconcile_fields
 
@@ -1315,6 +1318,47 @@ def test_default_trust_requires_an_issuer(
         intermediate = tmp_path / "alias.pem"
 
     trust = ca_store_overrides(tmp_path, store, intermediate)
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, False)
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+def test_expired_trusted_ca_fails_tls_handshake(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    store: str,
+) -> None:
+    context, certs = keeper_certificate
+    root = x509.load_pem_x509_certificate((certs / "keeper-ca.pem").read_bytes())
+    key = serialization.load_pem_private_key(
+        (certs / "keeper-ca.key").read_bytes(), None
+    )
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(root.subject)
+        .issuer_name(root.issuer)
+        .public_key(root.public_key())
+        .serial_number(root.serial_number)
+        .not_valid_before(datetime(2020, 1, 1, tzinfo=UTC))
+        .not_valid_after(datetime(2021, 1, 1, tzinfo=UTC))
+    )
+    for extension in root.extensions:
+        builder = builder.add_extension(extension.value, extension.critical)
+    expired = builder.sign(key, hashes.SHA256())
+    (tmp_path / "expired.pem").write_bytes(
+        expired.public_bytes(serialization.Encoding.PEM)
+    )
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        "expired.pem",
+        "-addtrust",
+        "serverAuth",
+        "-out",
+        "trusted.pem",
+    )
+    trust = ca_store_overrides(tmp_path, store, tmp_path / "trusted.pem")
     assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, False)
 
 

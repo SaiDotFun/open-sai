@@ -21,6 +21,7 @@ use x509_cert::{
     ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier, name::GeneralName},
     name::Name,
     spki::AlgorithmIdentifierOwned,
+    time::Validity,
 };
 
 use super::ca_dir::canonical_name;
@@ -31,6 +32,7 @@ const ANY_EXTENDED_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2
 pub(super) struct CaCertificate {
     pub der: CertificateDer<'static>,
     pub trust: ServerTrust,
+    pub trusted_pem_validity: Option<Validity>,
 }
 
 pub(super) enum ServerTrust {
@@ -128,6 +130,7 @@ fn certificate_entry(mut der: Vec<u8>, trusted: bool) -> der::Result<CaCertifica
     Ok(CaCertificate {
         der: der.into(),
         trust,
+        trusted_pem_validity: trusted.then_some(certificate.tbs_certificate.validity),
     })
 }
 
