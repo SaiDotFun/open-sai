@@ -907,6 +907,11 @@ def warn(message: str) -> None:
 @click.option("--slippage", required=True, help="Maximum slippage percentage.")
 @click.option("--take-profit")
 @click.option("--stop-loss")
+@click.option(
+    "--allow-concurrent-open",
+    is_flag=True,
+    help="Allow another open while an earlier open is unknown or accepted.",
+)
 @click.option("--dry-run", is_flag=True)
 @click.pass_context
 def trade_open(
@@ -920,6 +925,7 @@ def trade_open(
     slippage: str,
     take_profit: str | None,
     stop_loss: str | None,
+    allow_concurrent_open: bool,
     dry_run: bool,
 ) -> None:
     """Open a market, limit, or stop trade."""
@@ -937,6 +943,7 @@ def trade_open(
             slippage=slippage,
             take_profit=take_profit,
             stop_loss=stop_loss,
+            allow_concurrent_open=allow_concurrent_open,
             dry_run=dry_run,
             notify=warn,
         ),

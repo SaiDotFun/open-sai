@@ -307,8 +307,8 @@ async def trade_open(
     from the confirmed preview, and, for a market order, PRICE_MOVED when
     Keeper's current price moved from reference_price by more than the
     slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an open is pending, or a recent open is still
-    unknown or accepted. Check its key with intent_status before retrying.
+    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or
+    pending. Check its key with intent_status before retrying.
 
     Args:
         market_id: Market id from market_list.
@@ -324,9 +324,9 @@ async def trade_open(
         preview_digest: previewDigest from the confirmed preview_open.
         reference_price: referencePrice from the confirmed preview_open;
             required for market orders only.
-        allow_concurrent_open: True to submit with a recent accepted open,
-            after checking its status and getting confirmation for another
-            position. Unknown outcomes and pending fills still block trades.
+        allow_concurrent_open: True to submit while an earlier open is unknown
+            or accepted, after checking its status and getting confirmation for
+            another position. A known pending fill still blocks submission.
         addr: Connected account to act as (0x...). Defaults to the
             active account.
     """
