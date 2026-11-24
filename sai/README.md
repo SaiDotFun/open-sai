@@ -13,13 +13,23 @@ Session binding and ledger lookups use the full endpoint.
 Run `sai intent status ADDR --key KEY` to reconcile one intent, or omit
 `--key` to list the account's recent Keeper records. With `--json`, command
 failures use the same error codes and envelope as the Python CLI.
+The `market list`, `market prices`, and `account positions` commands
+return Keeper's GraphQL data. The `account history` command keeps the
+GraphQL envelope and projects each row to validated public fields. The `account balances`
+command reads one WebSocket snapshot. Use `watch price TOKEN_ID`, `watch
+balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 
 ## Port Order
 
 C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
 uses Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf` for
 Keeper requests, reconciliation, structured errors, and emitted events.
+Every Keeper query logs only public GraphQL error codes and an error count,
+following the current Python reference below.
 Logging v2 and intent wait have their own port work. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
+C5 compares read and watch commands against Python on `main` at
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. These commands emit schema v2
+events, including keyed endpoint IDs for Keeper HTTP reads.
 
 | Lane | Acceptance criteria |
 | --- | --- |
@@ -72,6 +82,14 @@ Run `SAI_PARITY_BIN="$PWD/target/debug/sai" uv run pytest tests/parity`
 after `just rust-build` to compare `sai intent status` against the Python
 package in this checkout. The tests reuse the recorded Keeper outcomes
 and compare request bytes and counts, ledger rows, and log events.
+
+Compare the read and watch commands with the Python package in this
+checkout using the loopback replay cases:
+
+```sh
+SAI_PARITY_BIN="$PWD/target/debug/sai" uv run python tests/parity/parity.py \
+  --case 'market-*' --case 'account-*' --case 'watch-*'
+```
 
 Native archives and compatible shim wheels ship on the existing
 `sai-cli/v*` tags with SHA-256 checksums. Each shim version fetches and
