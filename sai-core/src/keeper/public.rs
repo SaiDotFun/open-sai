@@ -1,4 +1,4 @@
-//! Public intent records use the same field allowlists as the Python Keeper client.
+//! Public Keeper reads use the same field rules as the Python client.
 
 use std::{path::Path, sync::LazyLock};
 
@@ -146,6 +146,38 @@ fn account_history_timestamp(block: &mut Map<String, Value>, timestamp: &Value) 
         block.insert("block_ts".into(), timestamp.clone());
     } else if !timestamp.is_null() {
         block.insert("block_tsInvalid".into(), json!(true));
+    }
+}
+
+/// Keeper uses the Unix epoch when it has a block height without a timestamp.
+pub fn normalize_market_price_timestamps(data: &mut Map<String, Value>) {
+    let Some(rows) = data
+        .get_mut("oracle")
+        .and_then(|oracle| oracle.get_mut("tokenPricesUsd"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for row in rows {
+        if let Some(block) = row
+            .get_mut("lastUpdatedBlock")
+            .and_then(Value::as_object_mut)
+        {
+            let timestamp = block.entry("block_ts").or_insert(Value::Null);
+            if timestamp.as_f64() == Some(0.0)
+                || timestamp.as_str().is_some_and(|value| {
+                    value == "0"
+                        || chrono::DateTime::parse_from_rfc3339(value).is_ok_and(
+                            |at| {
+                                at.timestamp() == 0
+                                    && at.timestamp_subsec_nanos() == 0
+                            },
+                        )
+                })
+            {
+                *timestamp = Value::Null;
+            }
+        }
     }
 }
 

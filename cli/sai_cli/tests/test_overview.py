@@ -241,6 +241,44 @@ def decode_mcp(result: Any) -> dict[str, Any]:
     return json.loads(block.text)
 
 
+def test_market_prices_reports_missing_block_times_as_null(replay):
+    prices = replay["http"][keeper.PRICES]["data"]
+    rows = prices["oracle"]["tokenPricesUsd"][:7]
+    prices["oracle"]["tokenPricesUsd"] = rows
+    del rows[0]["lastUpdatedBlock"]["block_ts"]
+    for row, stamp in zip(
+        rows[1:],
+        (
+            0,
+            None,
+            "0",
+            "1970-01-01T00:00:00Z",
+            BLOCK_TIME,
+            "1970-01-01T00:00:00.000000001Z",
+        ),
+        strict=True,
+    ):
+        row["lastUpdatedBlock"]["block_ts"] = stamp
+    heights = [row["lastUpdatedBlock"]["block"] for row in rows]
+
+    result = cli(replay, "--json", "market", "prices")
+    assert result.exit_code == 0, result.output
+    decoded = json.loads(result.stdout)
+    blocks = [row["lastUpdatedBlock"] for row in decoded["oracle"]["tokenPricesUsd"]]
+    assert [block["block"] for block in blocks] == heights
+    assert [block["block_ts"] for block in blocks] == [
+        None,
+        None,
+        None,
+        None,
+        None,
+        BLOCK_TIME,
+        "1970-01-01T00:00:00.000000001Z",
+    ]
+    server = create_server(replay["config"])
+    assert decode_mcp(asyncio.run(server.call_tool("market_prices", {}))) == decoded
+
+
 def save_session(replay: dict[str, Any], addr: str = ADDR):
     now = datetime.now(UTC)
     issued = (now - timedelta(days=28)).timestamp()

@@ -18,7 +18,9 @@ use crate::{
     log::{self, EventContext, Field, Level},
 };
 
-pub use public::{public_account_history, public_intent_status};
+pub use public::{
+    normalize_market_price_timestamps, public_account_history, public_intent_status,
+};
 pub use queries::*;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);

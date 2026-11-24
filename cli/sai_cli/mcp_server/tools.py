@@ -381,7 +381,7 @@ def market_list(settings: Settings) -> dict[str, Any]:
 
 
 def market_prices(settings: Settings) -> dict[str, Any]:
-    return keeper.request(settings.endpoint, keeper.PRICES)
+    return keeper.market_prices(settings.endpoint)
 
 
 def account_positions(settings: Settings, addr: str | None) -> dict[str, Any]:
