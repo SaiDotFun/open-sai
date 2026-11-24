@@ -78,6 +78,12 @@ strict argument errors, and the JSON string in each successful response's
 `content` and `structuredContent`. It also replaces a fixture session
 between calls to check the trade refusal before argument validation.
 
+Native validation replies report the validation category and schema-defined
+field names. They omit submitted values and unknown field names. Until the
+Python follow-up lands, the transcript projects that expected difference
+only on the Python side of declared validation failures. It compares the
+native reply against the projected text exactly.
+
 ## Add a Case
 
 Each `[[case]]` table has a unique `name` and a list of CLI arguments in

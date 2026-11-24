@@ -283,7 +283,7 @@ def test_trade_integer_rejections(
             preview_digest="fixture",
         )
         assert result["isError"] is True
-        assert f"type={code}," in result["content"][0]["text"]
+        assert f"[type={code}]" in result["content"][0]["text"]
 
 
 @pytest.mark.parametrize("offline", ["true", "YES", 1.0])
@@ -329,28 +329,44 @@ def test_info_observes_launcher_replacement(
         assert after["restartNeeded"] is True
 
 
+REJECTED_MARKER = "fixture-mcp-key"
+REJECTED_URL = f"//127.0.0.1:9/?api_key={REJECTED_MARKER}"
+
+
 @pytest.mark.parametrize(
-    ("literal", "rendered"), [(b"1e2", "100.0"), (b"1e-7", "1e-07"), (b"-0.0", "-0.0")]
+    ("tool", "arguments", "field", "category"),
+    [
+        ("account_positions", {REJECTED_URL: True}, None, "extra_forbidden"),
+        ("account_positions", {"extra": REJECTED_URL}, None, "extra_forbidden"),
+        ("account_positions", {"addr": [REJECTED_URL]}, "addr", "string_type"),
+        ("preview_close", {"extra": REJECTED_URL}, "trade_id", "missing"),
+    ],
+    ids=["extra-name", "extra-value", "wrong-type-array", "missing-required"],
 )
-def test_extra_float_uses_python_spelling(
-    native: Path, tmp_path: Path, literal: bytes, rendered: str
+def test_validation_omits_rejected_input(
+    native: Path,
+    tmp_path: Path,
+    tool: str,
+    arguments: dict[str, Any],
+    field: str | None,
+    category: str,
 ) -> None:
     with (
         loopback("normal") as endpoints,
         server(native, tmp_path / "home", endpoints) as stdio,
     ):
-        stdio.write(
-            b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mcp_info","arguments":{"extra":'
-            + literal
-            + b"}}}"
-        )
-        response = stdio.receive()
-        assert response["id"] == 2
-        assert response["result"]["isError"] is True
-        assert (
-            f"input_value={rendered}, input_type=float"
-            in response["result"]["content"][0]["text"]
-        )
+        result = stdio.call(2, tool, **arguments)
+        assert result["isError"] is True
+        assert "structuredContent" not in result
+        assert len(result["content"]) == 1
+        text = result["content"][0]["text"]
+        assert f"[type={category}]" in text
+        if field is not None:
+            assert f"\n{field}\n" in text
+        assert REJECTED_MARKER not in json.dumps(result)
+        assert "input_value=" not in text
+        assert "input_type=" not in text
+        assert not endpoints.wire
 
 
 def test_local_ledger_read_while_keeper_reconciliation_is_busy(

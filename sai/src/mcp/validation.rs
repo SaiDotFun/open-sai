@@ -1,4 +1,4 @@
-//! Match FastMCP tool-level validation errors, including their field order.
+//! Report tool validation categories and schema-defined fields without rejected input.
 
 use std::fmt::Write as _;
 
@@ -30,11 +30,10 @@ pub(super) fn arguments(
     let required = tool.input_schema.get("required").and_then(Value::as_array);
     let mut issues = Vec::new();
     let mut converted = Vec::new();
-    let input = Value::Object(args.clone());
     for (name, schema) in properties {
         let Some(value) = args.get(name) else {
             if required.is_some_and(|fields| fields.iter().any(|field| field == name)) {
-                issues.push(Issue::new(name, "Field required", "missing", &input));
+                issues.push(Issue::new(Some(name), "Field required", "missing"));
             }
             continue;
         };
@@ -48,10 +47,13 @@ pub(super) fn arguments(
         };
         if let Some(choices) = schema.get("enum").and_then(Value::as_array) {
             if !choices.contains(value) {
-                let choices: Vec<_> = choices.iter().map(python_repr).collect();
+                let choices: Vec<_> = choices
+                    .iter()
+                    .map(|choice| choice.as_str().map_or_else(|| choice.to_string(), repr))
+                    .collect();
                 let (last, rest) = choices.split_last().expect("enum has choices");
                 let message = format!("Input should be {} or {last}", rest.join(", "));
-                issues.push(Issue::new(name, message, "literal_error", value));
+                issues.push(Issue::new(Some(name), message, "literal_error"));
             }
             continue;
         }
@@ -66,16 +68,15 @@ pub(super) fn arguments(
         match conversion {
             Ok(Some(value)) => converted.push((name.clone(), value)),
             Ok(None) => {}
-            Err((message, code)) => issues.push(Issue::new(name, message, code, value)),
+            Err((message, code)) => issues.push(Issue::new(Some(name), message, code)),
         }
     }
-    for (name, value) in &args {
+    for name in args.keys() {
         if !properties.contains_key(name) {
             issues.push(Issue::new(
-                name,
+                None,
                 "Extra inputs are not permitted",
                 "extra_forbidden",
-                value,
             ));
         }
     }
@@ -85,10 +86,10 @@ pub(super) fn arguments(
     };
     if tool.name == "logs_intent" {
         return Err(match first.field {
-            "key" => "Argument 'key' must be a string.",
-            "offline" => "Argument 'offline' must be a boolean.",
-            "addr" => "Argument 'addr' must be a string or null.",
-            "before" => "Argument 'before' must be a string or null.",
+            Some("key") => "Argument 'key' must be a string.",
+            Some("offline") => "Argument 'offline' must be a boolean.",
+            Some("addr") => "Argument 'addr' must be a string or null.",
+            Some("before") => "Argument 'before' must be a string or null.",
             _ => "Expected audit arguments 'key' (a string), 'offline' (a boolean), 'addr' (a string or null), 'before' (a string or null).",
         }.into());
     }
@@ -98,41 +99,35 @@ pub(super) fn arguments(
         "Error executing tool {}: {count} validation error{plural} for {}Arguments",
         tool.name, tool.name,
     );
-    for issue in issues {
-        let (kind, input) = (python_type(issue.input), abbreviated_repr(issue.input));
-        let Issue {
-            field,
-            message: detail,
-            code,
-            ..
-        } = issue;
+    for Issue {
+        field,
+        message: detail,
+        code,
+    } in issues
+    {
+        if let Some(field) = field {
+            let _ = write!(message, "\n{field}");
+        }
         let _ = write!(
             message,
-            "\n{field}\n  {detail} [type={code}, input_value={input}, input_type={kind}]\n    For further information visit {PYDANTIC_ERRORS}/{code}",
+            "\n  {detail} [type={code}]\n    For further information visit {PYDANTIC_ERRORS}/{code}",
         );
     }
     Err(message)
 }
 
 struct Issue<'a> {
-    field: &'a str,
+    field: Option<&'a str>,
     message: String,
     code: &'static str,
-    input: &'a Value,
 }
 
 impl<'a> Issue<'a> {
-    fn new(
-        field: &'a str,
-        message: impl Into<String>,
-        code: &'static str,
-        input: &'a Value,
-    ) -> Self {
+    fn new(field: Option<&'a str>, message: impl Into<String>, code: &'static str) -> Self {
         Self {
             field,
             message: message.into(),
             code,
-            input,
         }
     }
 }
@@ -242,63 +237,4 @@ fn boolean(value: &Value) -> Conversion {
         _ => return Err(TYPE),
     };
     Ok(Some(Value::Bool(flag)))
-}
-
-fn python_type(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "NoneType",
-        Value::Bool(_) => "bool",
-        Value::Number(_) if is_integer(value) => "int",
-        Value::Number(_) => "float",
-        Value::String(_) => "str",
-        Value::Array(_) => "list",
-        Value::Object(_) => "dict",
-    }
-}
-
-fn python_repr(value: &Value) -> String {
-    match value {
-        Value::Null => "None".into(),
-        Value::Bool(true) => "True".into(),
-        Value::Bool(false) => "False".into(),
-        Value::Number(_) => {
-            let text = crate::reads::output::inline(value).expect("JSON number");
-            match text.as_str() {
-                "Infinity" => "inf".into(),
-                "-Infinity" => "-inf".into(),
-                _ => text,
-            }
-        }
-        Value::String(text) => repr(text),
-        Value::Array(values) => format!(
-            "[{}]",
-            values
-                .iter()
-                .map(python_repr)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        Value::Object(fields) => format!(
-            "{{{}}}",
-            fields
-                .iter()
-                .map(|(key, value)| format!("{}: {}", repr(key), python_repr(value)))
-                .collect::<Vec<_>>()
-                .join(", "),
-        ),
-    }
-}
-
-fn abbreviated_repr(value: &Value) -> String {
-    let text = python_repr(value);
-    if text.chars().count() <= 50 {
-        return text;
-    }
-    let front: String = text.chars().take(25).collect();
-    let back = text
-        .char_indices()
-        .rev()
-        .nth(23)
-        .map_or(0, |(index, _)| index);
-    format!("{front}...{}", &text[back..])
 }
