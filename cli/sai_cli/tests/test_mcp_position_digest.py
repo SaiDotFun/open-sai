@@ -14,7 +14,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from mcp import ClientSession
@@ -39,6 +39,8 @@ class Position:
     cap: str | None = "5"
     caps_on_position_read: deque[str | None] = field(default_factory=deque)
     reported_height: int | None = 120
+    cache_contract_queries: bool = False
+    drop_pinned_height: bool = False
     cap_query_heights: list[str | None] = field(default_factory=list)
     collateral_price: str | None = "1"
     oracle_position_updates: deque[tuple[int, str] | None] = field(
@@ -50,6 +52,7 @@ class Position:
 @pytest.fixture
 def position_service() -> Iterator[tuple[Position, str]]:
     position = Position()
+    cached_replies: dict[str, Any] = {}
     market = {
         "marketId": 0,
         "isOpen": True,
@@ -104,12 +107,16 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.reply({"data": data})
 
         def do_GET(self) -> None:
-            if self.path == "/cosmos/base/tendermint/v1beta1/node_info":
+            path = urlsplit(self.path).path
+            if path == "/cosmos/base/tendermint/v1beta1/node_info":
                 self.reply({"default_node_info": {"network": CHAIN_ID}})
                 return
             prefix = "/cosmwasm/wasm/v1/contract/nibi1contract/smart/"
-            assert self.path.startswith(prefix)
-            message = json.loads(base64.b64decode(unquote(self.path[len(prefix) :])))
+            assert path.startswith(prefix)
+            if position.cache_contract_queries and self.path in cached_replies:
+                self.reply({"data": cached_replies[self.path]})
+                return
+            message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
                 if position.caps_on_position_read:
                     cap = position.caps_on_position_read.popleft()
@@ -164,11 +171,16 @@ def position_service() -> Iterator[tuple[Position, str]]:
             if data is None:
                 self.send_error(400, "contract query unavailable")
                 return
-            self.reply({"data": data}, position.reported_height)
+            if position.cache_contract_queries:
+                cached_replies[self.path] = data
+            height = position.reported_height
+            if position.drop_pinned_height and "x-cosmos-block-height" in self.headers:
+                height = None
+            self.reply({"data": data}, height)
 
         def reply(self, value: dict[str, Any], height: int | None = None) -> None:
             requested_height = self.headers.get("x-cosmos-block-height")
-            if requested_height is not None:
+            if requested_height is not None and height is not None:
                 assert requested_height == str(height)
             data = json.dumps(value).encode()
             self.send_response(200)
@@ -412,6 +424,37 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
             else:
                 assert accepted["status"] == "accepted"
                 assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
+    ],
+)
+def test_trade_confirms_through_lcd_cache_and_refuses_unverified_heights(
+    position_service: tuple[Position, str], tool: str, args: dict[str, Any]
+) -> None:
+    position, base_url = position_service
+    position.cache_contract_queries = True
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            trade = {**args, "preview_digest": preview["previewDigest"]}
+            position.drop_pinned_height = True
+            rejected = await call(client, f"trade_{tool}", trade)
+            assert rejected.get("code") == "PREVIEW_MISMATCH", rejected
+            assert "Retry" in rejected["error"]
+            assert position.submitted == []
+
+            position.drop_pinned_height = False
+            accepted = await call(client, f"trade_{tool}", trade)
+            assert accepted["status"] == "accepted", accepted
+            assert len(position.submitted) == 1
 
     asyncio.run(scenario())
 

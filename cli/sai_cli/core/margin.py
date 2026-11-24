@@ -7,19 +7,23 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
+from secrets import token_hex
 from typing import Any
 from urllib.parse import quote
 
 import httpx
 
 from . import intents, keeper
+from .errors import Code, SaiError
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
 
 
-class QueryHeightMismatch(ValueError):
+class QueryHeightMismatch(SaiError, ValueError):
     """The LCD answered a pinned query at an unverified height."""
+
+    code = Code.PREVIEW_MISMATCH
 
 
 def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
@@ -27,22 +31,31 @@ def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
 
 
 def _get_json_at_height(
-    url: str, timeout: float = 20, *, height: str | None = None
+    url: str, timeout: float = 20, *, height: str | None = None, fresh: bool = False
 ) -> tuple[dict[str, Any], str | None]:
     keeper.check_url(url, "LCD")
     try:
         headers = {BLOCK_HEIGHT_HEADER: height} if height is not None else None
-        response = httpx.get(url, timeout=timeout, headers=headers)
+        # The mainnet LCD caches by URI and can omit metadata on a hit.
+        # Give every confirmation read a fresh URI, including the height anchor.
+        params = {"_sai_query": token_hex(16)} if fresh or height is not None else None
+        response = httpx.get(url, timeout=timeout, headers=headers, params=params)
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
     except (httpx.HTTPError, ValueError, TypeError) as exc:
+        if height is not None or fresh:
+            raise QueryHeightMismatch(
+                "Unable to verify contract state during confirmation."
+                " Retry the preview and confirmation."
+            ) from exc
         raise ValueError("Unable to read contract state") from exc
     query_height = response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}")
     if height is not None and query_height != height:
         raise QueryHeightMismatch(
-            "LCD did not serve the requested contract query height"
+            "LCD did not serve the requested contract query height."
+            " Retry the preview and confirmation."
         )
     return result, query_height
 
@@ -92,14 +105,19 @@ def _latest_position(
     lcd: str, state: PositionSnapshot, trade_id: int
 ) -> tuple[dict[str, Any], str | None]:
     message = {"get_trade_raw": {"trader": state.raw["user"], "index": trade_id}}
-    result, height = _get_json_at_height(_smart_url(lcd, state.contract, message))
+    result, height = _get_json_at_height(
+        _smart_url(lcd, state.contract, message), fresh=True
+    )
     raw = result.get("data")
     if not isinstance(raw, dict):
         raise TypeError("Contract returned invalid state")
     if height is not None and (
         not height.isascii() or not height.isdecimal() or not height.lstrip("0")
     ):
-        raise QueryHeightMismatch("LCD returned an invalid contract query height")
+        raise QueryHeightMismatch(
+            "LCD returned an invalid contract query height."
+            " Retry the preview and confirmation."
+        )
     return raw, height
 
 
@@ -130,7 +148,7 @@ def position_unchanged(
     if height is None:
         raise ValueError(
             "Cannot confirm the position and leverage at the same block."
-            " Use an LCD that reports the contract query height."
+            " Retry with an LCD that reports the contract query height."
         )
     return True
 
