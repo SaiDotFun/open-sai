@@ -14,7 +14,9 @@ import signal
 import subprocess
 import sys
 import termios
+import time
 import tty
+from collections.abc import Callable
 from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -424,7 +426,12 @@ def test_import_disables_echo_before_showing_prompt(
 
 
 def interrupt_prompt(
-    env: Env, args: CLI, terminal_ctrl_c: bool, *, raw_mode: bool = False
+    env: Env,
+    args: CLI,
+    terminal_ctrl_c: bool,
+    *,
+    raw_mode: bool = False,
+    before_interrupt: Callable[[int], None] | None = None,
 ) -> tuple[int, str, str]:
     master, slave = pty.openpty()
     if raw_mode:
@@ -452,6 +459,8 @@ def interrupt_prompt(
             transcript.extend(os.read(master, 4096))
         assert b"Paste the Sai session token" in transcript
         assert not termios.tcgetattr(master)[3] & termios.ECHO
+        if before_interrupt is not None:
+            before_interrupt(master)
         if terminal_ctrl_c:
             os.write(master, b"\x03")
         else:
@@ -501,6 +510,75 @@ def test_import_ctrl_c_restores_an_inherited_raw_terminal(
     assert code == 1
     assert stdout == ""
     assert stderr.endswith("\nAborted!\n")
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_interrupting_import_clipboard_handoff_saves_nothing(
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], json_output: bool
+) -> None:
+    args = ("--json", "auth", "import") if json_output else ("auth", "import")
+    results = []
+    for env in homes(tmp_path, auth_pair):
+        started = env.clip.with_suffix(".started")
+        release = env.clip.with_suffix(".release")
+        token = fixture_token(ADDR)
+        env.clip.write_text(token)
+        env.tool(
+            "pbpaste",
+            "import time\n"
+            "from pathlib import Path\n"
+            f"Path({str(started)!r}).touch()\n"
+            "deadline = time.monotonic() + 8\n"
+            f"while not Path({str(release)!r}).exists() and time.monotonic() < deadline:\n"
+            "    time.sleep(0.01)\n"
+            "sys.stdout.write(Path(CLIP).read_text())\n",
+        )
+
+        def wait_for_reader(master: int, started: Path = started) -> None:
+            os.write(master, b"\n")
+            deadline = time.monotonic() + 5
+            while not started.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert started.exists(), "clipboard reader did not start"
+
+        try:
+            result = interrupt_prompt(
+                env, args, terminal_ctrl_c=False, before_interrupt=wait_for_reader
+            )
+        finally:
+            release.touch()
+        assert result[0] == 1
+        assert not session_state(env)["sessions"]
+        assert env.clip.read_text() == token
+        results.append(result)
+    assert results[0] == results[1]
+
+
+def test_interrupting_import_while_session_store_is_locked_saves_nothing(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI]
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    token = fixture_token(ADDR)
+    trader = rust.home / "trader"
+    trader.mkdir(parents=True, mode=0o700)
+
+    def submit_token(master: int) -> None:
+        os.write(master, (token + "\n").encode())
+        assert select.select([master], [], [], 5)[0], "prompt did not complete"
+        assert os.read(master, 4096) == b"\r\n"
+
+    with (trader / "sessions.lock").open("wb") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        code, stdout, stderr = interrupt_prompt(
+            rust,
+            ("auth", "import"),
+            terminal_ctrl_c=False,
+            before_interrupt=submit_token,
+        )
+    assert code == 1
+    assert stdout == ""
+    assert stderr.endswith("\nAborted!\n")
+    assert not session_state(rust)["sessions"]
 
 
 @pytest.mark.parametrize("entry", ["clipboard", "hidden", "enter", "changed"])

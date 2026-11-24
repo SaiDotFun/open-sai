@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{collections::BTreeMap, fs, io, path::Path, time::Duration};
 
 use aes::Aes256;
 use aes_gcm::{
@@ -292,14 +292,36 @@ impl Storage<'_> {
         Ok(())
     }
 
+    fn session_lock_file(&self) -> io::Result<fs::File> {
+        private_file(&self.directory()?.join("sessions.lock"))
+    }
+
     fn lock_sessions(&self) -> io::Result<fs::File> {
-        let lock = private_file(&self.directory()?.join("sessions.lock"))?;
+        let lock = self.session_lock_file()?;
         lock.lock()?;
         Ok(lock)
     }
 
     pub fn save_session(&self, session: Session) -> Result<(), StorageError> {
-        let lock = self.lock_sessions()?;
+        self.save_session_locked(self.lock_sessions()?, session)
+    }
+
+    /// Wait for the session lock without blocking cancellation in the caller.
+    /// Once acquired, keep the lock through the synchronous commit.
+    pub async fn save_session_async(&self, session: Session) -> Result<(), StorageError> {
+        let lock = self.session_lock_file()?;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return self.save_session_locked(lock, session),
+                Err(fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn save_session_locked(&self, lock: fs::File, session: Session) -> Result<(), StorageError> {
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
             Err(StorageError::SessionData(_)) => Accounts::default(),

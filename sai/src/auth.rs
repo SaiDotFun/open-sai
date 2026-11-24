@@ -256,12 +256,23 @@ async fn import(
     env: &Environment,
     json: bool,
 ) -> Result<(), SaiError> {
-    let token = read_token().await?;
-    let settings = load_settings(flags, env)?;
-    let session = auth::import_session(token.clone(), settings.endpoint())?;
-    let summary = serde_json::to_value(session.summary()).map_err(|_| SaiError::internal())?;
-    log::remember([token.to_string()]);
-    storage.save_session(session)?;
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| SaiError::internal())?;
+    let (token, summary) = tokio::select! {
+        biased;
+        _ = interrupt.recv() => {
+            eprintln!();
+            return Err(aborted());
+        }
+        result = async {
+            let token = read_token().await?;
+            let settings = load_settings(flags, env)?;
+            let session = auth::import_session(token.clone(), settings.endpoint())?;
+            let summary = serde_json::to_value(session.summary()).map_err(|_| SaiError::internal())?;
+            log::remember([token.to_string()]);
+            storage.save_session_async(session).await?;
+            Ok::<_, SaiError>((token, summary))
+        } => result?,
+    };
     if let Some((copied, tool)) = Clipboard::read().await
         && copied == token
         && !tool.clear().await
@@ -333,8 +344,6 @@ async fn hidden_line(terminal: &AsyncFd<BorrowedFd<'_>>) -> io::Result<Zeroizing
 }
 
 async fn prompt_token(stdin: &io::Stdin) -> Result<Zeroizing<String>, SaiError> {
-    let aborted = || SaiError::new(Code::InvalidRequest, "Aborted");
-    let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| SaiError::internal())?;
     let _hidden = HiddenInput::new(stdin).map_err(|_| aborted())?;
     // SAFETY: BorrowedFd keeps stdin's descriptor valid and unchanged while
     // the registration is live. HiddenInput has already enabled nonblocking reads.
@@ -344,13 +353,13 @@ async fn prompt_token(stdin: &io::Stdin) -> Result<Zeroizing<String>, SaiError> 
         .write_all(b"Paste the Sai session token (Enter reads the clipboard): ")
         .and_then(|()| io::stderr().flush())
         .map_err(|_| aborted())?;
-    let result = tokio::select! {
-        biased;
-        _ = interrupt.recv() => Err(aborted()),
-        line = hidden_line(&terminal) => line.map_err(|_| aborted()),
-    };
+    let result = hidden_line(&terminal).await.map_err(|_| aborted());
     eprintln!();
     result
+}
+
+fn aborted() -> SaiError {
+    SaiError::new(Code::InvalidRequest, "Aborted")
 }
 
 async fn read_token() -> Result<Zeroizing<String>, SaiError> {
