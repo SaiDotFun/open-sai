@@ -240,12 +240,7 @@ def close_trade(
             if lcd_endpoint is None:
                 raise ValueError("Cannot verify the pending order without an LCD")
             contract = margin.trading_contract(endpoint, lcd_endpoint)
-            trade = margin.smart_value(
-                lcd_endpoint,
-                contract,
-                {"get_trade_raw": {"trader": addr, "index": trade_id}},
-                fresh=True,
-            )
+            trade = margin.read_cancel_target(lcd_endpoint, contract, addr, trade_id)
             if (
                 not isinstance(trade, dict)
                 or trade.get("user_trade_index") != f"UserTradeIndex({trade_id})"

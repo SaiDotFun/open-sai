@@ -36,6 +36,7 @@ class Position:
     collateral: int = 4_000_000
     trade_type: str = "trade"
     logout_on_position_read: bool = False
+    missing_trade_status: int = 400
     leverage: str = "2"
     max_leverage: int = 100
     liquidation_threshold: str = "60"
@@ -140,6 +141,16 @@ def position_service() -> Iterator[tuple[Position, str]]:
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
+                index = message["get_trade_raw"]["index"]
+                if index != 7:
+                    self.reply(
+                        {
+                            "code": 3,
+                            "message": f"Generic error: Trade not found for trader {TRADER} with index {index}",
+                        },
+                        status=position.missing_trade_status,
+                    )
+                    return
                 if position.logout_on_position_read:
                     assert storage.delete_session(ADDR) == ADDR
                     position.logout_on_position_read = False
@@ -260,12 +271,14 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 height = None
             self.reply({"data": data}, height)
 
-        def reply(self, value: dict[str, Any], height: int | None = None) -> None:
+        def reply(
+            self, value: dict[str, Any], height: int | None = None, *, status: int = 200
+        ) -> None:
             requested_height = self.headers.get("x-cosmos-block-height")
             if requested_height is not None and height is not None:
                 assert requested_height == str(height)
             data = json.dumps(value).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
             if height is not None:
@@ -1249,5 +1262,23 @@ def test_voluntary_close_fees_cannot_exceed_position_collateral(position_service
             estimates = quote["estimates"]
             assert estimates["execution"]["status"] == "voluntary_close"
             assert estimates["fees"]["amountUsdc"] == "1"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("status", [400, 500])
+def test_cancel_missing_trade_is_a_usage_error(position_service, status):
+    position, base_url = position_service
+    position.missing_trade_status = status
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            result = await call(
+                client, "preview_close", {"trade_id": 99, "cancel_order": True}
+            )
+            assert result["code"] == "INVALID_REQUEST"
+            assert result["error"] == "Trade 99 was not found for this account."
+            assert "preview" not in result
+            assert position.submitted == []
 
     asyncio.run(scenario())

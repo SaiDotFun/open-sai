@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
@@ -89,6 +90,28 @@ def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise TypeError("Contract returned invalid state")
     return data
+
+
+def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> Any:
+    """Read the live order and distinguish Perp's missing-target error from a quote mismatch."""
+    try:
+        return smart_value(
+            lcd,
+            contract,
+            {"get_trade_raw": {"trader": trader, "index": trade_id}},
+            fresh=True,
+        )
+    except QueryHeightMismatch as exc:
+        failure = exc.__cause__
+        # The wasm gRPC gateway can wrap Perp query errors in HTTP 500.
+        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+            rf"Trade not found for trader \S+ with index {trade_id}\b",
+            failure.response.text,
+        ):
+            raise ValueError(
+                f"Trade {trade_id} was not found for this account."
+            ) from exc
+        raise ValueError(f"Unable to read pending order {trade_id} from Perp.") from exc
 
 
 @dataclass(frozen=True)
