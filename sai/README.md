@@ -24,11 +24,11 @@ balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
 uses Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf` for
 Keeper requests, reconciliation, structured errors, and emitted events.
-The codes-only GraphQL diagnostics for intent and history queries follow
-the current Python reference below.
+Every Keeper query logs only public GraphQL error codes and an error count,
+following the current Python reference below.
 Logging v2 and intent wait have their own port work. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
 C5 compares read and watch commands against Python on `main` at
-`106d4f3324134c2b1be845be44fc126076aef53c`. These commands emit schema v2
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. These commands emit schema v2
 events, including keyed endpoint IDs for Keeper HTTP reads.
 
 | Lane | Acceptance criteria |

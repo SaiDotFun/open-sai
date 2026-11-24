@@ -81,6 +81,7 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    absent_log_text: list[str] | None = None
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
 
@@ -361,6 +362,11 @@ def observe(
     normalize = Normalize(
         home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
     )
+    if case.absent_log_text:
+        for path in (home / "sai" / "logs").glob("*.jsonl"):
+            text = path.read_text(encoding="utf-8")
+            if any(value in text for value in case.absent_log_text):
+                raise ValueError("Fixture credential appeared in a log")
     files = snapshot(home / "sai", normalize)
     check_state(case.state or {}, files)
     try:

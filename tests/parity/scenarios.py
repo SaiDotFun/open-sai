@@ -77,10 +77,11 @@ class Endpoints:
     admission: Admission = field(default_factory=Admission)
     interrupt_ready: threading.Event = field(default_factory=threading.Event)
     interrupt_closed: threading.Event = field(default_factory=threading.Event)
+    keeper_path: str = "/query"
 
     @property
     def keeper(self) -> str:
-        return self.http + "/query"
+        return self.http + self.keeper_path
 
     def expand(self, value: str) -> str:
         for key, replacement in {
@@ -172,6 +173,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     admission = Admission()
     interrupt_ready, interrupt_closed = threading.Event(), threading.Event()
     scope = f"/parity/{uuid.uuid4().hex}"
+    keeper_path = (
+        "/query/fixture-path-key?key=fixture-query-key"
+        if scenario == "keeper-echo-error"
+        else "/query"
+    )
     markets = fixture("mainnet_markets_http.json")
     prices = fixture("mainnet_prices_http.json")
     position = PROTOCOL["account_positions_response"]["data"]["perp"]["trades"][0]
@@ -357,11 +363,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
 
         def do_POST(self) -> None:
             if not self.path.startswith("/") or (
-                self.path.startswith(scope) and self.path != f"{scope}/query"
+                self.path.startswith(scope) and self.path != scope + keeper_path
             ):
                 self.reject("Unexpected HTTP POST")
                 return
-            if self.path != f"{scope}/query":
+            if self.path != scope + keeper_path:
                 self.reply({}, 404)
                 return
             try:
@@ -384,6 +390,22 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                         interrupt_closed.wait(8)
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif scenario == "keeper-echo-error":
+                        self.reply(
+                            {
+                                "errors": [
+                                    {
+                                        "message": f"Rejected request {self.path}",
+                                        "extensions": {"code": "FORBIDDEN"},
+                                    },
+                                    {
+                                        "extensions": {
+                                            "code": self.path.partition("?key=")[2]
+                                        }
+                                    },
+                                ]
+                            }
+                        )
                     elif (
                         scenario == "read-number-spelling" and name == "tokenPricesUsd"
                     ):
@@ -642,4 +664,5 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             admission,
             interrupt_ready,
             interrupt_closed,
+            keeper_path=keeper_path,
         )

@@ -156,11 +156,8 @@ impl<'a> Keeper<'a> {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
-            let codes_only = matches!(query, INTENTS | HISTORY);
-            log.errors = Some(graphql_errors(errors, codes_only));
-            if codes_only {
-                log.error_count = Some(errors.as_array().map_or(1, Vec::len));
-            }
+            log.errors = Some(graphql_errors(errors));
+            log.error_count = Some(errors.as_array().map_or(1, Vec::len));
             if query == SUBMIT
                 && !result.get("data").is_some_and(truthy)
                 && errors.as_array().is_some_and(|items| {
@@ -233,29 +230,19 @@ const GRAPHQL_ERROR_CODES: &[&str] = &[
     "UNAUTHENTICATED",
 ];
 
-fn graphql_errors(errors: &Value, codes_only: bool) -> Field {
+fn graphql_errors(errors: &Value) -> Field {
     let entries = errors.as_array().into_iter().flatten().take(3);
     Field::Array(
         entries
             .filter_map(Value::as_object)
             .map(|item| {
-                let code = item.get("extensions").and_then(|value| value.get("code"));
-                if codes_only {
-                    let public_code = code
-                        .and_then(Value::as_str)
-                        .filter(|value| GRAPHQL_ERROR_CODES.contains(value))
-                        .map_or_else(|| json!(Code::KeeperError), |value| json!(value));
-                    return Field::Object(vec![("code".into(), public_code.into())]);
-                }
-                let code = code.filter(|value| !value.is_null()).map(stringify);
-                let message = item.get("message").map_or_else(String::new, stringify);
-                Field::Object(vec![
-                    (
-                        "code".into(),
-                        code.map_or(Field::Scalar(Value::Null), Field::Untrusted),
-                    ),
-                    ("message".into(), Field::Untrusted(message)),
-                ])
+                let code = item
+                    .get("extensions")
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str)
+                    .filter(|value| GRAPHQL_ERROR_CODES.contains(value))
+                    .map_or_else(|| json!(Code::KeeperError), |value| json!(value));
+                json!({"code": code}).into()
             })
             .collect(),
     )

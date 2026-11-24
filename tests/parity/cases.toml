@@ -125,6 +125,15 @@ expect = 1
 wire = ["tokenPricesUsd"]
 
 [[case]]
+name = "market-keeper-echo-error"
+args = ["--json","--endpoint","{keeper}","market","prices"]
+server = "keeper-echo-error"
+expect = 1
+wire = ["tokenPricesUsd"]
+absent_log_text = ["fixture-path-key", "fixture-query-key"]
+state = { "logs/cli.jsonl#1.keeperErrors" = [{ code = "FORBIDDEN" }, { code = "KEEPER_ERROR" }], "logs/cli.jsonl#1.keeperErrorCount" = 2 }
+
+[[case]]
 name = "market-prices-interrupt"
 args = ["--json","market","prices"]
 server = "interrupt-http"
