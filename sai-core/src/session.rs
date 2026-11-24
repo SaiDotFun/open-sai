@@ -7,10 +7,13 @@ use serde::Serialize;
 
 use crate::{
     errors::{Code, SaiError},
+    keeper::is_evm_address,
     log,
     settings::MAINNET_HTTP,
     storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
+
+const INVALID_RENEWAL_ADDRESS: &str = "Stored session address is invalid. Sign in again.";
 
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
     Ok(session_expiry(session)? <= now)
@@ -28,7 +31,8 @@ pub fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> 
 #[serde(rename_all = "camelCase")]
 pub struct ExpiryNotice {
     pub expiry_warning: String,
-    pub renewal_command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_command: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub renewal_guidance: Option<String>,
 }
@@ -40,8 +44,10 @@ impl ExpiryNotice {
             notice.push(' ');
             notice.push_str(guidance);
         }
-        let _ = write!(notice, " Run {}", self.renewal_command);
-        escape_warning_text(&notice)
+        if let Some(command) = &self.renewal_command {
+            let _ = write!(notice, " Run {command}");
+        }
+        notice
     }
 }
 
@@ -208,19 +214,24 @@ impl Storage<'_> {
                 addr: session.addr(),
                 expires_at: session.expires_at(),
             });
+            if !is_evm_address(session.addr()) {
+                let mut error = SaiError::new(Code::SessionExpired, INVALID_RENEWAL_ADDRESS);
+                error.hint = None;
+                return Err(SessionError(error));
+            }
             let mut error = SaiError::new(
                 Code::SessionExpired,
                 "Trading session expired; sign in again",
             );
-            error.hint = Some(if session.key_name().is_some() || session.is_imported() {
+            error.hint = if session.key_name().is_some() || session.is_imported() {
                 let (command, guidance) = self.renewal_fields(session);
                 if let Some(guidance) = guidance {
                     error.message.push_str(&format!(". {guidance}"));
                 }
                 command
             } else {
-                self.sign_in_hint(endpoint, Some(session.addr()))
-            });
+                Some(self.sign_in_hint(endpoint, Some(session.addr())))
+            };
             return Err(SessionError(error));
         }
         Ok(())
@@ -262,7 +273,10 @@ impl Storage<'_> {
         format!("sai --endpoint {flag} {}", shell_join(args))
     }
 
-    pub fn renewal_fields(&self, session: &Session) -> (String, Option<String>) {
+    pub fn renewal_fields(&self, session: &Session) -> (Option<String>, Option<String>) {
+        if !is_evm_address(session.addr()) {
+            return (None, Some(INVALID_RENEWAL_ADDRESS.into()));
+        }
         let args: &[&str] = if session.key_name().is_some() {
             &["auth", "renew", session.addr()]
         } else {
@@ -290,7 +304,7 @@ impl Storage<'_> {
             guidance.push("You can also sign in again with your Foundry keystore.".into());
         }
         (
-            self.keeper_command(endpoint, route, "", args),
+            Some(self.keeper_command(endpoint, route, "", args)),
             (!guidance.is_empty()).then(|| guidance.join(" ")),
         )
     }

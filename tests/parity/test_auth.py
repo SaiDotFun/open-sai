@@ -519,6 +519,53 @@ def test_auth_expiry_notice_on_terminal_matches_python(
     assert results[0] == results[1]
 
 
+@pytest.mark.parametrize("source", ["legacy", "imported"])
+def test_auth_expiry_notice_for_invalid_subject_matches_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    renewal_pair: tuple[CLI, CLI],
+    source: str,
+) -> None:
+    endpoint = "http://127.0.0.1:9/private-path"
+    addr = ADDR[:-4] + "\n\r\x1b\u2028"
+    expiry = datetime.now(UTC) + timedelta(hours=24, minutes=30)
+    warning = rf"Sai session for {ADDR[:-4]}\n\r\x1b\u2028 expires in 24 h."
+    guidance = "Stored session address is invalid. Sign in again."
+    outputs = []
+    for env in homes(tmp_path, renewal_pair):
+        save_expiry_fixture(
+            env, monkeypatch, addr=addr, endpoint=endpoint, expiry=expiry, source=source
+        )
+        reports = []
+        for auth in ("status", "list"):
+            result = run_expiry_notice_on_terminal(
+                env, "--endpoint", endpoint, "auth", auth
+            )
+            assert result[0] == 0
+            data = json.loads(result[1])
+            report = data if auth == "status" else data["accounts"][0]
+            assert report["expiryWarning"] == warning
+            assert report["renewalGuidance"] == guidance
+            assert "renewalCommand" not in report
+            assert result[2].splitlines() == [f"{warning} {guidance}"]
+            reports.append(result)
+        save_expiry_fixture(
+            env,
+            monkeypatch,
+            addr=addr,
+            endpoint=endpoint,
+            expiry=datetime.now(UTC) - timedelta(hours=1),
+            source=source,
+        )
+        expired = env.run("--json", "--endpoint", endpoint, "auth", "status")
+        assert expired.returncode == 6
+        failure = json.loads(expired.stdout)["error"]
+        assert failure["message"] == guidance
+        assert "hint" not in failure
+        outputs.append(reports)
+    assert outputs[0] == outputs[1]
+
+
 @pytest.mark.parametrize("path", ["", "/query", "/fixture-path-key/query"])
 def test_signed_out_recovery_hint_only_shows_the_keeper_origin(
     tmp_path: Path, auth_pair: tuple[CLI, CLI], path: str

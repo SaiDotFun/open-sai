@@ -145,8 +145,14 @@ pub fn dispatch(
                     "Stored session belongs to another Keeper endpoint",
                 ));
             }
+            let (command, guidance) = storage.renewal_fields(&stored);
+            let Some(command) = command else {
+                return Err(SaiError::new(
+                    Code::InvalidRequest,
+                    guidance.unwrap_or_default(),
+                ));
+            };
             let Some(name) = stored.key_name() else {
-                let (command, guidance) = storage.renewal_fields(&stored);
                 let mut message = if stored.is_imported() {
                     format!("This session was imported. Run `{command}` with a fresh token.")
                 } else {
@@ -162,7 +168,6 @@ pub fn dispatch(
                 .block_on(login(&keeper, name, Some(stored.addr())))
                 .map_err(|error| {
                     if matches!(error, LoginError::NeedsTerminal(_)) {
-                        let (command, guidance) = storage.renewal_fields(&stored);
                         let mut message = format!("{error} Run `{command}` in a terminal.");
                         if let Some(guidance) = guidance {
                             message.push_str(&format!(" {guidance}"));

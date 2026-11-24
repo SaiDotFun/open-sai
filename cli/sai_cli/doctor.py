@@ -735,7 +735,7 @@ def check_session(ctx: Context) -> Check:
             "session",
             "fail",
             f"{summary}. {guidance}" if guidance else summary,
-            state.get("renewalCommand", SIGN_IN),
+            state.get("renewalCommand", None if guidance else SIGN_IN),
             details,
         )
     if not state["endpointMatches"]:
@@ -765,7 +765,7 @@ def check_session(ctx: Context) -> Check:
             "session",
             "warn",
             f"{warning} {guidance}" if guidance else warning,
-            state["renewalCommand"],
+            state.get("renewalCommand"),
             details,
         )
     return Check(

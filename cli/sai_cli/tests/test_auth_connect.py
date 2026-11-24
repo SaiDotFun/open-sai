@@ -1186,6 +1186,39 @@ def test_expiry_notice_with_path_endpoint(env: Env, keeper_auth, auth: str):
     assert "expiryWarning" not in json.loads(current.stdout)
 
 
+def test_legacy_expiry_notice_with_invalid_subject_guides_sign_in(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    addr = ADDR[:-4] + "\n\r\x1b\u2028"
+    stored = {
+        "evmAddress": addr,
+        "token": make_token(addr, hours=48),
+        "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        "endpoint": keeper.MAINNET_HTTP,
+    }
+    storage.save_session(stored)
+
+    result, warning = run_expiry_notice_on_terminal(env, "auth", "status")
+    report = json.loads(result.stdout)
+    assert "renewalCommand" not in report
+    assert (
+        report["renewalGuidance"] == "Stored session address is invalid. Sign in again."
+    )
+    assert warning.splitlines() == [
+        f"{report['expiryWarning']} {report['renewalGuidance']}"
+    ]
+    assert rf"{ADDR[:-4]}\n\r\x1b\u2028" in warning
+
+    stored["expiresAt"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    storage.save_session(stored)
+    expired = env.run("--json", "auth", "status")
+    assert expired.returncode == 6
+    failure = json.loads(expired.stdout)["error"]
+    assert failure["message"] == report["renewalGuidance"]
+    assert "hint" not in failure
+
+
 @pytest.mark.parametrize(
     "suffix",
     ["/query?api_key=synthetic-test-credential", "/synthetic-test-credential/query"],

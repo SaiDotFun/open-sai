@@ -13,6 +13,7 @@ from . import keeper, log, storage
 from .errors import Code, SessionError
 
 EXPIRY_WARNING = timedelta(days=3)
+INVALID_RENEWAL_ADDRESS = "Stored session address is invalid. Sign in again."
 
 
 def expiry_time(result: dict[str, str]) -> datetime:
@@ -24,10 +25,13 @@ def expiry_time(result: dict[str, str]) -> datetime:
 
 def renewal_fields(result: dict[str, str]) -> dict[str, str]:
     """Return a shell command and any guidance needed to renew the session."""
+    addr = result["evmAddress"]
+    if not keeper.is_address(addr):
+        return {"renewalGuidance": INVALID_RENEWAL_ADDRESS}
     if result.get("keyName"):
-        args = ("auth", "renew", result["evmAddress"])
+        args = ("auth", "renew", addr)
     else:
-        args = ("auth", "import", "--addr", result["evmAddress"])
+        args = ("auth", "import", "--addr", addr)
     endpoint = result.get("endpoint") or ""
     origin = log.origin(endpoint)
     show_origin = origin != log.REDACTED_URL and log.redact(origin) == origin
@@ -52,12 +56,13 @@ def renewal_fields(result: dict[str, str]) -> dict[str, str]:
 
 
 def expiry_notice_text(fields: Mapping[str, str]) -> str:
+    command = fields.get("renewalCommand")
     parts = (
         fields["expiryWarning"],
         fields.get("renewalGuidance"),
-        f"Run {fields['renewalCommand']}",
+        f"Run {command}" if command else None,
     )
-    return escape_warning_text(" ".join(part for part in parts if part))
+    return " ".join(part for part in parts if part)
 
 
 def escape_warning_text(value: str) -> str:
@@ -122,6 +127,10 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
             addr=result.get("evmAddress"),
             expiresAt=result["expiresAt"],
         )
+        if not keeper.is_address(result["evmAddress"]):
+            error = SessionError(INVALID_RENEWAL_ADDRESS, Code.SESSION_EXPIRED)
+            error.hint = None
+            raise error
         message = "Trading session expired; sign in again"
         if result.get("keyName") or result.get("source") == "imported":
             fields = renewal_fields(result)

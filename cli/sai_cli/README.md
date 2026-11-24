@@ -241,9 +241,10 @@ Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
 warning when a session has less than three days left. Interactive commands
 can also print a one-line notice to stderr. In the `auth status` and `auth
 list` JSON output, the account overview, and MCP session reports, look for
-`expiryWarning`, the shell command `renewalCommand`, and optional
-`renewalGuidance`. Share the guidance separately when passing the command to
-someone else.
+`expiryWarning`, the shell command `renewalCommand` when available, and
+optional `renewalGuidance`. Share the guidance separately when passing the
+command to someone else. If the stored account address is invalid, the
+report asks you to sign in again.
 
 The command specifies `--endpoint` so the destination shell uses the original
 Keeper. An origin-only URL or the public built-in Keeper URL appears directly

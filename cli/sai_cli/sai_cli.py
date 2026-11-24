@@ -567,6 +567,8 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         endpoint = keeper_url(ctx)
         if stored.get("endpoint") != endpoint:
             raise SessionError("Stored session belongs to another Keeper endpoint")
+        if not keeper.is_address(stored["evmAddress"]):
+            raise ValueError(sessions.INVALID_RENEWAL_ADDRESS)
         name = stored.get("keyName")
         if not name:
             fields = sessions.renewal_fields(stored)
