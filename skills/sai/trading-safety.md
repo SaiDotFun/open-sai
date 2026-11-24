@@ -172,14 +172,18 @@ approval still describes the trade:
   risk guard can also reduce the position before Perp closes the requested
   slice.
 - **Margin** takes an amount, `--direction add|remove --amount USDC`, and
-  computes the target leverage from the position at submit. The dry run's
-  target is a quote: adding 25 USDC to 100 USDC of collateral at 5x previews
+  computes the target from the effective leverage Perp will use, including
+  any applicable after-hours cap. The dry run's target is a quote: adding
+  25 USDC to 100 USDC of collateral at 5x previews
   4x, but if the collateral doubles before submit the same command sends
   about 4.44x. Ask the person to approve the amount, and say the CLI
   computes the target leverage at submit. If they approve a specific target
   leverage, use MCP tools `preview_margin` and `trade_margin`, whose digest
   binds the whole quote, or `trade leverage ID --leverage VALUE`, which
-  sends the target they named.
+  sends the target they named. If `quote.marginChangeIsEstimate` is true,
+  tell the person the after-hours guard can deduct fees before Perp applies
+  the target leverage. Perp determines the direction from effective leverage
+  at execution.
 - **Market open** fills from the price at submit. Give the worst case from
   rule 3 before asking.
 

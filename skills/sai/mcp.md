@@ -108,8 +108,10 @@ the one the person confirmed. The digest covers:
 
 - Every trade: the account and the intent the arguments produce.
 - `trade_open` for a market order: also the confirmed `reference_price`.
-- `trade_margin` also binds the full margin quote, including the position's
-  starting collateral and leverage.
+- `trade_margin` also binds the full margin quote, including starting
+  collateral, stored leverage, and the inputs that determine effective
+  leverage. If `quote.marginChangeIsEstimate` is true, say that after-hours
+  guard fees can change the amount.
 - `trade_partial_close` also binds the close percentage, starting collateral
   and leverage, and the contract inputs used to quote the requested slice,
   including the applicable after-hours cap and collateral/USD oracle price.
