@@ -15,7 +15,7 @@ use std::{
 use serde_json::{Value, json};
 use toml_edit::{Item, TomlError};
 
-use crate::endpoint::Endpoint;
+use crate::{endpoint::Endpoint, log};
 use toml::ParsedDocument;
 
 pub const FILE_NAME: &str = "config.toml";
@@ -152,18 +152,8 @@ impl Key {
     }
 
     pub fn public_value(self, value: &Value) -> Value {
-        if let (Kind::Url(_), Some(endpoint)) = (self.spec().kind, value.as_str())
-            && let Some(endpoint) = Endpoint::split(endpoint)
-        {
-            let (host, port) = endpoint.host_port();
-            let authority = match port {
-                Ok(Some(port)) => format!("{host}:{port}"),
-                _ => host,
-            };
-            return json!(format!(
-                "{}://{authority}{}",
-                endpoint.scheme, endpoint.path
-            ));
+        if let (Kind::Url(_), Some(endpoint)) = (self.spec().kind, value.as_str()) {
+            return json!(log::origin(endpoint));
         }
         value.clone()
     }

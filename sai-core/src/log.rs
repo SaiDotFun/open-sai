@@ -24,8 +24,8 @@ use uuid::Uuid;
 use crate::settings::{self, Environment};
 
 use files::LogDir;
-pub use privacy::Field;
 use privacy::{Budget, EVENT_CHARS, endpoint_digest, prefix};
+pub use privacy::{Field, origin};
 use session_tokens::{FileStamp, Tokens, stamp};
 
 const QUEUE_SIZE: usize = 2048;

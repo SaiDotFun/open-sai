@@ -94,7 +94,7 @@ impl ConfigCommand {
                     println!(
                         "{{\"key\": {}, \"value\": {}, \"path\": {path}}}",
                         format_json(&json!(key.spec().name)),
-                        format_json(&value)
+                        format_json(&key.public_value(&value))
                     );
                 } else {
                     println!("Set {} in {}", key.spec().name, path.display());
@@ -146,7 +146,7 @@ pub fn help(command: &str) -> Option<String> {
         }
         "config get" => "Print the exact value of KEY as resolved now.",
         "config list" => {
-            "Show every setting with its value and source.\n\n  The source is flag, env, file, default, or derived. URLs are shown without\n  credentials; `sai config get` prints the exact value."
+            "Show every setting with its value and source.\n\n  The source is flag, env, file, default, or derived. Endpoint URLs are\n  shown as origins. `sai config get` prints the exact value."
         }
         "config set" => "Set KEY to VALUE in the config file, keeping its comments.",
         "config unset" => "Remove KEY from the config file so the default applies again.",
