@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import subprocess
 from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler
@@ -24,6 +25,7 @@ from scenarios import (
     PROTOCOL,
     TRADE_REQUEST_HASH,
     Endpoints,
+    child_env,
     seed_home,
 )
 from test_trade import CLI, rows, run
@@ -356,11 +358,25 @@ def runners(
     return [("python", (reference,)), rust] if reference else [rust]
 
 
-def normalize_times(output: dict[str, Any]) -> None:
-    liq = output["estimates"]["liquidationPrice"]
+def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> bytes:
+    result = subprocess.run(
+        [*cli, "--json", *command, "--dry-run"],
+        cwd=home,
+        env={**child_env(home, endpoints), "SAI_UPDATE_AUTO": "0"},
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    assert (result.returncode, result.stderr) == (0, b"")
+    liq = json.loads(result.stdout)["estimates"]["liquidationPrice"]
     if entry := liq.get("entry"):
-        assert timestamp(entry["observedAt"])
-        entry["observedAt"] = "<timestamp>"
+        observed_at = entry["observedAt"]
+        assert timestamp(observed_at)
+        return result.stdout.replace(
+            json.dumps(observed_at).encode(), b'"<timestamp>"', 1
+        )
+    return result.stdout
 
 
 @pytest.mark.parametrize(
@@ -477,12 +493,9 @@ def test_position_update_dry_run(
         home = tmp_path / implementation
         with update_loopback(mode) as endpoints:
             seed_home(home, endpoints, "session")
-            code, output, stderr = run(
-                cli, home, endpoints, (*command, "--dry-run"), python=False
+            assert (
+                dry_run_bytes(cli, home, endpoints, command) == (golden + "\n").encode()
             )
-            assert (code, stderr) == (0, "")
-            normalize_times(output)
-            assert json.dumps(output) == golden
             assert [entry.label for entry in endpoints.wire] == QUOTE_WIRE + suffix
             assert not endpoints.errors
             assert not (home / "sai/trader/intents.sqlite3").exists()
