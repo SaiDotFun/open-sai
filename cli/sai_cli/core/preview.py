@@ -524,7 +524,7 @@ def position_estimates(
 ) -> dict[str, Any]:
     """Quote leverage or TP/SL changes after checking the after-hours guard."""
     unknown = unavailable(
-        "Cannot verify the position and Perp execution inputs at one block."
+        "Cannot verify the Perp execution inputs and after-hours guard at one block."
     )
     result = dict.fromkeys(ESTIMATE_FIELDS, unknown)
     if state is None:
