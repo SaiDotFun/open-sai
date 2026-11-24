@@ -504,6 +504,27 @@ def test_config_list_reports_invalid_retention_when_logging_is_off(
 
 
 @pytest.mark.parametrize(
+    "args",
+    [("--json", "account", "overview"), ("account", "overview", "--json")],
+    ids=["root", "subcommand"],
+)
+def test_account_overview_reports_settings_errors_in_json(monkeypatch, args):
+    monkeypatch.setenv("SAI_UPDATE_AUTO", "fixture-invalid-boolean")
+
+    result = sai(*args)
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error": {
+            "code": "INVALID_REQUEST",
+            "message": "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false",
+            "retryable": False,
+        }
+    }
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
     ("args", "key", "flag"),
     [
         (

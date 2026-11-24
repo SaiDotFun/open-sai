@@ -298,6 +298,9 @@ class LoggedGroup(SaiGroup):
         exit_code: int = ExitCode.OK
         failure: SaiError | None = None
         start_logged = False
+        obj = extra.get("obj")
+        if not isinstance(obj, dict):
+            obj = extra["obj"] = {}
 
         def log_start() -> None:
             nonlocal start_logged
@@ -318,10 +321,7 @@ class LoggedGroup(SaiGroup):
             if command == "doctor" and not quiet:
                 # Let doctor report directory creation before logging creates
                 # the profile to record its first event.
-                extra["obj"] = {
-                    **(extra.get("obj") or {}),
-                    "doctor_log_start": log_start,
-                }
+                obj["doctor_log_start"] = log_start
             else:
                 log_start()
             try:
@@ -338,7 +338,7 @@ class LoggedGroup(SaiGroup):
                 exit_code = failure.exit_code
                 if not standalone_mode:
                     raise
-                show_failure(exc, failure, json_requested(argv))
+                show_failure(exc, failure, obj.get("json", json_requested(argv)))
             else:
                 # With standalone mode disabled, Click returns explicit exit codes.
                 if isinstance(result, int):
@@ -527,6 +527,7 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
         if line in ("exit", "quit"):
             break
         args: list[str] = []
+        command_obj: dict[str, Any] = {}
         try:
             args = repl_args(line)
             if args:
@@ -534,11 +535,14 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
                     args=[*forwarded_flags(ctx.obj), *args],
                     prog_name="sai",
                     standalone_mode=False,
+                    obj=command_obj,
                 )
         except (click.Abort, KeyboardInterrupt):
             click.echo("Interrupted", err=True)
         except Exception as exc:  # noqa: BLE001 - keep the REPL open
-            show_failure(exc, cli_failure(exc), json_requested(args))
+            show_failure(
+                exc, cli_failure(exc), command_obj.get("json", json_requested(args))
+            )
 
 
 @main.group()
