@@ -148,6 +148,44 @@ def test_config_set_accepts_ipv6_with_port():
     assert json.loads(result.stdout)["value"] == endpoint
 
 
+@pytest.mark.parametrize("source", ["set", "flag", "env", "file"])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://bad host/path",
+        "https://bad\thost/path",
+        "https://user:password@bad host/path",
+        "https://bad\\host/path",
+        "https:\t//bad host/path",
+        "https:/\t/host/path",
+    ],
+)
+def test_rejects_malformed_endpoint_authority(tmp_path, monkeypatch, source, endpoint):
+    path = tmp_path / "config.toml"
+    if source == "set":
+        args = ["config", "set", "keeper.endpoint", endpoint]
+    else:
+        args = ["config", "get", "keeper.endpoint"]
+        if source == "flag":
+            args[:0] = ["--endpoint", endpoint]
+        elif source == "env":
+            monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        else:
+            path.write_text(f"[keeper]\nendpoint = {json.dumps(endpoint)}\n")
+
+    result = sai("--json", *args)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert "keeper.endpoint" in error["message"]
+    assert endpoint not in error["message"]
+    assert "password" not in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / ".config.lock").exists()
+    assert path.exists() == (source == "file")
+
+
 def test_flag_and_env_override_the_file(monkeypatch):
     sai("config", "set", "keeper.endpoint", "https://file.example/q")
     sai("config", "set", "keeper.ws_endpoint", "wss://ws.file.example/q")

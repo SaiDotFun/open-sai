@@ -12,6 +12,7 @@ the text with tomlkit, so comments the person adds survive.
 from __future__ import annotations
 
 import os
+import re
 import sys
 import tempfile
 import tomllib
@@ -248,8 +249,20 @@ def check_value(key: str, value: Any) -> str | bool | int:
                 or (suffix and not suffix.startswith(":"))
             ):
                 hostname = None
-        if parts.scheme in spec.schemes and hostname:
-            return value
+        scheme, separator, rest = value.partition("://")
+        if (
+            separator
+            and scheme.lstrip().lower() == parts.scheme
+            and parts.scheme in spec.schemes
+            and hostname
+        ):
+            # urlsplit strips tabs and newlines before it parses the authority.
+            authority = re.split(r"[/#?]", rest, maxsplit=1)[0]
+            if not any(
+                char.isspace() or char == "\\" or ord(char) < 32 or ord(char) == 127
+                for char in authority
+            ):
+                return value
     raise InvalidEndpoint(
         f"Invalid value for {key}: expected a URL starting with"
         f" {' or '.join(s + '://' for s in spec.schemes)}"
