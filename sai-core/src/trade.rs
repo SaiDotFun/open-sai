@@ -197,6 +197,11 @@ impl<'a> Trading<'a> {
         preview.position_route = self.basic_trade_route(session, &preview, true).await?;
         if preview.requires_market_price_refresh() {
             self.refresh_market_open(&mut preview).await?;
+            let price = preview
+                .reference_price
+                .as_deref()
+                .ok_or_else(SaiError::internal)?;
+            confirmation::reference_price_units(price, "Current price")?;
         }
         self.load_session(Some(session.addr()))?;
         Ok(preview.confirmed_output(Some(session.addr())))
@@ -267,7 +272,11 @@ impl<'a> Trading<'a> {
                     .reference_price
                     .as_deref()
                     .ok_or_else(SaiError::internal)?;
-                positive_decimal(price, "Current price")?;
+                if confirming {
+                    confirmation::reference_price_units(price, "Current price")?;
+                } else {
+                    positive_decimal(price, "Current price")?;
+                }
                 prepared.intent.body["intentPrice"] = json!(price);
             }
             &prepared
