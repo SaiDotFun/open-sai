@@ -378,7 +378,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     }
     contract_args = {
         "get_trade_raw": {
-            "trader": ADDRESS if scenario == "pending-order" else position["trader"],
+            "trader": ADDRESS
+            if scenario in {"pending-order", "concurrent-close"}
+            else position["trader"],
             "index": 7,
         },
         "get_exchange_balance": {
