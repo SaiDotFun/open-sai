@@ -1131,10 +1131,10 @@ def assert_watch_disconnect(
         f"Disconnected ({error_type}); data may be stale; reconnecting in 2s\n".encode()
     )
     assert [
-        (event["code"], event["errorType"])
+        (event["level"], event["code"], event["errorType"], event["endpoint"])
         for event in read_events(home)
         if event["event"] == "watch.disconnected"
-    ] == [("STREAM_ERROR", error_type)]
+    ] == [("warn", "STREAM_ERROR", error_type, ws.removesuffix("/query"))]
 
 
 @pytest.mark.parametrize(
@@ -1148,6 +1148,16 @@ def assert_watch_disconnect(
         ("Sec-WebSocket-Accept", (), "InvalidHeader"),
         ("Sec-WebSocket-Accept", ("first", "second"), "InvalidHeader"),
         ("Sec-WebSocket-Accept", ("wrong",), "InvalidHeaderValue"),
+        (
+            "Sec-WebSocket-Protocol",
+            ("graphql-transport-ws", "graphql-transport-ws"),
+            "InvalidHeader",
+        ),
+        (
+            "Sec-WebSocket-Protocol",
+            ("graphql-transport-ws, other",),
+            "InvalidHeader",
+        ),
     ],
 )
 def test_watch_reports_rejected_upgrade(
