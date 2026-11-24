@@ -38,12 +38,13 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Generator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from .. import mcp_install
 from . import log, update
 
 EXIT_OK = 0
@@ -560,6 +561,7 @@ class Outcome:
     installed: str | None = None
     target: str | None = None
     rolled_back: bool = False
+    mcp: tuple[mcp_install.RegistrationCheck, ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -568,13 +570,26 @@ class Outcome:
         return EXIT_FAILED if self.status == FAILED else EXIT_OK
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        result = {
             "status": self.status,
             "message": self.message,
             "installed": self.installed,
             "target": self.target,
             "rolledBack": self.rolled_back,
         }
+        if self.mcp:
+            result["mcp"] = self.mcp_results()
+        return result
+
+    def mcp_results(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "client": check.client,
+                "status": check.status,
+                "changes": list(check.changes),
+            }
+            for check in self.mcp
+        ]
 
 
 @dataclass(frozen=True)
@@ -618,6 +633,8 @@ def _record(outcome: Outcome, before: str | None, seen: bool) -> None:
         "error": outcome.message if outcome.status == FAILED else None,
         "rolledBack": outcome.rolled_back,
     }
+    if outcome.mcp:
+        result["mcp"] = outcome.mcp_results()
     changes: dict[str, Any] = {"result": result}
     if seen:
         changes["notified"] = f"{outcome.status}:{outcome.target}"
@@ -1034,6 +1051,24 @@ def update_now(options: Options | None = None) -> Outcome:
                 status = BUSY if options.background else FAILED
                 return Outcome(status, message, installed, target)
             outcome, interrupted = _install(options, current, release, uv)
+        if outcome.status == UPDATED:
+            target = mcp_install.launcher_target(str(current.launcher), os.environ)
+            checks = mcp_install.check_registrations(target, fix=True)
+            outcome = replace(
+                outcome,
+                mcp=tuple(
+                    check for check in checks if check.status in ("fixed", "fail")
+                ),
+            )
+            if outcome.mcp:
+                log.event(
+                    "update.mcp_repair",
+                    "warn"
+                    if any(check.status == "fail" for check in outcome.mcp)
+                    else "info",
+                    background=options.background,
+                    clients=outcome.mcp_results(),
+                )
         _record(outcome, installed, seen)
         if interrupted:
             raise KeyboardInterrupt
@@ -1041,6 +1076,32 @@ def update_now(options: Options | None = None) -> Outcome:
 
 
 # Automatic updates
+
+
+def mcp_notice(results: Any) -> str:
+    """Summarize this update's repairs using only known client names."""
+    if not isinstance(results, list):
+        return ""
+    repaired, failed = [], []
+    for entry in results:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("client") not in mcp_install.CLIENTS
+        ):
+            continue
+        if entry.get("status") == "fixed":
+            repaired.append(entry["client"])
+        elif entry.get("status") == "fail":
+            failed.append(entry["client"])
+    messages = []
+    if repaired:
+        messages.append(f"Repaired Sai MCP registrations for {', '.join(repaired)}.")
+    if failed:
+        messages.append(
+            f"Sai MCP registrations need attention for {', '.join(failed)}."
+            " Run `sai doctor` for details."
+        )
+    return " ".join(messages)
 
 
 def notice(state: dict[str, Any], installed: str | None) -> tuple[str, str] | None:
@@ -1058,9 +1119,10 @@ def notice(state: dict[str, Any], installed: str | None) -> tuple[str, str] | No
     if state.get("notified") == key:
         return None
     if status == UPDATED:
-        return key, (
+        message = (
             f"sai updated itself to {target}. Restart agent clients so they load it."
         )
+        return key, " ".join(filter(None, [message, mcp_notice(result.get("mcp"))]))
     if installed is not None and not update.is_newer(update.tag_for(target), installed):
         return None
     if status == AVAILABLE:

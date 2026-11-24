@@ -25,11 +25,12 @@ from pathlib import Path
 import pytest
 from click.testing import CliRunner
 from fake_release import build_wheel, downloads, release_routes
-from sai_cli.core import update, updater
+from sai_cli.core import log, update, updater
 from sai_cli.sai_cli import EXIT_UNSUPPORTED, auto_update_applies, main
+from test_mcp_install import FAKE_CLAUDE, OLD_COMMAND, OTHER, SECRET, write_exe
 from test_update import API_PATH, Stub, listing, make_prefix
 
-REAL_UV = shutil.which("uv")
+REAL_UV = os.environ.get("UV") or shutil.which("uv")
 needs_uv = pytest.mark.skipif(REAL_UV is None, reason="uv is not on PATH")
 
 
@@ -124,6 +125,93 @@ BROKEN_WHEN_INSTALLED = (
 
 
 # Real uv
+
+
+@pytest.mark.slow
+@needs_uv
+@pytest.mark.parametrize("mode", ["foreground", "json", "background", "failed"])
+def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
+    home = uv_dirs / "home"
+    home.mkdir()
+    codex_home = uv_dirs / "codex-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("FAKE_LOG", str(uv_dirs / "client-calls.jsonl"))
+    monkeypatch.chdir(uv_dirs)
+    config = home / ".claude.json"
+    entry = {
+        "command": OLD_COMMAND,
+        "args": ["--endpoint", "https://private.example/" + SECRET],
+        "env": {"CUSTOM": SECRET},
+    }
+    other = {"url": "https://private.example/mcp", "headers": {"X-Token": SECRET}}
+    original = json.dumps({"mcpServers": {"sai": entry, OTHER: other}})
+    config.write_text(original)
+    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    bad_hash = ("0.2.0",) if mode == "failed" else ()
+    with Stub(release_routes(wheels, bad_hash=bad_hash)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        write_exe(tool.sai.with_name("claude"), FAKE_CLAUDE)
+        # Supply the installed tool prefix to the real CLI. Keep the test
+        # runner's Python and dependencies while uv replaces the tool.
+        monkeypatch.setenv(
+            "PATH", str(tool.sai.parent) + os.pathsep + os.environ["PATH"]
+        )
+        args = ["update", "--api-base", stub.url, "--web-base", stub.url]
+        if mode == "json":
+            args.insert(0, "--json")
+        if mode == "background":
+            args.append("--background")
+        with monkeypatch.context() as runtime:
+            runtime.setattr(sys, "prefix", str(tool.prefix))
+            result = CliRunner().invoke(main, args, catch_exceptions=False)
+        if mode == "failed":
+            assert result.exit_code == 1
+            assert config.read_text() == original
+            assert not (uv_dirs / "client-calls.jsonl").exists()
+            return
+        assert result.exit_code == 0, result.output
+        assert tool.version() == "0.2.0"
+        assert json.loads(config.read_text())["mcpServers"] == {
+            "sai": {
+                **entry,
+                "command": str(tool.sai),
+                "args": ["mcp", "serve", *entry["args"]],
+            },
+            OTHER: other,
+        }
+        assert log.flush()
+        repair = [
+            event
+            for path in log.directory().glob("update-*.jsonl")
+            for line in path.read_text().splitlines()
+            if (event := json.loads(line))["event"] == "update.mcp_repair"
+        ]
+        assert len(repair) == 1
+        assert repair[0]["background"] is (mode == "background")
+        assert repair[0]["clients"][0]["client"] == "claude"
+        assert repair[0]["clients"][0]["status"] == "fixed"
+        state = updater.read_state()
+        message = "Repaired Sai MCP registrations for claude."
+        if mode == "background":
+            assert result.output == ""
+            notices: list[str] = []
+            # This check just ran. The next terminal command announces it once.
+            updater.save_state({"scheduledAt": time.time()})
+            updater.tick(notices.append, prefix=tool.prefix)
+            updater.tick(notices.append, prefix=tool.prefix)
+            assert len(notices) == 1 and message in notices[0]
+        elif mode == "json":
+            assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
+        else:
+            assert message in result.stdout
+        if mode != "background":
+            assert updater.notice(state, "0.2.0") is None
+        output = result.output + json.dumps(repair) + json.dumps(updater.read_state())
+        for value in (OTHER, SECRET, "private.example"):
+            assert value not in output
 
 
 @pytest.mark.slow

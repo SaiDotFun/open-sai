@@ -1886,8 +1886,8 @@ def update_command(
     Downloads the release wheel, checks it against the release's SHA256SUMS,
     installs it with `uv tool install`, and then runs the new version. If any
     step fails, the previous version stays or is put back. The `sai` path and
-    everything under $SAI_HOME stay as they are, so registered MCP clients
-    keep working; restart them to load the new version.
+    your Sai data stay in place. The update repairs stale MCP registrations.
+    Restart agent clients to load the new version.
 
     Only a `uv tool install` of a release or of the official Git source is
     updated; a checkout, uvx, or other install gets a note and exit code 3.
@@ -1933,6 +1933,8 @@ def update_command(
         emit(ctx, outcome.to_json())
     else:
         click.echo(outcome.message, err=outcome.exit_code != 0)
+        if notice := updater.mcp_notice(outcome.mcp_results()):
+            click.echo(notice)
     ctx.exit(outcome.exit_code)
 
 
