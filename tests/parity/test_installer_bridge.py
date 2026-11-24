@@ -1035,7 +1035,7 @@ from sai_cli.sai_cli import main
 launcher, *args = sys.argv[1:]
 def interrupt(event, values):
     if (event == 'subprocess.Popen'
-        and [os.fsdecode(value) for value in values[1]] == [launcher, '--version']):
+        and [os.fsdecode(value) for value in values[1]] == [os.path.realpath(launcher), '--version']):
         os.kill(os.getpid(), signal.SIGKILL)
 sys.addaudithook(interrupt)
 sys.argv = [launcher, *args]
@@ -1107,7 +1107,7 @@ def test_bridge_recovers_when_uv_removed_the_environment_and_launcher(
         f"#!{sys.executable}\n"
         "import os, signal, subprocess, sys\n"
         f"uv = {uv!r}\n"
-        "if sys.argv[1:4] == ['tool', 'install', '--force']:\n"
+        "if sys.argv[1:4] == ['pip', 'install', '--reinstall-package']:\n"
         "    subprocess.run([uv, 'tool', 'uninstall', 'sai-cli'], check=True)\n"
         "    os.kill(os.getppid(), signal.SIGKILL)\n"
         "else:\n"

@@ -573,7 +573,9 @@ def test_rollback_needs_no_package_source_for_the_old_dependencies(
     )
     assert done.returncode == 0, done.stderr
     # uv replaced the install once and was not asked to put it back.
-    installs = [line for line in log.read_text().splitlines() if "tool install" in line]
+    installs = [
+        line for line in log.read_text().splitlines() if "--reinstall-package" in line
+    ]
     assert len(installs) == 1
 
 
@@ -601,6 +603,37 @@ def test_the_spare_wheel_restores_when_the_copy_cannot_be_swapped_back(
     assert record is not None
     assert record.sha256 == hashlib.sha256(wheels["0.1.0"]).hexdigest()
     assert tool.kind() == update.UV_TOOL_RELEASE
+
+
+@pytest.mark.skipif(os.name == "nt", reason="uv launches through POSIX symlinks")
+@pytest.mark.parametrize("foreign", [False, True])
+def test_snapshot_rollback_only_publishes_to_a_vacant_launcher(
+    tmp_path: Path, foreign: bool
+) -> None:
+    prefix = tmp_path / "tools" / "sai-cli"
+    snapshot = prefix.with_name("snapshot")
+    for environment, contents in ((prefix, "candidate"), (snapshot, "previous")):
+        sai = environment / "bin" / "sai"
+        sai.parent.mkdir(parents=True)
+        sai.write_text(contents)
+    public = tmp_path / "sai"
+    competitor = tmp_path / "external-sai"
+    competitor.write_text("another installer")
+    if foreign:
+        public.symlink_to(competitor)
+        entry = public.lstat()
+
+    error = updater.swap_back(prefix, snapshot, public)
+    if foreign:
+        assert error and str(public) in error and str(competitor) in error
+        assert os.path.samestat(public.lstat(), entry)
+        assert public.read_text() == "another installer"
+        assert (prefix / "bin" / "sai").read_text() == "candidate"
+        assert snapshot.is_dir()
+    else:
+        assert error is None
+        assert public.read_text() == "previous"
+        assert not snapshot.exists()
 
 
 @pytest.mark.slow
@@ -636,6 +669,36 @@ def test_with_no_previous_wheel_the_environment_copy_restores_the_install(uv_dir
         "sai-cli",
     ]
     assert list(update.wheel_cache().glob("*.whl")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="test replaces a public POSIX symlink")
+@needs_uv
+def test_updating_the_uv_environment_does_not_replace_a_late_competitor(uv_dirs):
+    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    with Stub(release_routes(wheels)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        target = uv_dirs / "other-sai"
+        target.write_text("another install")
+        competitor = uv_dirs / "competitor"
+        competitor.symlink_to(target)
+        entry = competitor.lstat()
+
+        def takeover(command: Sequence[str], timeout: float) -> tuple[int, str]:
+            installed = (
+                command[1:3] == ["tool", "install"] or "--reinstall-package" in command
+            )
+            if installed and competitor.is_symlink():
+                competitor.replace(tool.sai)
+            return updater.run(command, timeout)
+
+        outcome = tool.update(runner=takeover)
+
+    assert outcome.status == updater.FAILED
+    assert str(tool.sai) in outcome.message
+    assert str(target) in outcome.message
+    assert os.path.samestat(tool.sai.lstat(), entry)
+    assert tool.sai.read_text() == "another install"
 
 
 @pytest.mark.slow
@@ -839,7 +902,9 @@ def test_two_workers_install_once(uv_dirs, monkeypatch):
         updater.CURRENT,
         updater.UPDATED,
     ]
-    installs = [line for line in log.read_text().splitlines() if "tool install" in line]
+    installs = [
+        line for line in log.read_text().splitlines() if "--reinstall-package" in line
+    ]
     assert len(installs) == 1
     assert tool.version() == "0.2.0"
 
@@ -889,7 +954,7 @@ class Script:
     and the installed sai.
 
     COMMITS maps a Git commit to the version it installs. FAIL_TRIAL fails
-    the trial `uv pip install`; FAIL_INSTALL fails `uv tool install`. A
+    the trial `uv pip install`; FAIL_INSTALL fails the in-place `uv pip install`. A
     version in BROKEN fails `sai --version` everywhere; one in
     BROKEN_INSTALLED only as the installed tool. INTERRUPT raises Ctrl-C
     from the first installed `sai --version` after an install.
@@ -939,20 +1004,20 @@ class Script:
             return 0, f"{self.root / name}\n"
         if command[1:2] == ["venv"]:
             return 0, ""
-        if command[1:3] == ["pip", "install"]:
-            if self.fail_trial:
-                return 2, "error: no such revision"
-            self.staged = self.named(command[-1])
-            return 0, "Installed 1 package"
-        if command[1:3] == ["tool", "install"]:
+        if command[1:4] == ["pip", "install", "--reinstall-package"]:
             if self.fail_install:
                 return 2, "error: disk full"
             dist = next(self.prefix.glob("lib/*/site-packages/sai_cli-*.dist-info"))
             version = self.named(command[-1])
             (dist / "METADATA").write_text(f"Name: sai-cli\nVersion: {version}\n")
             return 0, "Installed 1 executable: sai"
+        if command[1:3] == ["pip", "install"]:
+            if self.fail_trial:
+                return 2, "error: no such revision"
+            self.staged = self.named(command[-1])
+            return 0, "Installed 1 package"
         if command[-1] == "--version":
-            installed = command[0] == self.launcher
+            installed = command[0] == str(self.prefix / "bin/sai")
             version = self.version if installed else self.staged
             if installed and self.interrupt:
                 self.interrupt = False
@@ -966,11 +1031,19 @@ class Script:
 
     @property
     def installs(self) -> list[str]:
-        return [c[-1] for c in self.commands if c[1:3] == ["tool", "install"]]
+        return [
+            c[-1]
+            for c in self.commands
+            if c[1:4] == ["pip", "install", "--reinstall-package"]
+        ]
 
     @property
     def trials(self) -> list[str]:
-        return [c[-1] for c in self.commands if c[1:3] == ["pip", "install"]]
+        return [
+            c[-1]
+            for c in self.commands
+            if c[1:3] == ["pip", "install"] and "--reinstall-package" not in c
+        ]
 
 
 def scripted(tmp_path: Path, stub: Stub, script: Script, **changes) -> updater.Options:
@@ -1003,12 +1076,11 @@ def test_source_builds_the_exact_release_tag_from_git(tmp_path, sai_home):
         "tool dir",
         "venv --python",
         "pip install",
-        "tool install",
+        "pip install",
     ]
     assert script.trials == [spec]
-    # The check after the install runs the registered launcher, the one on
-    # PATH, and imports with an isolated interpreter.
-    assert [str(tmp_path / "bin" / "sai"), "--version"] in script.commands
+    # The check runs the tool executable after checking the registered link.
+    assert [str(tmp_path / "tools/sai-cli/bin/sai"), "--version"] in script.commands
     last = script.commands[-1]
     assert last[1:] == ["-I", "-c", "import sai_cli.sai_cli, sai_cli.mcp_server.server"]
     assert last[0] == str(tmp_path / "tools" / "sai-cli" / "bin" / "python")

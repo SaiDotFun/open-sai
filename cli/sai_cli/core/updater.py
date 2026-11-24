@@ -1,8 +1,8 @@
 """Install a sai-cli release over this install, verify it, and roll back.
 
 `sai update` downloads the release wheel and its SHA256SUMS, checks the hash,
-installs the wheel with `uv tool install --force`, and then runs the new
-`sai --version` and imports the package. A failure at any step leaves or
+installs the wheel inside the existing uv tool environment, and then runs
+the new `sai --version` and imports the package. A failure at any step leaves or
 restores the previous version. Only an official uv tool install is changed.
 
 Interactive commands call `tick`, which prints at most one notice per state
@@ -503,6 +503,20 @@ def check_runs(
     return None
 
 
+def launcher_change_error(
+    prefix: Path, launcher: Path, expected: os.stat_result
+) -> str | None:
+    try:
+        if os.path.samestat(launcher.lstat(), expected):
+            return launcher_owner_error(prefix, launcher)
+        actual = (
+            launcher.parent / launcher.readlink() if launcher.is_symlink() else launcher
+        )
+    except OSError:
+        actual = launcher
+    return f"the launcher changed at {launcher}; found {actual}, expected {_executables(prefix)[0]}"
+
+
 def verify(
     prefix: Path,
     launcher: Path,
@@ -512,17 +526,22 @@ def verify(
     *,
     native: bool = False,
 ) -> str | None:
-    """Return why the install at PREFIX is not a working VERSION, or None.
-
-    It runs LAUNCHER, the registered `sai` that clients use, after checking
-    that it still runs this install.
-    """
+    """Check ownership, run the executable inside PREFIX, and recheck identity."""
     owner = launcher_owner_error(prefix, launcher)
     if owner is not None:
         return owner
-    return check_runs(
-        launcher, _executables(prefix)[1], version, imports, runner, native=native
-    )
+    binary, python = _executables(prefix)
+    try:
+        entry = launcher.lstat()
+        executable = binary.stat()
+        error = check_runs(binary, python, version, imports, runner, native=native)
+        if error is not None:
+            return error
+        if not os.path.samestat(binary.stat(), executable):
+            return f"the executable changed at {binary}"
+        return launcher_change_error(prefix, launcher, entry)
+    except OSError as error:
+        return f"could not verify the launcher at {launcher}: {type(error).__name__}"
 
 
 def preverify(
@@ -575,14 +594,16 @@ def preverify(
 
 
 def install_spec(
-    uv: str, spec: str, runner: Runner, *, offline: bool = False
+    uv: str, spec: str, prefix: Path, runner: Runner, *, offline: bool = False
 ) -> str | None:
-    """Run `uv tool install --force SPEC`; return the error, or None."""
-    args = [uv, "tool", "install", "--force"]
+    """Update the tool environment while uv's public entry stays in place."""
+    args = [uv, "pip", "install", "--reinstall-package", "sai-cli"]
     if offline:
         args.append("--offline")
-    code, output = runner([*args, spec], UV_TIMEOUT)
-    return None if code == 0 else f"uv tool install failed: {_last_line(output)}"
+    code, output = runner(
+        [*args, "--python", str(_executables(prefix)[1]), spec], UV_TIMEOUT
+    )
+    return None if code == 0 else f"uv pip install failed: {_last_line(output)}"
 
 
 def write_record(prefix: Path, tag: str, digest: str, wheel: Path) -> None:
@@ -846,22 +867,43 @@ def snapshot_environment(prefix: Path) -> Path | None:
     return target
 
 
+def rollback_launcher_error(prefix: Path, launcher: Path) -> str | None:
+    """Recovery can publish in a vacant slot or keep uv's existing link."""
+    if not os.path.lexists(launcher):
+        return None
+    if os.name == "nt":
+        return launcher_owner_error(prefix, launcher)
+    inside = _executables(prefix)[0]
+    try:
+        target = launcher.parent / launcher.readlink()
+    except OSError:
+        return f"{launcher} is occupied. Expected a uv launcher for {inside}"
+    # uv may have removed its environment. Check the link even when dangling.
+    if not _same(target, inside):
+        return f"{launcher} points to {target}. Expected the uv executable at {inside}"
+    return None
+
+
 def swap_back(prefix: Path, snapshot: Path, launcher: Path) -> str | None:
     """Put the copied environment SNAPSHOT back at PREFIX and make LAUNCHER
     run it again. Return the error, or None."""
     broken = prefix.parent / f"{BROKEN_PREFIX}{os.getpid()}"
     try:
+        if error := rollback_launcher_error(prefix, launcher):
+            return error
         shutil.rmtree(broken, ignore_errors=True)
         if prefix.exists():
             os.rename(prefix, broken)
         os.rename(snapshot, prefix)
         shutil.rmtree(broken, ignore_errors=True)
-        if os.name != "nt" and launcher_owner_error(prefix, launcher) is not None:
-            launcher.unlink(missing_ok=True)
-            launcher.symlink_to(_executables(prefix)[0])
+        if os.name != "nt" and not os.path.lexists(launcher):
+            try:
+                launcher.symlink_to(_executables(prefix)[0])
+            except FileExistsError:
+                return rollback_launcher_error(prefix, launcher)
+        return rollback_launcher_error(prefix, launcher)
     except OSError as exc:
         return f"could not put the previous environment back: {type(exc).__name__}"
-    return None
 
 
 def bridge_wheel_path(tools: Path, version: str, digest: str) -> Path:
@@ -1054,7 +1096,10 @@ def restore(
     def reinstall(wheel: tuple[str, str, Path]) -> str | None:
         error = (
             wheel_error(wheel)
-            or install_spec(uv, str(wheel[2]), options.runner, offline=native)
+            or rollback_launcher_error(current.prefix, current.launcher)
+            or install_spec(
+                uv, str(wheel[2]), current.prefix, options.runner, offline=native
+            )
             or runs()
         )
         if error is None:
@@ -1130,6 +1175,12 @@ def _install(
         message = f"sai {target} is available. Run `sai update` to install it."
         return Outcome(AVAILABLE, message, installed, target), False
 
+    try:
+        expected_launcher = current.launcher.lstat()
+    except OSError as error:
+        return unchanged(
+            f"could not inspect {current.launcher}: {type(error).__name__}"
+        )
     if options.source:
         # The full ref: a branch named like the tag must not shadow it.
         spec = f"git+{options.git_url}@refs/tags/{release.tag}"
@@ -1233,6 +1284,10 @@ def _install(
                 # The tool-local wheel is the durable recovery source.
                 created = False
             if error is None:
+                error = launcher_change_error(
+                    prefix, current.launcher, expected_launcher
+                )
+            if error is None:
                 if native and not options.background:
                     recovery = shlex.join(
                         [str(prefix.parent / NATIVE_RECOVERY), "update", "--recover"]
@@ -1242,7 +1297,7 @@ def _install(
                         file=sys.stderr,
                         flush=True,
                     )
-                error = install_spec(uv, spec, runner)
+                error = install_spec(uv, spec, prefix, runner)
             if error is None:
                 error = verify(
                     prefix, current.launcher, target, imports, runner, native=native
@@ -1250,11 +1305,15 @@ def _install(
             if error is None and native:
                 # The isolated probes leave the invoking profile's cache cold.
                 error = native_bridge.smoke(
-                    current.launcher,
+                    _executables(prefix)[0],
                     target,
                     update.sai_home(),
                     VERIFY_TIMEOUT,
                     version_only=True,
+                )
+            if error is None:
+                error = launcher_change_error(
+                    prefix, current.launcher, expected_launcher
                 )
             if error is None and wheel is not None:
                 try:
@@ -1290,6 +1349,8 @@ def _install(
                 return Outcome(
                     FAILED, f"Could not finish the uv bridge: {exc}", target, target
                 ), False
+        if error := launcher_change_error(prefix, current.launcher, expected_launcher):
+            return Outcome(FAILED, error, installed, target), False
         message = (
             f"Updated sai from {installed} to {target}. Restart agent clients and"
             " any open `sai` shell so they load it."
