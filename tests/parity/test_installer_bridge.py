@@ -335,6 +335,19 @@ def test_native_dry_run_selects_an_explicit_prerelease(
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_uv_owned_launcher_rejects_an_explicit_native_prerelease(
+    install: Install, replay: Replay
+) -> None:
+    prepare_uv(install, artifact("BRIDGE"), replay)
+    requests = len(replay.requests)
+    result = install.install(replay, "--native", "--dry-run", "--version", "0.2.0-rc.1")
+    assert result.returncode == 1
+    assert "'0.2.0-rc.1' is not a version like 0.2.0." in result.stderr
+    assert "Running" not in result.stdout
+    assert len(replay.requests) == requests
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 def test_standalone_preserves_a_concurrent_launcher(
     install: Install, replay: Replay
 ) -> None:

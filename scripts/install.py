@@ -899,6 +899,8 @@ def install_native(args: argparse.Namespace) -> int:
     check_path(launcher)
     target = launcher_target(launcher)
     if target is not None and uv_launcher(target):
+        if args.version and parse_tag(TAG_PREFIX + args.version) is None:
+            raise LookupFailed(f"{args.version!r} is not a version like 0.2.0.")
         command = [str(launcher), "update"]
         if args.version:
             command += ["--to", args.version]
