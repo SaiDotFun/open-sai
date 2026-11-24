@@ -6,14 +6,17 @@ import asyncio
 import base64
 import json
 import re
+import socket
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
 from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from secrets import token_hex
-from typing import Any
+from threading import BoundedSemaphore, Thread
+from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
@@ -24,12 +27,57 @@ from .errors import Code, SaiError
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
 BLOCK_PATH = "/cosmos/base/tendermint/v1beta1/blocks/"
+_LCD_DNS_SLOTS = BoundedSemaphore(8)
+_AddressInfo = (
+    tuple[Literal[socket.AF_INET], socket.SocketKind, int, str, tuple[str, int]]
+    | tuple[
+        Literal[socket.AF_INET6],
+        socket.SocketKind,
+        int,
+        str,
+        tuple[str, int, int, int] | tuple[int, bytes],
+    ]
+)
 
 
 class QueryHeightMismatch(SaiError, ValueError):
     """The LCD answered a pinned query at an unverified height."""
 
     code = Code.PREVIEW_MISMATCH
+
+
+async def _resolve_lcd_host(
+    host: str | bytes | None,
+    port: str | bytes | int | None,
+    *,
+    family: int = 0,
+    type: int = 0,
+    proto: int = 0,
+    flags: int = 0,
+) -> list[_AddressInfo]:
+    if not _LCD_DNS_SLOTS.acquire(blocking=False):
+        raise TimeoutError("LCD DNS slots are busy")
+    result: Future[list[_AddressInfo]] = Future()
+
+    def resolve() -> None:
+        try:
+            if result.set_running_or_notify_cancel():
+                result.set_result(
+                    socket.getaddrinfo(host, port, family, type, proto, flags)
+                )
+        except Exception as exc:  # noqa: BLE001 - forward the resolver's exception
+            result.set_exception(exc)
+        finally:
+            _LCD_DNS_SLOTS.release()
+
+    # System DNS can outlive the HTTP request. Keep its permit until the lookup
+    # returns, and let the CLI exit even if a resolver is still blocked.
+    try:
+        Thread(target=resolve, name="sai-lcd-dns", daemon=True).start()
+    except RuntimeError as exc:
+        _LCD_DNS_SLOTS.release()
+        raise TimeoutError("Could not start LCD DNS lookup") from exc
+    return await asyncio.wrap_future(result)
 
 
 def _get_before_deadline(
@@ -46,8 +94,8 @@ def _get_before_deadline(
             async with httpx.AsyncClient(timeout=None) as client:
                 return await client.get(url, headers=headers, params=params)
 
-    # Closing the loop avoids waiting for system DNS after the request is cancelled.
     with closing(asyncio.new_event_loop()) as loop:
+        loop.getaddrinfo = _resolve_lcd_host
         task = loop.create_task(request())
         try:
             return loop.run_until_complete(task)

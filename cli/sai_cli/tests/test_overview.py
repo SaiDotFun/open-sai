@@ -5,9 +5,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import socket
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -933,6 +935,45 @@ def test_trickling_lcd_disconnects_before_the_next_overview(
                     runner.run(server.call_tool("account_overview", {"addr": ADDR}))
                 )
             )
+
+
+def test_overview_bounds_stalled_lcd_resolution(replay, monkeypatch):
+    config = replay["config"]
+    server = create_server(
+        replace(
+            config, lcd_endpoint=config.lcd_endpoint.replace("127.0.0.1", "localhost")
+        )
+    )
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setattr(overview, "LCD_REQUEST_SECONDS", 0.6)
+    resume = threading.Event()
+    resolvers: list[threading.Thread] = []
+    getaddrinfo = socket.getaddrinfo
+
+    def stalled_resolution(host, *args, **kwargs):
+        if host in ("localhost", b"localhost") and not resume.is_set():
+            resolvers.append(threading.current_thread())
+            resume.wait()
+        return getaddrinfo(host, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", stalled_resolution)
+    with asyncio.Runner() as runner:
+        try:
+            for _ in range(10):
+                result = decode_mcp(
+                    runner.run(server.call_tool("account_overview", {"addr": ADDR}))
+                )
+                assert result["positions"]["membership"]["status"] == "unavailable"
+            assert len(resolvers) == 8
+        finally:
+            resume.set()
+            for worker in resolvers:
+                worker.join(timeout=2)
+        assert all(not worker.is_alive() for worker in resolvers)
+        result = decode_mcp(
+            runner.run(server.call_tool("account_overview", {"addr": ADDR}))
+        )
+        assert result["positions"]["membership"]["status"] == "verified"
 
 
 def test_overview_rejects_an_invalid_lcd_port():
