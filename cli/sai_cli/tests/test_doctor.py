@@ -379,23 +379,39 @@ def test_doctor_leaves_a_home_with_only_foreign_config_at_0755(isolated_home):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
-def test_doctor_repairs_a_home_with_sai_command_logs(isolated_home):
-    code, _ = run_cli("--json", "config", "get", "keeper.endpoint")
-    assert code == 0 and log.flush()
-    assert not (isolated_home / "trader").exists()
+@pytest.mark.parametrize(
+    ("key", "expected_code"), [("keeper.endpoint", 0), ("bogus", 2)]
+)
+def test_doctor_preserves_a_foreign_home_with_sai_logs(
+    isolated_home, key, expected_code
+):
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
     isolated_home.chmod(0o755)
+    code, _ = run_cli("--json", "config", "get", key)
+    assert code == expected_code and log.flush()
+    assert log.log_files()
+    assert not (isolated_home / "trader").exists()
 
-    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
-    assert code == 0
-    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
-    assert check["fix"] == f"chmod go-rwx {isolated_home}"
-    assert isolated_home.stat().st_mode & 0o777 == 0o755
+    for flags in [("--no-fix",), (), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == 0
+        check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+        assert check["status"] == "warn"
+        assert check["fix"] == doctor.SAI_HOME_MODE_FIX
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_preserves_a_home_with_only_a_cached_sai_wheel(isolated_home):
+    wheels = updater.private_cache()
+    (wheels / update.wheel_name("0.1.0")).touch()
+    isolated_home.chmod(0o755)
 
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
-    assert check["status"] == "fixed"
-    assert isolated_home.stat().st_mode & 0o777 == 0o700
+    assert check["status"] == "warn"
+    assert isolated_home.stat().st_mode & 0o777 == 0o755
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")

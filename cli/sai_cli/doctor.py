@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator, Sequence
-from contextlib import closing, contextmanager
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
@@ -500,21 +500,9 @@ def profile_has_data(
             or (directory == "cache/wheels" and update.is_wheel_name(name))
         ):
             return None
-        elif directory in ("trader", "cache/wheels"):
+        elif directory == "trader":
             has_data = True
     return has_data
-
-
-def profile_has_sai_logs(path: Path) -> bool:
-    # Doctor can create logs in an ambiguous home. Require evidence of
-    # another Sai command before using the logs to identify the profile.
-    with closing(log.LogScan().rows(path / log.DIR_NAME)) as rows:
-        return any(
-            row.get("event") == "command.start"
-            and isinstance(command := row.get("command"), str)
-            and command != "doctor"
-            for row in rows
-        )
 
 
 def repair_profile_root(path: Path, *, apply: bool) -> str | None:
@@ -532,8 +520,7 @@ def repair_profile_root(path: Path, *, apply: bool) -> str | None:
                 return None
             has_data = profile_has_data(fd, info.st_uid, allow_loose_trader=not apply)
             if (
-                has_data is None
-                or (not has_data and not profile_has_sai_logs(path))
+                not has_data
                 or os.fstat(fd).st_mode != info.st_mode
                 or not os.path.samestat(info, path.lstat())
             ):

@@ -1355,7 +1355,7 @@ class LogScan:
         prefix: bool = False,
         accept: Callable[[dict[str, Any]], bool] | None = None,
         frontier_before: str | None = None,
-    ) -> Generator[dict[str, Any]]:
+    ) -> Iterator[dict[str, Any]]:
         """Read bounded snapshots in UTC day order, alternating surfaces."""
         opened = LogDir.open(root or directory())
         if opened is None:
