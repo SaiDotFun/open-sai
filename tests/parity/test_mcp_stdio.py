@@ -187,6 +187,8 @@ def test_interrupting_intent_wait_preserves_the_ledger(
             assert stdio.proc.stdin is not None
             stdio.proc.stdin.close()
             assert stdio.proc.wait(timeout=1.5) == 0
+            assert stdio.proc.stdout is not None
+            assert stdio.proc.stdout.read() == b""
         else:
             stdio.send("notifications/cancelled", requestId=2, reason="fixture")
             assert stdio.receive(timeout=1.5) == {

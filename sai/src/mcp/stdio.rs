@@ -3,8 +3,9 @@ use std::{collections::HashMap, io, sync::Arc};
 use rmcp::{
     ErrorData, RoleServer,
     model::{
-        ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorCode, JsonRpcMessage,
-        RequestId, ServerJsonRpcMessage,
+        CancelledNotification, CancelledNotificationParam, ClientJsonRpcMessage,
+        ClientNotification, ClientRequest, ErrorCode, JsonRpcMessage, RequestId,
+        ServerJsonRpcMessage,
     },
     transport::{
         StdioReader, StdioWriter, Transport, async_rw::DEFAULT_MAX_LINE_LENGTH, stdio_pipes,
@@ -21,6 +22,11 @@ use tokio::{
 pub(super) const MAX_IN_FLIGHT: usize = 64;
 type Outbound = (ServerJsonRpcMessage, Option<OwnedSemaphorePermit>);
 
+struct PendingRequest {
+    slot: OwnedSemaphorePermit,
+    cancel_on_eof: bool,
+}
+
 pub(super) struct Stdio {
     input: BufReader<StdioReader>,
     line: Vec<u8>,
@@ -29,7 +35,7 @@ pub(super) struct Stdio {
     writer: Option<JoinHandle<io::Result<()>>>,
     slots: Arc<Semaphore>,
     overflow: Arc<Semaphore>,
-    pending: HashMap<RequestId, OwnedSemaphorePermit>,
+    pending: HashMap<RequestId, PendingRequest>,
 }
 
 impl Stdio {
@@ -47,6 +53,21 @@ impl Stdio {
             overflow: Arc::new(Semaphore::new(1)),
             pending: HashMap::new(),
         }
+    }
+
+    fn cancel_wait_at_eof(&mut self) -> Option<ClientJsonRpcMessage> {
+        // rmcp drains handlers after EOF. Cancel each pending intent wait first
+        // so a closed client does not leave Keeper polling during the drain.
+        let (id, _) = self
+            .pending
+            .iter()
+            .find(|(_, request)| request.cancel_on_eof)?;
+        let id = id.clone();
+        self.pending.remove(&id);
+        let params = CancelledNotificationParam::new(Some(id), None);
+        Some(ClientJsonRpcMessage::notification(
+            CancelledNotification::new(params).into(),
+        ))
     }
 
     async fn read_frame(&mut self) -> io::Result<Option<Frame>> {
@@ -140,7 +161,9 @@ impl Transport<RoleServer> for Stdio {
             JsonRpcMessage::Error(error) => error.id.as_ref(),
             _ => None,
         };
-        let slot = id.and_then(|id| self.pending.remove(id));
+        let slot = id
+            .and_then(|id| self.pending.remove(id))
+            .map(|request| request.slot);
         let output = self.output.clone();
         async move {
             output
@@ -167,7 +190,10 @@ impl Transport<RoleServer> for Stdio {
             };
             let kind = tokio::select! {
                 _ = output.closed() => return None,
-                kind = self.read_frame() => kind.ok()??,
+                kind = self.read_frame() => match kind.ok()? {
+                    Some(kind) => kind,
+                    None => return self.cancel_wait_at_eof(),
+                },
             };
             let frame = match kind {
                 Frame::Oversized => {
@@ -201,19 +227,29 @@ impl Transport<RoleServer> for Stdio {
                 Ok(frame) => {
                     match &frame {
                         JsonRpcMessage::Request(request) => {
-                            self.pending.insert(request.id.clone(), slot);
+                            let cancel_on_eof = matches!(
+                                &request.request,
+                                ClientRequest::CallToolRequest(call) if call.params.name == "intent_wait"
+                            );
+                            self.pending.insert(
+                                request.id.clone(),
+                                PendingRequest {
+                                    slot,
+                                    cancel_on_eof,
+                                },
+                            );
                         }
                         JsonRpcMessage::Notification(notification) => {
                             if let ClientNotification::CancelledNotification(cancel) =
                                 &notification.notification
                                 && let Some(id) = &cancel.params.request_id
-                                && let Some(slot) = self.pending.remove(id)
+                                && let Some(request) = self.pending.remove(id)
                             {
                                 // rmcp stops the handler and drops its reply.
                                 // Python also replies on the original ID.
                                 let reply =
                                     ServerJsonRpcMessage::error(cancelled(), Some(id.clone()));
-                                output.try_send((reply, Some(slot))).ok()?;
+                                output.try_send((reply, Some(request.slot))).ok()?;
                             }
                         }
                         _ => {}
