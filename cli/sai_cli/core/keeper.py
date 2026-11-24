@@ -109,6 +109,18 @@ INTENT_ERROR_CODES = frozenset(
         "intent_already_used",
         "below_minimum",
         "insufficient_idle",
+        # Browser intent lifecycle and authentication diagnostics.
+        "intent_validation_failed",
+        "chain_switch_failed",
+        "gas_estimation_failed",
+        "wallet_rejected",
+        "wallet_sign_failed",
+        "chain_mismatch",
+        "request_pending",
+        "rpc_submission_failed",
+        "sign_failed_unknown",
+        "intent_auth_rejected",
+        "jwt_failed",
     }
 )
 GRAPHQL_ERROR_CODES = frozenset(

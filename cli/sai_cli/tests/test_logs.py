@@ -2197,6 +2197,51 @@ def test_keeper_read_timestamps_match_the_wire_format(keeper_stub, timestamp, va
 
 
 @pytest.mark.parametrize(
+    ("error_code", "step"),
+    [
+        ("intent_validation_failed", "sign_failed"),
+        ("chain_switch_failed", "sign_failed"),
+        ("gas_estimation_failed", "sign_failed"),
+        ("wallet_rejected", "sign_reject"),
+        ("wallet_sign_failed", "sign_failed"),
+        ("chain_mismatch", "sign_failed"),
+        ("request_pending", "sign_failed"),
+        ("rpc_submission_failed", "exec_req_fail"),
+        ("sign_failed_unknown", "sign_failed"),
+        ("intent_auth_rejected", "jwt_failed"),
+        ("jwt_failed", "jwt_failed"),
+    ],
+)
+def test_browser_lifecycle_codes_survive_intent_status(keeper_stub, error_code, step):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "OPEN_TRADE",
+            "execActor": "user",
+            "lifecycleStep": step,
+            "errorCode": error_code,
+            "errorMsg": "provider-specific browser diagnostic",
+        }
+    ]
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    records = [
+        json.loads(output)["userIntents"][0],
+        call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][0],
+    ]
+    for record in records:
+        assert record["execActor"] == "user" and record["lifecycleStep"] == step
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
+@pytest.mark.parametrize(
     "error_code",
     [
         "market_order_expired",
