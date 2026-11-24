@@ -110,6 +110,34 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
 }
 
 #[test]
+fn config_set_acknowledges_only_the_endpoint_origin() {
+    for (key, scheme) in [
+        ("lcd.endpoint", "https"),
+        ("keeper.endpoint", "https"),
+        ("keeper.ws_endpoint", "wss"),
+    ] {
+        let root = tempdir().unwrap();
+        let origin = format!("{scheme}://provider.example:8443");
+        let endpoint = format!("{origin}/fixture-private-path?key=fixture-private-query");
+        let set = sai(root.path())
+            .args(["--json", "config", "set", key, &endpoint])
+            .output()
+            .unwrap();
+        assert_eq!(read_json(&set)["value"], origin);
+        for secret in ["fixture-private-path", "fixture-private-query"] {
+            assert!(!String::from_utf8_lossy(&set.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&set.stderr).contains(secret));
+        }
+        let get = sai(root.path())
+            .args(["config", "get", key])
+            .output()
+            .unwrap();
+        assert_eq!(get.stdout, format!("{endpoint}\n").as_bytes());
+        assert!(get.status.success());
+    }
+}
+
+#[test]
 fn missing_relative_config_leaves_home_absent_with_logging_disabled() {
     let root = tempdir().unwrap();
     let output = sai(Path::new("relative-home"))

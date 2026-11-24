@@ -1686,7 +1686,15 @@ def config_set(ctx: click.Context, key: str, value: str) -> None:
         )
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    report_change(ctx, spec, {"key": spec.key, "value": parsed, "path": str(path)})
+    report_change(
+        ctx,
+        spec,
+        {
+            "key": spec.key,
+            "value": sai_settings.public_value(spec, parsed),
+            "path": str(path),
+        },
+    )
 
 
 @config_group.command("unset")

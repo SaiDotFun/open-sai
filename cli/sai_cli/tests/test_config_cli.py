@@ -63,7 +63,7 @@ def test_set_get_unset(tmp_path):
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {
         "key": "keeper.endpoint",
-        "value": SECRET_URL,
+        "value": "https://k.example",
         "path": str(path),
     }
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -171,7 +171,27 @@ def test_config_set_accepts_ipv6_with_port():
     endpoint = "https://[::1]:8443/path"
     result = sai("--json", "config", "set", "keeper.endpoint", endpoint)
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["value"] == endpoint
+    assert json.loads(result.stdout)["value"] == "https://[::1]:8443"
+    assert sai("config", "get", "keeper.endpoint").stdout == endpoint + "\n"
+
+
+@pytest.mark.parametrize(
+    ("key", "scheme"),
+    [
+        ("lcd.endpoint", "https"),
+        ("keeper.endpoint", "https"),
+        ("keeper.ws_endpoint", "wss"),
+    ],
+)
+def test_config_set_acknowledges_only_the_endpoint_origin(key, scheme):
+    origin = f"{scheme}://provider.example:8443"
+    path_key, query_key = "fixture-private-path", "fixture-private-query"
+    endpoint = f"{origin}/{path_key}?key={query_key}"
+    result = sai("--json", "config", "set", key, endpoint)
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["value"] == origin
+    assert path_key not in result.output and query_key not in result.output
+    assert sai("config", "get", key).stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(
@@ -240,7 +260,8 @@ def test_config_set_accepts_percent_encoded_websocket_request_target():
     endpoint = "wss://keeper.example/graphql%20stream?name=one%20two"
     result = sai("--json", "config", "set", "keeper.ws_endpoint", endpoint)
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["value"] == endpoint
+    assert json.loads(result.stdout)["value"] == "wss://keeper.example"
+    assert sai("config", "get", "keeper.ws_endpoint").stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(

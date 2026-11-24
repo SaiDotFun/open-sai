@@ -89,7 +89,7 @@ impl ConfigCommand {
                     println!(
                         "{{\"key\": {}, \"value\": {}, \"path\": {path}}}",
                         format_json(&json!(key.spec().name)),
-                        format_json(&value)
+                        format_json(&key.public_value(&value))
                     );
                 } else {
                     println!("Set {} in {}", key.spec().name, path.display());

@@ -450,20 +450,24 @@ def load(
 # Redacted output
 
 
+def public_value(
+    spec: Setting, value: str | bool | int | None
+) -> str | bool | int | None:
+    """Show only the origin for an endpoint setting."""
+    if spec.kind == "url" and isinstance(value, str):
+        return log.origin(value)
+    return value
+
+
 def public(settings: Settings) -> dict[str, dict[str, Any]]:
     """Every key with its display value, source, variable, and default."""
 
-    def shown(spec: Setting, value: Any) -> Any:
-        if spec.kind != "url" or value is None:
-            return value
-        return log.origin(value)
-
     return {
         spec.key: {
-            "value": shown(spec, settings.value(spec.key)),
+            "value": public_value(spec, settings.value(spec.key)),
             "source": settings.sources[spec.key],
             "env": spec.env,
-            "default": shown(spec, spec.default),
+            "default": public_value(spec, spec.default),
         }
         for spec in SETTINGS
     }
