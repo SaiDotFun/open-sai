@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import re
+import zlib
 from collections import Counter, defaultdict
 from collections.abc import Callable
 from contextlib import closing
@@ -52,6 +54,7 @@ INTENT_EVIDENCE = {
     "intent.wait.end",
     "intent.status_write_failed",
 }
+TX_EVENTS = ("intent.submitted", "intent.wait.end", "intent.keeper")
 
 
 def _id(line: LogLine, field: str) -> str | None:
@@ -263,6 +266,87 @@ class _Cursor:
         )
 
 
+INTENT_CURSOR_SUFFIX = "~i~"
+MAX_INTENT_CURSOR = 96 * 1024
+MAX_INTENT_STATE = 2 * 1024 * 1024
+
+
+def _intent_cursor(value: str | None) -> tuple[_Cursor, list[log.RowPosition]]:
+    base, _, payload = (value or "").partition(INTENT_CURSOR_SUFFIX)
+    if INTENT_CURSOR_SUFFIX not in (value or ""):
+        return _Cursor.parse(value), []
+    cursor = _Cursor.parse(base)
+    try:
+        if cursor.position is None or len(payload) > MAX_INTENT_CURSOR:
+            raise ValueError
+        inflater = zlib.decompressobj()
+        raw = inflater.decompress(
+            base64.b64decode(payload, altchars=b"-_", validate=True),
+            MAX_INTENT_STATE + 1,
+        )
+        if not inflater.eof or inflater.unused_data or len(raw) > MAX_INTENT_STATE:
+            raise ValueError
+        items = json.loads(raw)
+        if not isinstance(items, list):
+            raise ValueError
+        positions = []
+        for item in items:
+            if (
+                not isinstance(item, list)
+                or len(item) != 4
+                or any(type(value) is not int for value in item)
+            ):
+                raise ValueError
+            day, slot, offset, size = item
+            if not (
+                0 <= slot < len(log.SURFACES)
+                and 1 <= size <= log.MAX_LINE + 1
+                and 0 <= offset < 2**63 - size
+            ):
+                raise ValueError
+            positions.append(log.RowPosition(date.fromordinal(day), slot, offset, size))
+        return cursor, positions
+    except (ValueError, OverflowError, RecursionError, zlib.error):
+        raise SaiError(
+            "Pass a log cursor or a UTC timestamp to --before.",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE,
+        ) from None
+
+
+def _save_intent_cursor(report: LogLine, positions: list[log.RowPosition]) -> None:
+    if positions and (base := report.get("nextBefore")):
+        raw = json.dumps(
+            [
+                (row.day.toordinal(), row.slot, row.offset, row.size)
+                for row in positions
+            ],
+            separators=(",", ":"),
+        ).encode()
+        payload = base64.urlsafe_b64encode(zlib.compress(raw)).decode()
+        if len(raw) > MAX_INTENT_STATE or len(payload) > MAX_INTENT_CURSOR:
+            del report["nextBefore"]
+        else:
+            report["nextBefore"] = base + INTENT_CURSOR_SUFFIX + payload
+
+
+def _anchor_group(line: LogLine) -> tuple[Any, ...]:
+    """Rows with these facts in common provide the same attribution."""
+    event = _id(line, "event")
+    scope = _scope(line)
+    return (
+        scope,
+        _invocation(line),
+        _id(line, "runId"),
+        event in INTENT_EVIDENCE and line.get("found") is not False,
+        scope is None
+        and (line.get("endpoint") is not None or event in INTENT_EVIDENCE),
+        event
+        if event in TX_EVENTS and keeper.request_hash(line.get("txHash"))[0]
+        else None,
+    )
+
+
 def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     name = _id(line, "event")
     spec = EVENTS.get(name) if name else None
@@ -375,16 +459,23 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    cursor = _Cursor.parse(before)
+    cursor, positions = _intent_cursor(before)
     log.flush(1.0)
     anchors: list[LogLine] = []
+    evidence: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
 
     def is_anchor(line: LogLine) -> bool:
         return _has_intent(line, key) and _timestamp(line) is not None
 
-    def remember_anchor(line: LogLine) -> None:
+    def remember_anchor(position: log.RowPosition, line: LogLine) -> None:
         if is_anchor(line):
-            anchors.append(line)
+            group = _anchor_group(line)
+            previous = evidence.get(group)
+            if previous is None or log.event_order(line) > log.event_order(previous[1]):
+                evidence[group] = (position, line)
+
+    for position, line in log.read_rows_at(root, positions):
+        remember_anchor(position, line)
 
     scan = _trail_scan()
     rows = [
@@ -398,21 +489,7 @@ def intent(
         )
         if (ts := _timestamp(line)) is not None
     ]
-    replay = scan.start
-    if cursor.replay is not None:
-        # Preserve the snapshot that supplies attribution across pages.
-        # Its starting offsets exclude rows appended to that day's files.
-        anchor_count = len(anchors)
-        for _ in _trail_scan().rows(
-            root,
-            start=cursor.replay,
-            last_day=cursor.last_day,
-            before=cursor.upper,
-            observe=remember_anchor,
-        ):
-            pass
-        if len(anchors) > anchor_count:
-            replay = cursor.replay
+    anchors.extend(line for _, line in evidence.values())
     boundary_days = {cursor.last_day, cursor.position.day if cursor.position else None}
     for day in sorted(
         day for day in boundary_days if day is not None and day < date.max
@@ -474,7 +551,7 @@ def intent(
     request_hash = next(
         (
             tx_hash
-            for event in ("intent.submitted", "intent.wait.end", "intent.keeper")
+            for event in TX_EVENTS
             for line in reversed(direct)
             if line.get("event") == event
             and (tx_hash := keeper.request_hash(line.get("txHash"))[0])
@@ -518,7 +595,8 @@ def intent(
         scan.truncated |= any(
             not page.add("unattributedGaps", line) for line in unattributed[:8]
         )
-    page.finish(scan, cursor, last, stop, replay=replay)
+    page.finish(scan, cursor, last, stop)
+    _save_intent_cursor(report, [position for position, _ in evidence.values()])
     if report.get("truncated") and "nextBefore" not in report:
         report["more"] = "Inspect the retained files from sai logs path."
     return report
@@ -575,7 +653,7 @@ def run(
         start=cursor.position,
         last_day=last_day,
         before=cursor.upper,
-        observe=remember_call_run if not parent else None,
+        observe=(lambda _, line: remember_call_run(line)) if not parent else None,
     ):
         if (ts := _timestamp(line)) is None:
             continue

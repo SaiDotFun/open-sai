@@ -1358,6 +1358,49 @@ class ScanPosition:
     offsets: tuple[int, ...] | None = None
 
 
+@dataclass(frozen=True, order=True)
+class RowPosition:
+    day: date
+    slot: int
+    offset: int
+    size: int
+
+
+def read_rows_at(
+    root: Path | None, positions: list[RowPosition]
+) -> Iterator[tuple[RowPosition, dict[str, Any]]]:
+    """Read the individual lines that supplied attribution on earlier pages."""
+    if not positions:
+        return
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        return
+    with opened:
+        for (day, slot), group in itertools.groupby(
+            sorted(positions), key=lambda position: (position.day, position.slot)
+        ):
+            try:
+                fd = opened.read_fd(file_name(SURFACES[slot], day))
+            except OSError:
+                continue
+            try:
+                for position in group:
+                    os.lseek(fd, position.offset, os.SEEK_SET)
+                    raw = os.read(fd, position.size)
+                    if len(raw) != position.size or not raw.endswith(b"\n"):
+                        continue
+                    try:
+                        line = decode_row(raw)
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(line, dict):
+                        yield position, line
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
+
+
 def read_prefix(
     root: Path | None,
     day: date,
@@ -1407,7 +1450,6 @@ class PageScan:
     max_files: int = MAX_SCAN_FILES
     truncated: bool = False
     resume: ScanPosition | None = None
-    start: ScanPosition | None = None
 
     def rows(
         self,
@@ -1418,7 +1460,7 @@ class PageScan:
         last_day: date | None = None,
         since: str | None = None,
         before: str | None = None,
-        observe: Callable[[dict[str, Any]], None] | None = None,
+        observe: Callable[[RowPosition, dict[str, Any]], None] | None = None,
     ) -> Generator[tuple[ScanPosition, dict[str, Any]]]:
         """Merge reverse file reads one day at a time and checkpoint each file."""
         opened = LogDir.open(root or directory())
@@ -1441,6 +1483,8 @@ class PageScan:
             return data
 
         def decode_block(
+            day: date,
+            slot: int,
             block: list[tuple[int, bytes]],
         ) -> Iterator[tuple[int, int, dict[str, Any]]]:
             for offset, raw in block:
@@ -1458,16 +1502,17 @@ class PageScan:
                     continue
                 if not isinstance(line, dict):
                     continue
+                size = len(raw) + 1
                 if observe is not None:
-                    observe(line)
+                    observe(RowPosition(day, slot, offset, size), line)
                 ts = line.get("ts")
                 if isinstance(ts, str) and (
                     (since is None or ts >= since) and (before is None or ts < before)
                 ):
-                    yield offset, offset + len(raw) + 1, line
+                    yield offset, offset + size, line
 
         def read_rows(
-            slot: int, fd: int, end: int, offsets: list[int]
+            day: date, slot: int, fd: int, end: int, offsets: list[int]
         ) -> Iterator[tuple[int, dict[str, Any]]]:
             os.lseek(fd, end - 1, os.SEEK_SET)
             complete = read(fd, 1) == b"\n"
@@ -1481,7 +1526,7 @@ class PageScan:
             ):
                 # Observe the whole chunk before choosing its first merge candidate.
                 # A call in the chunk can identify gaps from other files.
-                candidates = decode_block(block)
+                candidates = decode_block(day, slot, block)
                 for offset, row_end, line in (
                     list(candidates) if observe is not None else candidates
                 ):
@@ -1538,12 +1583,9 @@ class PageScan:
                                 end = min(end, start.offsets[slot])
                             offsets[slot] = end
                             if end:
-                                readers[slot] = read_rows(slot, fd, end, offsets)
+                                readers[slot] = read_rows(day, slot, fd, end, offsets)
                         except OSError:
                             self.truncated = True
-
-                    if self.start is None:
-                        self.start = ScanPosition(day, tuple(offsets))
 
                     heads: dict[int, tuple[int, dict[str, Any]]] = {}
 

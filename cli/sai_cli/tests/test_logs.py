@@ -3245,6 +3245,54 @@ def test_intent_cursor_keeps_invocation_attribution_from_prior_page(home):
     assert "nextBefore" not in third
 
 
+def test_intent_cursor_keeps_anchors_from_each_scan_window(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    row = {"event": "command.start", "ts": f"{day}T11:00:00.000Z", "surface": "cli"}
+    scope = {"intentKey": "KEY", "addr": ADDR, "endpointId": "h1_" + "a" * 64}
+    path = log.file_path("cli", day, root)
+    filler = log.encode({**row, "runId": "unrelated", "seq": 1000})
+    with path.open("wb") as stream:
+        for seq in range(256):
+            stream.write(
+                log.encode({**row, "runId": "b", "commandId": "b", "seq": seq})
+            )
+        stream.write(
+            log.encode(
+                {
+                    **row,
+                    **scope,
+                    "event": "intent.keeper",
+                    "runId": "b",
+                    "commandId": "b",
+                    "seq": 256,
+                }
+            )
+        )
+        stream.write(filler * log.MAX_SCAN_ROWS)
+        stream.write(
+            log.encode(
+                {**row, **scope, "event": "intent.keeper", "runId": "a", "seq": 257}
+            )
+        )
+
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    seen = []
+    continuation: tuple[str, ...] = ()
+    for _ in range(5):
+        code, output = run_cli(*args, *continuation)
+        assert code == 0
+        page = json.loads(output)
+        seen.extend(line["seq"] for line in page["events"])
+        if "nextBefore" not in page:
+            break
+        continuation = ("--before", page["nextBefore"])
+    else:
+        pytest.fail("Intent cursor did not finish the retained log")
+    assert sorted(seen) == list(range(258))
+
+
 def test_log_stats_scan_continues_inside_one_millisecond(home):
     root = home / "logs"
     root.mkdir()
