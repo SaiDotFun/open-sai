@@ -37,10 +37,13 @@ means the MCP tool's schema and metadata matched in `tools/list`.
 ## Native Distribution
 
 The Native Distribution workflow installs the built shim wheel with uv on
-each native target and serves the matching archive over loopback. Set
-`SAI_NATIVE_WHEEL` and `SAI_NATIVE_ARCHIVE` to their local paths to run
+each native target and serves the matching archive over loopback. Build the
+loopback-only wheel with `python scripts/native-dist.py rehearsal-wheel DIR`.
+Set `SAI_NATIVE_WHEEL` and `SAI_NATIVE_ARCHIVE` to the rehearsal wheel and archive paths to run
 `uv run --locked pytest tests/parity/test_native_distribution.py`. If uv
 is exposed through a version manager, set `UV` to the uv executable itself.
+Set `SAI_NATIVE_RELEASE_WHEEL` to the official-source wheel to check that it
+ignores the loopback override. The CI bundle contains the official-source wheel.
 
 The Linux x86_64 job also tests upgrade and offline rollback against the
 published Python release `sai-cli/v0.1.1` at commit

@@ -116,6 +116,35 @@ def test_native_archive_initializes_mcp(distribution: SimpleNamespace) -> None:
         verify_mcp_startup(d)
 
 
+def test_distributable_wheel_ignores_loopback_release_override(
+    distribution: SimpleNamespace,
+) -> None:
+    wheel = os.environ.get("SAI_NATIVE_RELEASE_WHEEL")
+    if not wheel:
+        pytest.skip("set SAI_NATIVE_RELEASE_WHEEL to the distributable shim wheel")
+    d = distribution
+    d.replay.add_release(Path(wheel), d.version)
+    with (
+        d.rehearsal.keeper_server(d.replay.handler()) as base,
+        closing(socket.socket()) as proxy,
+    ):
+        offline_env(d, base, proxy)
+        run(
+            d.tool,
+            "Install the distributable wheel",
+            d.tool.uv,
+            "tool",
+            "install",
+            Path(wheel).resolve(),
+        )
+        result = d.tool.run(
+            "Probe the official release source", d.tool.sai, "--version", check=False
+        )
+    assert result.returncode == 1 and result.stdout == ""
+    assert d.replay.get_requests == []
+    assert (d.tool.sai_home / "bin" / "shim").is_dir()
+
+
 @pytest.mark.parametrize(
     "permissions",
     [

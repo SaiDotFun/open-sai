@@ -14,6 +14,7 @@ on:
       - 'scripts/native-dist.py'
       - 'scripts/release-rehearsal.py'
       - 'tests/parity/test_native_distribution.py'
+      - 'tests/parity/native_release_source.py'
       - 'cli/sai_cli/tests/fixtures/intent_outcomes.json'
       - 'cli/sai_cli/tests/loopback_keeper.py'
       - 'pyproject.toml'
@@ -109,9 +110,12 @@ jobs:
         env:
           SAI_NATIVE_BASELINE: ${{ matrix.bridge && format('{0}/sai-baseline', runner.temp) || '' }}
         run: |
+          uv run --no-project python scripts/native-dist.py rehearsal-wheel dist/rehearsal-shim
           archives=(dist/native/sai-*.tar.gz)
-          wheels=(dist/native-shim/sai_cli-*.whl)
+          wheels=(dist/rehearsal-shim/sai_cli-*.whl)
+          release_wheels=(dist/native-shim/sai_cli-*.whl)
           UV="$(command -v uv)" SAI_NATIVE_ARCHIVE="${archives[0]}" SAI_NATIVE_WHEEL="${wheels[0]}" \
+            SAI_NATIVE_RELEASE_WHEEL="${release_wheels[0]}" \
             uv run --locked pytest -rx tests/parity/test_native_distribution.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

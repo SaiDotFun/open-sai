@@ -22,6 +22,8 @@ from typing import BinaryIO
 from urllib.parse import urljoin, urlsplit
 from urllib.request import HTTPErrorProcessor, Request, build_opener
 
+from ._release_source import release_source
+
 REPO = "SaiDotFun/open-sai"
 DOWNLOAD_HOSTS = {
     "github.com",
@@ -75,19 +77,6 @@ class AssetResponses(HTTPErrorProcessor):
         return response
 
     https_response = http_response
-
-
-def release_source() -> tuple[str, str]:
-    fixture = os.environ.get("SAI_NATIVE_RELEASE_BASE")
-    if fixture is None:
-        return "https://github.com", "shim"
-    match = re.fullmatch(r"http://127\.0\.0\.1:([1-9][0-9]{0,4})", fixture)
-    if match is None or int(match[1]) > 65535 or not os.environ.get("SAI_HOME"):
-        raise ShimError(
-            "SAI_NATIVE_RELEASE_BASE requires a loopback origin and an explicit SAI_HOME"
-        )
-    # Fixture downloads cannot populate the official offline cache.
-    return fixture, f"shim-loopback-{match[1]}"
 
 
 @contextmanager
@@ -373,7 +362,10 @@ def install_binary(cache: Path, url: str, name: str, base: str) -> None:
 def verified_binary() -> Generator[tuple[Path, BinaryIO]]:
     release = release_version(version("sai-cli"))
     target = native_target()
-    base, scope = release_source()
+    try:
+        base, scope = release_source()
+    except RuntimeError as exc:
+        raise ShimError(str(exc)) from exc
     home = Path(os.environ.get("SAI_HOME", Path.home() / ".sai")).absolute()
     cache = private_directory(trusted_home(home), home=True)
     for part in ("bin", scope, release, target):
