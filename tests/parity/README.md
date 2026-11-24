@@ -32,7 +32,26 @@ any selected case differs or fails its expectations.
 
 `PASS` means the selected invocation or MCP tool call matched. `LISTED`
 means the MCP tool's schema and metadata matched in `tools/list`.
-`DEFERRED` marks a CLI command that needs another fixture.
+`DEFERRED` marks a CLI command awaiting a fixture or a native implementation.
+
+## Auth Cases Awaiting Rust
+
+The Python regression suite checks credential output in CLI text, JSON, and
+MCP. The cross-runtime matrix defers these cases while the native auth port
+lands in [PR #106](https://github.com/SaiDotFun/open-sai/pull/106).
+
+- `auth-import-rejected-operand-text` and `auth-import-rejected-operand-json`.
+  The current Rust CLI has no `auth import` command. The text comparator can
+  match the exit status and stderr category for two different usage errors.
+- `auth-use-invalid-expiry-text` and `auth-use-invalid-expiry-json`.
+  The current Rust CLI can activate an account with a malformed expiry. Python
+  returns `SESSION_UNAVAILABLE` and keeps the previous account active.
+- `auth-use-missing`. The current Rust diagnostic quotes the unregistered
+  operand. Python returns a fixed diagnostic and omits the operand from logs.
+
+The Python `command.start` event also omits argument values for all auth
+commands. Native auth logging and the unregistered-account diagnostic need
+their own parity coverage when the Rust behavior matches.
 
 ## Add a Case
 

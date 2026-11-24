@@ -132,23 +132,20 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         for name in ("config.toml", "trader/sessions.json"):
             (sai_home / name).chmod(0o600)
         return
-    if seed in {"config", "config-logs-disabled", "invalid-expiry"}:
+    if seed in {"config", "config-logs-disabled"}:
         path = sai_home / "config.toml"
         text = CONFIG if seed == "config" else "[logs]\nenabled = false\n"
         path.write_text(text, encoding="utf-8")
         path.chmod(0o600)
-        if seed != "invalid-expiry":
-            return
+        return
     session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
     sessions = []
-    if seed in {"session", "accounts", "history-token", "invalid-expiry"}:
+    if seed in {"session", "accounts", "history-token"}:
         sessions.append({**session, "endpoint": endpoints.keeper})
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
-        if seed in {"accounts", "invalid-expiry"}:
+        if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
-        if seed == "invalid-expiry":
-            sessions[0]["expiresAt"] = "synthetic-expiry-credential-marker"
     subprocess.run(
         [sys.executable, "-c", SEED],
         input=json.dumps(
@@ -167,8 +164,6 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         check=True,
         timeout=15,
     )
-    if seed == "invalid-expiry":
-        (sai_home / "trader" / "sessions.lock").chmod(0o600)
 
 
 @contextmanager
