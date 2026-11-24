@@ -1,7 +1,7 @@
 # List uncovered commands explicitly so adding a command requires a decision.
 [deferred]
 "account overview" = "Requires pinned LCD and trade replay fixtures."
-"auth import" = "Compared with a fixture clipboard and PTY in test_auth.py."
+"auth import" = "Successful imports are compared with a fixture clipboard and PTY in test_auth.py."
 "auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
 "auth renew" = "Compared with Python main in test_auth.py."
 "mcp uninstall" = "Requires a client registration fixture."
@@ -277,6 +277,19 @@ expect = 1
 wire = ["ws:init"]
 
 [[case]]
+name = "auth-import-rejected-operand-text"
+args = ["auth","import","synthetic-import-credential-marker"]
+mode = "text"
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
+name = "auth-import-rejected-operand-json"
+args = ["--json","auth","import","synthetic-import-credential-marker"]
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
 name = "auth-status-signed-out"
 args = ["--json","auth","status"]
 expect = 6
@@ -306,9 +319,19 @@ seed = "accounts"
 state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
 
 [[case]]
-name = "auth-use-missing"
+name = "auth-use-invalid-expiry-text"
+args = ["auth","use","{addr}"]
+mode = "text"
+expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
+
+[[case]]
+name = "auth-use-invalid-expiry-json"
 args = ["--json","auth","use","{addr}"]
 expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
 
 [[case]]
 name = "auth-logout"
@@ -707,7 +730,87 @@ state = { "clients/.claude.json#changed" = true, "clients/.codex/config.toml#cha
 name = "mcp-tool-inventory"
 args = ["mcp","serve"]
 mode = "mcp"
+mcp_profile = "inventory"
+mcp_logs = true
 wire = ["borrowings", "tokenPricesUsd"]
+
+[[case]]
+name = "mcp-initialize-legacy"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "initialize"
+mcp_protocol = "2024-11-05"
+
+[[case]]
+name = "mcp-initialize-newer"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "initialize"
+mcp_protocol = "2026-07-28"
+
+[[case]]
+name = "mcp-info-public-endpoints"
+args = ["mcp","serve","--endpoint","{keeper}?fixture=hidden","--ws-endpoint","{ws}?fixture=hidden","--lcd-endpoint","{http}/fixture-lcd-private?fixture=hidden"]
+mode = "mcp"
+mcp_profile = "info"
+seed = "mcp-info-cache"
+
+[[case]]
+name = "mcp-market-number-spelling"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "number-spelling"
+server = "read-number-spelling"
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "mcp-account-intent-reads"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "reads"
+seed = "ledger"
+server = "mcp-reads"
+wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
+# The current Python checkout uses the narrower history query during reconciliation.
+mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
+
+[[case]]
+name = "mcp-argument-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "validation"
+
+[[case]]
+name = "mcp-session-refusals"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "refusals"
+
+[[case]]
+name = "mcp-session-reloads"
+args = ["--endpoint","{http}","mcp","serve","--endpoint","{keeper}"]
+mode = "mcp"
+mcp_profile = "session"
+# Temporary. The native-only trade_open probe expires this when the tool lands.
+mcp_deferred_trade_exception = true
+seed = "session"
+wire = ["trades", "trades", "trades"]
+
+[[case]]
+name = "mcp-keeper-errors"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "keeper-errors"
+server = "keeper-error"
+wire = ["borrowings", "tokenPricesUsd", "trades", "tradeHistory", "userIntents"]
+
+[[case]]
+name = "mcp-stream-error"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "stream-error"
+server = "ws-partial"
+wire = ["ws:init", "ws:userBalances", "ws:pong"]
 
 [[case]]
 name = "logs-path"
@@ -771,7 +874,7 @@ args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
 seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market",
     "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
     "is_after_hours_market", "get_market", "get_fees",
 ]
