@@ -59,20 +59,6 @@ impl From<Value> for Field {
 }
 
 impl Field {
-    /// Keep only the intermediate digest until the writer keys it.
-    pub fn endpoint_identity(endpoint: &str) -> Self {
-        let site = origin(endpoint);
-        if site != REDACTED_URL
-            && let Some(url) = Endpoint::split(endpoint.trim())
-        {
-            let path = if url.path.is_empty() { "/" } else { &url.path };
-            return Self::EndpointIdentity(
-                Sha256::digest(format!("{site}{path}?{}", url.query)).into(),
-            );
-        }
-        Self::Scalar(Value::Null)
-    }
-
     pub fn argv(args: impl IntoIterator<Item = String>) -> Self {
         Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Arg).collect())
     }
@@ -103,7 +89,6 @@ impl Field {
             Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
             Self::EndpointIdentity(_) => self,
             Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
-            Self::EndpointIdentity(_) => self,
             Self::Scalar(Value::Number(number))
                 if number.is_i64()
                     || number.is_u64()
