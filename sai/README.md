@@ -14,6 +14,12 @@ Run `sai intent status ADDR --key KEY` to reconcile one intent, or omit
 `--key` to list the account's recent Keeper records. With `--json`, command
 failures use the same error codes and envelope as the Python CLI.
 
+`sai trade open`, `sai trade close`, and `sai trade cancel` support
+`--dry-run`. Python spells cancellation `sai trade close ID --cancel-order`,
+which the Rust CLI also accepts. A live submission reserves the intent
+before it contacts Keeper. If the send outcome is unknown, use the intent
+key to reconcile it before trading again.
+
 ## Port Order
 
 C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
@@ -72,6 +78,12 @@ Run `SAI_PARITY_BIN="$PWD/target/debug/sai" uv run pytest tests/parity`
 after `just rust-build` to compare `sai intent status` against the Python
 package in this checkout. The tests reuse the recorded Keeper outcomes
 and compare request bytes and counts, ledger rows, and log events.
+
+The C7a trade cases and digest fixtures use Python commit
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. Set `SAI_PARITY_C7_PYTHON` to
+the absolute path of a `sai` binary installed from that checkout when
+running `pytest tests/parity/test_trade.py` with `SAI_PARITY_BIN`.
+Without that override the tests use Python from the current workspace.
 
 Native archives and compatible shim wheels ship on the existing
 `sai-cli/v*` tags with SHA-256 checksums. Each shim version fetches and

@@ -32,6 +32,24 @@ impl<'a> Confirmation<'a> {
     }
 
     pub(super) fn verify(self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
+        match (
+            preview.requires_market_price_refresh(),
+            self.reference_price,
+        ) {
+            (true, None) => {
+                return Err(SaiError::new(
+                    Code::InvalidRequest,
+                    "reference_price is required for a market order: pass the referencePrice from the preview_open result the user confirmed",
+                ));
+            }
+            (false, Some(_)) => {
+                return Err(SaiError::new(
+                    Code::InvalidRequest,
+                    "reference_price applies only to market orders",
+                ));
+            }
+            _ => {}
+        }
         let mut confirmed = preview.clone();
         if let Some((reference, _)) = self.reference_price {
             confirmed.reference_price = Some(reference.into());
@@ -114,12 +132,47 @@ fn display_movement(moved: BigUint, reference: BigUint) -> String {
     format!("{whole}.{fraction}")
 }
 
-fn canonical_price(price: &str) -> &str {
-    if price.contains('.') {
-        price.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        price
+fn canonical_price(price: &str) -> String {
+    let (whole, fraction) = price.split_once('.').unwrap_or((price, ""));
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    let point = significant.len() as i64 - fraction.len() as i64;
+    if significant.is_empty() {
+        return "0".into();
     }
+    if !significant.bytes().all(|byte| byte.is_ascii_digit()) {
+        return price.into();
+    }
+    // Python Decimal.normalize() rounds to the default 28 significant digits.
+    let rounded;
+    let (significant, point) = if significant.len() > 28 {
+        let (kept, rest) = significant.split_at(28);
+        let mut units = kept.parse::<u128>().expect("28 digits fit in u128");
+        let first = rest.as_bytes()[0];
+        let above_half =
+            first > b'5' || first == b'5' && rest[1..].bytes().any(|digit| digit != b'0');
+        if above_half || first == b'5' && units % 2 == 1 {
+            units += 1;
+        }
+        rounded = units.to_string();
+        let carry = rounded.len() as i64 - 28;
+        (rounded.as_str(), point + carry)
+    } else {
+        (significant, point)
+    };
+    plain_decimal(significant.trim_end_matches('0'), point)
+}
+
+pub(super) fn plain_decimal(significant: &str, point: i64) -> String {
+    if point <= 0 {
+        return format!("0.{}{significant}", "0".repeat((-point) as usize));
+    }
+    let point = point as usize;
+    if point >= significant.len() {
+        return format!("{significant}{}", "0".repeat(point - significant.len()));
+    }
+    let (whole, fraction) = significant.split_at(point);
+    format!("{whole}.{fraction}")
 }
 
 /// The exact canonical JSON bytes that the user confirms.
@@ -154,4 +207,75 @@ pub fn digest_bytes(preview: &TradePreview, account: Option<&str>) -> Vec<u8> {
 
 pub fn preview_digest(preview: &TradePreview, account: Option<&str>) -> String {
     format!("{:x}", Sha256::digest(digest_bytes(preview, account)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trade::TradeIntent;
+    use serde_json::Value;
+
+    #[test]
+    fn canonical_bytes_and_digests_match_the_python_reference() {
+        let data: Value =
+            serde_json::from_str(include_str!("../../../tests/parity/trade_digest.json")).unwrap();
+        for case in data["cases"].as_array().unwrap() {
+            let input = &case["preview"];
+            let intent = &input["intent"];
+            let kind = match intent["kind"].as_str().unwrap() {
+                "OPEN_TRADE" => "OPEN_TRADE",
+                "CLOSE_POSITION" => "CLOSE_POSITION",
+                "CANCEL_PENDING_TRADE" => "CANCEL_PENDING_TRADE",
+                other => panic!("Unexpected fixture intent kind {other}"),
+            };
+            let mut preview = TradePreview::new(TradeIntent::new(
+                kind,
+                intent["target"]["userTradeId"].as_str().map(str::to_owned),
+                intent["body"].clone(),
+            ));
+            preview.reference_price = input["referencePrice"].as_str().map(str::to_owned);
+            preview.quote = input.get("quote").cloned();
+            let account = input["addr"].as_str();
+            assert_eq!(
+                digest_bytes(&preview, account),
+                case["canonical"].as_str().unwrap().as_bytes()
+            );
+            assert_eq!(
+                preview_digest(&preview, account),
+                case["digest"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn confirmation_binds_the_account_before_checking_market_movement() {
+        let account = "0xaa00000000000000000000000000000000000001";
+        let mut preview = TradePreview::new(TradeIntent::new(
+            "OPEN_TRADE",
+            None,
+            json!({"orderType": "market", "maxSlippagePct": "1"}),
+        ));
+        preview.reference_price = Some("100".into());
+        let digest = preview_digest(&preview, Some(account));
+        preview.reference_price = Some("101".into());
+        Confirmation::new(&digest, Some("100.0"))
+            .unwrap()
+            .verify(&preview, account)
+            .unwrap();
+
+        preview.reference_price = Some("101.00005".into());
+        let check = || Confirmation::new(&digest, Some("100")).unwrap();
+        let refusal = check()
+            .verify(&preview, "0xbb00000000000000000000000000000000000002")
+            .unwrap_err();
+        assert_eq!(refusal.code, Code::PreviewMismatch);
+        let refusal = check().verify(&preview, account).unwrap_err();
+        assert_eq!(refusal.code, Code::PriceMoved);
+        assert!(refusal.message.contains("1.0000%"));
+        assert_eq!(
+            refusal.details.unwrap()["preview"]["referencePrice"],
+            "101.00005"
+        );
+        assert_eq!(display_movement(3u32.into(), 20_000u32.into()), "0.0002");
+    }
 }

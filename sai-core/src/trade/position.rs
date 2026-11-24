@@ -8,7 +8,6 @@ use serde_json::{Map, Value, json};
 use crate::{
     errors::{Code, SaiError},
     keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, truthy},
-    settings::repr,
 };
 
 use super::{Confirmation, SubmitOptions, TradePreview, Trading, actions::id};
@@ -62,16 +61,7 @@ impl Trading<'_> {
         action: PositionAction<'_>,
         mode: PositionMode<'_>,
     ) -> Result<Value, SaiError> {
-        let id = id(trade_id).map_err(|_| {
-            let message = format!(
-                "Invalid value for 'TRADE_ID': {} is not a valid integer.",
-                repr(trade_id)
-            );
-            match &mode {
-                PositionMode::DryRun | PositionMode::Submit(None) => SaiError::usage(message),
-                _ => invalid(&message),
-            }
-        })?;
+        let id = id(trade_id, "TRADE_ID")?;
         let id = serde_json::from_str(&id.to_string()).map_err(|_| SaiError::internal())?;
         let session = self.load_session(account)?;
         let addr = session.addr();
