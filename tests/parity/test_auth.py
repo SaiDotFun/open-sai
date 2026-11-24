@@ -16,6 +16,7 @@ import sys
 import termios
 import tty
 from contextlib import suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -233,12 +234,13 @@ def test_auth_summaries_hide_keeper_path(
     path = "/fixture-path-key/query"
     origin = keeper_auth["endpoint"].removesuffix("/query")
     endpoint = origin + path
+    expiry = int((datetime.now(UTC) + timedelta(days=30)).timestamp())
     results = []
     for env in homes(tmp_path, auth_pair):
         fake_cast(env)
         keystore(env, addr=ADDR)
         env.clipboard()
-        env.clip.write_text(fixture_token(OTHER))
+        env.clip.write_text(fixture_token(OTHER, expiry))
         keeper_auth["paths"].clear()
         args = ("--json", "--endpoint", endpoint, "auth")
         outputs = []

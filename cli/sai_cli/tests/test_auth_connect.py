@@ -34,7 +34,6 @@ ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
 # Keeper sends the nonce as bare hex and the typed-data challenge with 0x.
 NONCE = "12" * 32
-CHALLENGE_EXPIRY = "2099-01-01T00:05:00Z"
 
 
 def make_token(addr: str = ADDR, hours: int = 720) -> str:
@@ -517,7 +516,7 @@ def typed_data(**overrides) -> dict:
             "account": ADDR,
             "challenge": "0x" + NONCE,
             "action": "Enable Sai trading",
-            "expiresAt": CHALLENGE_EXPIRY,
+            "expiresAt": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         },
     }
     for key, value in overrides.items():
@@ -568,11 +567,11 @@ def keeper_auth():
     """Serve Keeper's challenge and session mutations on loopback."""
     state: dict[str, Any] = {
         "typed": typed_data(),
-        "challenge_expires_at": CHALLENGE_EXPIRY,
+        "challenge_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         "challenge_addr": None,
         "pending": False,
         "token": make_token(),
-        "expires_at": "2026-12-17T00:00:00+00:00",
+        "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
         "requests": [],
         "paths": [],
         "signatures": [],
@@ -641,6 +640,14 @@ def keeper_auth():
     server.shutdown()
     server.server_close()
     thread.join()
+
+
+def test_keeper_fixture_uses_expiries_relative_to_now(keeper_auth) -> None:
+    now = datetime.now(UTC)
+    session_expiry = datetime.fromisoformat(keeper_auth["expires_at"])
+    challenge_expiry = datetime.fromisoformat(keeper_auth["challenge_expires_at"])
+    assert now + timedelta(days=29) < session_expiry <= now + timedelta(days=30)
+    assert now < challenge_expiry <= now + timedelta(minutes=5)
 
 
 @pytest.mark.parametrize("fault", ["expired", "signature"])
