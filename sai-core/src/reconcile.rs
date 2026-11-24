@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use num_bigint::BigInt;
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -307,6 +308,14 @@ fn normalize_hash(value: &Value) -> String {
     }
 }
 
+fn history_integer(value: &Value) -> Option<BigInt> {
+    // Python's isinstance(value, int) includes booleans and unbounded integers.
+    if let Some(flag) = value.as_bool() {
+        return Some(BigInt::from(u8::from(flag)));
+    }
+    value.as_number()?.as_str().parse().ok()
+}
+
 async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
     let hash = normalize_hash(&row["txHash"]);
     if hash.is_empty() {
@@ -331,7 +340,7 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
         let mut seen = HashSet::new();
         let mut execution_block = None;
         if row["lifecycleStep"] == "exec_pass" {
-            execution_block = row["execBlock"].as_i64();
+            execution_block = history_integer(&row["execBlock"]);
         }
         for page in 0..pages_left.min(HISTORY_MAX_PAGES) {
             let timeout = remaining();
@@ -369,7 +378,7 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
                             .iter()
                             .any(|field| normalize_hash(&item[*field]) == *hash)
                     })
-                    && item["id"].as_i64().is_none_or(|id| seen.insert(id))
+                    && history_integer(&item["id"]).is_none_or(|id| seen.insert(id))
                 {
                     found.push(item.clone());
                 }
@@ -378,13 +387,14 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
                 break;
             }
             if let Some(first) = found.first() {
-                execution_block = execution_block.or_else(|| first["block"]["block"].as_i64());
+                execution_block =
+                    execution_block.or_else(|| history_integer(&first["block"]["block"]));
                 let oldest = history
                     .last()
-                    .and_then(|item| item["block"]["block"].as_i64());
+                    .and_then(|item| history_integer(&item["block"]["block"]));
                 if oldest
-                    .zip(execution_block)
-                    .is_some_and(|(oldest, execution)| oldest < execution)
+                    .zip(execution_block.as_ref())
+                    .is_some_and(|(oldest, execution)| &oldest < execution)
                 {
                     break;
                 }

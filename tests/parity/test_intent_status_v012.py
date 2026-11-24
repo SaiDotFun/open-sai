@@ -118,6 +118,31 @@ def test_history_pages_deduplicate_matching_fills_and_stop_at_older_block(
     assert output["matchedTradeHistory"][1]["txHashInvalid"] is True
 
 
+@pytest.mark.parametrize(
+    "full_page", [False, True], ids=["boolean-id", "boolean-block"]
+)
+def test_history_treats_booleans_as_integers_when_scanning(
+    release_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    full_page: bool,
+) -> None:
+    fill = {**RESPONSES["filled_history"]["data"]["perp"]["tradeHistory"][0], "id": 1}
+    rows = [fill, {**fill, "id": True}]
+    if full_page:
+        rows.extend([{}] * 22)
+        rows.append({"block": {"block": True}})
+    output = replay_status(
+        release_pair,
+        tmp_path,
+        monkeypatch,
+        ("outcome_not_indexed", history_page(rows)),
+        (0,),
+        "terminal",
+    )
+    assert [row["id"] for row in output["matchedTradeHistory"]] == [1]
+
+
 def test_pending_history_retries_once_with_five_request_cap(
     release_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
