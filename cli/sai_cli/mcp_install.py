@@ -385,8 +385,24 @@ def main_checkout(root: Path) -> Path | None:
     return shared.parent
 
 
-def claude_denied(paths: list[Path], scope: str, name: str, argv: list[str]) -> bool:
-    """Match Claude's deny lists against the entry before any launcher change."""
+def claude_command_denied(rule: object, argv: list[str]) -> bool:
+    # Claude expands both sides. Settings can set values outside Sai's
+    # environment, so treat an expansion as a potential match.
+    return (
+        isinstance(rule, list)
+        and len(rule) == len(argv)
+        and all(
+            isinstance(denied, str)
+            and (denied == actual or "${" in denied or "${" in actual)
+            for denied, actual in zip(rule, argv, strict=True)
+        )
+    )
+
+
+def claude_denied_entry(
+    paths: list[Path], scope: str, name: str, argv: list[str], replacement: list[str]
+) -> str | None:
+    """Identify any applicable denial of the old or proposed entry."""
     for path in paths:
         data = load_json(path) or {}
         rules = data.get("deniedMcpServers", [])
@@ -394,26 +410,16 @@ def claude_denied(paths: list[Path], scope: str, name: str, argv: list[str]) -> 
         if not isinstance(rules, list) or not isinstance(disabled, list):
             raise ClaudeMcpPolicyError("Could not check Claude Code MCP deny rules")
         if name in disabled:
-            return True
+            return "existing entry"
         for rule in rules:
             if not isinstance(rule, dict):
                 continue
-            if rule.get("serverName") == name:
-                return True
             command = rule.get("serverCommand")
-            # Claude expands both sides. Settings can set values outside
-            # Sai's environment, so treat an expansion as a potential match.
-            if (
-                isinstance(command, list)
-                and len(command) == len(argv)
-                and all(
-                    isinstance(denied, str)
-                    and (denied == actual or "${" in denied or "${" in actual)
-                    for denied, actual in zip(command, argv, strict=True)
-                )
-            ):
-                return True
-    return False
+            if rule.get("serverName") == name or claude_command_denied(command, argv):
+                return "existing entry"
+            if claude_command_denied(command, replacement):
+                return "replacement command"
+    return None
 
 
 def entry_registration(
@@ -671,15 +677,25 @@ class Claude(Client):
         return None
 
     def check_repair_policy(
-        self, scope: str, name: str, argv: list[str], policy_cwd: Path | None
+        self,
+        scope: str,
+        name: str,
+        argv: list[str],
+        replacement: list[str],
+        policy_cwd: Path | None,
     ) -> None:
         try:
             opaque = self.opaque_policy_source()
-            denied = opaque is None and claude_denied(
-                self.deny_settings_paths(scope, policy_cwd or self.cwd),
-                scope,
-                name,
-                argv,
+            denied = (
+                claude_denied_entry(
+                    self.deny_settings_paths(scope, policy_cwd or self.cwd),
+                    scope,
+                    name,
+                    argv,
+                    replacement,
+                )
+                if opaque is None
+                else None
             )
         except (ClientError, OSError, ValueError, KeyError, subprocess.TimeoutExpired):
             raise ClaudeMcpPolicyError(
@@ -687,7 +703,7 @@ class Claude(Client):
             ) from None
         if denied:
             raise ClaudeMcpPolicyError(
-                "A Claude Code MCP deny rule matches the existing entry"
+                f"A Claude Code MCP deny rule matches the {denied}"
             )
         if opaque:
             raise ClaudeMcpPolicyError(opaque)
@@ -1350,7 +1366,9 @@ def replace_registration(
     config = read_client_config(client, scope, path)
     entry = repair_entry(config.entries, stale)
     if isinstance(client, Claude):
-        client.check_repair_policy(scope, name, stale.registration.argv, policy_cwd)
+        client.check_repair_policy(
+            scope, name, stale.registration.argv, expected.argv, policy_cwd
+        )
     entry["command"], entry["args"] = launcher, stale.args
     # Publish a complete entry in one rename. In particular, Claude must
     # never observe a replacement that is missing its profile or endpoints.

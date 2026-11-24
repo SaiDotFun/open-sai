@@ -370,6 +370,7 @@ def test_doctor_preserves_denied_registration_names(env: Env):
     ("source", "match", "blocked"),
     [
         ("user", "exact", True),
+        ("user", "replacement", True),
         ("project", "exact", True),
         ("local", "exact", True),
         ("git-root", "exact", True),
@@ -413,6 +414,7 @@ def test_doctor_respects_claude_deny_rules(env, monkeypatch, source, match, bloc
     }[source]
     rule = {
         "exact": {"serverCommand": command},
+        "replacement": {"serverCommand": [*serve(env), *command[1:]]},
         "name": {"serverName": "sai"},
         "expanded": {"serverCommand": [*command[:-1], "${POSSIBLY_SECRET}"]},
         "different-arg": {"serverCommand": [*command[:-1], "different"]},
@@ -432,7 +434,10 @@ def test_doctor_respects_claude_deny_rules(env, monkeypatch, source, match, bloc
     if blocked:
         assert config.read_bytes() == original
         assert check["status"] == "warn"
-        reason = "Could not check" if match == "invalid-file" else "deny rule matches"
+        reason = {
+            "invalid-file": "Could not check",
+            "replacement": "deny rule matches the replacement command",
+        }.get(match, "deny rule matches")
         assert reason in check["summary"]
         assert not check.get("changes")
     else:

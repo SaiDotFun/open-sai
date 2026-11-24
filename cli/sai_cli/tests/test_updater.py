@@ -150,6 +150,7 @@ BROKEN_WHEN_INSTALLED = (
         "denied-project",
         "command-denied-background",
         "opaque-policy-background",
+        "replacement-denied-foreground",
     ],
 )
 def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
@@ -167,8 +168,9 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     denied = mode == "denied-project"
     background_denied = mode == "command-denied-background"
     opaque = mode == "opaque-policy-background"
+    replacement_denied = mode == "replacement-denied-foreground"
     background = mode == "background" or background_denied or opaque
-    policy_blocked = denied or background_denied or opaque
+    policy_blocked = denied or background_denied or opaque or replacement_denied
     name = OLD_COMMAND if denied else "sai"
     config = project / ".mcp.json" if denied else home / ".claude.json"
     entry = {
@@ -227,6 +229,13 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     bad_hash = ("0.2.0",) if mode == "failed" else ()
     with Stub(release_routes(wheels, bad_hash=bad_hash)) as stub:
         tool = Tool(uv_dirs, stub.url)
+        if replacement_denied:
+            settings = project / ".claude/settings.json"
+            settings.parent.mkdir()
+            command = [str(tool.sai), "mcp", "serve", *entry["args"]]
+            settings.write_text(
+                json.dumps({"deniedMcpServers": [{"serverCommand": command}]})
+            )
         tool.install_release("0.1.0")
         write_exe(tool.sai.with_name("claude"), FAKE_CLAUDE)
         if denied:
@@ -342,6 +351,8 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
         else:
             assert message in result.stdout
+        if replacement_denied:
+            assert "Repaired Sai MCP registrations for claude" not in result.stdout
         if not background:
             assert updater.notice(state, "0.2.0") is None
         output = result.output + json.dumps(repair) + json.dumps(updater.read_state())
