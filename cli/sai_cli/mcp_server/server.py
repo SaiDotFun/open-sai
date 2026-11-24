@@ -391,12 +391,15 @@ async def trade_open(
     confirmation first. `accepted` means Keeper admitted the intent, not
     that it executed.
 
-    Refuses without submitting: PREVIEW_MISMATCH when the intent differs
-    from the confirmed preview, and, for a market order, PRICE_MOVED when
-    Keeper's current price moved from reference_price by more than the
-    slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or
-    pending. Check its key with intent_status before retrying.
+    Returns PREVIEW_MISMATCH without submitting when the live terms differ
+    from the confirmed preview or Perp would reject the order. For a market
+    order, PRICE_MOVED means the refreshed price moved from reference_price
+    by more than the slippage percent. Show the replacement preview if it
+    includes a previewDigest. If preview is absent or has no digest, call
+    preview_open again before asking the user to confirm.
+
+    RECENT_OPEN_PENDING means an earlier open is still unknown, accepted,
+    or pending. Check its key with intent_status before retrying.
 
     Args:
         market_id: Market id from market_list.
