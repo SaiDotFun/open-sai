@@ -100,7 +100,7 @@ checked on both sides.
 | `update.json` | `checkedAt` |
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
 | Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps. The latter must be stored as REAL Unix seconds within the invocation window. |
-| Log file grouping | Dated files for each surface are merged in UTC date order. Each event must belong to the file's date and fall within that run's invocation window at millisecond precision. |
+| Log file grouping | Dated files for each surface are merged in UTC date order. Each event requires a UTC timestamp in `YYYY-MM-DDTHH:MM:SS.sssZ` format that belongs to the file's date and falls within the invocation window. |
 | Log events | `ts`, `durationMs`, `pid`, `runId`, `callId`, generated `intentKey`, and CLI version. The `doctor.result` and `update.check` events use the same rules as their stdout reports. |
 
 Generated IDs use the same placeholder wherever the original ID reappears

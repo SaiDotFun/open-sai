@@ -4,7 +4,15 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
-from compare import Entry, InvalidLogTime, Normalize, first_difference, ledger, snapshot
+from compare import (
+    Entry,
+    InvalidLogTime,
+    Normalize,
+    first_difference,
+    ledger,
+    snapshot,
+    stdout,
+)
 from parity import Observation, differences
 
 
@@ -23,7 +31,11 @@ def test_log_ids_preserve_joins_and_sequence(tmp_path: Path) -> None:
             )
         ]
 
-    times = ["2026-11-24T01:00:00Z", "2026-11-24T01:00:01Z", "2026-11-24T01:00:02Z"]
+    times = [
+        "2026-11-24T01:00:00.000Z",
+        "2026-11-24T01:00:01.000Z",
+        "2026-11-24T01:00:02.000Z",
+    ]
     reference = Normalize(tmp_path).log_records(
         records("a" * 32, ["b" * 12] * 3, times)
     )
@@ -221,3 +233,26 @@ def test_logs_reject_a_valid_time_in_the_wrong_shard(tmp_path: Path) -> None:
             "2026-01-01T23:59:59.999500Z",
             "2026-01-02T00:00:00.002Z",
         )
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2026-01-01T19:00:00.001-05:00",
+        "2026-01-02T00:00:00.001+00:00",
+        "2026-01-02T00:00:00.001000Z",
+        "2026-01-02T00:00:00Z",
+    ],
+)
+def test_noncanonical_log_time_fails_in_files_and_tail(
+    tmp_path: Path, stamp: str
+) -> None:
+    with pytest.raises(InvalidLogTime, match="UTC millisecond format"):
+        log_snapshot(
+            tmp_path,
+            {"2026-01-02": [(1, "2026-01-02T00:00:00.000Z"), (2, stamp)]},
+            "2026-01-02T00:00:00Z",
+            "2026-01-02T00:00:00.002Z",
+        )
+    with pytest.raises(InvalidLogTime, match="UTC millisecond format"):
+        stdout(json.dumps({"ts": stamp}), "jsonl", "logs tail", Normalize(tmp_path))

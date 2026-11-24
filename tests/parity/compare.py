@@ -12,7 +12,7 @@ import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,9 @@ from tomlkit.items import Item
 
 VERSION = re.compile(r"v?\d+\.\d+\.\d+(?:[-+][\w.+-]+)?")
 LOG_FILE = re.compile(r"logs/(?P<surface>[a-z]+)-(?P<day>\d{4}-\d{2}-\d{2})\.jsonl")
+LOG_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
+)
 LEDGER = "trader/intents.sqlite3"
 SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
@@ -35,7 +38,17 @@ class InvalidReservationTime(ValueError):
 
 
 class InvalidLogTime(ValueError):
-    """An event timestamp is outside the observation window."""
+    """An event timestamp has a noncanonical format or is outside the run."""
+
+
+def parse_log_timestamp(value: object) -> datetime:
+    message = "Log timestamp must use UTC millisecond format YYYY-MM-DDTHH:MM:SS.sssZ"
+    if not isinstance(value, str) or LOG_TIMESTAMP.fullmatch(value) is None:
+        raise InvalidLogTime(message)
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        raise InvalidLogTime(message) from None
 
 
 def config_text(text: str, edited_key: str) -> str:
@@ -139,23 +152,14 @@ class Normalize:
     def log_event(self, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise TypeError("Expected a JSON log event object")
+        stamp = parse_log_timestamp(value.get("ts"))
         if self.started_at is not None and self.ended_at is not None:
-            stamp = value.get("ts")
             # Sai truncates its event clock to milliseconds.
             first_ms = int(self.started_at * 1000) / 1000
-            if (
-                not isinstance(stamp, str)
-                or not timestamp(stamp)
-                or not (
-                    first_ms
-                    <= datetime.fromisoformat(stamp).timestamp()
-                    <= self.ended_at
-                )
-            ):
+            if not first_ms <= stamp.timestamp() <= self.ended_at:
                 raise InvalidLogTime("Log timestamp is outside the invocation window")
         result = self.paths(value)
         predicates = {
-            "timestamp": timestamp,
             "duration": is_count,
             "version": is_version,
         }
@@ -166,7 +170,11 @@ class Normalize:
         }
         for field, rule in self.log_fields.items():
             item = value.get(field)
-            if rule in predicates:
+            if rule == "timestamp" and field in value:
+                if field != "ts":
+                    parse_log_timestamp(item)
+                result[field] = f"<{field}>"
+            elif rule in predicates:
                 replace_if(result, field, predicates[rule])
             elif (
                 rule == "pid"
@@ -481,11 +489,7 @@ def read_log(path: Path, day: str) -> list[dict[str, Any]]:
     ]
     for event in records:
         stamp = event.get("ts") if isinstance(event, dict) else None
-        if (
-            not isinstance(stamp, str)
-            or not timestamp(stamp)
-            or datetime.fromisoformat(stamp).astimezone(UTC).date().isoformat() != day
-        ):
+        if parse_log_timestamp(stamp).date().isoformat() != day:
             raise ValueError("Log timestamp does not match its filename")
     return records
 
@@ -518,7 +522,7 @@ def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
                     records.extend(read_log(path, match["day"]))
                     continue
                 data = content(path, name, normalize)
-            except InvalidReservationTime:
+            except (InvalidReservationTime, InvalidLogTime):
                 raise
             except (ValueError, KeyError, TypeError, sqlite3.Error, InvalidTag) as exc:
                 # A decode failure must fail even when both sides produce it.
