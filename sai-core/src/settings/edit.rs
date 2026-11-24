@@ -1,8 +1,11 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::{self, OpenOptions, TryLockError},
     io::{self, Write},
     ops::Range,
     path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
 };
 
 use serde_json::Value;
@@ -15,21 +18,27 @@ const TEMPLATE: &str = include_str!("../settings-template.toml");
 const LOCK_NAME: &str = ".config.lock";
 
 pub fn set(path: &Path, key: Key, value: &Value) -> Result<(), SettingsError> {
-    edit_file(path, |text| {
-        let new = edit(text, path, key, Some(value))?;
-        Ok(new)
-    })?;
-    Ok(())
+    edit_setting(path, key, Some(value), None).map(|_| ())
 }
 
 pub fn unset(path: &Path, key: Key) -> Result<bool, SettingsError> {
-    edit_file(path, |text| edit(text, path, key, None))
+    edit_setting(path, key, None, None)
 }
 
-fn edit_file(
+pub fn edit_setting(
     path: &Path,
-    edit: impl FnOnce(Option<&str>) -> Result<Option<String>, SettingsError>,
+    key: Key,
+    value: Option<&Value>,
+    interrupt: Option<&AtomicBool>,
 ) -> Result<bool, SettingsError> {
+    let check_interrupt = || {
+        if interrupt.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            Err(SettingsError::invalid("Aborted".into()))
+        } else {
+            Ok(())
+        }
+    };
+    check_interrupt()?;
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -59,9 +68,21 @@ fn edit_file(
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(writing)?;
     }
     let lock = options.open(parent.join(LOCK_NAME)).map_err(writing)?;
-    lock.lock().map_err(writing)?;
+    if interrupt.is_some() {
+        loop {
+            check_interrupt()?;
+            match lock.try_lock() {
+                Ok(()) => break,
+                Err(TryLockError::WouldBlock) => thread::sleep(Duration::from_millis(20)),
+                Err(TryLockError::Error(error)) => return Err(writing(error)),
+            }
+        }
+    } else {
+        lock.lock().map_err(writing)?;
+    }
+    check_interrupt()?;
     let text = read_raw_text(path)?;
-    let Some(new) = edit(text.as_deref())? else {
+    let Some(new) = edit(text.as_deref(), path, key, value)? else {
         return Ok(false);
     };
 
@@ -70,6 +91,7 @@ fn edit_file(
         .tempfile_in(parent)
         .map_err(writing)?;
     temp.write_all(new.as_bytes()).map_err(writing)?;
+    check_interrupt()?;
     temp.persist(path).map_err(|error| writing(error.error))?;
     Ok(true)
 }

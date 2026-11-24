@@ -1,13 +1,17 @@
 use std::{
     borrow::Cow,
-    cell::Cell,
+    cell::RefCell,
     env,
     ffi::OsString,
     fs::{self, File},
     future::Future,
     io::{self, IsTerminal, Read, Write},
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use chrono::Utc;
@@ -27,7 +31,7 @@ use sai_core::{
 };
 
 thread_local! {
-    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    static INTERRUPT: RefCell<Option<Arc<AtomicBool>>> = const { RefCell::new(None) };
 }
 
 #[derive(Default)]
@@ -115,21 +119,36 @@ impl ConditionalEventHandler for HistoryKeys {
 }
 
 pub fn active() -> bool {
-    ACTIVE.get()
+    INTERRUPT.with_borrow(Option::is_some)
+}
+
+pub fn interrupt_flag() -> Option<Arc<AtomicBool>> {
+    INTERRUPT.with_borrow(Clone::clone)
 }
 
 pub async fn interruptible<T>(
     operation: impl Future<Output = Result<T, SaiError>>,
 ) -> Result<T, SaiError> {
-    if !active() {
+    let Some(interrupt) = interrupt_flag() else {
         return operation.await;
-    }
-    tokio::select! {
-        signal = tokio::signal::ctrl_c() => {
-            signal.map_err(|_| SaiError::internal())?;
-            Err(SaiError::new(Code::InvalidRequest, "Aborted"))
+    };
+    let wait_for_interrupt = async {
+        while !interrupt.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+    };
+    tokio::select! {
+        biased;
+        () = wait_for_interrupt => Err(SaiError::new(Code::InvalidRequest, "Aborted")),
         result = operation => result
+    }
+}
+
+struct InterruptRegistration(signal_hook::SigId);
+
+impl Drop for InterruptRegistration {
+    fn drop(&mut self) {
+        signal_hook::low_level::unregister(self.0);
     }
 }
 
@@ -348,6 +367,11 @@ pub fn run(
     account: Option<&str>,
     mut dispatch: impl FnMut(Vec<OsString>),
 ) -> Result<(), SaiError> {
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let _registration = InterruptRegistration(
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupt))
+            .map_err(|_| SaiError::internal())?,
+    );
     let directory = history_directory(home).map_err(|_| SaiError::internal())?;
     banner(
         io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
@@ -433,8 +457,9 @@ pub fn run(
             break;
         }
         match arguments(line) {
-            Ok(arguments) if !arguments.is_empty() => ACTIVE.with(|active| {
-                let previous = active.replace(true);
+            Ok(arguments) if !arguments.is_empty() => {
+                interrupt.store(false, Ordering::Relaxed);
+                let previous = INTERRUPT.replace(Some(Arc::clone(&interrupt)));
                 dispatch(
                     forwarded
                         .iter()
@@ -442,8 +467,8 @@ pub fn run(
                         .chain(arguments.into_iter().map(OsString::from))
                         .collect(),
                 );
-                active.set(previous);
-            }),
+                INTERRUPT.set(previous);
+            }
             Ok(_) => {}
             Err(error) => eprintln!("Error: {}", error.message),
         }

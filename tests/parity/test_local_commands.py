@@ -883,6 +883,102 @@ def test_repl_history_matches_typed_prefix(
                 os.close(master)
 
 
+def test_repl_interrupt_cancels_config_lock_wait_after_lookup(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    import fcntl
+    import pty
+    import signal
+    import time
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Event, Thread
+
+    looked_up = Event()
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers["Content-Length"]))
+            response = b'{"data":{"userIntents":[]}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+            looked_up.set()
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    prompt = "❯".encode()
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for index, cli in enumerate(local_pair):
+                looked_up.clear()
+                root = tmp_path / str(index)
+                home = root / "sai-home"
+                home.mkdir(parents=True)
+                lock_path = home / ".config.lock"
+                master, slave = pty.openpty()
+                endpoint = f"http://127.0.0.1:{server.server_port}/graphql"
+                with subprocess.Popen(
+                    [*cli, "--endpoint", endpoint],
+                    cwd=root,
+                    env={**case_env(root, logging="0"), "TERM": "xterm-256color"},
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                ) as process:
+                    os.close(slave)
+                    pending = bytearray()
+                    try:
+                        read_terminal(master, pending, prompt)
+                        os.write(
+                            master, f"logs intent {INTENT_KEY} --addr {ADDR}\r".encode()
+                        )
+                        assert looked_up.wait(timeout=8)
+                        read_terminal(master, pending, b"No matching log events.")
+                        read_terminal(master, pending, prompt)
+                        with lock_path.open("a+b") as lock:
+                            fcntl.flock(lock, fcntl.LOCK_EX)
+                            command = b"config set logs.keep_days 30"
+                            os.write(master, command + b"\r")
+                            fds = Path(f"/proc/{process.pid}/fd")
+                            if fds.is_dir():
+                                # Observe the actual settings lock open while our
+                                # exclusive lock still prevents the edit.
+                                deadline = time.monotonic() + 5
+                                while True:
+                                    if any(
+                                        fd.resolve() == lock_path
+                                        for fd in fds.iterdir()
+                                    ):
+                                        break
+                                    assert time.monotonic() < deadline
+                                    time.sleep(0.01)
+                            else:
+                                read_terminal(master, pending, command)
+                                time.sleep(0.25)
+                            process.send_signal(signal.SIGINT)
+                            read_terminal(master, pending, b"Interrupted")
+                            read_terminal(master, pending, prompt)
+                        assert not (home / "config.toml").exists()
+                        os.write(master, b"config get logs.keep_days\r")
+                        read_terminal(master, pending, b"14\r\n")
+                        read_terminal(master, pending, prompt)
+                        os.write(master, b"quit\r")
+                        assert process.wait(timeout=8) == 0
+                        assert not (home / "config.toml").exists()
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                        os.close(master)
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
 def test_repl_commands_share_run_but_keep_command_ids(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:

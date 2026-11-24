@@ -748,4 +748,4 @@ fn parse_error(path: &Path, input: &str, error: &TomlError, editing: bool) -> Se
     SettingsError::invalid(format!("Cannot parse {}: {detail}", path.display()))
 }
 
-pub use edit::{set, unset};
+pub use edit::{edit_setting, set, unset};
