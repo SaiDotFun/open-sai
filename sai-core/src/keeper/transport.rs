@@ -129,14 +129,21 @@ async fn open_socket(
     forward: bool,
     timeout: Duration,
 ) -> Result<SocketBox, SaiError> {
-    let tls = Arc::new(keeper_tls_config()?);
+    let secure_proxy = proxy
+        .as_ref()
+        .is_some_and(|proxy| proxy.uri().scheme_str() == Some("https"));
+    // Native and configured trust stores are blocking filesystem reads. Run
+    // them off the reactor so an outer probe timeout can cancel the request.
+    let (tls, proxy_tls) = tokio::task::spawn_blocking(move || {
+        let tls = Arc::new(keeper_tls_config()?);
+        let proxy_tls = secure_proxy.then(|| Arc::new(proxy_tls_config()));
+        Ok::<_, SaiError>((tls, proxy_tls))
+    })
+    .await
+    .map_err(|_| SaiError::internal())??;
     if let Some(proxy) = proxy {
-        let proxy_tls = if proxy.uri().scheme_str() == Some("https") {
-            Arc::new(proxy_tls_config())
-        } else {
-            Arc::clone(&tls)
-        };
-        let socket = connect(proxy.uri(), &proxy_tls, timeout).await?;
+        let proxy_tls = proxy_tls.as_ref().unwrap_or(&tls);
+        let socket = connect(proxy.uri(), proxy_tls, timeout).await?;
         if forward {
             Ok(socket)
         } else {
@@ -358,7 +365,8 @@ fn tls_config(roots: RootCertStore) -> ClientConfig {
 }
 
 fn add_pem_file(roots: &mut RootCertStore, path: &Path) -> Result<(), SaiError> {
-    let certs = CertificateDer::pem_file_iter(path).map_err(|_| SaiError::internal())?;
+    let file = crate::files::open_regular(path).map_err(|_| SaiError::internal())?;
+    let certs = CertificateDer::pem_reader_iter(file);
     for cert in certs {
         roots
             .add(cert.map_err(|_| SaiError::internal())?)

@@ -10,8 +10,8 @@ use rustix::{
     fs::{self as unix, AtFlags, Dir, FileType, Mode, OFlags},
     process::{geteuid, getuid},
 };
-use sai_core::settings::{Environment, doctor_log_settings};
-use serde_json::json;
+use sai_core::settings::Environment;
+use serde_json::{Value, json};
 
 use super::{Check, plural};
 
@@ -410,7 +410,7 @@ fn log_name(name: &str) -> Option<(NaiveDate, &str)> {
         .then_some((parsed, surface))
 }
 
-pub(super) fn logs_check(env: &Environment, fix: bool) -> Check {
+pub(super) fn logs_check(env: &Environment, fix: bool, (on, keep_days): (bool, Value)) -> Check {
     let root = env.home.join("logs");
     if env.home.is_symlink() {
         return Check::new(
@@ -421,7 +421,6 @@ pub(super) fn logs_check(env: &Environment, fix: bool) -> Check {
         .fix(SYMLINK_FIX)
         .details(json!({"path": root, "symlinks": [env.home]}));
     }
-    let (on, keep_days) = doctor_log_settings(env);
     let mut files = Vec::new();
     let mut refused = Vec::new();
     if let Ok(dir) = open_directory(&root)

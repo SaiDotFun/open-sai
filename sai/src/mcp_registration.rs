@@ -807,6 +807,7 @@ impl Clients {
                 name,
                 &target,
                 Some(entry),
+                deadline,
             )
         }
         .map_err(problem)
@@ -1036,7 +1037,8 @@ impl Clients {
         let mut result = InstallResult::new(client, scope);
         result.report["name"] = json!(name);
         let work = || -> ClientResult<Option<Target>> {
-            let mut entries = self.registrations(client, name, Instant::now() + CLIENT_TIMEOUT)?;
+            let deadline = Instant::now() + CLIENT_TIMEOUT;
+            let mut entries = self.registrations(client, name, deadline)?;
             let entry = entries
                 .drain(..)
                 .find(|entry| entry.scope == scope)
@@ -1066,6 +1068,7 @@ impl Clients {
                     name,
                     &replacement,
                     Some(&entry),
+                    deadline,
                 )?;
             }
             Ok(Some(replacement))
@@ -1172,9 +1175,11 @@ impl Clients {
         if let Some(step) = step {
             client::run_step(&step, &self.cwd, deadline)?;
         } else if let Some(old) = existing.filter(|_| client == Client::Claude) {
-            client.replace_claude(&self.home, &self.cwd, NAMES[0], target, old)?;
+            client.replace_claude(&self.home, &self.cwd, NAMES[0], target, old, deadline)?;
         } else {
-            client.write(scope, &self.home, &self.cwd, NAMES[0], target, None)?;
+            client.write(
+                scope, &self.home, &self.cwd, NAMES[0], target, None, deadline,
+            )?;
         }
         result.changed = true;
         self.verify(client, scope, NAMES[0], target, deadline)?;

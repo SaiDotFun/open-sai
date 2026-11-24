@@ -7,7 +7,8 @@ mod toml;
 use std::{
     env,
     ffi::{OsStr, OsString},
-    fmt, fs, io,
+    fmt,
+    io::{self, Read},
     path::{Path, PathBuf},
 };
 
@@ -15,6 +16,7 @@ use serde_json::{Value, json};
 use toml_edit::{Item, TomlError};
 
 use crate::endpoint::Endpoint;
+use crate::files::open_regular;
 use toml::ParsedDocument;
 
 pub const FILE_NAME: &str = "config.toml";
@@ -706,8 +708,9 @@ fn read_text(path: &Path) -> Result<Option<String>, SettingsError> {
 }
 
 fn read_raw_text(path: &Path) -> Result<Option<String>, SettingsError> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(text)),
+    let mut text = String::new();
+    match open_regular(path).and_then(|mut file| file.read_to_string(&mut text)) {
+        Ok(_) => Ok(Some(text)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(SettingsError::invalid(format!(
             "Cannot read {}: {}",

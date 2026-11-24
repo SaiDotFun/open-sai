@@ -14,7 +14,7 @@ use sai_core::{
     keeper,
     log::{self, EventContext, Field, Level},
     session::parse_expiry,
-    settings::{Environment, Flags, KEYS, Key, Settings, Source},
+    settings::{Environment, Flags, KEYS, Key, Settings, Source, doctor_log_settings},
     storage::{Session, Storage},
 };
 use serde::Serialize;
@@ -149,7 +149,26 @@ impl DoctorArgs {
             ..flags
         };
         let fix = !self.no_fix;
-        let (config, settings, invalid_endpoint) = config_check(&flags, env);
+        let config_env = env.clone();
+        let (config, settings, invalid_endpoint, log_settings) =
+            sai_core::files::read_before(Instant::now() + DEADLINE, move || {
+                let (check, settings, invalid_endpoint) = config_check(&flags, &config_env);
+                Ok((
+                    check,
+                    settings,
+                    invalid_endpoint,
+                    doctor_log_settings(&config_env),
+                ))
+            })
+            .unwrap_or_else(|error| {
+                let check = if error.kind() == io::ErrorKind::TimedOut {
+                    Check::new("config", "fail", "No answer within 7 s")
+                        .fix("Check that config.toml in the Sai home is readable")
+                } else {
+                    crashed("config", "OSError")
+                };
+                (check, None, false, (false, json!(14)))
+            });
         let code = if config.status == "fail" {
             Code::InvalidRequest
         } else {
@@ -166,7 +185,7 @@ impl DoctorArgs {
         if let Some(writer) = events.writer {
             writer.flush(Duration::from_secs(1));
         }
-        checks.push(timed(|| files::logs_check(env, fix)));
+        checks.push(timed(|| files::logs_check(env, fix, log_settings)));
 
         let started = Instant::now();
         match mcp::check_registrations(fix, DEADLINE) {

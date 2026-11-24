@@ -1,5 +1,6 @@
 mod endpoint;
 pub mod errors;
+pub mod files;
 pub mod keeper;
 pub mod log;
 pub mod reconcile;

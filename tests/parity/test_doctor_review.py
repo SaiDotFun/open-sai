@@ -200,3 +200,33 @@ def test_doctor_prefers_the_running_install_over_path_shadow(
         assert cursor["status"] == "fail"
         assert cursor["fix"] == "Install a stable Sai launcher on PATH"
         assert config.read_bytes() == before
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs POSIX named pipes")
+@pytest.mark.parametrize("source", ["settings", "cursor", "ca"])
+def test_doctor_refuses_named_pipes(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str], source: str
+) -> None:
+    args = ["doctor", "--no-fix"]
+    if source == "settings":
+        path = tmp_path / "sai/config.toml"
+        check = "config"
+    elif source == "cursor":
+        path = tmp_path / ".cursor/mcp.json"
+        check = "mcp.cursor"
+    else:
+        path = tmp_path / "ca.pem"
+        check = "lcd"
+        fixture_env |= {
+            "SSL_CERT_FILE": str(path),
+            "SAI_ENDPOINT": "https://127.0.0.1:1/query",
+            "SAI_WS_ENDPOINT": "wss://127.0.0.1:1/query",
+            "SAI_LCD_ENDPOINT": "https://127.0.0.1:1",
+        }
+    path.parent.mkdir(exist_ok=True)
+    os.mkfifo(path, 0o600)
+    if source != "ca":
+        args.append("--offline")
+    result = invoke(candidate, tmp_path, fixture_env, *args)
+    assert checks(result)[check]["status"] == "fail"
+    assert stat.S_ISFIFO(path.stat().st_mode)

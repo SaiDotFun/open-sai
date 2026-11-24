@@ -90,8 +90,8 @@ impl Client {
             return Ok(project.into_iter().chain(user).collect());
         }
 
-        let user = read_json(&self.path(Scope::User, home, cwd))?;
-        let project = read_json(&self.path(Scope::Project, home, cwd))?;
+        let user = read_json(&self.path(Scope::User, home, cwd), deadline)?;
+        let project = read_json(&self.path(Scope::Project, home, cwd), deadline)?;
         let local = &user["projects"][cwd.to_string_lossy().as_ref()];
         let disabled = self == Self::Claude && has_name(&local["disabledMcpServers"], name);
         let project_entry = &project["mcpServers"][name];
@@ -114,6 +114,7 @@ impl Client {
             .collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn write(
         self,
         scope: Scope,
@@ -122,13 +123,17 @@ impl Client {
         name: &str,
         target: &Target,
         old: Option<&Registration>,
+        deadline: Instant,
     ) -> Result<()> {
         let path = self.path(scope, home, cwd);
         if self == Self::Codex {
-            return edit(&path, true, |source| edit_codex(source, name, target, old)).map(|_| ());
+            return edit(&path, true, deadline, |source| {
+                edit_codex(source, name, target, old)
+            })
+            .map(|_| ());
         }
         let update = old.map_or(JsonUpdate::Install(None), JsonUpdate::Repair);
-        self.write_json(&path, cwd, scope, name, target, update)
+        self.write_json(&path, cwd, scope, name, target, update, deadline)
     }
 
     pub(super) fn repair_codex(
@@ -141,7 +146,7 @@ impl Client {
     ) -> Result<()> {
         let client = Self::Codex;
         let path = client.path(Scope::User, home, cwd);
-        let published = edit(&path, true, |source| {
+        let published = edit(&path, true, deadline, |source| {
             edit_codex(source, name, target, Some(old))
         })?;
         let verification = codex_get(&client.codex_neutral(home), Scope::User, name, deadline)
@@ -155,7 +160,9 @@ impl Client {
         if verification.is_err()
             && let Some(published) = published
         {
-            published.restore(&path)?;
+            // A verification timeout can consume the inspection budget.
+            // Allow a separate bounded read to check whether rollback is safe.
+            published.restore(&path, Instant::now() + Duration::from_secs(1))?;
         }
         verification
     }
@@ -167,6 +174,7 @@ impl Client {
         name: &str,
         target: &Target,
         old: &Registration,
+        deadline: Instant,
     ) -> Result<()> {
         let scope = old.scope;
         let path = self.path(scope, home, cwd);
@@ -177,9 +185,11 @@ impl Client {
             name,
             target,
             JsonUpdate::Install(Some(old)),
+            deadline,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_json(
         self,
         path: &Path,
@@ -188,12 +198,13 @@ impl Client {
         name: &str,
         target: &Target,
         update: JsonUpdate<'_>,
+        deadline: Instant,
     ) -> Result<()> {
         let existing = match update {
             JsonUpdate::Install(old) => old,
             JsonUpdate::Repair(old) => Some(old),
         };
-        edit(path, existing.is_none(), |source| {
+        edit(path, existing.is_none(), deadline, |source| {
             let mut doc = json_object(source, path)?;
             let holder = if scope == Scope::Local {
                 doc["projects"][cwd.to_string_lossy().as_ref()]
@@ -307,7 +318,7 @@ fn claude_project_disabled(home: &Path, cwd: &Path, name: &str, deadline: Instan
         }
     }
     for path in paths {
-        if has_name(&read_json(&path)?["disabledMcpjsonServers"], name) {
+        if has_name(&read_json(&path, deadline)?["disabledMcpjsonServers"], name) {
             return Ok(true);
         }
     }
@@ -449,6 +460,7 @@ fn io_kind(error: io::Error) -> String {
     match error.kind() {
         io::ErrorKind::NotFound => "FileNotFoundError",
         io::ErrorKind::PermissionDenied => "PermissionError",
+        io::ErrorKind::TimedOut => "TimeoutExpired",
         _ => "OSError",
     }
     .into()
@@ -519,9 +531,15 @@ pub(super) fn resolved(path: &Path) -> PathBuf {
     current
 }
 
-fn read(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
+fn read(path: &Path, deadline: Instant) -> io::Result<Option<Vec<u8>>> {
+    let path = path.to_owned();
+    sai_core::files::read_before(deadline, move || read_config(&path))
+}
+
+fn read_config(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    match sai_core::files::open_regular(path).and_then(|mut file| file.read_to_end(&mut bytes)) {
+        Ok(_) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -546,8 +564,10 @@ fn json_object(source: &[u8], path: &Path) -> Result<Value> {
     }
 }
 
-fn read_json(path: &Path) -> Result<Value> {
-    match read(path).map_err(|e| format!("could not read {}: {}", path.display(), io_kind(e)))? {
+fn read_json(path: &Path, deadline: Instant) -> Result<Value> {
+    match read(path, deadline)
+        .map_err(|e| format!("could not read {}: {}", path.display(), io_kind(e)))?
+    {
         Some(source) => json_object(&source, path),
         None => Ok(serde_json::json!({})),
     }
@@ -561,7 +581,7 @@ struct PublishedConfig {
 }
 
 impl PublishedConfig {
-    fn restore(self, path: &Path) -> Result<()> {
+    fn restore(self, path: &Path, deadline: Instant) -> Result<()> {
         // A concurrent edit belongs to the client or user. Restore only the
         // file this repair published, even if a newer file has identical text.
         let original = self
@@ -573,6 +593,7 @@ impl PublishedConfig {
             Some(self.replacement.as_bytes()),
             &original,
             Some(&self.metadata),
+            deadline,
         )?;
         if restored.is_some() {
             Ok(())
@@ -585,12 +606,13 @@ impl PublishedConfig {
 fn edit(
     path: &Path,
     retry: bool,
+    deadline: Instant,
     render: impl Fn(&[u8]) -> Result<String>,
 ) -> Result<Option<PublishedConfig>> {
     let attempts = if retry { 2 } else { 1 };
     for _ in 0..attempts {
         let destination = resolved(path);
-        let seen = read(&destination).map_err(io_kind)?;
+        let seen = read(&destination, deadline).map_err(io_kind)?;
         let rendered = render(seen.as_deref().unwrap_or(
             if retry && path.extension().is_some_and(|e| e == "toml") {
                 b""
@@ -618,6 +640,7 @@ fn edit(
             seen.as_deref(),
             rendered.as_bytes(),
             original_metadata.as_ref(),
+            deadline,
         )? {
             return Ok(Some(PublishedConfig {
                 destination,
@@ -645,6 +668,7 @@ fn replace_if_current(
     seen: Option<&[u8]>,
     replacement: &[u8],
     original_metadata: Option<&Metadata>,
+    deadline: Instant,
 ) -> Result<Option<Metadata>> {
     let parent = destination.parent().ok_or("Missing config directory")?;
     fs::create_dir_all(parent).map_err(io_kind)?;
@@ -656,7 +680,9 @@ fn replace_if_current(
             .map_err(io_kind)?;
     }
     let published_metadata = temp.as_file().metadata().map_err(io_kind)?;
-    if resolved(path) != destination || read(destination).map_err(io_kind)?.as_deref() != seen {
+    if resolved(path) != destination
+        || read(destination, deadline).map_err(io_kind)?.as_deref() != seen
+    {
         return Ok(None);
     }
     if let Some(expected) = original_metadata
