@@ -4,17 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 import time
 from collections import deque
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import KeeperHandler, keeper_server
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from sai_cli.core import keeper, reconcile, settings, storage
@@ -39,9 +38,9 @@ Reply = str | dict[str, Any]
 def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
     replies: deque[Reply] = deque()
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(KeeperHandler):
         def do_POST(self) -> None:
-            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            request = self.read_json()
             queued = replies.popleft()
             if queued == "admission_ack":
                 assert request["query"] == keeper.SUBMIT
@@ -69,25 +68,11 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
                 assert request["variables"] == {"trader": ADDR}
             elif "borrowings" in reply["data"].get("perp", {}):
                 assert request["query"] == keeper.MARKETS
-            body = json.dumps(reply).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.reply(reply)
 
-        def log_message(self, format: str, *args: Any) -> None:
-            pass
-
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as http:
-        thread = threading.Thread(target=http.serve_forever, args=(0.01,), daemon=True)
-        thread.start()
-        try:
-            yield f"http://127.0.0.1:{http.server_port}/query", replies
-            assert not replies
-        finally:
-            http.shutdown()
-            thread.join()
+    with keeper_server(Handler) as base:
+        yield f"{base}/query", replies
+        assert not replies
 
 
 def status(endpoint: str) -> str:
