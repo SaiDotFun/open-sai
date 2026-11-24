@@ -129,6 +129,22 @@ def test_list_shows_only_endpoint_origins():
 
 
 @pytest.mark.parametrize(
+    ("host", "ascii_host"),
+    [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("faß.example", "xn--fa-hia.example"),
+    ],
+)
+def test_config_list_shows_idna_origin_for_internationalized_lcd(host, ascii_host):
+    endpoint = f"https://{host}:8443/fixture-private-path?key=fixture-private-query"
+    assert sai("config", "set", "lcd.endpoint", endpoint).exit_code == 0
+    expected = f"https://{ascii_host}:8443"
+    assert listed()["settings"]["lcd.endpoint"]["value"] == expected
+    assert f'lcd.endpoint = "{expected}"' in sai("config", "list").stdout
+    assert sai("config", "get", "lcd.endpoint").stdout == endpoint + "\n"
+
+
+@pytest.mark.parametrize(
     "args",
     [
         ("config", "get", "keeper.url"),

@@ -138,6 +138,38 @@ fn config_set_acknowledges_only_the_endpoint_origin() {
 }
 
 #[test]
+fn config_list_shows_idna_origin_for_internationalized_lcd() {
+    for (host, ascii_host) in [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("faß.example", "xn--fa-hia.example"),
+    ] {
+        let root = tempdir().unwrap();
+        let endpoint =
+            format!("https://{host}:8443/fixture-private-path?key=fixture-private-query");
+        let set = sai(root.path())
+            .args(["config", "set", "lcd.endpoint", &endpoint])
+            .output()
+            .unwrap();
+        assert!(set.status.success());
+        let expected = format!("https://{ascii_host}:8443");
+        let listed = sai(root.path())
+            .args(["--json", "config", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            read_json(&listed)["settings"]["lcd.endpoint"]["value"],
+            expected
+        );
+        let get = sai(root.path())
+            .args(["config", "get", "lcd.endpoint"])
+            .output()
+            .unwrap();
+        assert_eq!(get.stdout, format!("{endpoint}\n").as_bytes());
+        assert!(get.status.success());
+    }
+}
+
+#[test]
 fn missing_relative_config_leaves_home_absent_with_logging_disabled() {
     let root = tempdir().unwrap();
     let output = sai(Path::new("relative-home"))
