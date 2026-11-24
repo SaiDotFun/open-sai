@@ -540,27 +540,39 @@ def stats(
 
     log.flush(1.0)
     scan = log.LogScan()
+    rows = [
+        (ts, line)
+        for line in scan.rows(
+            root,
+            first_day=first_day,
+            last_day=instant.date() if instant else None,
+            since=cutoff,
+            before=upper,
+        )
+        if (ts := _timestamp(line)) is not None
+    ]
+    # Alternating between files can read sparse older rows before the
+    # busiest file reaches the same timestamp. Defer those to the next page.
+    frontier = scan.frontier if scan.truncated else None
+    gaps = [
+        ("gaps", line)
+        for ts, line in rows
+        if line.get("event") == "log.dropped" and (frontier is None or ts >= frontier)
+    ]
+    gaps.sort(key=lambda entry: log.event_order(entry[1]))
+    report = _limit({"since": cutoff, "gaps": []}, gaps, scan.truncated, frontier)
+
+    # The report cap can move the boundary forward when there are many gaps.
+    page_start = report.get("nextBefore")
     durations: defaultdict[str, list[int]] = defaultdict(list)
     codes: Counter[str] = Counter()
-    gaps: list[tuple[str, LogLine]] = []
-    oldest = None
-    for line in scan.rows(
-        root,
-        first_day=first_day,
-        last_day=instant.date() if instant else None,
-        since=cutoff,
-        before=upper,
-    ):
-        ts = _timestamp(line)
-        if ts is None or (cutoff and ts < cutoff) or (upper and ts >= upper):
-            continue
-        oldest = min(oldest, ts) if oldest else ts
-        if line.get("event") == "log.dropped":
-            gaps.append(("gaps", line))
+    for ts, line in rows:
+        event = line.get("event")
+        if event == "log.dropped" or (page_start is not None and ts < page_start):
             continue
         if (code := _id(line, "code")) and code in CODES:
             codes[code] += 1
-        if line.get("event") == "keeper.request":
+        if event == "keeper.request":
             operation, duration = _id(line, "operation"), line.get("durationMs")
             if (
                 operation
@@ -578,15 +590,6 @@ def stats(
             "p50Ms": samples[(count * 50 + 99) // 100 - 1],
             "p95Ms": samples[(count * 95 + 99) // 100 - 1],
         }
-    gaps.sort(key=lambda entry: log.event_order(entry[1]))
-    return _limit(
-        {
-            "since": cutoff,
-            "keeper": operations,
-            "errors": dict(sorted(codes.items())),
-            "gaps": [],
-        },
-        gaps,
-        scan.truncated,
-        scan.frontier if scan.truncated else oldest,
-    )
+    report["keeper"] = operations
+    report["errors"] = dict(sorted(codes.items()))
+    return report

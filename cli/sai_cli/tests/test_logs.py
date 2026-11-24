@@ -2396,25 +2396,83 @@ def test_stats_does_not_spend_row_budget_on_stale_other_surface(home):
 def test_stats_caps_the_number_of_scanned_rows(home):
     root = home / "logs"
     root.mkdir()
-    today = date(2026, 11, 24)
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
     row = {
         "event": "keeper.request",
         "operation": "prices",
         "durationMs": 7,
-        "ts": "2026-11-24T11:00:00.000Z",
+        "code": "KEEPER_ERROR",
     }
-    path = log.file_path("mcp", today, root)
-    path.write_bytes(log.encode(row) * (log.MAX_SCAN_ROWS + 1))
-    log.file_path("cli", today, root).write_bytes(
-        log.encode({**row, "operation": "markets", "ts": "2026-11-24T01:00:00.000Z"})
+    log.file_path("mcp", start.date(), root).write_bytes(
+        b"".join(
+            log.encode({**row, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(
+            {
+                **row,
+                "operation": "markets",
+                "ts": log.stamp(start - timedelta(hours=10)),
+            }
+        )
     )
     report = log_queries.stats()
     assert (
         report["truncated"]
         and report["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS - 1
     )
-    assert report["keeper"]["markets"]["count"] == 1
-    assert report["nextBefore"] == row["ts"]
+    assert "markets" not in report["keeper"]
+    assert report["errors"] == {"KEEPER_ERROR": log.MAX_SCAN_ROWS - 1}
+    assert report["nextBefore"] == log.stamp(start + timedelta(milliseconds=2))
+
+    earlier = log_queries.stats(before=report["nextBefore"])
+    assert earlier["keeper"] == {
+        "markets": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+        "prices": {"count": 2, "p50Ms": 7, "p95Ms": 7},
+    }
+    assert earlier["errors"] == {"KEEPER_ERROR": 3}
+    assert "truncated" not in earlier
+
+
+def test_logs_stats_counts_older_rows_once_when_gap_output_is_capped(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    gap = {"event": "log.dropped", "count": 1, "runId": "process"}
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode({**sample, "ts": log.stamp(start)})
+        + b"".join(
+            log.encode({**gap, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(1, log_queries.MAX_REPORT_ROWS + 2)
+        )
+        + log.encode({**sample, "ts": log.stamp(start + timedelta(seconds=1))})
+    )
+
+    code, output = run_cli("--json", "logs", "stats")
+    assert code == 0
+    report = json.loads(output)
+    assert report["keeper"] == {"prices": {"count": 1, "p50Ms": 7, "p95Ms": 7}}
+    assert report["errors"] == {"KEEPER_ERROR": 1}
+    assert len(report["gaps"]) == log_queries.MAX_REPORT_ROWS
+    assert report["nextBefore"] == log.stamp(start + timedelta(milliseconds=2))
+
+    code, output = run_cli("--json", "logs", "stats", "--before", report["nextBefore"])
+    assert code == 0
+    earlier = json.loads(output)
+    assert earlier["keeper"] == report["keeper"]
+    assert earlier["errors"] == report["errors"]
+    assert earlier["gaps"] == [
+        {**gap, "ts": log.stamp(start + timedelta(milliseconds=1))}
+    ]
+    assert "truncated" not in earlier
 
 
 def test_mcp_log_concurrency_leaves_normal_tools_available(keeper_stub):
