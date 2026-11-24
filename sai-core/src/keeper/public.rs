@@ -131,22 +131,30 @@ fn block_time(value: &Value) -> bool {
         .is_some_and(|text| text.chars().count() <= 40 && parse_expiry(text).is_some())
 }
 
-pub(crate) fn request_hash(value: &Value) -> Option<String> {
-    let hash = value.as_str()?;
-    let digits = hash
-        .strip_prefix("0x")
-        .or_else(|| hash.strip_prefix("0X"))
-        .unwrap_or(hash);
-    (digits.len() == 64 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
-        .then(|| hash.to_ascii_lowercase())
-}
-
 fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
-    if let Some(hash) = request_hash(value) {
+    let (hash, invalid) = request_hash(value);
+    if let Some(hash) = hash {
         out.insert(key.into(), json!(hash));
-    } else if !value.is_null() {
+    }
+    if invalid {
         out.insert(format!("{key}Invalid"), json!(true));
     }
+}
+
+pub(crate) fn request_hash(value: &Value) -> (Option<String>, bool) {
+    if value.is_null() {
+        return (None, false);
+    }
+    if let Some(hash) = value.as_str() {
+        let digits = hash
+            .strip_prefix("0x")
+            .or_else(|| hash.strip_prefix("0X"))
+            .unwrap_or(hash);
+        if digits.len() == 64 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return (Some(hash.to_ascii_lowercase()), false);
+        }
+    }
+    (None, true)
 }
 
 fn reconcile_fields(out: &mut Map<String, Value>, source: &Map<String, Value>) {

@@ -140,8 +140,8 @@ impl<'a> Evidence<'a> {
             .any(|(_, value)| !value.is_null())
             .then(|| Map::from_iter(fees.map(|(key, value)| (key.into(), value))));
         json!({
-            "requestTxHash": keeper::request_hash(request_hash)
-                .or_else(|| keeper::request_hash(&order["orderReqTxHash"]))
+            "requestTxHash": keeper::request_hash(request_hash).0
+                .or_else(|| keeper::request_hash(&order["orderReqTxHash"]).0)
                 .or_else(|| public["txHash"].as_str().map(str::to_owned)),
             "requestBlock": first_truthy([&number(request_block), &number(&order["orderReqBlock"])]),
             "action": {"kind": intent["kind"], "orderType": self.order_type},

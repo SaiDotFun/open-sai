@@ -1,5 +1,6 @@
 mod config;
 mod local;
+mod trade;
 
 use std::{env, path::Path, process, time::Instant};
 
@@ -62,6 +63,11 @@ enum Command {
     Config {
         #[command(subcommand)]
         command: ConfigCommand,
+    },
+    /// Submit authenticated trading intents.
+    Trade {
+        #[command(subcommand)]
+        command: trade::TradeCommand,
     },
 }
 
@@ -150,6 +156,10 @@ fn main() -> process::ExitCode {
                         Command::Config { command } => {
                             command.run(&flags, env, json).map(|()| ExitCode::Ok)
                         }
+                        Command::Trade { command } => {
+                            trade::run(command, cli.account.as_deref(), &flags, env, json, events)
+                                .map(|()| ExitCode::Ok)
+                        }
                     }
                 });
             match result {
@@ -232,7 +242,8 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" => "",
+        "config list" | "auth status" | "auth list" | "trade open" => "",
+        "trade close" | "trade cancel" => " TRADE_ID",
         "intent status" | "intent local" | "auth use" => " ADDR",
         "intent wait" => " KEY",
         "auth logout" => " [ADDR]",
@@ -310,10 +321,11 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return ("logs", &[]),
-            "config" | "auth" | "intent" => {
+            "config" | "auth" | "intent" | "trade" => {
                 let group = match arg.as_str() {
                     "auth" => "auth",
                     "intent" => "intent",
+                    "trade" => "trade",
                     _ => "config",
                 };
                 let Some((index, leaf)) = args
@@ -336,6 +348,9 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("intent", "local") => "intent local",
                     ("intent", "status") => "intent status",
                     ("intent", "wait") => "intent wait",
+                    ("trade", "open") => "trade open",
+                    ("trade", "close") => "trade close",
+                    ("trade", "cancel") => "trade cancel",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);

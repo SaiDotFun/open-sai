@@ -547,9 +547,12 @@ sys.stdout.flush()
 sys.stdin.buffer.read(1)
 try:
     storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
-except ValueError as error:
-    if "Reconcile uncertain intent rust " not in str(error):
-        raise
+except storage.UnresolvedIntent as error:
+    if hasattr(storage, "RecentOpenPending"):
+        assert isinstance(error, storage.RecentOpenPending)
+        assert error.intent_key == "rust"
+    else:
+        assert "Reconcile uncertain intent rust " in str(error)
     sys.exit(4)
 "#,
             ENDPOINT,
@@ -575,7 +578,7 @@ except ValueError as error:
     let python_status = python.wait().unwrap().code();
     match reserved {
         Ok(()) => assert_eq!(python_status, Some(4)),
-        Err(StorageError::UncertainIntent(key)) => {
+        Err(StorageError::RecentOpenPending { key, .. }) => {
             assert_eq!(key, "python");
             assert_eq!(python_status, Some(0));
         }
@@ -641,8 +644,12 @@ from sai_cli.core import storage
 endpoint, addr = sys.argv[1:]
 try:
     storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
-except ValueError as error:
-    assert "Reconcile uncertain intent rust " in str(error)
+except storage.UnresolvedIntent as error:
+    if hasattr(storage, "RecentOpenPending"):
+        assert isinstance(error, storage.RecentOpenPending)
+        assert error.intent_key == "rust"
+    else:
+        assert "Reconcile uncertain intent rust " in str(error)
 else:
     raise AssertionError("Python reserved a second intent")
 "#,
