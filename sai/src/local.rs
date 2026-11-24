@@ -3,34 +3,20 @@ use std::{
     io::{self, Write},
 };
 
-use chrono::Utc;
 use clap::Subcommand;
 use sai_core::{
     errors::{Code, SaiError},
     keeper,
     log::{EventContext, Field, Level},
     reconcile,
-    session::expired,
     settings::{Environment, Flags},
-    storage::{IntentStatus, RemovedSession, SessionSummary, Storage, StorageEvent},
+    storage::{IntentStatus, Storage, StorageEvent},
 };
 use serde::Serialize;
 use serde_json::json;
 use serde_json::ser::{Formatter, PrettyFormatter};
 
 use crate::{load_settings, usage};
-
-#[derive(Subcommand)]
-pub enum AuthCommand {
-    /// Show the current account and expiry.
-    Status,
-    /// List connected accounts and which one is active.
-    List,
-    /// Make a connected account active.
-    Use { addr: String },
-    /// Remove the specified account or the active account.
-    Logout { addr: Option<String> },
-}
 
 #[derive(Subcommand)]
 pub enum IntentCommand {
@@ -62,93 +48,6 @@ pub fn intent_help(command: &str) -> Option<String> {
     Some(format!("{}\n\n{help}", usage(command)))
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AccountRow<'a> {
-    #[serde(flatten)]
-    summary: SessionSummary<'a>,
-    active: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expired: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    endpoint_matches: Option<bool>,
-}
-
-#[derive(Serialize)]
-struct AccountList<'a> {
-    accounts: Vec<AccountRow<'a>>,
-}
-
-#[derive(Serialize)]
-struct Logout {
-    removed: bool,
-    addr: Option<String>,
-    note: &'static str,
-}
-
-pub fn auth(
-    command: AuthCommand,
-    as_addr: Option<&str>,
-    flags: &Flags,
-    env: &Environment,
-    json: bool,
-    events: EventContext<'_>,
-) -> Result<(), SaiError> {
-    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
-    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
-    match command {
-        AuthCommand::Status => {
-            let settings = load_settings(flags, env)?;
-            let session = storage.load_active_session(settings.endpoint(), as_addr)?;
-            emit(&session.summary()?, json)
-        }
-        AuthCommand::List => {
-            let settings = load_settings(flags, env)?;
-            let accounts = storage.load_accounts()?;
-            let now = Utc::now();
-            let accounts = accounts
-                .iter()
-                .map(|(session, active)| {
-                    Ok(AccountRow {
-                        summary: session.summary()?,
-                        active,
-                        expired: Some(expired(session, now)?),
-                        endpoint_matches: Some(session.endpoint() == Some(settings.endpoint())),
-                    })
-                })
-                .collect::<Result<_, sai_core::storage::StorageError>>()?;
-            emit(&AccountList { accounts }, json)
-        }
-        AuthCommand::Use { addr } => {
-            let session = storage.use_session(&addr)?;
-            emit(
-                &AccountRow {
-                    summary: session.summary()?,
-                    active: true,
-                    expired: None,
-                    endpoint_matches: None,
-                },
-                json,
-            )
-        }
-        AuthCommand::Logout { addr } => {
-            let removed =
-                storage.delete_session(addr.as_deref().filter(|s| !s.is_empty()).or(as_addr))?;
-            emit(
-                &Logout {
-                    removed: removed.is_some(),
-                    addr: match removed {
-                        Some(RemovedSession::Account(addr)) => Some(addr),
-                        _ => None,
-                    },
-                    note: "Keeper cannot revoke session tokens yet; the token stays valid until it expires.",
-                },
-                json,
-            )
-        }
-    }
-}
-
 pub fn intent(
     command: IntentCommand,
     flags: &Flags,
@@ -156,9 +55,11 @@ pub fn intent(
     json: bool,
     events: EventContext<'_>,
 ) -> Result<(), SaiError> {
-    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
-    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let settings = load_settings(flags, env)?;
+    let log_storage = |event: StorageEvent<'_>| {
+        storage_event_with_endpoint(events, event, Some(settings.endpoint()))
+    };
+    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     match command {
         IntentCommand::Status { addr, key } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -181,8 +82,46 @@ pub fn intent(
     }
 }
 
-fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+    storage_event_with_endpoint(events, event, None);
+}
+
+pub(crate) fn storage_event_with_endpoint(
+    events: EventContext<'_>,
+    event: StorageEvent<'_>,
+    trade_endpoint: Option<&str>,
+) {
+    let endpoint_id = || {
+        trade_endpoint.map_or(
+            Field::Scalar(serde_json::Value::Null),
+            Field::endpoint_identity,
+        )
+    };
     match event {
+        StorageEvent::IntentReserved {
+            key,
+            kind,
+            addr,
+            entity,
+            endpoint,
+        } => {
+            events.event(
+                "intent.reserved",
+                Level::Info,
+                [
+                    ("intentKey", json!(key).into()),
+                    ("kind", json!(kind).into()),
+                    ("status", json!("unknown").into()),
+                    ("addr", json!(addr).into()),
+                    (
+                        "tradeId",
+                        json!((!entity.is_empty()).then_some(entity)).into(),
+                    ),
+                    ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("endpointId", endpoint_id()),
+                ],
+            );
+        }
         StorageEvent::IntentStatus {
             key,
             kind,
@@ -206,6 +145,7 @@ fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
                     ("status", json!(status.as_str()).into()),
                     ("addr", json!(addr).into()),
                     ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("endpointId", endpoint_id()),
                     ("code", json!(code).into()),
                 ],
             );
@@ -218,10 +158,61 @@ fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
                     ("code", json!(Code::SessionExpired).into()),
                     ("addr", json!(addr).into()),
                     ("expiresAt", json!(expires_at).into()),
+                    ("endpointId", endpoint_id()),
                 ],
             );
         }
-        _ => {}
+        StorageEvent::SessionSaved {
+            addr,
+            expires_at,
+            endpoint,
+            connected_accounts,
+        } => {
+            events.event(
+                "session.saved",
+                Level::Info,
+                [
+                    ("addr", json!(addr).into()),
+                    ("expiresAt", json!(expires_at).into()),
+                    (
+                        "endpoint",
+                        endpoint
+                            .map_or_else(|| json!(null).into(), |url| Field::Endpoint(url.into())),
+                    ),
+                    ("connectedAccounts", json!(connected_accounts).into()),
+                ],
+            );
+        }
+        StorageEvent::SessionActive { addr } => {
+            events.event(
+                "session.active",
+                Level::Info,
+                [("addr", json!(addr).into())],
+            );
+        }
+        StorageEvent::SessionRemoved {
+            addr,
+            connected_accounts,
+        } => {
+            events.event(
+                "session.removed",
+                Level::Info,
+                [
+                    ("addr", json!(addr).into()),
+                    ("connectedAccounts", json!(connected_accounts).into()),
+                ],
+            );
+        }
+        StorageEvent::UnreadableSessionRemoved => {
+            events.event(
+                "session.removed",
+                Level::Warn,
+                [
+                    ("code", json!(Code::SessionUnavailable).into()),
+                    ("reason", json!("unreadable session file").into()),
+                ],
+            );
+        }
     }
 }
 
@@ -253,7 +244,7 @@ impl Formatter for InlineJson {
     }
 }
 
-fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
+pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     let mut bytes = Vec::new();
     if json {
         value.serialize(&mut serde_json::Serializer::with_formatter(

@@ -17,11 +17,12 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from click.testing import CliRunner
 from sai_cli import doctor
-from sai_cli.core import keeper, margin, settings, storage, stream, update, updater
+from sai_cli.core import keeper, log, margin, settings, storage, stream, update, updater
 from sai_cli.sai_cli import main
 from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
@@ -226,11 +227,8 @@ def test_expired_session_fails():
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
     assert "expired" in check.summary
-    assert check.fix and check.fix.startswith(
-        'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-    )
-    assert "auth login NAME" in check.fix
-    assert ENDPOINT not in check.fix
+    assert check.fix == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
+    assert "Foundry keystore" in check.summary
 
 
 def test_session_for_other_endpoint_fails():
@@ -953,6 +951,8 @@ class Stub:
         self.on_intents: Any = None
         self.queries: list[str] = []
         self.paths: list[str] = []
+        self.lcd_paths: list[str] = []
+        self.reflect_lcd_network: Callable[[str], str] | None = None
 
 
 @pytest.fixture
@@ -1006,8 +1006,14 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
             self.reply({"data": {"oneClickTrading": route}})
 
         def do_GET(self):
-            assert self.path.endswith("/cosmos/base/tendermint/v1beta1/node_info")
-            info = {} if state.network is None else {"network": state.network}
+            state.lcd_paths.append(self.path)
+            assert urlsplit(self.path).path.endswith(margin.NODE_INFO_PATH)
+            network = (
+                state.reflect_lcd_network(self.path)
+                if state.reflect_lcd_network is not None
+                else state.network
+            )
+            info = {} if network is None else {"network": network}
             self.reply({"default_node_info": info})
 
         def log_message(self, format, *args):
@@ -1066,11 +1072,15 @@ def free_port() -> int:
 
 
 def test_network_checks_pass_against_stubs(http_stub):
-    base, _state = http_stub
+    base, state = http_stub
     ws, stop = ws_stub(ack=True)
     try:
         checks = doctor.run_checks(
-            ctx(f"{base}/query", ws_override=ws, lcd_endpoint=base)
+            ctx(
+                f"{base}/query",
+                ws_override=ws,
+                lcd_endpoint=f"{base}/fixture-lcd-path/?key=fixture-lcd-query",
+            )
         )
     finally:
         stop()
@@ -1089,15 +1099,94 @@ def test_network_checks_pass_against_stubs(http_stub):
     assert by_id["keeper"].status == "pass"
     assert by_id["websocket"].status == "pass"
     assert by_id["lcd"].status == "pass"
-    assert by_id["lcd"].details["network"] == "cataclysm-1"
+    assert by_id["lcd"].details == {"endpoint": base, "matchesKeeperChain": True}
+    assert "matches Keeper chain cataclysm-1" in by_id["lcd"].summary
+    assert state.lcd_paths == [
+        f"/fixture-lcd-path{margin.NODE_INFO_PATH}?key=fixture-lcd-query"
+    ]
 
 
-def test_lcd_without_a_network_fails(http_stub):
+@pytest.mark.parametrize("network", [None, "a" * 51, "cataclysm-1\n"])
+def test_lcd_with_an_invalid_network_fails(http_stub, network):
     base, state = http_stub
-    state.network = None
+    state.network = network
     check = one(doctor.check_lcd, ctx(lcd_endpoint=base))
     assert check.status == "fail"
-    assert "network" in check.summary
+    assert "invalid chain ID" in check.summary
+    assert check.details == {"endpoint": base}
+
+
+@pytest.mark.parametrize(
+    ("reflect", "status", "summary"),
+    [
+        pytest.param(lambda target: target, "fail", "invalid chain ID", id="target"),
+        pytest.param(
+            lambda target: urlsplit(target).path.split("/")[1],
+            "warn",
+            "LCD network differs from Keeper chain cataclysm-1",
+            id="path-segment",
+        ),
+        pytest.param(
+            lambda target: parse_qs(urlsplit(target).query)["key"][0],
+            "warn",
+            "LCD network differs from Keeper chain cataclysm-1",
+            id="query-key",
+        ),
+    ],
+)
+def test_doctor_does_not_echo_a_reflected_lcd_network(
+    http_stub, isolated_home, reflect, status, summary
+):
+    base, state = http_stub
+    state.reflect_lcd_network = reflect
+    path_key, query_key = "fixture-private-lcd-path", "fixture-private-lcd-query"
+    target = f"/{path_key}{margin.NODE_INFO_PATH}?key={query_key}"
+    ws, stop = ws_stub(ack=True)
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                base + "/query",
+                "doctor",
+                "--ws-endpoint",
+                ws,
+                "--lcd-endpoint",
+                f"{base}/{path_key}?key={query_key}",
+            )
+            assert code == (1 if status == "fail" else 0)
+            assert summary in output
+            assert path_key not in output and query_key not in output
+            if flags:
+                report = json.loads(output)
+                if status == "fail":
+                    report = report["error"]["details"]
+                lcd = next(check for check in report["checks"] if check["id"] == "lcd")
+                assert lcd["status"] == status
+                details = {"endpoint": base}
+                if status == "warn":
+                    details["matchesKeeperChain"] = False
+                assert lcd["details"] == details
+    finally:
+        stop()
+    assert state.lcd_paths == [target, target]
+    assert log.flush(5)
+    logs = "".join(
+        path.read_text() for path in (isolated_home / "logs").glob("*.jsonl")
+    )
+    assert path_key not in logs and query_key not in logs
+    results = [json.loads(line) for line in logs.splitlines()]
+    lcd_results = [
+        check
+        for result in results
+        if result["event"] == "doctor.result"
+        for check in result["checks"]
+        if check["id"] == "lcd"
+    ]
+    assert len(lcd_results) == 2
+    assert all(
+        row["status"] == status and summary in row["summary"] for row in lcd_results
+    )
 
 
 @pytest.fixture
@@ -1224,7 +1313,8 @@ def test_lcd_on_another_chain_warns(http_stub):
         stop()
     lcd = next(check for check in checks if check.id == "lcd")
     assert lcd.status == "warn"
-    assert "Keeper trades on cataclysm-1" in lcd.summary
+    assert "LCD network differs from Keeper chain cataclysm-1" in lcd.summary
+    assert lcd.details == {"endpoint": base, "matchesKeeperChain": False}
 
 
 def test_silent_websocket_fails_within_the_timeout():
@@ -1365,11 +1455,12 @@ def blocked_on(endpoint: str) -> None:
 @pytest.mark.parametrize(
     "matches", [False, True], ids=["same-origin-mismatch", "match"]
 )
-def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
+def test_doctor_shows_only_endpoint_origins_in_reports_and_hints(
     http_stub, matches, request
 ):
     base, state = http_stub
     path_key, query_key = "fixture-keeper-path", "fixture-keeper-query"
+    lcd_path_key, lcd_query_key = "fixture-lcd-path", "fixture-lcd-query"
     stored_path_key = "fixture-stored-path"
     route = f"/{path_key}/query?key={query_key}"
     endpoint = base + route
@@ -1390,12 +1481,18 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
             "--ws-endpoint",
             ws_origin + route,
             "--lcd-endpoint",
-            base,
+            f"{base}/{lcd_path_key}?key={lcd_query_key}",
         )
         assert code == 1
         assert ws_origin in output
-        assert path_key not in output and query_key not in output
-        assert stored_path_key not in output
+        for secret in (
+            path_key,
+            query_key,
+            stored_path_key,
+            lcd_path_key,
+            lcd_query_key,
+        ):
+            assert secret not in output
         assert "${SAI_RECONCILE_ENDPOINT:?" in output
         if flags:
             checks = {
@@ -1407,6 +1504,8 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
             assert session["endpoint"] == base and session["endpointMatches"] is matches
             assert checks["websocket"]["status"] == "pass"
             assert checks["websocket"]["details"]["endpoint"] == ws_origin
+            assert checks["lcd"]["status"] == "pass"
+            assert checks["lcd"]["details"]["endpoint"] == base
             fix = checks["intents" if matches else "session"]["fix"]
             command = (
                 f"intent status {ADDR} --key {KEY}" if matches else "auth login NAME"
@@ -1563,15 +1662,13 @@ def test_json_report_shape_and_exit_code():
     error = json.loads(output)["error"]
     assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
     assert "expired" in error["message"]
-    assert "auth login NAME" in error["message"]
+    assert "Foundry keystore" in error["message"]
     details = error["details"]
     assert details["schemaVersion"] == 1 and details["overall"] == "fail"
     checks = {check["id"]: check for check in details["checks"]}
     assert checks["session"]["status"] == "fail"
     recovery = checks["session"]["fix"]
-    assert recovery.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert "auth login NAME" in recovery
-    assert ENDPOINT not in recovery
+    assert recovery == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
     assert checks["keeper"]["status"] == "skipped"
 
 

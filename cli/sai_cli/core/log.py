@@ -68,7 +68,7 @@ import uuid
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
@@ -76,8 +76,10 @@ from types import MappingProxyType
 from typing import Any, Self
 from urllib.parse import urlsplit
 
+import httpx
+
 from . import paths
-from .errors import Code
+from .errors import Code, ExitCode, SaiError
 from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
 
 DIR_NAME = "logs"
@@ -144,6 +146,7 @@ _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 # brackets, commas, and semicolons are all legal inside a URL, so nothing
 # else ends it; whatever follows without a space is removed with it.
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*")
+_RETAINED_URL = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z0-9+.-]+://\S*")
 # The same, to the end of the string: for a value that is one token.
 _URL_REST = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://.*", re.DOTALL)
 _HOST = re.compile(r"[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]")
@@ -348,13 +351,15 @@ def origin(value: str) -> str:
         host = parts.hostname or ""
         if ":" in host:
             host = f"[{host}]"
+        elif not host.isascii():
+            host = httpx.URL(scheme=parts.scheme, host=host).raw_host.decode("ascii")
         # A host with any other character is not a host: it is text that ran
         # into the URL, and may be the secret.
         if not parts.scheme or not _HOST.fullmatch(host):
             return REDACTED_URL
         port = parts.port
         return f"{parts.scheme}://{host}" + ("" if port is None else f":{port}")
-    except ValueError:
+    except (ValueError, httpx.InvalidURL):
         return REDACTED_URL
 
 
@@ -750,6 +755,24 @@ class LogDir:
                 raise OSError("invalid log identity key")
             return key
 
+    def publish_private(self, name: str, data: bytes) -> None:
+        """Atomically replace an owner-only file in the opened directory."""
+        staged = f".staged-{uuid.uuid4().hex}"
+        try:
+            fd = self._open_file(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(fd, "wb") as output:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(output.fileno(), FILE_MODE)
+                output.write(data)
+            source, _ = self._target(staged)
+            target, _ = self._target(name)
+            if self.fd is None:
+                os.replace(source, target)
+            else:
+                os.replace(source, target, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        finally:
+            self.unlink(staged)
+
     def endpoint_key(self, *, create: bool = False) -> bytes | None:
         try:
             key = self._read_endpoint_key()
@@ -769,29 +792,29 @@ class LogDir:
                 if key is not None:
                     return key
                 key = os.urandom(32)
-                name = f".endpoint-key-{uuid.uuid4().hex}"
-                try:
-                    staged = self._open_file(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-                    with os.fdopen(staged, "wb") as output:
-                        output.write(key)
-                    source, _ = self._target(name)
-                    destination, _ = self._target(ENDPOINT_KEY)
-                    if self.fd is None:
-                        os.replace(source, destination)
-                    else:
-                        os.replace(
-                            source, destination, src_dir_fd=self.fd, dst_dir_fd=self.fd
-                        )
-                finally:
-                    self.unlink(name)
+                self.publish_private(ENDPOINT_KEY, key)
                 return key
             finally:
                 os.close(fd)
         except OSError:
             return None
 
-    def read_fd(self, name: str) -> int:
-        return self._open_file(name, os.O_RDONLY)
+    def read_fd(self, name: str, extent: FileExtent | None = None) -> int:
+        try:
+            fd = self._open_file(name, os.O_RDONLY)
+        except OSError:
+            if extent is not None:
+                raise stale_snapshot() from None
+            raise
+        if extent is not None:
+            try:
+                matches = extent.matches(os.fstat(fd))
+            except OSError:
+                matches = False
+            if not matches:
+                os.close(fd)
+                raise stale_snapshot()
+        return fd
 
     def modified(self, name: str) -> float | None:
         target, extra = self._target(name)
@@ -811,13 +834,13 @@ class LogDir:
         finally:
             os.close(fd)
 
-    def is_regular(self, name: str) -> bool:
+    def file_info(self, name: str) -> os.stat_result | None:
         target, extra = self._target(name)
         try:
             info = os.stat(target, follow_symlinks=False, **extra)
         except OSError:
-            return False
-        return stat.S_ISREG(info.st_mode)
+            return None
+        return info if stat.S_ISREG(info.st_mode) else None
 
     def unlink(self, name: str) -> bool:
         target, extra = self._target(name)
@@ -855,7 +878,7 @@ class LogDir:
         found: list[tuple[date, str, str]] = []
         for name in self.names():
             parsed = parse_name(name)
-            if parsed is not None and self.is_regular(name):
+            if parsed is not None and self.file_info(name) is not None:
                 found.append((*parsed, name))
         return sorted(found)
 
@@ -1301,19 +1324,82 @@ def _invalid_constant(_text: str) -> Any:
     raise ValueError("Invalid JSON constant")
 
 
+def _redact_retained_urls(value: Any, *, argument: bool = False) -> Any:
+    if isinstance(value, str):
+        if "://" not in value:
+            return value
+        if argument and (match := _RETAINED_URL.search(value)):
+            return value[: match.start()] + origin(value[match.start() :])
+        return _RETAINED_URL.sub(lambda match: origin(match[0]), value)
+    if isinstance(value, list):
+        return [_redact_retained_urls(item, argument=argument) for item in value]
+    if isinstance(value, dict):
+        return {
+            _redact_retained_urls(key): (
+                origin(item)
+                if key in ("endpoint", "keeper", "websocket", "lcd")
+                and isinstance(item, str)
+                else _redact_retained_urls(item, argument=key == "argv")
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
+def _redact_retained_endpoint_args(line: dict[str, Any]) -> None:
+    argv = line.get("argv")
+    if not isinstance(argv, list):
+        return
+    from . import settings
+
+    endpoints = {spec.key for spec in settings.SETTINGS if spec.kind == "url"}
+    flags = {spec.flag for spec in settings.SETTINGS if spec.key in endpoints}
+    operands: list[int] = []
+    index = 0
+    options = True
+    while index < len(argv):
+        arg = argv[index]
+        if not isinstance(arg, str):
+            index += 1
+            continue
+        flag, equals, value = arg.partition("=")
+        if options and flag in flags:
+            if equals:
+                argv[index] = flag + "=" + origin(value)
+            elif index + 1 < len(argv) and isinstance(argv[index + 1], str):
+                index += 1
+                argv[index] = origin(argv[index])
+        elif options and arg == "--":
+            options = False
+        elif options and flag in ("--as", "--as-addr"):
+            index += not equals
+        elif not options or not arg.startswith("-") or len(operands) >= 3:
+            operands.append(index)
+        index += 1
+
+    if len(operands) >= 3:
+        group, action, key = (argv[index] for index in operands[:3])
+        if group == "config" and action in ("set", "get") and key in endpoints:
+            for index in operands[3:]:
+                argv[index] = origin(argv[index])
+
+
 def decode_row(raw: bytes) -> Any:
     line = json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
-    if (
-        isinstance(line, dict)
-        and line.get("event") == "keeper.request"
-        and "keeperErrors" in line
-    ):
+    if not isinstance(line, dict):
+        return line
+    _redact_retained_endpoint_args(line)
+    # Preserve the placeholder for malformed top-level endpoint fields.
+    for field in ("endpoint", "keeper", "websocket", "lcd"):
+        if (value := line.get(field)) is not None and not isinstance(value, str):
+            line[field] = REDACTED_URL
+    if line.get("event") == "keeper.request" and "keeperErrors" in line:
         line.update(
             keeper_error_fields(
                 line["keeperErrors"], retained=True, total=line.get("keeperErrorCount")
             )
         )
-    return line
+    return _redact_retained_urls(line)
 
 
 MAX_SCAN_BYTES = 16 * 1024 * 1024
@@ -1321,168 +1407,21 @@ MAX_SCAN_ROWS = 20_000
 MAX_SCAN_FILES = 128
 
 
+@dataclass
+class ScanBudget:
+    bytes_left: int = MAX_SCAN_BYTES
+    rows_left: int = MAX_SCAN_ROWS
+    files_left: int = MAX_SCAN_FILES
+
+    def read(self, fd: int, size: int) -> bytes:
+        data = os.read(fd, min(size, self.bytes_left))
+        self.bytes_left -= len(data)
+        return data
+
+
 # Writers put ts before any event data. This recognizes that header in
 # both schema versions, so older rows can be skipped before JSON decoding.
 _TS_HEADER = re.compile(rb'^\{"(?:schema":[0-9]+,"|)ts":"([0-9TZ:.-]{24})"')
-
-
-@dataclass
-class LogScan:
-    max_bytes: int = MAX_SCAN_BYTES
-    max_rows: int = MAX_SCAN_ROWS
-    max_files: int = MAX_SCAN_FILES
-    truncated: bool = False
-    frontier: str | None = None
-    visited: set[str] = field(default_factory=set)
-
-    def _stop_at_frontier(self, pending: Mapping[str, str | None]) -> None:
-        # A fully read sparse file cannot advance a cursor past an
-        # unfinished busy file on the same UTC day.
-        known = [ts for ts in pending.values() if ts is not None]
-        if known and len(known) == len(pending):
-            self.frontier = max(known)
-
-    def rows(
-        self,
-        root: Path | None = None,
-        *,
-        first_day: date | None = None,
-        last_day: date | None = None,
-        since: str | None = None,
-        before: str | None = None,
-        days: set[date] | None = None,
-        skip: set[str] | None = None,
-        prefix: bool = False,
-        accept: Callable[[dict[str, Any]], bool] | None = None,
-        frontier_before: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
-        """Read bounded snapshots in UTC day order, alternating surfaces."""
-        opened = LogDir.open(root or directory())
-        if opened is None:
-            return
-        remaining_bytes, remaining_rows = self.max_bytes, self.max_rows
-        lower = since.encode() if since else None
-        upper = before.encode() if before else None
-        byte_limit = False
-
-        def read(fd: int, size: int) -> bytes:
-            nonlocal remaining_bytes, byte_limit
-            if size > remaining_bytes:
-                self.truncated = True
-                byte_limit = True
-                return b""
-            data = os.read(fd, size)
-            remaining_bytes -= len(data)
-            return data
-
-        with opened:
-            files = [
-                (day, name)
-                for day, _, name in reversed(opened.files())
-                if (first_day is None or day >= first_day)
-                and (last_day is None or day <= last_day)
-                and (days is None or day in days)
-                and (skip is None or name not in skip)
-            ]
-            self.truncated = len(files) > self.max_files
-            for _, daily in itertools.groupby(
-                files[: self.max_files], key=lambda item: item[0]
-            ):
-                if remaining_bytes == 0:
-                    self.truncated = True
-                    return
-                names = [name for _, name in daily]
-                with ExitStack() as active:
-                    readers = []
-                    for name in names:
-                        try:
-                            fd = opened.read_fd(name)
-                            active.callback(os.close, fd)
-                            size = os.fstat(fd).st_size
-                            if not size:
-                                continue
-                            if prefix:
-                                # Context after midnight starts at the head of each file.
-                                length = min(size, self.max_bytes // len(names))
-                                data = read(fd, length)
-                                self.truncated |= len(data) < size
-                                readers.append((name, iter([data.split(b"\n")[:-1]])))
-                            else:
-                                os.lseek(fd, size - 1, os.SEEK_SET)
-                                complete = read(fd, 1) == b"\n"
-                                readers.append(
-                                    (
-                                        name,
-                                        _line_blocks(
-                                            fd,
-                                            TAIL_CHUNK,
-                                            end=size,
-                                            read=read,
-                                            max_line=MAX_LINE,
-                                            complete_end=complete,
-                                        ),
-                                    )
-                                )
-                        except OSError:
-                            self.truncated = True
-                    # Read one chunk per surface before advancing a busy file.
-                    pending: dict[str, str | None] = {name: None for name, _ in readers}
-
-                    while readers:
-                        next_readers = []
-                        for name, reader in readers:
-                            try:
-                                block = next(reader)
-                            except StopIteration:
-                                if byte_limit:
-                                    self._stop_at_frontier(pending)
-                                    return
-                                pending.pop(name)
-                                continue
-                            except OSError:
-                                self.truncated = True
-                                continue
-                            self.visited.add(name)
-                            next_readers.append((name, reader))
-                            for raw in block:
-                                if len(raw) > MAX_LINE:
-                                    continue
-                                if (lower or upper) and (
-                                    header := _TS_HEADER.match(raw)
-                                ):
-                                    ts = header[1]
-                                    if lower and ts < lower or upper and ts >= upper:
-                                        continue
-                                try:
-                                    line = decode_row(raw)
-                                except (ValueError, RecursionError):
-                                    continue
-                                if not isinstance(line, dict):
-                                    continue
-                                if since or before:
-                                    ts = line.get("ts")
-                                    if not isinstance(ts, str) or (
-                                        since and ts < since or before and ts >= before
-                                    ):
-                                        continue
-                                if accept is not None and not accept(line):
-                                    continue
-                                if remaining_rows == 0:
-                                    self.truncated = True
-                                    self._stop_at_frontier(pending)
-                                    return
-                                remaining_rows -= 1
-                                ts = line.get("ts")
-                                if (
-                                    isinstance(ts, str)
-                                    and (
-                                        frontier_before is None or ts < frontier_before
-                                    )
-                                    and (current := pending[name]) != ts
-                                ):
-                                    pending[name] = min(current, ts) if current else ts
-                                yield line
-                        readers = next_readers
 
 
 @dataclass(frozen=True)
@@ -1490,6 +1429,205 @@ class ScanPosition:
     day: date
     # Exclusive byte endpoints in SURFACES order. None starts a fresh day.
     offsets: tuple[int, ...] | None = None
+
+
+@dataclass(frozen=True, order=True)
+class RowPosition:
+    day: date
+    slot: int
+    offset: int
+    size: int
+
+
+@dataclass(frozen=True)
+class FileExtent:
+    size: int
+    device: int
+    inode: int
+    modified: int
+
+    def matches(self, info: os.stat_result | None) -> bool:
+        return (
+            info is not None
+            and (info.st_dev, info.st_ino) == (self.device, self.inode)
+            and (
+                info.st_size > self.size
+                or (info.st_size == self.size and info.st_mtime_ns == self.modified)
+            )
+        )
+
+
+FileSnapshot = dict[tuple[date, int], FileExtent]
+
+
+def stale_snapshot() -> SaiError:
+    return SaiError(
+        "Retained log files changed. Start a new intent log query.",
+        Code.INVALID_REQUEST,
+        exit_code=ExitCode.USAGE,
+    )
+
+
+def snapshot_files(root: Path | None) -> FileSnapshot:
+    """Record the identity and extent of each daily file."""
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        return {}
+    snapshot: FileSnapshot = {}
+    with opened:
+        for name in opened.names():
+            if (
+                (parsed := parse_name(name))
+                and (info := opened.file_info(name))
+                and info.st_size
+            ):
+                day, surface = parsed
+                snapshot[day, SURFACES.index(surface)] = FileExtent(
+                    info.st_size, info.st_dev, info.st_ino, info.st_mtime_ns
+                )
+    return snapshot
+
+
+def check_snapshot(
+    root: Path | None, snapshot: FileSnapshot, required: set[tuple[date, int]]
+) -> None:
+    if not required:
+        return
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        raise stale_snapshot()
+    with opened:
+        for day, slot in required:
+            expected = snapshot.get((day, slot))
+            if expected is None or not expected.matches(
+                opened.file_info(file_name(SURFACES[slot], day))
+            ):
+                raise stale_snapshot()
+
+
+def _scan_files(
+    opened: LogDir, snapshot: FileSnapshot | None
+) -> list[tuple[date, str, str]]:
+    if snapshot is None:
+        return opened.files()
+    return [
+        (day, SURFACES[slot], file_name(SURFACES[slot], day))
+        for day, slot in sorted(snapshot)
+    ]
+
+
+def read_rows_at(
+    root: Path | None,
+    positions: list[RowPosition],
+    snapshot: FileSnapshot,
+    budget: ScanBudget,
+) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
+    """Read the individual lines that supplied attribution on earlier pages."""
+    rows: list[tuple[RowPosition, dict[str, Any]]] = []
+    if not positions:
+        return rows, False
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        raise stale_snapshot()
+    with opened:
+        for (day, slot), group in itertools.groupby(
+            sorted(set(positions)), key=lambda position: (position.day, position.slot)
+        ):
+            extent = snapshot.get((day, slot))
+            if extent is None:
+                raise stale_snapshot()
+            if budget.files_left == 0:
+                return rows, True
+            budget.files_left -= 1
+            try:
+                fd = opened.read_fd(file_name(SURFACES[slot], day), extent)
+            except OSError:
+                continue
+            try:
+                for position in group:
+                    if position.offset + position.size > extent.size:
+                        continue
+                    if position.size > budget.bytes_left or budget.rows_left == 0:
+                        return rows, True
+                    os.lseek(fd, position.offset, os.SEEK_SET)
+                    raw = budget.read(fd, position.size)
+                    budget.rows_left -= 1
+                    if len(raw) != position.size or not raw.endswith(b"\n"):
+                        continue
+                    try:
+                        line = decode_row(raw)
+                    except (ValueError, RecursionError):
+                        continue
+                    if isinstance(line, dict):
+                        rows.append((position, line))
+            except OSError:
+                continue
+            finally:
+                os.close(fd)
+    return rows, False
+
+
+def read_prefix(
+    root: Path | None,
+    day: date,
+    accept: Callable[[dict[str, Any]], bool],
+    *,
+    max_bytes: int,
+    max_rows: int,
+    snapshot: FileSnapshot | None = None,
+    budget: ScanBudget | None = None,
+) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
+    """Read bounded attribution context from the start of one day's files."""
+    rows: list[tuple[RowPosition, dict[str, Any]]] = []
+    truncated = False
+    if budget is None:
+        budget = ScanBudget(max_bytes, max_rows, len(SURFACES))
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        return rows, truncated
+    with opened:
+        files = [
+            (slot, name)
+            for found, surface, name in reversed(_scan_files(opened, snapshot))
+            for slot in (SURFACES.index(surface),)
+            if found == day
+        ]
+        for slot, name in files:
+            if (
+                budget.files_left == 0
+                or budget.rows_left == 0
+                or budget.bytes_left == 0
+            ):
+                return rows, True
+            budget.files_left -= 1
+            try:
+                extent = snapshot[day, slot] if snapshot is not None else None
+                fd = opened.read_fd(name, extent)
+                try:
+                    size = extent.size if extent is not None else os.fstat(fd).st_size
+                    data = budget.read(fd, min(size, max_bytes // len(files)))
+                    truncated |= len(data) < size
+                finally:
+                    os.close(fd)
+            except OSError:
+                truncated = True
+                continue
+            offset = 0
+            for raw in data.split(b"\n")[:-1]:
+                position = RowPosition(day, slot, offset, len(raw) + 1)
+                offset += position.size
+                if len(raw) > MAX_LINE:
+                    continue
+                try:
+                    line = decode_row(raw)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(line, dict) and accept(line):
+                    if len(rows) == max_rows or budget.rows_left == 0:
+                        return rows, True
+                    rows.append((position, line))
+                    budget.rows_left -= 1
+    return rows, truncated
 
 
 @dataclass
@@ -1509,31 +1647,36 @@ class PageScan:
         last_day: date | None = None,
         since: str | None = None,
         before: str | None = None,
-        observe: Callable[[dict[str, Any]], None] | None = None,
+        snapshot: FileSnapshot | None = None,
+        budget: ScanBudget | None = None,
+        reserve: ScanBudget | None = None,
+        observe: Callable[[RowPosition, dict[str, Any]], None] | None = None,
+        context: Callable[[dict[str, Any]], bool] | None = None,
     ) -> Generator[tuple[ScanPosition, dict[str, Any]]]:
         """Merge reverse file reads one day at a time and checkpoint each file."""
         opened = LogDir.open(root or directory())
         if opened is None:
+            if snapshot:
+                raise stale_snapshot()
             return
-        bytes_left, rows_left, files_left = (
-            self.max_bytes,
-            self.max_rows,
-            self.max_files,
-        )
+        if budget is None:
+            budget = ScanBudget(self.max_bytes, self.max_rows, self.max_files)
+        read_budget = budget
+        reserved = reserve or ScanBudget(0, 0, 0)
         byte_limit = False
 
         def read(fd: int, size: int) -> bytes:
-            nonlocal bytes_left, byte_limit
-            if size > bytes_left:
+            nonlocal byte_limit
+            if size > read_budget.bytes_left - reserved.bytes_left:
                 self.truncated = byte_limit = True
                 return b""
-            data = os.read(fd, size)
-            bytes_left -= len(data)
-            return data
+            return read_budget.read(fd, size)
 
         def decode_block(
+            day: date,
+            slot: int,
             block: list[tuple[int, bytes]],
-        ) -> Iterator[tuple[int, int, dict[str, Any]]]:
+        ) -> Iterator[tuple[int, int, dict[str, Any], bool]]:
             for offset, raw in block:
                 if (
                     observe is None
@@ -1549,17 +1692,19 @@ class PageScan:
                     continue
                 if not isinstance(line, dict):
                     continue
-                if observe is not None:
-                    observe(line)
+                size = len(raw) + 1
+                if observe is not None and context is None:
+                    observe(RowPosition(day, slot, offset, size), line)
                 ts = line.get("ts")
-                if isinstance(ts, str) and (
+                visible = isinstance(ts, str) and (
                     (since is None or ts >= since) and (before is None or ts < before)
-                ):
-                    yield offset, offset + len(raw) + 1, line
+                )
+                if visible or (context is not None and context(line)):
+                    yield offset, offset + size, line, visible
 
         def read_rows(
-            slot: int, fd: int, end: int, offsets: list[int]
-        ) -> Iterator[tuple[int, dict[str, Any]]]:
+            day: date, slot: int, fd: int, end: int, offsets: list[int]
+        ) -> Iterator[tuple[int, dict[str, Any], bool]]:
             os.lseek(fd, end - 1, os.SEEK_SET)
             complete = read(fd, 1) == b"\n"
             for resume, block in _positioned_blocks(
@@ -1572,18 +1717,20 @@ class PageScan:
             ):
                 # Observe the whole chunk before choosing its first merge candidate.
                 # A call in the chunk can identify gaps from other files.
-                candidates = decode_block(block)
-                for offset, row_end, line in (
-                    list(candidates) if observe is not None else candidates
+                candidates = decode_block(day, slot, block)
+                for offset, row_end, line, visible in (
+                    list(candidates)
+                    if observe is not None and context is None
+                    else candidates
                 ):
                     offsets[slot] = row_end
-                    yield offset, line
+                    yield offset, line, visible
                 offsets[slot] = resume
 
         def advance(
             slot: int,
-            readers: dict[int, Iterator[tuple[int, dict[str, Any]]]],
-            heads: dict[int, tuple[int, dict[str, Any]]],
+            readers: dict[int, Iterator[tuple[int, dict[str, Any], bool]]],
+            heads: dict[int, tuple[int, dict[str, Any], bool]],
             offsets: list[int],
         ) -> None:
             try:
@@ -1599,28 +1746,42 @@ class PageScan:
         with opened:
             files = (
                 (day, surface, name)
-                for day, surface, name in reversed(opened.files())
+                for day, surface, name in reversed(_scan_files(opened, snapshot))
                 if (first_day is None or day >= first_day)
                 and (last_day is None or day <= last_day)
                 and (start is None or day <= start.day)
+                and (
+                    snapshot is None
+                    or start is None
+                    or day != start.day
+                    or start.offsets is None
+                    or start.offsets[SURFACES.index(surface)] > 0
+                )
             )
             for day, daily in itertools.groupby(files, key=lambda item: item[0]):
                 names = list(daily)
-                if len(names) > files_left:
+                if len(names) > read_budget.files_left - reserved.files_left:
                     self.truncated = True
                     self.resume = ScanPosition(day)
                     return
-                files_left -= len(names)
+                read_budget.files_left -= len(names)
                 offsets = [0] * len(SURFACES)
                 with ExitStack() as active:
-                    readers: dict[int, Iterator[tuple[int, dict[str, Any]]]] = {}
+                    readers: dict[int, Iterator[tuple[int, dict[str, Any], bool]]] = {}
 
                     for _, surface, name in names:
                         slot = SURFACES.index(surface)
                         try:
-                            fd = opened.read_fd(name)
+                            extent = (
+                                snapshot[day, slot] if snapshot is not None else None
+                            )
+                            fd = opened.read_fd(name, extent)
                             active.callback(os.close, fd)
-                            end = os.fstat(fd).st_size
+                            end = (
+                                extent.size
+                                if extent is not None
+                                else os.fstat(fd).st_size
+                            )
                             if (
                                 start is not None
                                 and day == start.day
@@ -1629,11 +1790,11 @@ class PageScan:
                                 end = min(end, start.offsets[slot])
                             offsets[slot] = end
                             if end:
-                                readers[slot] = read_rows(slot, fd, end, offsets)
+                                readers[slot] = read_rows(day, slot, fd, end, offsets)
                         except OSError:
                             self.truncated = True
 
-                    heads: dict[int, tuple[int, dict[str, Any]]] = {}
+                    heads: dict[int, tuple[int, dict[str, Any], bool]] = {}
 
                     for slot in readers:
                         advance(slot, readers, heads, offsets)
@@ -1641,18 +1802,24 @@ class PageScan:
                             self.resume = ScanPosition(day, tuple(offsets))
                             return
                     while heads:
-                        if rows_left == 0:
+                        if read_budget.rows_left <= reserved.rows_left:
                             self.truncated = True
                             self.resume = ScanPosition(day, tuple(offsets))
                             return
                         slot = max(
                             heads, key=lambda key: (event_order(heads[key][1]), key)
                         )
-                        offset, line = heads[slot]
+                        offset, line, visible = heads[slot]
                         position = ScanPosition(day, tuple(offsets))
+                        if observe is not None and context is not None:
+                            observe(
+                                RowPosition(day, slot, offset, offsets[slot] - offset),
+                                line,
+                            )
                         offsets[slot] = offset
-                        rows_left -= 1
-                        yield position, line
+                        read_budget.rows_left -= 1
+                        if visible:
+                            yield position, line
                         advance(slot, readers, heads, offsets)
                         if byte_limit:
                             self.resume = ScanPosition(day, tuple(offsets))

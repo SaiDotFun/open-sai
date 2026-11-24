@@ -1,4 +1,4 @@
-mod output;
+pub(crate) mod output;
 mod overview;
 
 use std::{

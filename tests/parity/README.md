@@ -34,6 +34,24 @@ any selected case differs or fails its expectations.
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command that needs another fixture.
 
+## Compare MCP Stdio
+
+Check out Python commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` in a
+separate directory. Use CPython 3.12, which preserves the tool description
+indentation recorded in the Rust inventory.
+
+```sh
+uv sync --project /absolute/path/to/python-checkout --python 3.12 --locked
+SAI_MCP_PARITY_PYTHON=/absolute/path/to/python-checkout/.venv/bin/sai \
+SAI_PARITY_BIN=/absolute/path/to/rust/sai \
+  uv run python tests/parity/parity.py --case 'mcp-*-*'
+```
+
+The transcript checks server initialization, ordered tool metadata,
+strict argument errors, and the JSON string in each successful response's
+`content` and `structuredContent`. It also replaces a fixture session
+between calls to check the trade refusal before argument validation.
+
 ## Add a Case
 
 Each `[[case]]` table has a unique `name` and a list of CLI arguments in
@@ -65,6 +83,15 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
 
+## Auth Subprocess Cases
+
+Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.
+Set `SAI_PARITY_AUTH_PYTHON` to the Python `sai` executable from a checkout
+of `main` to compare auth, including renewal, expiry recovery, and origin-only
+output. The Rust CI job pins the reference to a commit on `main`. The test runs
+use private temporary homes, fixture clipboard and signing commands, and
+loopback Keeper.
+
 The `legacy` seed contains a config file and an encrypted synthetic session
 written by the Python source at tag `sai-cli/v0.1.0`. The concurrent-close
 case overlaps two processes using one ledger. The stub holds the first
@@ -81,8 +108,11 @@ object keys may appear in any order. Market, account, and watch cases also
 compare stdout and stderr byte for byte. Array entries and JSONL events retain
 their order. For the concurrent-close case, each process's events retain
 their own order, and the two streams are matched by the process outcome.
-For MCP, replies are matched by request ID and entries in `tools/list` by
-tool name.
+For MCP, each request must receive one response with the matching ID.
+The driver rejects any extra lines on stdout and compares the tool list
+in wire order. It checks that both content fields contain the same JSON
+string before comparing the decoded document. Server provenance has
+implementation-specific values and must have a valid absolute path and shape.
 
 The `SAI_HOME` snapshot compares relative paths, file types, modes, and
 contents. It parses TOML values and checks that edits preserve the existing
@@ -104,6 +134,7 @@ checked on both sides.
 | Text and structured output | The run's absolute temporary home path |
 | Stdout from `--version`, `skill source`, `update --check`, `doctor`, and MCP initialization | Running or installed CLI versions at the documented fields |
 | Doctor checks | `generatedAt` and check durations, including durations embedded in network-check summaries |
+| Doctor provenance | Source checkout path, commit, and dirty flag |
 | `update.json` | `checkedAt` |
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
 | Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps. The latter must be stored as REAL Unix seconds within the invocation window. |
@@ -129,3 +160,48 @@ Set `SAI_PARITY_OVERVIEW_PYTHON` to its `sai` executable for local runs.
 The cases validate height-pinned requests and compare section errors,
 source timestamps, risk values, and persisted state. Fetch timestamps and
 ages are checked against the invocation and then normalized.
+## Doctor and MCP Registration Reference
+
+The C9a cases compare against Python main at
+`3feb83a1ab3e46b4f618f497a4820d6179d19eba`. Install that checkout with
+`uv sync --locked`, then point `SAI_C9A_PYTHON` at its
+`.venv/bin/sai` executable. Run the driver with
+`--case 'doctor-*' --case 'mcp-list*' --case 'mcp-install-*'` and set
+`SAI_PARITY_BIN` to the Rust binary. With `SAI_C9A_PYTHON` unset, the
+driver uses the Python entry point from its own environment.
+
+The `client_seed` key supplies private Claude Code, Codex, and Cursor
+configs. The runner uses fixture programs for client subprocesses and
+compares their arguments, file modes, config values, Codex comments, and
+which files changed. It also checks that stdout and stderr omit the
+fixture credential.
+
+In `doctor-mcp-verification-failure`, Rust restores the Codex config when
+verification rejects the repaired entry. The case checks that Rust keeps the
+original bytes and mode. The pinned Python reference leaves the replacement
+on disk.
+
+The `lcd-origin-only` cases project the LCD endpoint in Python's report to
+its origin before comparing it with Rust. They cover successful probes and
+an unavailable LCD with a private path. Rust output is compared as emitted.
+
+## TP/SL and Leverage
+
+The cases in `test_position_update.py` use the Python v0.1.2 preview
+calculations and unsigned dry runs from commit
+`8557a7e13dceab0accc369191182c8e01423c91b`. Signed cases also check the
+ownership requirements from PR #148 at commit
+`c6d85c210a441f3729d091151a114a8edeb0afa3`. Each case checks the ordered
+preview or intent against a fixture after validating dynamic values such
+as the oracle observation timestamp and intent key.
+
+CI installs both pinned Python launchers. For a local run, set
+`SAI_PARITY_BIN` to the Rust binary,
+`SAI_PARITY_POSITION_V012_PYTHON` to the v0.1.2 launcher, and
+`SAI_PARITY_POSITION_OWNER_PYTHON` to the PR #148 launcher. Run
+`uv run --locked pytest tests/parity/test_position_update.py`.
+
+The Rust confirmation test uses canonical digest bytes generated by the
+Python digest function from PR #150 at commit
+`9b20dd771050724dc8684ffca8de3f34ae417ffa`. The vectors apply its
+`positionRoute` field to both standalone updates.

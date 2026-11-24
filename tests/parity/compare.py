@@ -45,6 +45,54 @@ SQLITE_SYNTAX = (
     r"|->>|->|<=|>=|<>|!=|==|\|\||<<|>>|."
 )
 ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+SQLITE_OPERAND_PREFIXES = {
+    "(",
+    ",",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "~",
+    "&",
+    "|",
+    "<<",
+    ">>",
+    "||",
+    "->",
+    "->>",
+    "=",
+    "==",
+    "!=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "ALL",
+    "AND",
+    "BETWEEN",
+    "BY",
+    "DISTINCT",
+    "ELSE",
+    "ESCAPE",
+    "GLOB",
+    "HAVING",
+    "IS",
+    "LIKE",
+    "LIMIT",
+    "MATCH",
+    "NOT",
+    "OFFSET",
+    "ON",
+    "OR",
+    "REGEXP",
+    "SELECT",
+    "THEN",
+    "WHEN",
+    "WHERE",
+}
+SQLITE_NUMERIC_START = re.compile(r"[0-9]|\.[0-9]")
 
 
 class InvalidReservationTime(ValueError):
@@ -260,6 +308,117 @@ def doctor_checks(checks: Any) -> None:
                 check["summary"] = re.sub(
                     rf"(?<=sai ){VERSION.pattern}(?=[ ;]|$)", "<version>", message
                 )
+            if name == "install":
+                checkout = "sai <version> runs from a source checkout at "
+                if check["summary"].startswith(checkout):
+                    root = check["summary"].removeprefix(checkout)
+                    if Path(root).is_absolute():
+                        check["summary"] = checkout + "<checkout>"
+                if isinstance(detail, dict) and isinstance(
+                    provenance := detail.get("provenance"), dict
+                ):
+                    doctor_provenance(provenance)
+
+
+def doctor_provenance(install: dict[str, Any]) -> None:
+    if install.get("kind") != "source-checkout":
+        return
+    replace_if(
+        install, "path", lambda path: isinstance(path, str) and Path(path).is_absolute()
+    )
+    if isinstance(git := install.get("git"), dict):
+        replace_if(
+            git,
+            "commit",
+            lambda sha: (
+                isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) is not None
+            ),
+        )
+        replace_if(git, "dirty", lambda dirty: type(dirty) is bool)
+
+
+def doctor_report(value: dict[str, Any]) -> None:
+    replace_if(value, "generatedAt", timestamp)
+    doctor_checks(value.get("checks"))
+    if isinstance(sai := value.get("sai"), dict):
+        replace_if(sai, "version", is_version)
+        if isinstance(install := sai.get("install"), dict):
+            doctor_provenance(install)
+
+
+def rewrite_mcp_fields(text: str, updates: dict[str, Any]) -> str:
+    """Replace selected top-level JSON values while retaining all other bytes."""
+    if not updates:
+        return text
+    decoder = json.JSONDecoder()
+    whitespace = re.compile(r"\s*")
+    pos = whitespace.match(text).end() + 1
+    previous = 0
+    chunks = []
+    while (pos := whitespace.match(text, pos).end()) < len(text) and text[pos] != "}":
+        name, end = decoder.raw_decode(text, pos)
+        colon = whitespace.match(text, end).end()
+        start = whitespace.match(text, colon + 1).end()
+        _, pos = decoder.raw_decode(text, start)
+        if name in updates:
+            chunks.extend((text[previous:start], json.dumps(updates[name])))
+            previous = pos
+        pos = whitespace.match(text, pos).end()
+        if text[pos] == "}":
+            break
+        pos += 1
+    chunks.append(text[previous:])
+    return "".join(chunks)
+
+
+def normalize_mcp_result(result: dict[str, Any]) -> None:
+    info = result.get("serverInfo")
+    if isinstance(info, dict):
+        replace_if(info, "version", is_version)
+    for block in result.get("content", []):
+        if block.get("type") != "text":
+            continue
+        text = block["text"]
+        if not isinstance(text, str):
+            raise TypeError("MCP text content must be a string")
+        if result.get("isError"):
+            continue
+        if result.get("structuredContent") != {"result": text}:
+            raise ValueError("MCP structuredContent must carry the same JSON string")
+        value = json.loads(text)
+        updates = {}
+        if isinstance(value, dict) and value.get("name") == "sai":
+            for version in ("version", "installedVersion", "mcpVersion"):
+                if is_version(value.get(version)):
+                    updates[version] = f"<{version}>"
+            # Each implementation reports its own installation or checkout.
+            # Validate the shape before substituting a common path.
+            provenance = value["provenance"]
+            kind = provenance.get("kind")
+            path = provenance.get("path")
+            if (
+                kind not in {"installed", "source-checkout"}
+                or not isinstance(path, str)
+                or not Path(path).is_absolute()
+            ):
+                raise ValueError("Invalid MCP server provenance")
+            keys = {"kind", "path"}
+            if kind == "source-checkout":
+                keys.add("git")
+                git = provenance.get("git")
+                if git is not None and (
+                    set(git) != {"commit", "dirty"}
+                    or not re.fullmatch(r"[0-9a-f]{40,64}", git["commit"])
+                    or type(git["dirty"]) is not bool
+                ):
+                    raise ValueError("Invalid MCP server Git provenance")
+            if set(provenance) != keys:
+                raise ValueError("Unexpected MCP server provenance fields")
+            updates["provenance"] = "<provenance>"
+            value.update(updates)
+        result["_toolText"] = rewrite_mcp_fields(text, updates)
+        block["text"] = value
+        result["structuredContent"]["result"] = value
 
 
 def mask_overview_stdout(raw: str, mode: str) -> str:
@@ -337,20 +496,11 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         if command == "logs tail":
             return [normalize.log_event(record) for record in records]
         if mode == "mcp":
-            for record in records:
+            for frame, record in zip(raw.splitlines(), records, strict=True):
                 result = record.get("result", {})
-                info = result.get("serverInfo")
-                if isinstance(info, dict):
-                    replace_if(info, "version", is_version)
-                if isinstance(result.get("tools"), list):
-                    result["tools"].sort(key=lambda tool: tool["name"])
-                for block in result.get("content", []):
-                    if block.get("type") == "text":
-                        try:
-                            block["text"] = json.loads(block["text"])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-            records.sort(key=lambda record: str(record.get("id", "")))
+                if "tools" in result:
+                    result["_schemaWire"] = frame
+                normalize_mcp_result(result)
         return normalize.paths(records)
     value = normalize.paths(json.loads(raw))
     if (
@@ -364,8 +514,13 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
     if command == "account overview":
         overview_clocks(value, normalize)
     if command == "doctor" and isinstance(value, dict):
-        replace_if(value, "generatedAt", timestamp)
-        doctor_checks(value.get("checks"))
+        if isinstance(error := value.get("error"), dict):
+            if isinstance(report := error.get("details"), dict):
+                doctor_report(report)
+            if isinstance(error.get("message"), str):
+                error["message"] = DURATION.sub("<durationMs>", error["message"])
+        else:
+            doctor_report(value)
     if (
         command.startswith("trade ")
         and isinstance(value, dict)
@@ -465,15 +620,197 @@ def sqlite_identifier(token: str) -> str:
     return token.translate(ASCII_UPPER)
 
 
-def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
-    """Read CHECK expressions, table options, and column collations from stored DDL."""
+def sqlite_tokens(sql: str) -> list[str]:
     # SQLite treats high-byte characters as identifier characters, except
     # when its tokenizer skips a BOM. Quoted tokens can contain parentheses.
-    tokens = [
+    return [
         token[0].translate(ASCII_UPPER) if token.lastgroup == "name" else token[0]
         for token in sqlite_tokenizer().finditer(sql)
         if token.lastgroup != "trivia"
     ]
+
+
+def normalize_collations(tokens: list[str]) -> list[str]:
+    normalized = tokens.copy()
+    for i, token in enumerate(tokens[:-1]):
+        if token == "COLLATE":
+            normalized[i + 1] = sqlite_identifier(tokens[i + 1])
+    return normalized
+
+
+def parenthesis_pairs(tokens: list[str]) -> Iterator[tuple[int, int]]:
+    openings = []
+    for i, token in enumerate(tokens):
+        if token == "(":
+            openings.append(i)
+        elif token == ")":
+            yield openings.pop(), i
+
+
+def strip_outer_parentheses(tokens: list[str]) -> list[str]:
+    while (
+        tokens[:1] == ["("]
+        and (0, len(tokens) - 1) in parenthesis_pairs(tokens)
+        and tokens[1] not in {"SELECT", "VALUES", "WITH"}
+    ):
+        tokens = tokens[1:-1]
+    return tokens
+
+
+def view_expressions(tokens: list[str]) -> list[str]:
+    """Strip outer groups at view expression boundaries, including in subqueries."""
+    starts = {
+        ",",
+        "ALL",
+        "BY",
+        "DISTINCT",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "ON",
+        "SELECT",
+        "WHERE",
+    }
+    ends = {
+        ")",
+        ",",
+        "AS",
+        "ASC",
+        "DESC",
+        "EXCEPT",
+        "FROM",
+        "GROUP",
+        "HAVING",
+        "INTERSECT",
+        "JOIN",
+        "LIMIT",
+        "NULLS",
+        "OFFSET",
+        "ORDER",
+        "UNION",
+        "WHERE",
+        "WINDOW",
+    }
+    removed = set()
+    for start, end in parenthesis_pairs(tokens):
+        if start == 0 or tokens[start - 1] not in starts:
+            continue
+        following = tokens[end + 1 : end + 3]
+        if following and following[0] not in ends:
+            alias = following[0]
+            if not (
+                sqlite_name_token(alias)
+                and (len(following) == 1 or following[1] in ends)
+            ):
+                continue
+        expression = tokens[start : end + 1]
+        pairs = (len(expression) - len(strip_outer_parentheses(expression))) // 2
+        removed.update(range(start, start + pairs))
+        removed.update(range(end - pairs + 1, end + 1))
+    return [token for i, token in enumerate(tokens) if i not in removed]
+
+
+def unquoted_sqlite_name(token: str) -> bool:
+    match = sqlite_tokenizer().fullmatch(token)
+    return match is not None and match.lastgroup == "name"
+
+
+def sqlite_name_token(token: str) -> bool:
+    return token[0] in {'"', "`", "["} or unquoted_sqlite_name(token)
+
+
+def strip_operand_parentheses(tokens: list[str]) -> list[str]:
+    """Try ungrouping individual operands within larger SQL expressions."""
+    pairs = dict(parenthesis_pairs(tokens))
+    removed = set()
+    for opening, close_index in pairs.items():
+        # Function argument lists and IN lists have structural parentheses.
+        if opening and tokens[opening - 1] not in SQLITE_OPERAND_PREFIXES:
+            continue
+        start, end = opening + 1, close_index - 1
+        while start in removed and end in removed:
+            start += 1
+            end -= 1
+        if start > end:
+            continue
+        first = tokens[start]
+        if start == end:
+            operand = (
+                sqlite_name_token(first)
+                or first.startswith(("'", "x'", "X'"))
+                or SQLITE_NUMERIC_START.match(first) is not None
+            )
+        elif start + 1 == end and first in {"+", "-"}:
+            operand = SQLITE_NUMERIC_START.match(tokens[end]) is not None
+        elif pairs.get(start + 1) == end:
+            operand = sqlite_name_token(first)
+        else:
+            parts = tokens[start : end + 1]
+            operand = (
+                len(parts) in {3, 5}
+                and all(token == "." for token in parts[1::2])
+                and all(sqlite_name_token(token) for token in parts[::2])
+            )
+        if operand:
+            removed.update((opening, close_index))
+    return [token for i, token in enumerate(tokens) if i not in removed]
+
+
+def normalize_expression_sql(
+    conn: sqlite3.Connection,
+    original: list[str],
+    ungrouped: list[str],
+    as_select: Callable[[str], str],
+) -> list[str]:
+    """Use SQLite's name resolution to check edits to expression syntax."""
+
+    def program(tokens: list[str]) -> list[tuple] | None:
+        try:
+            return conn.execute("EXPLAIN " + as_select(" ".join(tokens))).fetchall()
+        except sqlite3.DatabaseError:
+            return None
+
+    # SQLite can treat an unresolved double-quoted token as a string, and an
+    # unquoted name can be a keyword. Only accept rewrites with the same program.
+    # Collation names are identifiers by grammar and are normalized separately.
+    def quoted_names(tokens: list[str]) -> list[int]:
+        return [
+            i
+            for i, token in enumerate(tokens)
+            if token[0] in {'"', "`", "["} and (i == 0 or tokens[i - 1] != "COLLATE")
+        ]
+
+    operands = strip_operand_parentheses(ungrouped)
+    if operands == original and not quoted_names(original):
+        return normalize_collations(original)
+    reference = program(original)
+    if reference is None:
+        return normalize_collations(original)
+    normalized = next(
+        candidate.copy()
+        for candidate in (operands, ungrouped, original)
+        if candidate == original or program(candidate) == reference
+    )
+    for i in quoted_names(normalized):
+        token = normalized[i]
+        name = sqlite_identifier(token)
+        # Keep a canonical quoted spelling for names that require quoting.
+        quoted_name = "`" + name.replace("`", "``") + "`"
+        candidates = (
+            (name, quoted_name) if unquoted_sqlite_name(name) else (quoted_name,)
+        )
+        for candidate in candidates:
+            normalized[i] = candidate
+            if candidate == token or program(normalized) == reference:
+                break
+        else:
+            normalized[i] = token
+    return normalize_collations(normalized)
+
+
+def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
+    """Read CHECK expressions, table options, and column collations from stored DDL."""
+    tokens = sqlite_tokens(sql)
     if tokens[:2] != ["CREATE", "TABLE"]:
         return [], [], {}
     opening = tokens.index("(")
@@ -507,12 +844,63 @@ def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
     raise ValueError("Unbalanced CREATE TABLE definition")
 
 
+def index_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
+    """Read index keys and the partial-index predicate from stored DDL."""
+    tokens = sqlite_tokens(sql)
+    start = tokens.index("(") + 1
+    keys = []
+    depth = 0
+    for i in range(start, len(tokens)):
+        token = tokens[i]
+        if depth == 0 and token in {",", ")"}:
+            keys.append(tokens[start:i])
+            start = i + 1
+            if token == ")":
+                where = tokens[i + 2 :] if tokens[i + 1 : i + 2] == ["WHERE"] else []
+                return keys, where
+        elif token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+    raise ValueError("Unbalanced CREATE INDEX definition")
+
+
+def index_expressions(
+    conn: sqlite3.Connection,
+    table: str,
+    keys: list[list[str]],
+    where: list[str],
+    index_columns: list[tuple],
+) -> tuple[dict[int, list[str]], list[str]]:
+    source = '"' + table.replace('"', '""') + '" NOT INDEXED'
+    expressions = {}
+    for seqno, key in enumerate(keys):
+        # PRAGMA reports the effective collation and uses cid -2 for expressions.
+        if index_columns[seqno][1] != -2 and key.count("COLLATE") <= 1:
+            continue
+        end = -1 if key[-1] in {"ASC", "DESC"} else len(key)
+        ungrouped = strip_outer_parentheses(key[:end]) + key[end:]
+        # In a SELECT projection, SQLite reads a trailing ASC or DESC as the
+        # result alias. An integer key remains a literal in this context.
+        expressions[seqno] = normalize_expression_sql(
+            conn, key, ungrouped, lambda expr: f"SELECT {expr} FROM {source}"
+        )
+    predicate = normalize_expression_sql(
+        conn,
+        where,
+        strip_outer_parentheses(where),
+        lambda expr: f"SELECT {expr} FROM {source}",
+    )
+    return expressions, predicate
+
+
 def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         raise ValueError(SQLITE_SCHEMA_REQUIREMENT)
     catalog = conn.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
     ).fetchall()
+    index_sql = {name: sql for kind, name, _, sql in catalog if kind == "index" and sql}
     tables = {}
     for kind, name, _, sql in catalog:
         if kind not in {"table", "view"}:
@@ -540,10 +928,22 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
             'SELECT name, "unique", origin, partial FROM pragma_index_list(?) ORDER BY name',
             (name,),
         ):
+            keys, where = (
+                index_ddl(index_sql[index]) if index in index_sql else ([], [])
+            )
+            index_columns = conn.execute(
+                'SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?) ORDER BY seqno',
+                (index,),
+            ).fetchall()
+            expressions, where = index_expressions(
+                conn, name, keys, where, index_columns
+            )
             indexes[index] = {
                 "unique": unique,
                 "origin": origin,
                 "partial": partial,
+                "where": where,
+                "expressions": expressions,
                 "columns": [
                     (
                         seqno,
@@ -555,10 +955,7 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                         else collation.translate(ASCII_UPPER),
                         is_key,
                     )
-                    for seqno, cid, index_column, descending, collation, is_key in conn.execute(
-                        'SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?) ORDER BY seqno',
-                        (index,),
-                    )
+                    for seqno, cid, index_column, descending, collation, is_key in index_columns
                 ],
             }
         tables[name] = {
@@ -572,6 +969,13 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                 "SELECT * FROM pragma_foreign_key_list(?) ORDER BY id, seq", (name,)
             ).fetchall(),
         }
+        if kind == "view":
+            tokens = sqlite_tokens(sql)
+            query_start = tokens.index("AS") + 1
+            body = tokens[query_start:]
+            tables[name]["definition"] = normalize_expression_sql(
+                conn, body, view_expressions(body), str
+            )
     return {
         "tables": tables,
         "objects": [(kind, name, table) for kind, name, table, _ in catalog],
@@ -683,7 +1087,9 @@ def read_log(path: Path, day: str) -> list[dict[str, Any]]:
     return records
 
 
-def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
+def snapshot(
+    root: Path, normalize: Normalize, *, raw_config: bool = False
+) -> dict[str, Entry]:
     if not root.exists() and not root.is_symlink():
         return {}
     entries: dict[str, Entry] = {}
@@ -710,7 +1116,11 @@ def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
                         raise ValueError("Log file modes differ within a surface")
                     records.extend(read_log(path, match["day"]))
                     continue
-                data = content(path, name, normalize)
+                data = (
+                    path.read_bytes()
+                    if raw_config and name == "config.toml"
+                    else content(path, name, normalize)
+                )
             except (InvalidReservationTime, InvalidLogTime):
                 raise
             except (ValueError, KeyError, TypeError, sqlite3.Error, InvalidTag) as exc:

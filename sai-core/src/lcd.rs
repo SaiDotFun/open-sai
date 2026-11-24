@@ -3,6 +3,7 @@
 use std::{sync::LazyLock, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use hyper::{HeaderMap, header::HeaderValue};
 use serde_json::Value;
 use tokio::{
     sync::Semaphore,
@@ -11,7 +12,7 @@ use tokio::{
 use url::form_urlencoded::byte_serialize;
 use uuid::Uuid;
 
-use crate::keeper::{check_url, transport};
+use crate::keeper::{TIMEOUT, check_lcd_url, lcd_get};
 
 const HEIGHT: &str = "x-cosmos-block-height";
 const METADATA_HEIGHT: &str = "grpc-metadata-x-cosmos-block-height";
@@ -62,28 +63,33 @@ async fn read(
     let _slot = SLOTS.try_acquire().map_err(|_| ReadError::Invalid)?;
     let deadline = deadline.min(now + REQUEST_TIMEOUT);
     let mut url = format!("{}{path}", lcd.trim_end_matches('/'));
-    check_url(&url).map_err(|_| ReadError::Invalid)?;
+    check_lcd_url(&url).map_err(|_| ReadError::Invalid)?;
     if fresh {
         url.push_str(&format!("?_sai_query={}", Uuid::new_v4().simple()));
     }
+    let mut request_headers = HeaderMap::new();
+    if let Some(height) = height {
+        request_headers.insert(
+            HEIGHT,
+            HeaderValue::from_str(height).map_err(|_| ReadError::Invalid)?,
+        );
+    }
     // The outer deadline covers DNS and the entire body, including trickling responses.
-    let (parts, bytes) = time::timeout_at(
-        deadline,
-        transport::get(&url, height, crate::keeper::TIMEOUT),
-    )
-    .await
-    .map_err(|_| ReadError::Timeout)?
-    .map_err(|_| ReadError::Invalid)?;
-    if !parts.status.is_success() {
+    let (status, headers, bytes) =
+        time::timeout_at(deadline, lcd_get(&url, request_headers, TIMEOUT))
+            .await
+            .map_err(|_| ReadError::Timeout)?
+            .map_err(|_| ReadError::Invalid)?;
+    if !status.is_success() {
         return Err(ReadError::Invalid);
     }
     if let Some(height) = height {
-        let header = if parts.headers.contains_key(METADATA_HEIGHT) {
+        let header = if headers.contains_key(METADATA_HEIGHT) {
             METADATA_HEIGHT
         } else {
             HEIGHT
         };
-        let values = parts.headers.get_all(header);
+        let values = headers.get_all(header);
         let mut values = values.iter();
         let served = values.next().and_then(|value| value.to_str().ok());
         if served != Some(height) || values.next().is_some() {

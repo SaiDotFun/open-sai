@@ -1,5 +1,7 @@
+pub mod auth;
 mod endpoint;
 pub mod errors;
+pub mod files;
 pub mod keeper;
 mod lcd;
 pub mod log;
@@ -8,3 +10,4 @@ pub mod reconcile;
 pub mod session;
 pub mod settings;
 pub mod storage;
+pub mod trade;

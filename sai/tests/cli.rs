@@ -51,8 +51,10 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     let path = root.path().join("config.toml");
     let contents = "[keeper]\nendpoint = \"https://who:fixture@EXAMPLE.invalid:443/query?token=fixture\"\nfuture_setting = 1\n[update]\nauto = false\n";
     fs::write(&path, contents).unwrap();
+    let lcd_origin = "https://lcd.example:8443";
+    let lcd = format!("{lcd_origin}/fixture-lcd-path?key=fixture-lcd-query");
     let output = sai(root.path())
-        .args(["--json", "config", "list"])
+        .args(["--lcd-endpoint", &lcd, "--json", "config", "list"])
         .output()
         .unwrap();
     let result = read_json(&output);
@@ -60,15 +62,15 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     assert_eq!(
         result["settings"]["keeper.endpoint"],
         json!({
-            "value": "https://example.invalid:443/query",
+            "value": "https://example.invalid:443",
             "source": "file",
             "env": "SAI_ENDPOINT",
-            "default": "https://sai-keeper.nibiru.fi/query",
+            "default": "https://sai-keeper.nibiru.fi",
         })
     );
     assert_eq!(
         result["settings"]["keeper.ws_endpoint"]["value"],
-        "wss://example.invalid:443/query"
+        "wss://example.invalid:443"
     );
     assert_eq!(
         result["settings"]["keeper.ws_endpoint"]["source"],
@@ -76,11 +78,95 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     );
     assert_eq!(result["settings"]["update.auto"]["value"], false);
     assert_eq!(result["settings"]["logs.keep_days"]["value"], 14);
+    assert_eq!(result["settings"]["lcd.endpoint"]["value"], lcd_origin);
+    assert_eq!(result["settings"]["lcd.endpoint"]["source"], "flag");
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("ignoring unknown setting 'keeper.future_setting'")
     );
     assert_eq!(fs::read_to_string(path).unwrap(), contents);
+
+    let logs: String = fs::read_dir(root.path().join("logs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    assert!(logs.contains(lcd_origin));
+    for secret in ["fixture-lcd-path", "fixture-lcd-query"] {
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        assert!(!logs.contains(secret));
+    }
+    let exact = sai(root.path())
+        .args(["--lcd-endpoint", &lcd, "config", "get", "lcd.endpoint"])
+        .output()
+        .unwrap();
+    assert!(exact.status.success());
+    assert_eq!(String::from_utf8(exact.stdout).unwrap(), format!("{lcd}\n"));
+}
+
+#[test]
+fn config_set_acknowledges_only_the_endpoint_origin() {
+    for (key, scheme) in [
+        ("lcd.endpoint", "https"),
+        ("keeper.endpoint", "https"),
+        ("keeper.ws_endpoint", "wss"),
+    ] {
+        let root = tempdir().unwrap();
+        let origin = format!("{scheme}://provider.example:8443");
+        let endpoint = format!("{origin}/fixture-private-path?key=fixture-private-query");
+        let set = sai(root.path())
+            .args(["--json", "config", "set", key, &endpoint])
+            .output()
+            .unwrap();
+        assert_eq!(read_json(&set)["value"], origin);
+        for secret in ["fixture-private-path", "fixture-private-query"] {
+            assert!(!String::from_utf8_lossy(&set.stdout).contains(secret));
+            assert!(!String::from_utf8_lossy(&set.stderr).contains(secret));
+        }
+        let get = sai(root.path())
+            .args(["config", "get", key])
+            .output()
+            .unwrap();
+        assert_eq!(get.stdout, format!("{endpoint}\n").as_bytes());
+        assert!(get.status.success());
+    }
+}
+
+#[test]
+fn config_list_shows_idna_origin_for_internationalized_lcd() {
+    for (host, ascii_host) in [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("faß.example", "xn--fa-hia.example"),
+    ] {
+        let root = tempdir().unwrap();
+        let endpoint =
+            format!("https://{host}:8443/fixture-private-path?key=fixture-private-query");
+        let set = sai(root.path())
+            .args(["config", "set", "lcd.endpoint", &endpoint])
+            .output()
+            .unwrap();
+        assert!(set.status.success());
+        let expected = format!("https://{ascii_host}:8443");
+        let listed = sai(root.path())
+            .args(["--json", "config", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            read_json(&listed)["settings"]["lcd.endpoint"]["value"],
+            expected
+        );
+        let get = sai(root.path())
+            .args(["config", "get", "lcd.endpoint"])
+            .output()
+            .unwrap();
+        assert_eq!(get.stdout, format!("{endpoint}\n").as_bytes());
+        assert!(get.status.success());
+    }
 }
 
 #[test]
@@ -544,8 +630,7 @@ fn usage_errors_keep_json_at_every_supported_option_position() {
         ["--json", "intent", "status"],
         ["intent", "--json", "status"],
         ["intent", "status", "--json"],
-        ["auth", "--json", "use"],
-        ["auth", "use", "--json"],
+        ["--json", "auth", "use"],
     ] {
         let output = sai(home.path()).args(args).output().unwrap();
         assert_eq!(output.status.code(), Some(2));

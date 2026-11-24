@@ -63,7 +63,7 @@ def test_set_get_unset(tmp_path):
     assert result.exit_code == 0, result.output
     assert json.loads(result.stdout) == {
         "key": "keeper.endpoint",
-        "value": SECRET_URL,
+        "value": "https://k.example",
         "path": str(path),
     }
     assert stat.S_IMODE(path.stat().st_mode) == 0o600
@@ -104,10 +104,12 @@ def test_bool_setting_text_output():
     assert "update.auto = false  # file, SAI_UPDATE_AUTO" in text
 
 
-def test_list_shows_only_keeper_origins():
+def test_list_shows_only_endpoint_origins():
     path_key, query_key = "fixture-path-key", "fixture-query-key"
     endpoint = f"https://[::1]:9443/{path_key}/query?key={query_key}"
     assert sai("config", "set", "keeper.endpoint", endpoint).exit_code == 0
+    lcd = f"https://lcd.example:8443/{path_key}?key={query_key}"
+    assert sai("config", "set", "lcd.endpoint", lcd).exit_code == 0
 
     text = sai("config", "list")
     structured = sai("--json", "config", "list")
@@ -117,10 +119,29 @@ def test_list_shows_only_keeper_origins():
 
     assert 'keeper.endpoint = "https://[::1]:9443"' in text.stdout
     assert 'keeper.ws_endpoint = "wss://[::1]:9443"' in text.stdout
+    assert 'lcd.endpoint = "https://lcd.example:8443"' in text.stdout
     shown = json.loads(structured.stdout)["settings"]
     assert shown["keeper.endpoint"]["value"] == "https://[::1]:9443"
     assert shown["keeper.ws_endpoint"]["value"] == "wss://[::1]:9443"
     assert shown["keeper.ws_endpoint"]["source"] == "derived"
+    assert shown["lcd.endpoint"]["value"] == "https://lcd.example:8443"
+    assert sai("config", "get", "lcd.endpoint").stdout == lcd + "\n"
+
+
+@pytest.mark.parametrize(
+    ("host", "ascii_host"),
+    [
+        ("bücher.example", "xn--bcher-kva.example"),
+        ("faß.example", "xn--fa-hia.example"),
+    ],
+)
+def test_config_list_shows_idna_origin_for_internationalized_lcd(host, ascii_host):
+    endpoint = f"https://{host}:8443/fixture-private-path?key=fixture-private-query"
+    assert sai("config", "set", "lcd.endpoint", endpoint).exit_code == 0
+    expected = f"https://{ascii_host}:8443"
+    assert listed()["settings"]["lcd.endpoint"]["value"] == expected
+    assert f'lcd.endpoint = "{expected}"' in sai("config", "list").stdout
+    assert sai("config", "get", "lcd.endpoint").stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(
@@ -166,7 +187,27 @@ def test_config_set_accepts_ipv6_with_port():
     endpoint = "https://[::1]:8443/path"
     result = sai("--json", "config", "set", "keeper.endpoint", endpoint)
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["value"] == endpoint
+    assert json.loads(result.stdout)["value"] == "https://[::1]:8443"
+    assert sai("config", "get", "keeper.endpoint").stdout == endpoint + "\n"
+
+
+@pytest.mark.parametrize(
+    ("key", "scheme"),
+    [
+        ("lcd.endpoint", "https"),
+        ("keeper.endpoint", "https"),
+        ("keeper.ws_endpoint", "wss"),
+    ],
+)
+def test_config_set_acknowledges_only_the_endpoint_origin(key, scheme):
+    origin = f"{scheme}://provider.example:8443"
+    path_key, query_key = "fixture-private-path", "fixture-private-query"
+    endpoint = f"{origin}/{path_key}?key={query_key}"
+    result = sai("--json", "config", "set", key, endpoint)
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["value"] == origin
+    assert path_key not in result.output and query_key not in result.output
+    assert sai("config", "get", key).stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(
@@ -235,7 +276,8 @@ def test_config_set_accepts_percent_encoded_websocket_request_target():
     endpoint = "wss://keeper.example/graphql%20stream?name=one%20two"
     result = sai("--json", "config", "set", "keeper.ws_endpoint", endpoint)
     assert result.exit_code == 0
-    assert json.loads(result.stdout)["value"] == endpoint
+    assert json.loads(result.stdout)["value"] == "wss://keeper.example"
+    assert sai("config", "get", "keeper.ws_endpoint").stdout == endpoint + "\n"
 
 
 @pytest.mark.parametrize(
