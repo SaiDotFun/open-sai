@@ -590,6 +590,7 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
         result = signed_login(endpoint, name, addr)
         result["endpoint"] = endpoint
         result["keyName"] = name
+        sessions.validate_issued_session(result)
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
@@ -628,6 +629,7 @@ def renew(ctx: click.Context, addr: str | None) -> None:
             )
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
+        sessions.validate_issued_session(result)
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:

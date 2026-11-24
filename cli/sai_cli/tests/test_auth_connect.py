@@ -1191,6 +1191,45 @@ def test_renew_uses_saved_name_and_preserves_active_account(env: Env, keeper_aut
     assert len(keeper_auth["signatures"]) == 2
 
 
+@pytest.mark.parametrize("command", [("login", "dev"), ("renew", ADDR)])
+@pytest.mark.parametrize("numeric_expiry", [True, False])
+def test_auth_refuses_malformed_issued_expiry_before_saving(
+    env: Env,
+    keeper_auth: dict[str, Any],
+    command: tuple[str, str],
+    numeric_expiry: bool,
+) -> None:
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    args = ("--json", "--endpoint", keeper_auth["endpoint"], "auth")
+    assert env.run(*args, "login", "dev").returncode == 0
+    env.clipboard()
+    env.clip.write_text(make_token(OTHER))
+    assert env.run(*args, "import").returncode == 0
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    marker = "synthetic-issued-session-credential-marker"
+    expiry = 6754981276043819275 if numeric_expiry else marker
+    keeper_auth.update(token=marker, expires_at=expiry)
+    result = env.run(*args, *command)
+
+    assert result.returncode == 1 and result.stderr == ""
+    assert json.loads(result.stdout)["error"] == {
+        "code": "KEEPER_ERROR",
+        "message": "Keeper returned an invalid session expiry",
+        "retryable": False,
+    }
+    for value in (marker, str(expiry)):
+        assert value not in result.stdout
+        assert value.encode() not in env.stored_bytes()
+    assert len(keeper_auth["signatures"]) == 2
+    assert path.read_bytes() == before
+    status = env.run(*args, "status")
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["addr"] == OTHER
+
+
 def test_renew_refuses_a_key_that_changed_address(env: Env, keeper_auth):
     fake_cast(env)
     keystore(env, addr=ADDR)

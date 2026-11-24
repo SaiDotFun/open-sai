@@ -38,6 +38,16 @@ def expiry_time(result: dict[str, str]) -> datetime:
     return expiry
 
 
+def validate_issued_session(result: dict[str, str]) -> None:
+    """Reject a Keeper reply that the session store or expiry reader cannot use."""
+    try:
+        expiry_time(storage.check_session_fields(result))
+    except SessionError:
+        raise keeper.KeeperError("Keeper returned an invalid session expiry") from None
+    except ValueError:
+        raise keeper.KeeperError("Keeper returned invalid session data") from None
+
+
 def renewal_command(result: dict[str, str]) -> str:
     """Return recovery instructions scoped to the session's Keeper."""
     endpoint = result.get("endpoint")

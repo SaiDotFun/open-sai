@@ -125,7 +125,8 @@ def _decrypt(fields: dict[str, Any], aad: bytes) -> Any:
     return json.loads(AESGCM(_SESSION_KEY).decrypt(nonce, ciphertext, aad))
 
 
-def _check_session(session: Any) -> dict[str, str]:
+def check_session_fields(session: Any) -> dict[str, str]:
+    """Check the fields required to read a session from the store."""
     if not isinstance(session, dict) or not all(
         isinstance(session.get(k), str) for k in SESSION_FIELDS
     ):
@@ -161,7 +162,7 @@ def _load_v2(fields: dict[str, Any]) -> dict[str, Any]:
     if fields.get("version") != 2 or fields.get("backend") != "test":
         raise ValueError(f"Unsupported session version; {SIGN_IN_AGAIN}")
     try:
-        session = _check_session(_decrypt(fields, _V2_AAD))
+        session = check_session_fields(_decrypt(fields, _V2_AAD))
         log.remember([session["token"]])
     except SessionError:
         raise
@@ -194,7 +195,7 @@ def load_accounts() -> dict[str, Any]:
         stored = accounts["sessions"]
         if not isinstance(stored, dict):
             raise TypeError("Invalid session set")
-        sessions = {k: _check_session(v) for k, v in stored.items()}
+        sessions = {k: check_session_fields(v) for k, v in stored.items()}
         log.remember(session["token"] for session in sessions.values())
         active = accounts.get("active")
         if active is not None and active not in sessions:
