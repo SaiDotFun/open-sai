@@ -170,7 +170,9 @@ fn main() -> process::ExitCode {
                         }
                         Command::Config { command } => command.run(&flags, env, json),
                         Command::Market { command } => command.run(&flags, env, json, events),
-                        Command::Account { command } => command.run(&flags, env, json, events),
+                        Command::Account { command } => {
+                            command.run(cli.account.as_deref(), &flags, env, json, events)
+                        }
                         Command::Watch { command } => command.run(&flags, env, events),
                     }
                 });
@@ -257,7 +259,8 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" | "market list" | "market prices" => "",
+        "config list" | "auth status" | "auth list" | "market list" | "market prices"
+        | "account overview" => "",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
         "watch price" => " TOKEN_ID",
@@ -366,6 +369,7 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("intent", "status") => "intent status",
                     ("market", "list") => "market list",
                     ("market", "prices") => "market prices",
+                    ("account", "overview") => "account overview",
                     ("account", "positions") => "account positions",
                     ("account", "history") => "account history",
                     ("account", "balances") => "account balances",
@@ -443,6 +447,7 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
     let mut operands = operands.iter().map(String::as_str);
     let mut options = true;
     let mut positional = Vec::new();
+    let overview = command == "account overview";
     let websocket = command.starts_with("watch ") || command == "account balances";
     while let Some(arg) = operands.next() {
         match arg {
@@ -455,8 +460,15 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
                 operands.next();
             }
             arg if options && websocket && arg.starts_with("--ws-endpoint=") => {}
+            "--as" if options && overview => {
+                operands.next();
+            }
+            arg if options && overview && arg.starts_with("--as=") => {}
             "--json"
-                if options && (command.starts_with("intent ") || command.starts_with("auth ")) => {}
+                if options
+                    && (overview
+                        || command.starts_with("intent ")
+                        || command.starts_with("auth ")) => {}
             _ => positional.push(arg),
         }
     }

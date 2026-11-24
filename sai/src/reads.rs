@@ -1,4 +1,5 @@
 mod output;
+mod overview;
 
 use std::{
     fmt::Write as _,
@@ -34,7 +35,10 @@ pub(crate) fn help(command: &str) -> Option<String> {
     let description = entry.get_about()?;
     // Clap strips the final period from each doc comment's short help.
     let mut text = format!("{}\n\n  {description}.\n\nOptions:\n", usage(command));
-    let help_column = if let Some(arg) = entry
+    let help_column = if command == "account overview" {
+        text.push_str("  --as ADDR  Read this EVM account.\n  --json     Print compact JSON.\n");
+        9
+    } else if let Some(arg) = entry
         .get_arguments()
         .find(|arg| arg.get_long() == Some("ws-endpoint"))
     {
@@ -62,7 +66,11 @@ pub(crate) fn help(command: &str) -> Option<String> {
                 text,
                 "\n  {:<width$}  {}.",
                 child.get_name(),
-                child.get_about()?,
+                if child.get_name() == "overview" {
+                    "Show Sai funds, positions, orders, local blockers, and..".into()
+                } else {
+                    child.get_about()?.to_string()
+                },
             )
             .ok()?;
         }
@@ -96,6 +104,15 @@ impl MarketCommand {
 
 #[derive(Subcommand)]
 pub(crate) enum AccountCommand {
+    /// Show Sai funds, positions, orders, local blockers, and session expiry.
+    Overview {
+        /// Read this EVM account.
+        #[arg(long = "as", value_name = "ADDR")]
+        addr: Option<String>,
+        /// Print compact JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// List positions and pending orders for ADDR.
     Positions { addr: String },
     /// Read trade history for ADDR.
@@ -112,12 +129,32 @@ pub(crate) enum AccountCommand {
 impl AccountCommand {
     pub(crate) fn run(
         self,
+        account: Option<&str>,
         flags: &Flags,
         env: &Environment,
         json: bool,
         events: EventContext<'_>,
     ) -> Result<(), SaiError> {
         let (query, addr) = match self {
+            Self::Overview {
+                addr,
+                json: overview_json,
+            } => {
+                let addr = addr.as_deref().filter(|addr| !addr.is_empty()).or(account);
+                let settings = load_settings(flags, env)?;
+                let value = runtime()?.block_on(sai_core::overview::read(
+                    &settings,
+                    &env.home,
+                    addr,
+                    events,
+                    interrupted(),
+                ))?;
+                return if json || overview_json {
+                    output::read(&value, true)
+                } else {
+                    overview::show(&value)
+                };
+            }
             Self::Positions { addr } => (keeper::POSITIONS, addr),
             Self::History { addr } => (keeper::HISTORY, addr),
             Self::Balances { addr, ws_endpoint } => {
