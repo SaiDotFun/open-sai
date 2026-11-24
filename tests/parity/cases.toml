@@ -890,6 +890,7 @@ wire = ["oneClickTrading", "ws:init", "node_info"]
 name = "doctor-invalid-endpoint"
 args = ["--json", "doctor", "--no-fix"]
 seed = "doctor-invalid-endpoint"
+unset = ["SAI_ENDPOINT"]
 expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 
@@ -898,6 +899,7 @@ name = "doctor-invalid-endpoint-text"
 args = ["doctor", "--offline", "--no-fix"]
 mode = "text"
 seed = "doctor-invalid-endpoint"
+unset = ["SAI_ENDPOINT"]
 expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 

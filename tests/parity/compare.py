@@ -257,6 +257,13 @@ class Normalize:
             replace_if(result, "installed", is_version)
         if result.get("event") == "doctor.result":
             doctor_checks(result.get("checks"))
+        if (
+            result.get("event") == "command.start"
+            and isinstance(argv := result.get("argv"), list)
+            and all(isinstance(arg, str) for arg in argv)
+        ):
+            # Python records names only. Pinned releases and Rust retain values.
+            result["argv"] = "<argv>"
         if result.get("event") == "command.end" and isinstance(
             result.get("error"), str
         ):
