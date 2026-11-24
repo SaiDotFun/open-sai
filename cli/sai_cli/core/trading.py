@@ -246,6 +246,17 @@ def open_trade(
                 pass
         preview["estimates"] = estimate(preview)
         return preview
+    if (
+        order_type == "market"
+        and lcd_endpoint is not None
+        and "positionRoute" in preview
+    ):
+        fresh_route = _trading_route(endpoint, lcd_endpoint, confirming=True)
+        if fresh_route != preview["positionRoute"]:
+            raise PositionChanged(
+                "The trading route changed during the market price refresh."
+                " Request a new preview before submitting."
+            )
     _checked(before_submit, preview, estimate)
     result = intents.submit(
         endpoint, active, payload, allow_concurrent_open=allow_concurrent_open

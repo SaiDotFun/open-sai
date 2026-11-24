@@ -96,6 +96,7 @@ class Position:
     deny_lcd: bool = False
     denied_lcd_targets: list[str] = field(default_factory=list)
     price: float | str = 100.5
+    switch_contract_on_market_read: str | None = None
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
     oracle_position_updates: deque[tuple[int, str] | None] = field(
@@ -121,6 +122,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_POST(self) -> None:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if (
+                request["query"] == keeper.MARKETS
+                and position.switch_contract_on_market_read
+            ):
+                position.contract_address = position.switch_contract_on_market_read
+                position.switch_contract_on_market_read = None
             indexed_collateral = position.collateral
             if request["query"] == keeper.POSITION:
                 if position.switch_and_logout_on_keeper_read is not None:
@@ -861,6 +868,43 @@ def test_trade_confirmation_binds_verified_route(
                         pending["intentKey"] == json.loads(accepted.stdout)["intentKey"]
                     )
             assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+def test_market_open_rechecks_route_after_price_refresh(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    args = {**OPEN_ARGS, "order_type": "market"}
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, [*OPEN_COMMAND, "--type", "market"])
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_open", args)
+            digest = preview["previewDigest"]
+            reference = preview["referencePrice"]
+
+            position.switch_contract_on_market_read = "nibi1replacement"
+            cli_result = cli.invoke(
+                main, [*cli_args, "--preview-digest", digest, "--price", reference]
+            )
+            assert cli_result.exit_code == ExitCode.REJECTED, cli_result.output
+            cli_error = json.loads(cli_result.stdout)["error"]
+            assert position.contract_address == "nibi1replacement"
+
+            position.contract_address = preview["positionRoute"]["contractAddress"]
+            position.switch_contract_on_market_read = "nibi1replacement"
+            mcp_error = await call(
+                client,
+                "trade_open",
+                {**args, "preview_digest": digest, "reference_price": reference},
+            )
+            assert position.contract_address == "nibi1replacement"
+            assert cli_error["code"] == mcp_error["code"] == "PREVIEW_MISMATCH"
+            assert "details" not in cli_error and "preview" not in mcp_error
+            assert position.submitted == []
+            assert storage.list_pending(f"{base_url}/query", ADDR) == []
 
     asyncio.run(scenario())
 
