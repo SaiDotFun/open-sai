@@ -12,9 +12,9 @@ Keeper row. Reconciliation applies the history and ledger rules below.
 | --- | --- | --- | --- |
 | `jwt_pass`, `exec_req_pass` | `server` | null | Accepted. Keeper admitted the intent or recorded the execution handoff. |
 | `pending_exec` | `server` | null | Pending. The request transaction landed. The market order awaits an end-block fill or cancellation. |
-| `exec_fail` | `server` | `market_order_outcome_not_indexed` | Pending. Keeper's sweep found the order missing on chain and lacks an indexed outcome. A correlated history row can establish success. |
-| `exec_fail` | `server` | `chain_execution_failed` or `market_order_<reason>` other than `market_order_outcome_not_indexed` | Terminal-failed. The request transaction failed or Keeper has a cancellation. |
-| `exec_req_fail` | `server` | `admission_expired`, `simulation_failed`, `broadcast_rejected`, or another rejection code | Terminal-failed. Admission expired, preflight failed, or the broadcast was rejected. |
+| `exec_fail`, `exec_req_fail` | `server` | `market_order_outcome_not_indexed` | Pending. Keeper's sweep found the order missing on chain and lacks an indexed outcome. A correlated history row can establish success. |
+| `exec_fail` | `server` | Any remaining code, including `chain_execution_failed` and `market_order_<reason>` | Terminal-failed. The request transaction failed or Keeper has a cancellation. |
+| `exec_req_fail` | `server` | Any remaining code, including `admission_expired`, `simulation_failed`, and `broadcast_rejected` | Terminal-failed. Admission expired, preflight failed, or the broadcast was rejected. |
 | `exec_pass` | `server` | null | Terminal-filled. Keeper observed the intent succeed. Trade history can arrive later or be unavailable for a fill recovered from chain state. |
 | `exec_finality_observed` | `user` or `server` | null | Pending for a Perp trade until history contains a row with the same `intentKey` and a `trade`. That row makes the intent terminal-filled. For other kinds, unknown. |
 | `intent_start`, `jwt_failed`, `sign_reject`, `sign_failed` | Applicable actor | Any | Unknown. These lifecycle records give no authoritative execution outcome. |
