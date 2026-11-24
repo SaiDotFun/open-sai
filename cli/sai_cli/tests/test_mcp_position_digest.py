@@ -906,7 +906,7 @@ def test_position_disappears_during_confirmation(position_service):
                 {**args, "preview_digest": preview["previewDigest"]},
             )
             assert result["code"] == "PREVIEW_MISMATCH"
-            assert "Open position not found" in result["error"]
+            assert "Position not found for this account" in result["error"]
             assert result["quoteStatus"] == "unavailable"
             assert result["recovery"]["action"] == "request_preview"
             assert "confirmation" in result["recovery"]["message"]
