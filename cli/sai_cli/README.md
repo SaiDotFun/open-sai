@@ -61,10 +61,12 @@ sai --json account overview --as 0x0000000000000000000000000000000000000001
 
 With no address, the command uses the active account on the configured
 Keeper endpoint. Pass `--as ADDR` to read any EVM account without signing
-in. The command accepts `--as` and `--json` after `account overview` as
-well. If it has no address or usable active account, it exits 1 with code
-`SESSION_UNAVAILABLE`. The MCP tool `account_overview` takes an optional
-`addr` and returns the same fields.
+in. For scripts, use `sai --json account overview` so failures return JSON
+on stdout. If Sai cannot select an account, it exits 1 with code
+`SESSION_UNAVAILABLE`. The local flag in `sai account overview --json`
+formats successful results as JSON. Its errors are text on stderr.
+The MCP tool `account_overview` takes an optional `addr` and returns the
+same overview fields.
 
 The fields `addr` and `addrSource` identify the account and how Sai selected
 it. Section fields are `balances`, `positions`, `pendingOrders`,
