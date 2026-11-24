@@ -3342,6 +3342,122 @@ def test_intent_cursor_bounds_following_day_to_original_files(home, before):
     assert code == 0 and "ambiguous" in json.loads(output)["scopeWarning"]
 
 
+def test_intent_replay_and_page_share_one_read_budget(home, monkeypatch):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    path = log.file_path("cli", day, root)
+    row = {"ts": f"{day}T11:00:00.000Z", "event": "command.start", "surface": "cli"}
+    filler = log.encode({**row, "seq": 0, "padding": "x" * 2048})
+    with path.open("wb") as stream:
+        stream.write(filler * (20 * 1024 * 1024 // len(filler)))
+        for seq in range(160):
+            stream.write(
+                log.encode(
+                    {
+                        **row,
+                        "event": "intent.keeper",
+                        "seq": seq,
+                        "runId": f"run-{seq}",
+                        "intentKey": "KEY",
+                        "addr": ADDR,
+                        "endpointId": "h1_" + "a" * 64,
+                        "padding": "x" * 8192,
+                    }
+                )
+            )
+    first = log_queries.intent("KEY", offline=True, root=root)
+    assert len(first["events"]) == 128
+
+    read = os.read
+    target = path.stat()
+    bytes_read = 0
+
+    def count_log_bytes(fd, size):
+        nonlocal bytes_read
+        data = read(fd, size)
+        found = os.fstat(fd)
+        if (found.st_dev, found.st_ino) == (target.st_dev, target.st_ino):
+            bytes_read += len(data)
+        return data
+
+    monkeypatch.setattr(os, "read", count_log_bytes)
+    second = log_queries.intent(
+        "KEY", offline=True, before=first["nextBefore"], root=root
+    )
+    assert [line["seq"] for line in second["events"]] == list(range(32))
+    assert 0 < bytes_read <= log.MAX_SCAN_BYTES
+
+
+def test_intent_response_budget_includes_saved_attribution(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    base = {
+        "ts": f"{day}T11:00:00.000Z",
+        "event": "intent.keeper",
+        "surface": "cli",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+        "command": "x " * 480,
+    }
+    log.file_path("cli", day, root).write_bytes(
+        b"".join(
+            log.encode(
+                {**base, "seq": seq, "runId": f"r-{seq}", "padding": "x" * (seq % 255)}
+            )
+            for seq in range(3600)
+        )
+    )
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0 and len(output.encode()) <= log_queries.MAX_REPORT_BYTES
+    first = json.loads(output)
+    assert first["events"] and first["nextBefore"]
+    code, output = run_cli(*args, "--before", first["nextBefore"])
+    assert code == 0 and len(output.encode()) <= log_queries.MAX_REPORT_BYTES
+    second = json.loads(output)
+    assert second["events"][-1]["seq"] + 1 == first["events"][0]["seq"]
+
+
+@pytest.mark.parametrize("spread_days", [False, True])
+def test_intent_cursor_budgets_only_replay_needed_by_the_page(home, spread_days):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    total = 129 if spread_days else 1300
+    streams: dict[Path, list[bytes]] = {}
+    for seq in range(total):
+        row_day = day + timedelta(days=seq // 3) if spread_days else day
+        surface = log.SURFACES[seq % 3] if spread_days else "cli"
+        row = {
+            "ts": f"{row_day}T11:00:00.000Z",
+            "event": "intent.keeper",
+            "surface": surface,
+            "intentKey": "KEY",
+            "addr": ADDR,
+            "endpointId": "h1_" + "a" * 64,
+            "seq": seq,
+            "runId": f"run-{seq}",
+            "padding": "" if spread_days else "x" * 14_000,
+        }
+        streams.setdefault(log.file_path(surface, row_day, root), []).append(
+            log.encode(row)
+        )
+    for path, rows in streams.items():
+        path.write_bytes(b"".join(rows))
+    seen = []
+    before = None
+    for _ in range(15):
+        report = log_queries.intent("KEY", offline=True, before=before, root=root)
+        seen.extend(line["seq"] for line in report["events"])
+        before = report.get("nextBefore")
+        if before is None:
+            break
+    assert sorted(seen) == list(range(total))
+
+
 def test_log_stats_scan_continues_inside_one_millisecond(home):
     root = home / "logs"
     root.mkdir()

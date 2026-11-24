@@ -176,9 +176,17 @@ def _prefix(
     day: date,
     accept: Callable[[LogLine], bool],
     ends: tuple[int, ...] | None = None,
+    *,
+    budget: log.ScanBudget | None = None,
 ) -> tuple[list[tuple[log.RowPosition, LogLine]], bool]:
     return log.read_prefix(
-        root, day, accept, max_bytes=CONTEXT_BYTES, max_rows=CONTEXT_ROWS, ends=ends
+        root,
+        day,
+        accept,
+        max_bytes=CONTEXT_BYTES,
+        max_rows=CONTEXT_ROWS,
+        ends=ends,
+        budget=budget,
     )
 
 
@@ -270,16 +278,18 @@ class _Cursor:
 
 
 INTENT_CURSOR_SUFFIX = "~i~"
-MAX_INTENT_CURSOR = 96 * 1024
+MAX_INTENT_CURSOR = 48 * 1024
 MAX_INTENT_STATE = 2 * 1024 * 1024
+LinkPositions = dict[str, set[log.RowPosition]]
+LINK_TAG = re.compile(r"[0-9a-f]{16}")
 
 
 def _intent_cursor(
     value: str | None,
-) -> tuple[_Cursor, list[log.RowPosition], log.FileEnds | None]:
+) -> tuple[_Cursor, list[log.RowPosition], log.FileEnds | None, LinkPositions]:
     base, separator, payload = (value or "").partition(INTENT_CURSOR_SUFFIX)
     if not separator:
-        return _Cursor.parse(value), [], None
+        return _Cursor.parse(value), [], None, {}
     cursor = _Cursor.parse(base)
     try:
         if cursor.position is None or len(payload) > MAX_INTENT_CURSOR:
@@ -291,11 +301,11 @@ def _intent_cursor(
         )
         if not inflater.eof or inflater.unused_data or len(raw) > MAX_INTENT_STATE:
             raise ValueError
-        items, days = json.loads(raw)
-        if not isinstance(items, list) or not isinstance(days, list):
-            raise ValueError
-        positions = []
-        for item in items:
+        items, days, tagged = json.loads(raw)
+        if not all(isinstance(value, list) for value in (items, days, tagged)):
+            raise TypeError
+
+        def position(item: Any) -> log.RowPosition:
             if (
                 not isinstance(item, list)
                 or len(item) != 4
@@ -309,7 +319,9 @@ def _intent_cursor(
                 and 0 <= offset < 2**63 - size
             ):
                 raise ValueError
-            positions.append(log.RowPosition(date.fromordinal(day), slot, offset, size))
+            return log.RowPosition(date.fromordinal(day), slot, offset, size)
+
+        positions = [position(item) for item in items]
         ends = {}
         for row in days:
             if (
@@ -322,7 +334,17 @@ def _intent_cursor(
                 raise ValueError
             day, *offsets = row
             ends[date.fromordinal(day)] = tuple(offsets)
-        return cursor, positions, ends
+        links: LinkPositions = defaultdict(set)
+        for entry in tagged:
+            if (
+                not isinstance(entry, list)
+                or len(entry) != 5
+                or not isinstance(entry[0], str)
+                or LINK_TAG.fullmatch(entry[0]) is None
+            ):
+                raise ValueError
+            links[entry[0]].add(position(entry[1:]))
+        return cursor, positions, ends, links
     except (TypeError, ValueError, OverflowError, RecursionError, zlib.error):
         raise SaiError(
             "Pass a log cursor or a UTC timestamp to --before.",
@@ -332,16 +354,25 @@ def _intent_cursor(
 
 
 def _save_intent_cursor(
-    report: LogLine, positions: list[log.RowPosition], ends: log.FileEnds
+    report: LogLine,
+    positions: list[log.RowPosition],
+    ends: log.FileEnds,
+    links: LinkPositions,
 ) -> None:
     if base := report.get("nextBefore"):
+
+        def fields(row: log.RowPosition) -> tuple[int, int, int, int]:
+            return row.day.toordinal(), row.slot, row.offset, row.size
+
         raw = json.dumps(
             (
-                [
-                    (row.day.toordinal(), row.slot, row.offset, row.size)
-                    for row in positions
-                ],
+                list(map(fields, positions)),
                 [(day.toordinal(), *ends[day]) for day in sorted(ends)],
+                [
+                    (tag, *fields(row))
+                    for tag, refs in links.items()
+                    for row in sorted(refs)
+                ],
             ),
             separators=(",", ":"),
         ).encode()
@@ -367,6 +398,14 @@ def _anchor_group(line: LogLine) -> tuple[Any, ...]:
         if event in TX_EVENTS and keeper.request_hash(line.get("txHash"))[0]
         else None,
     )
+
+
+def _link_tag(kind: str, value: str | tuple[str, str, str]) -> str:
+    # The cursor indexes candidate locations. The retained row must still
+    # establish the relationship before the report can use it.
+    return hashlib.blake2s(
+        json.dumps((kind, value)).encode(), digest_size=8
+    ).hexdigest()
 
 
 def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
@@ -421,10 +460,10 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
 
 
 class _PageReport:
-    def __init__(self, report: LogLine) -> None:
+    def __init__(self, report: LogLine, *, cursor_bytes: int = 0) -> None:
         self.report = report
         self.tokens = log.known_tokens(check=True)
-        self.bytes_left = MAX_REPORT_BYTES - 8192
+        self.bytes_left = MAX_REPORT_BYTES - 8192 - cursor_bytes
         self.rows_left = MAX_REPORT_ROWS
         self.fields: set[str] = set()
 
@@ -481,7 +520,7 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    cursor, positions, ends = _intent_cursor(before)
+    cursor, positions, ends, links = _intent_cursor(before)
     log.flush(1.0)
     if ends is None:
         ends = log.snapshot_ends(root)
@@ -497,33 +536,54 @@ def intent(
             if previous is None or log.event_order(line) > log.event_order(previous[1]):
                 evidence[group] = (position, line)
 
-    for position, line in log.read_rows_at(root, positions, ends):
-        remember_anchor(position, line)
-
-    scan = _trail_scan()
-    rows = [
-        (position, ts, line)
-        for position, line in scan.rows(
-            root,
-            start=cursor.position,
-            last_day=cursor.last_day,
-            before=cursor.upper,
-            ends=ends,
-            observe=remember_anchor,
-        )
-        if (ts := _timestamp(line)) is not None
-    ]
-    boundary_days = {cursor.last_day, cursor.position.day if cursor.position else None}
-    for day in sorted(
-        day for day in boundary_days if day is not None and day < date.max
-    ):
-        following_day = day + timedelta(days=1)
-        following, truncated = _prefix(
-            root, following_day, is_anchor, ends.get(following_day, log.NO_FILES)
-        )
-        for position, line in following:
+    budget = log.ScanBudget()
+    scan = log.PageScan()
+    previous, scan.truncated = log.read_rows_at(root, positions, ends, budget)
+    checked = set(positions)
+    rows = []
+    if not scan.truncated:
+        for position, line in previous:
             remember_anchor(position, line)
-        scan.truncated |= truncated
+        if (
+            cursor.position is None
+            and (day := cursor.last_day) is not None
+            and day < date.max
+        ):
+            following_day = day + timedelta(days=1)
+            following, truncated = _prefix(
+                root,
+                following_day,
+                is_anchor,
+                ends.get(following_day, log.NO_FILES),
+                budget=budget,
+            )
+            for position, line in following:
+                remember_anchor(position, line)
+            scan.truncated |= truncated
+        pending = set().union(*links.values()) - checked if links else set()
+        # Leave part of the same budget for links the selected rows need.
+        reserved = log.ScanBudget(
+            min(sum(ref.size for ref in pending), budget.bytes_left // 2),
+            min(len(pending), budget.rows_left // 2),
+            min(len({(ref.day, ref.slot) for ref in pending}), budget.files_left // 2),
+        )
+        rows = [
+            (position, ts, line)
+            for position, line in scan.rows(
+                root,
+                start=cursor.position,
+                last_day=cursor.last_day,
+                before=cursor.upper,
+                ends=ends,
+                budget=budget,
+                reserve=reserved,
+                observe=remember_anchor,
+                context=is_anchor,
+            )
+            if (ts := _timestamp(line)) is not None
+        ]
+        if not rows and scan.resume == cursor.position:
+            scan.resume = None
     anchors = sorted((line for _, line in evidence.values()), key=log.event_order)
     identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
     scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
@@ -587,27 +647,61 @@ def intent(
     )
     report["txHash"] = keeper.request_hash(log.clean(request_hash))[0]
     matched_runs = {_id(line, "runId") for line in direct} - {None}
-    page = _PageReport(report)
+
+    def resolve_link(tag: str) -> bool:
+        pending = links.get(tag, set()) - checked
+        previous, truncated = log.read_rows_at(root, list(pending), ends, budget)
+        if truncated:
+            return False
+        checked.update(pending)
+        for position, anchor in previous:
+            if not is_anchor(anchor):
+                continue
+            remember_anchor(position, anchor)
+            anchor_scope = _scope(anchor)
+            if anchor_scope == scope:
+                if run_id := _id(anchor, "runId"):
+                    matched_runs.add(run_id)
+                if match := _invocation(anchor):
+                    invocations.add(match)
+            elif anchor_scope is not None and (match := _invocation(anchor)):
+                conflicting.add(match)
+        return True
+
+    page = _PageReport(report, cursor_bytes=MAX_INTENT_CURSOR)
     last = None
     stop = None
     unattributed = []
     for position, ts, line in rows:
         if line.get("event") == "log.dropped":
-            if _id(line, "runId") not in matched_runs:
+            run_id = _id(line, "runId")
+            if (
+                scope is not None
+                and run_id
+                and run_id not in matched_runs
+                and not resolve_link(_link_tag("run", run_id))
+            ):
+                stop = position
+                break
+            if run_id not in matched_runs:
                 unattributed.append(line)
                 continue
             field = "gaps"
-        elif scope is not None and (
-            (_has_intent(line, key) and _scope(line) == scope)
-            or (
-                (match := _invocation(line)) in invocations
-                and match not in conflicting
-                and line.get("intentKey") in (None, key)
-                and _address(line) in (None, scope[0])
-                and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
-                and line.get("endpointId") in (None, scope[1])
-            )
+        elif scope is not None and _has_intent(line, key) and _scope(line) == scope:
+            field = "events"
+        elif (
+            scope is not None
+            and (match := _invocation(line)) is not None
+            and line.get("intentKey") in (None, key)
+            and _address(line) in (None, scope[0])
+            and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
+            and line.get("endpointId") in (None, scope[1])
         ):
+            if not resolve_link(_link_tag("invocation", match)):
+                stop = position
+                break
+            if match not in invocations or match in conflicting:
+                continue
             field = "events"
         else:
             continue
@@ -622,8 +716,48 @@ def intent(
         scan.truncated |= any(
             not page.add("unattributedGaps", line) for line in unattributed[:8]
         )
+    if stop is not None and stop == cursor.position and last is None:
+        # The first unread row needs more context than this page can verify.
+        scan.truncated = True
+        scan.resume = stop = None
     page.finish(scan, cursor, last, stop)
-    _save_intent_cursor(report, [position for position, _ in evidence.values()], ends)
+    if frontier := stop or scan.resume:
+        # Scope evidence can be deeper than the next page's scan. Links to
+        # unread anchors are only needed when the scan already saw related rows.
+        related_invocations = {
+            match
+            for _, _, line in rows
+            if not _has_intent(line, key) and (match := _invocation(line)) is not None
+        }
+        related_runs = {
+            _id(line, "runId")
+            for _, _, line in rows
+            if line.get("event") == "log.dropped"
+        }
+        summaries: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
+        for group, (position, line) in evidence.items():
+            authority = (group[0], *group[3:])
+            previous = summaries.get(authority)
+            if previous is None or log.event_order(line) > log.event_order(previous[1]):
+                summaries[authority] = (position, line)
+            unread = position.day < frontier.day or (
+                position.day == frontier.day
+                and (
+                    frontier.offsets is None
+                    or position.offset < frontier.offsets[position.slot]
+                )
+            )
+            if (match := _invocation(line)) and (
+                not unread or match in related_invocations
+            ):
+                links.setdefault(_link_tag("invocation", match), set()).add(position)
+            if (run_id := _id(line, "runId")) and (
+                not unread or run_id in related_runs
+            ):
+                links.setdefault(_link_tag("run", run_id), set()).add(position)
+        _save_intent_cursor(
+            report, [position for position, _ in summaries.values()], ends, links
+        )
     if report.get("truncated") and "nextBefore" not in report:
         report["more"] = "Inspect the retained files from sai logs path."
     return report

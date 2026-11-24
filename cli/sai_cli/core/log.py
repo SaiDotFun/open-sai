@@ -1346,6 +1346,18 @@ MAX_SCAN_ROWS = 20_000
 MAX_SCAN_FILES = 128
 
 
+@dataclass
+class ScanBudget:
+    bytes_left: int = MAX_SCAN_BYTES
+    rows_left: int = MAX_SCAN_ROWS
+    files_left: int = MAX_SCAN_FILES
+
+    def read(self, fd: int, size: int) -> bytes:
+        data = os.read(fd, min(size, self.bytes_left))
+        self.bytes_left -= len(data)
+        return data
+
+
 # Writers put ts before any event data. This recognizes that header in
 # both schema versions, so older rows can be skipped before JSON decoding.
 _TS_HEADER = re.compile(rb'^\{"(?:schema":[0-9]+,"|)ts":"([0-9TZ:.-]{24})"')
@@ -1385,18 +1397,25 @@ def snapshot_ends(root: Path | None) -> FileEnds:
 
 
 def read_rows_at(
-    root: Path | None, positions: list[RowPosition], ends: FileEnds
-) -> Iterator[tuple[RowPosition, dict[str, Any]]]:
+    root: Path | None,
+    positions: list[RowPosition],
+    ends: FileEnds,
+    budget: ScanBudget,
+) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
     """Read the individual lines that supplied attribution on earlier pages."""
+    rows: list[tuple[RowPosition, dict[str, Any]]] = []
     if not positions:
-        return
+        return rows, False
     opened = LogDir.open(root or directory())
     if opened is None:
-        return
+        return rows, False
     with opened:
         for (day, slot), group in itertools.groupby(
-            sorted(positions), key=lambda position: (position.day, position.slot)
+            sorted(set(positions)), key=lambda position: (position.day, position.slot)
         ):
+            if budget.files_left == 0:
+                return rows, True
+            budget.files_left -= 1
             try:
                 fd = opened.read_fd(file_name(SURFACES[slot], day))
             except OSError:
@@ -1405,8 +1424,11 @@ def read_rows_at(
                 for position in group:
                     if position.offset + position.size > ends.get(day, NO_FILES)[slot]:
                         continue
+                    if position.size > budget.bytes_left or budget.rows_left == 0:
+                        return rows, True
                     os.lseek(fd, position.offset, os.SEEK_SET)
-                    raw = os.read(fd, position.size)
+                    raw = budget.read(fd, position.size)
+                    budget.rows_left -= 1
                     if len(raw) != position.size or not raw.endswith(b"\n"):
                         continue
                     try:
@@ -1414,11 +1436,12 @@ def read_rows_at(
                     except (ValueError, RecursionError):
                         continue
                     if isinstance(line, dict):
-                        yield position, line
+                        rows.append((position, line))
             except OSError:
                 continue
             finally:
                 os.close(fd)
+    return rows, False
 
 
 def read_prefix(
@@ -1429,10 +1452,13 @@ def read_prefix(
     max_bytes: int,
     max_rows: int,
     ends: tuple[int, ...] | None = None,
+    budget: ScanBudget | None = None,
 ) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
     """Read bounded attribution context from the start of one day's files."""
     rows: list[tuple[RowPosition, dict[str, Any]]] = []
     truncated = False
+    if budget is None:
+        budget = ScanBudget(max_bytes, max_rows, len(SURFACES))
     opened = LogDir.open(root or directory())
     if opened is None:
         return rows, truncated
@@ -1444,13 +1470,20 @@ def read_prefix(
             if found == day and (ends is None or ends[slot] > 0)
         ]
         for slot, name in files:
+            if (
+                budget.files_left == 0
+                or budget.rows_left == 0
+                or budget.bytes_left == 0
+            ):
+                return rows, True
+            budget.files_left -= 1
             try:
                 fd = opened.read_fd(name)
                 try:
                     size = os.fstat(fd).st_size
                     if ends is not None:
                         size = min(size, ends[slot])
-                    data = os.read(fd, min(size, max_bytes // len(files)))
+                    data = budget.read(fd, min(size, max_bytes // len(files)))
                     truncated |= len(data) < size
                 finally:
                     os.close(fd)
@@ -1468,9 +1501,10 @@ def read_prefix(
                 except (ValueError, RecursionError):
                     continue
                 if isinstance(line, dict) and accept(line):
-                    if len(rows) == max_rows:
+                    if len(rows) == max_rows or budget.rows_left == 0:
                         return rows, True
                     rows.append((position, line))
+                    budget.rows_left -= 1
     return rows, truncated
 
 
@@ -1492,33 +1526,33 @@ class PageScan:
         since: str | None = None,
         before: str | None = None,
         ends: FileEnds | None = None,
+        budget: ScanBudget | None = None,
+        reserve: ScanBudget | None = None,
         observe: Callable[[RowPosition, dict[str, Any]], None] | None = None,
+        context: Callable[[dict[str, Any]], bool] | None = None,
     ) -> Generator[tuple[ScanPosition, dict[str, Any]]]:
         """Merge reverse file reads one day at a time and checkpoint each file."""
         opened = LogDir.open(root or directory())
         if opened is None:
             return
-        bytes_left, rows_left, files_left = (
-            self.max_bytes,
-            self.max_rows,
-            self.max_files,
-        )
+        if budget is None:
+            budget = ScanBudget(self.max_bytes, self.max_rows, self.max_files)
+        read_budget = budget
+        reserved = reserve or ScanBudget(0, 0, 0)
         byte_limit = False
 
         def read(fd: int, size: int) -> bytes:
-            nonlocal bytes_left, byte_limit
-            if size > bytes_left:
+            nonlocal byte_limit
+            if size > read_budget.bytes_left - reserved.bytes_left:
                 self.truncated = byte_limit = True
                 return b""
-            data = os.read(fd, size)
-            bytes_left -= len(data)
-            return data
+            return read_budget.read(fd, size)
 
         def decode_block(
             day: date,
             slot: int,
             block: list[tuple[int, bytes]],
-        ) -> Iterator[tuple[int, int, dict[str, Any]]]:
+        ) -> Iterator[tuple[int, int, dict[str, Any], bool]]:
             for offset, raw in block:
                 if (
                     observe is None
@@ -1535,17 +1569,18 @@ class PageScan:
                 if not isinstance(line, dict):
                     continue
                 size = len(raw) + 1
-                if observe is not None:
+                if observe is not None and context is None:
                     observe(RowPosition(day, slot, offset, size), line)
                 ts = line.get("ts")
-                if isinstance(ts, str) and (
+                visible = isinstance(ts, str) and (
                     (since is None or ts >= since) and (before is None or ts < before)
-                ):
-                    yield offset, offset + size, line
+                )
+                if visible or (context is not None and context(line)):
+                    yield offset, offset + size, line, visible
 
         def read_rows(
             day: date, slot: int, fd: int, end: int, offsets: list[int]
-        ) -> Iterator[tuple[int, dict[str, Any]]]:
+        ) -> Iterator[tuple[int, dict[str, Any], bool]]:
             os.lseek(fd, end - 1, os.SEEK_SET)
             complete = read(fd, 1) == b"\n"
             for resume, block in _positioned_blocks(
@@ -1559,17 +1594,19 @@ class PageScan:
                 # Observe the whole chunk before choosing its first merge candidate.
                 # A call in the chunk can identify gaps from other files.
                 candidates = decode_block(day, slot, block)
-                for offset, row_end, line in (
-                    list(candidates) if observe is not None else candidates
+                for offset, row_end, line, visible in (
+                    list(candidates)
+                    if observe is not None and context is None
+                    else candidates
                 ):
                     offsets[slot] = row_end
-                    yield offset, line
+                    yield offset, line, visible
                 offsets[slot] = resume
 
         def advance(
             slot: int,
-            readers: dict[int, Iterator[tuple[int, dict[str, Any]]]],
-            heads: dict[int, tuple[int, dict[str, Any]]],
+            readers: dict[int, Iterator[tuple[int, dict[str, Any], bool]]],
+            heads: dict[int, tuple[int, dict[str, Any], bool]],
             offsets: list[int],
         ) -> None:
             try:
@@ -1595,14 +1632,14 @@ class PageScan:
             )
             for day, daily in itertools.groupby(files, key=lambda item: item[0]):
                 names = list(daily)
-                if len(names) > files_left:
+                if len(names) > read_budget.files_left - reserved.files_left:
                     self.truncated = True
                     self.resume = ScanPosition(day)
                     return
-                files_left -= len(names)
+                read_budget.files_left -= len(names)
                 offsets = [0] * len(SURFACES)
                 with ExitStack() as active:
-                    readers: dict[int, Iterator[tuple[int, dict[str, Any]]]] = {}
+                    readers: dict[int, Iterator[tuple[int, dict[str, Any], bool]]] = {}
 
                     for _, surface, name in names:
                         slot = SURFACES.index(surface)
@@ -1624,7 +1661,7 @@ class PageScan:
                         except OSError:
                             self.truncated = True
 
-                    heads: dict[int, tuple[int, dict[str, Any]]] = {}
+                    heads: dict[int, tuple[int, dict[str, Any], bool]] = {}
 
                     for slot in readers:
                         advance(slot, readers, heads, offsets)
@@ -1632,18 +1669,24 @@ class PageScan:
                             self.resume = ScanPosition(day, tuple(offsets))
                             return
                     while heads:
-                        if rows_left == 0:
+                        if read_budget.rows_left <= reserved.rows_left:
                             self.truncated = True
                             self.resume = ScanPosition(day, tuple(offsets))
                             return
                         slot = max(
                             heads, key=lambda key: (event_order(heads[key][1]), key)
                         )
-                        offset, line = heads[slot]
+                        offset, line, visible = heads[slot]
                         position = ScanPosition(day, tuple(offsets))
+                        if observe is not None and context is not None:
+                            observe(
+                                RowPosition(day, slot, offset, offsets[slot] - offset),
+                                line,
+                            )
                         offsets[slot] = offset
-                        rows_left -= 1
-                        yield position, line
+                        read_budget.rows_left -= 1
+                        if visible:
+                            yield position, line
                         advance(slot, readers, heads, offsets)
                         if byte_limit:
                             self.resume = ScanPosition(day, tuple(offsets))
