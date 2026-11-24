@@ -76,12 +76,13 @@ from types import MappingProxyType
 from typing import Any, Self
 from urllib.parse import urlsplit
 
+from . import paths
 from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
 
 DIR_NAME = "logs"
 SURFACES = ("cli", "mcp", "update")
 LEVELS = ("info", "warn", "error")
-DIR_MODE, FILE_MODE = 0o700, 0o600
+FILE_MODE = 0o600
 DEFAULT_KEEP_DAYS = 14
 PRUNE_MARKER = ".pruned"
 ENDPOINT_KEY = ".endpoint-key"
@@ -152,8 +153,7 @@ _silenced = 0
 
 
 def home(env: Mapping[str, str] | None = None) -> Path:
-    values = os.environ if env is None else env
-    return Path(values.get("SAI_HOME", Path.home() / ".sai"))
+    return paths.sai_home(env)
 
 
 def directory(env: Mapping[str, str] | None = None) -> Path:
@@ -588,10 +588,9 @@ class LogDir:
         directory, or owned by someone else. With CREATE, make it first, and
         remove group and other access from a directory this user owns."""
         try:
-            if create and not root.is_symlink() and not root.exists():
-                root.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
-                with suppress(FileExistsError):
-                    root.mkdir(mode=DIR_MODE)
+            if create:
+                paths.private_directory(root.parent)
+                paths.private_directory(root)
             if not _DIR_FD:
                 if redirected(root) or not root.is_dir():
                     return None

@@ -277,6 +277,30 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
     assert snapshot(isolated_home) == before
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize("with_trader", [False, True])
+def test_doctor_reports_and_tightens_loose_sai_home(isolated_home, with_trader):
+    if with_trader:
+        (isolated_home / "trader").mkdir(mode=0o700)
+    isolated_home.chmod(0o755)
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["details"]["looseModes"] == [
+        {"path": str(isolated_home), "mode": "755"}
+    ]
+    assert isolated_home.stat().st_mode & 0o777 == 0o755
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "fixed"
+    assert f"chmod {isolated_home} 755 -> 700" in check["changes"]
+    assert isolated_home.stat().st_mode & 0o777 == 0o700
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
 def test_fix_makes_the_directory_and_files_private(isolated_home):
     root = loosen(isolated_home)

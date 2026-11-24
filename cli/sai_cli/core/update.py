@@ -25,6 +25,8 @@ from urllib.parse import quote, unquote, urlsplit
 
 import httpx
 
+from . import paths
+
 REPO = "SaiDotFun/open-sai"
 API_BASE = "https://api.github.com"
 WEB_BASE = "https://github.com"
@@ -614,7 +616,7 @@ def guidance(install: Install) -> Guidance:
 def sai_home() -> Path:
     """$SAI_HOME or ~/.sai, as an absolute path, so a relative SAI_HOME
     means the same directory to every process this one starts."""
-    return Path(os.path.abspath(os.environ.get("SAI_HOME", Path.home() / ".sai")))
+    return Path(os.path.abspath(paths.sai_home()))
 
 
 def wheel_cache() -> Path:
@@ -661,9 +663,17 @@ def read_cache(path: Path | None = None) -> Cache | None:
     return Cache(latest, checked_at)
 
 
+def prepare_parent(target: Path) -> None:
+    """Create the parent for profile state or for uv tool metadata."""
+    if target.parent.absolute() == sai_home():
+        paths.private_directory(target.parent)
+    else:
+        target.parent.mkdir(mode=paths.PRIVATE_MODE, parents=True, exist_ok=True)
+
+
 def write_json(target: Path, value: dict[str, Any]) -> None:
     """Replace the JSON file at TARGET atomically."""
-    target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    prepare_parent(target)
     fd, temp = tempfile.mkstemp(dir=target.parent, prefix=".update-")
     try:
         with os.fdopen(fd, "w") as handle:

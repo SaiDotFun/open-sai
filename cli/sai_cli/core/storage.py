@@ -24,7 +24,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import log
+from . import log, paths
 from .errors import Code, SaiError, SessionError
 
 PLAIN_KEEPER_URL = re.compile(
@@ -56,14 +56,13 @@ class RecentOpenPending(UnresolvedIntent):
 
 
 def home() -> Path:
-    return Path(os.environ.get("SAI_HOME", Path.home() / ".sai")) / "trader"
+    return paths.sai_home() / "trader"
 
 
 def directory() -> Path:
     path = home()
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.chmod(0o700)
-    return path
+    paths.private_directory(path.parent)
+    return paths.private_directory(path)
 
 
 # Sessions are encrypted with this fixed key, which ships in the source, like
