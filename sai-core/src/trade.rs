@@ -1,5 +1,6 @@
 //! Trade previews and one reservation and submission path for CLI and MCP.
 
+mod actions;
 mod confirmation;
 
 use chrono::{SecondsFormat, Utc};
@@ -14,6 +15,7 @@ use crate::{
     storage::{IntentStatus, Session, Storage, StorageError},
 };
 
+pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
 
 #[derive(Clone, Debug, Serialize)]
@@ -85,6 +87,10 @@ impl TradePreview {
         output["previewDigest"] = json!(preview_digest(self, account));
         output
     }
+
+    pub fn requires_market_price_refresh(&self) -> bool {
+        self.intent.is_market_open()
+    }
 }
 
 #[derive(Default)]
@@ -146,6 +152,21 @@ impl<'a> Trading<'a> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
         self.storage.check_active(session, endpoint)?;
+        let mut prepared;
+        let preview = if preview.requires_market_price_refresh() {
+            let price = preview.reference_price.as_deref().ok_or_else(|| {
+                SaiError::new(
+                    Code::InvalidRequest,
+                    "Current open USDC market data is unavailable",
+                )
+            })?;
+            positive_decimal(price, "Current price")?;
+            prepared = preview.clone();
+            prepared.intent.body["intentPrice"] = json!(price);
+            &prepared
+        } else {
+            preview
+        };
         if let Some(confirmation) = options.confirmation {
             // A logout or account expiry during a refresh invalidates confirmation.
             self.load_session(Some(account))?;
