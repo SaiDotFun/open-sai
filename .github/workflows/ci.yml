@@ -272,6 +272,7 @@ jobs:
           uv run --locked pytest tests/parity --verbose -rxX \
             --ignore=tests/parity/test_config_regressions.py \
             --ignore=tests/parity/test_intent_status.py \
+            --ignore=tests/parity/test_intent_status_v012.py \
             --ignore=tests/parity/test_trade_shared_state.py
 
       - name: Check out the shared-state Python reference
@@ -324,7 +325,8 @@ jobs:
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
         run: |
           uv run --locked pytest tests/parity/test_config_regressions.py \
-            tests/parity/test_intent_status.py --release-xfails --verbose -rxX
+            tests/parity/test_intent_status.py tests/parity/test_intent_status_v012.py \
+            --release-xfails --verbose -rxX
 
       - name: Compare the full Rust manifest against the released Python CLI
         if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false') }}

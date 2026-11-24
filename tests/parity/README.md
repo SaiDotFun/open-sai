@@ -145,6 +145,14 @@ reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
 
+## Released Intent Status Cases
+
+Run `tests/parity/test_intent_status_v012.py` with `SAI_PARITY_BIN` set to
+the Rust binary and `SAI_PARITY_PYTHON` set to the Python executable from
+tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
+The focused release CI step runs this file and the intent status replays
+against the same executable.
+
 ## Comparison Rules
 
 The C7d estimate cases use the Python v0.1.2 commit

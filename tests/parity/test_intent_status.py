@@ -329,14 +329,8 @@ def compare(
                         result.stdout,
                         result.stderr,
                     )
-                    assert not replies
-                    assert bodies == expected
-                else:
-                    assert bodies[:1] == [first_request]
-                    legacy_history = wire(keeper.HISTORY, trader=step.addr)
-                    assert all(
-                        body in (history_request, legacy_history) for body in bodies[1:]
-                    )
+                assert not replies
+                assert bodies == expected
                 if step.json_output:
                     assert not result.stderr
                     assert len(result.stdout.splitlines()) == 1
@@ -686,10 +680,8 @@ def test_intent_status_logs_only_public_graphql_codes(
             expected_requests = [wire(keeper.INTENTS, user=ADDR, key=KEY)]
             if operation == "history":
                 replies.append(response("outcome_not_indexed"))
-                history_request = (
-                    wire(keeper.INTENT_HISTORY, trader=ADDR, limit=25, offset=0)
-                    if index == 0
-                    else wire(keeper.HISTORY, trader=ADDR)
+                history_request = wire(
+                    keeper.INTENT_HISTORY, trader=ADDR, limit=25, offset=0
                 )
                 expected_requests.append(history_request)
             replies.append(response(failure))

@@ -690,8 +690,13 @@ def run_case(
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints
         )
+        candidate_case = (
+            replace(case, wire=case.mcp_checkout_wire)
+            if candidate != reference and case.mcp_checkout_wire is not None
+            else case
+        )
         right, right_error = safe_observe(
-            case,
+            candidate_case,
             candidate,
             Path(temp) / "candidate",
             endpoints,
@@ -875,10 +880,8 @@ def main() -> int:
         else:
             oracle = reference
         if (
-            candidate is reference
-            and oracle is reference
-            and case.mcp_checkout_wire is not None
-        ):
+            args.cutover or (candidate is reference and oracle is reference)
+        ) and case.mcp_checkout_wire is not None:
             case = replace(case, wire=case.mcp_checkout_wire)
         executable = oracle if candidate is reference else candidate
         if args.cutover:
