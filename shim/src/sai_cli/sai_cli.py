@@ -210,6 +210,59 @@ def private_directory(path: Path, *, home: bool = False) -> Path:
         raise ShimError(
             f"The Sai cache requires an owner-controlled directory named {path.name}"
         )
+    check_directory_acl(path)
+    return path
+
+
+def check_acl(fd: int) -> None:
+    if sys.platform == "darwin":
+        from ._darwin_acl import has_mutating_acl
+
+        if has_mutating_acl(fd):
+            raise ShimError("The Sai cache path has an ACL permitting changes")
+
+
+def check_directory_acl(path: Path) -> None:
+    if sys.platform == "darwin":
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            check_acl(fd)
+        finally:
+            os.close(fd)
+
+
+def trusted_home(path: Path) -> Path:
+    # Canonicalize the parent once, for aliases such as /var on macOS.
+    # The opened directory chain below must keep that canonical path stable.
+    path = path.parent.resolve() / path.name
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(path.anchor, flags)
+    try:
+        check_acl(fd)
+        # User namespaces can report the host root as an unmapped UID.
+        trusted_owners = {0, os.getuid(), os.fstat(fd).st_uid}
+        for part in path.parts[1:]:
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                child = os.open(part, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            check_acl(fd)
+            info = os.fstat(fd)
+            mode = info.st_mode
+            # In a trusted sticky directory, only the entry owner or the
+            # directory owner can rename an entry. Check both owners.
+            if info.st_uid not in trusted_owners or (
+                mode & 0o022 and not mode & stat.S_ISVTX
+            ):
+                raise ShimError("SAI_HOME has an untrusted ancestor directory")
+    finally:
+        os.close(fd)
     return path
 
 
@@ -237,18 +290,22 @@ def cache_lock(path: Path) -> Generator[None]:
             or info.st_nlink != 1
         ):
             raise ShimError("The Sai cache lock must be an owner-only regular file")
+        check_acl(descriptor)
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
     finally:
         os.close(descriptor)
 
 
-def cached_binary(cache: Path) -> Path | None:
+def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
     receipt = cache / "verified"
     try:
-        if not is_private_file(receipt.lstat(), 0o600, 130):
-            return None
-        fields = receipt.read_bytes().split()
+        fd = os.open(receipt, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(fd, "rb") as contents:
+            if not is_private_file(os.fstat(fd), 0o600, 130):
+                return None
+            check_acl(fd)
+            fields = contents.read(131).split()
         if len(fields) != 2 or any(
             SHA256.fullmatch(d.decode("ascii")) is None for d in fields
         ):
@@ -262,12 +319,22 @@ def cached_binary(cache: Path) -> Path | None:
             or info.st_mode & 0o077
         ):
             return None
+        check_directory_acl(folder)
         binary = folder / "sai"
-        if not is_private_file(binary.lstat(), 0o700, BINARY_LIMIT):
-            return None
-        with binary.open("rb") as file:
-            if hashlib.file_digest(file, "sha256").hexdigest() == binary_digest:
-                return binary
+        fd = os.open(binary, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        file = os.fdopen(fd, "rb")
+        verified = False
+        try:
+            check_acl(fd)
+            verified = (
+                is_private_file(os.fstat(fd), 0o700, BINARY_LIMIT)
+                and hashlib.file_digest(file, "sha256").hexdigest() == binary_digest
+            )
+            if verified:
+                return binary, file
+        finally:
+            if not verified:
+                file.close()
     except (FileNotFoundError, UnicodeError):
         pass
     return None
@@ -280,7 +347,7 @@ def publish(path: Path, source: BinaryIO, mode: int) -> None:
     os.replace(str(source.name), path)
 
 
-def install_binary(cache: Path, url: str, name: str, base: str) -> Path:
+def install_binary(cache: Path, url: str, name: str, base: str) -> None:
     with tempfile.TemporaryFile(dir=cache) as manifest:
         download(f"{url}/SHA256SUMS", base, manifest, MANIFEST_LIMIT)
         manifest.seek(0)
@@ -300,29 +367,41 @@ def install_binary(cache: Path, url: str, name: str, base: str) -> Path:
             with (staged / "verified").open("wb") as file:
                 file.write(f"{digest} {binary_digest}\n".encode("ascii"))
                 publish(cache / "verified", file, 0o600)
-    return binary
 
 
-def verified_binary() -> Path:
+@contextmanager
+def verified_binary() -> Generator[tuple[Path, BinaryIO]]:
     release = release_version(version("sai-cli"))
     target = native_target()
     base, scope = release_source()
     home = Path(os.environ.get("SAI_HOME", Path.home() / ".sai")).absolute()
-    cache = private_directory(home, home=True)
+    cache = private_directory(trusted_home(home), home=True)
     for part in ("bin", scope, release, target):
         cache = private_directory(cache / part)
     with cache_lock(cache / ".lock"):
         cached = cached_binary(cache)
-        if cached is not None:
-            return cached
-        url = f"{base}/{REPO}/releases/download/sai-cli/v{release}"
-        return install_binary(cache, url, archive_name(release, target), base)
+        if cached is None:
+            url = f"{base}/{REPO}/releases/download/sai-cli/v{release}"
+            install_binary(cache, url, archive_name(release, target), base)
+            cached = cached_binary(cache)
+            if cached is None:
+                raise ShimError("Could not reopen the verified Sai binary")
+        path, executable = cached
+        with executable:
+            yield path, executable
 
 
 def main() -> int:
     try:
-        binary = verified_binary()
-        os.execv(binary, [str(binary), *sys.argv[1:]])
+        with verified_binary() as (binary, executable):
+            argv = [str(binary), *sys.argv[1:]]
+            if os.execve in os.supports_fd:
+                os.execve(executable.fileno(), argv, os.environ)
+            # macOS uses the canonical path under the trusted directory
+            # chain. Retain the verified inode until exec replaces us.
+            if not os.path.samestat(os.fstat(executable.fileno()), binary.lstat()):
+                raise ShimError("The verified Sai binary changed before launch")
+            os.execv(binary, argv)
     except ShimError as exc:
         print(f"sai: {exc}", file=sys.stderr)
     except (

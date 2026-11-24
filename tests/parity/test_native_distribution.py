@@ -77,6 +77,56 @@ def offline_env(distribution: SimpleNamespace, base: str, proxy: socket.socket) 
     distribution.tool.env["SAI_NATIVE_RELEASE_BASE"] = base
 
 
+@pytest.mark.parametrize(
+    "permissions",
+    [
+        "mode",
+        pytest.param(
+            "acl",
+            marks=pytest.mark.skipif(sys.platform != "darwin", reason="macOS ACLs"),
+        ),
+    ],
+)
+def test_shim_rejects_untrusted_profile_ancestry(
+    distribution: SimpleNamespace,
+    tmp_path: Path,
+    permissions: str,
+) -> None:
+    d = distribution
+    shared = tmp_path / "shared"
+    shared.mkdir()
+    if permissions == "acl":
+        run(
+            d.tool,
+            "Set a directory ACL in the temporary profile",
+            "/bin/chmod",
+            "+a",
+            "everyone allow delete_child",
+            shared,
+        )
+    else:
+        shared.chmod(0o777)
+    profile = shared / "sai-profile"
+    profile.mkdir(mode=0o700)
+    with (
+        d.rehearsal.keeper_server(d.replay.handler()) as base,
+        closing(socket.socket()) as proxy,
+    ):
+        offline_env(d, base, proxy)
+        run(d.tool, "Install the shim wheel", d.tool.uv, "tool", "install", d.wheel)
+        d.tool.env["SAI_HOME"] = str(profile)
+        result = d.tool.run(
+            "Reject untrusted profile ancestry", d.tool.sai, "--version", check=False
+        )
+    assert result.returncode == 1 and result.stdout == ""
+    diagnostic = (
+        "ACL permitting changes" if permissions == "acl" else "untrusted ancestor"
+    )
+    assert diagnostic in result.stderr
+    assert d.replay.get_requests == []
+    assert list(profile.iterdir()) == []
+
+
 def test_native_shim_selects_exact_asset_and_reuses_it_offline(
     distribution: SimpleNamespace,
 ) -> None:
