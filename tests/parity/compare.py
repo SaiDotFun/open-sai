@@ -421,6 +421,35 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
         result["structuredContent"]["result"] = value
 
 
+OVERVIEW_AGE = re.compile(r"(?<=\()-?[\d.,]+(?:e[+-]\d+)?(?= s\))")
+OVERVIEW_TABLE = re.compile(
+    r"(?m)^  [^\n]* │ [^\n]*\n  ─+\n(?:  [^\n]* │ [^\n]*\n(?!  ─+\n))+"
+)
+
+
+def normalize_overview_table(match: re.Match[str]) -> str:
+    """Reflow only columns that contain a rendered source age."""
+    header, divider, *body = match[0].splitlines()
+    rows = [line[2:].split(" │ ") for line in (header, *body)]
+    widths = [len(cell) for cell in rows[0]]
+    # Keep malformed layout visible to the byte comparison.
+    if len(divider) != 2 + sum(widths) + 3 * (len(widths) - 1) or any(
+        [len(cell) for cell in row] != widths for row in rows
+    ):
+        return match[0]
+    for column, cells in enumerate(zip(*rows, strict=True)):
+        if any(OVERVIEW_AGE.search(cell) for cell in cells):
+            masked = [
+                OVERVIEW_AGE.sub("<sourceAgeSeconds>", cell.rstrip()) for cell in cells
+            ]
+            widths[column] = max(map(len, masked))
+            for row, cell in zip(rows, masked, strict=True):
+                row[column] = cell.ljust(widths[column])
+    lines = [" │ ".join(row) for row in rows]
+    lines.insert(1, "───".join("─" * width for width in widths))
+    return "".join(f"  {line}\n" for line in lines)
+
+
 def mask_overview_stdout(raw: str, mode: str) -> str:
     """Mask clock values in place so serialization and table layout stay comparable."""
     if mode == "json":
@@ -435,7 +464,8 @@ def mask_overview_stdout(raw: str, mode: str) -> str:
         r"\1<fetchedAt>",
         raw,
     )
-    return re.sub(r"(?<=\()-?[\d.,]+(?:e[+-]\d+)?(?= s\))", "<sourceAgeSeconds>", raw)
+    raw = OVERVIEW_TABLE.sub(normalize_overview_table, raw)
+    return OVERVIEW_AGE.sub("<sourceAgeSeconds>", raw)
 
 
 def overview_clocks(
