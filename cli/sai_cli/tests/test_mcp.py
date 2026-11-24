@@ -200,6 +200,26 @@ def test_no_tool_accepts_a_token_or_passphrase(mcp):
             assert "token" not in field and "pass" not in field, tool.name
 
 
+def test_position_quote_trade_descriptions_explain_mismatch_recovery(mcp):
+    async def descriptions() -> dict[str, str | None]:
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            return {
+                tool.name: tool.description
+                for tool in (await client.list_tools()).tools
+            }
+
+    listed = asyncio.run(descriptions())
+    for name in ("trade_margin", "trade_partial_close"):
+        description = listed[name]
+        assert description is not None
+        assert "PREVIEW_MISMATCH" in description
+        assert "recovery.action" in description
+        assert "quoteStatus=available" in description
+        assert "quoteStatus=unavailable" in description
+
+
 def names(mcp: FastMCP) -> set[str]:
     return {tool.name for tool in mcp._tool_manager.list_tools()}
 
