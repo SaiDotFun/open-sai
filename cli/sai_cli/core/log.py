@@ -163,6 +163,10 @@ _DIR_FD = hasattr(os, "O_DIRECTORY") and os.open in os.supports_dir_fd
 _context: ContextVar[Mapping[str, Any]] = ContextVar(
     "sai_log_context", default=MappingProxyType({})
 )
+_flag_keys: ContextVar[frozenset[str]] = ContextVar(
+    "sai_log_setting_flags", default=frozenset()
+)
+_silenced_context = ContextVar("sai_log_silenced", default=False)
 # How many `silenced` blocks are open, in any thread.
 _silenced = 0
 
@@ -213,6 +217,7 @@ def _off(raw: str | None) -> bool:
 
 
 _ConfigStat = tuple[int, int, int, int, int]
+_ConfigKey = tuple[str, str | None, str | None, frozenset[str]]
 _config_cache: dict[tuple[Any, ...], tuple[float, tuple[bool, int]]] = {}
 _config_generation = object()
 
@@ -237,57 +242,70 @@ def invalidate_config() -> None:
 def resolve_config(
     root: Path, raw_enabled: str | None, raw_keep: str | None
 ) -> tuple[bool, int]:
-    """Return (`logs.enabled`, `logs.keep_days`) for the home ROOT from the
-    two environment values and its config file.
-
-    Each key resolves on its own, environment first. With logging turned
-    off, `logs.keep_days` is not validated. Otherwise any logs value that is
-    invalid, or a config file that cannot be read or parsed, turns logging
-    off. The answer is cached by file metadata and environment values.
-    """
-    value, _ = _resolve_config(root, raw_enabled, raw_keep)
+    """Return the effective logging values for ROOT."""
+    value, _ = _resolve_config(_config_key(root, raw_enabled, raw_keep))
     return value
 
 
-def _resolve_config(
+@contextmanager
+def setting_flags(keys: frozenset[str]) -> Generator[None]:
+    """Use the command's flag keys for audit settings without keeping values."""
+    token = _flag_keys.set(keys)
+    try:
+        yield
+    finally:
+        _flag_keys.reset(token)
+
+
+def _config_key(
     root: Path, raw_enabled: str | None, raw_keep: str | None
-) -> tuple[tuple[bool, int], _ConfigStat | None]:
+) -> _ConfigKey:
+    from . import settings
+
+    # The raw arguments supply log-specific environment values to the writer.
+    shadowed = settings.shadowed_file_keys(_flag_keys.get(), os.environ) - {
+        "logs.enabled",
+        "logs.keep_days",
+    }
+    return (str(root), raw_enabled, raw_keep, shadowed)
+
+
+def _resolve_config(key: _ConfigKey) -> tuple[tuple[bool, int], _ConfigStat | None]:
     """Return the settings and the file metadata they were checked against."""
     from . import settings
 
+    root, raw_enabled, raw_keep, shadowed = key
     generation = _config_generation
-    path = root / settings.FILE_NAME
+    path = Path(root) / settings.FILE_NAME
     try:
         signature = _config_stat(path)
     except OSError:
         return (False, DEFAULT_KEEP_DAYS), None
-    key = (str(path), signature, raw_enabled, raw_keep, generation)
+    cache_key = (key, signature, generation)
     checked_at = time.monotonic()
-    cached = _config_cache.get(key)
+    cached = _config_cache.get(cache_key)
     # Expire unchanged entries too, for filesystems with coarse timestamps
     # and Windows versions that report creation time as ctime.
     if cached is not None and checked_at - cached[0] < RECHECK_SECONDS:
         return cached[1], signature
 
-    def pick(name: str, raw: str | None, file: Mapping[str, Any]) -> Any:
-        if raw is not None and raw.strip():
-            return settings.parse_value(name, raw)
-        value = file.get(name, settings.BY_KEY[name].default)
-        if isinstance(value, settings.Invalid):
-            raise settings.SettingsError(value.message)
-        return value
-
     value = (False, DEFAULT_KEEP_DAYS)
     try:
-        file, _warnings = settings.read_file(path)
-        if pick("logs.enabled", raw_enabled, file) is True:
-            # Only now does the other value matter.
-            value = (True, int(pick("logs.keep_days", raw_keep, file)))
+        file, _warnings = settings.read_file(path, overridden=shadowed)
+        # Other flag and environment values can be invalid on failed commands
+        # that still need auditing. Resolve only the selected logging values.
+        logs = settings.resolve(
+            {},
+            {"SAI_LOG": raw_enabled or "", "SAI_LOG_KEEP_DAYS": raw_keep or ""},
+            {name: item for name, item in file.items() if name.startswith("logs.")},
+        )
+        if logs.logs_enabled:
+            value = (True, logs.logs_keep_days)
     except Exception:  # noqa: BLE001 - unreadable settings mean no logging
         value = (False, DEFAULT_KEEP_DAYS)
     if len(_config_cache) > 64:
         _config_cache.clear()
-    _config_cache[key] = (checked_at, value)
+    _config_cache[cache_key] = (checked_at, value)
     return value, signature
 
 
@@ -336,11 +354,6 @@ class Arg(str):
     a tool argument: from a scheme to its end it is logged as an origin."""
 
     __slots__ = ()
-
-
-def argv(tokens: Any) -> list[Arg]:
-    """Mark each of TOKENS as one whole value. Parses nothing."""
-    return [Arg(token) for token in tokens]
 
 
 def origin(value: str) -> str:
@@ -607,13 +620,15 @@ def bind(**fields: Any) -> Generator[None]:
 
 @contextmanager
 def silenced() -> Generator[None]:
-    """Write no events inside the block, in any thread of this process."""
+    """Suppress events during the block and in contexts copied from it."""
     global _silenced
+    token = _silenced_context.set(True)
     _silenced += 1
     try:
         yield
     finally:
         _silenced -= 1
+        _silenced_context.reset(token)
 
 
 def bound(name: str) -> Any:
@@ -954,25 +969,13 @@ def prune(opened: LogDir, keep_days: int, today: date) -> list[str]:
 # Writing
 
 
+@dataclass(slots=True)
 class _Item:
-    """One event waiting for the writer, with the home and the logging
-    values of the environment it was written under."""
+    """One queued event and its command's log configuration key."""
 
-    __slots__ = ("keep", "line", "on", "root", "size")
-
-    def __init__(
-        self,
-        root: str,
-        on: str | None,
-        keep: str | None,
-        line: dict[str, Any],
-        size: int,
-    ) -> None:
-        self.root = root
-        self.on = on
-        self.keep = keep
-        self.line = line
-        self.size = size
+    target: _ConfigKey
+    line: dict[str, Any]
+    size: int
 
 
 _queue: queue.Queue[_Item] = queue.Queue(maxsize=QUEUE_SIZE)
@@ -985,9 +988,7 @@ _dropped = 0
 _queued_chars = 0
 _size_lock = threading.Lock()
 # Homes whose logging is off or failing, with the config the writer checked.
-_skip: dict[
-    tuple[str, str | None, str | None], tuple[object, float, _ConfigStat | None]
-] = {}
+_skip: dict[_ConfigKey, tuple[object, float, _ConfigStat | None]] = {}
 # The UTC day each home was last checked for old files.
 _pruned: dict[str, date] = {}
 
@@ -1006,10 +1007,10 @@ def encode(line: Mapping[str, Any]) -> bytes:
 def _write(item: _Item) -> None:
     """Redact and append one event. Runs on the writer thread."""
     global _dropped
-    key = (item.root, item.on, item.keep)
-    root = Path(item.root)
+    key = item.target
+    root = Path(key[0])
     generation = _config_generation
-    (on, keep_days), signature = _resolve_config(root, item.on, item.keep)
+    (on, keep_days), signature = _resolve_config(key)
     if not on:
         _skip[key] = (generation, time.monotonic(), signature)
         return
@@ -1047,8 +1048,8 @@ def _write(item: _Item) -> None:
         # surfaces' files may be fine.
         with suppress(OSError):
             opened.append(file_name(line["surface"], day), data)
-        if _pruned.get(item.root) != today:
-            _pruned[item.root] = today
+        if _pruned.get(key[0]) != today:
+            _pruned[key[0]] = today
             with suppress(OSError):
                 prune(opened, keep_days, today)
 
@@ -1076,16 +1077,16 @@ def _start() -> None:
             _thread.start()
 
 
-def _target() -> tuple[str, str | None, str | None] | None:
+def _target() -> _ConfigKey | None:
     """The home and logging values an event would be written under now, or
     None when it would not be written: logging is silenced, SAI_LOG is off,
     or the writer found this home off or unusable moments ago."""
-    if _silenced:
+    if _silenced or _silenced_context.get():
         return None
     raw_on = os.environ.get("SAI_LOG")
     if _off(raw_on):
         return None
-    key = (str(home()), raw_on, os.environ.get("SAI_LOG_KEEP_DAYS"))
+    key = _config_key(home(), raw_on, os.environ.get("SAI_LOG_KEEP_DAYS"))
     if skipped := _skip.get(key):
         generation, checked_at, signature = skipped
         if (
@@ -1153,7 +1154,7 @@ def event(name: str, level: str = "info", /, **fields: Any) -> None:
             _dropped += 1
             return
         try:
-            _queue.put_nowait(_Item(*key, line, size))
+            _queue.put_nowait(_Item(key, line, size))
         except queue.Full:
             with _size_lock:
                 _queued_chars -= size
@@ -1365,7 +1366,8 @@ def _redact_retained_endpoint_args(line: dict[str, Any]) -> None:
         flag, equals, value = arg.partition("=")
         if options and flag in flags:
             if equals:
-                argv[index] = flag + "=" + origin(value)
+                if value:
+                    argv[index] = flag + "=" + origin(value)
             elif index + 1 < len(argv) and isinstance(argv[index + 1], str):
                 index += 1
                 argv[index] = origin(argv[index])
