@@ -11,7 +11,10 @@ use crate::{
     storage::{Session, SessionError, Storage, StorageError, StorageEvent},
 };
 
-pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
+pub fn expired(
+    session: &Session,
+    now: DateTime<Utc>,
+) -> Result<bool, SessionError> {
     let expires_at = parse_expiry(session.expires_at())
         .ok_or_else(|| SessionError::new(
             "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again",
@@ -26,7 +29,8 @@ pub(crate) fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
     let date = text.get(..date_end)?;
     let tail = text.get(date_end..)?;
     let time_and_offset = tail.get(tail.chars().next()?.len_utf8()..)?;
-    let (time, offset) = time_and_offset.split_at(time_and_offset.find(['Z', '+', '-'])?);
+    let (time, offset) =
+        time_and_offset.split_at(time_and_offset.find(['Z', '+', '-'])?);
     let (hour, minute, second, micros) = time_parts(time)?;
     let date = iso_date(date)?;
     let local = date.and_hms_micro_opt(hour, minute, second, micros)?;
@@ -86,7 +90,11 @@ fn iso_date(text: &str) -> Option<NaiveDate> {
             ) =>
         {
             let (_, week) = text.split_once('W')?;
-            NaiveDate::from_isoywd_opt(year.parse().ok()?, week.parse().ok()?, Weekday::Mon)
+            NaiveDate::from_isoywd_opt(
+                year.parse().ok()?,
+                week.parse().ok()?,
+                Weekday::Mon,
+            )
         }
         8 if text.as_bytes().get(4) == Some(&b'W') => {
             NaiveDate::parse_from_str(text, "%GW%V%u").ok()
@@ -107,7 +115,8 @@ fn time_parts(text: &str) -> Option<(u32, u32, u32, u32)> {
         return None;
     }
     let precision = fraction.len().min(6);
-    let micros = fraction[..precision].parse::<u32>().ok()? * 10_u32.pow((6 - precision) as u32);
+    let micros = fraction[..precision].parse::<u32>().ok()?
+        * 10_u32.pow((6 - precision) as u32);
     let pair = |a: u8, b: u8| {
         (a.is_ascii_digit() && b.is_ascii_digit())
             .then(|| u32::from(a - b'0') * 10 + u32::from(b - b'0'))
@@ -141,7 +150,11 @@ impl Storage<'_> {
         Ok(session)
     }
 
-    pub fn check_active(&self, session: &Session, endpoint: &str) -> Result<(), SessionError> {
+    pub fn check_active(
+        &self,
+        session: &Session,
+        endpoint: &str,
+    ) -> Result<(), SessionError> {
         if session.endpoint() != Some(endpoint) {
             return Err(SessionError::new(
                 "Stored session belongs to another Keeper endpoint",
@@ -187,11 +200,11 @@ impl Storage<'_> {
     }
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     if !text.is_empty()
-        && text
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+        && text.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte)
+        })
     {
         text.into()
     } else {

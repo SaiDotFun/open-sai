@@ -13,8 +13,8 @@ use tempfile::Builder;
 use zeroize::Zeroizing;
 
 use super::{
-    SessionError, Storage, StorageError, StorageEvent, endpoint_origin, private_file,
-    remove_if_exists,
+    SessionError, Storage, StorageError, StorageEvent, endpoint_origin,
+    private_file, remove_if_exists,
 };
 use crate::errors::{Code, SaiError};
 
@@ -24,8 +24,10 @@ const SESSION_KEY_SEED: &[u8] = b"sai-cli keyring-backend test; not a secret";
 const VERSION: u64 = 3;
 const AAD: &[u8] = b"sai-sessions-v3";
 const V2_AAD: &[u8] = b"sai-session-v2-test";
-const SIGN_IN_AGAIN: &str = "run `sai auth import` or `sai auth login NAME` again";
-const NO_SESSION: &str = "No Sai session; run `sai auth import` or `sai auth login NAME`";
+const SIGN_IN_AGAIN: &str =
+    "run `sai auth import` or `sai auth login NAME` again";
+const NO_SESSION: &str =
+    "No Sai session; run `sai auth import` or `sai auth login NAME`";
 
 /// A stored account session. Call `summary` to display it without the token.
 #[derive(Deserialize, Serialize)]
@@ -63,7 +65,10 @@ impl Session {
             token,
             addr,
             expires_at,
-            extra: BTreeMap::from([("endpoint".to_owned(), Value::String(endpoint))]),
+            extra: BTreeMap::from([(
+                "endpoint".to_owned(),
+                Value::String(endpoint),
+            )]),
         }
     }
 
@@ -84,9 +89,9 @@ impl Session {
     }
 
     pub fn summary(&self) -> Result<SessionSummary<'_>, StorageError> {
-        let endpoint = self
-            .endpoint()
-            .ok_or_else(|| SessionError::new("Stored session is missing its Keeper endpoint"))?;
+        let endpoint = self.endpoint().ok_or_else(|| {
+            SessionError::new("Stored session is missing its Keeper endpoint")
+        })?;
         Ok(SessionSummary {
             addr: self.addr(),
             expires_at: self.expires_at(),
@@ -95,7 +100,10 @@ impl Session {
     }
 }
 
-fn serialize_token<S: Serializer>(token: &str, serializer: S) -> Result<S::Ok, S::Error> {
+fn serialize_token<S: Serializer>(
+    token: &str,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
     serializer.serialize_str(token)
 }
 
@@ -120,9 +128,9 @@ struct StoredAccounts(#[serde(with = "Accounts")] Accounts);
 
 impl Accounts {
     pub fn iter(&self) -> impl Iterator<Item = (&Session, bool)> {
-        self.sessions
-            .iter()
-            .map(|(addr, session)| (&session.0, Some(addr) == self.active.as_ref()))
+        self.sessions.iter().map(|(addr, session)| {
+            (&session.0, Some(addr) == self.active.as_ref())
+        })
     }
 
     fn find(&self, addr: &str) -> Result<String, SessionError> {
@@ -170,17 +178,22 @@ fn read_envelope(path: &Path) -> Result<Option<Value>, SessionError> {
 fn cipher() -> AesGcm<Aes256, U12> {
     // This built-in compatibility key keeps tokens out of plaintext files.
     // The private file modes control access to the store.
-    let key: Zeroizing<[u8; 32]> = Zeroizing::new(Sha256::digest(SESSION_KEY_SEED).into());
+    let key: Zeroizing<[u8; 32]> =
+        Zeroizing::new(Sha256::digest(SESSION_KEY_SEED).into());
     AesGcm::new((&*key).into())
 }
 
-fn decrypt<T: for<'de> Deserialize<'de>>(fields: &Value, aad: &[u8]) -> Result<T, SessionError> {
+fn decrypt<T: for<'de> Deserialize<'de>>(
+    fields: &Value,
+    aad: &[u8],
+) -> Result<T, SessionError> {
     let cannot_unlock = || session_error("Cannot unlock session");
     let decode = |key: &str| {
         let field = fields[key].as_str().ok_or_else(cannot_unlock)?;
         STANDARD.decode(field).map_err(|_| cannot_unlock())
     };
-    let nonce: [u8; 12] = decode("nonce")?.try_into().map_err(|_| cannot_unlock())?;
+    let nonce: [u8; 12] =
+        decode("nonce")?.try_into().map_err(|_| cannot_unlock())?;
     let mut plaintext = Zeroizing::new(decode("ciphertext")?);
     cipher()
         .decrypt_in_place(&Nonce::from(nonce), aad, &mut *plaintext)
@@ -213,7 +226,9 @@ impl Storage<'_> {
         let fields = match read_envelope(&path)? {
             Some(fields) => fields,
             None => {
-                if let Some(fields) = read_envelope(&self.trader.join(LEGACY_SESSION))? {
+                if let Some(fields) =
+                    read_envelope(&self.trader.join(LEGACY_SESSION))?
+                {
                     return Ok(load_v2(&fields)?);
                 }
                 // Another process may have published v3 and removed v2 between our reads.
@@ -241,7 +256,8 @@ impl Storage<'_> {
             .map_err(|_| cannot_save())?;
         let mut plaintext = Zeroizing::new(Vec::new());
         let mut serializer = serde_json::Serializer::new(&mut *plaintext);
-        Accounts::serialize(accounts, &mut serializer).map_err(|_| cannot_save())?;
+        Accounts::serialize(accounts, &mut serializer)
+            .map_err(|_| cannot_save())?;
         let tag = cipher()
             .encrypt_in_place_detached(&Nonce::from(nonce), AAD, &mut plaintext)
             .map_err(|_| cannot_save())?;
@@ -254,7 +270,8 @@ impl Storage<'_> {
         let mut temp = Builder::new()
             .prefix(".sessions-")
             .tempfile_in(&self.trader)?;
-        serde_json::to_writer(temp.as_file_mut(), &envelope).map_err(io::Error::other)?;
+        serde_json::to_writer(temp.as_file_mut(), &envelope)
+            .map_err(io::Error::other)?;
         temp.persist(self.trader.join(SESSIONS))
             .map_err(|error| error.error)?;
         remove_if_exists(&self.trader.join(LEGACY_SESSION))?;
@@ -291,12 +308,15 @@ impl Storage<'_> {
         Ok(())
     }
 
-    pub fn load_session(&self, addr: Option<&str>) -> Result<Session, StorageError> {
+    pub fn load_session(
+        &self,
+        addr: Option<&str>,
+    ) -> Result<Session, StorageError> {
         let mut accounts = self.load_accounts()?;
         let key = if let Some(addr) = addr {
-            accounts
-                .find(addr)
-                .map_err(|error| SessionError(SaiError::new(Code::SignedOut, error.0.message)))?
+            accounts.find(addr).map_err(|error| {
+                SessionError(SaiError::new(Code::SignedOut, error.0.message))
+            })?
         } else {
             accounts.active.take().ok_or_else(|| {
                 if accounts.sessions.is_empty() {
@@ -321,7 +341,8 @@ impl Storage<'_> {
         accounts.active = Some(key.clone());
         self.save_accounts(&accounts)?;
         drop(lock);
-        let session = accounts.sessions.remove(&key).expect("connected account").0;
+        let session =
+            accounts.sessions.remove(&key).expect("connected account").0;
         self.emit(StorageEvent::SessionActive {
             addr: session.addr(),
         });
@@ -329,7 +350,8 @@ impl Storage<'_> {
     }
 
     pub fn session_exists(&self) -> bool {
-        self.trader.join(SESSIONS).is_file() || self.trader.join(LEGACY_SESSION).is_file()
+        self.trader.join(SESSIONS).is_file()
+            || self.trader.join(LEGACY_SESSION).is_file()
     }
 
     fn remove_session_files(&self) -> io::Result<()> {
