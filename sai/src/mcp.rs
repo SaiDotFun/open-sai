@@ -1,4 +1,5 @@
 mod session;
+mod stdio;
 mod validation;
 
 use std::{
@@ -20,7 +21,6 @@ use rmcp::{
         Tool,
     },
     service::{QuitReason, RequestContext, ServerInitializeError},
-    transport::stdio,
 };
 use sai_core::{
     errors::{Code, SaiError},
@@ -128,7 +128,7 @@ impl SaiMcp {
     async fn serve_stdio(self) -> Result<(), SaiError> {
         let failure = || SaiError::new(Code::InternalError, "Sai MCP stdio session failed");
         let run = async {
-            match self.serve(stdio()).await {
+            match self.serve(stdio::Stdio::new()).await {
                 Ok(service) => match service.waiting().await {
                     Ok(QuitReason::Closed | QuitReason::Cancelled) => Ok(()),
                     _ => Err(failure()),
@@ -255,20 +255,22 @@ impl SaiMcp {
         let writer = self.writer.clone();
         let (addr, key, call_id) = (addr.to_owned(), key.map(str::to_owned), call_id.to_owned());
         let runtime = tokio::runtime::Handle::current();
+        let (_cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
         // Reconciliation combines Keeper requests with synchronous SQLite operations.
         self.ledger_work(move || {
             let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
                 .with_tool("intent_status", &call_id);
             let log_storage = |event: StorageEvent<'_>| crate::local::storage_event(events, event);
             let storage = Storage::new(&home).with_event_sink(&log_storage);
-            let data = runtime.block_on(reconcile::reconcile(
-                &endpoint,
-                &addr,
-                key.as_deref(),
-                keeper::TIMEOUT,
-                &storage,
-                events,
-            ))?;
+            let data = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = cancel => Err(SaiError::internal()),
+                    result = reconcile::reconcile(
+                        &endpoint, &addr, key.as_deref(), keeper::TIMEOUT, &storage, events,
+                    ) => result,
+                }
+            })?;
             Ok(keeper::public_intent_status(&home, &data))
         })
         .await
@@ -402,7 +404,7 @@ impl ServerHandler for SaiMcp {
     async fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<CallToolResponse, ErrorData> {
         let name = request.name.as_ref();
         let args = request.arguments.unwrap_or_default();
@@ -418,7 +420,12 @@ impl ServerHandler for SaiMcp {
         }
         let duration =
             || json!((started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64).into();
-        let result = match self.checked_call(name, tool, args, &call_id[..12]).await {
+        let call = tokio::select! {
+            biased;
+            _ = context.ct.cancelled() => return Err(stdio::cancelled()),
+            result = self.checked_call(name, tool, args, &call_id[..12]) => result,
+        };
+        let result = match call {
             Ok(value) => {
                 let error = value.get("error").and_then(Value::as_str);
                 let level = if error.is_some() {

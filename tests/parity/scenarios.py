@@ -457,6 +457,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                         expected = {**expected, "key": None}
                     if not same_variables(request.variables, expected):
                         self.reject(f"Wrong Keeper variables for {name}")
+                    elif scenario == "mcp-cancel":
+                        interrupt_ready.set()
+                        self.connection.settimeout(5)
+                        if self.rfile.read(1) == b"":
+                            interrupt_closed.set()
                     elif scenario == "interrupt-http":
                         interrupt_ready.set()
                         interrupt_closed.wait(8)

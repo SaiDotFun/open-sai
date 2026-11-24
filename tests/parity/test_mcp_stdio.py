@@ -149,3 +149,23 @@ def test_ping_during_exclusive_ledger_lock(native: Path, tmp_path: Path) -> None
         response = stdio.receive()
         assert response["id"] == 2
         assert json.loads(response["result"]["content"][0]["text"])["intents"]
+
+
+def test_cancelling_market_read_closes_keeper_connection(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("mcp-cancel") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        stdio.send("tools/call", id_=2, name="market_list", arguments={})
+        assert endpoints.interrupt_ready.wait(3), "Keeper did not receive market_list"
+        stdio.send("notifications/cancelled", requestId=2, reason="fixture")
+        assert stdio.receive() == {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {"code": 0, "message": "Request cancelled"},
+        }
+        assert endpoints.interrupt_closed.wait(3), "Keeper connection remained open"
+        stdio.send("ping", id_=3)
+        assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
