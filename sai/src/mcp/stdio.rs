@@ -1,4 +1,4 @@
-use std::{collections::HashSet, future::ready, io};
+use std::{collections::HashMap, io, sync::Arc};
 
 use rmcp::{
     ErrorData, RoleServer,
@@ -6,49 +6,80 @@ use rmcp::{
         ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorCode, JsonRpcMessage,
         RequestId, ServerJsonRpcMessage,
     },
-    transport::Transport,
+    transport::{
+        StdioReader, StdioWriter, Transport, async_rw::DEFAULT_MAX_LINE_LENGTH, stdio_pipes,
+    },
 };
 use serde_json::{Value, json};
 use tokio::{
-    io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout},
-    sync::mpsc,
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::{OwnedSemaphorePermit, Semaphore, mpsc},
     task::JoinHandle,
 };
 
+// A slot covers an admitted request through the flush of its reply.
+const MAX_IN_FLIGHT: usize = 64;
+type Outbound = (ServerJsonRpcMessage, Option<OwnedSemaphorePermit>);
+
 pub(super) struct Stdio {
-    input: BufReader<Stdin>,
+    input: BufReader<StdioReader>,
     line: Vec<u8>,
-    output: Option<mpsc::UnboundedSender<ServerJsonRpcMessage>>,
+    discarding: bool,
+    output: Option<mpsc::Sender<Outbound>>,
     writer: Option<JoinHandle<io::Result<()>>>,
-    pending: HashSet<RequestId>,
+    slots: Arc<Semaphore>,
+    overflow: Arc<Semaphore>,
+    pending: HashMap<RequestId, OwnedSemaphorePermit>,
 }
 
 impl Stdio {
     pub(super) fn new() -> Self {
-        let (output, frames) = mpsc::unbounded_channel();
-        let writer = tokio::spawn(write_frames(tokio_io::stdout(), frames));
+        let (input, stdout) = stdio_pipes();
+        let (output, frames) = mpsc::channel(MAX_IN_FLIGHT + 1);
+        let writer = tokio::spawn(write_frames(stdout, frames));
         Self {
-            input: BufReader::new(tokio_io::stdin()),
+            input: BufReader::new(input),
             line: Vec::new(),
+            discarding: false,
             output: Some(output),
             writer: Some(writer),
-            pending: HashSet::new(),
+            slots: Arc::new(Semaphore::new(MAX_IN_FLIGHT)),
+            overflow: Arc::new(Semaphore::new(1)),
+            pending: HashMap::new(),
         }
     }
 
-    fn enqueue(&self, frame: ServerJsonRpcMessage) -> io::Result<()> {
-        self.output
-            .as_ref()
-            .ok_or(io::ErrorKind::BrokenPipe)?
-            .send(frame)
-            .map_err(|_| io::ErrorKind::BrokenPipe.into())
-    }
-    fn reject_request(&self, id: RequestId) -> io::Result<()> {
-        let error = ErrorData::invalid_params("Invalid request parameters", Some(json!("")));
-        self.enqueue(ServerJsonRpcMessage::error(error, Some(id)))
+    async fn read_frame(&mut self) -> io::Result<Option<Frame>> {
+        loop {
+            // Store buffered bytes and discard state on the transport so a
+            // cancelled select in rmcp cannot lose part of a frame.
+            let input = self.input.fill_buf().await?;
+            if input.is_empty() {
+                return Ok((!self.line.is_empty()).then_some(Frame::Complete));
+            }
+            let newline = input.iter().position(|byte| *byte == b'\n');
+            let length = newline.unwrap_or(input.len());
+            let consumed = length + usize::from(newline.is_some());
+            if self.discarding {
+                self.discarding = newline.is_none();
+                self.input.consume(consumed);
+                continue;
+            }
+            if self.line.len() + length > DEFAULT_MAX_LINE_LENGTH {
+                self.line = Vec::new();
+                self.discarding = newline.is_none();
+                self.input.consume(consumed);
+                return Ok(Some(Frame::Oversized));
+            }
+            self.line.extend_from_slice(&input[..length]);
+            self.input.consume(consumed);
+            if newline.is_some() {
+                return Ok(Some(Frame::Complete));
+            }
+        }
     }
 
-    fn report_invalid_frame(&self) -> io::Result<()> {
+    fn invalid_frame_reply(&self) -> ServerJsonRpcMessage {
         match serde_json::from_slice::<Value>(&self.line) {
             Ok(value) => {
                 if value["jsonrpc"] == "2.0"
@@ -56,10 +87,9 @@ impl Stdio {
                     && (value["params"].is_null() || value["params"].is_object())
                     && let Ok(id) = serde_json::from_value(value["id"].clone())
                 {
-                    return self.reject_request(id);
+                    return invalid_params(id);
                 }
                 eprintln!("Invalid MCP JSON-RPC envelope");
-                self.enqueue(parse_diagnostic())
             }
             Err(error) => {
                 eprintln!(
@@ -67,10 +97,20 @@ impl Stdio {
                     error.line(),
                     error.column()
                 );
-                self.enqueue(parse_diagnostic())
             }
         }
+        parse_diagnostic()
     }
+}
+
+enum Frame {
+    Complete,
+    Oversized,
+}
+
+fn invalid_params(id: RequestId) -> ServerJsonRpcMessage {
+    let error = ErrorData::invalid_params("Invalid request parameters", Some(json!("")));
+    ServerJsonRpcMessage::error(error, Some(id))
 }
 
 // The pinned Python server uses the legacy MCP logging notification on parse errors.
@@ -100,54 +140,87 @@ impl Transport<RoleServer> for Stdio {
             JsonRpcMessage::Error(error) => error.id.as_ref(),
             _ => None,
         };
-        if let Some(id) = id {
-            self.pending.remove(id);
+        let slot = id.and_then(|id| self.pending.remove(id));
+        let output = self.output.clone();
+        async move {
+            output
+                .ok_or(io::ErrorKind::BrokenPipe)?
+                .send((frame, slot))
+                .await
+                .map_err(|_| io::ErrorKind::BrokenPipe.into())
         }
-        ready(self.enqueue(frame))
     }
 
     async fn receive(&mut self) -> Option<ClientJsonRpcMessage> {
+        let output = self.output.as_ref()?.clone();
         loop {
-            // Keep the partial frame across rmcp's select loops.
-            if self.input.read_until(b'\n', &mut self.line).await.ok()? == 0 && self.line.is_empty()
-            {
-                return None;
-            }
-            let frame = serde_json::from_slice::<ClientJsonRpcMessage>(&self.line);
-            let frame = match frame {
-                Ok(JsonRpcMessage::Request(request))
-                    if matches!(request.request, ClientRequest::CustomRequest(_)) =>
-                {
-                    self.reject_request(request.id).ok()?;
-                    None
+            // Leave one slot to read a cancellation when all handlers are
+            // busy. An excess request gets one bounded reply on that slot.
+            let (mut slot, mut overloaded) = match Arc::clone(&self.slots).try_acquire_owned() {
+                Ok(slot) => (slot, false),
+                Err(_) => tokio::select! {
+                    biased;
+                    _ = output.closed() => return None,
+                    slot = Arc::clone(&self.slots).acquire_owned() => (slot.ok()?, false),
+                    slot = Arc::clone(&self.overflow).acquire_owned() => (slot.ok()?, true),
+                },
+            };
+            let kind = tokio::select! {
+                _ = output.closed() => return None,
+                kind = self.read_frame() => kind.ok()??,
+            };
+            let frame = match kind {
+                Frame::Oversized => {
+                    eprintln!("MCP input frame exceeds {DEFAULT_MAX_LINE_LENGTH} bytes");
+                    Err(parse_diagnostic())
                 }
-                Ok(frame) => Some(frame),
-                Err(_) => {
-                    self.report_invalid_frame().ok()?;
-                    None
-                }
+                Frame::Complete => serde_json::from_slice::<ClientJsonRpcMessage>(&self.line)
+                    .map_err(|_| self.invalid_frame_reply()),
             };
             self.line.clear();
-            let Some(frame) = frame else { continue };
-            match &frame {
-                JsonRpcMessage::Request(request) => {
-                    self.pending.insert(request.id.clone());
-                }
-                JsonRpcMessage::Notification(notification) => {
-                    if let ClientNotification::CancelledNotification(cancel) =
-                        &notification.notification
-                        && let Some(id) = &cancel.params.request_id
-                        && self.pending.remove(id)
-                    {
-                        // rmcp cancels the handler's token and drops its reply.
-                        // Python also sends a cancellation error on the original ID.
-                        self.enqueue(ServerJsonRpcMessage::error(cancelled(), Some(id.clone())))
-                            .ok()?;
-                    }
-                }
-                _ => {}
+            if overloaded && let Ok(available) = Arc::clone(&self.slots).try_acquire_owned() {
+                slot = available;
+                overloaded = false;
             }
-            return Some(frame);
+            match frame {
+                Err(reply) => output.try_send((reply, Some(slot))).ok()?,
+                Ok(JsonRpcMessage::Request(request))
+                    if matches!(request.request, ClientRequest::CustomRequest(_))
+                        || self.pending.contains_key(&request.id) =>
+                {
+                    output
+                        .try_send((invalid_params(request.id), Some(slot)))
+                        .ok()?;
+                }
+                Ok(JsonRpcMessage::Request(request)) if overloaded => {
+                    let error =
+                        ErrorData::new(ErrorCode(-32000), "Too many pending requests", None);
+                    let reply = ServerJsonRpcMessage::error(error, Some(request.id));
+                    output.try_send((reply, Some(slot))).ok()?;
+                }
+                Ok(frame) => {
+                    match &frame {
+                        JsonRpcMessage::Request(request) => {
+                            self.pending.insert(request.id.clone(), slot);
+                        }
+                        JsonRpcMessage::Notification(notification) => {
+                            if let ClientNotification::CancelledNotification(cancel) =
+                                &notification.notification
+                                && let Some(id) = &cancel.params.request_id
+                                && let Some(slot) = self.pending.remove(id)
+                            {
+                                // rmcp stops the handler and drops its reply.
+                                // Python also replies on the original ID.
+                                let reply =
+                                    ServerJsonRpcMessage::error(cancelled(), Some(id.clone()));
+                                output.try_send((reply, Some(slot))).ok()?;
+                            }
+                        }
+                        _ => {}
+                    }
+                    return Some(frame);
+                }
+            }
         }
     }
 
@@ -161,10 +234,10 @@ impl Transport<RoleServer> for Stdio {
 }
 
 async fn write_frames(
-    mut output: Stdout,
-    mut frames: mpsc::UnboundedReceiver<ServerJsonRpcMessage>,
+    mut output: StdioWriter,
+    mut frames: mpsc::Receiver<Outbound>,
 ) -> io::Result<()> {
-    while let Some(frame) = frames.recv().await {
+    while let Some((frame, _slot)) = frames.recv().await {
         let mut bytes = serde_json::to_vec(&frame)?;
         bytes.push(b'\n');
         output.write_all(&bytes).await?;

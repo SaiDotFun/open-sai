@@ -9,6 +9,7 @@ import shutil
 import signal
 import sqlite3
 import subprocess
+import sys
 import time
 from collections.abc import Iterator
 from contextlib import closing, contextmanager
@@ -167,6 +168,31 @@ def test_cancelling_market_read_closes_keeper_connection(
         assert endpoints.interrupt_closed.wait(3), "Keeper connection remained open"
         stdio.send("ping", id_=3)
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+def test_cancellation_is_admitted_while_request_slots_are_full(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("mcp-cancel") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        stdio.send("tools/call", id_=2, name="market_list", arguments={})
+        assert endpoints.interrupt_ready.wait(3), "Keeper did not receive market_list"
+        for id_ in range(3, 66):
+            stdio.send("tools/call", id_=id_, name="market_list", arguments={})
+        stdio.send("ping", id_=66)
+        assert stdio.receive() == {
+            "jsonrpc": "2.0",
+            "id": 66,
+            "error": {"code": -32000, "message": "Too many pending requests"},
+        }
+        stdio.send("notifications/cancelled", requestId=2)
+        assert stdio.receive() == {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "error": {"code": 0, "message": "Request cancelled"},
+        }
 
 
 @pytest.mark.parametrize("use_python", [False, True], ids=["native", "python"])
@@ -412,3 +438,71 @@ def test_invalid_envelope_reports_diagnostic(
         }
         stdio.send("ping", id_=3)
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+def test_oversized_partial_frame_is_diagnosed_before_newline(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        assert stdio.proc.stdin is not None
+        stdio.proc.stdin.write(b" " * (16 * 1024 * 1024 + 1))
+        stdio.proc.stdin.flush()
+        diagnostic = stdio.receive()
+        assert diagnostic["method"] == "notifications/message"
+        assert diagnostic["params"] == {
+            "level": "error",
+            "logger": "mcp.server.exception_handler",
+            "data": "Internal Server Error",
+        }
+        stdio.write(b"")
+        stdio.send("ping", id_=3)
+        assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Sets Linux pipe size")
+def test_paused_stdout_applies_backpressure(native: Path, tmp_path: Path) -> None:
+    import fcntl
+
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        assert stdio.proc.stdin is not None
+        assert stdio.proc.stdout is not None
+        stdin = stdio.proc.stdin.fileno()
+        fcntl.fcntl(stdin, fcntl.F_SETPIPE_SZ, 4096)
+        fcntl.fcntl(stdio.proc.stdout.fileno(), fcntl.F_SETPIPE_SZ, 4096)
+        stdio.send("tools/list", id_=2)
+        assert select.select([stdio.proc.stdout], [], [], 3)[0]
+        os.set_blocking(stdin, False)
+        pending = memoryview(
+            b"".join(
+                json.dumps(
+                    {"jsonrpc": "2.0", "id": id_, "method": "tools/list"}
+                ).encode()
+                + b"\n"
+                for id_ in range(3, 1500)
+            )
+        )
+        while pending:
+            if not select.select([], [stdin], [], 1)[1]:
+                break
+            pending = pending[os.write(stdin, pending[:4096]) :]
+        assert pending, "Server consumed all requests with the output pipe blocked"
+        assert stdio.receive()["result"]["tools"]
+
+
+def test_stdout_failure_ends_session_with_stdin_open(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        assert stdio.proc.stdout is not None
+        stdio.proc.stdout.close()
+        stdio.send("ping", id_=2)
+        stdio.proc.wait(timeout=3)
