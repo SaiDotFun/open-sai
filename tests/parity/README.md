@@ -81,11 +81,11 @@ tool name.
 The `SAI_HOME` snapshot compares relative paths, file types, modes, and
 contents. It parses TOML values and checks that edits preserve the existing
 config text outside the edited value, including its inline comment. It
-authenticates and decrypts session envelopes. It reads SQLite schema SQL,
-indexes, user version, columns, and typed rows from a copy with its journal
-files. SQL whitespace, comments, and unquoted ASCII case may vary. Column
-types, constraints, literal values, and table options such as `WITHOUT ROWID`
-are compared. SQLite row order and physical page layout may vary.
+authenticates and decrypts session envelopes. It reads SQLite's parsed column
+types, defaults, nullability, primary keys, foreign keys, table options, and
+index metadata from a copy with its journal files. The snapshot also compares
+the user version and typed rows. Formatting of the CREATE statements, row
+order, and physical page layout may vary.
 The runner parses `update.json` as JSON and compares other files byte for
 byte. The report names differing paths and fields.
 

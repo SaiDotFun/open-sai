@@ -79,17 +79,20 @@ def test_snapshot_reports_mode_and_semantic_config_changes(tmp_path: Path) -> No
 
 def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> None:
     compact = (
-        "CREATE TABLE intents (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'waiting now');"
-        "CREATE INDEX by_status ON intents(status) WHERE status != 'waiting  now';"
+        "CREATE TABLE account (id INTEGER PRIMARY KEY);"
+        "CREATE TABLE intents (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'waiting now',"
+        " owner INTEGER REFERENCES account(id) ON DELETE CASCADE);"
+        "CREATE INDEX by_status ON intents(status);"
     )
     formatted = """
+        CREATE TABLE account (id INTEGER PRIMARY KEY);
         CREATE TABLE intents (
             id text PRIMARY KEY,
-            status text NOT NULL DEFAULT 'waiting now' /* keep the default */
+            status text NOT NULL DEFAULT 'waiting now' /* keep the default */,
+            owner INTEGER REFERENCES account (id) ON DELETE CASCADE
         );
         CREATE INDEX by_status
-            ON intents (status)
-            WHERE status != 'waiting  now';
+            ON intents (status);
     """
 
     def read(name: str, schema: str) -> dict:
@@ -97,7 +100,7 @@ def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> 
         with sqlite3.connect(path) as db:
             db.executescript(schema)
             db.execute("PRAGMA user_version = 1")
-            db.execute("INSERT INTO intents (id) VALUES ('saved')")
+            db.execute("INSERT INTO intents (id, status) VALUES ('saved', 'pending')")
         return ledger(path, Normalize(tmp_path))
 
     reference = read("reference.sqlite3", compact)
@@ -105,17 +108,27 @@ def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> 
         first_difference(reference, read("format.sqlite3", formatted), "ledger") is None
     )
     mutations = {
-        "literal": compact.replace("waiting  now", "waiting now"),
+        "literal": compact.replace("waiting now", "waiting  now"),
         "type": compact.replace("status TEXT", "status NUMERIC"),
         "constraint": compact.replace("NOT NULL ", ""),
         "rowid": compact.replace(");CREATE INDEX", ") WITHOUT ROWID;CREATE INDEX"),
         "index": compact.replace("CREATE INDEX", "CREATE UNIQUE INDEX"),
+        "index-order": compact.replace("intents(status)", "intents(status DESC)"),
+        "foreign-key": compact.replace("ON DELETE CASCADE", "ON DELETE RESTRICT"),
     }
     for name, schema in mutations.items():
         difference = first_difference(
             reference, read(f"{name}.sqlite3", schema), "ledger"
         )
         assert difference is not None and difference.startswith("ledger.schema"), name
+
+    nullable = read(
+        "nonbreaking-space.sqlite3", compact.replace("NOT NULL", "NOT\u00a0NULL")
+    )
+    assert reference["tables"] == nullable["tables"]
+    assert first_difference(reference, nullable, "ledger") == (
+        "ledger.schema.tables.intents.columns[1].notnull"
+    )
 
 
 def log_snapshot(

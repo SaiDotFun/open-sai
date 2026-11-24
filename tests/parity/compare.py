@@ -28,14 +28,6 @@ SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
-SQL_TOKEN = re.compile(
-    r"(?P<trivia>\s+|--[^\r\n]*|/\*[\s\S]*?\*/)"
-    r"""|(?P<quoted>[xX]?'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])"""
-    r"|(?P<number>0[xX][0-9A-Fa-f]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
-    r"|(?P<word>[^\W\d][\w$]*)"
-    r"|->>|->|<=|>=|<>|!=|==|\|\||<<|>>|.",
-    re.DOTALL,
-)
 
 
 class InvalidReservationTime(ValueError):
@@ -44,20 +36,6 @@ class InvalidReservationTime(ValueError):
 
 class InvalidLogTime(ValueError):
     """An event timestamp is outside the observation window."""
-
-
-def schema_tokens(sql: str | None) -> list[str] | None:
-    if sql is None:
-        return None
-    # SQLite stores source DDL. Ignore trivia and ASCII identifier casing,
-    # retaining literal and quoted token contents, operators, and clause order.
-    return [
-        match[0].upper()
-        if match.lastgroup == "word" and match[0].isascii()
-        else match[0]
-        for match in SQL_TOKEN.finditer(sql)
-        if match.lastgroup != "trivia"
-    ]
 
 
 def config_text(text: str, edited_key: str) -> str:
@@ -354,6 +332,59 @@ def paths(root: Path) -> Iterator[Path]:
             yield from paths(child)
 
 
+def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    tables = {}
+    for name, kind, without_rowid, strict in conn.execute(
+        "SELECT name, type, wr, strict FROM pragma_table_list"
+        " WHERE schema = 'main' AND name != 'sqlite_schema' ORDER BY name"
+    ):
+        # The PRAGMA reports parsed defaults, nullability, PK order, and
+        # hidden or generated columns, including when the table is empty.
+        columns = [
+            {
+                "cid": cid,
+                "name": column,
+                "type": datatype.upper() if datatype.isascii() else datatype,
+                "notnull": notnull,
+                "default": default,
+                "pk": primary_key,
+                "hidden": hidden,
+            }
+            for cid, column, datatype, notnull, default, primary_key, hidden in conn.execute(
+                "SELECT * FROM pragma_table_xinfo(?) ORDER BY cid", (name,)
+            )
+        ]
+        indexes = {}
+        for index, unique, origin, partial in conn.execute(
+            'SELECT name, "unique", origin, partial FROM pragma_index_list(?) ORDER BY name',
+            (name,),
+        ):
+            indexes[index] = {
+                "unique": unique,
+                "origin": origin,
+                "partial": partial,
+                "columns": conn.execute(
+                    "SELECT * FROM pragma_index_xinfo(?) ORDER BY seqno", (index,)
+                ).fetchall(),
+            }
+        tables[name] = {
+            "type": kind,
+            "without_rowid": without_rowid,
+            "strict": strict,
+            "columns": columns,
+            "indexes": indexes,
+            "foreign_keys": conn.execute(
+                "SELECT * FROM pragma_foreign_key_list(?) ORDER BY id, seq", (name,)
+            ).fetchall(),
+        }
+    return {
+        "tables": tables,
+        "objects": conn.execute(
+            "SELECT type, name, tbl_name FROM sqlite_schema ORDER BY type, name"
+        ).fetchall(),
+    }
+
+
 def ledger(path: Path, normalize: Normalize) -> dict[str, Any]:
     # Read a copy so SQLite can recover or checkpoint a journal without
     # touching either CLI's captured tree.
@@ -367,25 +398,13 @@ def ledger(path: Path, normalize: Normalize) -> dict[str, Any]:
         conn = sqlite3.connect(copy)
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            schema = list(
-                conn.execute(
-                    "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name"
-                )
-            )
+            schema = sqlite_schema(conn)
             result: dict[str, Any] = {
                 "user_version": version,
-                "schema": [
-                    {
-                        "type": kind,
-                        "name": name,
-                        "table": table,
-                        "sql": schema_tokens(sql),
-                    }
-                    for kind, name, table, sql in schema
-                ],
+                "schema": schema,
                 "tables": {},
             }
-            for kind, name, _, _ in schema:
+            for kind, name, _ in schema["objects"]:
                 if kind != "table":
                     continue
                 quoted = name.replace('"', '""')
