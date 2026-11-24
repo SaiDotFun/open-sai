@@ -401,32 +401,30 @@ def test_margin_quote_uses_exact_contract_integer_math():
     effective = Decimal(10)
     assert (
         margin.margin_quote(
-            raw, funds, market, "add", "10", effective_leverage=effective
+            raw, funds, market, "add", 10_000_000, effective_leverage=effective
         )["requestedLeverage"]
         == "5"
     )
     assert (
         margin.margin_quote(
-            raw, funds, market, "remove", "5", effective_leverage=effective
+            raw, funds, market, "remove", 5_000_000, effective_leverage=effective
         )["requestedLeverage"]
         == "20"
     )
     with pytest.raises(ValueError, match="six decimal"):
-        margin.margin_quote(
-            raw, funds, market, "add", "0.0000001", effective_leverage=effective
-        )
+        margin.margin_amount_usdc("0.0000001")
     with pytest.raises(ValueError, match="Insufficient"):
         margin.margin_quote(
             raw,
             {"available_to_trade": "1"},
             market,
             "add",
-            "1",
+            1_000_000,
             effective_leverage=effective,
         )
     with pytest.raises(ValueError, match="Keep some margin"):
         margin.margin_quote(
-            raw, funds, market, "remove", "10", effective_leverage=effective
+            raw, funds, market, "remove", 10_000_000, effective_leverage=effective
         )
 
 
@@ -462,7 +460,7 @@ def test_margin_rounding_vectors(
         {"available_to_trade": "9000000"},
         {"minLeverage": 1, "maxLeverage": 100},
         direction,
-        amount,
+        margin.margin_amount_usdc(amount),
         effective_leverage=Decimal(leverage),
     )
     assert quote["requestedLeverage"] == result

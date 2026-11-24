@@ -427,6 +427,7 @@ def change_margin(
     The amount is a quote, not a cap. Before submitting, a second snapshot
     must match the first, or the change is refused for review.
     """
+    delta = margin.margin_amount_usdc(amount)
     active = get_session()
     addr = active["evmAddress"]
 
@@ -440,7 +441,7 @@ def change_margin(
             state.funds,
             state.market,
             direction,
-            amount,
+            delta,
             effective_leverage=leverage,
         )
         return (

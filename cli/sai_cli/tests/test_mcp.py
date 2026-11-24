@@ -16,6 +16,7 @@ from typing import Any, TextIO
 
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import KeeperHandler, keeper_server
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
@@ -740,6 +741,29 @@ def test_trade_tool_integer_positions_reject_coercion(mcp, malformed):
 def test_trade_tool_accepts_a_plain_digit_string(mcp):
     preview = invoke(mcp, "preview_close", {"trade_id": "007"})
     assert preview["intent"]["target"]["userTradeId"] == "7"
+
+
+@pytest.mark.parametrize("amount", ["٣", "3_0", " 30 ", "0.0000001", "0"])
+def test_preview_margin_validates_amount_before_keeper(monkeypatch, amount):
+    requests = []
+
+    class Keeper(KeeperHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            self.send_error(503)
+
+    with keeper_server(Keeper) as base:
+        endpoint = f"{base}/query"
+        monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        storage.save_session(stored_session(endpoint=endpoint))
+        error = invoke(
+            server.create_server(),
+            "preview_margin",
+            {"trade_id": 7, "direction": "add", "amount": amount},
+        )
+    assert error["code"] == "INVALID_REQUEST"
+    assert "Margin amount" in error["error"]
+    assert requests == []
 
 
 @pytest.mark.parametrize(("name", "arguments"), PREVIEWS)
