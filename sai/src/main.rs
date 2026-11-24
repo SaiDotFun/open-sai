@@ -1,5 +1,6 @@
 mod config;
 mod local;
+mod skill;
 
 use std::{env, path::Path, process, time::Instant};
 
@@ -20,6 +21,7 @@ use local::{AuthCommand, IntentCommand};
     version,
     about,
     disable_help_subcommand = true,
+    after_help = "Use --skill to print the bundled agent skill and exit.",
     args_override_self = true
 )]
 struct Cli {
@@ -63,6 +65,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Read, locate, and install the bundled agent skill.
+    Skill {
+        #[command(subcommand)]
+        command: skill::SkillCommand,
+    },
 }
 
 fn main() -> process::ExitCode {
@@ -76,8 +83,11 @@ fn main() -> process::ExitCode {
     let environment = Environment::from_process();
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
+    if eager_skill(&argv) {
+        return (complete(skill::show(None), "skill show", requested_json, home).0 as u8).into();
+    }
     let started = Instant::now();
-    let writer = if command == "logs"
+    let writer = if matches!(command, "logs" | "skill show")
         || argv
             .iter()
             .any(|flag| matches!(flag.as_str(), "--help" | "--version" | "--skill"))
@@ -142,6 +152,7 @@ fn main() -> process::ExitCode {
                             local::intent(command, &flags, env, json, events)
                         }
                         Command::Config { command } => command.run(&flags, env, json),
+                        Command::Skill { command } => command.run(json),
                     }
                 });
             complete(result, command, json, home)
@@ -149,6 +160,22 @@ fn main() -> process::ExitCode {
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
     finish(writer, command_field(), started, outcome)
+}
+
+fn eager_skill(argv: &[String]) -> bool {
+    let mut args = argv.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--skill" => return true,
+            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => {
+                args.next();
+            }
+            "--help" | "--version" | "--" => break,
+            arg if !arg.starts_with('-') => break,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn json_requested(args: &[String]) -> bool {
@@ -222,6 +249,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" => "",
+        "skill show" | "skill source" | "skill install" => "",
         "intent status" | "intent local" | "auth use" => " ADDR",
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -298,10 +326,11 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return ("logs", &[]),
-            "config" | "auth" | "intent" => {
+            "config" | "auth" | "intent" | "skill" => {
                 let group = match arg.as_str() {
                     "auth" => "auth",
                     "intent" => "intent",
+                    "skill" => "skill",
                     _ => "config",
                 };
                 let Some((index, leaf)) = args
@@ -323,6 +352,9 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("auth", "logout") => "auth logout",
                     ("intent", "local") => "intent local",
                     ("intent", "status") => "intent status",
+                    ("skill", "show") => "skill show",
+                    ("skill", "source") => "skill source",
+                    ("skill", "install") => "skill install",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);
@@ -413,7 +445,12 @@ fn print_parse_error(
     json: bool,
     home: Option<&Path>,
 ) -> (ExitCode, Option<SaiError>) {
-    let help = || config::help(command).or_else(|| local::intent_help(command));
+    let help = || {
+        skill::help(command)
+            .map(str::to_owned)
+            .or_else(|| config::help(command))
+            .or_else(|| local::intent_help(command))
+    };
     match error.kind() {
         ErrorKind::DisplayHelp => {
             if let Some(help) = help() {
@@ -428,6 +465,11 @@ fn print_parse_error(
             return (ExitCode::Ok, None);
         }
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
+            if command == "skill"
+                && let Some(help) = help()
+            {
+                return complete(Err(SaiError::usage(help)), command, json, home);
+            }
             if matches!(command, "config" | "intent")
                 && let Some(help) = help()
             {

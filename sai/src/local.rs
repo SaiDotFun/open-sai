@@ -253,7 +253,7 @@ impl Formatter for InlineJson {
     }
 }
 
-fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
+pub fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     let mut bytes = Vec::new();
     if json {
         value.serialize(&mut serde_json::Serializer::with_formatter(
