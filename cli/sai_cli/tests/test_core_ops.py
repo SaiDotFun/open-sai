@@ -361,7 +361,7 @@ def snapshots(monkeypatch, *collaterals: str) -> Iterator[margin.PositionSnapsho
             },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
-            "test-contract",
+            {"chainId": "test-1", "contractAddress": "test-contract"},
         )
         for amount in collaterals
     )

@@ -22,14 +22,14 @@ pub(super) fn add_roots(roots: &mut RootCertStore, dir: &Path) {
     }
     for (hash, entries) in groups {
         for (expected, (index, path)) in entries.into_iter().enumerate() {
-            if expected != index || !path.is_file() {
+            if expected != index {
                 break;
             }
-            let Ok(certs) = CertificateDer::pem_file_iter(path) else {
+            let Ok(file) = crate::files::open_regular(&path) else {
                 break;
             };
             let mut loaded = false;
-            for cert in certs.flatten() {
+            for cert in CertificateDer::pem_reader_iter(file).flatten() {
                 loaded = true;
                 if subject_hash(&cert) == Some(hash) {
                     let _ = roots.add(cert);

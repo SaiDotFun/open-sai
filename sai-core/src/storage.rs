@@ -4,7 +4,7 @@ use std::{
     net::Ipv6Addr,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use thiserror::Error;
@@ -29,6 +29,8 @@ pub enum StorageError {
     UncertainIntent(String),
     #[error("{0}")]
     Session(#[from] SessionError),
+    #[error("{0}")]
+    SessionData(#[source] SessionError),
 }
 
 #[derive(Debug, Error)]
@@ -50,7 +52,7 @@ impl From<SessionError> for SaiError {
 impl From<StorageError> for SaiError {
     fn from(error: StorageError) -> Self {
         match error {
-            StorageError::Session(error) => error.into(),
+            StorageError::Session(error) | StorageError::SessionData(error) => error.into(),
             StorageError::NewerLedger | StorageError::UncertainIntent(_) => {
                 Self::new(Code::InvalidRequest, error.to_string())
             }
@@ -63,6 +65,7 @@ impl From<StorageError> for SaiError {
 pub struct Storage<'a> {
     pub(crate) trader: PathBuf,
     busy_timeout: Duration,
+    ledger_deadline: Option<Instant>,
     events: Option<&'a (dyn Fn(StorageEvent<'_>) + Sync)>,
 }
 
@@ -105,7 +108,7 @@ pub enum StorageEvent<'a> {
 }
 
 /// Project a stored endpoint onto the same fields as Python's log.origin.
-fn endpoint_origin(endpoint: &str) -> String {
+pub(crate) fn endpoint_origin(endpoint: &str) -> String {
     fn origin(endpoint: &str) -> Option<String> {
         let normalized = endpoint.trim().replace(['\t', '\n', '\r'], "");
         let (scheme, rest) = normalized.split_once("://")?;
@@ -161,6 +164,7 @@ impl<'a> Storage<'a> {
         Self {
             trader: sai_home.as_ref().join("trader"),
             busy_timeout: Duration::from_secs(10),
+            ledger_deadline: None,
             events: None,
         }
     }
@@ -169,6 +173,23 @@ impl<'a> Storage<'a> {
     pub fn with_busy_timeout(mut self, timeout: Duration) -> Self {
         self.busy_timeout = timeout;
         self
+    }
+
+    /// Bound ledger writes during one doctor reconciliation run.
+    pub fn with_ledger_deadline(mut self, deadline: Instant) -> Self {
+        self.ledger_deadline = Some(deadline);
+        self
+    }
+
+    fn remaining_busy_timeout(&self) -> io::Result<Duration> {
+        match self.ledger_deadline {
+            Some(end) => end
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .map(|remaining| self.busy_timeout.min(remaining))
+                .ok_or_else(|| io::ErrorKind::TimedOut.into()),
+            None => Ok(self.busy_timeout),
+        }
     }
 
     pub fn with_event_sink(mut self, sink: &'a (dyn Fn(StorageEvent<'_>) + Sync)) -> Self {
