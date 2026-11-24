@@ -8,15 +8,18 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import tomlkit
 from cryptography.exceptions import InvalidTag
 from sai_cli.core import storage
+from tomlkit.items import Item
 
 VERSION = re.compile(r"v?\d+\.\d+\.\d+(?:[-+][\w.+-]+)?")
 LOG_FILE = re.compile(r"logs/(?P<surface>[a-z]+)-(?P<day>\d{4}-\d{2}-\d{2})\.jsonl")
@@ -24,6 +27,30 @@ LEDGER = "trader/intents.sqlite3"
 SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
+TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
+
+
+class InvalidReservationTime(ValueError):
+    """The ledger clock cannot be normalized."""
+
+
+def config_text(text: str, edited_key: str) -> str:
+    """Keep the original text except for the edited scalar assignment."""
+    section, key = edited_key.split(".", 1)
+    assignment = re.compile(rf"\s*(?:#\s*)?({re.escape(key)}\s*=.+)")
+    table = ""
+    lines = text.splitlines(keepends=True)
+    for i, line in enumerate(lines):
+        if header := TOML_TABLE.fullmatch(line.rstrip("\r\n")):
+            table = header[1].strip()
+        if table == section and (match := assignment.fullmatch(line.rstrip("\r\n"))):
+            item = tomlkit.parse(match[1]).item(key)
+            if not isinstance(item, Item):
+                raise ValueError("Expected a scalar key in config.toml")
+            lines[i] = f"<edited key>{item.trivia.comment}\n"
+            break
+    return "".join(lines)
+
 
 # Can be supplied to Normalize from docs/log-events.json once the registry
 # defines its format. Values select a normalization rule, never a deletion.
@@ -69,22 +96,13 @@ class Normalize:
         log_fields: Mapping[str, str] = LOG_VOLATILE_FIELDS,
         *,
         concurrent: bool = False,
+        started_at: float | None = None,
     ):
         self.home = str(home)
         self.log_fields = log_fields
         self.concurrent = concurrent
         self.ids: dict[str, dict[int | str, str]] = {}
-        self.first_log_day: date | None = None
-
-    def log_name(self, name: str) -> str:
-        match = LOG_FILE.fullmatch(name)
-        if match is None:
-            return name
-        day = date.fromisoformat(match["day"])
-        if self.first_log_day is None:
-            self.first_log_day = day
-        offset = (day - self.first_log_day).days
-        return f"logs/{match['surface']}-<day {offset}>.jsonl"
+        self.started_at = started_at
 
     def identity(self, kind: str, value: int | str) -> str:
         existing = self.ids.setdefault(kind, {})
@@ -239,12 +257,16 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         and isinstance(value, dict)
         and isinstance(value.get("files"), list)
     ):
-        value["files"] = [
-            normalize.log_name(f"logs/{name}").removeprefix("logs/")
-            if isinstance(name, str)
-            else name
-            for name in value["files"]
-        ]
+        # A UTC midnight split may add a second dated file for one surface.
+        value["files"] = list(
+            dict.fromkeys(
+                f"{match['surface']}.jsonl"
+                if isinstance(name, str)
+                and (match := LOG_FILE.fullmatch(f"logs/{name}"))
+                else name
+                for name in value["files"]
+            )
+        )
     if command == "update" and isinstance(value, dict):
         replace_if(value, "installed", is_version)
     return value
@@ -303,29 +325,57 @@ def ledger(path: Path, normalize: Normalize) -> dict[str, Any]:
         conn = sqlite3.connect(copy)
         try:
             version = conn.execute("PRAGMA user_version").fetchone()[0]
-            tables = conn.execute(
-                "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name"
+            schema = list(
+                conn.execute(
+                    "SELECT type, name, tbl_name, sql FROM sqlite_schema ORDER BY type, name"
+                )
             )
-            result: dict[str, Any] = {"user_version": version, "tables": {}}
-            for (name,) in tables:
+            result: dict[str, Any] = {
+                "user_version": version,
+                "schema": [
+                    {"type": kind, "name": name, "table": table, "sql": sql}
+                    for kind, name, table, sql in schema
+                ],
+                "tables": {},
+            }
+            for kind, name, _, _ in schema:
+                if kind != "table":
+                    continue
                 quoted = name.replace('"', '""')
                 snapshot = conn.execute(f'SELECT * FROM "{quoted}"')
                 columns = [item[0] for item in snapshot.description]
-                rows = []
+                rows: list[tuple[dict[str, Any], dict[str, str]]] = []
                 for values in snapshot:
                     row = normalize.paths(dict(zip(columns, values, strict=True)))
+                    types = dict(
+                        zip(
+                            columns,
+                            (type(value).__name__ for value in values),
+                            strict=True,
+                        )
+                    )
                     if (
                         name == "intents"
                         and isinstance(row.get("id"), str)
                         and INTENT_ID.fullmatch(row["id"])
                     ):
                         row["id"] = normalize.intent_refs(row["id"])
-                        if type(row.get("created_at")) in (float, int):
-                            row["created_at"] = "<created_at>"
-                    rows.append(row)
+                        created_at = row.get("created_at")
+                        if (
+                            type(created_at) is not float
+                            or normalize.started_at is None
+                            or not normalize.started_at <= created_at <= time.time()
+                        ):
+                            raise InvalidReservationTime(
+                                "Ledger created_at must be a REAL Unix timestamp in seconds during the invocation"
+                            )
+                        row["created_at"] = "<created_at>"
+                    rows.append((row, types))
+                rows.sort(key=repr)
                 result["tables"][name] = {
                     "columns": sorted(columns),
-                    "rows": sorted(rows, key=repr),
+                    "rows": [row for row, _ in rows],
+                    "row_types": [types for _, types in rows],
                 }
             return result
         finally:
@@ -356,26 +406,30 @@ def content(path: Path, name: str, normalize: Normalize) -> Any:
         value = normalize.paths(json.loads(path.read_text(encoding="utf-8")))
         replace_if(value, "checkedAt", timestamp)
         return value
-    if match := LOG_FILE.fullmatch(name):
-        records = [
-            json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
-        ]
-        for event in records:
-            stamp = event.get("ts") if isinstance(event, dict) else None
-            if (
-                not isinstance(stamp, str)
-                or not timestamp(stamp)
-                or not stamp.startswith(match["day"])
-            ):
-                raise ValueError("Log timestamp does not match its filename")
-        return normalize.log_records(records)
     return path.read_bytes()
+
+
+def read_log(path: Path, day: str) -> list[dict[str, Any]]:
+    records = [
+        json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()
+    ]
+    for event in records:
+        stamp = event.get("ts") if isinstance(event, dict) else None
+        if (
+            not isinstance(stamp, str)
+            or not timestamp(stamp)
+            or datetime.fromisoformat(stamp).astimezone(UTC).date().isoformat() != day
+        ):
+            raise ValueError("Log timestamp does not match its filename")
+    return records
 
 
 def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
     if not root.exists() and not root.is_symlink():
         return {}
-    entries = {}
+    entries: dict[str, Entry] = {}
+    logs: dict[str, list[dict[str, Any]]] = {}
+    log_modes: dict[str, int] = {}
     for path in paths(root):
         name = path.relative_to(root).as_posix()
         mode = path.lstat().st_mode
@@ -387,7 +441,19 @@ def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
             entry = Entry("directory", stat.S_IMODE(mode), None)
         elif stat.S_ISREG(mode):
             try:
+                if match := LOG_FILE.fullmatch(name):
+                    # paths() visits each surface's dated files in date order.
+                    stream = f"logs/{match['surface']}.jsonl"
+                    records = logs.setdefault(stream, [])
+                    if log_modes.setdefault(stream, stat.S_IMODE(mode)) != stat.S_IMODE(
+                        mode
+                    ):
+                        raise ValueError("Log file modes differ within a surface")
+                    records.extend(read_log(path, match["day"]))
+                    continue
                 data = content(path, name, normalize)
+            except InvalidReservationTime:
+                raise
             except (ValueError, KeyError, TypeError, sqlite3.Error, InvalidTag) as exc:
                 # A decode failure must fail even when both sides produce it.
                 raise ValueError(
@@ -396,7 +462,11 @@ def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
             entry = Entry("file", stat.S_IMODE(mode), data)
         else:
             raise ValueError(f"Unsupported file type at {name}")
-        entries[normalize.log_name(name)] = entry
+        entries[name] = entry
+    for name, records in logs.items():
+        if name in entries:
+            raise ValueError(f"File collides with merged log stream at {name}")
+        entries[name] = Entry("file", log_modes[name], normalize.log_records(records))
     return entries
 
 

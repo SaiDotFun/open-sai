@@ -8,6 +8,14 @@ SAI_PARITY_BIN=/absolute/path/to/sai just parity
 SAI_PARITY_BIN=/absolute/path/to/sai uv run python tests/parity/parity.py --case 'config-*'
 ```
 
+Run on Linux with user and network namespaces, `unshare` and `setpriv`
+from util-linux, and `ip` from iproute2. The driver brings up loopback in a
+fresh network namespace and launches both CLIs without network administration
+privileges. Unroutable IPv4 or IPv6 attempts fail the case, even if the CLI
+catches the socket error. The driver stops at startup if it cannot establish
+the isolated network or find a native `uv` executable that runs with a
+temporary home.
+
 The default run compares Python with Python. Set `SAI_PARITY_BIN` to an
 executable path or a command on `PATH` to compare a port. Arguments belong in
 `cases.toml`. The runner prints a Markdown report to stdout and exits 1 if
@@ -29,12 +37,15 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   separate temporary `HOME` and `SAI_HOME` directories at mode `0700`.
 - Use placeholders such as `{addr}`, `{intent}`, and `{keeper}` in
   arguments. Both implementations use the same loopback HTTP and WebSocket
-  servers. The environments contain fixture settings and proxy variables
-  that send unexpected external HTTP requests to the loopback stub.
+  servers. Child environments omit inherited proxies and set `NO_PROXY`
+  for loopback.
 - The `wire` list specifies the required requests, including counts.
-  The stub checks GraphQL and LCD arguments before returning the recorded
-  or synthetic responses. Doctor runs its network checks in parallel, so
-  its wire list is compared without regard to order.
+  The stub checks the full GraphQL document against `keeper-requests.json`
+  before returning a fixture. HTTP queries and WebSocket subscriptions
+  preserve operation names, arguments, and variables. Whitespace and field
+  order may vary. LCD requests also check their arguments. Doctor runs its
+  network checks in parallel, so its wire list is compared without regard
+  to order.
 - The `state` table pins persisted values on each side. A key takes the
   form `file#object.key.0.field`, with zero-based list indexes. Use
   `file#@mode` to assert a mode, or `"<absent>"` to assert that a file or
@@ -62,9 +73,11 @@ For MCP, replies are matched by request ID and entries in `tools/list` by
 tool name.
 
 The `SAI_HOME` snapshot compares relative paths, file types, modes, and
-contents. It parses TOML values, authenticates and decrypts session
-envelopes, and reads SQLite user version, columns, and rows from a copy
-with its journal files. SQLite row order and physical page layout may vary.
+contents. It parses TOML values and checks that edits preserve the existing
+config text outside the edited value, including its inline comment. It
+authenticates and decrypts session envelopes. It reads SQLite schema SQL,
+indexes, user version, columns, and typed rows from a copy with its journal
+files. SQLite row order and physical page layout may vary.
 The runner parses `update.json` as JSON and compares other files byte for
 byte. The report names differing paths and fields.
 
@@ -78,8 +91,8 @@ checked on both sides.
 | Doctor checks | `generatedAt` and check durations, including durations embedded in network-check summaries |
 | `update.json` | `checkedAt` |
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
-| Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps |
-| Log file names | UTC date, expressed relative to the first dated log file. The events must belong to the date in the file name. |
+| Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps. The latter must be stored as REAL Unix seconds within the invocation window. |
+| Log file grouping | Dated files for each surface are merged in UTC date order. Each event must belong to the date in the file name. |
 | Log events | `ts`, `durationMs`, `pid`, `runId`, `callId`, generated `intentKey`, and CLI version. The `doctor.result` and `update.check` events use the same rules as their stdout reports. |
 
 Generated IDs use the same placeholder wherever the original ID reappears

@@ -22,7 +22,12 @@ dependencies = [
 sai = "sai_cli.sai_cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.11", "ty>=0.0.1a6"]
+dev = [
+    "graphql-core>=3.2,<3.3",
+    "pytest>=8",
+    "ruff>=0.11",
+    "ty>=0.0.1a6",
+]
 
 [tool.setuptools.packages.find]
 where = ["cli"]

@@ -5,7 +5,6 @@ from __future__ import annotations
 import base64
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -19,7 +18,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
-from compare import INTENT_ID, first_difference, timestamp
+from compare import INTENT_ID, timestamp
+from keeper_wire import WireRequest, graphql_request, same_variables
 from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import ServerConnection
@@ -35,10 +35,10 @@ NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 RELEASES = "/repos/SaiDotFun/open-sai/releases"
 CONFIG = """# Keep this comment when editing
 [update]
-auto = true
+auto   =  true # Keep this inline comment
 
 [logs]
-keep_days = 3
+keep_days  =  3
 """
 # Use the same public storage operations as the CLI tests, in a subprocess
 # so the driver's own environment and storage never change.
@@ -69,7 +69,7 @@ class Endpoints:
     http: str
     ws: str
     errors: list[str] = field(default_factory=list)
-    wire: list[str] = field(default_factory=list)
+    wire: list[WireRequest] = field(default_factory=list)
     admission: Admission = field(default_factory=Admission)
 
     @property
@@ -106,14 +106,6 @@ def child_env(home: Path, endpoints: Endpoints) -> dict[str, str]:
         "TZ": "UTC",
         "LC_ALL": "C",
         "PYTHONUTF8": "1",
-        # Route unexpected HTTP requests from clients that honor proxy
-        # variables to the stub. All configured endpoints bypass the proxy.
-        "HTTP_PROXY": endpoints.http,
-        "HTTPS_PROXY": endpoints.http,
-        "ALL_PROXY": endpoints.http,
-        "http_proxy": endpoints.http,
-        "https_proxy": endpoints.http,
-        "all_proxy": endpoints.http,
         "NO_PROXY": "127.0.0.1,localhost,::1",
         "no_proxy": "127.0.0.1,localhost,::1",
     }
@@ -166,7 +158,7 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
 @contextmanager
 def loopback(scenario: str) -> Generator[Endpoints]:
     errors: list[str] = []
-    wire: list[str] = []
+    wire: list[WireRequest] = []
     admission = Admission()
     scope = f"/parity/{uuid.uuid4().hex}"
     markets = fixture("mainnet_markets_http.json")
@@ -257,9 +249,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         def do_CONNECT(self) -> None:
             self.reject("Unexpected external HTTP connection")
 
-        def admit_close(self, body: dict[str, Any]) -> None:
-            wire.append("recordUserIntent")
-            envelope = body["variables"]["input"]
+        def admit_close(self, variables: Any) -> None:
+            envelope = variables["input"]
             key = envelope["intentKey"]
             intent_stamp = envelope["intent"]["tsIntentInit"]
             lifecycle_stamp = envelope["lifecycle"]["tsLifecycleStep"]
@@ -276,7 +267,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 "token"
             ]
             if (
-                first_difference(body["variables"], {"input": expected}, "variables")
+                not same_variables(variables, {"input": expected})
                 or not INTENT_ID.fullmatch(key)
                 or not timestamp(intent_stamp)
                 or intent_stamp != lifecycle_stamp
@@ -304,30 +295,24 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 return
             try:
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-                query = body["query"]
-                # Match GraphQL fields, independent of formatting or operation name.
-                fields = re.findall(r"\b\w+\s*(?=[({])", query)
-                if scenario == "concurrent-close" and "recordUserIntent" in query:
-                    self.admit_close(body)
+                try:
+                    request = graphql_request(body)
+                except ValueError as exc:
+                    self.reject(str(exc))
                     return
-                if "mutation" not in query and "recordUserIntent" not in query:
-                    for name in (field.strip() for field in fields):
-                        if name in responses:
-                            wire.append(name)
-                            if first_difference(
-                                body.get("variables", {}),
-                                variables.get(name, {}),
-                                "variables",
-                            ):
-                                self.reject(f"Wrong Keeper variables for {name}")
-                                return
-                            if scenario == "keeper-error":
-                                self.reply(
-                                    {"errors": [{"message": "fixture unavailable"}]}
-                                )
-                            else:
-                                self.reply(responses[name])
-                            return
+                wire.append(request)
+                name = request.label
+                if name == "recordUserIntent" and scenario == "concurrent-close":
+                    self.admit_close(request.variables)
+                    return
+                if name in responses:
+                    if not same_variables(request.variables, variables.get(name, {})):
+                        self.reject(f"Wrong Keeper variables for {name}")
+                    elif scenario == "keeper-error":
+                        self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    else:
+                        self.reply(responses[name])
+                    return
             except (ValueError, KeyError, TypeError):
                 pass
             self.reject("Unsupported Keeper request")
@@ -340,11 +325,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             if path.startswith(scope):
                 path = path.removeprefix(scope)
                 if path == NODE_INFO:
-                    wire.append("node_info")
+                    wire.append(WireRequest("node_info"))
                     self.reply({"default_node_info": {"network": "cataclysm-1"}})
                     return
                 if path == RELEASES:
-                    wire.append("releases")
+                    wire.append(WireRequest("releases"))
                     self.reply(
                         [
                             {
@@ -362,10 +347,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        if query != {name: contract_args[name]}:
+                        if not same_variables(query, {name: contract_args[name]}):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
-                        wire.append(name)
+                        wire.append(WireRequest(name, variables=query))
                         self.reply({"data": contracts[name]})
                         return
                     except (ValueError, KeyError, TypeError):
@@ -390,21 +375,33 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             if initial["type"] != "connection_init":
                 errors.append("Expected WebSocket connection_init")
                 return
-            wire.append("ws:init")
+            wire.append(WireRequest("ws:init"))
             connection.send(json.dumps({"type": "connection_ack"}))
             subscription = json.loads(connection.recv(timeout=5))
             if subscription["type"] != "subscribe":
                 errors.append("Expected WebSocket subscribe")
                 return
-            query = subscription["payload"]["query"]
-            name = next(name for name in queue_payloads if name in query)
-            expected = {"id": 3} if name == "tokenPricesUsd" else {"user": ADDRESS}
-            if subscription["payload"].get("variables") != expected:
-                errors.append(f"Wrong WebSocket variables for {name}")
-                return
-            wire.append(f"ws:{name}")
-            payload = queue_payloads[name]
             request_id = subscription["id"]
+            try:
+                request = graphql_request(subscription["payload"], websocket=True)
+                wire.append(request)
+                name = request.label.removeprefix("ws:")
+                expected = {"id": 3} if name == "tokenPricesUsd" else {"user": ADDRESS}
+                if not same_variables(request.variables, expected):
+                    raise ValueError(f"Wrong WebSocket variables for {name}")
+            except ValueError as exc:
+                errors.append(str(exc))
+                connection.send(
+                    json.dumps(
+                        {
+                            "id": request_id,
+                            "type": "error",
+                            "payload": [{"message": str(exc)}],
+                        }
+                    )
+                )
+                return
+            payload = queue_payloads[name]
             connection.send(
                 json.dumps({"id": request_id, "type": "next", "payload": payload})
             )

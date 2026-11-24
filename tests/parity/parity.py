@@ -27,12 +27,15 @@ from compare import (
     LEDGER,
     Entry,
     Normalize,
+    config_text,
     first_difference,
     ledger,
     snapshot,
     stderr_category,
     stdout,
 )
+from network import enter_loopback, restricted, unroutable_packets
+from reference_uv import resolve_uv
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import HERE, ROOT, Endpoints, child_env, loopback, seed_home
@@ -95,7 +98,7 @@ def invoke(
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [*binary, *args],
+        restricted([*binary, *args]),
         cwd=home,
         env=env,
         stdin=subprocess.DEVNULL,
@@ -114,7 +117,7 @@ def mcp_exchange(
     # still running can cancel the MCP server's pending work.
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
         with subprocess.Popen(
-            [*binary, *args],
+            restricted([*binary, *args]),
             cwd=home,
             env=env,
             stdin=subprocess.PIPE,
@@ -205,7 +208,10 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
 def observe(
     case: Case, binary: list[str], home: Path, endpoints: Endpoints
 ) -> Observation:
+    started_at = time.time()
     seed_home(home, endpoints, case.seed)
+    config = home / "sai" / "config.toml"
+    before_config = config.read_bytes().decode("utf-8") if config.is_file() else None
     env = child_env(home, endpoints)
     for key in case.unset or ():
         env.pop(key, None)
@@ -224,7 +230,7 @@ def observe(
             try:
                 if not admission.arrived.wait(10):
                     raise ValueError("First process did not reach synthetic admission")
-                before = Normalize(home)
+                before = Normalize(home, started_at=started_at)
                 expected_id = before.identity("intentKey", admission.key)
                 before_ack = ledger(home / "sai" / LEDGER, before)
                 rows = before_ack["tables"]["intents"]["rows"]
@@ -249,12 +255,22 @@ def observe(
         result = run(binary, args, home, env)
     if endpoints.errors:
         raise ValueError(endpoints.errors[0])
-    actual, expected = endpoints.wire, case.wire or []
+    actual, expected = [request.label for request in endpoints.wire], case.wire or []
     if case.command == "doctor":
         actual, expected = sorted(actual), sorted(expected)
     if actual != expected:
         raise ValueError(f"Expected wire {expected}, got {actual}")
-    normalize = Normalize(home, concurrent=concurrent)
+    if before_config is not None:
+        if config.is_symlink() or not config.is_file():
+            raise ValueError("The existing config.toml was replaced or removed")
+        after_config = config.read_bytes().decode("utf-8")
+        if case.command in {"config set", "config unset"}:
+            key = case.args[-2] if case.command == "config set" else case.args[-1]
+            before_config = config_text(before_config, key)
+            after_config = config_text(after_config, key)
+        if before_config != after_config:
+            raise ValueError("config.toml changed text outside the edited value")
+    normalize = Normalize(home, concurrent=concurrent, started_at=started_at)
     files = snapshot(home / "sai", normalize)
     check_state(case.state or {}, files)
     try:
@@ -332,16 +348,23 @@ def safe_observe(
     endpoints.admission.arrived.clear()
     endpoints.admission.release.clear()
     endpoints.admission.key = ""
+    outbound = unroutable_packets()
     try:
-        return observe(case, binary, home, endpoints), ""
+        result: tuple[Observation | None, str] = (
+            observe(case, binary, home, endpoints),
+            "",
+        )
     except subprocess.TimeoutExpired:
-        return None, "timed out"
+        result = (None, "timed out")
     except subprocess.CalledProcessError as exc:
-        return None, f"fixture setup exited {exc.returncode}"
+        result = (None, f"fixture setup exited {exc.returncode}")
     except ValueError as exc:
-        return None, str(exc)
+        result = (None, str(exc))
     except (OSError, sqlite3.Error, AttributeError, KeyError, TypeError) as exc:
-        return None, type(exc).__name__
+        result = (None, type(exc).__name__)
+    if unroutable_packets() != outbound:
+        return None, "attempted a non-loopback network connection"
+    return result
 
 
 def run_case(
@@ -419,6 +442,11 @@ def main() -> int:
         "--case", action="append", help="Run matching case IDs (glob, repeatable)"
     )
     args = parser.parse_args()
+    try:
+        enter_loopback()
+        uv = resolve_uv()
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        parser.error(str(exc))
     with (HERE / "cases.toml").open("rb") as file:
         configured = tomllib.load(file)
     cases = [Case(**item) for item in configured["case"]]
@@ -438,9 +466,6 @@ def main() -> int:
     ]
     if not selected:
         parser.error("No parity cases matched")
-    uv = shutil.which("uv")
-    if not uv:
-        parser.error("uv is required to run the Python reference")
     reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
     candidate = reference
     if "SAI_PARITY_BIN" in os.environ:

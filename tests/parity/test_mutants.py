@@ -1,0 +1,118 @@
+"""Exercise deliberately wrong candidates through the public driver."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).parent
+ROOT = HERE.parents[1]
+
+
+def run_driver(case: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [sys.executable, str(HERE / "parity.py"), "--case", case],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=40,
+        check=False,
+    )
+
+
+def run_mutant(
+    tmp_path: Path, mutant: str, case: str
+) -> subprocess.CompletedProcess[str]:
+    candidate = tmp_path / mutant
+    source = (HERE / "mutant_cli.py").read_text(encoding="utf-8")
+    candidate.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
+    candidate.chmod(0o700)
+    return run_driver(
+        case,
+        {
+            **os.environ,
+            "SAI_PARITY_BIN": str(candidate),
+            "HTTPS_PROXY": "http://127.0.0.1:1",
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    ("mutant", "case", "message"),
+    [
+        ("history-order", "account-history", "Keeper HTTP GraphQL request differs"),
+        (
+            "history-projection",
+            "account-history",
+            "Keeper HTTP GraphQL request differs",
+        ),
+        ("history-operation", "account-history", "Keeper HTTP GraphQL request differs"),
+        ("ws-projection", "watch-price", "WebSocket GraphQL request differs"),
+        ("ledger-milliseconds", "trade-concurrent-close", "Unix timestamp in seconds"),
+        ("ledger-rowid", "intent-local-reserved", "intents.sqlite3.schema"),
+        ("ledger-index", "intent-local-reserved", "intents.sqlite3.schema"),
+        ("ledger-version", "intent-local-reserved", "intents.sqlite3.user_version"),
+        (
+            "config-comment",
+            "config-set-existing",
+            "changed text outside the edited value",
+        ),
+        ("config-inline", "config-unset", "changed text outside the edited value"),
+        (
+            "config-format",
+            "config-set-existing",
+            "changed text outside the edited value",
+        ),
+        (
+            "config-order",
+            "config-set-existing",
+            "changed text outside the edited value",
+        ),
+        ("network-ipv4", "config-list", "attempted a non-loopback network connection"),
+        ("network-ipv6", "config-list", "attempted a non-loopback network connection"),
+        ("midnight-order", "market-prices", "logs/cli.jsonl[0]"),
+        ("midnight-wrong-file", "market-prices", "Cannot decode logs/cli"),
+    ],
+)
+def test_wrong_candidate_fails(
+    tmp_path: Path, mutant: str, case: str, message: str
+) -> None:
+    run = run_mutant(tmp_path, mutant, case)
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "| DIFF |" in run.stdout
+    assert message in run.stdout
+
+
+@pytest.mark.parametrize(
+    ("mutant", "case"),
+    [("history-format", "account-history"), ("midnight-split", "market-prices")],
+)
+def test_equivalent_candidate_passes(tmp_path: Path, mutant: str, case: str) -> None:
+    run = run_mutant(tmp_path, mutant, case)
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert "| PASS |" in run.stdout
+
+
+def test_reference_uses_real_uv_with_home_dependent_shim(tmp_path: Path) -> None:
+    fake = tmp_path / "uv"
+    fake.write_text("#!/bin/sh\nexit 71\n", encoding="utf-8")
+    fake.chmod(0o700)
+    env = {**os.environ, "PATH": str(tmp_path)}
+    env.pop("SAI_PARITY_BIN", None)
+    real = run_driver("version", env)
+    assert real.returncode == 0, real.stdout + real.stderr
+    assert "| PASS |" in real.stdout
+
+    env.pop("UV", None)
+    fake_only = run_driver("version", env)
+    assert fake_only.returncode == 2
+    assert (
+        "Could not resolve a uv executable that runs with an isolated HOME"
+        in fake_only.stderr
+    )
+    assert "| Command |" not in fake_only.stdout
