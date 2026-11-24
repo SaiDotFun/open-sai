@@ -8,6 +8,10 @@ the CLI or the MCP tools. A mistake here spends the person's money.
 1. **Preview first.** With MCP tools, call the matching `preview_*` tool. In
    the CLI, run the trade command with `--dry-run`. Show the person the
    result and the account it names, and wait for an explicit yes.
+   During a collateral oracle outage, a partial-close preview can show a
+   USDC estimate, and Sai requires a verifiable collateral price to submit
+   the trade. Once Sai can verify the price, run a fresh preview and get
+   the person's confirmation before submitting.
 2. **Pin the account and the network on both calls.** Each call resolves
    the active account and the Keeper endpoint by itself. Another terminal or
    MCP client can switch the account, and a changed setting can point the
