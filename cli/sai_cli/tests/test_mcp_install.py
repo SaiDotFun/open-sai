@@ -71,9 +71,19 @@ import tomlkit
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(sys.argv) + "\\n")
 args = sys.argv[1:]
-assert args[:2] == ["mcp", "get"], args
 name = args[2]
 config = Path(os.environ["CODEX_HOME"]) / "config.toml"
+if args[:2] == ["mcp", "add"]:
+    if (config.parent / "reject-add").exists():
+        sys.exit(4)
+    divider = args.index("--")
+    command, *command_args = args[divider + 1 :]
+    variables = dict(arg.removeprefix("--env=").split("=", 1) for arg in args[3:divider])
+    document = tomlkit.parse(config.read_text())
+    document["mcp_servers"][name] = {"command": command, "args": command_args, "env": variables}
+    config.write_text(document.as_string())
+    sys.exit(0)
+assert args[:2] == ["mcp", "get"], args
 state = tomlkit.parse(config.read_text()).unwrap() if config.exists() else {}
 # Stands in for Codex's own project rules: a project entry Codex would load
 # from this directory is given in ./fake-codex-project.json.
@@ -830,13 +840,14 @@ def test_doctor_restores_codex_entry_when_verification_fails(
     config = env.codex_path()
     config.write_text(source)
     config.chmod(0o640)
-    # Reject only the new launcher. A second writer may publish an
-    # identical copy while Codex is verifying the repair.
+    # Reject only the new launcher. A second writer can add a server
+    # while Codex is verifying the repair.
     reject = f"""
     if entry["command"] == {str(env.sai)!r}:
         if {concurrent_write!r}:
             pending = config.with_suffix(".new")
-            pending.write_bytes(config.read_bytes())
+            state["mcp_servers"]["newer_server"] = {{"command": "new-command"}}
+            pending.write_text(tomlkit.dumps(state))
             pending.replace(config)
         sys.stderr.write({SECRET!r})
         sys.exit(3)
@@ -853,14 +864,72 @@ def test_doctor_restores_codex_entry_when_verification_fails(
     assert check["status"] == "fail"
     assert "Could not repair the user registration" in check["summary"]
     assert not check.get("changes")
+    original = tomlkit.parse(source).unwrap()["mcp_servers"]
     if concurrent_write:
-        assert "changed before Sai could restore it" in check["summary"]
-        assert str(env.sai) in config.read_text()
-    else:
-        assert config.read_text() == source
-        if os.name != "nt":
-            assert stat.S_IMODE(config.stat().st_mode) == 0o640
+        original["newer_server"] = {"command": "new-command"}
+    assert tomlkit.parse(config.read_text()).unwrap()["mcp_servers"] == original
+    assert [call[1] for call in env.calls()].count("add") == 1
     assert SECRET not in result.output
+
+
+@pytest.mark.parametrize("has_policy", [False, True])
+def test_doctor_gives_private_codex_recovery_instructions(env: Env, has_policy: bool):
+    original = {
+        "command": OLD_COMMAND,
+        "args": ["--endpoint", f"https://fixture.invalid/{SECRET}"],
+        "env": {"PRIVATE": SECRET},
+    }
+    if has_policy:
+        original.update(enabled=False, enabled_tools=[])
+    env.write_codex({"sai": original})
+    reject = f"""
+    if entry["command"] == {str(env.sai)!r}:
+        sys.stderr.write({SECRET!r})
+        sys.exit(3)
+"""
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "    transport = dict(entry)", reject + "    transport = dict(entry)"
+        ),
+    )
+    marker = env.codex_home / "reject-add"
+    marker.touch()
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 1
+    check = mcp_checks(result)["codex"]
+    assert check["status"] == "fail"
+    assert not check.get("changes")
+    assert SECRET not in result.output
+    [detail] = (env.codex_home / "sai-recovery").iterdir()
+    assert str(detail) in check["fix"]
+    assert SECRET in detail.read_text()
+    assert "mcp add sai" in detail.read_text()
+    if os.name != "nt":
+        assert stat.S_IMODE(detail.stat().st_mode) == 0o600
+    if has_policy:
+        assert not any(call[1] == "add" for call in env.calls())
+        table = tomlkit.parse(env.codex_path().read_text())["mcp_servers"]["sai"]
+        assert table["enabled"] is False and table["enabled_tools"] == []
+        assert "manual restore" in check["summary"]
+    else:
+        assert "exited 4" in check["summary"]
+        marker.unlink()
+        shell = shutil.which("sh", path=os.defpath)
+        assert shell is not None
+        [retry] = check["fix"].split("`")[1::2]
+        subprocess.run(
+            [shell, "-c", retry],
+            cwd=env.project,
+            env={**os.environ, "PATH": os.pathsep.join([str(env.bin), os.defpath])},
+            check=True,
+        )
+        assert (
+            tomlkit.parse(env.codex_path().read_text()).unwrap()["mcp_servers"]["sai"]
+            == original
+        )
 
 
 def test_doctor_reports_same_stale_codex_project_entry_after_repairing_user(env: Env):

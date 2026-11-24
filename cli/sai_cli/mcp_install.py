@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -30,7 +31,7 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import InlineTable
 
-from .core import settings
+from .core import paths, settings
 
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
@@ -177,6 +178,12 @@ class ClientError(Exception):
     """A client command or config file failed; the message is safe to print."""
 
 
+class CodexRestoreError(ClientError):
+    def __init__(self, message: str, fix: str) -> None:
+        super().__init__(message)
+        self.fix = fix
+
+
 @dataclass(frozen=True)
 class ClaudeRepair:
     scope: str
@@ -309,12 +316,16 @@ def server_target(
 # --- helpers --------------------------------------------------------------
 
 
-def run(argv: list[str]) -> None:
+def run(
+    argv: list[str], *, cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> None:
     """Run a client command without relaying output that may contain config values."""
     command = " ".join([Path(argv[0]).name, *argv[1:3]])
     try:
         done = subprocess.run(
             argv,
+            cwd=cwd,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -416,14 +427,11 @@ def before_replace(path: Path) -> None:
 def replace_if_unchanged(
     path: Path, data: dict[str, Any], seen: bytes | None, destination: Path
 ) -> bool:
-    return (
-        replace_bytes(
-            path,
-            (json.dumps(data, indent=2) + "\n").encode(),
-            seen,
-            destination=destination,
-        )
-        is not None
+    return replace_bytes(
+        path,
+        (json.dumps(data, indent=2) + "\n").encode(),
+        seen,
+        destination=destination,
     )
 
 
@@ -433,12 +441,11 @@ def replace_bytes(
     seen: bytes | None,
     *,
     destination: Path,
-    expected_file: os.stat_result | None = None,
-) -> os.stat_result | None:
+) -> bool:
     """Write data over path in one rename if path still holds `seen`.
 
-    Keeps the file mode (0600 for a new file). Returns the published file's
-    metadata, or None if another program has changed the file.
+    Keeps the file mode (0600 for a new file). Returns False if another
+    program has changed the file.
     """
     # Replace the file, including when the configured path is a symlink.
     # Recheck the link before writing so a concurrent retarget is detectable.
@@ -449,24 +456,16 @@ def replace_bytes(
             handle.write(data)
         before_replace(path)
         if path.resolve() != destination or read_bytes(destination) != seen:
-            return None
+            return False
         try:
-            current = destination.stat()
-            if expected_file is not None and (
-                not os.path.samestat(current, expected_file)
-                or current.st_mtime_ns != expected_file.st_mtime_ns
-                or current.st_mode != expected_file.st_mode
-            ):
-                return None
-            mode = stat.S_IMODE(current.st_mode)
+            mode = stat.S_IMODE(destination.stat().st_mode)
         except FileNotFoundError:
             if seen is not None:
-                return None
+                return False
             mode = 0o600
         os.chmod(temp, mode)
-        published = os.stat(temp)
         os.replace(temp, destination)
-        return published
+        return True
     finally:
         Path(temp).unlink(missing_ok=True)
 
@@ -1161,19 +1160,97 @@ def repair_entry(
 @dataclass(frozen=True)
 class CodexEdit:
     destination: Path
-    original: bytes | None
-    replacement: bytes
-    published: os.stat_result
+    original: dict[str, Any]
+    replacement: dict[str, Any]
 
-    def restore(self, path: Path) -> None:
-        if self.original is None or not replace_bytes(
-            path,
-            self.original,
-            self.replacement,
-            destination=self.destination,
-            expected_file=self.published,
+
+def codex_saved_entry(path: Path, name: str) -> dict[str, Any] | None:
+    entries = tomllib.loads(path.read_text(encoding="utf-8")).get("mcp_servers", {})
+    entry = entries.get(name) if isinstance(entries, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def codex_restore_instructions(
+    client: Codex, name: str, original: dict[str, Any], argv: list[str], *, manual: bool
+) -> str:
+    """Keep the exact original settings and command out of doctor output and logs."""
+    try:
+        home = client.home_dir().resolve()
+        directory = paths.private_directory(home / "sai-recovery")
+        detail = directory / f"{name}{'.txt' if manual else '.sh'}"
+        fd, filename = tempfile.mkstemp(prefix=f".{name}-", dir=directory)
+        pending = Path(filename)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                pending.chmod(0o600)
+                config = tomlkit.dumps({"mcp_servers": {name: original}})
+                for line in config.splitlines():
+                    handle.write(f"# {line}\n")
+                handle.write(f"export CODEX_HOME={shlex.quote(str(home))}\n")
+                handle.write(f"exec {shlex.join(argv)}\n")
+            os.replace(pending, detail)
+        finally:
+            pending.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        return "Review the Sai entry in the Codex user config. Could not save the private recovery instructions."
+    if manual:
+        return (
+            f"Restore only the original Sai entry from the private instructions at {detail}. "
+            "The add command in that file would reset settings that only Codex config.toml supports."
+        )
+    return f"Review the original settings in {detail}, then run `{shlex.join(['sh', str(detail)])}` to retry the Codex add."
+
+
+def restore_codex_entry(client: Codex, path: Path, name: str, edit: CodexEdit) -> None:
+    original = edit.original
+    env = original.get("env", {})
+    argv = [
+        client.exe() or client.binary,
+        "mcp",
+        "add",
+        name,
+        *(f"--env={key}={value}" for key, value in env.items()),
+        "--",
+        original["command"],
+        *original.get("args", []),
+    ]
+    unsupported = original.keys() - {"command", "args", "env"}
+    if unsupported:
+        raise CodexRestoreError(
+            "Codex rejected the repaired entry. Its original settings require a manual restore",
+            codex_restore_instructions(client, name, original, argv, manual=True),
+        )
+    try:
+        if path.resolve() != edit.destination:
+            raise ClientError("Codex config changed before Sai could restore the entry")
+        current = codex_saved_entry(path, name)
+        if current == original:
+            return
+        if current != edit.replacement:
+            raise ClientError("The Sai entry changed before Sai could restore it")
+        run(
+            argv,
+            cwd=client.neutral_dir(),
+            env={**client.environ, "CODEX_HOME": str(client.home_dir().resolve())},
+        )
+        restored = codex_saved_entry(path, name)
+        if (
+            restored is None
+            or restored.get("command") != original["command"]
+            or restored.get("args", []) != original.get("args", [])
+            or restored.get("env", {}) != env
         ):
-            raise ClientError("Codex config.toml changed before Sai could restore it")
+            raise ClientError("Codex did not save the original Sai entry")
+    except (ClientError, OSError, ValueError) as exc:
+        reason = (
+            str(exc)
+            if isinstance(exc, ClientError)
+            else "Could not read the Codex user config"
+        )
+        raise CodexRestoreError(
+            f"Codex rejected the repaired entry. {reason}",
+            codex_restore_instructions(client, name, original, argv, manual=False),
+        ) from None
 
 
 def edit_codex_config(
@@ -1202,9 +1279,14 @@ def edit_codex_config(
         data = rendered.encode()
         if data == seen:
             return None
-        published = replace_bytes(path, data, seen, destination=destination)
-        if published is not None:
-            return CodexEdit(destination, seen, data, published)
+        if replace_bytes(path, data, seen, destination=destination):
+            if stale is None:
+                return None
+            return CodexEdit(
+                destination,
+                tomllib.loads(source)["mcp_servers"][name],
+                tomllib.loads(rendered)["mcp_servers"][name],
+            )
     raise ClientError("Codex config.toml changed while Sai was writing it")
 
 
@@ -1348,9 +1430,10 @@ def replace_registration(
             actual = client.get(client.neutral_dir(), "user", name)
             if actual is None or not actual.matches_command(expected):
                 raise ClientError("Codex did not load the repaired Sai registration")
-        except ClientError:
+        except ClientError as exc:
             if edit is not None:
-                edit.restore(path)
+                restore_codex_entry(client, path, name, edit)
+                raise ClientError(f"{exc}. The original Sai entry is present") from None
             raise
         return
     if not isinstance(client, Cursor):
@@ -1521,7 +1604,9 @@ def check_registration(
                 failures.append(
                     (
                         summary,
-                        "Check this client's Sai registration and rerun `sai doctor`",
+                        exc.fix
+                        if isinstance(exc, CodexRestoreError)
+                        else "Check this client's Sai registration and rerun `sai doctor`",
                     )
                 )
             else:
