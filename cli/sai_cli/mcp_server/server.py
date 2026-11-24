@@ -1070,10 +1070,13 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             f"sai mcp serve: {exc}",
             Code.INVALID_REQUEST,
             exit_code=ExitCode.USAGE
-            if isinstance(exc, sai_settings.InvalidEndpoint)
+            if isinstance(exc, sai_settings.InvalidSetting)
             else None,
         ) from exc
-    with sai_log.bind(surface="mcp"):
+    flag_keys = frozenset(
+        key for key, value in (flags or {}).items() if value is not None
+    )
+    with sai_log.setting_flags(flag_keys), sai_log.bind(surface="mcp"):
         sai_log.event(
             "mcp.server_start",
             keeper=sai_log.endpoint(settings.endpoint),
