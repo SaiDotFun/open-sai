@@ -1,5 +1,5 @@
 {
-  "pythonReference": "ea09f0d417a53a71079bb8c5e426005fa29051a4",
+  "pythonReference": "8557a7e13dceab0accc369191182c8e01423c91b",
   "cases": [
     {
       "preview": {
@@ -42,8 +42,8 @@
         },
         "referencePrice": "12345678901234567890.123456785000000000"
       },
-      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"referencePrice\":\"12345678901234567890.12345678\"}",
-      "digest": "990a8c8f96d76f8d32d5a1113c51e66e87fb3c61becbad88d6dc6b8b3edac382"
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"referencePrice\":\"12345678901234567890.123456785\"}",
+      "digest": "0bd194a1515909ed7f8629a1f8931e3a01371fd22621200a89a60fa64829587c"
     },
     {
       "preview": {
@@ -121,6 +121,34 @@
       },
       "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{},\"kind\":\"CANCEL_PENDING_TRADE\",\"target\":{\"userTradeId\":\"7\"}},\"quote\":{\"a\":true,\"z\":1,\"\\ud83e\\uddea\":\"\\u00e9\\u007f\"}}",
       "digest": "4bd99fc6c63ea6ac1cf497a11e6a536197e905195920ea890ff0f286a0196d64"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "CANCEL_PENDING_TRADE",
+          "target": {
+            "userTradeId": "7"
+          },
+          "body": {}
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{},\"kind\":\"CANCEL_PENDING_TRADE\",\"target\":{\"userTradeId\":\"7\"}}}",
+      "digest": "12532f15238f876cf470b8bd9e7f821f4f0bcbc4944108c79ecfeb3aee1a9301"
     }
-  ]
+  ],
+  "estimates": {
+    "fees": {
+      "status": "estimate",
+      "amountUsdc": "0.025"
+    },
+    "liquidationPrice": {
+      "status": "estimate",
+      "price": "60"
+    },
+    "worstCaseFill": {
+      "status": "bound",
+      "price": "101"
+    }
+  }
 }
