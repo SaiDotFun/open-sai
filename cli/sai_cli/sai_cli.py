@@ -1068,11 +1068,12 @@ def doctor_command(
     ws_endpoint: str | None,
     lcd_endpoint: str | None,
 ) -> None:
-    """Check the install, config, session, intent ledger, and endpoints.
+    """Check the install, config, MCP registrations, session, intent ledger,
+    and endpoints.
 
     Fixes: create $SAI_HOME/trader, make it, $SAI_HOME/logs, and their files
-    private, migrate the intent ledger, and reconcile unknown intents for
-    the signed-in account with Keeper (a read; no trade is placed or cancelled). It never
+    private, repair stale MCP registrations, migrate the intent ledger, and
+    reconcile unknown intents for the signed-in account with Keeper. It never
     deletes or rewrites the session, and never prints its token. Each check
     prints pass, fixed, warn, fail, or skipped, with a fix for the rest. Exits
     1 if any check still fails.

@@ -11,9 +11,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import tomlkit
 from click.testing import CliRunner
 from sai_cli import mcp_install
 from sai_cli import sai_cli as cli
+from sai_cli.core import log
 from sai_cli.sai_cli import main
 
 # Built from parts so the retired-names test does not match this file.
@@ -41,18 +43,24 @@ holder = data
 if scope == "local":
     holder = data.setdefault("projects", {}).setdefault(str(Path.cwd()), {})
 servers = holder.setdefault("mcpServers", {})
+name = args[args.index("--scope") + 2]
 if args[1] == "remove":
-    if "sai" not in servers:
-        sys.stderr.write(f'No MCP server named "sai" in {scope} scope\\n')
+    if name not in servers:
+        sys.stderr.write(f'No MCP server named "{name}" in {scope} scope\\n')
         sys.exit(1)
-    del servers["sai"]
+    del servers[name]
 else:
+    if os.environ.get("FAKE_ADD_FAIL") == "claude":
+        data["concurrentEdit"] = True
+        path.write_text(json.dumps(data))
+        sys.stderr.write(os.environ["FAKE_ADD_ERROR"])
+        sys.exit(1)
     dash = args.index("--")
     env = dict(
         a.split("=", 2)[1:] for a in args[:dash] if a.startswith("--env=")
     )
     command = args[dash + 1 :]
-    servers["sai"] = {
+    servers[name] = {
         "type": "stdio", "command": command[0], "args": command[1:], "env": env
     }
 path.write_text(json.dumps(data))
@@ -64,38 +72,62 @@ from pathlib import Path
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(sys.argv) + "\\n")
 args = sys.argv[1:]
+name = args[2]
 path = Path(os.environ["CODEX_HOME"]) / "fake-state.json"
-state = json.loads(path.read_text()) if path.exists() else {}
+config = path.with_name("config.toml")
+if config.exists():
+    import tomlkit
+
+    doc = tomlkit.parse(config.read_text())
+    state = doc.setdefault("mcp_servers", tomlkit.table())
+else:
+    state = json.loads(path.read_text()) if path.exists() else {}
 # Stands in for Codex's own project rules: a project entry Codex would load
 # from this directory is given in ./fake-codex-project.json.
 project = Path.cwd() / "fake-codex-project.json"
-if args[:2] == ["mcp", "get"] and project.exists():
+if args[:2] == ["mcp", "get"] and name == "sai" and project.exists():
     data = json.loads(project.read_text())
     if "transport" not in data:
         data = {"transport": data}
     print(json.dumps({"name": "sai", "enabled": True, **data}))
 elif args[:2] == ["mcp", "get"]:
-    if "sai" not in state:
-        sys.stderr.write("Error: No MCP server named 'sai' found.\\n")
+    if name not in state:
+        sys.stderr.write(f"Error: No MCP server named '{name}' found.\\n")
         sys.exit(1)
-    enabled = state.get("sai_enabled", True)
-    print(json.dumps({"name": "sai", "enabled": enabled, "transport": state["sai"]}))
+    transport = dict(state[name])
+    enabled = transport.pop("enabled", state.get(name + "_enabled", True))
+    data = {"name": name, "enabled": enabled, "transport": transport}
+    for key in ("enabled_tools", "disabled_tools"):
+        if key in transport:
+            data[key] = transport.pop(key)
+    print(json.dumps(data))
 elif args[:2] == ["mcp", "remove"]:
-    state.pop("sai", None)
-    state.pop("sai_enabled", None)
+    state.pop(name, None)
+    state.pop(name + "_enabled", None)
 elif args[:2] == ["mcp", "add"]:
+    if os.environ.get("FAKE_ADD_FAIL") == "codex":
+        doc["concurrentEdit"] = True
+        config.write_text(doc.as_string())
+        sys.stderr.write(os.environ["FAKE_ADD_ERROR"])
+        sys.exit(1)
     dash = args.index("--")
     env = dict(
         a.split("=", 2)[1:] for a in args[:dash] if a.startswith("--env=")
     )
     command = args[dash + 1 :]
-    state["sai"] = {
+    state[name] = {
         "type": "stdio", "command": command[0], "args": command[1:],
-        "env": env, "env_vars": [], "cwd": None,
+        "env": env, "env_vars": [],
     }
+    if not config.exists():
+        state[name]["cwd"] = None
 else:
     sys.exit(2)
-path.write_text(json.dumps(state))
+if args[1] != "get":
+    if config.exists():
+        config.write_text(doc.as_string())
+    else:
+        path.write_text(json.dumps(state))
 """
 
 
@@ -178,6 +210,178 @@ def actions(result: Any) -> dict[str, str]:
 
 def serve(e: Env) -> list[str]:
     return [str(e.sai), "mcp", "serve"]
+
+
+def write_doctor_entries(env: Env, name: str, entry: dict[str, Any]) -> dict[str, Any]:
+    unrelated = {"url": "https://private.example/mcp", "headers": {"X-Token": SECRET}}
+    entries = {name: entry, OTHER: unrelated}
+    document = json.dumps({"mcpServers": entries})
+    (env.home / ".claude.json").write_text(document)
+    env.cursor_path().parent.mkdir()
+    env.cursor_path().write_text(document)
+    (env.codex_home / "config.toml").write_text(tomlkit.dumps({"mcp_servers": entries}))
+    return unrelated
+
+
+def doctor_entries(env: Env) -> dict[str, dict[str, Any]]:
+    return {
+        "claude": env.claude_json()["mcpServers"],
+        "codex": tomlkit.parse((env.codex_home / "config.toml").read_text()).unwrap()[
+            "mcp_servers"
+        ],
+        "cursor": json.loads(env.cursor_path().read_text())["mcpServers"],
+    }
+
+
+def mcp_checks(result: Any) -> dict[str, dict[str, Any]]:
+    return {
+        check["id"].split(".")[1]: check
+        for check in payload(result)["checks"]
+        if check["id"].startswith("mcp.")
+    }
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("stable", "pass"),
+        ("other-absolute", "pass"),
+        ("missing", "fail"),
+        ("uv-cache", "fail"),
+        ("legacy-command", "fail"),
+        ("legacy-name", "fail"),
+    ],
+)
+def test_doctor_repairs_recognized_registrations_in_all_clients(
+    env: Env, monkeypatch: pytest.MonkeyPatch, kind: str, expected: str
+):
+    monkeypatch.setenv("SAI_HOME", str(env.root / "sai-home"))
+    command = str(env.sai)
+    if kind in ("other-absolute", "missing", "uv-cache"):
+        root = env.home / (".cache/uv" if kind == "uv-cache" else kind)
+        root.mkdir(parents=True)
+        path = root / "sai"
+        if kind != "missing":
+            write_exe(path, "raise RuntimeError('doctor must not run the server')")
+        command = str(path)
+    suffix = ["--endpoint", "https://private.example/query?token=" + SECRET]
+    args = ["mcp", "serve", *suffix]
+    if kind == "legacy-command":
+        command, args = OLD_COMMAND, suffix
+    name = OLD_COMMAND if kind == "legacy-name" else "sai"
+    entry = {
+        "command": command,
+        "args": args,
+        "env": {"SAI_HOME": str(env.root / "other-profile"), "CUSTOM": SECRET},
+        "enabled_tools": ["market_list"],
+    }
+    unrelated = write_doctor_entries(env, name, entry)
+    files = [
+        env.home / ".claude.json",
+        env.cursor_path(),
+        env.codex_home / "config.toml",
+    ]
+    before = [path.read_bytes() for path in files]
+    report = invoke("doctor", "--offline", "--no-fix")
+    assert report.exit_code == (1 if expected == "fail" else 0), report.output
+    checks = mcp_checks(report)
+    assert set(checks) == set(mcp_install.CLIENTS)
+    assert {check["status"] for check in checks.values()} == {expected}
+    assert [path.read_bytes() for path in files] == before
+    assert {call[1] for call in env.calls()} == {"get"}
+
+    result = invoke("doctor", "--offline")
+    assert result.exit_code == 0, result.output
+    status = "fixed" if expected == "fail" else "pass"
+    assert {check["status"] for check in mcp_checks(result).values()} == {status}
+    if status == "pass":
+        assert [path.read_bytes() for path in files] == before
+    else:
+        for registrations in doctor_entries(env).values():
+            assert registrations == {
+                "sai": {
+                    **entry,
+                    "command": str(env.sai),
+                    "args": ["mcp", "serve", *suffix],
+                },
+                OTHER: unrelated,
+            }
+        assert all(check["changes"] for check in mcp_checks(result).values())
+        again = invoke("doctor", "--offline")
+        assert {check["status"] for check in mcp_checks(again).values()} == {"pass"}
+    assert log.flush()
+    output = report.output + result.output
+    output += "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
+    for private_value in (SECRET, OTHER, "private.example", "other-profile"):
+        assert private_value not in output
+
+
+@pytest.mark.parametrize("client", ["claude", "codex"])
+def test_doctor_restores_original_entry_when_add_fails(
+    env: Env, monkeypatch: pytest.MonkeyPatch, client: str
+):
+    monkeypatch.setenv("SAI_HOME", str(env.root / "sai-home"))
+    monkeypatch.setenv("FAKE_ADD_FAIL", client)
+    monkeypatch.setenv("FAKE_ADD_ERROR", f"{OTHER} https://private.example/{SECRET}")
+    entry = {
+        "command": OLD_COMMAND,
+        "args": ["--endpoint", "https://private.example/" + SECRET],
+        "env": {"CUSTOM": SECRET},
+        "enabled_tools": ["market_list"],
+    }
+    unrelated = write_doctor_entries(env, "sai", entry)
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 1, result.output
+    assert mcp_checks(result)[client]["status"] == "fail"
+    assert doctor_entries(env)[client] == {"sai": entry, OTHER: unrelated}
+    if client == "claude":
+        assert env.claude_json()["concurrentEdit"] is True
+    else:
+        config = tomlkit.parse((env.codex_home / "config.toml").read_text()).unwrap()
+        assert config["concurrentEdit"] is True
+    calls = [call for call in env.calls() if call[1] in ("remove", "add")]
+    assert [call[1] for call in calls] == ["remove", "add", "remove", "add"]
+    assert all(SECRET not in " ".join(call) for call in calls)
+    for private_value in (SECRET, OTHER, "private.example"):
+        assert private_value not in result.output
+
+
+def test_doctor_warns_for_absent_entries_and_leaves_custom_entries_alone(env: Env):
+    env.cursor_path().parent.mkdir()
+    env.cursor_path().write_text(
+        json.dumps({"mcpServers": {"sai": {"command": "missing-custom-wrapper"}}})
+    )
+    result = invoke("doctor", "--offline")
+    assert result.exit_code == 1
+    assert {name: check["status"] for name, check in mcp_checks(result).items()} == {
+        "claude": "warn",
+        "codex": "warn",
+        "cursor": "fail",
+    }
+    assert {call[1] for call in env.calls()} == {"get"}
+    assert "missing-custom-wrapper" in env.cursor_path().read_text()
+
+
+def test_doctor_reports_same_stale_codex_project_entry_after_repairing_user(env: Env):
+    entry = {"command": OLD_COMMAND, "args": []}
+    override = env.project / "fake-codex-project.json"
+    override.write_text(json.dumps(entry))
+    (env.codex_home / "config.toml").write_text(
+        tomlkit.dumps({"mcp_servers": {"sai": entry}})
+    )
+
+    result = invoke("doctor", "--offline")
+
+    check = mcp_checks(result)["codex"]
+    assert result.exit_code == 1
+    assert check["status"] == "fail"
+    assert "project registration is still active" in check["summary"]
+    assert check["changes"]
+    assert json.loads(override.read_text()) == entry
+    config = tomlkit.parse((env.codex_home / "config.toml").read_text()).unwrap()
+    assert config["mcp_servers"]["sai"]["command"] == str(env.sai)
 
 
 def test_install_runs_each_clients_add_command(env: Env):

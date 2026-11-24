@@ -4,7 +4,8 @@ fix the rest.
 Each check returns pass, warn, fail, skipped, or fixed. A fixed check lists
 what it changed in `changes`. Doctor fixes only what it can from inspection:
 it creates `$SAI_HOME/trader`, tightens file modes there and under
-`$SAI_HOME/logs`, migrates the intent ledger, and reconciles unknown intents for the signed-in account with Keeper
+`$SAI_HOME/logs`, repairs stale MCP registrations, migrates the intent ledger,
+and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
 
@@ -35,6 +36,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from . import mcp_install
 from .core import (
     keeper,
     log,
@@ -133,6 +135,33 @@ def check_config(
             "config", "warn", "config.toml contains unknown settings", fix
         ), config
     return Check("config", "pass", "Config file settings are valid"), config
+
+
+def check_mcp(ctx: Context) -> list[Check]:
+    home = Path.home()
+    install = ctx.install or update.install_kind()
+    target = None
+    if install.official:
+        launcher = updater.registered_launcher(Path(install.prefix))
+        if launcher is not None and shutil.which(str(launcher)):
+            target = mcp_install.launcher_target(str(launcher), os.environ)
+    else:
+        try:
+            target, _ = mcp_install.server_target(
+                None, os.environ, home, mcp_install.running_prefix()
+            )
+        except mcp_install.InstallError:
+            pass
+    return [
+        Check(
+            f"mcp.{result.client}",
+            result.status,
+            result.summary,
+            result.fix,
+            changes=list(result.changes),
+        )
+        for result in mcp_install.check_registrations(target, fix=ctx.fix)
+    ]
 
 
 def log_entry(check: Check) -> dict[str, Any]:
@@ -1082,6 +1111,7 @@ LOCAL_CHECKS: list[tuple[str, CheckFn]] = [
     ("version", check_version),
     ("home", check_home),
     ("logs", check_logs),
+    ("mcp", check_mcp),
     ("session", check_session),
     ("intents", check_intents),
 ]

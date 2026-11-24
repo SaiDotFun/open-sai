@@ -44,6 +44,7 @@ TOKEN = f"{HEADER}.{PAYLOAD}.{SIGNATURE}"
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "")
     for name in ("SAI_ENDPOINT", "SAI_WS_ENDPOINT", "SAI_LCD_ENDPOINT"):
         monkeypatch.delenv(name, raising=False)
     return tmp_path
