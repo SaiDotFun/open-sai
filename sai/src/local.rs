@@ -56,7 +56,7 @@ pub enum IntentCommand {
 pub fn intent_help(command: &str) -> Option<String> {
     let help = match command {
         "intent" => {
-            "  Inspect and reconcile trading request outcomes.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  local   List locally recorded intent identities for ADDR.\n  status  Read Keeper's latest intent records and record local pending..."
+            "  Inspect and reconcile trading request outcomes.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  local   List locally recorded intent identities for ADDR.\n  status  Read Keeper's latest intent records and record local pending...\n  wait    Wait for an intent's final outcome and print its receipt."
         }
         "intent status" => {
             "  Read Keeper's latest intent records and record local pending fills.\n\n  Use --key to check one intent for a final outcome.\n\nOptions:\n  --key TEXT  Specific intent key.\n  --help      Show this message and exit."

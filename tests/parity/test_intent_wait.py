@@ -414,6 +414,37 @@ def test_intent_wait(
     assert observed[0] == observed[1]
 
 
+@pytest.mark.parametrize(
+    ("args", "exit_code"),
+    [
+        (("intent", "--help"), 0),
+        (("--json", "intent"), 2),
+        (("intent", "wait", "--help"), 0),
+        (("intent", "wait"), 2),
+    ],
+)
+def test_wait_help(
+    wait_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    args: tuple[str, ...],
+    exit_code: int,
+) -> None:
+    outputs = []
+    for index, cli in enumerate(wait_cli_pair):
+        home = tmp_path / str(index)
+        result = invoke(cli, home, *args)
+        stdout_help = exit_code == 0 or args[0] == "--json"
+        assert result.returncode == exit_code
+        assert bool(result.stdout) == stdout_help
+        assert bool(result.stderr) != stdout_help
+        if args[0] == "--json":
+            assert json.loads(result.stdout)["error"]["code"] == "INVALID_REQUEST"
+        if exit_code == 0:
+            assert not home.exists()
+        outputs.append((result.stdout, result.stderr))
+    assert outputs[0] == outputs[1]
+
+
 def test_wait_account_first_matches_python(
     wait_cli_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:

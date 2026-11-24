@@ -739,7 +739,6 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
     ("args", "exit_code", "code"),
     [
         (("--json",), 2, "INVALID_REQUEST"),
-        (("--json", "intent"), 2, "INVALID_REQUEST"),
         (("--json", "config"), 2, "INVALID_REQUEST"),
         (("--bad-option", "--json", "intent", "status", ADDR), 2, "INVALID_REQUEST"),
         (("--json", "intent", "status"), 2, "INVALID_REQUEST"),
@@ -805,14 +804,11 @@ def test_cli_errors_share_one_envelope(
     assert outputs[0] == outputs[1]
 
 
-@pytest.mark.parametrize("args", [("intent", "--help"), ("intent", "status", "--help")])
-def test_intent_help(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path, args: tuple[str, ...]
-) -> None:
+def test_intent_help(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
     outputs = []
     for index, cli in enumerate(cli_pair):
         home = tmp_path / str(index)
-        result = invoke(cli, home, *args)
+        result = invoke(cli, home, "intent", "status", "--help")
         assert result.returncode == 0
         assert not result.stderr
         assert not home.exists()
