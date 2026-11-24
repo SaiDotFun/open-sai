@@ -559,7 +559,9 @@ class FakeClock:
         self.elapsed += delay
 
 
-def test_wait_reports_fill_when_optional_history_uses_remaining_budget(keeper_replay):
+def test_wait_keeps_confirmation_when_optional_history_uses_remaining_budget(
+    keeper_replay,
+):
     endpoint, replies = keeper_replay
     reserve(endpoint)
     clock = FakeClock()
@@ -578,8 +580,9 @@ def test_wait_reports_fill_when_optional_history_uses_remaining_budget(keeper_re
     result = wait.for_intent(
         endpoint, ADDR, KEY, timeout=1, clock=wait.Clock(clock.now, clock.sleep)
     )
-    assert result["outcome"] == "filled"
+    assert result["outcome"] == "succeeded"
     assert result["receipt"]["execution"]["block"] == 50109596
+    assert result["receipt"]["fill"] is None
     assert status(endpoint) == "terminal"
 
 
@@ -1067,6 +1070,61 @@ def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
     assert receipt["fill"]["oraclePrice"] == 81000.5
     assert receipt["positionNow"]["openPrice"] == 87000
     assert receipt["positionNow"]["openCollateralAmount"] == 6000000
+
+
+@pytest.mark.parametrize(
+    ("change", "outcome", "exit_code"),
+    [
+        ("position_liquidated", "liquidated", 1),
+        ("position_closed_user", "unexpected", 1),
+        ("trade_size_increase", "unexpected", 1),
+        ("trade_size_decrease", "filled", 0),
+    ],
+)
+def test_partial_close_wait_reports_observed_history(
+    keeper_replay, change, outcome, exit_code
+):
+    endpoint, replies = keeper_replay
+    storage.pending(KEY, endpoint, ADDR, "DECREASE_POSITION_SIZE", "7")
+    completed = deepcopy(RESPONSES["filled"])
+    completed["data"]["userIntents"][0]["kind"] = "DECREASE_POSITION_SIZE"
+    history = fill_history()
+    rows = history["data"]["perp"]["tradeHistory"]
+    rows[0]["tradeChangeType"] = change
+    rows[0]["trade"]["isOpen"] = change not in (
+        "position_liquidated",
+        "position_closed_user",
+    )
+    if outcome != "filled":
+        # A plausible row must not hide another observed effect of this intent.
+        rows.insert(0, {**rows[0], "tradeChangeType": "trade_size_decrease"})
+    replies.extend((completed, history))
+    command = CliRunner().invoke(
+        main, ["--endpoint", endpoint, "--json", "intent", "wait", KEY]
+    )
+    assert command.exit_code == exit_code, command.output
+    result = json.loads(command.stdout)
+    assert result["outcome"] == outcome
+    assert result["receipt"]["execution"]["tradeChangeType"] == change
+    assert (result["receipt"]["fill"] is not None) == (outcome == "filled")
+    if exit_code:
+        assert result["error"]["code"] == "KEEPER_ERROR"
+    assert status(endpoint) == "terminal"
+
+
+def test_leverage_wait_flags_a_take_profit_update(keeper_replay):
+    endpoint, replies = keeper_replay
+    storage.pending(KEY, endpoint, ADDR, "UPDATE_TRADE", "7")
+    completed = deepcopy(RESPONSES["filled"])
+    row = completed["data"]["userIntents"][0]
+    row.update(kind="UPDATE_TRADE", body={"requestedLeverage": "2"})
+    history = fill_history()
+    history["data"]["perp"]["tradeHistory"][0]["tradeChangeType"] = "tp_updated"
+    replies.extend((completed, history))
+    result = wait.for_intent(endpoint, ADDR, KEY)
+    assert result["outcome"] == "unexpected"
+    assert result["receipt"]["execution"]["tradeChangeType"] == "tp_updated"
+    assert status(endpoint) == "terminal"
 
 
 def test_wait_returns_conditional_order_placement_without_fill(keeper_replay):

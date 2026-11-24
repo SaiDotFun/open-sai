@@ -334,6 +334,11 @@ A confirmed failure exits 1, and an admission rejection exits 4. The
 outcomes `filled`, `placed`, and `succeeded` exit 0. A limit or stop
 order can return `placed` before its trigger. The receipt's `action`
 identifies the intent kind and order type when available.
+Keeper can confirm execution while the matching history is still unavailable.
+In that case the wait returns `succeeded` for a market intent.
+If matched history records liquidation or another effect that differs from
+the request, the CLI exits 1. The receipt reports the observed
+`execution.tradeChangeType` and the outcome is `liquidated` or `unexpected`.
 
 An acknowledged open blocks another open for the same account and Keeper
 endpoint. The refusal gives the existing intent key. Use

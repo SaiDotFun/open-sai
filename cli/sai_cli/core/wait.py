@@ -26,12 +26,16 @@ OUTCOME_CODES = {
     "rejected": Code.ADMISSION_REJECTED,
     "not_sent": Code.NOT_SENT,
     "failed": Code.KEEPER_ERROR,
+    "liquidated": Code.KEEPER_ERROR,
+    "unexpected": Code.KEEPER_ERROR,
 }
 Outcome = Literal[
     "filled",
     "placed",
     "succeeded",
     "failed",
+    "liquidated",
+    "unexpected",
     "rejected",
     "not_sent",
     "absent",
@@ -187,7 +191,7 @@ async def for_intent_async(
                             or data.get("outcome") == "terminal-filled"
                         ):
                             history = data.get("matchedTradeHistory", [])
-                            outcome = receipt.success(row, history, request_block)
+                            outcome = receipt.success(row, history)
                             break
                         if classified == "terminal-failed":
                             outcome = "failed"
@@ -295,6 +299,13 @@ def _result(
     }
     if outcome == "failed":
         result.update(keeperErrorCode=row.get("errorCode"), message=row.get("errorMsg"))
+    if outcome == "liquidated":
+        result["message"] = "Keeper recorded liquidation while processing the intent."
+    if outcome == "unexpected":
+        change = result["receipt"]["execution"]["tradeChangeType"]
+        result["message"] = (
+            f"Keeper recorded {change} for this intent. Review the receipt."
+        )
     if outcome == "rejected":
         result["message"] = "Keeper rejected admission for this intent."
     if outcome == "not_sent":

@@ -11,7 +11,15 @@ TRADE_FILLS = {
     "trade_size_decrease",
 }
 PLACEMENTS = {"limit_order_created": "limit", "stop_order_created": "stop"}
-FILL_KINDS = {"CLOSE_POSITION", "INCREASE_POSITION_SIZE", "DECREASE_POSITION_SIZE"}
+OPEN_CHANGES = {order_type: change for change, order_type in PLACEMENTS.items()}
+REQUESTED_CHANGES = {
+    "CLOSE_POSITION": {"position_closed_user"},
+    "INCREASE_POSITION_SIZE": {"trade_size_increase"},
+    "DECREASE_POSITION_SIZE": {"trade_size_decrease"},
+    "CANCEL_PENDING_TRADE": {"order_closed_user"},
+    "UPDATE_OPEN_ORDER": {"order_updated"},
+    "UPDATE_TRADE": {"tp_updated", "sl_updated", "tpsl_updated", "leverage_updated"},
+}
 
 
 def _indexed(row: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
@@ -20,15 +28,20 @@ def _indexed(row: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, An
     canonical_block = (
         row.get("execBlock") if row.get("lifecycleStep") == "exec_pass" else None
     )
-    return next(
-        (
-            item
-            for item in history
-            if canonical_block is None
-            or (item.get("block") or {}).get("block") == canonical_block
-        ),
-        {},
-    )
+    matching = [
+        item
+        for item in history
+        if canonical_block is None
+        or (item.get("block") or {}).get("block") == canonical_block
+    ]
+    for item in matching:
+        if item.get("tradeChangeType") == "position_liquidated":
+            return item
+    for item in matching:
+        change = item.get("tradeChangeType")
+        if change and not _matches_action(row, item, change):
+            return item
+    return matching[0] if matching else {}
 
 
 def _action(row: dict[str, Any], indexed: dict[str, Any]) -> dict[str, Any]:
@@ -39,26 +52,52 @@ def _action(row: dict[str, Any], indexed: dict[str, Any]) -> dict[str, Any]:
         if kind == "OPEN_TRADE" and isinstance(body, dict)
         else None
     )
-    return {
-        "kind": kind,
-        "orderType": order_type or PLACEMENTS.get(indexed.get("tradeChangeType")),
-    }
+    if order_type is None and kind in ("OPEN_TRADE", None):
+        order_type = PLACEMENTS.get(indexed.get("tradeChangeType"))
+    return {"kind": kind, "orderType": order_type}
+
+
+def _matches_action(row: dict[str, Any], indexed: dict[str, Any], change: str) -> bool:
+    kind = row.get("kind")
+    if kind == "OPEN_TRADE":
+        return change == OPEN_CHANGES.get(
+            _action(row, indexed)["orderType"], "position_opened"
+        )
+    if kind is None:
+        return change in TRADE_FILLS or change in PLACEMENTS
+    body = row.get("body")
+    if kind == "UPDATE_TRADE" and isinstance(body, dict):
+        tp = _requests_update(body.get("takeProfit"))
+        sl = _requests_update(body.get("stopLoss"))
+        return {
+            "leverage_updated": body.get("requestedLeverage") is not None,
+            "tp_updated": tp,
+            "sl_updated": sl,
+            "tpsl_updated": tp or sl,
+        }.get(change, False)
+    return change in REQUESTED_CHANGES.get(kind, ())
+
+
+def _requests_update(patch: object) -> bool:
+    return isinstance(patch, dict) and patch.get("operation") in ("set", "clear")
 
 
 def success(
-    row: dict[str, Any], history: list[dict[str, Any]], request_block: int | None
-) -> Literal["filled", "placed", "succeeded"]:
+    row: dict[str, Any], history: list[dict[str, Any]]
+) -> Literal["filled", "placed", "succeeded", "liquidated", "unexpected"]:
     indexed = _indexed(row, history)
     action = _action(row, indexed)
+    change = indexed.get("tradeChangeType")
+    if change == "position_liquidated":
+        return "liquidated"
+    if change:
+        if not _matches_action(row, indexed, change):
+            return "unexpected"
+        if change in PLACEMENTS:
+            return "placed"
+        return "filled" if change in TRADE_FILLS else "succeeded"
     if action["orderType"] in ("limit", "stop"):
         return "placed"
-    if (
-        indexed.get("tradeChangeType") in TRADE_FILLS
-        or action["kind"] in FILL_KINDS
-        or action["orderType"] == "market"
-        or (action["kind"] == "OPEN_TRADE" and request_block is not None)
-    ):
-        return "filled"
     return "succeeded"
 
 
@@ -76,7 +115,14 @@ def build(
     block = indexed.get("block") or {}
     change = indexed.get("tradeChangeType")
     execution = None
-    if outcome in ("filled", "placed", "succeeded", "failed"):
+    if outcome in (
+        "filled",
+        "placed",
+        "succeeded",
+        "failed",
+        "liquidated",
+        "unexpected",
+    ):
         execution = {
             "source": "trade_history" if indexed else "keeper_intent",
             "block": block.get("block")
