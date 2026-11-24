@@ -1339,7 +1339,6 @@ TRADE_DECIMAL = TradeDecimal()
 )
 @click.option(
     "--slippage",
-    type=TRADE_DECIMAL,
     required=True,
     help="Maximum slippage percentage, greater than 0 and at most 100.",
 )
