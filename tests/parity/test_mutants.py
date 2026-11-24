@@ -40,13 +40,18 @@ def run_driver(case: str, env: dict[str, str]) -> subprocess.CompletedProcess[st
     )
 
 
-def run_mutant(
-    tmp_path: Path, mutant: str, case: str
-) -> subprocess.CompletedProcess[str]:
+def write_mutant(tmp_path: Path, mutant: str) -> Path:
     candidate = tmp_path / mutant
     source = (HERE / "mutant_cli.py").read_text(encoding="utf-8")
     candidate.write_text(f"#!{sys.executable}\n" + source, encoding="utf-8")
     candidate.chmod(0o700)
+    return candidate
+
+
+def run_mutant(
+    tmp_path: Path, mutant: str, case: str
+) -> subprocess.CompletedProcess[str]:
+    candidate = write_mutant(tmp_path, mutant)
     return run_driver(
         case,
         {
@@ -112,6 +117,19 @@ def test_equivalent_candidate_passes(tmp_path: Path) -> None:
     run = run_mutant(tmp_path, "history-format", "account-history")
     assert run.returncode == 0, run.stdout + run.stderr
     assert "| PASS |" in run.stdout
+
+
+def test_doctor_offline_rejects_trader_creation_in_both_clis(tmp_path: Path) -> None:
+    # A matching side effect would pass the comparison without the case's state assertion.
+    mutant = write_mutant(tmp_path, "doctor-create-trader")
+    env = {**os.environ, "SAI_C9A_PYTHON": str(mutant)}
+    env.pop("SAI_PARITY_BIN", None)
+    run = run_driver("doctor-offline", env)
+    assert run.returncode == 1, run.stdout + run.stderr
+    for side in ("reference", "candidate"):
+        assert (
+            f"{side} Persisted state differs from expectation at trader" in run.stdout
+        )
 
 
 def test_reference_uses_real_uv_with_home_dependent_shim(tmp_path: Path) -> None:
