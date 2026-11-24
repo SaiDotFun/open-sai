@@ -272,6 +272,14 @@ or an unreadable file `SESSION_UNAVAILABLE`. Each message tells the agent to
 have the user run `sai auth login NAME` or `sai auth import`. A signed-in trade
 still needs the `previewDigest` of the preview the user confirmed.
 
+The partial-close digest covers the close percentage, starting collateral
+and leverage, and the quoted closed notional in field
+`quote.closedNotionalUsd`. The margin digest covers the full quote, including
+starting collateral and leverage. If either position changes and the trade
+can still be quoted, the server returns `PREVIEW_MISMATCH` with a fresh
+preview before submission. The direct leverage tool confirms the requested
+target leverage.
+
 ## Commands
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
@@ -282,11 +290,13 @@ requires a funded account; funding is performed separately. Trade commands
 support `--dry-run` to inspect the local semantic request.
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
-requiring refresh and may include an optional supplied reference. A partial close sizes the
-reduction from the Perp contract's collateral, refuses when Keeper's index
-disagrees with the contract, and rechecks the position before submission. It
-accepts `--lcd-endpoint` like `trade margin`. Market schedule and other Keeper admission checks
-remain authoritative.
+requiring refresh and may include an optional supplied reference. A partial
+close sizes the reduction from the Perp contract's collateral and leverage.
+Its dry run shows the closed notional in field `quote.closedNotionalUsd`.
+The CLI refuses when Keeper's index disagrees with the contract and rechecks
+the position before submission. Partial close accepts `--lcd-endpoint` like
+`trade margin`. Market schedule and other Keeper admission checks remain
+authoritative.
 
 `trade leverage TRADE_ID --leverage VALUE` sets a target leverage.
 `trade margin TRADE_ID --direction add|remove --amount USDC` reads the exact

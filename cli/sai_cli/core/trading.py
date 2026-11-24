@@ -262,7 +262,18 @@ def partial_close(
     payload = intents.partial_intent(
         position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
     )
-    preview = {"dryRun": True, "intent": payload}
+    leverage = str(raw["leverage"])
+    reduction_usd = Decimal(payload["body"]["collateral"]["amountUsd"])
+    preview = {
+        "dryRun": True,
+        "intent": payload,
+        "quote": {
+            "percent": percent,
+            "collateralBefore": str(raw["collateral_amount"]),
+            "leverageBefore": leverage,
+            "closedNotionalUsd": format(reduction_usd * Decimal(leverage), "f"),
+        },
+    }
     if dry_run:
         return preview
     latest, _, _ = margin.snapshot(

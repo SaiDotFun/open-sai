@@ -113,7 +113,8 @@ def margin_quote(
         raise ValueError("Margin amount must have at most six decimal places")
     delta = int(scaled_amount)
     collateral = int(raw["collateral_amount"])
-    old = int(intents.positive(str(raw["leverage"]), "Current leverage") * 10**18)
+    leverage_before = intents.positive(str(raw["leverage"]), "Current leverage")
+    old = int(leverage_before * 10**18)
     if collateral <= 0 or direction not in ("add", "remove"):
         raise ValueError("Invalid margin input")
     if direction == "remove" and delta >= collateral:
@@ -145,6 +146,7 @@ def margin_quote(
     return {
         "requestedLeverage": leverage,
         "collateralBefore": str(collateral),
+        "leverageBefore": format(leverage_before, "f"),
         "collateralAfter": str(after),
         "actualDeltaUsdc": str(actual),
     }

@@ -165,8 +165,11 @@ server rebuilds the trade and refuses it with a fresh preview when it no
 longer matches:
 
 - Every trade: the signed-in account and the trade's arguments.
-- `trade_margin` and `trade_partial_close`: also the position state the
-  preview quoted.
+- `trade_margin` also binds the margin quote, including the position's
+  starting collateral and leverage.
+- `trade_partial_close` also binds the close percentage, starting collateral
+  and leverage, and quoted closed notional. A leverage-only change requires
+  a new confirmation even when the collateral reduction is the same.
 - `trade_open` for a market order: also the market price, which may move at
   most the slippage from the confirmed `referencePrice`. A new price needs a
   new confirmation.

@@ -575,9 +575,10 @@ async def preview_partial_close(
 ) -> str:
     """Preview reducing an open USDC position by a whole percentage.
 
-    Sized from contract state and checked against the market minimum.
-    Needs a signed-in session to read the position. Show the user the
-    result; trade_partial_close needs its previewDigest.
+    Sizes the reduction from contract state, checks the market minimum, and
+    quotes the closed notional. Needs a signed-in session to read the
+    position. Show the user the closed notional and collateral reduction.
+    trade_partial_close needs the previewDigest they confirm.
 
     Args:
         trade_id: Trade id from account_positions.

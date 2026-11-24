@@ -425,7 +425,7 @@ def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
     """Return the parts of PREVIEW the user confirms.
 
     That is the account the trade would be submitted under, the intent, and
-    the margin quote when there is one. A market open leaves out its intent
+    the position quote when there is one. A market open leaves out its intent
     price, which is refreshed at submit, and binds the referencePrice the
     user confirmed instead.
     """
