@@ -110,6 +110,25 @@ CASES = (
         (None, 0),
     ),
     Case(
+        "numeric-fee-and-quoted-decimal",
+        (
+            "filled",
+            Reply(
+                body=response(
+                    history(
+                        indexed(
+                            openingFeeUsd=1.23,
+                            closingFeeUsd="1.2300",
+                        )
+                    )
+                ).body.replace(b'"openingFeeUsd": 1.23,', b'"openingFeeUsd": 1.2300,')
+            ),
+        ),
+        "filled",
+        "terminal",
+        (None, 0),
+    ),
+    Case(
         "confirmed-failure",
         ("pending_exec", intent("market_order_fill_failed", errorMsg=OPAQUE)),
         "failed",

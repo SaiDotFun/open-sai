@@ -1,3 +1,5 @@
+mod python_numbers;
+
 use std::{
     fmt::Write as _,
     io::{self, Write},
@@ -299,7 +301,7 @@ pub(crate) fn emit_wait(
         _ => None,
     };
     let (body, exit) = wait_output(receipt, endpoint, env, json, recovered);
-    let text = encode(&body, json)?;
+    let text = encode_wait(&body, json)?;
     let mut stdout = io::stdout().lock();
     if writeln!(stdout, "{}", ascii_json(&text))
         .and_then(|()| stdout.flush())
@@ -314,7 +316,7 @@ pub(crate) fn emit_wait(
     let interrupted = body["interrupted"].as_bool().unwrap_or(false);
     let receipt = wait::recovery_result(&storage, endpoint, addr, key, interrupted, confirmation);
     let (body, exit) = wait_output(receipt, endpoint, env, json, true);
-    let text = encode(&body, json)?;
+    let text = encode_wait(&body, json)?;
     let _ = writeln!(io::stderr().lock(), "{}", ascii_json(&text));
     Ok(exit)
 }
@@ -478,23 +480,31 @@ impl Formatter for InlineJson {
 }
 
 pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
-    println!("{}", ascii_json(&encode(value, json)?));
+    let text = if json {
+        encode(value, InlineJson)?
+    } else {
+        encode(value, PrettyFormatter::new())?
+    };
+    println!("{}", ascii_json(&text));
     Ok(())
 }
 
-fn encode(value: &impl Serialize, json: bool) -> Result<String, SaiError> {
-    let mut bytes = Vec::new();
+fn encode_wait(value: &Value, json: bool) -> Result<String, SaiError> {
+    use python_numbers::PythonNumbers;
     if json {
-        value.serialize(&mut serde_json::Serializer::with_formatter(
-            &mut bytes, InlineJson,
-        ))
+        encode(value, PythonNumbers(InlineJson))
     } else {
-        value.serialize(&mut serde_json::Serializer::with_formatter(
-            &mut bytes,
-            PrettyFormatter::new(),
-        ))
+        encode(value, PythonNumbers(PrettyFormatter::new()))
     }
-    .map_err(|_| SaiError::internal())?;
+}
+
+fn encode(value: &impl Serialize, formatter: impl Formatter) -> Result<String, SaiError> {
+    let mut bytes = Vec::new();
+    value
+        .serialize(&mut serde_json::Serializer::with_formatter(
+            &mut bytes, formatter,
+        ))
+        .map_err(|_| SaiError::internal())?;
     String::from_utf8(bytes).map_err(|_| SaiError::internal())
 }
 
