@@ -101,6 +101,12 @@ args = ["--json","market","prices"]
 wire = ["tokenPricesUsd"]
 
 [[case]]
+name = "market-prices-epoch-spellings"
+args = ["--json","market","prices"]
+server = "read-price-epoch-spellings"
+wire = ["tokenPricesUsd"]
+
+[[case]]
 name = "market-prices-text"
 args = ["market","prices"]
 mode = "text"

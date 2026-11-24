@@ -243,7 +243,7 @@ def decode_mcp(result: Any) -> dict[str, Any]:
 
 def test_market_prices_reports_missing_block_times_as_null(replay):
     prices = replay["http"][keeper.PRICES]["data"]
-    rows = prices["oracle"]["tokenPricesUsd"][:7]
+    rows = prices["oracle"]["tokenPricesUsd"][:11]
     prices["oracle"]["tokenPricesUsd"] = rows
     del rows[0]["lastUpdatedBlock"]["block_ts"]
     for row, stamp in zip(
@@ -253,8 +253,12 @@ def test_market_prices_reports_missing_block_times_as_null(replay):
             None,
             "0",
             "1970-01-01T00:00:00Z",
+            "1970-01-01t00:00:00z",
+            "1970-01-01 01:00:00.0000000000+01:00",
+            "1969-12-31T23:00:00−01:00",
             BLOCK_TIME,
             "1970-01-01T00:00:00.000000001Z",
+            "1970-01-01t00:00:00.0000000001z",
         ),
         strict=True,
     ):
@@ -272,8 +276,12 @@ def test_market_prices_reports_missing_block_times_as_null(replay):
         None,
         None,
         None,
+        None,
+        None,
+        None,
         BLOCK_TIME,
         "1970-01-01T00:00:00.000000001Z",
+        "1970-01-01t00:00:00.0000000001z",
     ]
     server = create_server(replay["config"])
     assert decode_mcp(asyncio.run(server.call_tool("market_prices", {}))) == decoded

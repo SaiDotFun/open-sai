@@ -164,17 +164,27 @@ pub fn normalize_market_price_timestamps(data: &mut Map<String, Value>) {
             .and_then(Value::as_object_mut)
         {
             let timestamp = block.entry("block_ts").or_insert(Value::Null);
-            if timestamp.as_f64() == Some(0.0)
-                || timestamp.as_str().is_some_and(|value| {
-                    value == "0"
-                        || chrono::DateTime::parse_from_rfc3339(value)
-                            .is_ok_and(|at| at.timestamp() == 0 && at.timestamp_subsec_nanos() == 0)
-                })
-            {
+            if timestamp.as_f64() == Some(0.0) || timestamp.as_str().is_some_and(zero_price_time) {
                 *timestamp = Value::Null;
             }
         }
     }
+}
+
+fn zero_price_time(value: &str) -> bool {
+    if value == "0" {
+        return true;
+    }
+    // Chrono truncates fractional seconds beyond nanoseconds.
+    let zero_fraction = value.split_once('.').is_none_or(|(_, fraction)| {
+        fraction
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .all(|digit| digit == b'0')
+    });
+    zero_fraction
+        && chrono::DateTime::parse_from_rfc3339(value)
+            .is_ok_and(|at| at.timestamp() == 0 && at.timestamp_subsec_nanos() == 0)
 }
 
 fn keep(out: &mut Map<String, Value>, key: &str, value: &Value, valid: bool) {
