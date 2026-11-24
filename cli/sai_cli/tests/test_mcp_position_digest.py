@@ -63,6 +63,7 @@ class Position:
     close_fee: str = "0.002"
     minimum_position_microusd: str = "1"
     keeper_minimum_position_microusd: int = 1
+    market_reads: int = 0
     preview_inputs: bool = False
     malformed_node_info: bool = False
     price: float | str = 100.5
@@ -90,6 +91,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_POST(self) -> None:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            if request["query"] == keeper.MARKETS:
+                position.market_reads += 1
             if request["query"] == keeper.POSITION and position.snapshot_leverages:
                 position.leverage = position.snapshot_leverages.popleft()
             if request["query"] == keeper.SUBMIT:
@@ -975,6 +978,90 @@ def test_cli_preview_text_and_json_use_the_order_trigger(
         Decimal(".0001")
     ) == Decimal(60)
     assert position.submitted == []
+
+
+@pytest.mark.parametrize(
+    ("slippage", "accepted"),
+    [
+        ("0", False),
+        ("0.0", False),
+        ("0.00000000000000001", False),
+        ("0.0000000000000001", True),
+        ("100", True),
+        ("100.0000000000000001", False),
+    ],
+)
+def test_open_checks_slippage_before_preview(
+    position_service: tuple[Position, str],
+    tmp_path,
+    monkeypatch,
+    slippage: str,
+    accepted: bool,
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": slippage,
+    }
+    cli = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            f"{base_url}/query",
+            "--lcd-endpoint",
+            base_url,
+            "trade",
+            "open",
+            "--market",
+            "0",
+            "--side",
+            "long",
+            "--type",
+            "market",
+            "--amount",
+            "10",
+            "--leverage",
+            "2",
+            "--slippage",
+            slippage,
+            "--dry-run",
+        ],
+    )
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_open", args)
+            if accepted:
+                assert cli.exit_code == 0, cli.output
+                assert json.loads(cli.output)["intent"]["body"]["maxSlippagePct"] == (
+                    slippage
+                )
+                assert preview["intent"]["body"]["maxSlippagePct"] == slippage
+                assert preview["referencePrice"] == "100.5"
+            else:
+                assert cli.exit_code == 2, cli.output
+                error = json.loads(cli.output)["error"]
+                assert error["code"] == "INVALID_REQUEST"
+                assert "Slippage" in error["message"]
+                assert preview["code"] == "INVALID_REQUEST"
+                assert preview["error"] == error["message"]
+                trade = await call(
+                    client,
+                    "trade_open",
+                    {**args, "preview_digest": "0" * 64, "reference_price": "100.5"},
+                )
+                assert trade == preview
+                assert position.market_reads == 0
+            assert position.submitted == []
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

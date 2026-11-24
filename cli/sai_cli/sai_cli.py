@@ -1216,7 +1216,11 @@ def warn(message: str) -> None:
     "--price",
     help="Required trigger for limit/stop; optional dry-run reference for market orders. Live market orders use a refreshed price.",
 )
-@click.option("--slippage", required=True, help="Maximum slippage percentage.")
+@click.option(
+    "--slippage",
+    required=True,
+    help="Maximum slippage percentage, greater than 0 and at most 100.",
+)
 @click.option("--take-profit")
 @click.option("--stop-loss")
 @click.option(

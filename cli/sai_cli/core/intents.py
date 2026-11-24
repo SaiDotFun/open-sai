@@ -14,7 +14,7 @@ from secrets import choice
 from typing import Any
 
 from . import keeper, log, storage
-from .errors import Code
+from .errors import Code, ExitCode, SaiError
 
 IntentIdentity = tuple[str, str, str]  # Keeper endpoint, account, key
 
@@ -77,11 +77,19 @@ def open_intent(
         raise ValueError("A trigger price is required for limit and stop orders")
     if Decimal(amount) * 1_000_000 != (Decimal(amount) * 1_000_000).to_integral_value():
         raise ValueError("Amount must have at most six decimal places")
-    if slippage != "0" and (
-        positive(slippage, "Slippage") > 100 or len(slippage.partition(".")[2]) > 16
-    ):
-        raise ValueError(
-            "Slippage must be between 0 and 100 with at most 16 decimal places"
+    try:
+        valid_slippage = (
+            positive(slippage, "Slippage") <= 100
+            and len(slippage.partition(".")[2]) <= 16
+        )
+    except ValueError:
+        valid_slippage = False
+    if not valid_slippage:
+        raise SaiError(
+            "Slippage must be greater than 0 and at most 100 percent,"
+            " with at most 16 decimal places",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE,
         )
     body: dict[str, Any] = {
         "market": {"marketIndex": f"MarketIndex({market})"},
