@@ -128,6 +128,31 @@ class DiagnosticsTest(unittest.TestCase):
 
 
 class NetworkTest(unittest.TestCase):
+    def test_strict_requires_a_namespace_before_installing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "tools"
+            bin_dir.mkdir()
+            for name in ("uv", "claude", "codex"):
+                (bin_dir / name).symlink_to(sys.executable)
+            wheel = root / "sai_cli-0.1.1-py3-none-any.whl"
+            wheel.write_bytes(b"unused wheel")
+            script = Path(__file__).with_name("release-rehearsal.py").resolve()
+            result = subprocess.run(
+                [sys.executable, str(script), "--strict", str(wheel)],
+                cwd=root,
+                env={"HOME": temp, "TMPDIR": temp, "PATH": str(bin_dir)},
+                timeout=5,
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(result.returncode, 1)
+            self.assertIn(
+                "--strict requires a loopback-only network namespace", result.stderr
+            )
+            self.assertEqual(result.stdout, "")
+            self.assertCountEqual(root.iterdir(), [bin_dir, wheel])
+
     def test_namespace_isolates_direct_connections_from_the_host(self) -> None:
         with tempfile.TemporaryDirectory() as temp, socket.socket() as host:
             root = Path(temp)

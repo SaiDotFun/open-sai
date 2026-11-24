@@ -876,8 +876,15 @@ def probe_retry(
     return True
 
 
-def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) -> int:
+def rehearse(
+    root: Path, wheel: Path, version: str, diagnostics: Path | None, *, strict: bool
+) -> int:
     tool = Install(root, diagnostics)
+    prefix = namespace_prefix(tool.home, tool.env)
+    if strict and prefix is None:
+        raise RehearsalError(
+            "--strict requires a loopback-only network namespace for egress isolation"
+        )
     with keeper_server(Replay(wheel, version).handler()) as base:
         tool.run(
             "Install the published release",
@@ -899,7 +906,6 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
         root / "dependency-cache",
         wheel,
     )
-    prefix = namespace_prefix(tool.home, tool.env)
     if prefix is None:
         print(
             "Loopback-only network namespace unavailable. Using the dead proxy for proxy-aware traffic.",
@@ -1125,10 +1131,17 @@ def main() -> int:
         action="store_true",
         help="Save child output in a private scratch log",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Require a loopback-only network namespace for the rehearsal",
+    )
     args = parser.parse_args()
     if args.self_test:
         if args.wheel:
             parser.error("--self-test takes no candidate wheel")
+        if args.strict:
+            parser.error("--strict requires a candidate wheel")
         suite = unittest.defaultTestLoader.discover(
             str(Path(__file__).resolve().parent), pattern="release_rehearsal_test.py"
         )
@@ -1165,7 +1178,9 @@ def main() -> int:
                         dir=diagnostics.parent if diagnostics else None,
                     )
                 )
-            return rehearse(Path(scratch), wheel, version, diagnostics)
+            return rehearse(
+                Path(scratch), wheel, version, diagnostics, strict=args.strict
+            )
 
     return report_result(work)
 
