@@ -13,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import threading
@@ -1213,7 +1214,17 @@ def test_the_wheel_cache_must_be_private_and_ours(tmp_path, sai_home, monkeypatc
     assert wheels.stat().st_mode & 0o777 == 0o700
 
     other = os.getuid() + 1
-    monkeypatch.setattr(updater.os, "getuid", lambda: other)
+    lstat = Path.lstat
+
+    def cache_owner(path: Path) -> os.stat_result:
+        info = lstat(path)
+        if path == sai_home:
+            fields = list(info)
+            fields[stat.ST_UID] = other
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(Path, "lstat", cache_owner)
     with pytest.raises(updater.UpdateFailed, match="belongs to another user"):
         updater.private_cache()
     script = Script(tmp_path, "0.1.0")
