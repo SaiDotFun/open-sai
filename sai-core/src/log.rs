@@ -107,6 +107,10 @@ pub fn redact(home: &std::path::Path, text: &str) -> String {
     privacy::replace_tokens(text, &known)
 }
 
+pub fn enabled(env: &Environment) -> bool {
+    settings::log_keep_days(env).is_some()
+}
+
 /// Use the event writer's privacy rules for Keeper-controlled display fields.
 pub fn scrubber(home: &std::path::Path) -> impl Fn(Field) -> Value {
     Tokens::default().refresh(home);
@@ -133,7 +137,7 @@ struct Event {
 }
 
 pub struct LogWriter {
-    events: SyncSender<QueueItem>,
+    events: Mutex<Option<SyncSender<QueueItem>>>,
     done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
     command_schema: bool,
@@ -169,30 +173,61 @@ fn endpoint_id(root: &std::path::Path, endpoint: &str) -> Option<String> {
 #[derive(Clone, Copy)]
 pub struct EventContext<'a> {
     pub writer: Option<&'a LogWriter>,
-    pub surface: Surface,
-    pub command: Option<&'a str>,
+    surface: Surface,
+    command: Option<&'a str>,
+    tool_call: Option<(&'a str, &'a str)>,
 }
 
-impl EventContext<'_> {
-    pub fn quiet() -> Self {
+impl<'a> EventContext<'a> {
+    pub const fn quiet() -> Self {
+        Self::new(None, Surface::Cli, None)
+    }
+
+    pub const fn new(
+        writer: Option<&'a LogWriter>,
+        surface: Surface,
+        command: Option<&'a str>,
+    ) -> Self {
         Self {
-            writer: None,
-            surface: Surface::Cli,
-            command: None,
+            writer,
+            surface,
+            command,
+            tool_call: None,
         }
     }
 
-    pub fn event<'a>(
+    pub fn without_command(mut self) -> Self {
+        self.command = None;
+        self
+    }
+
+    pub fn with_tool(mut self, tool: &'a str, call_id: &'a str) -> Self {
+        self.tool_call = Some((tool, call_id));
+        self
+    }
+
+    pub fn event<'b>(
         self,
         name: &str,
         level: Level,
-        fields: impl IntoIterator<Item = (&'a str, Field)>,
+        fields: impl IntoIterator<Item = (&'b str, Field)>,
     ) {
         let Some(writer) = self.writer else { return };
         let command = self
             .command
             .map(|command| ("command", Field::Text(command.into())));
-        writer.event(self.surface, name, level, command.into_iter().chain(fields));
+        let call = self.tool_call.into_iter().flat_map(|(tool, call_id)| {
+            [
+                ("tool", Field::Text(tool.into())),
+                ("callId", Field::Text(call_id.into())),
+            ]
+        });
+        writer.event(
+            self.surface,
+            name,
+            level,
+            command.into_iter().chain(call).chain(fields),
+        );
     }
 }
 
@@ -239,7 +274,7 @@ impl LogWriter {
             })
             .ok()?;
         Some(Self {
-            events,
+            events: Mutex::new(Some(events)),
             done: Mutex::new(done),
             queue,
             command_schema,
@@ -309,7 +344,12 @@ impl LogWriter {
             endpoint_digest,
             command_bound,
         };
-        if self.events.try_send(QueueItem::Event(event)).is_err() {
+        let sent = self.events.lock().is_ok_and(|events| {
+            events
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(QueueItem::Event(event)).is_ok())
+        });
+        if !sent {
             self.queue.chars.fetch_sub(chars, Relaxed);
             self.queue.dropped.fetch_add(1, Relaxed);
         }
@@ -318,16 +358,25 @@ impl LogWriter {
     /// Wait for already queued diagnostics before inspecting log files.
     pub fn flush(&self, timeout: Duration) {
         let (ack, done) = mpsc::channel();
-        if self.events.try_send(QueueItem::Flush(ack)).is_ok() {
+        let sent = self.events.lock().is_ok_and(|events| {
+            events
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(QueueItem::Flush(ack)).is_ok())
+        });
+        if sent {
             let _ = done.recv_timeout(timeout);
         }
     }
 
     /// Close the queue and allow the writer up to `timeout` to finish.
-    pub fn finish(self, timeout: Duration) -> bool {
-        drop(self.events);
+    pub fn finish(&self, timeout: Duration) -> bool {
+        let Ok(mut events) = self.events.lock() else {
+            return false;
+        };
+        events.take();
+        drop(events);
         self.done
-            .into_inner()
+            .lock()
             .is_ok_and(|done| done.recv_timeout(timeout).is_ok())
     }
 }

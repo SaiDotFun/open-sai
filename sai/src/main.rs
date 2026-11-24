@@ -3,6 +3,7 @@ mod config;
 mod doctor;
 mod local;
 mod logs;
+mod mcp;
 mod mcp_registration;
 mod reads;
 mod repl;
@@ -15,6 +16,7 @@ use std::{
     ffi::OsString,
     path::Path,
     process,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -126,6 +128,7 @@ impl Cli {
         events: EventContext<'_>,
         operands: &[String],
         start_log: impl FnOnce(),
+        writer: Option<&Arc<LogWriter>>,
     ) -> Result<(), SaiError> {
         let flags = Flags {
             endpoint: self.endpoint,
@@ -140,7 +143,13 @@ impl Cli {
                 local::intent(command, &flags, env, json, events)
             }
             Some(Command::Config { command }) => command.run(&flags, env, json),
-            Some(Command::Mcp(args)) => args.run(json, operands.iter().any(|arg| arg == "--")),
+            Some(Command::Mcp(args)) => args.run(
+                flags,
+                env,
+                json,
+                operands.iter().any(|arg| arg == "--"),
+                writer.cloned(),
+            ),
             Some(Command::Doctor(args)) => args.run(flags, env, json, events, start_log),
             Some(Command::Market { command }) => command.run(&flags, env, json, events),
             Some(Command::Account { command }) => command.run(&flags, env, json, events),
@@ -155,7 +164,7 @@ impl Cli {
             None if self.skill => skill::show(None),
             None if json => Err(SaiError::usage("Pass a command when using --json.")),
             None => {
-                if let Some(writer) = events.writer {
+                if let Some(writer) = writer {
                     writer.flush(Duration::from_secs(1));
                 }
                 let environment = Ok(env.clone());
@@ -194,6 +203,11 @@ fn execute(
         (!command.is_empty()).then_some(command)
     };
     let started = Instant::now();
+    let surface = if command == "mcp serve" {
+        Surface::Mcp
+    } else {
+        Surface::Cli
+    };
     let writer = if command == "logs"
         || command.starts_with("logs ")
         || command == "skill show"
@@ -212,14 +226,15 @@ fn execute(
             "doctor" | "mcp install" | "mcp list" => LogWriter::start_diagnostic_command,
             _ => LogWriter::start_command,
         };
-        environment.as_ref().ok().cloned().and_then(start)
+        environment
+            .as_ref()
+            .ok()
+            .cloned()
+            .and_then(start)
+            .map(Arc::new)
     };
     let command_field = || json!(event_command).into();
-    let events = EventContext {
-        writer: writer.as_ref(),
-        surface: Surface::Cli,
-        command: event_command,
-    };
+    let events = EventContext::new(writer.as_deref(), surface, event_command);
     let log_started = Cell::new(false);
     let start_log = || {
         if let Some(writer) = &writer
@@ -232,7 +247,7 @@ fn execute(
                 &argv
             };
             writer.event(
-                Surface::Cli,
+                surface,
                 "command.start",
                 Level::Info,
                 [
@@ -253,13 +268,19 @@ fn execute(
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
-                .and_then(|env| cli.run(env, json, events, operands, start_log));
-            complete(result, usage_command, json, home)
+                .and_then(|env| cli.run(env, json, events, operands, start_log, writer.as_ref()));
+            complete(result, usage_command, json && command != "mcp serve", home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
     start_log();
-    finish(writer, command_field(), started, outcome)
+    finish(
+        writer.as_deref(),
+        surface,
+        command_field(),
+        started,
+        outcome,
+    )
 }
 
 fn eager_skill(argv: &[String]) -> bool {
@@ -368,7 +389,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
-        | "market list" | "market prices" | "trade open" => "",
+        | "mcp serve" | "market list" | "market prices" | "trade open" => "",
         "mcp install" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
@@ -414,7 +435,8 @@ fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
 }
 
 fn finish(
-    writer: Option<LogWriter>,
+    writer: Option<&LogWriter>,
+    surface: Surface,
     command: Field,
     started: Instant,
     (code, error): (ExitCode, Option<SaiError>),
@@ -438,7 +460,7 @@ fn finish(
                 fields.push(("intentKey", Field::Text(key)));
             }
         }
-        writer.event(Surface::Cli, "command.end", level, fields);
+        writer.event(surface, "command.end", level, fields);
         writer.finish(EXIT_FLUSH);
     }
     (code as u8).into()

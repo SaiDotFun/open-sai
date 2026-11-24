@@ -334,10 +334,7 @@ pub(super) fn check(
         if !ledger.unchanged() {
             return ledger.moved().changes(changes);
         }
-        let probe_events = EventContext {
-            command: None,
-            ..events
-        };
+        let probe_events = events.without_command();
         if let Some(error) = reconcile_pending(&ledger, endpoint, addr, &blocking, probe_events) {
             details["reconcileError"] = json!(error);
         }

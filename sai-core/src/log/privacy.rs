@@ -127,7 +127,7 @@ fn known_command(group: &str, word: &str) -> bool {
         "intent" => matches!(word, "local" | "status" | "wait"),
         "logs" => matches!(word, "path" | "tail" | "intent" | "run" | "stats"),
         "market" => matches!(word, "list" | "prices"),
-        "mcp" => matches!(word, "list" | "install"),
+        "mcp" => matches!(word, "list" | "install" | "serve"),
         "skill" => matches!(word, "show" | "source" | "install"),
         "trade" => matches!(word, "open" | "close" | "cancel" | "tpsl" | "leverage"),
         "watch" => matches!(word, "positions" | "balances" | "price"),

@@ -1237,6 +1237,7 @@ def rejected_value_samples() -> tuple[str, ...]:
         ("market", "prices"),
         ("logs", "path"),
         ("mcp", "list"),
+        ("mcp", "serve"),
     ],
 )
 def test_unexpected_flags_do_not_echo_generated_credentials(
