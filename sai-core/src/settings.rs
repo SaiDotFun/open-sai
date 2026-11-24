@@ -532,10 +532,7 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
         let value = match raw.to_str() {
             Some(raw) => key.parse_value(raw),
             None => match key.spec().kind {
-                Kind::Url(schemes) => Err(key.expected(&format!(
-                    "a URL starting with {}:// or {}://",
-                    schemes[0], schemes[1]
-                ))),
+                Kind::Url(_) => key.check_url(""),
                 _ => Err(key.expected("a UTF-8 value")),
             },
         };

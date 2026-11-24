@@ -318,7 +318,8 @@ fn repairs_dotted_assignments_inside_an_explicit_section() {
 #[test]
 fn editing_any_registry_key_preserves_other_tables_byte_for_byte() {
     let home = tempdir().unwrap();
-    let path = home.path().join("config.toml");
+    let env = fixture(home.path(), &[]);
+    let path = env.path();
     let before = "[future.first]\n# first\nlist = [\n  1,\n]\n\n";
     let between = "[future.middle]\n# middle café\nother.key = { keep = true }\n\n";
     let after = "[[future.last]] # last\nother = '''\n# keep verbatim\n'''\n";
@@ -369,6 +370,13 @@ fn editing_any_registry_key_preserves_other_tables_byte_for_byte() {
                         actual.ends_with(&after.replace('\n', newline)),
                         "{input:?} => {actual:?}"
                     );
+                    let resolved = Settings::load(&Flags::default(), &env).unwrap();
+                    if unset {
+                        assert_ne!(resolved.source(key), Source::File, "{actual:?}");
+                    } else {
+                        assert_eq!(resolved.value(key), &value, "{actual:?}");
+                        assert_eq!(resolved.source(key), Source::File, "{actual:?}");
+                    }
                 }
             }
         }

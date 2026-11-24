@@ -387,6 +387,7 @@ fn undecodable_environment_values_keep_their_precedence() {
     let fixture = OsStr::from_bytes(b"\xff");
     let output = sai(root.path())
         .env("SAI_ENDPOINT", fixture)
+        .env("SAI_LOG", "0")
         .args(["config", "get", "keeper.endpoint"])
         .output()
         .unwrap();

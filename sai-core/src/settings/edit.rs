@@ -267,7 +267,6 @@ fn collect_item_ranges(item: &Item, ranges: &mut Vec<Range<usize>>) {
     let mut add_table = |table: &Table| {
         ranges.extend(header_span(table));
         for (_, child) in table.iter() {
-            // An explicit table's span already covers its direct assignments.
             collect_item_ranges(child, ranges);
         }
     };
