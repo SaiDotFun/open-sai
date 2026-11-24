@@ -744,8 +744,11 @@ def test_mcp_market_bound_and_moved_price_preview(
     asyncio.run(scenario())
 
 
-def test_mcp_stop_has_no_bound_and_unavailable_oracle_keeps_preview(
+@pytest.mark.parametrize(("side", "bound"), [("short", "99"), ("long", "101")])
+def test_mcp_stop_bounds_fill_even_without_a_collateral_price(
     position_service: tuple[Position, str],
+    side: str,
+    bound: str,
 ) -> None:
     position, base_url = position_service
     position.preview_inputs = True
@@ -758,7 +761,7 @@ def test_mcp_stop_has_no_bound_and_unavailable_oracle_keeps_preview(
                 "preview_open",
                 {
                     "market_id": 0,
-                    "side": "short",
+                    "side": side,
                     "order_type": "stop",
                     "price": "100",
                     "amount": "10",
@@ -767,8 +770,8 @@ def test_mcp_stop_has_no_bound_and_unavailable_oracle_keeps_preview(
                 },
             )
             estimates = preview["estimates"]
-            assert estimates["worstCaseFill"]["status"] == "unbounded"
-            assert "price" not in estimates["worstCaseFill"]
+            assert estimates["worstCaseFill"]["status"] == "bound"
+            assert estimates["worstCaseFill"]["price"] == bound
             assert estimates["fees"]["status"] == "unavailable"
             assert estimates["liquidationPrice"]["status"] == "unavailable"
             assert len(preview["previewDigest"]) == 64

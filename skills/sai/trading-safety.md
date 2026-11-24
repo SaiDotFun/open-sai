@@ -51,12 +51,9 @@ the CLI or the MCP tools. A mistake here spends the person's money.
      the worst fill is `trigger × (1 + s)` for a long and
      `trigger × (1 − s)` for a short. A long limit at 60,600 with 1% slippage
      can fill up to 61,206. State that number too.
-   - A stop order has no fill bound you can state in advance. It triggers
-     once the oracle price passes the stop price, and the contract applies
-     the slippage to the oracle price at that moment. If the price gaps from
-     below 60,600 to 62,000, a long stop at 60,600 fills near 62,000. Tell
-     the person the stop price is where the order starts, not where it
-     fills.
+   - Stop orders use the same slippage bound around the stored trigger.
+     A long stop at 100 with 1% slippage can fill up to 101. If the oracle
+     gaps to 105, the contract rejects a fill outside that bound.
    - Keeper's full and partial close intents carry no slippage limit.
    - Prefer MCP tools `preview_open` and `trade_open` when approval depends
      on a quoted price.
@@ -203,10 +200,9 @@ approval still describes the trade:
 
 - **Limit and stop opens, `tpsl`, `leverage`, `close`, and `--cancel-order`**
   send exactly the arguments shown. Drop `--dry-run` once the person has
-  confirmed the account, the network, and those arguments. For a limit
-  open, the confirmation covers the worst fill from rule 3,
-  `trigger × (1 + s)` for a long, not the trigger alone. For a stop open,
-  the person confirms knowing the fill has no advance bound.
+  confirmed the account, the network, and those arguments. For limit
+  and stop opens, include the bound from rule 3 in the confirmation.
+
 - **Partial close** takes a percentage and recomputes the amount from the
   position at submit. If the person approved "close 50%, about 50 USDC" and
   the position doubles before submit, the live command closes 100 USDC. Ask

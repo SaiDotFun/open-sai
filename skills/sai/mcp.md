@@ -148,11 +148,10 @@ reference `R`, choose a slippage with `R × (1 + s)² ≤ C`, so
 `s ≤ 0.498%`: 0.49% gives a worst case of 60,589.44, and 0.5% allows
 60,601.50. For a short with a floor `F`, use `s ≤ 1 − sqrt(F / R)`.
 
-A limit order's `price` is a trigger, not a cap. The contract applies the
-slippage after the trigger check, so its worst fill is `trigger × (1 + s)`
-for a long and `trigger × (1 − s)` for a short. A stop order has no advance
-fill bound: the slippage applies to the oracle price when the stop triggers,
-which can sit well past the stop price after a gap.
+Limit and stop order prices are triggers. Perp applies the slippage around
+the stored trigger after checking that the order can fill. The worst fill is
+`trigger × (1 + s)` for a long and `trigger × (1 − s)` for a short.
+A stop can miss its fill when a gap takes the price outside that bound.
 [trading-safety.md](trading-safety.md) rule 3 has the full rule.
 
 On `PREVIEW_MISMATCH` or `PRICE_MOVED` nothing was submitted. The result

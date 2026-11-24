@@ -48,11 +48,6 @@ def fill_range(
     *,
     mcp_market: bool,
 ) -> dict[str, Any]:
-    if order_type == "stop":
-        return {
-            "status": "unbounded",
-            "reason": "The oracle can gap past the stop trigger before execution.",
-        }
     if reference is None:
         return unavailable("Keeper market price is unavailable.")
     price = Decimal(reference["price"])
