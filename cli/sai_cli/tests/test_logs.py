@@ -2686,6 +2686,56 @@ def test_logs_stats_continuation_keeps_out_of_order_appends(home):
     assert "nextBefore" not in earlier
 
 
+@pytest.mark.parametrize("query", ["run", "stats"])
+def test_log_cursor_reaches_early_rows_past_the_byte_cap(home, query):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    retained = 300
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+        "runId": "process",
+        "extra": "x" * 1_800,
+    }
+    path = log.file_path("cli", start.date(), root)
+    with path.open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {**sample, "seq": i, "ts": log.stamp(start + timedelta(milliseconds=i))}
+            )
+            for i in range(10_000)
+        )
+    assert path.stat().st_size > log.MAX_SCAN_BYTES
+
+    args = ("--json", "logs", query, *(("process",) if query == "run" else ()))
+    before = log.stamp(start + timedelta(milliseconds=retained))
+    code, output = run_cli(*args, "--before", before)
+    assert code == 0
+    first = json.loads(output)
+    assert first["truncated"]
+    assert first["events" if query == "run" else "keeper"] == (
+        [] if query == "run" else {}
+    )
+    pages = []
+    while next_before := (pages[-1] if pages else first).get("nextBefore"):
+        code, output = run_cli(*args, "--before", next_before)
+        assert code == 0
+        pages.append(json.loads(output))
+        assert len(pages) <= 3
+
+    if query == "run":
+        assert [
+            line["seq"] for page in reversed(pages) for line in page["events"]
+        ] == list(range(retained))
+    else:
+        assert len(pages) == 1
+        assert pages[0]["keeper"]["prices"]["count"] == retained
+        assert pages[0]["errors"] == {"KEEPER_ERROR": retained}
+
+
 def test_mcp_log_concurrency_leaves_normal_tools_available(keeper_stub):
     endpoint, state = keeper_stub
     state.intents_block = threading.Event()

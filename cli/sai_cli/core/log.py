@@ -1543,6 +1543,7 @@ class PageScan:
                     for slot in readers:
                         advance(slot, readers, heads, offsets)
                         if byte_limit:
+                            self.resume = ScanPosition(day, tuple(offsets))
                             return
                     while heads:
                         if rows_left == 0:
@@ -1559,6 +1560,7 @@ class PageScan:
                         yield position, line
                         advance(slot, readers, heads, offsets)
                         if byte_limit:
+                            self.resume = ScanPosition(day, tuple(offsets))
                             return
 
 

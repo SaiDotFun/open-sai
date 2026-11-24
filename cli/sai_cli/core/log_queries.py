@@ -421,8 +421,13 @@ class _PageReport:
         if scan.truncated or stop is not None:
             self.report["truncated"] = True
             self.report["more"] = "Use --before to continue reading the retained logs."
-            if last is not None and (position := stop or scan.resume) is not None:
-                self.report["nextBefore"] = cursor.encode(position, last, parent)
+            if (position := stop or scan.resume) is not None:
+                # A timestamp-only query can exhaust its byte budget while
+                # skipping newer rows. The continuation still has a position.
+                stamp = last or cursor.timestamp or cursor.upper
+                if stamp is None:
+                    stamp = f"{position.day.isoformat()}T00:00:00.000Z"
+                self.report["nextBefore"] = cursor.encode(position, stamp, parent)
         return self.report
 
 
