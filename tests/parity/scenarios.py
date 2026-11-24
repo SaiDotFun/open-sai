@@ -442,6 +442,15 @@ def loopback(
                 if name == "recordUserIntent" and scenario == "concurrent-close":
                     self.admit_close(request.variables)
                     return
+                if (
+                    scenario == "confirmation-account-change"
+                    and name == "trade"
+                    and same_variables(
+                        request.variables, {"trader": OTHER_ADDRESS, "id": 7}
+                    )
+                ):
+                    self.reply({"data": {"perp": {"trade": None}}})
+                    return
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):
                         self.reject(f"Wrong Keeper variables for {name}")

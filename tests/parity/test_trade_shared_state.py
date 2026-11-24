@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import select
@@ -10,16 +11,20 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from collections import defaultdict
-from collections.abc import Generator
-from contextlib import closing, contextmanager
+from collections.abc import AsyncGenerator, Generator
+from contextlib import asynccontextmanager, closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import pytest
-from scenarios import ADDRESS, Endpoints, child_env, loopback, seed_home
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import TextContent
+from scenarios import ADDRESS, OTHER_ADDRESS, Endpoints, child_env, loopback, seed_home
 from trade_replay import REQUEST_HASH, SESSION, TradeReplay
 
 REFERENCE = "973f3f59f38dd89d0c2e03e674157934a00316ae"
@@ -564,3 +569,244 @@ def test_submission_times_out_after_keeper_receives_mutation(
         home.row(key, replay.kind, replay.entity, "pending")
         assert replay.counts() == {key: 1} and not endpoints.errors
         assert_trade_events(home, key, ["pending"], acked=False)
+
+
+@asynccontextmanager
+async def mcp_session(home: Home, runner: Runtime) -> AsyncGenerator[ClientSession]:
+    params = StdioServerParameters(
+        command=runner.cli[0],
+        args=[*runner.cli[1:], "mcp", "serve"],
+        cwd=home.path,
+        env=home.env,
+    )
+    with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
+        async with (
+            stdio_client(params, errlog=stderr) as (reader, writer),
+            ClientSession(reader, writer) as session,
+        ):
+            async with asyncio.timeout(10):
+                await session.initialize()
+            yield session
+
+
+async def tool(session: ClientSession, name: str, **params: Any) -> dict[str, Any]:
+    async with asyncio.timeout(12):
+        result = await session.call_tool(name, params)
+    [item] = result.content
+    assert isinstance(item, TextContent)
+    return json.loads(item.text)
+
+
+def rust_mcp_stub(runner: Runtime, name: str, result: dict[str, Any]) -> bool:
+    # #120 exposes tool schemas before the signed-in handlers are wired.
+    return runner.rust and result.get("error") == (
+        f"Tool {name} is not implemented in the Rust Sai server"
+    )
+
+
+def require_mcp(home: Home, runner: Runtime) -> None:
+    if command_help(home, runner, "mcp", "serve") is None:
+        pytest.skip("Rust MCP stdio awaits #120 and the signed-in trade handlers")
+
+
+MCP_ARGS: dict[str, dict[str, Any]] = {
+    "open": {
+        "market_id": 3,
+        "side": "long",
+        "order_type": "market",
+        "amount": "20",
+        "leverage": "2",
+        "slippage": "1",
+    },
+    "close": {"trade_id": 7},
+    "cancel": {"trade_id": 7, "cancel_order": True},
+    "margin": {"trade_id": 7, "direction": "add", "amount": "1"},
+    "partial-close": {"trade_id": 7, "percent": 50},
+    "tpsl": {"trade_id": 7, "take_profit": "110", "clear_stop_loss": True},
+    "leverage": {"trade_id": 7, "leverage": "5"},
+}
+
+
+def mcp_action(action_name: str) -> str:
+    return "close" if action_name == "cancel" else action_name.replace("-", "_")
+
+
+async def mcp_preview(
+    session: ClientSession, runner: Runtime, action_name: str
+) -> dict[str, Any] | None:
+    name = mcp_action(action_name)
+    preview_name = f"preview_{name}"
+    async with asyncio.timeout(10):
+        tools = {item.name for item in (await session.list_tools()).tools}
+    if runner.rust and not {preview_name, f"trade_{name}"} <= tools:
+        return None
+    preview = await tool(session, preview_name, **MCP_ARGS[action_name])
+    if rust_mcp_stub(runner, preview_name, preview):
+        return None
+    assert preview["addr"] == ADDRESS and preview["dryRun"] is True
+    assert preview["intent"]["kind"] == ACTIONS[action_name].kind
+    assert preview["previewDigest"]
+    return preview
+
+
+@pytest.mark.parametrize("first_surface", ["cli", "mcp"])
+@pytest.mark.parametrize("action_name", ACTIONS)
+@pytest.mark.parametrize(
+    ("cli_name", "mcp_name"),
+    [("python", "python"), ("python", "rust"), ("rust", "python")],
+)
+def test_cli_and_mcp_overlap(
+    first_surface: str,
+    action_name: str,
+    cli_name: str,
+    mcp_name: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    cli = runtime(cli_name, request, python_reference)
+    mcp = runtime(mcp_name, request, python_reference)
+    reconciler = runtime(
+        "rust" if python_reference is not None else "python", request, python_reference
+    )
+    action = ACTIONS[action_name]
+    replay = action.replay(hold_admission=True)
+    tool_name = f"trade_{mcp_action(action_name)}"
+    with loopback(action.server, trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "session")
+        trade_help(home, cli, action_name)
+        require_mcp(home, mcp)
+
+        async def overlap() -> str | None:
+            async with mcp_session(home, mcp) as session:
+                preview = await mcp_preview(session, mcp, action_name)
+                if preview is None:
+                    return None
+                params = {
+                    **MCP_ARGS[action_name],
+                    "preview_digest": preview["previewDigest"],
+                }
+                if action_name == "open":
+                    params["reference_price"] = preview["referencePrice"]
+
+                async def cli_trade() -> dict[str, Any]:
+                    result = await asyncio.to_thread(
+                        home.invoke, cli, "--json", "trade", *action.args
+                    )
+                    assert result.returncode in (0, 1) and not result.stderr, result
+                    data = json.loads(result.stdout)
+                    return data["error"] if result.returncode else data
+
+                async def mcp_trade() -> dict[str, Any]:
+                    return await tool(session, tool_name, **params)
+
+                start, contend = (
+                    (cli_trade, mcp_trade)
+                    if first_surface == "cli"
+                    else (mcp_trade, cli_trade)
+                )
+                first = asyncio.create_task(start())
+                arrived = asyncio.create_task(asyncio.to_thread(replay.arrived.wait, 8))
+                try:
+                    ready, _ = await asyncio.wait(
+                        (first, arrived), return_when=asyncio.FIRST_COMPLETED
+                    )
+                    if first in ready:
+                        result = first.result()
+                        if rust_mcp_stub(mcp, tool_name, result):
+                            return None
+                        pytest.fail(
+                            f"{first_surface} exited before admission: {result}"
+                        )
+                    assert arrived.result(), f"{first_surface} did not reach Keeper"
+                    [key] = replay.counts()
+                    home.row(key, replay.kind, replay.entity, "unknown")
+                    sent = replay.intent(key).copy()
+                    del sent["intentSchemaVersion"], sent["tsIntentInit"]
+                    expected_intent = preview["intent"]
+                    if action_name == "open":
+                        expected_intent = {
+                            **expected_intent,
+                            "body": {
+                                **expected_intent["body"],
+                                "intentPrice": preview["referencePrice"],
+                            },
+                        }
+                    assert sent == expected_intent
+                    blocked = await contend()
+                    if rust_mcp_stub(mcp, tool_name, blocked):
+                        return None
+                    expected = (
+                        "RECENT_OPEN_PENDING"
+                        if action_name == "open"
+                        else "INVALID_REQUEST"
+                    )
+                    assert blocked["code"] == expected, blocked
+                    assert key in blocked.get("message", blocked.get("error", ""))
+                    if "intentKey" in blocked:
+                        assert blocked["intentKey"] == key
+                    assert replay.counts() == {key: 1}
+                finally:
+                    replay.release.set()
+                    await arrived
+                    result = await first
+                assert result["intentKey"] == key and result["status"] == "accepted"
+                return key
+
+        key = asyncio.run(overlap())
+        if key is None:
+            pytest.skip(f"Rust MCP {mcp_action(action_name)} awaits signed-in handlers")
+        home.row(key, replay.kind, replay.entity, "accepted")
+        replay.phase = "pending"
+        home.json(reconciler, "intent", "status", ADDRESS, "--key", key)
+        home.row(key, replay.kind, replay.entity, "pending")
+        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert_trade_events(home, key, ["accepted", "pending"], acked=True)
+
+
+@pytest.mark.parametrize(
+    ("mcp_name", "switcher"),
+    [("python", "python"), ("python", "rust"), ("rust", "python")],
+)
+def test_mcp_confirmation_rechecks_active_account(
+    mcp_name: str,
+    switcher: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    mcp = runtime(mcp_name, request, python_reference)
+    cli = runtime(switcher, request, python_reference)
+    replay = TradeReplay()
+    with loopback("confirmation-account-change", trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "accounts")
+        require_mcp(home, mcp)
+        home.json(cli, "auth", "use", ADDRESS)
+
+        async def confirm() -> bool:
+            async with mcp_session(home, mcp) as session:
+                preview = await mcp_preview(session, mcp, "close")
+                if preview is None:
+                    return False
+                await asyncio.to_thread(home.json, cli, "auth", "use", OTHER_ADDRESS)
+                refused = await tool(
+                    session,
+                    "trade_close",
+                    trade_id=7,
+                    preview_digest=preview["previewDigest"],
+                )
+                if rust_mcp_stub(mcp, "trade_close", refused):
+                    return False
+                assert refused["code"] == "PREVIEW_MISMATCH"
+                assert refused["preview"]["addr"] == OTHER_ADDRESS
+                assert refused["preview"]["previewDigest"] != preview["previewDigest"]
+                return True
+
+        if not asyncio.run(confirm()):
+            pytest.skip(
+                "Rust MCP preview_close and trade_close await signed-in handlers"
+            )
+        assert replay.counts() == {} and not endpoints.errors
+        assert not (home.path / LEDGER).exists()
