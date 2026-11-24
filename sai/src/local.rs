@@ -1,10 +1,7 @@
 use std::{
-    env,
     error::Error,
     fmt::Write as _,
-    fs,
     io::{self, Write},
-    path::Path,
 };
 
 use chrono::Utc;
@@ -16,9 +13,10 @@ use sai_core::{
 };
 use serde::Serialize;
 use serde_json::ser::{Formatter, PrettyFormatter};
-use toml_edit::Document;
+mod settings;
 
-const MAINNET_HTTP: &str = "https://sai-keeper.nibiru.fi/query";
+pub use settings::SettingsFlags;
+use settings::keeper_endpoint;
 
 #[derive(Subcommand)]
 pub enum AuthCommand {
@@ -65,19 +63,19 @@ struct Logout {
 pub fn auth(
     command: AuthCommand,
     as_addr: Option<&str>,
-    flag: Option<&str>,
+    flags: SettingsFlags<'_>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let path = config_path()?;
     let storage = Storage::new(path.parent().expect("config filename under Sai home"));
     match command {
         AuthCommand::Status => {
-            let endpoint = keeper_endpoint(&path, flag)?;
+            let endpoint = keeper_endpoint(&path, flags)?;
             let session = storage.load_active_session(&endpoint, as_addr)?;
             emit(&session.summary()?, json)
         }
         AuthCommand::List => {
-            let endpoint = keeper_endpoint(&path, flag)?;
+            let endpoint = keeper_endpoint(&path, flags)?;
             let accounts = storage.load_accounts()?;
             let now = Utc::now();
             let accounts = accounts
@@ -125,76 +123,15 @@ pub fn auth(
 
 pub fn intent(
     command: IntentCommand,
-    flag: Option<&str>,
+    flags: SettingsFlags<'_>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
     let path = config_path()?;
     let storage = Storage::new(path.parent().expect("config filename under Sai home"));
-    let endpoint = keeper_endpoint(&path, flag)?;
+    let endpoint = keeper_endpoint(&path, flags)?;
     match command {
         IntentCommand::Local { addr } => emit(&storage.list_pending(&endpoint, &addr)?, json),
     }
-}
-
-// Replace this adapter with the shared C2 settings resolver once it lands.
-// Local commands keep the original endpoint string for storage comparisons.
-fn keeper_endpoint(path: &Path, flag: Option<&str>) -> Result<String, Box<dyn Error>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-        Err(error) => {
-            return Err(format!("Cannot read {}: {error}", path.display()).into());
-        }
-    };
-    let file = Document::parse(text.as_str())
-        .map_err(|_| format!("Cannot parse {} as TOML", path.display()))?;
-    let configured = file
-        .get("keeper")
-        .map(|item| {
-            item.as_table_like().ok_or_else(|| {
-                format!(
-                    "{}: 'keeper' must be a table, such as [keeper]",
-                    path.display()
-                )
-            })
-        })
-        .transpose()?
-        .and_then(|table| table.get("endpoint"))
-        .map(|item| {
-            let url = item.as_str().ok_or_else(|| {
-                format!(
-                    "{}: Invalid value for keeper.endpoint: expected a URL string",
-                    path.display()
-                )
-            })?;
-            checked_endpoint(url, &path.display().to_string())
-        })
-        .transpose()?;
-    if let Some(endpoint) = flag {
-        return Ok(checked_endpoint(endpoint.trim(), "--endpoint")?.to_owned());
-    }
-    if let Ok(endpoint) = env::var("SAI_ENDPOINT")
-        && !endpoint.trim().is_empty()
-    {
-        return Ok(checked_endpoint(endpoint.trim(), "SAI_ENDPOINT")?.to_owned());
-    }
-    Ok(configured.unwrap_or(MAINNET_HTTP).to_owned())
-}
-
-fn checked_endpoint<'a>(url: &'a str, source: &str) -> Result<&'a str, String> {
-    if let Some((scheme, rest)) = url.trim_start().split_once("://")
-        && (scheme.eq_ignore_ascii_case("https") || scheme.eq_ignore_ascii_case("http"))
-        && !rest
-            .split(['/', '?', '#'])
-            .next()
-            .unwrap_or_default()
-            .is_empty()
-    {
-        return Ok(url);
-    }
-    Err(format!(
-        "{source}: Invalid value for keeper.endpoint: expected a URL starting with https:// or http://"
-    ))
 }
 
 // Match the spaces Python emits with json.dumps(indent=None).

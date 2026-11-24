@@ -141,6 +141,76 @@ fn auth_output_shows_only_the_origin_but_checks_the_full_endpoint() {
 }
 
 #[test]
+fn local_commands_reject_an_invalid_lcd_setting_before_accessing_storage() {
+    let home = tempdir().unwrap();
+    let config = home.path().join("config.toml");
+    fs::write(&config, "[lcd]\nendpoint = false\n").unwrap();
+    let expected = format!(
+        "Error: {}: Invalid value for lcd.endpoint: expected a URL string\n",
+        config.display()
+    );
+    for args in [
+        &["auth", "list"][..],
+        &["auth", "status"][..],
+        &["intent", "local", ADDR][..],
+    ] {
+        let output = rust(home.path()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, expected.as_bytes());
+    }
+    assert!(!home.path().join("trader").exists());
+}
+
+#[test]
+fn url_validation_rejects_malformed_authorities_without_echoing_them() {
+    let home = tempdir().unwrap();
+    for bad in [
+        "https://fixture-user:fixture-password@example.test：80",
+        "https://[::1]suffix",
+        "https://[::1%]",
+    ] {
+        let output = rust(home.path())
+            .env("SAI_LCD_ENDPOINT", bad)
+            .args(["auth", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        assert!(output.stderr == b"Error: SAI_LCD_ENDPOINT: Invalid value for lcd.endpoint: expected a URL starting with https:// or http://\n");
+    }
+}
+
+#[test]
+#[ignore = "requires uv and a Python reference checkout"]
+fn invalid_settings_match_python_for_local_commands() {
+    let home = tempdir().unwrap();
+    let config = home.path().join("config.toml");
+    for invalid in [
+        "[lcd]\nendpoint = false\n",
+        "[update]\nauto = 'off'\n",
+        "[keeper]\nws_endpoint = 'http://localhost'\n",
+    ] {
+        fs::write(&config, invalid).unwrap();
+        parity(home.path(), &["--json", "auth", "list"], 1);
+        parity(home.path(), &["--json", "auth", "status"], 1);
+        parity(home.path(), &["--json", "intent", "local", ADDR], 1);
+    }
+    fs::remove_file(config).unwrap();
+    for flag in ["--ws-endpoint", "--lcd-endpoint"] {
+        parity(home.path(), &["--json", flag, "invalid", "auth", "list"], 1);
+    }
+    assert!(!home.path().join("trader").exists());
+
+    fs::write(
+        home.path().join("config.toml"),
+        "[future]\nnumber = 9223372036854775809\n[logs]\nkeep_days = 9223372036854775809\n",
+    )
+    .unwrap();
+    parity(home.path(), &["--json", "auth", "list"], 0);
+}
+
+#[test]
 #[ignore = "requires uv and a Python reference checkout"]
 fn python_import_rust_switch_and_python_logout() {
     let root = tempdir().unwrap();

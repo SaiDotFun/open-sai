@@ -6,7 +6,7 @@ use serde_json::json;
 
 mod local;
 
-use local::{AuthCommand, IntentCommand};
+use local::{AuthCommand, IntentCommand, SettingsFlags};
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -16,6 +16,12 @@ struct Cli {
     /// Override the Keeper GraphQL HTTP endpoint.
     #[arg(long)]
     endpoint: Option<String>,
+    /// Override the Keeper WebSocket endpoint.
+    #[arg(long)]
+    ws_endpoint: Option<String>,
+    /// Override the Nibiru REST endpoint.
+    #[arg(long)]
+    lcd_endpoint: Option<String>,
     /// Run as another connected account instead of the active account.
     #[arg(long = "as", value_name = "ADDR")]
     as_addr: Option<String>,
@@ -50,15 +56,20 @@ enum ConfigCommand {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    let settings_flags = SettingsFlags {
+        endpoint: cli.endpoint.as_deref(),
+        ws_endpoint: cli.ws_endpoint.as_deref(),
+        lcd_endpoint: cli.lcd_endpoint.as_deref(),
+    };
     match cli.command {
         Command::Auth { command } => local_result(local::auth(
             command,
             cli.as_addr.as_deref(),
-            cli.endpoint.as_deref(),
+            settings_flags,
             cli.json,
         )),
         Command::Intent { command } => {
-            local_result(local::intent(command, cli.endpoint.as_deref(), cli.json))
+            local_result(local::intent(command, settings_flags, cli.json))
         }
         Command::Config {
             command: ConfigCommand::List,
