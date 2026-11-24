@@ -77,6 +77,15 @@ def close_trade_args(endpoint: str) -> list[str]:
     return [*_resolve_cli(), "--endpoint", endpoint, "--json", "trade", "close", "7"]
 
 
+@pytest.fixture
+def fail_ledger_updates() -> None:
+    with storage.db() as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_status_write BEFORE UPDATE OF status ON intents "
+            "BEGIN SELECT RAISE(ABORT, 'ledger write failed'); END"
+        )
+
+
 def _resolve_cli() -> list[str]:
     path = shutil.which("sai")
     if path:
@@ -378,6 +387,72 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_keeper_result_survives_a_failed_ledger_write(
+    fail_ledger_updates, acknowledged
+):
+    requests = []
+
+    def reply(key: str) -> dict:
+        requests.append(key)
+        if not acknowledged:
+            return {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+        return {
+            "data": {
+                "recordUserIntent": {
+                    "intentKey": key,
+                    "lifecycleStep": "jwt_pass",
+                    "execActor": "server",
+                    "evmAddress": TRADE_ADDR,
+                }
+            }
+        }
+
+    with submission_keeper(reply) as endpoint:
+        save_trade_session(endpoint)
+        result = subprocess.run(
+            close_trade_args(endpoint),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    [key] = requests
+    assert result.returncode == (5 if acknowledged else 4), (
+        result.stderr or result.stdout
+    )
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == (
+        "OUTCOME_UNKNOWN" if acknowledged else "ADMISSION_REJECTED"
+    )
+    assert error["retryable"] is (not acknowledged)
+    assert error["intentKey"] == key
+    assert (
+        error["hint"]
+        == f"sai --endpoint {endpoint} intent status {TRADE_ADDR} --key {key}"
+    )
+    assert storage.list_pending(endpoint, TRADE_ADDR)[0]["status"] == "unknown"
+
+
+def test_connect_refusal_survives_a_failed_ledger_write(fail_ledger_updates):
+    with socket.socket() as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        endpoint = f"http://127.0.0.1:{unavailable.getsockname()[1]}/query"
+        save_trade_session(endpoint)
+        result = subprocess.run(
+            close_trade_args(endpoint),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    assert result.returncode == 4, result.stderr
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "NOT_SENT" and error["retryable"] is True
+    [entry] = storage.list_pending(endpoint, TRADE_ADDR)
+    assert entry["intentKey"] == error["intentKey"] and entry["status"] == "unknown"
 
 
 @pytest.mark.parametrize("credential_in_path", [False, True], ids=["query", "path"])
