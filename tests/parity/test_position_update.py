@@ -331,8 +331,13 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
             ):
                 self.reject("Perp estimate read was unpinned")
                 return
-            if mode == "group-fallback" and name == "get_pair_custom_max_leverage":
-                self.reply(MISSING_CAP, status=404)
+            missing_cap_heights = {
+                "group-fallback": HEIGHT,
+                "cap-wrong-height": "119",
+                "cap-missing-height": None,
+            }
+            if name == "get_pair_custom_max_leverage" and mode in missing_cap_heights:
+                self.reply(MISSING_CAP, status=404, height=missing_cap_heights[mode])
                 return
             if mode == "cap-unavailable" and name == "get_pair_custom_max_leverage":
                 self.reply({"message": "service unavailable"}, status=503)
@@ -499,6 +504,26 @@ def test_position_update_dry_run(
             assert [entry.label for entry in endpoints.wire] == QUOTE_WIRE + suffix
             assert not endpoints.errors
             assert not (home / "sai/trader/intents.sqlite3").exists()
+
+
+@pytest.mark.parametrize("mode", ["cap-wrong-height", "cap-missing-height"])
+def test_pair_cap_fallback_requires_the_pinned_height(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, mode: str
+) -> None:
+    # The pinned Python helper accepts even unverified storage misses.
+    _, rust = cli_pair
+    with update_loopback(mode) as endpoints:
+        seed_home(tmp_path / "rust", endpoints, "session")
+        code, output, stderr = run(
+            rust, tmp_path / "rust", endpoints, (*LEVERAGE, "--dry-run"), python=False
+        )
+        assert (code, stderr) == (0, "")
+        assert output["estimates"] == estimates(
+            unavailable("Position entry price or projected collateral is unavailable.")
+        )
+        assert [request.label for request in endpoints.wire] == QUOTE_WIRE + LEVERAGE_WIRE
+        assert not endpoints.errors
+        assert not (tmp_path / "rust/sai/trader/intents.sqlite3").exists()
 
 
 @pytest.mark.parametrize("command", [TPSL, LEVERAGE], ids=["tpsl", "leverage"])

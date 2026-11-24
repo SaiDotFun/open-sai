@@ -109,16 +109,10 @@ impl Lcd<'_> {
         let (status, headers, bytes) = keeper::lcd_get(url.as_str(), headers, TIMEOUT)
             .await
             .map_err(|_| read.failure())?;
-        if !status.is_success() {
-            // A Perp storage miss means the group maximum applies. Other LCD
-            // failures cannot establish whether the pair has a cap.
-            if missing_cap_is_zero && ABSENT_CAP.is_match(&String::from_utf8_lossy(&bytes)) {
-                return Ok((json!({"data": "0"}), None));
-            }
-            return Err(read.failure());
-        }
-        let data: Value = serde_json::from_slice(&bytes).map_err(|_| read.failure())?;
-        if !data.is_object() {
+        let missing_cap = !status.is_success()
+            && missing_cap_is_zero
+            && ABSENT_CAP.is_match(&String::from_utf8_lossy(&bytes));
+        if !status.is_success() && !missing_cap {
             return Err(read.failure());
         }
         let height = headers
@@ -130,6 +124,14 @@ impl Lcd<'_> {
             return Err(height_error(
                 "LCD did not serve the requested contract query height.",
             ));
+        }
+        // Apply the group cap only after verifying the block served for the miss.
+        if missing_cap {
+            return Ok((json!({"data": "0"}), height));
+        }
+        let data: Value = serde_json::from_slice(&bytes).map_err(|_| read.failure())?;
+        if !data.is_object() {
+            return Err(read.failure());
         }
         Ok((data, height))
     }
