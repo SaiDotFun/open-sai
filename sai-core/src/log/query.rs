@@ -284,6 +284,11 @@ pub fn tail(root: &Path, count: usize, surface: Option<&str>, name: Option<&str>
     }
     lines.sort_by_cached_key(order);
     lines.drain(..lines.len().saturating_sub(count));
+    for row in &mut lines {
+        if let Some(endpoint) = row.get_mut("endpoint") {
+            *endpoint = endpoint.as_str().map(super::privacy::origin).into();
+        }
+    }
     lines
 }
 

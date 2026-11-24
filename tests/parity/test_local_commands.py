@@ -288,6 +288,31 @@ def test_log_path_and_tail(
     assert outputs[0] == outputs[1]
 
 
+def test_logs_tail_redacts_retained_endpoint(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    origin = "https://fixture.invalid:8443"
+    endpoint = (
+        "https://user:fixture@fixture.invalid:8443/private?token=fixture#fragment"
+    )
+    # Accepted divergence: Python still exposes the retained endpoint verbatim.
+    for index, (cli, expected) in enumerate(
+        zip(local_pair, (endpoint, origin), strict=True)
+    ):
+        root = tmp_path / str(index)
+        seed_logs(root, {"cli": [event("keeper.request", 1, endpoint=endpoint)]})
+        for flag in ((), ("--json",)):
+            result = invoke(cli, root, *flag, "logs", "tail")
+            assert result.returncode == 0 and result.stderr == b""
+            if flag:
+                assert json.loads(result.stdout)["endpoint"] == expected
+            else:
+                assert b"endpoint=" + expected.encode() in result.stdout
+            if index:
+                assert b"/private" not in result.stdout
+                assert b"user:fixture" not in result.stdout
+
+
 def test_logs_run_same_stamp_cursor(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:

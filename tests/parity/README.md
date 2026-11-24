@@ -124,3 +124,8 @@ v2 schema from PR #69 and the paging fixes from PR #93. In CI,
 To reproduce the pinned comparison, install Python from that commit and set
 `SAI_C9B_PARITY_PYTHON` to its `sai` launcher. The C4 tests still use
 `SAI_PARITY_PYTHON` for the older Keeper baseline.
+
+Accepted C9b divergences from the pinned Python reference
+
+- Rust `logs tail` strips credentials, paths, queries, and fragments from
+  endpoints in retained rows. Python currently prints the retained value.
