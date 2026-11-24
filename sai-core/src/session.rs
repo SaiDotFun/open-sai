@@ -158,7 +158,7 @@ impl Storage<'_> {
                 "Trading session expired; sign in again",
             );
             error.hint = Some(if session.key_name().is_some() || session.is_imported() {
-                renewal_command(session)
+                self.renewal_command(session)
             } else {
                 self.sign_in_hint(endpoint, Some(session.addr()))
             });
@@ -192,6 +192,39 @@ impl Storage<'_> {
         };
         format!("sai --endpoint {flag} {}", shell_join(args))
     }
+
+    pub fn renewal_command(&self, session: &Session) -> String {
+        if session.key_name().is_none()
+            && session.is_imported()
+            && let Some(endpoint) = session.endpoint()
+        {
+            return self.keeper_command_hint(endpoint, &["auth", "import"]);
+        }
+        let origin = session.endpoint().and_then(keeper_origin);
+        let (prefix, suffix) = match origin.as_deref() {
+            Some(origin) if session.endpoint() == Some(origin) => (
+                format!("sai --endpoint {}", shell_quote(origin)),
+                String::new(),
+            ),
+            origin => (
+                "sai".into(),
+                format!(
+                    " (reuse the Keeper endpoint{} configured when this session was stored)",
+                    keeper_location(origin)
+                ),
+            ),
+        };
+        if session.key_name().is_some() {
+            format!(
+                "{prefix} auth renew {}{suffix}",
+                shell_quote(session.addr())
+            )
+        } else if session.is_imported() {
+            format!("{prefix} auth import{suffix}")
+        } else {
+            format!("{prefix} auth login NAME or {prefix} auth import{suffix}")
+        }
+    }
 }
 
 fn keeper_origin(endpoint: &str) -> Option<String> {
@@ -201,33 +234,6 @@ fn keeper_origin(endpoint: &str) -> Option<String> {
 
 fn keeper_location(origin: Option<&str>) -> String {
     origin.map_or_else(String::new, |origin| format!(" at {origin}"))
-}
-
-pub fn renewal_command(session: &Session) -> String {
-    let origin = session.endpoint().and_then(keeper_origin);
-    let (prefix, suffix) = match origin.as_deref() {
-        Some(origin) if session.endpoint() == Some(origin) => (
-            format!("sai --endpoint {}", shell_quote(origin)),
-            String::new(),
-        ),
-        origin => (
-            "sai".into(),
-            format!(
-                " (reuse the Keeper endpoint{} configured when this session was stored)",
-                keeper_location(origin)
-            ),
-        ),
-    };
-    if session.key_name().is_some() {
-        format!(
-            "{prefix} auth renew {}{suffix}",
-            shell_quote(session.addr())
-        )
-    } else if session.is_imported() {
-        format!("{prefix} auth import{suffix}")
-    } else {
-        format!("{prefix} auth login NAME or {prefix} auth import{suffix}")
-    }
 }
 
 fn shell_join(args: &[&str]) -> String {

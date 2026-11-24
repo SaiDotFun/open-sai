@@ -15,7 +15,7 @@ use sai_core::{
     errors::{Code, ExitCode, SaiError},
     keeper::Keeper,
     log::{self, EventContext},
-    session::{expired, renewal_command},
+    session::expired,
     settings::{Environment, Flags},
     storage::{RemovedSession, SessionSummary, Storage, StorageError, StorageEvent},
 };
@@ -130,7 +130,7 @@ pub fn dispatch(
                 ));
             }
             let Some(name) = stored.key_name() else {
-                let command = renewal_command(&stored);
+                let command = storage.renewal_command(&stored);
                 let message = if stored.is_imported() {
                     format!("This session was imported. Run {command} with a fresh token.")
                 } else {
@@ -145,7 +145,10 @@ pub fn dispatch(
                     if matches!(error, LoginError::NeedsTerminal(_)) {
                         SaiError::new(
                             Code::SessionUnavailable,
-                            format!("{error} Run {} in a terminal.", renewal_command(&stored)),
+                            format!(
+                                "{error} Run {} in a terminal.",
+                                storage.renewal_command(&stored)
+                            ),
                         )
                     } else {
                         login_failure(error)

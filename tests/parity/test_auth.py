@@ -243,6 +243,13 @@ def test_auth_login(
     assert python_state == rust_state
 
 
+def original_keeper_argument(origin: str) -> str:
+    return (
+        '"${SAI_RECONCILE_ENDPOINT:?'
+        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
+    )
+
+
 @pytest.mark.parametrize("path", ["", "/query", "/fixture-path-key/query"])
 def test_signed_out_recovery_hint_only_shows_the_keeper_origin(
     tmp_path: Path, cli_pair: tuple[CLI, CLI], path: str
@@ -253,11 +260,7 @@ def test_signed_out_recovery_hint_only_shows_the_keeper_origin(
     assert result.returncode == 6
     error = json.loads(result.stdout)["error"]
     assert error["code"] == "SIGNED_OUT"
-    endpoint = (
-        f'"${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
-        if path
-        else origin
-    )
+    endpoint = original_keeper_argument(origin) if path else origin
     assert error["hint"] == f"sai --endpoint {endpoint} auth login NAME"
 
 
@@ -760,7 +763,7 @@ def test_renew_matches_python_without_switching_active_account(
         assert error["code"] == "INVALID_REQUEST"
         origin = endpoint.removesuffix("/query")
         recovery = (
-            f"sai auth import (reuse the Keeper endpoint at {origin} configured when this session was stored)"
+            f"sai --endpoint {original_keeper_argument(origin)} auth import"
             if env is rust
             else f"sai --endpoint {endpoint} auth import"
         )
@@ -928,7 +931,12 @@ def test_expired_session_recovery_matches_python(
         hint = body.pop("hint")
         command = f"renew {ADDR}" if source == "keystore" else "import"
         endpoint = keeper_auth["endpoint"]
-        if env is rust:
+        if env is rust and source == "imported":
+            origin = endpoint.removesuffix("/query")
+            assert (
+                hint == f"sai --endpoint {original_keeper_argument(origin)} auth import"
+            )
+        elif env is rust:
             origin = endpoint.removesuffix("/query")
             assert hint == (
                 f"sai auth {command} (reuse the Keeper endpoint at {origin}"
@@ -940,3 +948,65 @@ def test_expired_session_recovery_matches_python(
             (observed(text), (structured.returncode, body, structured.stderr))
         )
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize(
+    "suffix", ["", "/fixture-path-key/query?access=fixture-query-key"]
+)
+def test_import_recovery_keeps_the_one_off_keeper_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cli_pair: tuple[CLI, CLI],
+    suffix: str,
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    origin = "http://127.0.0.1:9"
+    endpoint = origin + suffix
+    rust.extra_env["SAI_ENDPOINT"] = "http://127.0.0.1:10"
+    rust.clipboard()
+    rust.clip.write_text(fixture_token(ADDR))
+    (rust.bin / "sai").symlink_to(rust.command[0])
+    with monkeypatch.context() as context:
+        context.setenv("SAI_HOME", str(rust.home))
+        storage.save_session(
+            {
+                "evmAddress": ADDR,
+                "endpoint": endpoint,
+                "token": fixture_token(ADDR, 0),
+                "expiresAt": "2000-01-01T00:00:00Z",
+                "source": "imported",
+            }
+        )
+
+    result = rust.run("--json", "--endpoint", endpoint, "auth", "status")
+    assert result.returncode == 6
+    hint = json.loads(result.stdout)["error"]["hint"]
+    assert "fixture-path-key" not in hint
+    assert "fixture-query-key" not in hint
+    arg = original_keeper_argument(origin) if suffix else origin
+    assert hint == f"sai --endpoint {arg} auth import"
+    if suffix:
+        missing = subprocess.run(
+            ["/bin/sh", "-c", hint],
+            stdin=subprocess.DEVNULL,
+            env=rust.vars(),
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        assert missing.returncode != 0
+        assert (
+            session_state(rust)["sessions"][ADDR]["expiresAt"] == "2000-01-01T00:00:00Z"
+        )
+        rust.extra_env["SAI_RECONCILE_ENDPOINT"] = endpoint
+    recovered = subprocess.run(
+        ["/bin/sh", "-c", hint],
+        stdin=subprocess.DEVNULL,
+        env=rust.vars(),
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    assert recovered.returncode == 0
+    assert session_state(rust)["sessions"][ADDR]["endpoint"] == endpoint
+    assert rust.run("--endpoint", endpoint, "auth", "status").returncode == 0
