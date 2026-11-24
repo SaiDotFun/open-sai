@@ -144,6 +144,7 @@ _JWT = re.compile(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
 # brackets, commas, and semicolons are all legal inside a URL, so nothing
 # else ends it; whatever follows without a space is removed with it.
 _URL = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://\S*")
+_RETAINED_URL = re.compile(r"(?<![A-Za-z0-9+.-])[A-Za-z0-9+.-]+://\S*")
 # The same, to the end of the string: for a value that is one token.
 _URL_REST = re.compile(r"[A-Za-z][A-Za-z0-9+.-]*://.*", re.DOTALL)
 _HOST = re.compile(r"[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\]")
@@ -1301,22 +1302,43 @@ def _invalid_constant(_text: str) -> Any:
     raise ValueError("Invalid JSON constant")
 
 
+def _redact_retained_urls(value: Any, *, argument: bool = False) -> Any:
+    if isinstance(value, str):
+        if "://" not in value:
+            return value
+        if argument and (match := _RETAINED_URL.search(value)):
+            return value[: match.start()] + origin(value[match.start() :])
+        return _RETAINED_URL.sub(lambda match: origin(match[0]), value)
+    if isinstance(value, list):
+        return [_redact_retained_urls(item, argument=argument) for item in value]
+    if isinstance(value, dict):
+        return {
+            _redact_retained_urls(key): (
+                origin(item)
+                if key in ("endpoint", "keeper", "websocket", "lcd")
+                and isinstance(item, str)
+                else _redact_retained_urls(item, argument=key == "argv")
+            )
+            for key, item in value.items()
+        }
+    return value
+
+
 def decode_row(raw: bytes) -> Any:
     line = json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
     if not isinstance(line, dict):
         return line
-    # Older writers stored full endpoints. Project them before any reader
-    # uses the row, while keeping endpointId for intent attribution.
+    # Preserve the placeholder for malformed top-level endpoint fields.
     for field in ("endpoint", "keeper", "websocket", "lcd"):
-        if (value := line.get(field)) is not None:
-            line[field] = origin(value) if isinstance(value, str) else REDACTED_URL
+        if (value := line.get(field)) is not None and not isinstance(value, str):
+            line[field] = REDACTED_URL
     if line.get("event") == "keeper.request" and "keeperErrors" in line:
         line.update(
             keeper_error_fields(
                 line["keeperErrors"], retained=True, total=line.get("keeperErrorCount")
             )
         )
-    return line
+    return _redact_retained_urls(line)
 
 
 MAX_SCAN_BYTES = 16 * 1024 * 1024

@@ -3613,6 +3613,52 @@ def test_logs_tail_shows_origins_for_retained_mcp_endpoints(home):
         assert {field: found[field] for field in origins} == origins
 
 
+def test_logs_tail_redacts_retained_urls_in_arguments_and_free_text(home):
+    path = old_file(home / "logs", "cli", 1)
+    origin = "https://keeper.example:8443"
+    url = f"https://user:{URL_PASSWORD}@keeper.example:8443/{PATH_KEY}?key={URL_KEY}"
+    ts = log.stamp(log.now() - timedelta(days=1))
+    rows = [
+        {
+            "event": "command.start",
+            "ts": ts,
+            "seq": 1,
+            "argv": [
+                "config",
+                "set",
+                "keeper.endpoint",
+                url,
+                f"--endpoint={url}",
+                url.replace(PATH_KEY, PATH_KEY + " with space"),
+            ],
+        },
+        {
+            "event": "doctor.result",
+            "ts": ts,
+            "seq": 2,
+            "checks": [
+                {"summary": f"Session endpoint {url} differs from {url} today"},
+                {"details": {"endpoint": url}},
+            ],
+        },
+    ]
+    raw = b"".join(map(log.encode, rows))
+    path.write_bytes(raw)
+    for flags in ((), ("--json",)):
+        code, output = run_cli(*flags, "logs", "tail")
+        assert code == 0
+        assert all(value not in output for value in (PATH_KEY, URL_KEY, URL_PASSWORD))
+        assert output.count(origin) == 6
+        if flags:
+            start, doctor = map(json.loads, output.splitlines())
+            assert start["argv"][-3:] == [origin, f"--endpoint={origin}", origin]
+            assert doctor["checks"] == [
+                {"summary": f"Session endpoint {origin} differs from {origin} today"},
+                {"details": {"endpoint": origin}},
+            ]
+    assert path.read_bytes() == raw
+
+
 def test_logs_tail_reads_from_the_end_of_large_files(home):
     """Tail finds the newest events by reading backwards in chunks, so
     lines split across chunks, bad lines, and a missing final newline all
