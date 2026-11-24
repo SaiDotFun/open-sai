@@ -1203,7 +1203,10 @@ def check_lcd(ctx: Context) -> Check:
     url = log.origin(ctx.config.lcd_endpoint)
     start = time.monotonic()
     try:
-        node = margin.node_info(ctx.config.lcd_endpoint, timeout=NETWORK_TIMEOUT)
+        node = margin._get_json(
+            margin.lcd_url(ctx.config.lcd_endpoint, margin.NODE_INFO_PATH),
+            timeout=NETWORK_TIMEOUT,
+        )
     except ValueError as exc:
         return Check(
             "lcd",

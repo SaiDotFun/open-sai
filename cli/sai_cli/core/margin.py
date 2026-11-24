@@ -196,13 +196,10 @@ def _get_json_at_height(
     return result, query_height
 
 
-def _lcd_url(lcd: str, route: str) -> str:
+def lcd_url(lcd: str, route: str) -> str:
+    """Append a REST route to the LCD path and keep its query parameters."""
     parts = urlsplit(lcd)
     return urlunsplit(parts._replace(path=parts.path.rstrip("/") + route))
-
-
-def node_info(lcd: str, timeout: float = 20) -> dict[str, Any]:
-    return _get_json(_lcd_url(lcd, NODE_INFO_PATH), timeout)
 
 
 def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
@@ -210,7 +207,7 @@ def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
-    return _lcd_url(lcd, f"/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}")
+    return lcd_url(lcd, f"/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}")
 
 
 def smart_value(
@@ -231,7 +228,7 @@ def smart_value(
 
 def block_header(lcd: str, height: int | str, *, deadline: float) -> dict[str, Any]:
     result, _ = _get_json_at_height(
-        _lcd_url(lcd, f"{BLOCK_PATH}{height}"),
+        lcd_url(lcd, f"{BLOCK_PATH}{height}"),
         fresh=height == "latest",
         deadline=deadline,
     )
@@ -408,7 +405,7 @@ def position_unchanged(
 
 def block_timestamp(lcd: str, height: str) -> int:
     """Read the UTC timestamp of a specific LCD block."""
-    result = _get_json(_lcd_url(lcd, f"{BLOCK_PATH}{height}"))
+    result = _get_json(lcd_url(lcd, f"{BLOCK_PATH}{height}"))
     block = result.get("sdk_block") or result.get("block")
     if not isinstance(block, dict):
         raise TypeError("LCD block header is unavailable")
@@ -421,7 +418,7 @@ def block_timestamp(lcd: str, height: str) -> int:
 
 def trading_contract(endpoint: str, lcd: str) -> str:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
-    node = node_info(lcd)
+    node = _get_json(lcd_url(lcd, NODE_INFO_PATH))
     info = node.get("default_node_info")
     if (
         not route["enabled"]
