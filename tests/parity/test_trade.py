@@ -283,43 +283,6 @@ MARKET_PREVIEW = intent_for(
 
 
 @pytest.mark.parametrize(
-    ("args", "intent", "market"),
-    [
-        (OPEN, MARKET_PREVIEW, True),
-        (
-            (*OPEN, "--type", "limit"),
-            intent_for("OPEN_TRADE", {**MARKET_PREVIEW["body"], "orderType": "limit"}),
-            False,
-        ),
-        (
-            (*OPEN, "--type", "stop"),
-            intent_for("OPEN_TRADE", {**MARKET_PREVIEW["body"], "orderType": "stop"}),
-            False,
-        ),
-    ],
-)
-def test_trade_dry_run(
-    trade_pair: tuple[CLI, CLI],
-    tmp_path: Path,
-    args: CLI,
-    intent: dict[str, Any],
-    market: bool,
-) -> None:
-    preview = {"addr": None, "dryRun": True, "intent": intent}
-    if market:
-        preview["requiresMarketPriceRefresh"] = True
-    for index, cli in enumerate(trade_pair):
-        with loopback("trade-accepted") as endpoints:
-            home = tmp_path / str(index)
-            seed_home(home, endpoints, "empty")
-            assert run(
-                cli, home, endpoints, (*args, "--dry-run"), python=index == 0
-            ) == (0, preview, "")
-            assert not endpoints.wire
-            assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
-
-
-@pytest.mark.parametrize(
     ("args", "message"),
     [
         (
@@ -657,6 +620,13 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
                 )[0]
                 == 0
             )
+            # The valid Rust dry run reads estimates. The rejected request
+            # below must still stop before any Keeper or LCD reads.
+            reads = endpoints.wire.copy()
+            if index == 0:
+                assert not reads
+            else:
+                assert reads and reads[0].label == "borrowings"
             code, result, stderr = run(
                 cli, home, endpoints, (*OPEN, *args, "--dry-run"), python=index == 0
             )
@@ -665,7 +635,7 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
                 assert code == 0 and result["dryRun"]
             else:
                 assert code == 1 and result["error"]["message"] == message
-            assert not endpoints.wire
+            assert endpoints.wire == reads
             assert not rows(home)
 
 

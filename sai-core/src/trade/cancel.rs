@@ -27,6 +27,9 @@ impl Trading<'_> {
         session: &Session,
         preview: &TradePreview,
     ) -> Result<Value, SaiError> {
+        if preview.intent.kind != "CANCEL_PENDING_TRADE" || preview.intent.target.is_none() {
+            return Err(SaiError::internal());
+        }
         self.storage
             .check_active_trade(session, self.keeper.endpoint())?;
         self.basic_trade_route(session, preview, false, None)

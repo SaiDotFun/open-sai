@@ -98,18 +98,6 @@ impl Trading<'_> {
         })
     }
 
-    pub(super) async fn read_contract_position(
-        &self,
-        lcd: &Lcd<'_>,
-        addr: &str,
-        id: &Value,
-        confirming: bool,
-    ) -> Result<(PositionRoute, Value), SaiError> {
-        let route = self.position_route(lcd, confirming).await?;
-        let raw = Self::read_contract_target(lcd, addr, id, &route).await?;
-        Ok((route, raw))
-    }
-
     async fn read_contract_target(
         lcd: &Lcd<'_>,
         addr: &str,
@@ -157,20 +145,10 @@ impl Trading<'_> {
     ) -> Result<Value, SaiError> {
         self.storage
             .check_active_trade(session, self.keeper.endpoint())?;
-        let addr = session.addr();
-        let id = preview.position_id()?;
-        self.indexed_position(addr, &id, TIMEOUT).await?;
-        let mut output = preview.output(Some(addr));
-        if let Some(lcd) = self.lcd_endpoint.map(Lcd)
-            && let Ok((_, raw)) = self.read_contract_position(&lcd, addr, &id, false).await
-        {
-            if !same_account(addr, raw.get("user")) {
-                return Err(contract_owner_error());
-            }
-        } else {
-            output["positionOwnerVerified"] = json!(false);
-        }
-        Ok(output)
+        Ok(self
+            .prepare_preview(preview.clone(), Some(session), super::PreviewMode::Cli)
+            .await?
+            .output(Some(session.addr())))
     }
 
     pub(super) async fn indexed_position(
@@ -225,6 +203,7 @@ impl Trading<'_> {
         id: &Value,
         route: PositionRoute,
         mut indexed: Value,
+        verified_raw: Option<Value>,
     ) -> Result<Snapshot, SnapshotError> {
         require_open(&indexed)?;
         let borrowing = field(&indexed, "perpBorrowing")?.clone();
@@ -255,10 +234,7 @@ impl Trading<'_> {
         {
             return Err(SnapshotError::Unavailable);
         }
-        let read_raw = || async {
-            let (raw, _) = lcd
-                .position(&route.contract_address, &trader, id, Read::Snapshot)
-                .await?;
+        let validate_raw = |raw: Value| {
             if !raw.is_object() {
                 return Err(SnapshotError::Unavailable);
             }
@@ -274,8 +250,17 @@ impl Trading<'_> {
             require_contract_open(&raw)?;
             Ok(raw)
         };
+        let read_raw = || async {
+            let (raw, _) = lcd
+                .position(&route.contract_address, &trader, id, Read::Snapshot)
+                .await?;
+            validate_raw(raw)
+        };
 
-        let mut raw = read_raw().await?;
+        let mut raw = match verified_raw {
+            Some(raw) => validate_raw(raw)?,
+            None => read_raw().await?,
+        };
         if !same_margin(&raw, &indexed)? {
             let deadline = Instant::now() + Duration::from_secs(2);
             for delay in [250, 500].map(Duration::from_millis) {

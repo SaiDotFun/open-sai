@@ -280,6 +280,10 @@ mod tests {
             ));
             preview.reference_price = input["referencePrice"].as_str().map(str::to_owned);
             preview.quote = input.get("quote").cloned();
+            preview.estimates = Some(data["estimates"].clone());
+            if kind == "CLOSE_POSITION" {
+                preview.close_owner_verified = Some(true);
+            }
             if let Some(route) = input.get("positionRoute") {
                 preview.position_route = Some(crate::trade::position::PositionRoute {
                     chain_id: route["chainId"].as_str().unwrap().into(),

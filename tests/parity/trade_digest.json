@@ -173,6 +173,34 @@
       },
       "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"amountUsd\":\"20.12345600\",\"leverage\":\"2\",\"market\":{\"marketIndex\":\"MarketIndex(3)\"},\"maxSlippagePct\":\"1\",\"orderType\":\"market\",\"side\":\"long\"},\"kind\":\"OPEN_TRADE\"},\"positionRoute\":{\"chainId\":\"fixture-chain-1\",\"contractAddress\":\"nibi1fixturecontract\"},\"referencePrice\":\"12345678901.123456789012345679\"}",
       "digest": "e3e1dffb7b8833d079f41a51194da3a80f8d3ea7adea649c5313ae536989468b"
+    },
+    {
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "CANCEL_PENDING_TRADE",
+          "target": {
+            "userTradeId": "7"
+          },
+          "body": {}
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{},\"kind\":\"CANCEL_PENDING_TRADE\",\"target\":{\"userTradeId\":\"7\"}}}",
+      "digest": "12532f15238f876cf470b8bd9e7f821f4f0bcbc4944108c79ecfeb3aee1a9301"
     }
-  ]
+  ],
+  "estimates": {
+    "fees": {
+      "status": "estimate",
+      "amountUsdc": "0.025"
+    },
+    "liquidationPrice": {
+      "status": "estimate",
+      "price": "60"
+    },
+    "worstCaseFill": {
+      "status": "bound",
+      "price": "101"
+    }
+  }
 }

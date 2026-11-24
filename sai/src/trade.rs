@@ -9,7 +9,7 @@ use sai_core::{
     log::EventContext,
     settings::{Environment, Flags},
     storage::{Session, Storage, StorageEvent},
-    trade::{self, OpenTrade, SubmitOptions, TradePreview, Trading, close_preview},
+    trade::{self, OpenTrade, PreviewMode, SubmitOptions, TradePreview, Trading, close_preview},
     wait,
 };
 use serde_json::{Map, Value, json};
@@ -220,38 +220,16 @@ pub fn run(
     };
     let session = match trading.load_session(account) {
         Ok(session) => Some(session),
-        Err(error)
-            if dry_run
-                && !cancelling
-                && !preview.is_market_close()
-                && account.is_none()
-                && session_error(error.code) =>
-        {
+        Err(error) if dry_run && !cancelling && account.is_none() && session_error(error.code) => {
             None
         }
         Err(error) => return Err(error),
     };
-    if dry_run
-        && !cancelling
-        && !preview.is_market_close()
-        && !preview.is_standalone_position_update()
-    {
-        local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
-        return Ok(ExitCode::Ok);
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| SaiError::internal())?;
     if dry_run {
-        if preview.is_market_close() {
-            let session = session.as_ref().ok_or_else(SaiError::internal)?;
-            local::emit(
-                &runtime.block_on(trading.close_position_preview(session, &preview))?,
-                json,
-            )?;
-            return Ok(ExitCode::Ok);
-        }
         if preview.is_standalone_position_update() {
             let output = runtime.block_on(trading.position_update_preview(
                 preview,
@@ -261,12 +239,12 @@ pub fn run(
             local::emit(&output, json)?;
             return Ok(ExitCode::Ok);
         }
-        local::emit(
-            &runtime.block_on(
-                trading.cancel_preview(session.as_ref().ok_or_else(SaiError::internal)?, &preview),
-            )?,
-            json,
-        )?;
+        let preview = runtime.block_on(trading.prepare_preview(
+            preview,
+            session.as_ref(),
+            PreviewMode::Cli,
+        ))?;
+        local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
         return Ok(ExitCode::Ok);
     }
     let session = session.ok_or_else(SaiError::internal)?;
