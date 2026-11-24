@@ -19,13 +19,11 @@ pub struct ConfigListing {
 pub fn config_path() -> io::Result<PathBuf> {
     let home = env::var_os("SAI_HOME")
         .map(PathBuf::from)
-        .or_else(|| env::home_dir().map(|path| path.join(".sai")))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "Cannot find the home directory",
-            )
-        })?;
+        .or_else(|| env::home_dir().map(|path| path.join(".sai")));
+    let Some(home) = home else {
+        let message = "Cannot find the home directory";
+        return Err(io::Error::new(io::ErrorKind::NotFound, message));
+    };
     Ok(home.join("config.toml"))
 }
 
