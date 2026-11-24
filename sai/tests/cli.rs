@@ -515,19 +515,19 @@ fn invalid_environment_settings_never_echo_values_to_stderr() {
             "SAI_ENDPOINT",
             "keeper.endpoint",
             "a URL starting with https:// or http://",
-            1,
+            2,
         ),
         (
             "SAI_WS_ENDPOINT",
             "keeper.ws_endpoint",
             "a URL starting with wss:// or ws://",
-            1,
+            2,
         ),
         (
             "SAI_LCD_ENDPOINT",
             "lcd.endpoint",
             "a URL starting with https:// or http://",
-            1,
+            2,
         ),
         (
             "SAI_UPDATE_AUTO",

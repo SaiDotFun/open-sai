@@ -185,10 +185,18 @@ def invoke(
         "http-flag",
         "http-env",
         "http-config",
+        "http-flag-space",
+        "http-env-space",
+        "http-config-space",
+        "http-flag-control",
+        "http-flag-leading-space",
         "ws-fragment",
         "ws-global-empty",
         "ws-local-empty",
         "ws-config-empty",
+        "ws-invalid-scheme",
+        "ws-invalid-port",
+        "ws-backslash-authority",
     ],
 )
 def test_c11_rejects_endpoints_before_network_io(
@@ -217,14 +225,26 @@ def test_c11_rejects_endpoints_before_network_io(
             if source.startswith("http-"):
                 command = ["market", "list"]
                 detail = "Invalid value for keeper.endpoint: remove the URL fragment"
-                if source == "http-flag":
-                    flags += ["--endpoint", http + "#client"]
+                layer, _, malformed = source.removeprefix("http-").partition("-")
+                value = http + ("#" if layer == "env" else "#client")
+                if malformed:
+                    detail = (
+                        "Invalid value for keeper.endpoint: URL contains whitespace "
+                        "or control characters"
+                    )
+                    value = {
+                        "space": http + "/has space",
+                        "control": http + "/has\x80control",
+                        "leading-space": " " + http,
+                    }[malformed]
+                if layer == "flag":
+                    flags += ["--endpoint", value]
                     origin = "--endpoint"
-                elif source == "http-env":
-                    env["SAI_ENDPOINT"] = http + "#"
+                elif layer == "env":
+                    env["SAI_ENDPOINT"] = value
                     origin = "SAI_ENDPOINT"
                 else:
-                    config.write_text(f'[keeper]\nendpoint = "{http}#client"\n')
+                    config.write_text(f'[keeper]\nendpoint = "{value}"\n')
                     origin = str(config)
             else:
                 command = ["watch", "balances", ADDR]
@@ -250,9 +270,19 @@ def test_c11_rejects_endpoints_before_network_io(
                 elif source == "ws-local-empty":
                     command += ["--ws-endpoint", ""]
                     origin = ""
-                else:
+                elif source == "ws-config-empty":
                     config.write_text('[keeper]\nws_endpoint = ""\n')
                     origin = str(config)
+                else:
+                    invalid_ws = {
+                        "ws-invalid-scheme": http,
+                        "ws-invalid-port": "ws://127.0.0.1:65536/query",
+                        "ws-backslash-authority": ws.replace(
+                            "/query", "\\example/query"
+                        ),
+                    }[source]
+                    command = ["account", "balances", ADDR, "--ws-endpoint", invalid_ws]
+                    origin = ""
             message = f"{origin}: {detail}" if origin else detail
             result = invoke(cli, home, *flags, *command, overrides=env)
             assert requests == []

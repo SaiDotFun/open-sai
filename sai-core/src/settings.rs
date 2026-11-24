@@ -117,7 +117,7 @@ impl Key {
         let text = raw.trim();
         let name = self.spec().name;
         match self.spec().kind {
-            Kind::Url(_) => self.check_url(text),
+            Kind::Url(_) => self.check_url(raw),
             Kind::Bool => match parse_bool(text) {
                 Some(value) => Ok(Value::Bool(value)),
                 None => Err(SettingsError::invalid(format!(
@@ -192,48 +192,34 @@ impl Key {
         let Kind::Url(schemes) = self.spec().kind else {
             unreachable!()
         };
-        if self.section_and_name().0 == "keeper" && value.contains('#') {
-            return Err(SettingsError::endpoint(format!(
-                "Invalid value for {}: remove the URL fragment",
-                self.spec().name
-            )));
+        let invalid = |reason| {
+            SettingsError::endpoint(format!("Invalid value for {}: {reason}", self.spec().name))
+        };
+        if self != Self::LcdEndpoint && value.contains('#') {
+            return Err(invalid("remove the URL fragment"));
         }
-        if Endpoint::split(value).is_some_and(|url| schemes.contains(&url.scheme.as_str())) {
+        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(invalid("URL contains whitespace or control characters"));
+        }
+        if Endpoint::split(value).is_some_and(|url| {
+            let (host, port) = url.host_port();
+            schemes.contains(&url.scheme.as_str())
+                && !host.is_empty()
+                && port.is_ok()
+                && !url.authority.contains('\\')
+        }) {
             return Ok(json!(value));
         }
-        let error = self.expected(&format!(
+        Err(self.expected(&format!(
             "a URL starting with {}:// or {}://",
             schemes[0], schemes[1]
-        ));
-        Err(if value.is_empty() {
-            SettingsError::endpoint(error.message)
-        } else {
-            error
-        })
+        )))
     }
 
     /// Validate server endpoints for diagnostics and registration repair.
     pub fn check_diagnostic_url(self, value: &str) -> Result<(), SettingsError> {
-        if !matches!(self.spec().kind, Kind::Url(_)) {
-            return Ok(());
-        }
-        let bad = |reason| {
-            let mut error =
-                SettingsError::invalid(format!("Invalid value for {}: {reason}", self.spec().name));
-            error.invalid_endpoint = true;
-            error
-        };
-        if self != Self::LcdEndpoint && value.contains('#') {
-            return Err(bad("remove the URL fragment"));
-        }
-        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-            return Err(bad("URL contains whitespace or control characters"));
-        }
-        self.check_url(value)?;
-        let url = Endpoint::split(value).expect("URL checked");
-        let (host, port) = url.host_port();
-        if host.is_empty() || port.is_err() || url.authority.contains('\\') {
-            return Err(self.invalid_env_value());
+        if matches!(self.spec().kind, Kind::Url(_)) {
+            self.check_url(value)?;
         }
         Ok(())
     }
