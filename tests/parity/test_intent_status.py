@@ -322,6 +322,20 @@ def test_history(
     compare(cli_pair, tmp_path, monkeypatch, (Step(history, local),))
 
 
+def test_empty_history_object_retries(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty = {"data": {"perp": {"tradeHistory": {}}}}
+    compare(
+        cli_pair,
+        tmp_path,
+        monkeypatch,
+        (Step(("outcome_not_indexed", empty, "filled_history"), "terminal"),),
+    )
+
+
 @pytest.mark.parametrize("key", [KEY, None])
 def test_late_admission_and_stale_results(
     cli_pair: tuple[CLI, CLI],

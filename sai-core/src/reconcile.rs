@@ -333,9 +333,13 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Result<Vec<Valu
             .ok_or_else(|| incomplete_data("TypeError"))?
             .get("tradeHistory")
             .ok_or_else(|| incomplete_data("KeyError"))?;
-        let history = history
-            .as_array()
-            .ok_or_else(|| incomplete_data("TypeError"))?;
+        let history = match history {
+            Value::Array(items) => items,
+            // Python iterates these containers. An empty one yields no matches.
+            Value::Object(_) | Value::String(_) if !truthy(history) => continue,
+            Value::Object(_) | Value::String(_) => return Err(SaiError::internal()),
+            _ => return Err(incomplete_data("TypeError")),
+        };
         let mut matches = Vec::new();
         for item in history {
             if !item.is_object() {
