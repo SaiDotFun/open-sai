@@ -6,13 +6,22 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::time;
 use tokio_tungstenite::{
-    client_async_with_config,
+    WebSocketStream,
     tungstenite::{
-        Error, Message, client::IntoClientRequest, http::HeaderValue, protocol::WebSocketConfig,
+        Error, Message,
+        protocol::{Role, WebSocketConfig},
     },
 };
+use url::Url;
 
-use super::{ProbeEndpoint, check_transport, transport};
+use super::{
+    ProbeEndpoint, check_transport,
+    stream::{
+        Failure,
+        upgrade::{self, Upgrade},
+    },
+    transport,
+};
 
 /// Read the LCD chain ID. None means node_info answered without a network.
 pub async fn lcd_network(
@@ -43,27 +52,23 @@ pub async fn lcd_network(
 pub async fn websocket_handshake(endpoint: &str, timeout: Duration) -> Result<(), String> {
     check_transport(endpoint, ProbeEndpoint::WebSocket).map_err(|_| String::from("StreamError"))?;
     time::timeout(timeout, async {
-        let mut request = endpoint.into_client_request().map_err(ws_error)?;
-        request.headers_mut().insert(
-            "Sec-WebSocket-Protocol",
-            HeaderValue::from_static("graphql-transport-ws"),
-        );
-        let socket = transport::doctor_websocket_socket(endpoint, timeout)
+        let url = Url::parse(endpoint).map_err(|_| "InvalidURI")?;
+        let socket = transport::doctor_websocket_socket(&url, timeout)
             .await
             .map_err(|_| "OSError")?;
+        let socket = match upgrade::connect(&url, socket).await {
+            Ok(Upgrade::Connected(socket)) => socket,
+            Ok(Upgrade::Rejected(status) | Upgrade::Redirect { status, .. }) => {
+                return Err(format!("InvalidStatus (HTTP status {})", status.as_u16()));
+            }
+            Err(Failure::Disconnected(reason)) => return Err(reason.into()),
+            Err(Failure::Protocol(_)) => return Err("StreamError".into()),
+        };
         let config = WebSocketConfig::default()
             .max_message_size(Some(1024 * 1024))
             .max_frame_size(Some(1024 * 1024));
-        let (mut connection, response) = client_async_with_config(request, socket, Some(config))
-            .await
-            .map_err(ws_error)?;
-        if response
-            .headers()
-            .get("Sec-WebSocket-Protocol")
-            .is_some_and(|header| header != "graphql-transport-ws")
-        {
-            return Err("NegotiationError".into());
-        }
+        let mut connection =
+            WebSocketStream::from_raw_socket(socket, Role::Client, Some(config)).await;
         connection
             .send(Message::Text(
                 json!({"type": "connection_init"}).to_string().into(),

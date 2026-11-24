@@ -363,6 +363,14 @@ seed = "session"
 wire = ["oneClickTrading","ws:init","node_info"]
 
 [[case]]
+name = "doctor-ws-no-subprotocol"
+args = ["--json", "doctor", "--no-fix"]
+accepted_divergence = "lcd-origin-only"
+seed = "session"
+server = "ws-no-subprotocol"
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
 name = "doctor-ws-timeout"
 args = ["--json", "doctor", "--no-fix"]
 accepted_divergence = "lcd-origin-only"

@@ -107,10 +107,10 @@ async fn send(
 }
 
 pub(super) async fn doctor_websocket_socket(
-    endpoint: &str,
+    endpoint: &Url,
     timeout: Duration,
 ) -> Result<SocketBox, SaiError> {
-    let mut url = Url::parse(endpoint).map_err(|_| request_failed())?;
+    let mut url = endpoint.clone();
     let scheme = match url.scheme() {
         "ws" => "http",
         "wss" => "https",
