@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use url::Host;
 
 use crate::endpoint::Endpoint;
 
@@ -219,11 +220,18 @@ pub(super) fn replace_tokens(text: &str, tokens: &[String]) -> String {
     text
 }
 
+/// Strip credentials, path, query, and fragment for a public endpoint report.
 pub fn origin(text: &str) -> String {
     let Some(url) = Endpoint::split(text.trim()) else {
         return REDACTED_URL.into();
     };
-    let (host, port) = url.host_port();
+    let (mut host, port) = url.host_port();
+    if !host.is_ascii() && !host.starts_with('[') {
+        let Ok(encoded) = Host::parse(&host) else {
+            return REDACTED_URL.into();
+        };
+        host = encoded.to_string();
+    }
     if !HOST.is_match(&host) {
         return REDACTED_URL.into();
     }
