@@ -1,3 +1,4 @@
+mod auth;
 mod config;
 mod local;
 mod logs;
@@ -22,12 +23,14 @@ use sai_core::log::{self, EXIT_FLUSH, EventContext, Field, Level, LogWriter, Sur
 use sai_core::settings::{Environment, Flags, Settings, SettingsError, repr};
 use serde_json::{Value, json};
 
+use auth::AuthCommand;
 use config::ConfigCommand;
-use local::{AuthCommand, IntentCommand};
+use local::IntentCommand;
 use reads::{AccountCommand, MarketCommand, WatchCommand};
 
 #[derive(Parser)]
 #[command(
+    bin_name = "sai",
     version,
     about,
     disable_help_subcommand = true,
@@ -75,8 +78,6 @@ enum Command {
     },
     /// Manage local Sai sessions.
     Auth {
-        #[arg(long, global = true, help = "Print machine-readable JSON")]
-        json: bool,
         #[command(subcommand)]
         command: AuthCommand,
     },
@@ -170,6 +171,12 @@ fn execute(
         command_id: Some(&command_id),
     };
     if let Some(writer) = events_writer {
+        // Import accepts no operands, and a stray argument can contain a token.
+        let logged_argv = if command == "auth import" {
+            &argv[..argv.len() - operands.len()]
+        } else {
+            &argv
+        };
         writer.event(
             Surface::Cli,
             "command.start",
@@ -177,17 +184,13 @@ fn execute(
             [
                 ("command", command_field()),
                 ("commandId", json!(command_id).into()),
-                ("argv", Field::argv(argv.iter().take(64).cloned())),
+                ("argv", Field::argv(logged_argv.iter().take(64).cloned())),
             ],
         );
     }
     let outcome = match Cli::try_parse_from(args) {
         Ok(cli) => {
-            let json = cli.json
-                || matches!(
-                    &cli.command,
-                    Some(Command::Auth { json: true, .. } | Command::Intent { json: true, .. })
-                );
+            let json = cli.json || matches!(&cli.command, Some(Command::Intent { json: true, .. }));
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
@@ -198,9 +201,14 @@ fn execute(
                         lcd_endpoint: cli.lcd_endpoint,
                     };
                     match cli.command {
-                        Some(Command::Auth { command, .. }) => {
-                            local::auth(command, cli.account.as_deref(), &flags, env, json, events)
-                        }
+                        Some(Command::Auth { command }) => auth::dispatch(
+                            command,
+                            cli.account.as_deref(),
+                            &flags,
+                            env,
+                            json,
+                            events,
+                        ),
                         Some(Command::Intent { command, .. }) => {
                             local::intent(command, &flags, env, json, events)
                         }
@@ -259,7 +267,7 @@ fn json_requested(args: &[String]) -> bool {
                 args.next();
             }
             "--" => break,
-            "auth" | "intent" => {
+            "intent" => {
                 return args
                     .take_while(|arg| *arg != "--")
                     .any(|arg| arg == "--json");
@@ -298,7 +306,8 @@ fn complete(
     let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
     let message = redact(&error.message);
     let interrupted = error.code == Code::InvalidRequest && error.message == "Aborted";
-    if interrupted {
+    // Auth import emits its own newline on cancellation.
+    if interrupted && command != "auth import" {
         eprintln!();
     }
     if json_output {
@@ -333,7 +342,9 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" | "market list" | "market prices" => "",
+        "config list" | "auth status" | "auth list" | "auth import" | "market list"
+        | "market prices" => "",
+        "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
         "watch price" => " TOKEN_ID",
@@ -341,7 +352,7 @@ fn usage(command: &str) -> String {
         "logs path" | "logs tail" | "logs stats" => "",
         "logs intent" => " KEY",
         "logs run" => " ID",
-        "auth logout" => " [ADDR]",
+        "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
     };
@@ -444,6 +455,9 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("auth", "list") => "auth list",
                     ("auth", "use") => "auth use",
                     ("auth", "logout") => "auth logout",
+                    ("auth", "login") => "auth login",
+                    ("auth", "import") => "auth import",
+                    ("auth", "renew") => "auth renew",
                     ("intent", "local") => "intent local",
                     ("intent", "status") => "intent status",
                     ("skill", "show") => "skill show",
@@ -483,6 +497,13 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
 
 fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<SaiError> {
     let arg = context_text(error, ContextKind::InvalidArg);
+    if command == "auth import"
+        && !(error.kind() == ErrorKind::UnknownArgument
+            && arg == Some("--json")
+            && operands.first().is_some_and(|arg| arg == "--json"))
+    {
+        return Some(SaiError::usage("Unexpected arguments to auth import."));
+    }
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
             let command = context_text(error, ContextKind::InvalidSubcommand)?;
@@ -495,8 +516,8 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
             } else {
                 let consumed = match command {
                     "config get" | "config unset" | "intent status" | "intent local"
-                    | "auth use" | "auth logout" | "logs intent" | "logs run"
-                    | "account positions" | "account history" | "account balances"
+                    | "auth use" | "auth logout" | "auth login" | "auth renew" | "logs intent"
+                    | "logs run" | "account positions" | "account history" | "account balances"
                     | "watch positions" | "watch balances" | "watch price" => 1,
                     "config set" => 2,
                     _ => 0,
@@ -552,13 +573,16 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
             "--key" if options && command == "intent status" => {
                 operands.next();
             }
+            "--addr" if options && command == "auth login" => {
+                operands.next();
+            }
             arg if options && command == "intent status" && arg.starts_with("--key=") => {}
+            arg if options && command == "auth login" && arg.starts_with("--addr=") => {}
             "--ws-endpoint" if options && websocket => {
                 operands.next();
             }
             arg if options && websocket && arg.starts_with("--ws-endpoint=") => {}
-            "--json"
-                if options && (command.starts_with("intent ") || command.starts_with("auth ")) => {}
+            "--json" if options && command.starts_with("intent ") => {}
             _ => positional.push(arg),
         }
     }
@@ -578,6 +602,7 @@ fn print_parse_error(
             .map(str::to_owned)
             .or_else(|| config::help(command))
             .or_else(|| local::intent_help(command))
+            .or_else(|| auth::help(command))
             .or_else(|| reads::help(command))
     };
     match error.kind() {
@@ -601,7 +626,7 @@ fn print_parse_error(
             }
             if matches!(
                 command,
-                "config" | "intent" | "market" | "account" | "watch"
+                "config" | "intent" | "auth" | "market" | "account" | "watch"
             ) && let Some(help) = help()
             {
                 let error = SaiError::usage(help);
@@ -615,6 +640,8 @@ fn print_parse_error(
         ErrorKind::MissingRequiredArgument if !json && operands.is_empty() => {
             let missing_help = if matches!(command, "logs run" | "logs intent") {
                 help()
+            } else if matches!(command, "auth login" | "auth use") {
+                auth::help(command)
             } else {
                 reads::help(command)
             };
@@ -633,6 +660,8 @@ fn print_parse_error(
                 command
             } else if path == "config" || path.starts_with("config ") {
                 "config"
+            } else if path == "auth" || path.starts_with("auth ") {
+                "auth"
             } else {
                 ""
             }

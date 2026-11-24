@@ -1286,6 +1286,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "libc",
  "rustix",
  "rustyline",
  "sai-core",
@@ -1295,6 +1296,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tokio",
+ "zeroize",
  "zmij",
 ]
 
