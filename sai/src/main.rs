@@ -241,7 +241,7 @@ fn complete(
     } else if interrupted {
         eprintln!("Aborted!");
     } else {
-        if error.exit_code == ExitCode::Usage {
+        if error.exit_code == ExitCode::Usage && error.show_usage {
             eprintln!(
                 "{}\nTry '{} --help' for help.\n",
                 usage(command),

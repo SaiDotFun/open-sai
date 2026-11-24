@@ -34,14 +34,14 @@ fn resolves_all_layers_and_uses_websocket_from_the_same_or_higher_layer() {
     assert_eq!(from_env.source(Key::LcdEndpoint), Source::File);
     assert_eq!(from_env.source(Key::LogsKeepDays), Source::Default);
     let flags = Flags {
-        endpoint: Some("HTTP://user:pw@localhost:42/a/../b?key=secret#fragment".into()),
+        endpoint: Some("HTTP://user:pw@localhost:42/a/../b?key=secret".into()),
         ..Flags::default()
     };
     let from_flag = Settings::load(&flags, &env).unwrap();
     assert_eq!(from_flag.source(Key::KeeperEndpoint), Source::Flag);
     assert_eq!(
         from_flag.ws_endpoint(),
-        "ws://user:pw@localhost:42/a/../b?key=secret#fragment"
+        "ws://user:pw@localhost:42/a/../b?key=secret"
     );
     assert_eq!(from_flag.source(Key::KeeperWsEndpoint), Source::Derived);
 }

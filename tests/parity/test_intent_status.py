@@ -65,6 +65,15 @@ C4_INTENT_ERROR_CODES = frozenset(
 )
 
 
+@pytest.fixture
+def c11_cli_pair(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> tuple[CLI, CLI]:
+    version = invoke(cli_pair[0], tmp_path / "version-home", "--version")
+    assert version.returncode == 0, version.stderr
+    if version.stdout.strip() != b"sai, version 0.1.2":
+        pytest.skip("C11 uses the Python v0.1.2 reference in tests/parity/README.md")
+    return cli_pair
+
+
 @dataclass(frozen=True)
 class Reply:
     body: bytes = b""
@@ -163,6 +172,100 @@ def invoke(
         check=False,
         timeout=30,
     )
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http-flag",
+        "http-env",
+        "http-config",
+        "ws-fragment",
+        "ws-global-empty",
+        "ws-local-empty",
+        "ws-config-empty",
+    ],
+)
+def test_c11_rejects_endpoints_before_network_io(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path, source: str, json_output: bool
+) -> None:
+    upgrades: list[str] = []
+
+    def reject_stream(connection: ServerConnection) -> None:
+        # An unexpected upgrade ends the CLI immediately after connection_init.
+        connection.recv(timeout=5)
+        connection.send('{"type":"connection_error"}')
+
+    def record_upgrade(_connection: ServerConnection, request: UpgradeRequest) -> None:
+        upgrades.append(request.path)
+
+    with (
+        replay() as (http, _replies, requests),
+        graphql_ws(reject_stream, process_request=record_upgrade) as ws,
+    ):
+        for index, cli in enumerate(c11_cli_pair):
+            home = tmp_path / str(index)
+            home.mkdir(mode=0o700)
+            config = home / "config.toml"
+            flags = ["--json"] if json_output else []
+            env = {"SAI_ENDPOINT": http, "SAI_WS_ENDPOINT": ws}
+            if source.startswith("http-"):
+                command = ["market", "list"]
+                detail = "Invalid value for keeper.endpoint: remove the URL fragment"
+                if source == "http-flag":
+                    flags += ["--endpoint", http + "#client"]
+                    origin = "--endpoint"
+                elif source == "http-env":
+                    env["SAI_ENDPOINT"] = http + "#"
+                    origin = "SAI_ENDPOINT"
+                else:
+                    config.write_text(f'[keeper]\nendpoint = "{http}#client"\n')
+                    origin = str(config)
+            else:
+                command = ["watch", "balances", ADDR]
+                detail = (
+                    "Invalid value for keeper.ws_endpoint: expected a URL starting "
+                    "with wss:// or ws://"
+                )
+                if source == "ws-fragment":
+                    command = [
+                        "account",
+                        "balances",
+                        ADDR,
+                        "--ws-endpoint",
+                        ws + "#client",
+                    ]
+                    detail = (
+                        "Invalid value for keeper.ws_endpoint: remove the URL fragment"
+                    )
+                    origin = ""
+                elif source == "ws-global-empty":
+                    flags += ["--ws-endpoint", ""]
+                    origin = "--ws-endpoint"
+                elif source == "ws-local-empty":
+                    command += ["--ws-endpoint", ""]
+                    origin = ""
+                else:
+                    config.write_text('[keeper]\nws_endpoint = ""\n')
+                    origin = str(config)
+            message = f"{origin}: {detail}" if origin else detail
+            result = invoke(cli, home, *flags, *command, overrides=env)
+            assert requests == []
+            assert upgrades == []
+            assert result.returncode == 2, (result.stdout, result.stderr)
+            if json_output:
+                assert result.stderr == b""
+                assert json.loads(result.stdout) == {
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": message,
+                        "retryable": False,
+                    }
+                }
+            else:
+                assert result.stdout == b""
+                assert result.stderr == f"Error: {message}\n".encode()
 
 
 def read_events(home: Path) -> list[dict[str, Any]]:

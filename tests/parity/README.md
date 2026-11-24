@@ -74,6 +74,21 @@ reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
 
+## C11 Python Reference
+
+The C11 parity fixes use Python tag `sai-cli/v0.1.2` at commit
+`8557a7e13dceab0accc369191182c8e01423c91b`. Install that checkout with
+`uv sync --locked` and point `SAI_PARITY_PYTHON` at its `.venv/bin/sai`.
+The endpoint, directory, and intent cases skip the older Python reference
+used by Rust CI.
+
+```sh
+SAI_PARITY_PYTHON=/absolute/path/to/v0.1.2/.venv/bin/sai \
+SAI_PARITY_BIN=/absolute/path/to/rust/sai \
+  uv run --locked pytest tests/parity/test_intent_status.py \
+    -k 'c11 or watch_reports_rejected_upgrade'
+```
+
 ## Comparison Rules
 
 The runner compares exit codes, stderr categories, and stdout. JSON and JSONL
