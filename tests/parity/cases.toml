@@ -791,7 +791,87 @@ state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#ch
 name = "mcp-tool-inventory"
 args = ["mcp","serve"]
 mode = "mcp"
+mcp_profile = "inventory"
+mcp_logs = true
 wire = ["borrowings", "tokenPricesUsd"]
+
+[[case]]
+name = "mcp-initialize-legacy"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "initialize"
+mcp_protocol = "2024-11-05"
+
+[[case]]
+name = "mcp-initialize-newer"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "initialize"
+mcp_protocol = "2026-07-28"
+
+[[case]]
+name = "mcp-info-public-endpoints"
+args = ["mcp","serve","--endpoint","{keeper}?fixture=hidden","--ws-endpoint","{ws}?fixture=hidden","--lcd-endpoint","{http}/fixture-lcd-private?fixture=hidden"]
+mode = "mcp"
+mcp_profile = "info"
+seed = "mcp-info-cache"
+
+[[case]]
+name = "mcp-market-number-spelling"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "number-spelling"
+server = "read-number-spelling"
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "mcp-account-intent-reads"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "reads"
+seed = "ledger"
+server = "mcp-reads"
+wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
+# The current Python checkout uses the narrower history query during reconciliation.
+mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
+
+[[case]]
+name = "mcp-argument-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "validation"
+
+[[case]]
+name = "mcp-session-refusals"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "refusals"
+
+[[case]]
+name = "mcp-session-reloads"
+args = ["--endpoint","{http}","mcp","serve","--endpoint","{keeper}"]
+mode = "mcp"
+mcp_profile = "session"
+# Temporary. The native-only trade_open probe expires this when the tool lands.
+mcp_deferred_trade_exception = true
+seed = "session"
+wire = ["trades", "trades", "trades"]
+
+[[case]]
+name = "mcp-keeper-errors"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "keeper-errors"
+server = "keeper-error"
+wire = ["borrowings", "tokenPricesUsd", "trades", "tradeHistory", "userIntents"]
+
+[[case]]
+name = "mcp-stream-error"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "stream-error"
+server = "ws-partial"
+wire = ["ws:init", "ws:userBalances", "ws:pong"]
 
 [[case]]
 name = "logs-path"

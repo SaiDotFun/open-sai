@@ -5,13 +5,15 @@ pub(crate) mod update_repair;
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
     errors::{Code, ExitCode, SaiError},
-    settings::{KEYS, repr},
+    log::LogWriter,
+    settings::{Environment, Flags, KEYS, repr},
 };
 use serde_json::{Value, json};
 
@@ -39,6 +41,8 @@ pub(crate) enum McpCommand {
     Install(InstallArgs),
     /// Remove Sai from Claude Code, Codex, or Cursor.
     Uninstall(uninstall::UninstallArgs),
+    /// Serve Sai tools to an agent client over stdio.
+    Serve(crate::mcp::ServeArgs),
 }
 
 #[derive(Args)]
@@ -915,18 +919,29 @@ fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
 }
 
 impl McpArgs {
-    pub(crate) fn run(self, json: bool, explicit_separator: bool) -> Result<(), SaiError> {
-        let clients = Clients::open().map_err(|err| SaiError::new(Code::InternalError, err))?;
+    pub(crate) fn run(
+        self,
+        flags: Flags,
+        env: &Environment,
+        json: bool,
+        explicit_separator: bool,
+        writer: Option<Arc<LogWriter>>,
+    ) -> Result<(), SaiError> {
+        let open_clients =
+            || Clients::open().map_err(|err| SaiError::new(Code::InternalError, err));
         match self.command {
+            Some(McpCommand::Serve(args)) => args.run(flags, env, writer),
             Some(McpCommand::List) => {
+                let clients = open_clients()?;
                 let target = reported_target(Vec::new(), &clients.home)
                     .map_err(|err| eprintln!("{err}"))
                     .ok();
                 crate::local::emit(&clients.list(target.as_ref()), json)
             }
-            Some(McpCommand::Install(args)) => args.run(&clients, json, explicit_separator),
-            Some(McpCommand::Uninstall(args)) => args.run(&clients, json),
+            Some(McpCommand::Install(args)) => args.run(&open_clients()?, json, explicit_separator),
+            Some(McpCommand::Uninstall(args)) => args.run(&open_clients()?, json),
             None => {
+                open_clients()?;
                 use clap::CommandFactory;
                 let mut command = crate::Cli::command();
                 let mut mcp = command
