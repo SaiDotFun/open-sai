@@ -192,7 +192,7 @@ fn main() -> process::ExitCode {
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
     finish(
-        writer.and_then(Arc::into_inner),
+        writer.as_deref(),
         surface,
         command_field(),
         started,
@@ -316,7 +316,7 @@ fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
 }
 
 fn finish(
-    writer: Option<LogWriter>,
+    writer: Option<&LogWriter>,
     surface: Surface,
     command: Field,
     started: Instant,

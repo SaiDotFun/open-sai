@@ -11,7 +11,7 @@ import sqlite3
 import subprocess
 import time
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -122,8 +122,6 @@ def test_sigint_exits_with_stdin_open(native: Path, tmp_path: Path) -> None:
 
 
 def test_ping_during_exclusive_ledger_lock(native: Path, tmp_path: Path) -> None:
-    from contextlib import closing
-
     home = tmp_path / "home"
     with (
         loopback("normal") as endpoints,
@@ -354,3 +352,37 @@ def test_local_ledger_read_while_keeper_reconciliation_is_busy(
             assert json.loads(result["content"][0]["text"])["intents"]
         finally:
             endpoints.interrupt_closed.set()
+
+
+def test_sigint_flushes_command_end_during_locked_reconciliation(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="ledger", logs=True) as stdio,
+        closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as database,
+    ):
+        database.execute("BEGIN EXCLUSIVE")
+        stdio.send(
+            "tools/call",
+            id_=2,
+            name="intent_status",
+            arguments={"addr": ADDRESS, "key": INTENT},
+        )
+        deadline = time.monotonic() + 5
+        while not any(
+            '"event":"intent.keeper"' in file.read_text()
+            for file in (home / "sai/logs").glob("mcp-*.jsonl")
+        ):
+            assert time.monotonic() < deadline, "intent_status did not reach the ledger"
+            time.sleep(0.01)
+        stdio.proc.send_signal(signal.SIGINT)
+        assert stdio.proc.wait(timeout=3) == 0
+        events = [
+            json.loads(line)
+            for file in sorted((home / "sai/logs").glob("mcp-*.jsonl"))
+            for line in file.read_text().splitlines()
+        ]
+        assert events[-1]["event"] == "command.end"
+        assert events[-1]["exitCode"] == 0

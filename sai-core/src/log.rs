@@ -127,7 +127,7 @@ struct Event {
 }
 
 pub struct LogWriter {
-    events: SyncSender<Event>,
+    events: Mutex<Option<SyncSender<Event>>>,
     done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
     command_id: Option<String>,
@@ -204,7 +204,7 @@ impl LogWriter {
             })
             .ok()?;
         Some(Self {
-            events,
+            events: Mutex::new(Some(events)),
             done: Mutex::new(done),
             queue,
             command_id: None,
@@ -265,17 +265,26 @@ impl LogWriter {
             chars,
             v2: self.command_id.is_some(),
         };
-        if self.events.try_send(event).is_err() {
+        let sent = self.events.lock().is_ok_and(|events| {
+            events
+                .as_ref()
+                .is_some_and(|sender| sender.try_send(event).is_ok())
+        });
+        if !sent {
             self.queue.chars.fetch_sub(chars, Relaxed);
             self.queue.dropped.fetch_add(1, Relaxed);
         }
     }
 
     /// Close the queue and allow the writer up to `timeout` to finish.
-    pub fn finish(self, timeout: Duration) -> bool {
-        drop(self.events);
+    pub fn finish(&self, timeout: Duration) -> bool {
+        let Ok(mut events) = self.events.lock() else {
+            return false;
+        };
+        events.take();
+        drop(events);
         self.done
-            .into_inner()
+            .lock()
             .is_ok_and(|done| done.recv_timeout(timeout).is_ok())
     }
 }
