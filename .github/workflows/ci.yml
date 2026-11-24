@@ -243,6 +243,8 @@ jobs:
           fi
           test -x "$SAI_PARITY_BIN"
           test -x "$SAI_MCP_PARITY_PYTHON"
+          printf 'C8 Python reference '
+          git -C .parity-mcp-python rev-parse HEAD
           uv run --locked python tests/parity/parity.py --case 'mcp-*-*'
       - name: Race the Rust and Python intent reservations
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -260,4 +262,10 @@ jobs:
           SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
           SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
-        run: uv run --locked pytest tests/parity
+        run: |
+          printf 'Python release tag %s\n' 'sai-cli/v0.1.2'
+          for parity_checkout in .parity-python .parity-mcp-python .parity-python-c7 .parity-python-wait .parity-auth-python .parity-position-v012 .parity-position-owner; do
+            printf '%s ' "$parity_checkout"
+            git -C "$parity_checkout" rev-parse HEAD
+          done
+          uv run --locked pytest tests/parity --verbose -rxX
