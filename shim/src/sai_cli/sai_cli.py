@@ -9,12 +9,13 @@ import platform
 import re
 import signal
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
 import zlib
 from collections.abc import Generator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from http.client import HTTPException, HTTPResponse
 from importlib.metadata import version
 from pathlib import Path
@@ -358,6 +359,70 @@ def install_binary(cache: Path, url: str, name: str, base: str) -> None:
                 publish(cache / "verified", file, 0o600)
 
 
+def parent_directory() -> Path | None:
+    parent = os.getppid()
+    if sys.platform == "linux":
+        with suppress(OSError):
+            return Path(os.readlink(f"/proc/{parent}/cwd"))
+    elif sys.platform == "darwin":
+        with suppress(OSError, subprocess.SubprocessError):
+            result = subprocess.run(
+                ["/usr/sbin/lsof", "-nP", "-a", "-p", str(parent), "-d", "cwd", "-Fn0"],
+                capture_output=True,
+                check=True,
+                timeout=5,
+            )
+            for field in result.stdout.split(b"\0"):
+                if field.startswith(b"n/"):
+                    return Path(os.fsdecode(field[1:]))
+    return None
+
+
+def updater_holds_cache_lock(home: Path) -> bool:
+    import fcntl
+
+    try:
+        fd = os.open(
+            home / "update-cache.lock", os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            return False
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(fd)
+
+
+def profile_home() -> Path:
+    home = Path(os.environ.get("SAI_HOME", Path.home() / ".sai"))
+    if (
+        not home.is_absolute()
+        and sys.argv[1:] == ["--version"]
+        and Path.cwd() == Path("/")
+    ):
+        # The v0.1.1 updater runs its version probes from / with the
+        # original environment. Resolve the profile from the updater's cwd.
+        parent = parent_directory()
+        if parent is not None and parent.is_absolute():
+            candidate = Path(os.path.abspath(parent / home))
+            if updater_holds_cache_lock(candidate):
+                home = candidate
+                os.environ["SAI_HOME"] = str(home)
+    return Path(os.path.abspath(home))
+
+
 @contextmanager
 def verified_binary() -> Generator[tuple[Path, BinaryIO]]:
     release = release_version(version("sai-cli"))
@@ -366,7 +431,7 @@ def verified_binary() -> Generator[tuple[Path, BinaryIO]]:
         base, scope = release_source()
     except RuntimeError as exc:
         raise ShimError(str(exc)) from exc
-    home = Path(os.environ.get("SAI_HOME", Path.home() / ".sai")).absolute()
+    home = profile_home()
     cache = private_directory(trusted_home(home), home=True)
     for part in ("bin", scope, release, target):
         cache = private_directory(cache / part)

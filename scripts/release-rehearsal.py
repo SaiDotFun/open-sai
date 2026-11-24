@@ -583,7 +583,10 @@ class Replay:
 
         class Handler(KeeperHandler):
             def do_GET(self) -> None:
-                replay.get_requests.append(self.path)
+                if self.path.startswith(
+                    (f"/repos/{REPO}/releases", f"/{REPO}/releases/")
+                ):
+                    replay.get_requests.append(self.path)
                 if self.path.startswith(f"/repos/{REPO}/releases?"):
                     self.reply([{"tag_name": f"sai-cli/v{replay.latest}"}])
                 elif asset := replay.assets.get(self.path):

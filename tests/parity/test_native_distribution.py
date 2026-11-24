@@ -249,6 +249,21 @@ def test_native_shim_selects_exact_asset_and_reuses_it_offline(
             assert tool.json(
                 "Read the same profile", "config", "get", "update.auto"
             ) == {"key": "update.auto", "value": False, "source": "file"}
+            assert (
+                run(
+                    tool,
+                    "Run a legacy version probe from the neutral directory",
+                    sys.executable,
+                    "-I",
+                    "-c",
+                    "import fcntl, os, subprocess, sys; "
+                    "lock = os.open('.sai/update-cache.lock', os.O_CREAT | os.O_RDWR, 0o600); "
+                    "fcntl.flock(lock, fcntl.LOCK_EX); "
+                    "sys.exit(subprocess.call([sys.argv[1], '--version'], cwd='/'))",
+                    tool.sai,
+                )
+                == expected_version
+            )
             tool.env["SAI_HOME"] = str(tool.sai_home)
 
             # `uv tool run` is the same entry point as `uvx`.
@@ -417,10 +432,10 @@ def test_native_shim_rejects_invalid_release_or_cache(
         assert replay.get_requests == []
 
 
-@pytest.mark.parametrize("check_mcp", [False, True], ids=["rollback", "mcp-startup"])
+@pytest.mark.parametrize("check", ["rollback", "mcp-startup", "relative-profile"])
 def test_published_python_updater_can_skip_bridge(
     distribution: SimpleNamespace,
-    check_mcp: bool,
+    check: str,
 ) -> None:
     baseline_dir = os.environ.get("SAI_NATIVE_BASELINE")
     if not baseline_dir:
@@ -500,6 +515,8 @@ def test_published_python_updater_can_skip_bridge(
             ]
 
             replay.latest = d.version
+            if check == "relative-profile":
+                tool.env["SAI_HOME"] = ".sai"
             upgraded = run(
                 tool,
                 "Jump from the published Python updater to the shim",
@@ -522,7 +539,7 @@ def test_published_python_updater_can_skip_bridge(
             )
             assert config.read_bytes() == configured
             assert ledger.stat().st_ino == inode
-            if check_mcp:
+            if check == "mcp-startup":
                 verify_mcp_startup(d)
                 return
 
