@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 import socket
 import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from contextlib import closing, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -23,6 +25,7 @@ import httpx
 
 from . import intents, keeper
 from .errors import Code, SaiError
+from .log import origin
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
@@ -35,6 +38,11 @@ INDEX_LAG = (
     " synchronizes. No intent was submitted."
 )
 _LCD_DNS_SLOTS = BoundedSemaphore(8)
+_LOG = logging.getLogger(__name__)
+_LCD_REQUEST: ContextVar[bool] = ContextVar("sai_lcd_request", default=False)
+# HTTPX logs the complete URL at INFO. Filter at its logger before host
+# handlers receive the record, with the filter scoped to each LCD request.
+logging.getLogger("httpx").addFilter(lambda _: not _LCD_REQUEST.get())
 _AddressInfo = (
     tuple[Literal[socket.AF_INET], socket.SocketKind, int, str, tuple[str, int]]
     | tuple[
@@ -73,6 +81,12 @@ class QueryHeightMismatch(SaiError, ValueError):
 
 class LCDTimeout(ValueError):
     """An overview LCD request ran out of time."""
+
+
+class _LCDStatusError(ValueError):
+    def __init__(self, endpoint: str, response: httpx.Response) -> None:
+        super().__init__(f"LCD at {endpoint} returned HTTP {response.status_code}")
+        self.body = response.text
 
 
 async def _resolve_lcd_host(
@@ -160,11 +174,18 @@ def _get_json_at_height(
             request_url = request_url.copy_with(
                 query=query + separator + b"_sai_query=" + nonce
             )
-        if deadline is None:
-            response = httpx.get(request_url, timeout=timeout, headers=headers)
-        else:
-            response = _get_before_deadline(request_url, deadline, headers)
-        response.raise_for_status()
+        request_token = _LCD_REQUEST.set(True)
+        try:
+            if deadline is None:
+                response = httpx.get(request_url, timeout=timeout, headers=headers)
+            else:
+                response = _get_before_deadline(request_url, deadline, headers)
+        finally:
+            _LCD_REQUEST.reset(request_token)
+        site = origin(url)
+        _LOG.info("LCD HTTP response from %s (status %d)", site, response.status_code)
+        if not 200 <= response.status_code < 300:
+            raise _LCDStatusError(site, response)
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
@@ -178,13 +199,14 @@ def _get_json_at_height(
         if deadline is not None and isinstance(
             exc, (TimeoutError, httpx.TimeoutException)
         ):
-            raise LCDTimeout("LCD read timed out") from exc
+            raise LCDTimeout("LCD read timed out") from None
+        cause = exc if isinstance(exc, _LCDStatusError) else None
         if height is not None or fresh:
             raise QueryHeightMismatch(
                 "Unable to verify contract state during confirmation."
                 " Retry the preview and confirmation."
-            ) from exc
-        raise ValueError("Unable to read contract state") from exc
+            ) from cause
+        raise ValueError("Unable to read contract state") from cause
     query_height = response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}")
     if query_height is None and allow_unprefixed_height:
         query_height = response.headers.get(BLOCK_HEIGHT_HEADER)
@@ -278,9 +300,9 @@ def pair_leverage_cap(
         )
     except ValueError as exc:
         failure = exc.__cause__
-        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+        if isinstance(failure, _LCDStatusError) and re.search(
             r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found",
-            failure.response.text,
+            failure.body,
         ):
             return Decimal(0)
         raise
@@ -299,9 +321,9 @@ def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> A
     except QueryHeightMismatch as exc:
         failure = exc.__cause__
         # The wasm gRPC gateway can wrap Perp query errors in HTTP 500.
-        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+        if isinstance(failure, _LCDStatusError) and re.search(
             rf"Trade not found for trader \S+ with index {trade_id}\b",
-            failure.response.text,
+            failure.body,
         ):
             raise ValueError(
                 f"Trade {trade_id} was not found for this account."
