@@ -30,10 +30,12 @@ pub(super) fn operation(query: &str) -> &'static str {
 }
 
 pub(crate) fn is_log_operation(name: &str) -> bool {
-    [
-        CHALLENGE, HISTORY, INTENTS, MARKET, MARKETS, POSITION, POSITIONS, PRICES, ROUTE, SESSION,
-        SUBMIT, "",
-    ]
-    .into_iter()
-    .any(|query| operation(query) == name)
+    // These names also occur in logs written by Python account overview.
+    matches!(name, "overview_trades" | "pending_market_orders")
+        || [
+            CHALLENGE, HISTORY, INTENTS, MARKET, MARKETS, POSITION, POSITIONS, PRICES, ROUTE,
+            SESSION, SUBMIT, "",
+        ]
+        .into_iter()
+        .any(|query| operation(query) == name)
 }

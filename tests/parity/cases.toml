@@ -266,9 +266,10 @@ setup = ["--json","market","prices"]
 wire = ["tokenPricesUsd"]
 
 [[case]]
-name = "logs-tail-empty"
-args = ["--json","logs","tail","-n","2"]
+name = "logs-tail-command"
+args = ["--json","logs","tail","-n","2","--event","command"]
 mode = "jsonl"
+setup = ["--json","config","list"]
 
 [[case]]
 name = "logs-intent-offline"

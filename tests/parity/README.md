@@ -117,7 +117,7 @@ volatile fields listed in `docs/log-events.json` and to generated intent keys.
 
 ## C9b Python Reference
 
-Commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` is the Python
+Commit `bdc11da6c9938aa0371835d921f27d45daa77c36` is the Python
 reference for logs, skill management, and the REPL. It contains the logging
 v2 schema from PR #69 and the paging fixes from PR #93. In CI,
 `test_local_commands.py` uses the installed Python in the current checkout.

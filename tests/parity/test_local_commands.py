@@ -1,4 +1,4 @@
-"""C9b parity against Python ea09f0d417a53a71079bb8c5e426005fa29051a4."""
+"""C9b parity against Python bdc11da6c9938aa0371835d921f27d45daa77c36."""
 
 from __future__ import annotations
 
@@ -93,7 +93,13 @@ def test_skill_source(
         result = invoke(cli, root, "--json", "skill", "source")
         assert result.returncode == 0 and result.stderr == b""
         report = json.loads(result.stdout)
-        assert Path(report.pop("path")).exists()
+        location = Path(report.pop("path"))
+        if index == 0:
+            assert (location / "SKILL.md").read_bytes() == (
+                SKILL / "SKILL.md"
+            ).read_bytes()
+        else:
+            assert location.samefile(cli[0])
         assert report.pop("cliVersion")
         assert Path(report["install"].pop("defaultDir")) == root / ".agents/skills/sai"
         reports.append(report)
@@ -219,11 +225,23 @@ def test_log_path_and_tail(
             root,
             {
                 "cli": [
-                    event("keeper.request", 2, keeperErrors=[{"message": "private"}])
+                    event(
+                        "keeper.request",
+                        2,
+                        keeperErrors=[{"message": "private"}],
+                        operation="overview_trades",
+                        durationMs=3,
+                    )
                 ],
                 "mcp": [
                     event("command.start", 1, surface="mcp"),
-                    event("keeper.request", 3, surface="mcp"),
+                    event(
+                        "keeper.request",
+                        3,
+                        surface="mcp",
+                        operation="pending_market_orders",
+                        durationMs=5,
+                    ),
                 ],
             },
         )
@@ -254,6 +272,10 @@ def test_log_path_and_tail(
         assert [row["seq"] for row in rows] == [2, 3]
         assert rows[0]["keeperErrors"] == [{"code": "KEEPER_ERROR"}]
         assert rows[0]["keeperErrorCount"] == 1
+        assert cli_json(cli, root, "logs", "stats")["keeper"] == {
+            "overview_trades": {"count": 1, "p50Ms": 3, "p95Ms": 3},
+            "pending_market_orders": {"count": 1, "p50Ms": 5, "p95Ms": 5},
+        }
         assert invoke(cli, root, "logs", "tail", "--surface", "mcp").stdout.startswith(
             f"{STAMP} mcp info command.start\n".encode()
         )
