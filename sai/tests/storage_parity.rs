@@ -202,11 +202,18 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(code), "{variable}");
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(!stderr.contains(marker), "{variable} echoed its value");
-        assert!(stderr.contains(variable) && stderr.contains(key));
+        let diagnostic = if code == 0 {
+            String::from_utf8(output.stderr).unwrap()
+        } else {
+            assert!(output.stderr.is_empty());
+            let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+            assert_eq!(error["code"], "INVALID_REQUEST");
+            error["message"].as_str().unwrap().to_owned()
+        };
+        assert!(!diagnostic.contains(marker), "{variable} echoed its value");
+        assert!(diagnostic.contains(variable) && diagnostic.contains(key));
         if variable == "SAI_UPDATE_AUTO" {
-            assert!(stderr.contains("expected true, false, yes, no, on, off, 1, or 0"));
+            assert!(diagnostic.contains("expected true, false, yes, no, on, off, 1, or 0"));
         }
     }
 
