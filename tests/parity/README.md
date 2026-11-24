@@ -34,24 +34,18 @@ any selected case differs or fails its expectations.
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command awaiting a fixture or a native implementation.
 
-## Auth Cases Awaiting Rust
+## Auth Security Parity
 
-The Python regression suite checks credential output in CLI text, JSON, and
-MCP. The cross-runtime matrix defers these cases while the native auth port
-lands in [PR #106](https://github.com/SaiDotFun/open-sai/pull/106).
+The namespace matrix compares rejected import operands and malformed stored
+expiry in text and JSON against the native auth implementation from
+[PR #106](https://github.com/SaiDotFun/open-sai/pull/106). Those four cases
+disable logging. The auth regression tests check output and log redaction
+directly, including Python MCP stdio responses.
 
-- `auth-import-rejected-operand-text` and `auth-import-rejected-operand-json`.
-  The current Rust CLI has no `auth import` command. The text comparator can
-  match the exit status and stderr category for two different usage errors.
-- `auth-use-invalid-expiry-text` and `auth-use-invalid-expiry-json`.
-  The current Rust CLI can activate an account with a malformed expiry. Python
-  returns `SESSION_UNAVAILABLE` and keeps the previous account active.
-- `auth-use-missing`. The current Rust diagnostic quotes the unregistered
-  operand. Python returns a fixed diagnostic and omits the operand from logs.
-
-The Python `command.start` event also omits argument values for all auth
-commands. Native auth logging and the unregistered-account diagnostic need
-their own parity coverage when the Rust behavior matches.
+The matrix omits `auth-use-missing` while the native diagnostic quotes the
+unregistered operand. Python returns a fixed diagnostic and omits argument
+values from auth command logs. Native auth logging also differs from Python
+when the command includes an argument value.
 
 ## Add a Case
 
@@ -83,6 +77,15 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
 - Keep the coverage inventory current. The runner checks that each leaf
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
+
+## Auth Subprocess Cases
+
+Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.
+Set `SAI_PARITY_AUTH_PYTHON` to the Python `sai` executable from a checkout
+of `main` to compare auth, including renewal, expiry recovery, and origin-only
+output. The Rust CI job pins the reference to a commit on `main`. The test runs
+use private temporary homes, fixture clipboard and signing commands, and
+loopback Keeper.
 
 The `legacy` seed contains a config file and an encrypted synthetic session
 written by the Python source at tag `sai-cli/v0.1.0`. The concurrent-close
