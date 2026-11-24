@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import stat
@@ -38,6 +39,7 @@ RETIRED_NAME = "sai-mcp"
 SERVER_NAMES = (NAME, RETIRED_NAME)
 HIDDEN = "<hidden>"
 CODEX_TOOL_FILTERS = ("enabled_tools", "disabled_tools")
+RESTORE_ENV_NAME = re.compile(r"[A-Z_][A-Z0-9_]{0,63}")
 STILL_ACTIVE = "a project .codex/config.toml entry is still active"
 CLIENTS = ("claude", "codex", "cursor")
 ALIASES = {"claude-code": "claude", "claude_code": "claude"}
@@ -1179,13 +1181,17 @@ def codex_restore_hint(name: str, original: dict[str, Any]) -> str:
             args.append(arg)
         else:
             args.append("<original-argument>")
+    env_keys = [
+        key if RESTORE_ENV_NAME.fullmatch(key) else "<original-key>"
+        for key in original.get("env", {})
+    ]
     command = shlex.join(
         [
             "codex",
             "mcp",
             "add",
             name,
-            *(f"--env={key}=<original-value>" for key in original.get("env", {})),
+            *(f"--env={key}=<original-value>" for key in env_keys),
             "--",
             launcher if launcher in SERVER_NAMES else "<original-launcher>",
             *args,

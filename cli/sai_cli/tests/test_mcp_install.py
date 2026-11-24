@@ -889,10 +889,17 @@ def test_doctor_does_not_write_a_rejected_codex_repair(env: Env, writer: str):
 
 @pytest.mark.parametrize("has_policy", [False, True])
 def test_doctor_prints_redacted_codex_restore_command(env: Env, has_policy: bool):
+    valid_keys = ("PRIVATE", "_", "A9" + "B" * 62)
+    private_keys = (
+        "sk-fixture-token-used-as-a-key",
+        "fixturelowercasekey",
+        "9PRIVATE",
+        "B" * 65,
+    )
     original = {
         "command": str(env.root / SECRET / OLD_COMMAND),
         "args": [f"--endpoint=https://fixture.invalid/{SECRET}"],
-        "env": {"PRIVATE": SECRET},
+        "env": dict.fromkeys((*valid_keys, *private_keys), SECRET),
     }
     if has_policy:
         original.update(enabled=False, enabled_tools=[])
@@ -920,14 +927,19 @@ def test_doctor_prints_redacted_codex_restore_command(env: Env, has_policy: bool
         "mcp",
         "add",
         "sai",
-        "--env=PRIVATE=<original-value>",
+        *(f"--env={key}=<original-value>" for key in valid_keys),
+        *("--env=<original-key>=<original-value>" for _ in private_keys),
         "--",
         "<original-launcher>",
         "--endpoint=<original-value>",
     ]
     assert ("Codex config.toml" in check["fix"]) is has_policy
+    text_result = CliRunner().invoke(main, ["doctor", "--offline"])
+    assert text_result.exit_code == 1
+    assert "--env=<original-key>=<original-value>" in text_result.output
     logs = "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
-    assert SECRET not in result.output + logs + env.log.read_text()
+    outputs = result.output + text_result.output + logs + env.log.read_text()
+    assert all(private not in outputs for private in (SECRET, *private_keys))
     assert list(env.codex_home.iterdir()) == [env.codex_path()]
 
 
