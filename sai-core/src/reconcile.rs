@@ -14,7 +14,12 @@ use crate::{
 const OUTCOME_NOT_INDEXED: &str = "market_order_outcome_not_indexed";
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(2);
 const HISTORY_RETRY_DELAY: Duration = Duration::from_millis(250);
-const LOCAL_PENDING_HINT: &str = "This intent is still pending locally. Do not resubmit.";
+pub(crate) const PENDING_HINT: &str = "Fill pending at the next oracle price. Do not resubmit.";
+pub(crate) const UNINDEXED_HINT: &str =
+    "The order may have filled. Check positions and run intent status again. Do not resubmit.";
+pub(crate) const HISTORY_HINT: &str = "Waiting for matching trade history. Do not resubmit.";
+pub(crate) const LOCAL_PENDING_HINT: &str =
+    "This intent is still pending locally. Do not resubmit.";
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub enum Outcome {
@@ -70,11 +75,11 @@ fn explicit_market_pending(row: &Value) -> bool {
 
 fn pending_hint(row: &Value) -> &'static str {
     if row["lifecycleStep"] == "pending_exec" {
-        "Fill pending at the next oracle price. Do not resubmit."
+        PENDING_HINT
     } else if row["errorCode"] == OUTCOME_NOT_INDEXED {
-        "The order may have filled. Check positions and run intent status again. Do not resubmit."
+        UNINDEXED_HINT
     } else {
-        "Waiting for matching trade history. Do not resubmit."
+        HISTORY_HINT
     }
 }
 

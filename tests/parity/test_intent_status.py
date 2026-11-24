@@ -22,6 +22,7 @@ from typing import Any
 
 import pytest
 from sai_cli.core import keeper, log, storage
+from sai_cli.mcp_server.tools import _reconcile_fields
 
 FIXTURE = json.loads(
     (
@@ -219,58 +220,22 @@ class Step:
     json_output: bool = True
 
 
-def public_intent_errors(output: bytes, *, compact: bool) -> bytes:
-    """Apply PR 69's error fields to stdout from the pinned Python CLI."""
-    if not output:
-        return output
+def public_intent_output(output: bytes, *, compact: bool) -> bytes:
+    """Apply the PR 69 public field projection to raw pinned CLI stdout."""
     document = json.loads(output)
-    if not isinstance(document, dict) or not isinstance(
-        document.get("userIntents"), list
+    public = _reconcile_fields(document)
+    for name, project in (
+        (
+            "userIntents",
+            lambda row: keeper.safe_intent_record(row) | _reconcile_fields(row),
+        ),
+        ("matchedTradeHistory", keeper.safe_intent_history),
     ):
-        return output
-    safe_record = getattr(keeper, "safe_intent_record", None)
-    for row in document["userIntents"]:
-        if safe_record is not None:
-            # PR 69 applies this projection in MCP. Use its error fields as
-            # soon as the Python reference includes the helper.
-            public = safe_record(row)
-        elif (
-            row.get("errorCode")
-            or row.get("errorMsg")
-            or row.get("lifecycleStep")
-            in {
-                "jwt_failed",
-                "sign_reject",
-                "sign_failed",
-                "exec_req_fail",
-                "exec_fail",
-            }
-        ):
-            # The pinned reference exposes raw fields. Listed codes cover its
-            # lifecycle replay fixtures. Production Rust owns the full allowlist.
-            code = row.get("errorCode")
-            known = {
-                "admission_expired",
-                "broadcast_rejected",
-                "simulation_failed",
-                "chain_execution_failed",
-                "market_order_outcome_not_indexed",
-                "market_order_expired",
-                "market_order_fill_failed",
-                "market_order_trading_paused",
-                "market_order_market_closed",
-                "market_order_trade_not_open",
-            }
-            public = {
-                "errorCode": code if code in known else "KEEPER_ERROR",
-                "errorMsg": "Keeper reported an intent error.",
-            }
-        else:
-            continue
-        for field in ("errorCode", "errorMsg"):
-            if field in public:
-                row[field] = public[field]
-    return (json.dumps(document, indent=None if compact else 2) + "\n").encode()
+        if isinstance(rows := document.get(name), list):
+            public[name] = [project(row) for row in rows if isinstance(row, dict)]
+    return (
+        json.dumps(log.clean(public), indent=None if compact else 2) + "\n"
+    ).encode()
 
 
 def compare(
@@ -325,7 +290,7 @@ def compare(
                     )
                 stdout = result.stdout
                 if index == 0 and step.code == 0:
-                    stdout = public_intent_errors(stdout, compact=step.json_output)
+                    stdout = public_intent_output(stdout, compact=step.json_output)
                 runs.append((stdout, result.stderr, list(requests), state))
             observed.append((runs, read_events(home)))
         assert observed[0] == observed[1]
@@ -714,14 +679,16 @@ def test_expired_auth_status(
 
 @pytest.mark.parametrize("json_output", [True, False])
 @pytest.mark.parametrize("known_code", [True, False])
-def test_public_intent_status_scrubs_keeper_message(
+@pytest.mark.parametrize("valid_hash", [True, False])
+def test_public_intent_status_scrubs_keeper_payload(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     json_output: bool,
     known_code: bool,
+    valid_hash: bool,
 ) -> None:
-    token = "synthetic-stored-session"
+    token = "a1b2c3d4" * 8 if valid_hash else "synthetic-stored-session"
     private = f"Keeper message: {token} " + "x" * 500
     with replay() as (endpoint, replies, requests):
         expected = "market_order_expired" if known_code else "KEEPER_ERROR"
@@ -742,9 +709,15 @@ def test_public_intent_status_scrubs_keeper_message(
                 **row,
                 "errorMsg": private,
                 "errorCode": expected if known_code else token,
+                "txHash": token,
+                "serverDiagnostic": token,
             }
             requests.clear()
-            replies.append(response({"data": {"userIntents": [row]}}))
+            replies.append(
+                response(
+                    {"data": {"userIntents": [row], "hint": private, "extra": token}}
+                )
+            )
             args = ["--endpoint", endpoint]
             if json_output:
                 args.append("--json")
@@ -756,14 +729,60 @@ def test_public_intent_status_scrubs_keeper_message(
             ]
             output = result.stdout
             if index == 0:
-                # Until the reference CLI uses the projection, compare its
-                # public error fields. The Rust side is always checked raw.
-                output = public_intent_errors(output, compact=json_output)
+                # The pinned CLI returns raw rows. Compare the public
+                # projection and always check Rust stdout as emitted.
+                output = public_intent_output(output, compact=json_output)
             assert token.encode() not in output
             assert private.encode() not in output
-            public = json.loads(output)["userIntents"][0]
+            envelope = json.loads(output)
+            assert set(envelope) == {"userIntents"}
+            public = envelope["userIntents"][0]
+            assert "serverDiagnostic" not in public
+            if valid_hash:
+                assert public["txHash"] == "[redacted session token]"
+            else:
+                assert "txHash" not in public
+                assert public["txHashInvalid"] is True
             assert public["errorCode"] == expected
             assert public["errorMsg"] == "Keeper reported an intent error."
+
+
+def test_public_history_projects_after_raw_hash_correlation(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = "synthetic-keeper-text"
+    intent = RESPONSES["outcome_not_indexed"]["data"]["userIntents"][0]
+    history = {
+        "intentKey": KEY,
+        "id": opaque,
+        "tradeChangeType": opaque,
+        "txHash": opaque,
+        "evmTxHash": "0X" + "CD" * 32,
+        "trade": {"id": opaque, "trader": ADDR, "note": opaque},
+        "block": {"block": "2142-2", "block_ts": opaque},
+        "debug": opaque,
+    }
+    compare(
+        cli_pair,
+        tmp_path,
+        monkeypatch,
+        (
+            Step(
+                (
+                    {
+                        "data": {
+                            "userIntents": [{**intent, "txHash": opaque}],
+                            "extra": opaque,
+                        }
+                    },
+                    {"data": {"perp": {"tradeHistory": [history]}}},
+                ),
+                "terminal",
+            ),
+        ),
+    )
 
 
 @pytest.fixture(scope="module")
@@ -904,5 +923,10 @@ def test_keeper_tls_trust_matches_httpx(
             )
             if not trusted:
                 assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
-            observed.append((result.stdout, list(requests)))
+            stdout = (
+                public_intent_output(result.stdout, compact=True)
+                if index == 0 and trusted
+                else result.stdout
+            )
+            observed.append((stdout, list(requests)))
         assert observed[0] == observed[1]
