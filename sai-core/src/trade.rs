@@ -194,7 +194,9 @@ impl<'a> Trading<'a> {
         ) {
             return Err(SaiError::internal());
         }
-        preview.position_route = self.basic_trade_route(session, &preview, true).await?;
+        preview.position_route = self
+            .basic_trade_route(session, &preview, true, None)
+            .await?;
         if preview.requires_market_price_refresh() {
             self.refresh_market_open(&mut preview).await?;
             let price = preview
@@ -211,19 +213,43 @@ impl<'a> Trading<'a> {
         &self,
         session: &Session,
         preview: &TradePreview,
-        confirming: bool,
+        bind_open: bool,
+        confirmation: Option<&Confirmation<'_>>,
     ) -> Result<Option<position::PositionRoute>, SaiError> {
-        match preview.intent.kind {
-            "CANCEL_PENDING_TRADE" => self.check_pending_order(session, preview).await.map(Some),
-            "CLOSE_POSITION" => self.check_close(session.addr(), preview).await.map(Some),
-            "OPEN_TRADE" if confirming => {
-                let lcd = self.lcd_endpoint.map(position::Lcd).ok_or_else(|| {
-                    actions::invalid("Cannot verify the trade route without an LCD")
-                })?;
-                self.position_route(&lcd, false).await.map(Some)
+        let account = session.addr();
+        let mut close_id = None;
+        let no_lcd = match preview.intent.kind {
+            "CLOSE_POSITION" => {
+                let id = preview.position_id()?;
+                self.indexed_position(account, &id, keeper::TIMEOUT).await?;
+                close_id = Some(id);
+                "Cannot verify the position without an LCD"
             }
-            _ => Ok(None),
+            "CANCEL_PENDING_TRADE" => "Cannot verify the pending order without an LCD",
+            "OPEN_TRADE" if bind_open => "Cannot verify the trade route without an LCD",
+            _ => return Ok(None),
+        };
+        let lcd = self
+            .lcd_endpoint
+            .map(position::Lcd)
+            .ok_or_else(|| actions::invalid(no_lcd))?;
+        let route = self.position_route(&lcd, confirmation.is_some()).await?;
+        if let Some(confirmation) = confirmation
+            && !preview.requires_market_price_refresh()
+        {
+            let mut current = preview.clone();
+            current.position_route = Some(route.clone());
+            // A replacement contract may not contain the target. Compare the
+            // confirmed route before reading it so drift is reported first.
+            confirmation.verify_digest(&current, account)?;
         }
+        if let Some(id) = close_id {
+            Self::verify_contract_owner(&lcd, account, &id, &route).await?;
+        } else if preview.intent.kind == "CANCEL_PENDING_TRADE" {
+            self.check_pending_target(session, preview, &lcd, &route)
+                .await?;
+        }
+        Ok(Some(route))
     }
 
     /// Verify a confirmed preview, commit the reservation, then send once.
@@ -251,7 +277,9 @@ impl<'a> Trading<'a> {
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
         let confirming = options.confirmation.is_some();
-        let route = self.basic_trade_route(session, preview, confirming).await?;
+        let route = self
+            .basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
+            .await?;
         let checked_route = route.is_some();
         let market = preview.requires_market_price_refresh();
         let update = if preview.is_standalone_position_update() {

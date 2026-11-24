@@ -33,7 +33,11 @@ impl<'a> Confirmation<'a> {
         })
     }
 
-    pub(super) fn verify(self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
+    pub(super) fn verify_digest(
+        &self,
+        preview: &TradePreview,
+        account: &str,
+    ) -> Result<(), SaiError> {
         match (
             preview.requires_market_price_refresh(),
             self.reference_price.as_ref(),
@@ -56,16 +60,19 @@ impl<'a> Confirmation<'a> {
         if let Some((reference, _)) = &self.reference_price {
             confirmed.reference_price = Some((*reference).into());
         }
-        let refusal = |code, message: String| SaiError {
-            details: Some(Box::new(Map::from_iter([(
-                "preview".into(),
-                preview.confirmed_output(Some(account)),
-            )]))),
-            ..SaiError::new(code, message)
-        };
         if preview_digest(&confirmed, Some(account)) != self.digest {
-            return Err(refusal(Code::PreviewMismatch, MISMATCH.into()));
+            return Err(refusal(
+                preview,
+                account,
+                Code::PreviewMismatch,
+                MISMATCH.into(),
+            ));
         }
+        Ok(())
+    }
+
+    pub(super) fn verify(self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
+        self.verify_digest(preview, account)?;
         if let (Some((_, reference)), Some(current)) =
             (&self.reference_price, &preview.reference_price)
         {
@@ -87,6 +94,8 @@ impl<'a> Confirmation<'a> {
             if &moved * SCALE > reference * allowed {
                 let moved = display_movement(moved, reference.clone());
                 return Err(refusal(
+                    preview,
+                    account,
                     Code::PriceMoved,
                     format!(
                         "The market price moved {moved}% from the confirmed referencePrice, more than the {slippage}% slippage, so nothing was submitted. Show the user this new preview, get their confirmation again, then retry with its previewDigest and referencePrice."
@@ -95,6 +104,16 @@ impl<'a> Confirmation<'a> {
             }
         }
         Ok(())
+    }
+}
+
+fn refusal(preview: &TradePreview, account: &str, code: Code, message: String) -> SaiError {
+    SaiError {
+        details: Some(Box::new(Map::from_iter([(
+            "preview".into(),
+            preview.confirmed_output(Some(account)),
+        )]))),
+        ..SaiError::new(code, message)
     }
 }
 

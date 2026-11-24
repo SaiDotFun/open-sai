@@ -36,6 +36,7 @@ struct ReplyState {
     requests: Vec<String>,
     price: &'static str,
     trade_type: &'static str,
+    target_missing: bool,
 }
 
 struct PositionServer {
@@ -59,6 +60,7 @@ impl PositionServer {
             requests: Vec::new(),
             price: "100",
             trade_type: "trade",
+            target_missing: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let replies = Arc::clone(&state);
@@ -156,6 +158,9 @@ impl ReplyState {
             "{request}"
         );
         self.requests.push("contract_position".into());
+        if self.target_missing {
+            return json!({"data": null});
+        }
         json!({"data": {
             "user_trade_index": "UserTradeIndex(7)", "user": self.contract_owner,
             "trade_type": self.trade_type, "is_open": true,
@@ -508,4 +513,92 @@ async fn basic_trade_confirmation_checks_live_chain_and_contract() {
         );
         assert_eq!(server.requests().last().unwrap(), "admission");
     }
+}
+
+#[tokio::test]
+async fn basic_confirmation_reports_keeper_only_chain_drift() {
+    for (preview, reference, preflight) in [
+        (market_open(), Some("100"), &["route", "node_info"][..]),
+        (
+            close_preview("7", false).unwrap(),
+            None,
+            &["position", "route", "node_info"][..],
+        ),
+        (
+            close_preview("7", true).unwrap(),
+            None,
+            &["route", "node_info"][..],
+        ),
+    ] {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        server.state.lock().unwrap().trade_type = "limit";
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+        let issued = trading
+            .confirmed_trade_preview(&session, preview.clone())
+            .await
+            .unwrap();
+        let digest = issued["previewDigest"].as_str().unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.keeper_chain = "fixture-chain-2";
+            state.requests.clear();
+        }
+        let error = trading
+            .submit(
+                &session,
+                &preview,
+                SubmitOptions {
+                    confirmation: Some(Confirmation::new(digest, reference).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, Code::PreviewMismatch);
+        assert_eq!(server.requests(), preflight);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
+}
+
+#[tokio::test]
+async fn cancel_confirmation_checks_route_before_reading_replacement_contract() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    server.state.lock().unwrap().trade_type = "limit";
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = close_preview("7", true).unwrap();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    let digest = issued["previewDigest"].as_str().unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.contract = "nibi1differentcontract";
+        state.target_missing = true;
+        state.requests.clear();
+    }
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(digest, None).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert_eq!(server.requests(), ["route", "node_info"]);
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
 }

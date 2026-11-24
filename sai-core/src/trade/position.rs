@@ -106,13 +106,36 @@ impl Trading<'_> {
         confirming: bool,
     ) -> Result<(PositionRoute, Value), SaiError> {
         let route = self.position_route(lcd, confirming).await?;
+        let raw = Self::read_contract_target(lcd, addr, id, &route).await?;
+        Ok((route, raw))
+    }
+
+    async fn read_contract_target(
+        lcd: &Lcd<'_>,
+        addr: &str,
+        id: &Value,
+        route: &PositionRoute,
+    ) -> Result<Value, SaiError> {
         let (raw, _) = lcd
             .position(&route.contract_address, addr, id, Read::Fresh)
             .await?;
         if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
             return Err(invalid(&format!("Unable to verify contract position {id}")));
         }
-        Ok((route, raw))
+        Ok(raw)
+    }
+
+    pub(super) async fn verify_contract_owner(
+        lcd: &Lcd<'_>,
+        addr: &str,
+        id: &Value,
+        route: &PositionRoute,
+    ) -> Result<(), SaiError> {
+        let raw = Self::read_contract_target(lcd, addr, id, route).await?;
+        if !same_account(addr, raw.get("user")) {
+            return Err(contract_owner_error());
+        }
+        Ok(())
     }
 
     pub(super) async fn verify_position_owner(
@@ -122,27 +145,9 @@ impl Trading<'_> {
         id: &Value,
         confirming: bool,
     ) -> Result<PositionRoute, SaiError> {
-        let (route, raw) = self
-            .read_contract_position(lcd, addr, id, confirming)
-            .await?;
-        if !same_account(addr, raw.get("user")) {
-            return Err(contract_owner_error());
-        }
+        let route = self.position_route(lcd, confirming).await?;
+        Self::verify_contract_owner(lcd, addr, id, &route).await?;
         Ok(route)
-    }
-
-    pub(super) async fn check_close(
-        &self,
-        addr: &str,
-        preview: &TradePreview,
-    ) -> Result<PositionRoute, SaiError> {
-        let id = preview.position_id()?;
-        self.indexed_position(addr, &id, TIMEOUT).await?;
-        let lcd = self
-            .lcd_endpoint
-            .map(Lcd)
-            .ok_or_else(|| invalid("Cannot verify the position without an LCD"))?;
-        self.verify_position_owner(&lcd, addr, &id, false).await
     }
 
     pub async fn close_position_preview(

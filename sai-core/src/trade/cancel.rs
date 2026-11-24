@@ -29,18 +29,18 @@ impl Trading<'_> {
     ) -> Result<Value, SaiError> {
         self.storage
             .check_active_trade(session, self.keeper.endpoint())?;
-        self.check_pending_order(session, preview).await?;
+        self.basic_trade_route(session, preview, false, None)
+            .await?;
         Ok(preview.output(Some(session.addr())))
     }
 
-    pub(super) async fn check_pending_order(
+    pub(super) async fn check_pending_target(
         &self,
         session: &Session,
         preview: &TradePreview,
-    ) -> Result<PositionRoute, SaiError> {
-        let lcd = self
-            .lcd_endpoint
-            .ok_or_else(|| invalid("Cannot verify the pending order without an LCD"))?;
+        lcd: &Lcd<'_>,
+        route: &PositionRoute,
+    ) -> Result<(), SaiError> {
         let id = preview
             .intent
             .target
@@ -48,9 +48,8 @@ impl Trading<'_> {
             .filter(|_| preview.intent.kind == "CANCEL_PENDING_TRADE")
             .map(|target| target.trade_id.as_str())
             .ok_or_else(SaiError::internal)?;
-        let route = self.position_route(&Lcd(lcd), false).await?;
         let trade = read_cancel_target(
-            lcd.trim_end_matches('/'),
+            lcd.0.trim_end_matches('/'),
             &route.contract_address,
             session.addr(),
             id,
@@ -69,7 +68,7 @@ impl Trading<'_> {
                 "Contract pending order belongs to a different account",
             ));
         }
-        Ok(route)
+        Ok(())
     }
 }
 
