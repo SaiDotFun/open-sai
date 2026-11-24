@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from scenarios import ADDRESS, Endpoints, child_env, loopback, seed_home
+from scenarios import ADDRESS, INTENT, Endpoints, child_env, loopback, seed_home
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
 
@@ -327,3 +327,30 @@ def test_extra_float_uses_python_spelling(
             f"input_value={rendered}, input_type=float"
             in response["result"]["content"][0]["text"]
         )
+
+
+def test_local_ledger_read_while_keeper_reconciliation_is_busy(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("interrupt-http") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="ledger") as stdio,
+    ):
+        try:
+            for id_ in range(2, 10):
+                stdio.send(
+                    "tools/call",
+                    id_=id_,
+                    name="intent_status",
+                    arguments={"addr": ADDRESS, "key": INTENT},
+                )
+            deadline = time.monotonic() + 5
+            while sum(request.label == "userIntents" for request in endpoints.wire) < 8:
+                assert time.monotonic() < deadline, (
+                    "Keeper did not receive all eight requests"
+                )
+                time.sleep(0.01)
+            result = stdio.call(10, "intent_local", addr=ADDRESS)
+            assert json.loads(result["content"][0]["text"])["intents"]
+        finally:
+            endpoints.interrupt_closed.set()

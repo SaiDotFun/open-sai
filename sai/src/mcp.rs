@@ -91,7 +91,8 @@ impl McpCommand {
             env: env.clone(),
             writer,
             install: install::Installation::detect(),
-            ledger_slots: Arc::new(Semaphore::new(8)),
+            local_ledger_slots: Arc::new(Semaphore::new(2)),
+            reconcile_slots: Arc::new(Semaphore::new(8)),
         };
         server.events().event(
             "mcp.server_start",
@@ -124,7 +125,8 @@ struct SaiMcp {
     env: Environment,
     writer: Option<Arc<LogWriter>>,
     install: install::Installation,
-    ledger_slots: Arc<Semaphore>,
+    local_ledger_slots: Arc<Semaphore>,
+    reconcile_slots: Arc<Semaphore>,
 }
 
 impl SaiMcp {
@@ -204,7 +206,7 @@ impl SaiMcp {
                         let home = self.env.home.clone();
                         let endpoint = endpoint.to_owned();
                         let addr = addr.to_owned();
-                        self.ledger_work(move || {
+                        Self::ledger_work(&self.local_ledger_slots, move || {
                             let intents = Storage::new(home).list_pending(&endpoint, &addr)?;
                             Ok(json!({"intents": intents}))
                         })
@@ -230,12 +232,12 @@ impl SaiMcp {
     }
 
     async fn ledger_work<T: Send + 'static>(
-        &self,
+        slots: &Arc<Semaphore>,
         work: impl FnOnce() -> Result<T, SaiError> + Send + 'static,
     ) -> Result<T, SaiError> {
         // Leave room in Tokio's blocking pool for stdio even if every query
         // is waiting on the same SQLite lock.
-        let slot = Arc::clone(&self.ledger_slots)
+        let slot = Arc::clone(slots)
             .acquire_owned()
             .await
             .map_err(|_| SaiError::internal())?;
@@ -260,7 +262,7 @@ impl SaiMcp {
         let runtime = tokio::runtime::Handle::current();
         let (_cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
         // Reconciliation combines Keeper requests with synchronous SQLite operations.
-        self.ledger_work(move || {
+        Self::ledger_work(&self.reconcile_slots, move || {
             let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
                 .with_tool("intent_status", &call_id);
             let log_storage = |event: StorageEvent<'_>| crate::local::storage_event(events, event);
