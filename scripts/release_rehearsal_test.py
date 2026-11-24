@@ -14,15 +14,34 @@ import unittest
 import urllib.request
 from contextlib import suppress
 from pathlib import Path
+from threading import Event
 from typing import Any
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
+SCRIPT = Path(__file__).with_name("release-rehearsal.py").resolve()
+REHEARSAL = runpy.run_path(str(SCRIPT))
+RUN_WITH_RELEASE_API = (
+    "import runpy, sys; script, api = sys.argv[1:3]; "
+    "sys.argv = [script, *sys.argv[3:]]; "
+    "sys.exit(runpy.run_path(script)['main'](api_base=api))"
+)
 LOCK_DESCENDANT = (
     "import fcntl, os, sys, time; file = open(sys.argv[1], 'w'); "
     "fcntl.flock(file, fcntl.LOCK_EX); print('locked', os.getpid(), flush=True); time.sleep(30)"
 )
+
+
+def published_release(version: str) -> dict[str, Any]:
+    return {
+        "tag_name": f"sai-cli/v{version}",
+        "draft": False,
+        "prerelease": False,
+        "assets": [
+            {"name": f"sai_cli-{version}-py3-none-any.whl", "state": "uploaded"},
+            {"name": "SHA256SUMS", "state": "uploaded"},
+        ],
+    }
 
 
 class RetryBlockTest(unittest.TestCase):
@@ -49,6 +68,9 @@ class RetryBlockTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     REHEARSAL["is_retry_block"](result, key, legacy=False), accepted
+                )
+                self.assertEqual(
+                    REHEARSAL["is_retry_block"](result, key, legacy=True), accepted
                 )
 
     def test_legacy_message_is_accepted_only_for_the_original_key_and_legacy_cli(
@@ -128,9 +150,270 @@ class DiagnosticsTest(unittest.TestCase):
                         self.assertFalse(log.exists())
 
 
+class BaselineTest(unittest.TestCase):
+    def test_lost_acknowledgement_requires_the_original_intent_in_both_formats(
+        self,
+    ) -> None:
+        key = "original-intent"
+        legacy = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            f"Error: Outcome unknown for intent {key}; reconcile before another trade",
+        )
+        structured = subprocess.CompletedProcess(
+            [],
+            5,
+            json.dumps({"error": {"code": "OUTCOME_UNKNOWN", "intentKey": key}}),
+            "",
+        )
+        for result in (legacy, structured):
+            with self.subTest(exit_code=result.returncode):
+                self.assertTrue(REHEARSAL["is_lost_acknowledgement"](result, key))
+                self.assertFalse(
+                    REHEARSAL["is_lost_acknowledgement"](result, "other-intent")
+                )
+
+    def test_default_uses_highest_published_sai_cli_version_across_pages(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class Releases(keeper_handler):
+            def do_GET(self) -> None:
+                if self.path.endswith("?per_page=100&page=1"):
+                    body = json.dumps(
+                        [
+                            {"tag_name": "rust/v5.0.0"},
+                            {"tag_name": "sai-cli/v0.1.9"},
+                            {"tag_name": "sai-cli/v9.0.0", "draft": True},
+                            {"tag_name": "sai-cli/v8.0.0", "prerelease": True},
+                        ]
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("Link", '<ignored>; rel="next"')
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.endswith("?per_page=100&page=2"):
+                    self.reply([{"tag_name": "sai-cli/v0.1.10"}])
+                else:
+                    self.send_error(404)
+
+        with REHEARSAL["keeper_server"](Releases) as base:
+            self.assertEqual(REHEARSAL["resolve_baseline"](base, base), "0.1.10")
+
+    def test_missing_or_unavailable_published_baseline_fails(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class NoReleases(keeper_handler):
+            def do_GET(self) -> None:
+                if self.path.startswith("/repos/"):
+                    self.reply([{"tag_name": "rust/v5.0.0"}])
+                else:
+                    self.send_error(404)
+
+        with REHEARSAL["keeper_server"](NoReleases) as base:
+            with self.assertRaisesRegex(REHEARSAL["RehearsalError"], "No.*published"):
+                REHEARSAL["resolve_baseline"](base, base)
+            with self.assertRaisesRegex(
+                REHEARSAL["RehearsalError"], "Could not resolve.*--from"
+            ):
+                REHEARSAL["resolve_baseline"](f"{base}/invalid", base)
+
+    def test_candidate_has_to_be_newer_than_the_explicit_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wheel = Path(temp) / "sai_cli-0.1.9-py3-none-any.whl"
+            wheel.touch()
+            script = Path(__file__).with_name("release-rehearsal.py").resolve()
+            result = subprocess.run(
+                [sys.executable, str(script), "--from", "0.1.10", str(wheel)],
+                timeout=5,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "Candidate sai 0.1.9 must be newer than baseline sai 0.1.10", result.stderr
+        )
+
+    def test_explicit_baseline_requires_the_exact_stable_release_and_assets(
+        self,
+    ) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class Releases(keeper_handler):
+            def do_GET(self) -> None:
+                if self.path.endswith("/releases/tags/sai-cli%2Fv0.1.0"):
+                    self.reply(published_release("0.1.0"))
+                elif self.path.endswith("/releases/tags/sai-cli%2Fv0.1.1"):
+                    self.reply({**published_release("0.1.1"), "prerelease": True})
+                elif self.path.endswith("/releases/tags/sai-cli%2Fv0.1.2"):
+                    release = published_release("0.1.2")
+                    release["assets"].pop()
+                    self.reply(release)
+                else:
+                    self.send_error(404)
+
+        with (
+            REHEARSAL["keeper_server"](Releases) as base,
+            tempfile.TemporaryDirectory() as temp,
+        ):
+            REHEARSAL["verify_published_baseline"]("0.1.0", base)
+            wheel = Path(temp) / "sai_cli-0.1.3-py3-none-any.whl"
+            wheel.touch()
+            for version, detail in (
+                ("0.0.999", "release not found on GitHub"),
+                ("0.1.1", "expected a stable release"),
+                ("0.1.2", "missing release assets SHA256SUMS"),
+            ):
+                with self.subTest(version=version):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            RUN_WITH_RELEASE_API,
+                            str(SCRIPT),
+                            base,
+                            "--from",
+                            version,
+                            str(wheel),
+                        ],
+                        env={"HOME": temp, "TMPDIR": temp, "PATH": ""},
+                        timeout=5,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(
+                        f"Could not verify published sai-cli release {version}: {detail}",
+                        result.stderr,
+                    )
+                    self.assertCountEqual(Path(temp).iterdir(), [wheel])
+
+    def test_truncated_release_response_reports_baseline_lookup_failure(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class TruncatedRelease(keeper_handler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(b"10\r\n[\r\n")
+                self.close_connection = True
+
+        with (
+            REHEARSAL["keeper_server"](TruncatedRelease) as base,
+            tempfile.TemporaryDirectory() as temp,
+        ):
+            wheel = Path(temp) / "sai_cli-0.1.2-py3-none-any.whl"
+            wheel.touch()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    RUN_WITH_RELEASE_API,
+                    str(SCRIPT),
+                    base,
+                    str(wheel),
+                ],
+                timeout=5,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "Could not resolve the latest published sai-cli release", result.stderr
+        )
+        self.assertIn("incomplete or invalid GitHub HTTP response", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_signals_interrupt_a_stalled_default_lookup(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+        request_arrived = Event()
+        unblock = Event()
+
+        class SlowRelease(keeper_handler):
+            def do_GET(self) -> None:
+                request_arrived.set()
+                unblock.wait(timeout=10)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            request_arrived.clear()
+            unblock.clear()
+            with (
+                self.subTest(signal=signum.name),
+                REHEARSAL["keeper_server"](SlowRelease) as base,
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                wheel = Path(temp) / "sai_cli-0.1.2-py3-none-any.whl"
+                wheel.touch()
+                with subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        RUN_WITH_RELEASE_API,
+                        str(SCRIPT),
+                        base,
+                        str(wheel),
+                    ],
+                    env={"HOME": temp, "TMPDIR": temp, "PATH": ""},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ) as process:
+                    try:
+                        self.assertTrue(request_arrived.wait(timeout=5))
+                        process.send_signal(signum)
+                        stdout, stderr = process.communicate(timeout=3)
+                    finally:
+                        unblock.set()
+                        if process.poll() is None:
+                            process.kill()
+                self.assertEqual(process.returncode, 128 + signum)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    stderr, f"Release rehearsal interrupted by {signum.name}\n"
+                )
+                self.assertCountEqual(Path(temp).iterdir(), [wheel])
+
+
+class SessionTest(unittest.TestCase):
+    def test_changed_or_missing_session_file_fails_without_exposing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            tool = REHEARSAL["Install"](Path(temp), prepared=True)
+            tool.session_file.parent.mkdir(parents=True)
+            original = b"original encrypted session"
+            tool.session_file.write_bytes(original)
+            snapshot = tool.session_file.read_bytes()
+            token = REHEARSAL["SYNTHETIC_TOKEN"]
+            expected = {"endpoint": "http://127.0.0.1:12345/query", "token": token}
+
+            for contents in (b"changed encrypted session", None):
+                with self.subTest(contents=contents):
+                    if contents is None:
+                        tool.session_file.unlink()
+                    else:
+                        tool.session_file.write_bytes(contents)
+                    with self.assertRaisesRegex(
+                        REHEARSAL["RehearsalError"], "The stored session file changed"
+                    ) as error:
+                        tool.verify_session(snapshot, expected)
+                    self.assertNotIn(token, str(error.exception))
+
+
 class NetworkTest(unittest.TestCase):
     def test_strict_requires_a_namespace_before_installing(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class Release(keeper_handler):
+            def do_GET(self) -> None:
+                self.reply(published_release("0.1.0"))
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            REHEARSAL["keeper_server"](Release) as base,
+        ):
             root = Path(temp)
             bin_dir = root / "tools"
             bin_dir.mkdir()
@@ -138,9 +421,18 @@ class NetworkTest(unittest.TestCase):
                 (bin_dir / name).symlink_to(sys.executable)
             wheel = root / "sai_cli-0.1.1-py3-none-any.whl"
             wheel.write_bytes(b"unused wheel")
-            script = Path(__file__).with_name("release-rehearsal.py").resolve()
             result = subprocess.run(
-                [sys.executable, str(script), "--strict", str(wheel)],
+                [
+                    sys.executable,
+                    "-c",
+                    RUN_WITH_RELEASE_API,
+                    str(SCRIPT),
+                    base,
+                    "--strict",
+                    "--from",
+                    "0.1.0",
+                    str(wheel),
+                ],
                 cwd=root,
                 env={"HOME": temp, "TMPDIR": temp, "PATH": str(bin_dir)},
                 timeout=5,
@@ -449,7 +741,9 @@ class KeeperReplayTest(unittest.TestCase):
         self.key = "20261124T080000000Z_ABCDEFGHJKMNPQRS"
         self.replay.submitted.append(self.key)
 
-    def query(self, base: str, text: str, **variables: str | None) -> dict[str, Any]:
+    def query(
+        self, base: str, text: str, **variables: str | int | None
+    ) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{base}/query",
             data=json.dumps({"query": text, "variables": variables}).encode(),
@@ -478,6 +772,43 @@ class KeeperReplayTest(unittest.TestCase):
             {"rows": [{"intentKey": "the-key", "trade": {"owner": "trader-address"}}]},
         )
 
+    def test_projects_trade_history_with_variable_pagination_and_legacy_limit(
+        self,
+    ) -> None:
+        self.replay.history = [
+            {"id": number, "intentKey": self.key, "trade": {"trader": self.replay.addr}}
+            for number in (3, 2, 1)
+        ]
+        paginated = """
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) { id trade { trader } }
+  }
+}
+"""
+        legacy = (
+            "query($trader:String!) { perp { tradeHistory(where:{trader:$trader},"
+            " limit:50, order_desc:true) { id } } }"
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for offset, ids in ((0, (3, 2)), (2, (1,)), (4, ())):
+                with self.subTest(offset=offset):
+                    data = self.query(
+                        base, paginated, trader=self.replay.addr, limit=2, offset=offset
+                    )
+                    self.assertEqual(
+                        data["perp"]["tradeHistory"],
+                        [
+                            {"id": number, "trade": {"trader": self.replay.addr}}
+                            for number in ids
+                        ],
+                    )
+            data = self.query(base, legacy, trader=self.replay.addr)
+            self.assertEqual(
+                data["perp"]["tradeHistory"], [{"id": n} for n in (3, 2, 1)]
+            )
+
     def test_requires_the_original_intent_key_and_account(self) -> None:
         addr, key = self.replay.addr, self.key
         query = (
@@ -495,6 +826,33 @@ class KeeperReplayTest(unittest.TestCase):
                 with self.subTest(user=user, key=intent, query=text):
                     rows = self.query(base, text, user=user, key=intent)["userIntents"]
                     self.assertEqual(rows, [{"intentKey": key} for key in expected])
+
+    def test_filters_each_history_selection_before_paginating(self) -> None:
+        other = "0x" + "b" * 40
+        self.replay.history = [
+            {"id": number, "trade": {"trader": trader}}
+            for number, trader in (
+                (3, other),
+                (2, self.replay.addr),
+                (1, self.replay.nibi_addr),
+            )
+        ]
+        query = """
+query($trader:String!, $other:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    matching: tradeHistory(where:{trader:$trader}, limit:$limit, offset:$offset) { id }
+    wrong: tradeHistory(where:{trader:$other}, limit:$limit, offset:$offset) { id }
+    missing: tradeHistory(limit:$limit, offset:$offset) { id }
+  }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            data = self.query(
+                base, query, trader=self.replay.addr, other=other, limit=1, offset=1
+            )
+        self.assertEqual(
+            data, {"perp": {"matching": [{"id": 1}], "wrong": [], "missing": []}}
+        )
 
     def test_checks_filters_independently_for_each_intent_alias(self) -> None:
         query = """

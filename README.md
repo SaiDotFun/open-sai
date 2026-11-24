@@ -300,11 +300,12 @@ index. Use executables that can run with a fresh home directory.
 
 ```bash
 uv build --wheel --out-dir dist
-python3 scripts/release-rehearsal.py --strict dist/sai_cli-0.1.1-py3-none-any.whl
+python3 scripts/release-rehearsal.py --strict dist/sai_cli-0.1.2-py3-none-any.whl
 ```
 
-The script installs the published v0.1.0 wheel through the release installer
-in a temporary home and caches the candidate's dependencies. For the
+The script installs the latest published `sai-cli` wheel in a temporary home
+and caches the candidate's dependencies. To rehearse an older published
+baseline, pass `--from VERSION`. Run the script once per baseline. For the
 rehearsal, it sets uv offline and pins the endpoints to loopback. The
 `--strict` flag stops the run before installing anything if the namespace
 is unavailable. For a local practice run, omit `--strict` to allow the
@@ -315,7 +316,7 @@ and Claude and Codex MCP registrations work through the same launcher,
 that the migrated ledger blocks a retry, and that `sai doctor` passes once
 Keeper reports a terminal outcome.
 It restores the pending ledger checkpoint before running
-`sai update --to 0.1.0` and reports whether v0.1.0 still blocks the open
+`sai update --to` with the baseline version and reports whether it blocks the open
 before and after reconciling it.
 
 The script stops its command process groups during teardown. On Linux, it
