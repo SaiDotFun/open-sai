@@ -22,6 +22,13 @@ static JWT: LazyLock<Regex> =
     LazyLock::new(|| regex(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"));
 static URL: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z][A-Za-z0-9+.-]*://\S*"));
 static URL_REST: LazyLock<Regex> = LazyLock::new(|| regex(r"(?s)[A-Za-z][A-Za-z0-9+.-]*://.*"));
+static DIAGNOSTIC_URL: LazyLock<Regex> = LazyLock::new(|| {
+    regex(concat!(
+        r"(?i)(?:^|[^a-z0-9_+.-])(",
+        r"(?:https?|wss?):\s+[/\\]\S*|[a-z][a-z0-9+.-]*:\S*)|",
+        r"([?&](?:api[_-]?key|(?:access[_-]?)?token)=\S+)",
+    ))
+});
 static HOST: LazyLock<Regex> =
     LazyLock::new(|| regex(r"\A(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])\z"));
 static LONG_HEX: LazyLock<Regex> = LazyLock::new(|| regex(r"(?:0x)?[0-9A-Fa-f]{100,}"));
@@ -42,13 +49,31 @@ pub fn contains_private_url(text: &str) -> bool {
 }
 
 fn diagnostic_urls(text: &str) -> impl Iterator<Item = &str> {
-    URL.find_iter(text)
+    DIAGNOSTIC_URL
+        .captures_iter(text)
         .map(|matched| {
             matched
+                .get(1)
+                .or_else(|| matched.get(2))
+                .expect("diagnostic URL capture")
                 .as_str()
                 .trim_end_matches(['.', ',', ':', ';', ')', '}', '\'', '"'])
         })
-        .filter(|url| !url.ends_with("://"))
+        // Leave ordinary labels and scheme-only guidance such as `https://` intact.
+        .filter(|url| {
+            url.starts_with(['?', '&'])
+                || url
+                    .split_once(':')
+                    .is_some_and(|(_, suffix)| !matches!(suffix, "" | "//"))
+        })
+}
+
+fn safe_argument(text: &str) -> &str {
+    if diagnostic_urls(text).any(|url| URL.find(url).is_none_or(|found| found.start() != 0)) {
+        REDACTED_URL
+    } else {
+        text
+    }
 }
 
 /// A log field with its text redaction policy.
@@ -96,7 +121,7 @@ impl Field {
             Self::Untrusted(text) => Self::Untrusted(copy_text(&text, budget, tokens)),
             Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
             Self::EndpointIdentity(_) => self,
-            Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
+            Self::Arg(text) => Self::Arg(copy_text(safe_argument(&text), budget, tokens)),
             Self::Scalar(Value::Number(number))
                 if number.is_i64()
                     || number.is_u64()
@@ -149,7 +174,7 @@ impl Field {
         match self {
             Self::Text(text) => Value::String(scrub(&text, tokens, &URL, false)),
             Self::Untrusted(text) => Value::String(scrub(&text, tokens, &URL_REST, true)),
-            Self::Arg(text) => Value::String(scrub(&text, tokens, &URL_REST, false)),
+            Self::Arg(text) => Value::String(scrub(safe_argument(&text), tokens, &URL_REST, false)),
             Self::Endpoint(text) => Value::String(origin(&text)),
             Self::EndpointIdentity(_) => Value::Null,
             Self::Array(items) => {

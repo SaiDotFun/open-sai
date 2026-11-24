@@ -1065,6 +1065,83 @@ def test_skill_page_error_hides_endpoint_credentials(
 @pytest.mark.parametrize(
     "args",
     [
+        ("{}",),
+        ("config", "get", "{}"),
+        ("config", "set", "logs.enabled", "{}"),
+        ("config", "unset", "{}"),
+        ("logs", "tail", "--surface", "{}"),
+        ("logs", "tail", "-n", "{}"),
+        ("logs", "intent", "{}", "--offline"),
+        ("logs", "run", "{}"),
+        ("logs", "stats", "--since", "{}"),
+        ("skill", "show", "--page", "{}"),
+        ("skill", "source", "{}"),
+        ("skill", "install", "--force={}"),
+        ("auth", "login", "fixture", "--addr", "{}"),
+        ("auth", "import", "{}"),
+        ("auth", "renew", "{}"),
+        ("auth", "use", "{}"),
+        ("auth", "logout", ADDR, "{}"),
+        ("account", "positions", ADDR, "{}"),
+        ("account", "history", ADDR, "{}"),
+        ("account", "balances", "{}"),
+        ("watch", "positions", "{}", "--invalid"),
+        ("watch", "balances", "{}", "--invalid"),
+        ("watch", "price", "{}"),
+        ("intent", "local", ADDR, "{}"),
+        ("intent", "status", "{}"),
+        ("mcp", "install", "--scope", "{}"),
+        ("mcp", "install", "--client", "{}"),
+        ("doctor", "--no-fix={}"),
+        ("trade", "open", "--dry-run", "--side", "{}"),
+        ("trade", "close", "--dry-run", "{}"),
+        ("trade", "cancel", "--dry-run", "{}"),
+        ("trade", "tpsl", "--dry-run", "{}"),
+        ("trade", "leverage", "--dry-run", "{}", "--leverage", "1"),
+    ],
+)
+def test_rejected_values_hide_credentials_in_output_and_logs(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    args: tuple[str, ...],
+) -> None:
+    _, rust = local_pair
+    key = "fixture-rejected-key"
+    cases = (
+        f"https://fixture.invalid/private?api_key={key}",
+        f"https:/fixture.invalid/private?api_key={key}",
+        f"https:fixture.invalid/private?api_key={key}",
+        f"wss:/fixture.invalid/{key}",
+        f"endpoint=fixture.invalid/private?api_key={key}",
+    )
+    loopback = (
+        "--endpoint",
+        "http://127.0.0.1:1/graphql",
+        "--ws-endpoint",
+        "ws://127.0.0.1:1/graphql",
+        "--lcd-endpoint",
+        "http://127.0.0.1:1",
+    )
+    for index, rejected in enumerate(cases):
+        for flags, mode in [((), "text"), (("--json",), "json")]:
+            root = tmp_path / f"{index}-{mode}"
+            result = invoke(
+                rust,
+                root,
+                *flags,
+                *loopback,
+                *(arg.format(rejected) for arg in args),
+                logging="1",
+            )
+            assert result.returncode != 0, (index, mode)
+            assert key.encode() not in result.stdout + result.stderr, (index, mode)
+            for log in (root / "sai-home/logs").glob("*.jsonl"):
+                assert key.encode() not in log.read_bytes(), (index, mode, log.name)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
         ("--json", "config", "set", "keeper.endpoint", "https://fixture.invalid:abc"),
         ("--json", "config", "set", "keeper.endpoint", "https://fixture.invalid:65536"),
         ("--json", "config", "set", "keeper.endpoint", "https://host space.invalid"),

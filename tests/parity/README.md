@@ -145,8 +145,9 @@ an earlier page.
 
 Accepted C9b divergences from the pinned Python reference
 
-- Rust omits usage diagnostics that contain rejected URLs and prints a
-  generic argument error. Python v0.1.2 still echoes the rejected values.
+- Rust omits rejected URLs from usage and runtime diagnostics, including
+  malformed scheme prefixes. It keeps the valid page list in `skill show`
+  errors. Python v0.1.2 echoes rejected values in usage diagnostics.
 - Rust `logs tail` strips credentials, paths, queries, and fragments from
   URLs throughout retained rows, including arguments and nested fields.
   The pinned Python reference prints the retained values. Current Python
