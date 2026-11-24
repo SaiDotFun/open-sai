@@ -280,6 +280,8 @@ def loopback(
     market = {**recorded_markets[0], "marketId": borrowing["marketId"]}
     if market_price is not None:
         market["price"] = market_price
+    if scenario == "quote-null-price":
+        market["price"] = None
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
@@ -455,6 +457,8 @@ def loopback(
     if scenario == "quote-after-hours":
         contracts.update(is_after_hours_market=True, get_after_hours_leverage="1.1")
         contracts["get_market"].update(block_last_opened=50, block_last_closed=100)
+    if scenario == "quote-close-fee-cap":
+        contracts["get_fees"]["close_fee_p"] = "2"
     contract_args = {
         "get_trade_raw": {
             "trader": (
@@ -830,6 +834,20 @@ def loopback(
                                 self.reject(f"Expected a fresh {name} query")
                                 return
                         wire.append(WireRequest(name, variables=query))
+                        if (
+                            name == "get_pair_custom_max_leverage"
+                            and scenario == "quote-absent-cap"
+                        ):
+                            self.reply(
+                                {
+                                    "message": "type: cosmwasm_std::math::decimal::Decimal; key: [00] not found"
+                                },
+                                500,
+                            )
+                            return
+                        if name == "get_fees" and scenario == "quote-fee-read-error":
+                            self.reply({}, 503)
+                            return
                         if name == "get_trade_raw" and cancel_target is not None:
                             [nonce] = parse_qs(urlsplit(self.path).query).get(
                                 "_sai_query", [""]
