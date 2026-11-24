@@ -99,8 +99,8 @@ impl StoredSession {
                 "usable": *matches && !expired,
                 "addr": session.addr(),
                 "expiresAt": session.expires_at(),
-                "expired": expired,
                 "endpoint": session.endpoint().map(log::endpoint_origin),
+                "expired": expired,
                 "endpointMatches": matches,
             }),
         }

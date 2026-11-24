@@ -79,6 +79,7 @@ CALLS = {
         Call("market_list"),
         Call("market_prices"),
     ),
+    "number-spelling": (Call("market_prices"),),
     "reads": (
         Call("account_positions", {"addr": "{addr}"}),
         Call("account_history", {"addr": "{addr}"}),

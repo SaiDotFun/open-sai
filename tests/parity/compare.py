@@ -262,6 +262,31 @@ def doctor_checks(checks: Any) -> None:
                 )
 
 
+def rewrite_mcp_fields(text: str, updates: dict[str, Any]) -> str:
+    """Replace selected top-level JSON values while retaining all other bytes."""
+    if not updates:
+        return text
+    decoder = json.JSONDecoder()
+    whitespace = re.compile(r"\s*")
+    pos = whitespace.match(text).end() + 1
+    previous = 0
+    chunks = []
+    while (pos := whitespace.match(text, pos).end()) < len(text) and text[pos] != "}":
+        name, end = decoder.raw_decode(text, pos)
+        colon = whitespace.match(text, end).end()
+        start = whitespace.match(text, colon + 1).end()
+        _, pos = decoder.raw_decode(text, start)
+        if name in updates:
+            chunks.extend((text[previous:start], json.dumps(updates[name])))
+            previous = pos
+        pos = whitespace.match(text, pos).end()
+        if text[pos] == "}":
+            break
+        pos += 1
+    chunks.append(text[previous:])
+    return "".join(chunks)
+
+
 def normalize_mcp_result(result: dict[str, Any]) -> None:
     info = result.get("serverInfo")
     if isinstance(info, dict):
@@ -277,9 +302,11 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
         if result.get("structuredContent") != {"result": text}:
             raise ValueError("MCP structuredContent must carry the same JSON string")
         value = json.loads(text)
+        updates = {}
         if isinstance(value, dict) and value.get("name") == "sai":
             for version in ("version", "installedVersion", "mcpVersion"):
-                replace_if(value, version, is_version)
+                if is_version(value.get(version)):
+                    updates[version] = f"<{version}>"
             # Each implementation reports its own installation or checkout.
             # Validate the shape before substituting a common path.
             provenance = value["provenance"]
@@ -303,7 +330,9 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
                     raise ValueError("Invalid MCP server Git provenance")
             if set(provenance) != keys:
                 raise ValueError("Unexpected MCP server provenance fields")
-            value["provenance"] = "<provenance>"
+            updates["provenance"] = "<provenance>"
+            value.update(updates)
+        result["_toolText"] = rewrite_mcp_fields(text, updates)
         block["text"] = value
         result["structuredContent"]["result"] = value
 
@@ -323,8 +352,11 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         if command == "logs tail":
             return [normalize.log_event(record) for record in records]
         if mode == "mcp":
-            for record in records:
-                normalize_mcp_result(record.get("result", {}))
+            for frame, record in zip(raw.splitlines(), records, strict=True):
+                result = record.get("result", {})
+                if "tools" in result:
+                    result["_schemaWire"] = frame
+                normalize_mcp_result(result)
         return normalize.paths(records)
     value = normalize.paths(json.loads(raw))
     if (

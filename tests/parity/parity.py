@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import queue
+import re
 import select
 import shlex
 import shutil
@@ -22,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 from compare import (
@@ -34,6 +36,7 @@ from compare import (
     config_text,
     first_difference,
     ledger,
+    rewrite_mcp_fields,
     snapshot,
     stderr_category,
     stdout,
@@ -551,21 +554,37 @@ def safe_observe(
     return result
 
 
-def expect_native_mcp_info(output: list[dict[str, Any]], profile: str) -> str | None:
-    if profile == "info":
-        report = output[2]["result"]["content"][0]["text"]
-        lcd = report["endpoints"]["lcd"]
-        if lcd.endswith("/fixture-lcd-private"):
-            report["endpoints"]["lcd"] = lcd.removesuffix("/fixture-lcd-private")
-            return "Native MCP reports the LCD origin without the private path"
-    if profile != "session":
-        return None
-    report = output[2]["result"]["content"][0]["text"]
-    trading = report["trading"]
-    if trading["available"] is True and trading["reason"] == "signed-in":
-        trading.update(available=False, reason="not-implemented")
-        return "Native trading is unavailable while the trade tools are deferred"
-    return None
+def expect_native_mcp_info(output: list[dict[str, Any]]) -> str | None:
+    reasons: dict[str, None] = {}
+    for frame in output:
+        result = frame["result"]
+        value = result.get("structuredContent", {}).get("result")
+        if not isinstance(value, dict) or value.get("name") != "sai":
+            continue
+        updates = {}
+        lcd = urlsplit(value["endpoints"]["lcd"])
+        # All replay URLs contain a per-run path. The explicit privacy case
+        # appends a synthetic credential to that path.
+        if re.fullmatch(r"/parity/[0-9a-f]{32}(?:/fixture-lcd-private)?", lcd.path):
+            updates["endpoints"] = {
+                **value["endpoints"],
+                "lcd": f"{lcd.scheme}://{lcd.netloc}",
+            }
+            reasons["Native MCP reports the LCD origin without the private path"] = None
+        trading = value["trading"]
+        if trading["available"] is True and trading["reason"] == "signed-in":
+            updates["trading"] = {
+                **trading,
+                "available": False,
+                "reason": "not-implemented",
+            }
+            reasons[
+                "Native trading is unavailable while the trade tools are deferred"
+            ] = None
+        value.update(updates)
+        result["content"][0]["text"].update(updates)
+        result["_toolText"] = rewrite_mcp_fields(result["_toolText"], updates)
+    return ", ".join(reasons) or None
 
 
 def run_case(
@@ -611,7 +630,7 @@ def run_case(
         )
     expected = None
     if case.mode == "mcp" and reference != candidate:
-        expected = expect_native_mcp_info(left.output, case.mcp_profile)
+        expected = expect_native_mcp_info(left.output)
     diffs = differences(left, right)
     if (
         diffs

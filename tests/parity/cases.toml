@@ -511,6 +511,14 @@ mcp_profile = "info"
 seed = "mcp-info-cache"
 
 [[case]]
+name = "mcp-market-number-spelling"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "number-spelling"
+server = "read-number-spelling"
+wire = ["tokenPricesUsd"]
+
+[[case]]
 name = "mcp-account-intent-reads"
 args = ["mcp","serve"]
 mode = "mcp"
