@@ -51,11 +51,6 @@ if args[1] == "remove":
         sys.exit(1)
     del servers[name]
 else:
-    if os.environ.get("FAKE_ADD_FAIL") == "claude":
-        data["concurrentEdit"] = True
-        path.write_text(json.dumps(data))
-        sys.stderr.write(os.environ["FAKE_ADD_ERROR"])
-        sys.exit(1)
     dash = args.index("--")
     env = dict(
         a.split("=", 2)[1:] for a in args[:dash] if a.startswith("--env=")
@@ -65,11 +60,6 @@ else:
         "type": "stdio", "command": command[0], "args": command[1:], "env": env
     }
 path.write_text(json.dumps(data))
-if args[1] == "add" and (marker := os.environ.get("FAKE_ADD_INTERRUPT")):
-    import signal
-
-    Path(marker).write_text(json.dumps(servers[name]))
-    os.kill(os.getppid(), signal.SIGINT)
 """
 
 FAKE_CODEX = """
@@ -305,51 +295,74 @@ def test_doctor_repairs_recognized_registrations_in_all_clients(
         assert private_value not in output
 
 
-def test_doctor_restores_original_entry_when_add_fails(
-    env: Env, monkeypatch: pytest.MonkeyPatch
-):
-    client = "claude"
-    monkeypatch.setenv("SAI_HOME", str(env.root / "sai-home"))
-    monkeypatch.setenv("FAKE_ADD_FAIL", client)
-    monkeypatch.setenv("FAKE_ADD_ERROR", f"{OTHER} https://private.example/{SECRET}")
-    entry = {
-        "command": OLD_COMMAND,
-        "args": ["--endpoint", "https://private.example/" + SECRET],
-        "env": {"CUSTOM": SECRET},
-        "enabled_tools": ["market_list"],
-    }
-    unrelated = write_doctor_entries(env, "sai", entry)
+def test_doctor_repairs_claude_scopes_without_remove_and_add(env: Env, monkeypatch):
+    home = str(env.root / "sai-home")
+    monkeypatch.setenv("SAI_HOME", home)
+    suffix = ["--endpoint", "https://private.example/" + SECRET]
+    old = claude_entry([OLD_COMMAND, *suffix], {"SAI_HOME": home, "CUSTOM": SECRET})
+    scopes = {"mcpServers": {"sai": old, OTHER: {"command": "untouched"}}}
+    (env.home / ".claude.json").write_text(
+        json.dumps(
+            {**scopes, "projects": {str(env.project): scopes}, "preference": True}
+        )
+    )
+    project_file = env.project / ".mcp.json"
+    project_file.write_text(json.dumps(scopes))
 
     result = invoke("doctor", "--offline")
 
-    assert result.exit_code == 1, result.output
-    assert mcp_checks(result)[client]["status"] == "fail"
-    assert doctor_entries(env)[client] == {"sai": entry, OTHER: unrelated}
-    assert env.claude_json()["concurrentEdit"] is True
-    calls = [call for call in env.calls() if call[1] in ("remove", "add")]
-    assert [call[1] for call in calls] == ["remove", "add"]
-    assert all(SECRET not in " ".join(call) for call in calls)
+    check = mcp_checks(result)["claude"]
+    assert check["status"] == "fixed"
+    assert len(check["changes"]) == 3
+    user = env.claude_json()
+    local = user["projects"][str(env.project)]
+    project = json.loads(project_file.read_text())
+    for scope in (user, local, project):
+        assert scope["mcpServers"] == {
+            "sai": {**old, "command": str(env.sai), "args": ["mcp", "serve", *suffix]},
+            OTHER: {"command": "untouched"},
+        }
+    assert user["preference"] is True
+    assert {call[1] for call in env.calls()} == {"get"}
     for private_value in (SECRET, OTHER, "private.example"):
         assert private_value not in result.output
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX signal delivery")
-def test_claude_repair_publishes_profile_in_add_and_restores_on_interrupt(
+def test_claude_repair_stages_a_complete_entry_before_atomic_publication(
     env: Env, monkeypatch
 ):
-    marker = env.root / "published-entry.json"
-    monkeypatch.setenv("FAKE_ADD_INTERRUPT", str(marker))
+    marker = env.root / "staged-config.json"
     monkeypatch.setenv("SAI_HOME", str(env.root / "current-profile"))
     pinned_home = str(env.root / "private-pinned-profile=v1")
+    suffix = ["--endpoint", "https://private.example/" + SECRET]
     entry = claude_entry(
-        [OLD_COMMAND, "--endpoint", "https://private.example/" + SECRET],
-        {"SAI_HOME": pinned_home, "CUSTOM": SECRET},
+        [OLD_COMMAND, *suffix], {"SAI_HOME": pinned_home, "CUSTOM": SECRET}
     )
     original = {"mcpServers": {"sai": entry, OTHER: {"command": "untouched"}}}
-    (env.home / ".claude.json").write_text(json.dumps(original))
+    config = env.home / ".claude.json"
+    config.write_text(json.dumps(original))
+    # Observe the actual os.replace syscall boundary without modifying Sai.
+    code = """
+import signal
+import sys
+from pathlib import Path
+
+from sai_cli.sai_cli import main
+
+config, marker = map(Path, sys.argv[1:])
+
+def interrupt_write(event, args):
+    if event == "os.rename" and Path(args[1]) == config:
+        marker.write_bytes(Path(args[0]).read_bytes())
+        signal.raise_signal(signal.SIGINT)
+
+sys.addaudithook(interrupt_write)
+main.main(["doctor", "--offline"], prog_name="sai")
+"""
 
     result = subprocess.run(
-        [sys.executable, "-m", "sai_cli", "doctor", "--offline"],
+        [sys.executable, "-c", code, str(config), str(marker)],
         check=False,
         capture_output=True,
         text=True,
@@ -358,10 +371,18 @@ def test_claude_repair_publishes_profile_in_add_and_restores_on_interrupt(
     )
 
     assert result.returncode != 0
-    published = json.loads(marker.read_text())
-    assert published["command"] == str(env.sai)
-    assert published["env"] == {"SAI_HOME": pinned_home}
+    assert json.loads(marker.read_text()) == {
+        "mcpServers": {
+            "sai": {
+                **entry,
+                "command": str(env.sai),
+                "args": ["mcp", "serve", *suffix],
+            },
+            OTHER: {"command": "untouched"},
+        }
+    }
     assert env.claude_json() == original
+    assert not list(config.parent.glob(".claude.json.*"))
     output = result.stdout + result.stderr
     assert pinned_home not in output and SECRET not in output and OTHER not in output
 

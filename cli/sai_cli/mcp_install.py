@@ -1,7 +1,7 @@
 """Register `sai mcp serve` with agent clients: Claude Code, Codex, Cursor.
 
-Claude Code changes through `mcp add` and `mcp remove`. For Codex and
-Cursor, Sai edits the registration in the client's config file.
+Claude Code install and uninstall use its `mcp add` and `mcp remove`
+commands. Codex and Cursor writes and all repairs edit client config files.
 
 Registration inspection keeps only Sai's command, args, and selected
 metadata. Repair retains the full entry in memory so it can preserve
@@ -258,12 +258,11 @@ def server_target(
 # --- helpers --------------------------------------------------------------
 
 
-def run(argv: list[str], *, cwd: Path | None = None) -> None:
+def run(argv: list[str]) -> None:
     """Run a client command; raise ClientError with its first stderr line."""
     try:
         done = subprocess.run(
             argv,
-            cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -1146,60 +1145,6 @@ def repair_path(client: Client, scope: str) -> Path:
     return client.config_path(scope)
 
 
-def placeholder_entry(entry: Any, target: Target) -> bool:
-    """Recognize the entry created by the client CLI during this repair."""
-    return (
-        isinstance(entry, Mapping)
-        and entry.get("command") == target.argv[0]
-        and entry.get("args") == target.argv[1:]
-        and entry.get("type", "stdio") == "stdio"
-        and entry.get("enabled", True) is True
-        and (entry.get("env") or {}) == target.env
-        and all(
-            key in ("command", "args", "type", "enabled", "env") or not entry[key]
-            for key in entry
-        )
-    )
-
-
-def finish_replacement(
-    client: Client,
-    scope: str,
-    path: Path,
-    name: str,
-    original: MutableMapping[str, Any],
-    replacement: MutableMapping[str, Any],
-    placeholder: Target,
-    *,
-    restore: bool,
-) -> None:
-    """Merge only the Sai entries into the latest file after the CLI calls."""
-    for _ in range(2):
-        config = read_client_config(client, scope, path)
-        current = config.entries.get(NAME)
-        previous = config.entries.get(name)
-        if restore and previous == original and (name == NAME or current is None):
-            return
-        if name != NAME and previous not in (None, original):
-            break
-        if current is not None and not (
-            (name == NAME and current == original)
-            or placeholder_entry(current, placeholder)
-        ):
-            break
-        config.entries.pop(name, None)
-        if restore:
-            config.entries.pop(NAME, None)
-            config.entries[name] = original
-        else:
-            config.entries[NAME] = replacement
-        if replace_bytes(
-            path, config.render().encode(), config.seen, destination=config.destination
-        ):
-            return
-    raise ClientError("The Sai registration changed concurrently")
-
-
 def replace_registration(
     client: Client, stale: StaleRegistration, target: Target
 ) -> None:
@@ -1220,38 +1165,16 @@ def replace_registration(
         return
     path = repair_path(client, scope)
     config = read_client_config(client, scope, path)
-    original = repair_entry(config.entries, stale)
-    replacement = deepcopy(original)
-    replacement["command"], replacement["args"] = launcher, stale.args
-    if isinstance(client, Cursor):
-        config.entries.pop(name)
-        config.entries[NAME] = replacement
-        if not replace_bytes(
-            path, config.render().encode(), config.seen, destination=config.destination
-        ):
-            raise ClientError("The Sai registration changed concurrently")
-        return
-    # Publish the original profile with the launcher. Other args and env
-    # can hold credentials, so copy them directly into the file.
-    original_env = original.get("env")
-    home = original_env.get("SAI_HOME") if isinstance(original_env, Mapping) else None
-    placeholder = Target(
-        [launcher, "mcp", "serve"], {"SAI_HOME": home} if isinstance(home, str) else {}
-    )
-    steps = replacement_steps(client, scope, placeholder, name)
-    if read_bytes(path) != config.seen:
+    entry = repair_entry(config.entries, stale)
+    entry["command"], entry["args"] = launcher, stale.args
+    if name != NAME:
+        config.entries[NAME] = config.entries.pop(name)
+    # Publish a complete entry in one rename. In particular, Claude must
+    # never observe a replacement that is missing its profile or endpoints.
+    if not replace_bytes(
+        path, config.render().encode(), config.seen, destination=config.destination
+    ):
         raise ClientError("The Sai registration changed concurrently")
-    try:
-        for argv in steps:
-            run(argv, cwd=client.cwd or client.home)
-        finish_replacement(
-            client, scope, path, name, original, replacement, placeholder, restore=False
-        )
-    except (ClientError, OSError, ValueError, TOMLKitError, KeyboardInterrupt):
-        finish_replacement(
-            client, scope, path, name, original, replacement, placeholder, restore=True
-        )
-        raise
 
 
 def check_registration(
