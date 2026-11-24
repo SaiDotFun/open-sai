@@ -11,6 +11,7 @@ from sai_cli.core import keeper, margin, storage
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
+TRADER = "nibi1424242424242424242424242424242422mldj0"
 
 
 @pytest.fixture(autouse=True)
@@ -44,7 +45,7 @@ def partial_close(monkeypatch, indexed: int, contract: int, *args: str):
                 "perp": {
                     "trade": {
                         "id": 7,
-                        "trader": "nibi1trader",
+                        "trader": TRADER,
                         "isOpen": True,
                         "tradeType": "trade",
                         "collateralAmount": indexed,
@@ -85,7 +86,7 @@ def partial_close(monkeypatch, indexed: int, contract: int, *args: str):
         raise AssertionError("unexpected Keeper request")
 
     raw = {
-        "user": "nibi1trader",
+        "user": TRADER,
         "user_trade_index": "UserTradeIndex(7)",
         "market_index": "MarketIndex(0)",
         "collateral_index": "TokenIndex(1)",
