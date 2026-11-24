@@ -4,7 +4,7 @@ use std::{
     env,
     ffi::OsStr,
     fs,
-    io::{self, Read, Write},
+    io::{self, Read},
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -235,6 +235,12 @@ impl Uv {
         Ok(python)
     }
 
+    pub(super) fn version(&self) -> Version {
+        provenance::installed_version(&self.prefix).unwrap_or_else(|| {
+            Version::parse(super::super::RUNNING).expect("Cargo version is semantic")
+        })
+    }
+
     fn wheel_path(&self, wheel: &Wheel) -> Result<PathBuf> {
         let version = release::version(&wheel.version)
             .ok_or_else(|| "the wheel record has an invalid version".to_owned())?;
@@ -248,60 +254,65 @@ impl Uv {
             .join(wheel_name(&version)?))
     }
 
-    async fn stage(&self, releases: &Releases, version: &Version) -> Result<Wheel> {
+    async fn stage(
+        releases: &Releases,
+        version: &Version,
+        directory: &Path,
+    ) -> Result<(Wheel, PathBuf)> {
+        let name = wheel_name(version)?;
         let (bytes, digest) = releases
-            .verified(version, &wheel_name(version)?)
+            .verified(version, &name)
             .await
             .map_err(|err| err.0)?;
-        let wheel = Wheel {
-            version: version.to_string(),
-            digest,
-        };
-        let path = self.wheel_path(&wheel)?;
+        let path = directory.canonicalize().map_err(io_error)?.join(name);
+        fs::write(&path, bytes).map_err(io_error)?;
+        Ok((
+            Wheel {
+                version: version.to_string(),
+                digest,
+            },
+            path,
+        ))
+    }
+
+    fn publish_wheel(&self, wheel: &Wheel, staged: &Path) -> Result<PathBuf> {
+        let path = self.wheel_path(wheel)?;
         let parent = path.parent().expect("wheel path has a parent");
         state::private_dir(parent).map_err(io_error)?;
         if parent.canonicalize().ok().as_deref() != Some(parent) {
             return Err("the verified wheel directory has changed".into());
         }
-        if path.canonicalize().is_ok() {
-            self.verify_wheel(&wheel)?;
-        } else {
+        if path
+            .symlink_metadata()
+            .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+        {
+            verify_file(wheel, staged)?;
             let mut file = NamedTempFile::new_in(parent).map_err(io_error)?;
-            file.write_all(&bytes).map_err(io_error)?;
+            io::copy(&mut fs::File::open(staged).map_err(io_error)?, &mut file)
+                .map_err(io_error)?;
             file.as_file().sync_all().map_err(io_error)?;
             file.persist_noclobber(&path)
                 .map_err(|err| io_error(err.error))?;
             state::sync_dir(parent).map_err(io_error)?;
         }
-        Ok(wheel)
+        self.verify_wheel(wheel)
     }
 
     fn verify_wheel(&self, wheel: &Wheel) -> Result<PathBuf> {
         let path = self.wheel_path(wheel)?;
-        if path.canonicalize().ok().as_deref() != Some(path.as_path()) {
-            return Err("the verified wheel path is missing or has changed".into());
-        }
-        let mut bytes = Vec::new();
-        fs::File::open(&path)
-            .map_err(io_error)?
-            .take(release::MAX_ASSET as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(io_error)?;
-        if bytes.len() > release::MAX_ASSET || release::sha256(&bytes) != wheel.digest {
-            return Err("the verified wheel no longer matches its digest".into());
-        }
+        verify_file(wheel, &path)?;
         Ok(path)
     }
 
     async fn install(
-        &self,
         uv: &Path,
         python: &Path,
         wheel: &Wheel,
+        path: &Path,
         home: &Path,
         trial: Option<&Path>,
     ) -> Result<()> {
-        let path = self.verify_wheel(wheel)?;
+        verify_file(wheel, path)?;
         let mut command = Command::new(uv);
         command
             .current_dir(home)
@@ -330,7 +341,8 @@ impl Uv {
             .ok_or_else(|| "the rollback wheel record has an invalid version".to_owned())?;
         self.owner(true)?;
         self.check_recoverable_package(pending)?;
-        self.install(uv, python, wheel, home, None).await?;
+        let path = self.wheel_path(wheel)?;
+        Self::install(uv, python, wheel, &path, home, None).await?;
         self.owner(false)?;
         if smoke::version(&self.launcher, home, shim_base).await? != version {
             return Err(format!("the restored launcher did not report {version}"));
@@ -340,11 +352,14 @@ impl Uv {
         Ok(version)
     }
 
-    pub(super) async fn recover(&self, home: &Path) -> Result<Version> {
+    pub(super) async fn recover(&self, home: &Path, allowed: impl Fn() -> bool) -> Result<Version> {
         if let Some(pending) = self.pending()? {
             let scratch = TempDir::new().map_err(io_error)?;
             let uv = find_uv()?;
             self.check_destination(&uv, scratch.path()).await?;
+            if !allowed() {
+                return Ok(self.version());
+            }
             self.restore(&uv, &pending.python, &pending, home, None)
                 .await
         } else {
@@ -374,10 +389,17 @@ impl Uv {
             }
             let python = self.python()?;
             let shim_base = releases.shim_fixture_base();
-            let next = self.stage(releases, target).await?;
+            let (next, staged_next) = Self::stage(releases, target, home.path()).await?;
             let check = async {
-                self.install(&uv, &python, &next, home.path(), Some(trial.path()))
-                    .await?;
+                Self::install(
+                    &uv,
+                    &python,
+                    &next,
+                    &staged_next,
+                    home.path(),
+                    Some(trial.path()),
+                )
+                .await?;
                 smoke::verify(
                     &trial.path().join("bin/sai"),
                     home.path(),
@@ -388,13 +410,20 @@ impl Uv {
             }
             .await;
             check.map_err(|err| format!("the release failed its trial install: {err}"))?;
-            let previous = self
-                .stage(releases, installed)
-                .await
-                .map_err(|err| format!("could not prepare the rollback wheel: {err}"))?;
+            let (previous, staged_previous) =
+                Self::stage(releases, installed, home.path())
+                    .await
+                    .map_err(|err| format!("could not prepare the rollback wheel: {err}"))?;
             let prepare = async {
-                self.install(&uv, &python, &previous, home.path(), Some(trial.path()))
-                    .await?;
+                Self::install(
+                    &uv,
+                    &python,
+                    &previous,
+                    &staged_previous,
+                    home.path(),
+                    Some(trial.path()),
+                )
+                .await?;
                 smoke::verify(
                     &trial.path().join("bin/sai"),
                     home.path(),
@@ -412,6 +441,8 @@ impl Uv {
             if let Err(reason) = self.authorized(false) {
                 return Ok(Change::Unsupported(reason));
             }
+            let published_next = self.publish_wheel(&next, &staged_next)?;
+            self.publish_wheel(&previous, &staged_previous)?;
             let record = self.pending_path();
             let pending = Pending {
                 wheel: previous,
@@ -422,7 +453,7 @@ impl Uv {
             };
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let changed = async {
-                self.install(&uv, &python, &next, home.path(), None).await?;
+                Self::install(&uv, &python, &next, &published_next, home.path(), None).await?;
                 self.owner(false)?;
                 smoke::verify(&self.launcher, home.path(), target, shim_base).await?;
                 // Let the shim verify and cache its binary in the invoking profile.
@@ -468,6 +499,22 @@ impl Uv {
         .await;
         result.unwrap_or_else(|reason: String| Change::unchanged(reason, installed))
     }
+}
+
+fn verify_file(wheel: &Wheel, path: &Path) -> Result<()> {
+    if path.canonicalize().ok().as_deref() != Some(path) {
+        return Err("the verified wheel path is missing or has changed".into());
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .map_err(io_error)?
+        .take(release::MAX_ASSET as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    if bytes.len() > release::MAX_ASSET || release::sha256(&bytes) != wheel.digest {
+        return Err("the verified wheel no longer matches its digest".into());
+    }
+    Ok(())
 }
 
 fn pending_launcher(record: &Pending) -> Option<PathBuf> {

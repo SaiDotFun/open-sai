@@ -130,10 +130,23 @@ impl Install {
         }
     }
 
-    pub(super) async fn recover_and_version(&self, home: &Path) -> Result<Version> {
+    pub(super) fn version_without_recovery(&self) -> Result<Version> {
         match self {
-            Self::Standalone(install) => install.recover(),
-            Self::Uv(install) => install.recover(home).await,
+            Self::Standalone(install) => install.version(),
+            Self::Uv(install) => Ok(install.version()),
+            Self::Other(..) => unreachable!(),
+        }
+    }
+
+    pub(super) async fn recover_and_version(
+        &self,
+        home: &Path,
+        allowed: impl Fn() -> bool,
+    ) -> Result<Version> {
+        match self {
+            Self::Standalone(install) if allowed() => install.recover(),
+            Self::Standalone(install) => install.version(),
+            Self::Uv(install) => install.recover(home, allowed).await,
             Self::Other(..) => unreachable!(),
         }
     }

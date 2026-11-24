@@ -389,6 +389,28 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
     assert not record.exists()
 
 
+def test_background_optout_keeps_pending_standalone_recovery(
+    standalone: NativeInstall,
+) -> None:
+    root = standalone.executable.parent.parent
+    interrupted = f"2.0.0-{'a' * 64}"
+    staged = root / interrupted / "sai"
+    staged.parent.mkdir()
+    shutil.copy2(standalone.executable, staged)
+    standalone.launcher.unlink()
+    standalone.launcher.symlink_to(staged.relative_to(standalone.launcher.parent))
+    record = root / "pending.json"
+    content = json.dumps({"old": standalone.executable.parent.name, "new": interrupted})
+    record.write_text(content, encoding="utf-8")
+    with releases({}) as server:
+        result = standalone.update(server, "--background", SAI_UPDATE_AUTO="false")
+        assert server.reads == [f"/repos{REPO}/releases"]
+    assert result.returncode == 0 and result.stdout == ""
+    assert standalone.launcher.resolve() == staged
+    assert record.read_text(encoding="utf-8") == content
+    assert standalone.state()["result"]["status"] == "available"
+
+
 def test_only_explicit_targets_can_downgrade_or_select_prereleases(
     standalone: NativeInstall,
 ) -> None:
@@ -821,6 +843,124 @@ def test_uv_pending_recovery_distinguishes_partial_metadata_from_another_package
     assert record.exists() is occupied
     expected = "uv-tool-other" if occupied else "uv-tool-release"
     assert python_update.install_kind(prefix).kind == expected
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_background_optout_keeps_pending_uv_recovery(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    record = interrupted_uv_install(install, initial)
+    content = record.read_bytes()
+    install.launcher.unlink()
+    with releases({}) as server:
+        result = install.invoke(
+            "update",
+            "--background",
+            *server.args,
+            exe=install.executable,
+            SAI_NATIVE_UV_PREFIX=install.env["FIXTURE_STABLE_UV_PREFIX"],
+            SAI_UPDATE_AUTO="false",
+        )
+        assert server.reads == [f"/repos{REPO}/releases"]
+    assert result.returncode == 0 and result.stdout == ""
+    assert not install.launcher.is_symlink()
+    assert record.read_bytes() == content
+    assert install.state()["result"]["status"] == "available"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_background_uv_optout_while_validating_recovery_destination(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    record = interrupted_uv_install(install, initial)
+    content = record.read_bytes()
+    install.launcher.unlink()
+    wrapper = install.launcher.parent / "uv"
+    real_uv = wrapper.resolve()
+    wrapper.unlink()
+    entered = tmp_path / "uv-destination-entered"
+    resume = tmp_path / "uv-destination-resume"
+    wrapper.write_text(
+        f"""#!{sys.executable}
+import os
+import sys
+import time
+from pathlib import Path
+
+if sys.argv[1:] == ["tool", "dir", "--bin"]:
+    Path({str(entered)!r}).touch()
+    deadline = time.monotonic() + 10
+    while not Path({str(resume)!r}).exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+os.execv({str(real_uv)!r}, [{str(real_uv)!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    with (
+        releases({}) as server,
+        subprocess.Popen(
+            [install.executable, "update", "--background", *server.args],
+            env={
+                **install.env,
+                "SAI_NATIVE_UV_PREFIX": install.env["FIXTURE_STABLE_UV_PREFIX"],
+            },
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as child,
+    ):
+        try:
+            deadline = time.monotonic() + 5
+            while not entered.exists() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert entered.exists()
+            (install.home / "config.toml").write_text(
+                "[update]\nauto = false\n", encoding="utf-8"
+            )
+        finally:
+            resume.touch()
+        assert child.communicate(timeout=15) == (b"", b"")
+        assert child.returncode == 0
+    assert not install.launcher.is_symlink()
+    assert record.read_bytes() == content
+    assert install.state()["result"]["status"] == "available"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_background_uv_optout_during_download_discards_staged_wheels(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    replacement = wheel(tmp_path, NEW)
+    local_assets = {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **assets(NEW, replacement.name, replacement.read_bytes()),
+    }
+    entered, resume = threading.Event(), threading.Event()
+    pause = (asset_key(NEW, replacement.name), entered, resume)
+    with (
+        releases(local_assets, pause=pause) as server,
+        subprocess.Popen(
+            [install.launcher, "update", "--background", *server.args],
+            env=install.env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as child,
+    ):
+        try:
+            assert entered.wait(10)
+            (install.home / "config.toml").write_text(
+                "[update]\nauto = false\n", encoding="utf-8"
+            )
+        finally:
+            resume.set()
+        assert child.communicate(timeout=15) == (b"", b"")
+        assert child.returncode == 0
+    assert install.state()["result"]["status"] == "available"
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+    assert not (Path(install.env["UV_TOOL_DIR"]) / ".sai-cli-native-wheels").exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")

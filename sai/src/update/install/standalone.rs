@@ -121,6 +121,11 @@ impl Standalone {
         state::sync_dir(parent).map_err(io_error)
     }
 
+    pub(super) fn version(&self) -> Result<Version> {
+        self.active()
+            .map(|active| dir_version(&active).expect("validated managed target"))
+    }
+
     pub(super) fn recover(&self) -> Result<Version> {
         let active = self.active()?;
         let record = self.root.join(RECORD);

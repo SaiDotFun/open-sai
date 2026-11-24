@@ -162,7 +162,16 @@ impl UpdateCommand {
                 None,
             );
         }
-        let installed = match install.recover_and_version(home).await {
+        // An opted-out worker can still report an available release. Leave the
+        // launcher and any pending transaction for an authorized update.
+        let opted_in = allowed();
+        let allowed = || opted_in && allowed();
+        let version = if opted_in {
+            install.recover_and_version(home, &allowed).await
+        } else {
+            install.version_without_recovery()
+        };
+        let installed = match version {
             Ok(version) => version,
             Err(reason) => {
                 return Outcome::new(
