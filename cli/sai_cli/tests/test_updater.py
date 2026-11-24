@@ -39,7 +39,8 @@ from test_mcp_install import (
 )
 from test_update import API_PATH, Stub, listing, make_prefix
 
-REAL_UV = os.environ.get("UV") or shutil.which("uv")
+_uv_executable = shutil.which(os.environ.get("UV") or "uv")
+REAL_UV = os.path.abspath(_uv_executable) if _uv_executable else None
 needs_uv = pytest.mark.skipif(REAL_UV is None, reason="uv is not on PATH")
 
 
@@ -107,7 +108,7 @@ def private_updater_path(tmp_path, monkeypatch) -> None:
     executables = tmp_path / "path"
     executables.mkdir()
     if REAL_UV is not None:
-        (executables / "uv").symlink_to(Path(REAL_UV).resolve())
+        (executables / "uv").symlink_to(REAL_UV)
     monkeypatch.setenv("PATH", str(executables))
 
 
