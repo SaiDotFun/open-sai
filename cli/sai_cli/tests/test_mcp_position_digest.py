@@ -81,6 +81,7 @@ class Position:
     oracle_quote_age: int | None = None
     oracle_ttl: int = 300
     fill_at_next_oracle_price: bool = False
+    market_order_config_fails: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
     snapshot_traders: deque[str] = field(default_factory=deque)
     indexed_collaterals: deque[int] = field(default_factory=deque)
@@ -291,31 +292,30 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 if position.collateral_price_on_perp_read is not None:
                     position.collateral_price = position.collateral_price_on_perp_read
                     position.collateral_price_on_perp_read = None
-                data = (
-                    {
-                        "market": None
-                        if position.null_market_price
-                        else {
-                            "base_per_quote": str(position.price),
-                            "base_last_update_time": position.block_timestamp
-                            - position.oracle_base_age
-                            if position.oracle_base_age is not None
-                            else None,
-                            "quote_last_update_time": position.block_timestamp
-                            - position.oracle_quote_age
-                            if position.oracle_quote_age is not None
-                            else None,
-                        },
-                        "collateral": position.collateral_price,
-                    }
-                    if position.collateral_price is not None
-                    else None
-                )
+                data = {
+                    "market": None
+                    if position.null_market_price
+                    else {
+                        "base_per_quote": str(position.price),
+                        "base_last_update_time": position.block_timestamp
+                        - position.oracle_base_age
+                        if position.oracle_base_age is not None
+                        else None,
+                        "quote_last_update_time": position.block_timestamp
+                        - position.oracle_quote_age
+                        if position.oracle_quote_age is not None
+                        else None,
+                    },
+                    "collateral": position.collateral_price,
+                }
             elif "market_order_config" in message:
                 assert message["market_order_config"] == {}
                 assert self.headers.get("x-cosmos-block-height") == str(
                     position.reported_height
                 )
+                if position.market_order_config_fails:
+                    self.reply({}, status=503)
+                    return
                 data = {"fill_at_next_oracle_price": position.fill_at_next_oracle_price}
             elif "get_liquidation_price" in message:
                 assert message["get_liquidation_price"] == {
@@ -2156,6 +2156,39 @@ def test_close_digest_is_refused_when_oracle_time_disappears(
             assert "publication time is unknown" in refusal["error"]
             assert refusal["preview"] == await call(client, f"preview_{action}", args)
             assert "previewDigest" not in refusal["preview"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize(
+    ("action", "options"), [("close", {}), ("partial_close", {"percent": 10})]
+)
+def test_close_digest_is_refused_when_market_price_disappears(
+    position_service, action, options, queued
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        args = {"trade_id": 7, **options}
+        async with connected_client(base_url) as client:
+            dated = await call(client, f"preview_{action}", args)
+            position.null_market_price = True
+            position.market_order_config_fails = queued
+            refused = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": dated["previewDigest"]},
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["preview"] == await call(client, f"preview_{action}", args)
+            assert "previewDigest" not in refused["preview"]
+            assert refused["preview"]["estimates"]["execution"]["code"] == (
+                "OraclePublicationTimeUnknown"
+            )
             assert position.submitted == []
 
     asyncio.run(scenario())

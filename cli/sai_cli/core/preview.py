@@ -421,26 +421,33 @@ def close_estimates(
             if rechecked is None
             else rechecked.height
         )
-        if fills_at_next_oracle_price(lcd, state.contract, height):
-            return dict.fromkeys(
-                result,
-                unavailable("Queued closes settle on a fresh oracle update."),
+        try:
+            prices = (
+                margin.perp_prices(lcd, state, height)
+                if rechecked is None
+                else rechecked.close_prices
             )
-        prices = (
-            margin.perp_prices(lcd, state, height)
-            if rechecked is None
-            else rechecked.close_prices
-        )
-        oracle = prices["market"]
-        if not isinstance(oracle, dict):
-            return result
-        published_at = oracle_publication_time(oracle)
-        if published_at is None:
+            oracle = prices.get("market") if isinstance(prices, dict) else None
+            published_at = (
+                oracle_publication_time(oracle) if isinstance(oracle, dict) else None
+            )
+        except READ_ERRORS:
+            prices, oracle, published_at = None, None, None
+        if (
+            not isinstance(prices, dict)
+            or not isinstance(oracle, dict)
+            or published_at is None
+        ):
             missing_time = unavailable("The oracle price publication time is unknown.")
             return {
                 **dict.fromkeys(result, missing_time),
                 "execution": {**missing_time, "code": UNKNOWN_ORACLE_TIME},
             }
+        if fills_at_next_oracle_price(lcd, state.contract, height):
+            return dict.fromkeys(
+                result,
+                unavailable("Queued closes settle on a fresh oracle update."),
+            )
         pair = None
         if published_at is not None:
             pair = contract_market(
