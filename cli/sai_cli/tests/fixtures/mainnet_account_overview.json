@@ -1,0 +1,139 @@
+{
+  "recordedAt": "2026-11-24T12:32:38.806089+00:00",
+  "balances": {
+    "data": {
+      "userBalances": [
+        {
+          "amount": "512832363183",
+          "usd_value": 189.5428414324368,
+          "lastUpdatedBlock": 50011631,
+          "token_info": {
+            "name": "Nibiru",
+            "symbol": "NIBI",
+            "decimals": 6,
+            "type": "bank"
+          }
+        },
+        {
+          "amount": "0",
+          "usd_value": 0,
+          "lastUpdatedBlock": 50405256,
+          "token_info": {
+            "name": "USDC (Sai Teller)",
+            "symbol": "USDC",
+            "decimals": 6,
+            "type": "erc20"
+          }
+        },
+        {
+          "amount": "22091064",
+          "usd_value": 22.091064,
+          "lastUpdatedBlock": 49819589,
+          "token_info": {
+            "name": "USDC Credits on Sai",
+            "symbol": "USDC",
+            "decimals": 6,
+            "type": "sai"
+          }
+        },
+        {
+          "amount": "150813685",
+          "usd_value": 150.813685,
+          "lastUpdatedBlock": 49819589,
+          "token_info": {
+            "name": "USDC on Sai",
+            "symbol": "USDC",
+            "decimals": 6,
+            "type": "sai"
+          }
+        }
+      ]
+    }
+  },
+  "trades": {
+    "data": {
+      "perp": {
+        "trades": []
+      }
+    }
+  },
+  "marketOrders": {
+    "data": {
+      "perp": {
+        "marketOrders": []
+      }
+    }
+  },
+  "historicalTradeShape": {
+    "data": {
+      "perp": {
+        "trades": [
+          {
+            "id": 0,
+            "trader": "nibi1syntheticoverviewfixture",
+            "isLong": true,
+            "tradeType": "trade",
+            "collateralAmount": 48920868,
+            "leverage": 50,
+            "openPrice": 79095.3,
+            "tp": null,
+            "sl": null,
+            "state": null,
+            "perpBorrowing": {
+              "marketId": 0,
+              "baseToken": {
+                "id": 3,
+                "symbol": "BTC"
+              },
+              "quoteToken": {
+                "id": 0,
+                "symbol": null,
+                "name": "uusd"
+              },
+              "collateralToken": {
+                "id": 1,
+                "symbol": "USDC"
+              }
+            },
+            "lastUpdatedBlock": {
+              "block": 41148706,
+              "block_ts": "2026-05-16T01:02:42.32762Z"
+            }
+          },
+          {
+            "id": 1,
+            "trader": "nibi1syntheticoverviewfixture",
+            "isLong": false,
+            "tradeType": "trade",
+            "collateralAmount": 79660000,
+            "leverage": 10,
+            "openPrice": 0.12475,
+            "tp": 0.106,
+            "sl": 0.131,
+            "state": null,
+            "perpBorrowing": {
+              "marketId": 20,
+              "baseToken": {
+                "id": 21,
+                "symbol": "ARB"
+              },
+              "quoteToken": {
+                "id": 0,
+                "symbol": null,
+                "name": "uusd"
+              },
+              "collateralToken": {
+                "id": 1,
+                "symbol": "USDC"
+              }
+            },
+            "lastUpdatedBlock": {
+              "block": 41313029,
+              "block_ts": "2026-05-20T15:56:32.808107Z"
+            }
+          }
+        ]
+      }
+    }
+  }
+}

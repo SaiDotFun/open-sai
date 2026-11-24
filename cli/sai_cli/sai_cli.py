@@ -6,12 +6,14 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
+from functools import wraps
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -21,19 +23,23 @@ import click
 from . import mcp_install, skill
 from .core import (
     clipboard,
+    intents,
     keeper,
     log,
     log_queries,
+    overview,
     reconcile,
     storage,
     stream,
     trading,
     update,
     updater,
+    wait,
 )
 from .core import session as sessions
 from .core import settings as sai_settings
-from .core.errors import Code, ExitCode, McpStdioError, SaiError, describe
+from .core.errors import Code, ExitCode, McpStdioError, SaiError, SessionError, describe
+from .utils import overview_format
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
@@ -52,8 +58,11 @@ def print_skill(ctx: click.Context, _param: click.Parameter, value: bool) -> Non
     ctx.exit()
 
 
-def emit(ctx: click.Context, value: Any) -> None:
-    click.echo(json.dumps(value, indent=None if ctx.obj["json"] else 2, default=str))
+def emit(ctx: click.Context, value: Any, *, wait_receipt: bool = False) -> None:
+    encoded = json.dumps(value, indent=None if ctx.obj["json"] else 2, default=str)
+    if wait_receipt:
+        ctx.meta["wait_output_started"] = True
+    click.echo(encoded)
 
 
 # Global flags that override a setting: option name, setting key.
@@ -162,6 +171,15 @@ def redact_error(value: Any) -> Any:
 
 
 def show_failure(exc: Exception, failure: SaiError, json_output: bool) -> None:
+    if isinstance(exc, WaitRecovery):
+        result = exc.result.copy()
+        if json_output:
+            result["error"] = redact_error(failure.as_dict())
+        click.echo(
+            json.dumps(result, indent=None if json_output else 2, default=str),
+            err=exc.output_started,
+        )
+        return
     if json_output and not isinstance(failure, McpStdioError):
         error = failure.as_dict()
         for key in ("message", "hint", "details"):
@@ -346,12 +364,46 @@ def main(
     passed = (endpoint, ws_endpoint, lcd_endpoint)
     flags = {key: value for (_, key), value in zip(GLOBAL_FLAGS, passed, strict=True)}
     ctx.obj.update(flags=flags, settings=None, json=json_output, as_addr=as_addr)
-    if auto_update_applies(ctx.invoked_subcommand, json_output):
+    if ctx.invoked_subcommand not in {
+        "account",
+        "auth",
+        "doctor",
+        "mcp",
+        "logs",
+        "skill",
+    }:
+        session_notice(ctx, as_addr)
+    if ctx.invoked_subcommand != "account" and auto_update_applies(
+        ctx.invoked_subcommand, json_output
+    ):
         updater.tick(warn)
     if ctx.invoked_subcommand is None:
         if json_output:
             raise click.UsageError("Pass a command when using --json.", ctx)
         repl(ctx)
+
+
+def session_notice(ctx: click.Context, addr: str | None) -> None:
+    """Warn on a terminal without touching piped output or MCP stdio."""
+    if ctx.obj["json"] or not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return
+    try:
+        stored = storage.load_session(addr)
+        if stored.get("endpoint") == keeper_url(ctx):
+            show_expiry_notice(ctx, sessions.expiry_fields(stored))
+    except (ValueError, click.ClickException):
+        # This notice is optional. The command handles its own settings and session.
+        return
+
+
+def show_expiry_notice(ctx: click.Context, fields: Mapping[str, Any]) -> None:
+    if (
+        fields.get("expiryWarning")
+        and not ctx.obj["json"]
+        and sys.stdin.isatty()
+        and sys.stderr.isatty()
+    ):
+        warn(f"{fields['expiryWarning']} Run {fields['renewalCommand']}.")
 
 
 # Commands that never start or announce an automatic update. `mcp` serves
@@ -483,6 +535,7 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
     try:
         result = signed_login(endpoint, name, addr)
         result["endpoint"] = endpoint
+        result["keyName"] = name
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
@@ -496,6 +549,37 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
             Code.INVALID_REQUEST,
             hint=command,
             exit_code=ExitCode.UNSUPPORTED,
+        ) from exc
+
+
+@auth.command("renew")
+@click.argument("addr", required=False)
+@click.pass_context
+def renew(ctx: click.Context, addr: str | None) -> None:
+    """Renew ADDR's session with its saved key name, or renew the active account."""
+    chosen = addr or ctx.obj["as_addr"]
+    try:
+        stored = storage.load_session(chosen)
+        endpoint = keeper_url(ctx)
+        if stored.get("endpoint") != endpoint:
+            raise SessionError("Stored session belongs to another Keeper endpoint")
+        name = stored.get("keyName")
+        if not name:
+            if stored.get("source") == "imported":
+                raise ValueError(
+                    f"This session was imported. Run {sessions.renewal_command(stored)} with a fresh token."
+                )
+            raise ValueError(
+                f"This session has no saved key name. Run {sessions.renewal_command(stored)}."
+            )
+        result = signed_login(endpoint, name, stored["evmAddress"])
+        result.update(endpoint=endpoint, keyName=name)
+        storage.replace_session(stored, result)
+        emit(ctx, sessions.summary(result))
+    except NeedsTerminal as exc:
+        raise SaiError(
+            f"{exc} Run {sessions.renewal_command(stored)} in a terminal.",
+            Code.SESSION_UNAVAILABLE,
         ) from exc
 
 
@@ -733,8 +817,9 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
         {
             **sessions.summary(result),
             "active": key == accounts["active"],
-            "expired": datetime.fromisoformat(result["expiresAt"]) <= now,
+            "expired": sessions.expiry_time(result) <= now,
             "endpointMatches": result.get("endpoint") == endpoint,
+            **sessions.expiry_fields(result, now),
         }
         for key, result in sorted(accounts["sessions"].items())
     ]
@@ -744,7 +829,11 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
 @click.pass_context
 def auth_list(ctx: click.Context) -> None:
     """List connected accounts, their expiry, and which one is active."""
-    emit(ctx, {"accounts": account_rows(keeper_url(ctx))})
+    rows = account_rows(keeper_url(ctx))
+    for row in rows:
+        if row["active"] and row["endpointMatches"]:
+            show_expiry_notice(ctx, row)
+    emit(ctx, {"accounts": rows})
 
 
 @auth.command("use")
@@ -765,7 +854,9 @@ def auth_status(ctx: click.Context) -> None:
     """Show the active account, or the --as account, and its expiry without
     showing the token."""
     result = session(ctx)
-    emit(ctx, sessions.summary(result))
+    fields = sessions.expiry_fields(result)
+    show_expiry_notice(ctx, fields)
+    emit(ctx, {**sessions.summary(result), **fields})
 
 
 @main.group()
@@ -788,14 +879,39 @@ def market_prices(ctx: click.Context) -> None:
 
 
 @main.group()
-def account() -> None:
+@click.pass_context
+def account(ctx: click.Context) -> None:
     """Inspect positions and account activity."""
+    if ctx.invoked_subcommand != "overview":
+        session_notice(ctx, ctx.obj["as_addr"])
+        if auto_update_applies("account", ctx.obj["json"]):
+            updater.tick(warn)
 
 
 def perform_query(
     ctx: click.Context, query: str, variables: dict[str, Any] | None = None
 ) -> None:
     emit(ctx, keeper.request(keeper_url(ctx), query, variables))
+
+
+@account.command("overview")
+@click.option("--as", "addr", metavar="ADDR", help="Read this EVM account.")
+@click.option("--json", "json_output", is_flag=True, help="Print compact JSON.")
+@click.pass_context
+def account_overview(ctx: click.Context, addr: str | None, json_output: bool) -> None:
+    """Show Sai funds, positions, orders, local blockers, and session expiry."""
+    ctx.obj["json"] = ctx.obj["json"] or json_output
+    if auto_update_applies("account", ctx.obj["json"]):
+        updater.tick(warn)
+    try:
+        result = overview.account_overview(settings(ctx), addr or ctx.obj["as_addr"])
+    except overview.AccountUnavailable as exc:
+        raise SessionError(f"{exc}. Pass --as ADDR explicitly.") from exc
+    if ctx.obj["json"]:
+        emit(ctx, result)
+    else:
+        show_expiry_notice(ctx, result["session"].get("data", {}))
+        overview_format.show(result)
 
 
 @account.command("positions")
@@ -850,6 +966,47 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
     emit(ctx, reconcile.status_report(data))
 
 
+@intent.command("wait")
+@click.argument("key")
+@click.option("--addr", help="EVM or Nibiru address that submitted the intent.")
+@click.option(
+    "--timeout",
+    type=float,
+    default=wait.DEFAULT_TIMEOUT,
+    show_default=True,
+    help="Maximum wait in seconds.",
+)
+@click.pass_context
+def intent_wait(ctx: click.Context, key: str, addr: str | None, timeout: float) -> None:
+    """Wait for an intent's final outcome and print its receipt."""
+    started = time.monotonic()
+    wait.validate_timeout(timeout)
+    endpoint = keeper_url(ctx)
+    account = addr or ctx.obj["as_addr"]
+    if account is None:
+        try:
+            with storage.busy_timeout(max(0, started + timeout - time.monotonic())):
+                local = storage.intent_record(endpoint, key)
+        except sqlite3.OperationalError as exc:
+            if not wait.ledger_busy(exc):
+                raise
+            emit_wait(ctx, wait.unknown_result(key, None))
+            return
+        if local is not None:
+            account = local[0]
+        elif storage.session_exists():
+            stored = storage.load_session()
+            if stored.get("endpoint") == endpoint:
+                account = stored["evmAddress"]
+    if account is None:
+        raise ValueError("Pass --addr with the account that submitted this intent")
+    with protect_wait(ctx, lambda: (endpoint, account, key)):
+        emit_wait(
+            ctx,
+            wait.for_intent(endpoint, account, key, timeout=timeout, started=started),
+        )
+
+
 @intent.command("local")
 @click.argument("addr")
 @click.pass_context
@@ -888,6 +1045,108 @@ def loader(ctx: click.Context) -> PinnedSession:
     return ctx.obj.setdefault("loader", PinnedSession(ctx))
 
 
+class WaitRecovery(SaiError):
+    """Render recovery independently of the normal receipt output."""
+
+    def __init__(self, result: dict[str, Any], *, output_started: bool) -> None:
+        self.result = result
+        self.output_started = output_started
+        super().__init__(
+            "The receipt did not finish. Check the intent status before retrying.",
+            result["code"],
+            hint=result["hint"],
+            intent_key=result["intentKey"],
+        )
+
+
+@contextlib.contextmanager
+def protect_wait(
+    ctx: click.Context,
+    identity: Callable[[], intents.IntentIdentity | None],
+) -> Generator[None]:
+    ctx.meta["wait_output_started"] = False
+    try:
+        yield
+    except (click.exceptions.Exit, storage.UnresolvedIntent):
+        # A completed receipt has already printed. A reservation refusal
+        # carries the existing key, if any, and the new key was never sent.
+        raise
+    except (KeyboardInterrupt, Exception) as exc:
+        submission = identity()
+        if submission is None:
+            raise
+        confirmed: wait.Outcome = "unknown"
+        if isinstance(exc, keeper.AdmissionRejected):
+            confirmed = "rejected"
+        elif isinstance(exc, keeper.NotSent):
+            confirmed = "not_sent"
+        result = wait.recovery_result(
+            *submission,
+            interrupted=isinstance(exc, KeyboardInterrupt)
+            or isinstance(exc.__cause__, KeyboardInterrupt),
+            confirmed=confirmed,
+        )
+        # The normal receipt may already occupy stdout. Keep recovery on
+        # stderr once printing began so consumers see one JSON per stream.
+        raise WaitRecovery(
+            result, output_started=ctx.meta["wait_output_started"]
+        ) from exc
+
+
+def wait_option(action: Callable[..., None]) -> Callable[..., None]:
+    def record(ctx: click.Context, _param: click.Parameter, enabled: bool) -> None:
+        ctx.meta["wait_for_trade"] = enabled
+
+    @wraps(action)
+    def run(*args: Any, **kwargs: Any) -> None:
+        ctx = click.get_current_context()
+        if ctx.meta.get("wait_for_trade"):
+            with (
+                intents.track_submission() as trace,
+                protect_wait(ctx, lambda: trace.identity),
+            ):
+                action(*args, **kwargs)
+        else:
+            action(*args, **kwargs)
+
+    return click.option(
+        "--wait",
+        is_flag=True,
+        expose_value=False,
+        callback=record,
+        help=f"Wait up to {wait.DEFAULT_TIMEOUT:g} seconds for the intent outcome.",
+    )(run)
+
+
+def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
+    outcome = result["outcome"]
+    exit_code = ExitCode.OK
+    if outcome == "unknown":
+        addr_args = ["--addr", result["addr"]] if result.get("addr") else []
+        result["hint"] = storage.keeper_command_hint(
+            keeper_url(ctx),
+            "intent",
+            "wait",
+            result["intentKey"],
+            *addr_args,
+        )
+    if isinstance(result.get("message"), str):
+        result["message"] = log.redact(result["message"])
+    if outcome not in ("filled", "placed", "succeeded"):
+        failure = SaiError(
+            result.get("message") or "The intent outcome is still unknown.",
+            result.get("code", Code.KEEPER_ERROR),
+            intent_key=result["intentKey"],
+            hint=result.get("hint"),
+        )
+        exit_code = failure.exit_code
+        if ctx.obj["json"]:
+            result["error"] = redact_error(failure.as_dict())
+    emit(ctx, result, wait_receipt=True)
+    if exit_code != ExitCode.OK:
+        ctx.exit(exit_code)
+
+
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     """Print a trade result with the account it used or would use.
 
@@ -904,7 +1163,35 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
             if ctx.obj["as_addr"]:
                 raise
             account = None
+    if (
+        ctx.meta.get("wait_for_trade")
+        and account
+        and result.get("status") == "accepted"
+    ):
+        final = wait.for_intent(keeper_url(ctx), account, result["intentKey"])
+        # Keep trade quote metadata, but report the final outcome as the status.
+        metadata = {key: value for key, value in result.items() if key != "message"}
+        emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
+        return
     emit(ctx, {"addr": account, **result})
+
+
+def trade_error(ctx: click.Context, exc: Exception) -> None:
+    if (
+        ctx.meta.get("wait_for_trade")
+        and isinstance(exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected))
+        and not isinstance(exc.__cause__, KeyboardInterrupt)
+    ):
+        account = loader(ctx).addr
+        if account and exc.intent_key:
+            final = (
+                wait.rejected_result(exc.intent_key, account, str(exc))
+                if isinstance(exc, keeper.AdmissionRejected)
+                else wait.for_intent(keeper_url(ctx), account, exc.intent_key)
+            )
+            emit_wait(ctx, {**final, "status": final["outcome"]})
+            return
+    raise exc
 
 
 def warn(message: str) -> None:
@@ -937,6 +1224,7 @@ def warn(message: str) -> None:
     " including a late acknowledgement.",
 )
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_open(
     ctx: click.Context,
@@ -953,25 +1241,29 @@ def trade_open(
     dry_run: bool,
 ) -> None:
     """Open a market, limit, or stop trade."""
-    emit_trade(
-        ctx,
-        trading.open_trade(
-            keeper_url(ctx),
-            loader(ctx),
-            market_id=market_id,
-            side=side,
-            order_type=order_type,
-            amount=amount,
-            leverage=leverage,
-            price=price,
-            slippage=slippage,
-            take_profit=take_profit,
-            stop_loss=stop_loss,
-            allow_concurrent_open=allow_concurrent_open,
-            dry_run=dry_run,
-            notify=warn,
-        ),
-    )
+    try:
+        emit_trade(
+            ctx,
+            trading.open_trade(
+                keeper_url(ctx),
+                loader(ctx),
+                market_id=market_id,
+                side=side,
+                order_type=order_type,
+                amount=amount,
+                leverage=leverage,
+                price=price,
+                slippage=slippage,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                allow_concurrent_open=allow_concurrent_open,
+                dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
+                notify=warn,
+            ),
+        )
+    except (ValueError, KeyError, keeper.KeeperError) as exc:
+        trade_error(ctx, exc)
 
 
 @trade.command("close")
@@ -982,21 +1274,26 @@ def trade_open(
     help="Cancel a pending order instead of closing a position.",
 )
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_close(
     ctx: click.Context, trade_id: int, cancel_order: bool, dry_run: bool
 ) -> None:
     """Close a position or cancel a pending order."""
-    emit_trade(
-        ctx,
-        trading.close_trade(
-            keeper_url(ctx),
-            loader(ctx),
-            trade_id=trade_id,
-            cancel_order=cancel_order,
-            dry_run=dry_run,
-        ),
-    )
+    try:
+        emit_trade(
+            ctx,
+            trading.close_trade(
+                keeper_url(ctx),
+                loader(ctx),
+                trade_id=trade_id,
+                cancel_order=cancel_order,
+                dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
+            ),
+        )
+    except (ValueError, keeper.KeeperError) as exc:
+        trade_error(ctx, exc)
 
 
 @trade.command("tpsl")
@@ -1006,6 +1303,7 @@ def trade_close(
 @click.option("--clear-take-profit", is_flag=True)
 @click.option("--clear-stop-loss", is_flag=True)
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_tpsl(
     ctx: click.Context,
@@ -1017,40 +1315,49 @@ def trade_tpsl(
     dry_run: bool,
 ) -> None:
     """Set or clear take-profit and stop-loss prices."""
-    emit_trade(
-        ctx,
-        trading.set_tpsl(
-            keeper_url(ctx),
-            loader(ctx),
-            trade_id=trade_id,
-            take_profit=take_profit,
-            stop_loss=stop_loss,
-            clear_take_profit=clear_take_profit,
-            clear_stop_loss=clear_stop_loss,
-            dry_run=dry_run,
-        ),
-    )
+    try:
+        emit_trade(
+            ctx,
+            trading.set_tpsl(
+                keeper_url(ctx),
+                loader(ctx),
+                trade_id=trade_id,
+                take_profit=take_profit,
+                stop_loss=stop_loss,
+                clear_take_profit=clear_take_profit,
+                clear_stop_loss=clear_stop_loss,
+                dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
+            ),
+        )
+    except (ValueError, keeper.KeeperError) as exc:
+        trade_error(ctx, exc)
 
 
 @trade.command("leverage")
 @click.argument("trade_id", type=int)
 @click.option("--leverage", required=True, help="Target leverage as a decimal.")
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_leverage(
     ctx: click.Context, trade_id: int, leverage: str, dry_run: bool
 ) -> None:
     """Set target leverage without changing TP or SL."""
-    emit_trade(
-        ctx,
-        trading.set_leverage(
-            keeper_url(ctx),
-            loader(ctx),
-            trade_id=trade_id,
-            leverage=leverage,
-            dry_run=dry_run,
-        ),
-    )
+    try:
+        emit_trade(
+            ctx,
+            trading.set_leverage(
+                keeper_url(ctx),
+                loader(ctx),
+                trade_id=trade_id,
+                leverage=leverage,
+                dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
+            ),
+        )
+    except (ValueError, keeper.KeeperError) as exc:
+        trade_error(ctx, exc)
 
 
 @trade.command("margin")
@@ -1067,6 +1374,7 @@ def trade_leverage(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_margin(
     ctx: click.Context,
@@ -1080,18 +1388,21 @@ def trade_margin(
 
     The amount is a quote, not a cap: collateral can change before execution.
     """
-    emit_trade(
-        ctx,
-        trading.change_margin(
-            keeper_url(ctx),
-            loader(ctx),
-            trade_id=trade_id,
-            direction=direction,
-            amount=amount,
-            lcd_endpoint=lcd_url(ctx, lcd_endpoint),
-            dry_run=dry_run,
-        ),
-    )
+    try:
+        emit_trade(
+            ctx,
+            trading.change_margin(
+                keeper_url(ctx),
+                loader(ctx),
+                trade_id=trade_id,
+                direction=direction,
+                amount=amount,
+                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                dry_run=dry_run,
+            ),
+        )
+    except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
+        trade_error(ctx, exc)
 
 
 @trade.command("partial-close")
@@ -1103,6 +1414,7 @@ def trade_margin(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def partial_close(
     ctx: click.Context,
@@ -1112,17 +1424,20 @@ def partial_close(
     dry_run: bool,
 ) -> None:
     """Reduce an open USDC position by a whole percentage."""
-    emit_trade(
-        ctx,
-        trading.partial_close(
-            keeper_url(ctx),
-            loader(ctx),
-            trade_id=trade_id,
-            percent=percent,
-            lcd_endpoint=lcd_url(ctx, lcd_endpoint),
-            dry_run=dry_run,
-        ),
-    )
+    try:
+        emit_trade(
+            ctx,
+            trading.partial_close(
+                keeper_url(ctx),
+                loader(ctx),
+                trade_id=trade_id,
+                percent=percent,
+                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                dry_run=dry_run,
+            ),
+        )
+    except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
+        trade_error(ctx, exc)
 
 
 @main.command("doctor")
