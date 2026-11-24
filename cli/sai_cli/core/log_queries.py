@@ -371,8 +371,6 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     for name in ("intentKey", "runId", "callId", "commandId"):
         if name in safe and not TOKEN.fullmatch(str(safe[name])):
             del safe[name]
-    if "endpoint" in safe:
-        safe["endpoint"] = log.origin(str(safe["endpoint"]))
     tx_hash, invalid = keeper.request_hash(line.get("txHash"))
     safe.pop("txHash", None)
     if tx_hash:

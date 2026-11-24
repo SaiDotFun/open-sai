@@ -1303,11 +1303,14 @@ def _invalid_constant(_text: str) -> Any:
 
 def decode_row(raw: bytes) -> Any:
     line = json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
-    if (
-        isinstance(line, dict)
-        and line.get("event") == "keeper.request"
-        and "keeperErrors" in line
-    ):
+    if not isinstance(line, dict):
+        return line
+    # Older writers stored full endpoints. Project them before any reader
+    # uses the row, while keeping endpointId for intent attribution.
+    for field in ("endpoint", "keeper", "websocket", "lcd"):
+        if (value := line.get(field)) is not None:
+            line[field] = origin(value) if isinstance(value, str) else REDACTED_URL
+    if line.get("event") == "keeper.request" and "keeperErrors" in line:
         line.update(
             keeper_error_fields(
                 line["keeperErrors"], retained=True, total=line.get("keeperErrorCount")

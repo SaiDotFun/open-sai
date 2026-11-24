@@ -3481,7 +3481,7 @@ def test_log_readers_project_retained_keeper_errors(home):
         "runId": "old-run",
         "seq": 1,
         "operation": "intents",
-        "endpoint": "https://keeper.example",
+        "endpoint": f"https://user:{URL_PASSWORD}@keeper.example:8443{target}",
         "endpointId": "h1_" + "a" * 64,
         "addr": ADDR,
         "intentKey": "KEY",
@@ -3496,6 +3496,7 @@ def test_log_readers_project_retained_keeper_errors(home):
     current = {
         **row,
         "seq": 2,
+        "endpoint": "https://keeper.example:8443",
         "keeperErrors": [{"code": "FORBIDDEN"}],
         "keeperErrorCount": 5,
     }
@@ -3513,13 +3514,14 @@ def test_log_readers_project_retained_keeper_errors(home):
     ):
         code, text = run_cli("logs", *args)
         assert code == 0
-        assert PATH_KEY not in text and URL_KEY not in text
+        assert all(secret not in text for secret in (PATH_KEY, URL_KEY, URL_PASSWORD))
+        assert text.count("endpoint=https://keeper.example:8443") == 2
         assert "GRAPHQL_VALIDATION_FAILED" in text and "KEEPER_ERROR" in text
         assert "keeperErrorCount=2" in text and "keeperErrorCount=5" in text
 
         code, output = run_cli("--json", "logs", *args)
         assert code == 0
-        assert PATH_KEY not in output and URL_KEY not in output
+        assert all(secret not in output for secret in (PATH_KEY, URL_KEY, URL_PASSWORD))
         rows = (
             [json.loads(line) for line in output.splitlines()]
             if args[0] == "tail"
@@ -3528,6 +3530,7 @@ def test_log_readers_project_retained_keeper_errors(home):
         assert [
             (item["keeperErrorCount"], item["keeperErrors"]) for item in rows
         ] == expected
+        assert [item["endpoint"] for item in rows] == ["https://keeper.example:8443"] * 2
 
     mcp = server.create_server(settings.load())
     report = call(mcp, "logs_intent", {"key": "KEY", "offline": True})
@@ -3535,6 +3538,30 @@ def test_log_readers_project_retained_keeper_errors(home):
         (item["keeperErrorCount"], item["keeperErrors"]) for item in report["events"]
     ] == expected
     assert path.read_bytes() == raw
+
+
+def test_logs_tail_shows_origins_for_retained_mcp_endpoints(home):
+    path = old_file(home / "logs", "mcp", 1)
+    origins = {
+        "keeper": "https://keeper.example",
+        "websocket": "wss://keeper.example",
+        "lcd": "http://[::1]:1317",
+    }
+    row = {
+        "event": "mcp.server_start",
+        "runId": "server",
+        "ts": log.stamp(log.now() - timedelta(days=1)),
+        **{field: f"{url}/{PATH_KEY}?key={URL_KEY}" for field, url in origins.items()},
+    }
+    path.write_bytes(log.encode(row))
+    for query in (("tail",), ("run", "server")):
+        code, output = run_cli("--json", "logs", *query)
+        assert code == 0
+        assert PATH_KEY not in output and URL_KEY not in output
+        found = json.loads(output)
+        if query[0] == "run":
+            found = found["events"][0]
+        assert {field: found[field] for field in origins} == origins
 
 
 def test_logs_tail_reads_from_the_end_of_large_files(home):
