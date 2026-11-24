@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -17,6 +18,7 @@ from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
 
@@ -51,10 +53,53 @@ class SlowBody:
 
 
 Reply = str | dict[str, Any] | Callable[[], dict[str, Any]] | SlowBody
+MARKET = {
+    "data": {
+        "perp": {
+            "borrowings": [
+                {
+                    "marketId": 0,
+                    "collateralToken": {"symbol": "USDC"},
+                    "isOpen": True,
+                    "price": 100,
+                },
+            ]
+        }
+    }
+}
+OPEN_ARGS = {
+    "market_id": 0,
+    "side": "long",
+    "order_type": "market",
+    "amount": "10",
+    "leverage": "2",
+    "slippage": "1",
+}
+CLI_OPEN = [
+    "trade",
+    "open",
+    "--market",
+    "0",
+    "--side",
+    "long",
+    "--type",
+    "market",
+    "--amount",
+    "10",
+    "--leverage",
+    "2",
+    "--slippage",
+    "1",
+]
 
 
 @pytest.fixture
-def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
+def submitted_keys() -> list[str]:
+    return []
+
+
+@pytest.fixture
+def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]]]:
     replies: deque[Reply] = deque()
     active_key = KEY
     offset = 0
@@ -76,6 +121,7 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
                 replay = replay.response
             if request["query"] == keeper.SUBMIT:
                 active_key = request["variables"]["input"]["intentKey"]
+                submitted_keys.append(active_key)
             if replay == "drop_ack":
                 self.close_connection = True
                 return
@@ -102,11 +148,11 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
             if "userIntents" in data:
                 assert request["query"] == keeper.INTENTS
                 assert request["variables"]["user"].lower() in (ADDR, NIBI_ADDR)
-                assert request["variables"]["key"] in (active_key, None)
-                if active_key != KEY:
-                    for row in data["userIntents"]:
-                        if row["intentKey"] == KEY:
-                            row["intentKey"] = active_key
+                key = request["variables"]["key"]
+                assert key in (KEY, None, *submitted_keys)
+                for row in data["userIntents"]:
+                    if row["intentKey"] == KEY:
+                        row["intentKey"] = key or active_key
                 offset = 0
             elif "tradeHistory" in data.get("perp", {}):
                 assert request["query"] == keeper.INTENT_HISTORY
@@ -182,6 +228,22 @@ def reserve(endpoint: str, *, expired: bool = False) -> None:
                 "UPDATE intents SET created_at=? WHERE id=?",
                 (time.time() - keeper.ABSENT_AFTER_SECONDS - 1, KEY),
             )
+
+
+@pytest.fixture
+def connected_replay(
+    keeper_replay: tuple[str, deque[Reply]],
+) -> tuple[str, deque[Reply]]:
+    endpoint, _ = keeper_replay
+    storage.save_session(
+        {
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "token": "fixture-token",
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    return keeper_replay
 
 
 @pytest.mark.parametrize(
@@ -316,51 +378,13 @@ def test_unindexed_sweep_can_be_resolved_by_matching_history(keeper_replay):
 
 @pytest.mark.parametrize("provisional", ["pending_exec", "outcome_not_indexed"])
 def test_unkeyed_cli_status_blocks_a_second_acknowledged_open(
-    keeper_replay, provisional
+    connected_replay, provisional
 ):
-    endpoint, replies = keeper_replay
-    storage.save_session(
-        {
-            "evmAddress": ADDR,
-            "endpoint": endpoint,
-            "token": "fixture-token",
-            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
-        }
-    )
-    market = {
-        "data": {
-            "perp": {
-                "borrowings": [
-                    {
-                        "marketId": 0,
-                        "collateralToken": {"symbol": "USDC"},
-                        "isOpen": True,
-                        "price": 100,
-                    },
-                ]
-            }
-        }
-    }
-    trade = [
-        "trade",
-        "open",
-        "--market",
-        "0",
-        "--side",
-        "long",
-        "--type",
-        "market",
-        "--amount",
-        "10",
-        "--leverage",
-        "2",
-        "--slippage",
-        "1",
-    ]
+    endpoint, replies = connected_replay
     cli = CliRunner()
     options = ["--endpoint", endpoint, "--json"]
-    replies.extend((market, "admission_ack"))
-    submitted = cli.invoke(main, [*options, *trade])
+    replies.extend((MARKET, "admission_ack"))
+    submitted = cli.invoke(main, [*options, *CLI_OPEN])
     assert submitted.exit_code == 0, submitted.output
     key = json.loads(submitted.output)["intentKey"]
     assert status(endpoint) == "accepted"
@@ -374,33 +398,177 @@ def test_unkeyed_cli_status_blocks_a_second_acknowledged_open(
     assert "Do not resubmit" in row["hint"]
     assert status(endpoint) == "pending"
 
-    blocked = cli.invoke(main, [*options, *trade])
+    replies.append(MARKET)
+    blocked = cli.invoke(main, [*options, *CLI_OPEN])
     assert blocked.exit_code != 0
-    assert f"Reconcile uncertain intent {key}" in blocked.output
+    assert f"Earlier open intent {key}" in blocked.output
 
     with storage.db() as connection:
         connection.execute("UPDATE intents SET created_at=0 WHERE id=?", (key,))
     mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    replies.append(MARKET)
+    preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
     args = {
-        "market_id": 0,
-        "side": "long",
-        "order_type": "market",
-        "amount": "10",
-        "leverage": "2",
-        "slippage": "1",
+        **OPEN_ARGS,
+        "preview_digest": preview["previewDigest"],
+        "reference_price": preview["referencePrice"],
     }
-    replies.append(market)
-    preview = call_mcp(mcp, "preview_open", args)
-    args.update(
-        preview_digest=preview["previewDigest"],
-        reference_price=preview["referencePrice"],
-    )
     for allow in (False, True):
         result = call_mcp(mcp, "trade_open", {**args, "allow_concurrent_open": allow})
         assert result["code"] == "RECENT_OPEN_PENDING"
         assert result["intentKeys"] == [key]
-        assert "next oracle price" in result["error"]
+        assert "intent_status" in result["error"]
         assert "allow_concurrent_open" not in result["error"]
+
+
+@pytest.mark.parametrize("retry", ["same_process", "restart", "mcp"])
+def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry):
+    endpoint, replies = connected_replay
+    cli = CliRunner()
+    options = ["--endpoint", endpoint, "--json"]
+
+    def open_cli(*flags: str) -> tuple[int, dict[str, Any]]:
+        args = [*options, *CLI_OPEN, *flags]
+        if retry == "restart":
+            process = subprocess.run(
+                [sys.executable, "-m", "sai_cli", *args],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+            return process.returncode, json.loads(process.stdout)
+        result = cli.invoke(main, args)
+        return result.exit_code, json.loads(result.stdout)
+
+    replies.extend((MARKET, "admission_ack"))
+    exit_code, first = open_cli()
+    assert exit_code == 0
+    assert first["status"] == status(endpoint) == "accepted"
+    key = first["intentKey"]
+    if retry == "mcp":
+        mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+        replies.append(MARKET)
+        preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
+        args = {
+            **OPEN_ARGS,
+            "preview_digest": preview["previewDigest"],
+            "reference_price": preview["referencePrice"],
+        }
+        # Keeper now quotes 103, outside the 1% slippage of the confirmed 100.
+        moved = {
+            "data": {
+                "perp": {
+                    "borrowings": [
+                        {**MARKET["data"]["perp"]["borrowings"][0], "price": 103}
+                    ]
+                }
+            }
+        }
+        replies.append(moved)
+        error = call_mcp(mcp, "trade_open", args)
+        assert error["code"] == "RECENT_OPEN_PENDING"
+        assert replies.pop() == moved
+        assert error["intentKeys"] == [key]
+        assert f"intent {key}" in error["error"]
+        assert "intent_status" in error["error"]
+    else:
+        replies.append(MARKET)
+        exit_code, blocked = open_cli()
+        assert exit_code == 1
+        error = blocked["error"]
+        assert error["intentKey"] == key and error["retryable"] is False
+        assert (
+            error["hint"]
+            == f"sai --endpoint {endpoint} intent status {ADDR} --key {key}"
+        )
+    assert error["code"] == "RECENT_OPEN_PENDING"
+    assert submitted_keys == [key]
+
+    if retry == "same_process":
+        failure = RESPONSES["simulation_failed"]["data"]["userIntents"][0]
+        replies.append({"data": {"userIntents": [{**failure, "intentKey": key}]}})
+        checked = cli.invoke(main, [*options, "intent", "status", ADDR, "--key", key])
+        assert checked.exit_code == 0, checked.output
+        assert status(endpoint) == "terminal"
+        replies.extend((MARKET, "admission_ack"))
+        exit_code, allowed = open_cli()
+        assert exit_code == 0
+    elif retry == "restart":
+        replies.extend((MARKET, "admission_ack"))
+        exit_code, allowed = open_cli("--allow-concurrent-open")
+        assert exit_code == 0
+    else:
+        replies.extend((MARKET, "admission_ack"))
+        allowed = call_mcp(mcp, "trade_open", {**args, "allow_concurrent_open": True})
+    assert allowed["status"] == "accepted"
+    assert allowed["intentKey"] != key
+    assert submitted_keys == [key, allowed["intentKey"]]
+
+
+def _open_with_mcp(
+    endpoint: str, args: dict[str, Any], results: Queue[dict[str, Any]]
+) -> None:
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    results.put(call_mcp(mcp, "trade_open", args))
+
+
+def test_mcp_open_reservation_rechecks_after_concurrent_ack(
+    connected_replay, submitted_keys
+):
+    endpoint, replies = connected_replay
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    replies.append(MARKET)
+    preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
+    args = {
+        **OPEN_ARGS,
+        "preview_digest": preview["previewDigest"],
+        "reference_price": preview["referencePrice"],
+    }
+
+    # Both clients pass the ledger precheck before either gets a market price.
+    # One price reply waits until the winning process has recorded its ack.
+    both_refreshing = threading.Barrier(2, timeout=10)
+    winner_accepted = threading.Event()
+
+    def first_quote() -> dict[str, Any]:
+        both_refreshing.wait()
+        return MARKET
+
+    def second_quote() -> dict[str, Any]:
+        both_refreshing.wait()
+        assert winner_accepted.wait(timeout=10)
+        return MARKET
+
+    replies.extend((first_quote, second_quote, "admission_ack", "admission_ack"))
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    workers = [
+        context.Process(target=_open_with_mcp, args=(endpoint, args, results))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        winner = results.get(timeout=15)
+        assert winner["status"] == status(endpoint) == "accepted"
+        key = winner["intentKey"]
+        winner_accepted.set()
+        loser = results.get(timeout=15)
+        assert submitted_keys == [key]
+        assert replies.pop() == "admission_ack"
+        assert loser["code"] == "RECENT_OPEN_PENDING"
+        assert loser["intentKeys"] == [key]
+        for worker in workers:
+            worker.join(timeout=5)
+            assert worker.exitcode == 0
+    finally:
+        winner_accepted.set()
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+            worker.join(timeout=5)
+        results.close()
 
 
 @pytest.mark.parametrize(

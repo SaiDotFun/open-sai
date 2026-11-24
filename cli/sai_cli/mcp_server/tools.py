@@ -70,15 +70,6 @@ MISMATCH = (
     " was submitted. Show the user this new preview, get their confirmation"
     " again, then retry with its previewDigest."
 )
-RECENT_OPEN = (
-    "This account has an unresolved open. Call intent_local, then"
-    " intent_wait with each key in intentKeys."
-)
-PENDING_OPEN = (
-    "An open for this account is pending at the next oracle price or waiting"
-    " for Keeper to index its outcome. Call intent_status with each key in"
-    " intentKeys and wait for a final outcome before submitting another trade."
-)
 PRICE_MOVED = (
     "The market price moved {moved}% from the confirmed referencePrice, more"
     " than the {slippage}% slippage, so nothing was submitted. Show the user"
@@ -123,12 +114,6 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
 def describe(exc: Exception) -> dict[str, Any]:
     """Format the shared classification using the MCP response fields."""
     failure = describe_error(exc)
-    if isinstance(exc, storage.PendingOpen):
-        return error(
-            PENDING_OPEN if exc.pending_fill else RECENT_OPEN,
-            failure.code,
-            intentKeys=exc.keys,
-        )
     if failure.code == Code.OUTCOME_UNKNOWN:
         key = failure.intent_key
         return error(
@@ -139,6 +124,13 @@ def describe(exc: Exception) -> dict[str, Any]:
                 f"Call intent_status with key {key} to reconcile. Do not"
                 " resubmit until it reports a final outcome."
             ),
+        )
+    if isinstance(exc, storage.RecentOpenPending):
+        return error(
+            f"Earlier open intent {failure.intent_key} may still execute. Call"
+            " intent_status with each key in intentKeys before retrying.",
+            failure.code,
+            intentKeys=exc.keys,
         )
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
@@ -636,6 +628,12 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
+    if not dry_run:
+        storage.check_open_pending(
+            settings.endpoint,
+            load()["evmAddress"],
+            allow_concurrent_open=allow_concurrent_open,
+        )
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,

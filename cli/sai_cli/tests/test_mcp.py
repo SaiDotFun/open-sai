@@ -1097,7 +1097,7 @@ def test_recent_pending_open_blocks_a_second_open(mcp, monkeypatch):
     blocked = invoke(mcp, "trade_open", trade)
     assert blocked["code"] == "RECENT_OPEN_PENDING"
     assert blocked["intentKeys"] == [first["intentKey"]]
-    assert "intent_local" in blocked["error"]
+    assert "intent_status" in blocked["error"]
     assert len(fake.submitted) == 1
 
     # A close is not an open and is not blocked.
@@ -1121,21 +1121,6 @@ def test_unknown_open_after_a_timeout_blocks_with_its_key(mcp, monkeypatch):
     assert blocked["code"] == "RECENT_OPEN_PENDING"
     assert blocked["intentKeys"] == [lost["intentKey"]]
     assert len(fake.submitted) == 1
-
-
-def test_old_acknowledged_open_blocks_until_terminal():
-    key = "20260101T000000000Z_AAAAAAAAAAAAAAAA"
-    storage.pending(key, ENDPOINT, ADDR, "OPEN_TRADE", "")
-    storage.set_status(key, ENDPOINT, ADDR, "accepted")
-    with storage.db() as connection:
-        connection.execute("UPDATE intents SET created_at=0 WHERE id=?", (key,))
-    with pytest.raises(storage.PendingOpen, match=key):
-        storage.pending("next", ENDPOINT, ADDR, "OPEN_TRADE", "")
-    storage.pending(
-        "other-endpoint", "http://127.0.0.1:1/query", ADDR, "OPEN_TRADE", ""
-    )
-    storage.set_status(key, ENDPOINT, ADDR, "terminal")
-    storage.pending("next", ENDPOINT, ADDR, "OPEN_TRADE", "")
 
 
 def test_sign_in_comes_before_validation(mcp):

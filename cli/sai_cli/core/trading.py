@@ -14,7 +14,7 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
-from . import intents, keeper, margin, storage
+from . import intents, keeper, margin
 
 SessionLoader = Callable[[], dict[str, str]]
 Notify = Callable[[str], None]
@@ -45,6 +45,8 @@ def preview_or_submit(
     payload: dict[str, Any],
     dry_run: bool,
     before_submit: SubmitCheck = _accept,
+    *,
+    allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
     """Return the dry-run preview of PAYLOAD, or check and submit it."""
     preview = {"dryRun": True, "intent": payload}
@@ -52,7 +54,9 @@ def preview_or_submit(
         return preview
     active = get_session()
     before_submit(preview)
-    return intents.submit(endpoint, active, payload)
+    return intents.submit(
+        endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
+    )
 
 
 def open_usdc_market(endpoint: str, market_id: int) -> dict[str, Any]:
@@ -105,31 +109,36 @@ def open_trade(
         take_profit,
         stop_loss,
     )
-    preview = {"dryRun": True, "intent": payload}
-    if order_type == "market":
-        preview["requiresMarketPriceRefresh"] = True
+    if order_type != "market":
+        return preview_or_submit(
+            endpoint,
+            get_session,
+            payload,
+            dry_run,
+            before_submit,
+            allow_concurrent_open=allow_concurrent_open,
+        )
     if dry_run:
-        return preview
+        return {"dryRun": True, "requiresMarketPriceRefresh": True, "intent": payload}
     active = get_session()
-    storage.check_open(
-        endpoint,
-        active["evmAddress"],
-        allow_concurrent_open=allow_concurrent_open,
+    if price is not None:
+        notify(MARKET_PRICE_NOTICE)
+    current = open_usdc_market(endpoint, market_id)
+    current_price = format(Decimal(str(current["price"])), "f")
+    intents.positive(current_price, "Current price")
+    payload["body"]["intentPrice"] = current_price
+    before_submit(
+        {
+            "dryRun": True,
+            "requiresMarketPriceRefresh": True,
+            "intent": payload,
+            "referencePrice": current_price,
+        }
     )
-    if order_type == "market":
-        if price is not None:
-            notify(MARKET_PRICE_NOTICE)
-        current = open_usdc_market(endpoint, market_id)
-        current_price = format(Decimal(str(current["price"])), "f")
-        intents.positive(current_price, "Current price")
-        payload["body"]["intentPrice"] = current_price
-        preview["referencePrice"] = current_price
-    before_submit(preview)
     result = intents.submit(
         endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
     )
-    if "referencePrice" in preview:
-        result["referencePrice"] = preview["referencePrice"]
+    result["referencePrice"] = current_price
     return result
 
 
