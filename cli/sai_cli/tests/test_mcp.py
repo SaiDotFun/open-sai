@@ -20,7 +20,7 @@ from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
-from sai_cli.core import keeper, margin, settings, storage, stream, update
+from sai_cli.core import confirmation, keeper, margin, settings, storage, stream, update
 from sai_cli.core import session as sessions
 from sai_cli.mcp_server import info as sai_info
 from sai_cli.mcp_server import server, tools
@@ -542,7 +542,7 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
             },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
-            "test-contract",
+            {"chainId": "test-1", "contractAddress": "test-contract"},
         )
         for amount in collaterals
     )
@@ -584,7 +584,7 @@ def test_preview_open_is_exactly_what_trade_open_submits(mcp, monkeypatch):
     monkeypatch.setattr(keeper, "request", fake)
     preview = invoke(mcp, "preview_open", OPEN_ARGS)
     assert preview["dryRun"] is True
-    assert preview["previewDigest"] == tools.preview_digest(preview)
+    assert preview["previewDigest"] == confirmation.preview_digest(preview)
     assert fake.submitted == []
 
     result = invoke(
@@ -607,14 +607,14 @@ def test_digest_binds_account_and_reference_not_market_intent_price():
             },
         }
 
-    base = tools.preview_digest(market("5", "100", ADDR))
+    base = confirmation.preview_digest(market("5", "100", ADDR))
     # The refreshed intent price, reference spelling, and addr case don't
     # change what the user confirmed.
-    assert tools.preview_digest(market("6", "100.0", ADDR.upper())) == base
-    assert tools.preview_digest(market("5", "101", ADDR)) != base
-    assert tools.preview_digest(market("5", "100", OTHER)) != base
+    assert confirmation.preview_digest(market("6", "100.0", ADDR.upper())) == base
+    assert confirmation.preview_digest(market("5", "101", ADDR)) != base
+    assert confirmation.preview_digest(market("5", "100", OTHER)) != base
     limit = {"intent": {"kind": "OPEN_TRADE", "body": {"orderType": "limit"}}}
-    assert tools.preview_digest(limit) != tools.preview_digest(
+    assert confirmation.preview_digest(limit) != confirmation.preview_digest(
         {
             "intent": {
                 "kind": "OPEN_TRADE",
@@ -622,7 +622,7 @@ def test_digest_binds_account_and_reference_not_market_intent_price():
             }
         }
     )
-    assert len(tools.preview_digest(limit)) == 64
+    assert len(confirmation.preview_digest(limit)) == 64
 
 
 def test_trades_require_the_preview_digest(mcp):

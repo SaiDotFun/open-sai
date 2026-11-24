@@ -23,6 +23,7 @@ import click
 from . import mcp_install, skill
 from .core import (
     clipboard,
+    confirmation,
     intents,
     keeper,
     log,
@@ -1187,10 +1188,18 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         metadata = {key: value for key, value in result.items() if key != "message"}
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
         return
-    emit(ctx, {"addr": account, **result})
+    output = {"addr": account, **result}
+    if "positionRoute" in result:
+        output = confirmation.with_digest(output)
+    emit(ctx, output)
 
 
 def trade_error(ctx: click.Context, exc: Exception) -> None:
+    if isinstance(exc, trading.PositionChanged) and exc.preview is not None:
+        if ctx.obj["json"]:
+            exc.details = {"preview": confirmation.with_digest(exc.preview)}
+        else:
+            exc.message += " Run with --dry-run to review a fresh preview."
     if (
         ctx.meta.get("wait_for_trade")
         and isinstance(exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected))
@@ -1374,6 +1383,27 @@ def trade_leverage(
         trade_error(ctx, exc)
 
 
+def position_submit_check(
+    load: PinnedSession, digest: str | None
+) -> trading.SubmitCheck | None:
+    if digest is None:
+        return None
+
+    def check(preview: dict[str, Any]) -> None:
+        if digest != confirmation.preview_digest({**preview, "addr": load.addr}):
+            raise trading.PositionChanged(
+                "The trade no longer matches the confirmed preview. Run with"
+                " --dry-run to review a new preview before submitting."
+            )
+
+    return check
+
+
+position_digest_option = click.option(
+    "--preview-digest", help="Submit only if the trade matches this dry-run digest."
+)
+
+
 @trade.command("margin")
 @click.argument("trade_id", type=int)
 @click.option("--direction", type=click.Choice(["add", "remove"]), required=True)
@@ -1388,6 +1418,7 @@ def trade_leverage(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@position_digest_option
 @wait_option
 @click.pass_context
 def trade_margin(
@@ -1397,6 +1428,7 @@ def trade_margin(
     amount: str,
     lcd_endpoint: str | None,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Add or remove margin through a target-leverage intent.
 
@@ -1413,6 +1445,7 @@ def trade_margin(
                 amount=amount,
                 lcd_endpoint=lcd_url(ctx, lcd_endpoint),
                 dry_run=dry_run,
+                before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1428,6 +1461,7 @@ def trade_margin(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@position_digest_option
 @wait_option
 @click.pass_context
 def partial_close(
@@ -1436,6 +1470,7 @@ def partial_close(
     percent: int,
     lcd_endpoint: str | None,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Reduce an open USDC position by a whole percentage."""
     try:
@@ -1448,6 +1483,7 @@ def partial_close(
                 percent=percent,
                 lcd_endpoint=lcd_url(ctx, lcd_endpoint),
                 dry_run=dry_run,
+                before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
