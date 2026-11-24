@@ -83,27 +83,40 @@ ReplayReply = Reply | Callable[[Request], Reply]
 @contextmanager
 def replay(
     tls: ssl.SSLContext | None = None,
+    *,
+    get: Callable[[Request], Reply] | None = None,
 ) -> Iterator[tuple[str, deque[ReplayReply], list[Request]]]:
     replies: deque[ReplayReply] = deque()
     requests: list[Request] = []
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            requests.append(
-                Request(
-                    self.path,
-                    self.request_version,
-                    {name.lower(): value for name, value in self.headers.items()},
-                    body,
-                )
+        def record(self, body: bytes) -> Request:
+            request = Request(
+                self.path,
+                self.request_version,
+                {name.lower(): value for name, value in self.headers.items()},
+                body,
             )
+            requests.append(request)
+            return request
+
+        def do_POST(self) -> None:
+            request = self.record(self.rfile.read(int(self.headers["Content-Length"])))
             if not replies:
                 self.send_error(500, "Unexpected Keeper request")
                 return
             reply = replies.popleft()
             if callable(reply):
-                reply = reply(requests[-1])
+                reply = reply(request)
+            self.send_reply(reply)
+
+        def do_GET(self) -> None:
+            if get is None:
+                self.send_error(501, "Unexpected LCD request")
+                return
+            self.send_reply(get(self.record(b"")))
+
+        def send_reply(self, reply: Reply) -> None:
             if reply.disconnect:
                 self.close_connection = True
                 return

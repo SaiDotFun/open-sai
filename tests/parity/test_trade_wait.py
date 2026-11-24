@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import signal
@@ -10,9 +11,10 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 import pytest
-from sai_cli.core import log, storage
+from sai_cli.core import keeper, log, storage
 from test_intent_status import (
     ADDR,
     CLI,
@@ -49,6 +51,10 @@ OPEN = (
 )
 CLOSE = ("close", "17")
 CANCEL = (*CLOSE, "--cancel-order")
+CONTRACT = "nibi1contract"
+NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
+SMART_QUERY = f"/cosmwasm/wasm/v1/contract/{CONTRACT}/smart/"
+ROUTE = {"enabled": True, "chainId": "cataclysm-1", "contractAddress": CONTRACT}
 MARKETS = {
     "data": {
         "perp": {
@@ -137,6 +143,25 @@ def submitted_key(request: Request, kind: str) -> str:
     return submission["intentKey"]
 
 
+def cancel_lcd(request: Request) -> Reply:
+    assert "authorization" not in request.headers
+    if request.path == NODE_INFO:
+        return response({"default_node_info": {"network": ROUTE["chainId"]}})
+    path = urlsplit(request.path).path
+    assert path.startswith(SMART_QUERY)
+    query = json.loads(base64.b64decode(unquote(path.removeprefix(SMART_QUERY))))
+    assert query == {"get_trade_raw": {"trader": ADDR, "index": 17}}
+    return response(
+        {
+            "data": {
+                "user_trade_index": "UserTradeIndex(17)",
+                "is_open": True,
+                "trade_type": "limit",
+            }
+        }
+    )
+
+
 def accepted(key: str, kind: str) -> Reply:
     return response(
         {
@@ -170,7 +195,7 @@ def test_trade_wait(
 ) -> None:
     documents = []
     keys: list[str] = []
-    with replay() as (endpoint, replies, requests):
+    with replay(get=cancel_lcd) as (endpoint, replies, requests):
         for index, cli in enumerate(wait_cli_pair):
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
@@ -178,6 +203,16 @@ def test_trade_wait(
             keys.clear()
 
             def admit(request: Request) -> Reply:
+                wire = json.loads(request.body)
+                if (
+                    case.kind == "CANCEL_PENDING_TRADE"
+                    and wire["query"] == keeper.ROUTE
+                ):
+                    assert len(requests) == 1
+                    assert wire["variables"] == {}
+                    assert "authorization" not in request.headers
+                    replies.appendleft(admit)
+                    return response({"data": {"oneClickTrading": ROUTE}})
                 key = submitted_key(request, case.kind)
                 keys.append(key)
                 if case.args == OPEN:
@@ -235,7 +270,16 @@ def test_trade_wait(
                 else case.args
             )
             result = invoke(
-                cli, home, "--endpoint", endpoint, "--json", "trade", *args, "--wait"
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--lcd-endpoint",
+                endpoint.removesuffix("/query"),
+                "--json",
+                "trade",
+                *args,
+                "--wait",
             )
             expected_exit = {"rejected": 4, "failed": 1}.get(case.outcome, 0)
             assert result.returncode == expected_exit, result
@@ -244,7 +288,16 @@ def test_trade_wait(
             key = document["intentKey"]
             assert keys == [key]
             assert not replies
-            wire = [json.loads(request.body) for request in requests]
+            wire = [json.loads(request.body) for request in requests if request.body]
+            if wire[0]["query"] == keeper.ROUTE:
+                assert case.kind == "CANCEL_PENDING_TRADE"
+                assert requests[1].path == NODE_INFO
+                assert requests[2].path.startswith(SMART_QUERY)
+                wire.pop(0)
+                assert len(requests) == len(wire) + 3
+            else:
+                assert index != 0 or case.kind != "CANCEL_PENDING_TRADE"
+                assert all(request.body for request in requests)
             assert sum(item["query"].startswith("mutation") for item in wire) == 1
             assert document["outcome"] == document["status"] == case.outcome
             assert document["addr"] == ADDR
@@ -273,31 +326,32 @@ def test_trade_wait(
 
 
 def test_trade_wait_dry_run(wait_cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
-    documents = []
     with replay() as (endpoint, _, requests):
         for index, cli in enumerate(wait_cli_pair):
             home = tmp_path / str(index) / "sai"
             home.mkdir(parents=True)
-            result = invoke(
-                cli,
-                home,
-                "--endpoint",
-                endpoint,
-                "--json",
-                "trade",
-                *CLOSE,
-                "--wait",
-                "--dry-run",
-            )
-            assert result.returncode == 0, result
-            assert result.stderr == b""
+            documents = []
+            for wait in ((), ("--wait",)):
+                result = invoke(
+                    cli,
+                    home,
+                    "--endpoint",
+                    endpoint,
+                    "--json",
+                    "trade",
+                    *CLOSE,
+                    "--dry-run",
+                    *wait,
+                )
+                assert result.returncode == 0, result
+                assert result.stderr == b""
+                document = json.loads(result.stdout)
+                assert document["dryRun"] is True
+                assert "receipt" not in document
+                documents.append(document)
             assert not requests
             assert not (home / "trader/intents.sqlite3").exists()
-            document = json.loads(result.stdout)
-            assert document["dryRun"] is True
-            assert "receipt" not in document
-            documents.append(document)
-    assert documents[0] == documents[1]
+            assert documents[0] == documents[1]
 
 
 @pytest.mark.parametrize("phase", ["submit", "poll"])

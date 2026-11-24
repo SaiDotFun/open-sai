@@ -31,8 +31,10 @@ executable path or a command on `PATH` to compare a port. Arguments belong in
 any selected case differs or fails its expectations.
 
 The intent wait and trade `--wait` replays use Python commit
-`48e38755c5e391057b4a0a9b0a313e96f5964176` from PR #70. Set the reference
-launcher separately from the C4 parity reference.
+`bdc11da6c9938aa0371835d921f27d45daa77c36`, the main merge of PR #70. Set the
+reference launcher separately from the C4 parity reference. The cancel tests
+serve Python's pending-order preflight before comparing the shared submission
+and wait requests. The dry-run case compares each CLI with and without `--wait`.
 
 ```sh
 SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \
