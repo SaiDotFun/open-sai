@@ -105,6 +105,7 @@ class Position:
     denied_lcd_targets: list[str] = field(default_factory=list)
     price: float | str = 100.5
     switch_contract_on_market_read: str | None = None
+    switch_contract_on_perp_market_read: str | None = None
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
     oracle_position_updates: deque[tuple[int, str] | None] = field(
@@ -387,6 +388,11 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 data = position.after_hours
             elif "get_market" in message:
                 assert message["get_market"] == {"index": "MarketIndex(0)"}
+                if position.switch_contract_on_perp_market_read is not None:
+                    position.contract_address = (
+                        position.switch_contract_on_perp_market_read
+                    )
+                    position.switch_contract_on_perp_market_read = None
                 data = {
                     "block_last_opened": 110,
                     "block_last_closed": 100,
@@ -938,8 +944,25 @@ def test_trade_confirmation_binds_verified_route(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("market_open", [True, False])
-def test_market_open_rechecks_route_after_price_refresh(position_service, market_open):
+@pytest.mark.parametrize(
+    ("market_open", "switch_read", "perp_state"),
+    [
+        pytest.param(True, "switch_contract_on_market_read", "open", id="quote"),
+        pytest.param(False, "switch_contract_on_market_read", "open", id="no-quote"),
+        pytest.param(
+            False, "switch_contract_on_perp_market_read", "open", id="fallback"
+        ),
+        pytest.param(
+            False,
+            "switch_contract_on_perp_market_read",
+            "close_only",
+            id="fallback-rejection",
+        ),
+    ],
+)
+def test_market_open_rechecks_route_after_price_refresh(
+    position_service, market_open, switch_read, perp_state
+):
     position, base_url = position_service
     position.preview_inputs = True
     args = {**OPEN_ARGS, "order_type": "market"}
@@ -953,7 +976,8 @@ def test_market_open_rechecks_route_after_price_refresh(position_service, market
             reference = preview["referencePrice"]
 
             position.keeper_market_open = market_open
-            position.switch_contract_on_market_read = "nibi1replacement"
+            position.market_trading_state = perp_state
+            setattr(position, switch_read, "nibi1replacement")
             cli_result = cli.invoke(
                 main, [*cli_args, "--preview-digest", digest, "--price", reference]
             )
@@ -962,7 +986,7 @@ def test_market_open_rechecks_route_after_price_refresh(position_service, market
             assert position.contract_address == "nibi1replacement"
 
             position.contract_address = preview["positionRoute"]["contractAddress"]
-            position.switch_contract_on_market_read = "nibi1replacement"
+            setattr(position, switch_read, "nibi1replacement")
             mcp_error = await call(
                 client,
                 "trade_open",

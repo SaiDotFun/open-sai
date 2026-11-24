@@ -282,7 +282,9 @@ def open_trade(
                         " Request a new preview before submitting."
                     ) from exc
                 recheck_route()
-                _reject_execution(preview, estimate(preview), active["evmAddress"])
+                values = estimate(preview)
+                recheck_route()
+                _reject_execution(preview, values, active["evmAddress"])
                 raise
             assert reference is not None
             payload["body"]["intentPrice"] = reference["price"]
