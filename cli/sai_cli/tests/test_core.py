@@ -421,19 +421,36 @@ def test_margin_quote_uses_exact_contract_integer_math():
     raw = {"collateral_amount": "10000000", "leverage": "10"}
     funds = {"available_to_trade": "20000000"}
     market = {"minLeverage": 1, "maxLeverage": 100}
+    effective = Decimal(10)
     assert (
-        margin.margin_quote(raw, funds, market, "add", "10")["requestedLeverage"] == "5"
+        margin.margin_quote(
+            raw, funds, market, "add", "10", effective_leverage=effective
+        )["requestedLeverage"]
+        == "5"
     )
     assert (
-        margin.margin_quote(raw, funds, market, "remove", "5")["requestedLeverage"]
+        margin.margin_quote(
+            raw, funds, market, "remove", "5", effective_leverage=effective
+        )["requestedLeverage"]
         == "20"
     )
     with pytest.raises(ValueError, match="six decimal"):
-        margin.margin_quote(raw, funds, market, "add", "0.0000001")
+        margin.margin_quote(
+            raw, funds, market, "add", "0.0000001", effective_leverage=effective
+        )
     with pytest.raises(ValueError, match="Insufficient"):
-        margin.margin_quote(raw, {"available_to_trade": "1"}, market, "add", "1")
+        margin.margin_quote(
+            raw,
+            {"available_to_trade": "1"},
+            market,
+            "add",
+            "1",
+            effective_leverage=effective,
+        )
     with pytest.raises(ValueError, match="Keep some margin"):
-        margin.margin_quote(raw, funds, market, "remove", "10")
+        margin.margin_quote(
+            raw, funds, market, "remove", "10", effective_leverage=effective
+        )
 
 
 @pytest.mark.parametrize(
@@ -469,6 +486,7 @@ def test_margin_rounding_vectors(
         {"minLeverage": 1, "maxLeverage": 100},
         direction,
         amount,
+        effective_leverage=Decimal(leverage),
     )
     assert quote["requestedLeverage"] == result
     assert quote["collateralAfter"] == after
@@ -583,10 +601,16 @@ def test_leverage_is_separate_update_intent():
 
 
 def test_margin_dry_run_and_recheck(session, monkeypatch):
-    raw = {"collateral_amount": "10000000", "leverage": "10"}
+    raw = {
+        "collateral_amount": "10000000",
+        "leverage": "10",
+        "market_index": "MarketIndex(0)",
+        "collateral_index": "TokenIndex(1)",
+    }
     funds = {"available_to_trade": "20000000"}
     market = {"minLeverage": 1, "maxLeverage": 100}
     monkeypatch.setattr("sai_cli.sai_cli.session", lambda ctx: session)
+    monkeypatch.setattr(margin, "smart_value", lambda *args: False)
     monkeypatch.setattr(
         margin,
         "snapshot",
@@ -611,16 +635,25 @@ def test_margin_dry_run_and_recheck(session, monkeypatch):
 
 
 def test_margin_refuses_changed_position(session, monkeypatch):
+    identity = {
+        "user": "nibi1trader",
+        "user_trade_index": "UserTradeIndex(7)",
+        "market_index": "MarketIndex(0)",
+        "collateral_index": "TokenIndex(1)",
+        "is_open": True,
+        "trade_type": "trade",
+    }
+    newer = {**identity, "collateral_amount": "11000000", "leverage": "10"}
     items = iter(
         [
             margin.PositionSnapshot(
-                {"collateral_amount": "10000000", "leverage": "10"},
+                {**newer, "collateral_amount": "10000000"},
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
                 "test-contract",
             ),
             margin.PositionSnapshot(
-                {"collateral_amount": "11000000", "leverage": "10"},
+                newer,
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
                 "test-contract",
@@ -629,6 +662,11 @@ def test_margin_refuses_changed_position(session, monkeypatch):
     )
     monkeypatch.setattr("sai_cli.sai_cli.session", lambda ctx: session)
     monkeypatch.setattr(margin, "snapshot", lambda *args: next(items))
+    monkeypatch.setattr(
+        margin,
+        "smart_value",
+        lambda lcd, contract, query: newer if "get_trade_raw" in query else False,
+    )
     result = CliRunner().invoke(
         main, ["trade", "margin", "7", "--direction", "add", "--amount", "5"]
     )

@@ -145,7 +145,15 @@ def describe(exc: Exception) -> dict[str, Any]:
         extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(str(exc), exc.code, **extra, **exc.extra)
     if isinstance(exc, trading.PositionChanged):
-        return error(MISMATCH, "PREVIEW_MISMATCH", preview=with_digest(exc.preview))
+        if exc.preview is None:
+            return error(str(exc), "PREVIEW_MISMATCH")
+        return error(
+            "The position or quote changed during confirmation, so nothing was"
+            " submitted. Show the user the latest preview, get their confirmation"
+            " again, then retry with its previewDigest.",
+            "PREVIEW_MISMATCH",
+            preview=with_digest(exc.preview),
+        )
     if isinstance(exc, SessionUnavailable):
         return error(str(exc), exc.code)
     if isinstance(exc, stream.StreamError):

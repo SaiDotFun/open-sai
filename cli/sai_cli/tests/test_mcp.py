@@ -524,10 +524,15 @@ def markets(price: float = 100.5) -> dict[str, Any]:
 
 
 def snapshots(monkeypatch, *collaterals: str) -> None:
-    """Make margin.snapshot return one position state per call, in order."""
+    """Supply each indexed snapshot and repeat its contract state on recheck."""
+    current: margin.PositionSnapshot | None = None
     states = iter(
         margin.PositionSnapshot(
             {
+                "user": "nibi1trader",
+                "user_trade_index": "UserTradeIndex(7)",
+                "is_open": True,
+                "trade_type": "trade",
                 "collateral_amount": amount,
                 "leverage": "2",
                 "market_index": "MarketIndex(0)",
@@ -539,12 +544,20 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
         )
         for amount in collaterals
     )
-    monkeypatch.setattr(margin, "snapshot", lambda *args: next(states))
-    monkeypatch.setattr(
-        margin,
-        "smart_value",
-        lambda lcd, contract, query: "1" if "get_collateral_price" in query else False,
-    )
+
+    def snapshot(*args: Any) -> margin.PositionSnapshot:
+        nonlocal current
+        current = next(states)
+        return current
+
+    def contract_reply(lcd: str, contract: str, query: dict[str, Any]) -> Any:
+        if "get_trade_raw" in query:
+            assert current is not None
+            return current.raw
+        return "1" if "get_collateral_price" in query else False
+
+    monkeypatch.setattr(margin, "snapshot", snapshot)
+    monkeypatch.setattr(margin, "smart_value", contract_reply)
 
 
 def confirm(

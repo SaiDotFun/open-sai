@@ -11,6 +11,7 @@ from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 from urllib.parse import unquote
@@ -37,6 +38,9 @@ class Position:
     risk_block: int = 90
     cap: str | None = "5"
     collateral_price: str | None = "1"
+    oracle_position_updates: deque[tuple[int, str] | None] = field(
+        default_factory=deque
+    )
     submitted: list[dict[str, Any]] = field(default_factory=list)
 
 
@@ -141,6 +145,10 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     "get_collateral_price": {"collateral_index": "TokenIndex(1)"}
                 }
                 data = position.collateral_price
+                if position.oracle_position_updates:
+                    update = position.oracle_position_updates.popleft()
+                    if update is not None:
+                        position.collateral, position.leverage = update
             if data is None:
                 self.send_error(400, "contract query unavailable")
                 return
@@ -284,6 +292,109 @@ def test_trade_refuses_a_change_between_live_reads(
     asyncio.run(scenario())
 
 
+def test_partial_close_rechecks_position_after_the_last_oracle_read(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            assert preview["intent"]["body"]["collateral"]["amountUsdc"] == "2000000"
+            position.oracle_position_updates.extend([None, (3_200_000, "2.5")])
+            result = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert result.get("code") == "PREVIEW_MISMATCH", result
+            assert position.submitted == []
+            fresh = result["preview"]
+            assert fresh["previewDigest"] != preview["previewDigest"]
+            assert fresh["intent"]["body"]["collateral"]["amountUsdc"] == "1600000"
+            assert fresh == await call(client, "preview_partial_close", args)
+
+            accepted = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
+            assert accepted["status"] == "accepted"
+            (submitted,) = position.submitted
+            assert submitted["body"]["collateral"]["amountUsdc"] == "1600000"
+
+    asyncio.run(scenario())
+
+
+def test_margin_add_uses_carried_positions_effective_leverage(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    args = {"trade_id": 7, "direction": "add", "amount": "5"}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_margin", args)
+            target = preview["intent"]["body"]["requestedLeverage"]
+            assert Decimal(target) < Decimal(5)
+            assert target == "4.761904761904761905"
+            quote = preview["quote"]
+            assert quote["leverageBefore"] == "10"
+            assert quote["effectiveLeverage"] == quote["afterHoursLeverageCap"] == "5"
+            assert quote["marginChangeIsEstimate"] is True
+
+            position.cap = "4"
+            refused = await call(
+                client,
+                "trade_margin",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused.get("code") == "PREVIEW_MISMATCH", refused
+            assert position.submitted == []
+            fresh = refused["preview"]
+            assert fresh["quote"]["effectiveLeverage"] == "4"
+            assert Decimal(fresh["intent"]["body"]["requestedLeverage"]) < Decimal(4)
+            accepted = await call(
+                client,
+                "trade_margin",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
+            assert accepted["status"] == "accepted"
+            (submitted,) = position.submitted
+            assert submitted["body"] == fresh["intent"]["body"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cap", [None, "0"])
+def test_margin_refuses_when_the_guarded_leverage_cannot_size_a_change(
+    position_service: tuple[Position, str], cap: str | None
+) -> None:
+    position, base_url = position_service
+    position.leverage = "10"
+    position.after_hours = True
+    position.cap = cap
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            args = {"trade_id": 7, "direction": "add", "amount": "1"}
+            preview = await call(client, "preview_margin", args)
+            assert preview.get("code") == "INVALID_REQUEST", preview
+            assert "effective leverage" in preview["error"].lower()
+            result = await call(
+                client, "trade_margin", {**args, "preview_digest": "0" * 64}
+            )
+            assert result.get("code") == "INVALID_REQUEST", result
+            assert result["error"] == preview["error"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("field", "changed", "fresh_usd"),
     [("cap", "0", "0"), ("collateral_price", "1.000000000000000001", "250.000009")],
@@ -410,6 +521,7 @@ def test_margin_binds_starting_leverage_even_when_the_result_rounds_the_same(
             assert fresh["quote"] == {
                 **preview["quote"],
                 "leverageBefore": position.leverage,
+                "effectiveLeverage": position.leverage,
             }
 
     asyncio.run(scenario())

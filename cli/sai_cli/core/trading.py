@@ -31,9 +31,9 @@ MARKET_PRICE_NOTICE = (
 class PositionChanged(ValueError):
     """A live recheck found a different position quote."""
 
-    def __init__(self, message: str, preview: dict[str, Any], addr: str) -> None:
+    def __init__(self, message: str, preview: dict[str, Any] | None = None) -> None:
         super().__init__(message)
-        self.preview = {**preview, "addr": addr}
+        self.preview = preview
 
 
 def _ignore(_message: str) -> None:
@@ -180,6 +180,35 @@ def set_leverage(
     return preview_or_submit(endpoint, get_session, payload, dry_run, before_submit)
 
 
+def _position_preview(
+    build: Callable[[], tuple[margin.PositionSnapshot, dict[str, Any]]],
+    *,
+    lcd_endpoint: str,
+    addr: str,
+    trade_id: int,
+    dry_run: bool,
+    before_submit: SubmitCheck,
+    changed_message: str,
+) -> dict[str, Any]:
+    _, preview = build()
+    if dry_run:
+        return preview
+
+    state, fresh = build()
+    changed = not margin.position_unchanged(lcd_endpoint, state, trade_id)
+    if changed:
+        try:
+            _, fresh = build()
+        except (ValueError, keeper.KeeperError, KeyError, TypeError) as exc:
+            raise PositionChanged(
+                f"{changed_message}. Could not quote the latest position. {exc}"
+            ) from exc
+    if changed or fresh != preview:
+        raise PositionChanged(changed_message, {**fresh, "addr": addr})
+    before_submit(fresh)
+    return fresh
+
+
 def change_margin(
     endpoint: str,
     get_session: SessionLoader,
@@ -197,32 +226,45 @@ def change_margin(
     must match the first, or the change is refused for review.
     """
     active = get_session()
+    addr = active["evmAddress"]
 
-    def build_preview() -> dict[str, Any]:
-        state = margin.snapshot(endpoint, lcd_endpoint, active["evmAddress"], trade_id)
+    def build_preview() -> tuple[margin.PositionSnapshot, dict[str, Any]]:
+        state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
+        leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
+        if leverage is None:
+            raise ValueError("Cannot verify effective leverage for this margin change")
         quote = margin.margin_quote(
-            state.raw, state.funds, state.market, direction, amount
+            state.raw,
+            state.funds,
+            state.market,
+            direction,
+            amount,
+            effective_leverage=leverage,
         )
-        return {
+        return state, {
             "dryRun": True,
-            "quote": quote,
+            "quote": {
+                **quote,
+                **inputs,
+                "marginChangeIsEstimate": leverage < Decimal(quote["leverageBefore"]),
+            },
             "intent": intents.leverage_intent(trade_id, quote["requestedLeverage"]),
             "warning": MARGIN_WARNING,
         }
 
-    preview = build_preview()
+    preview = _position_preview(
+        build_preview,
+        lcd_endpoint=lcd_endpoint,
+        addr=addr,
+        trade_id=trade_id,
+        dry_run=dry_run,
+        before_submit=before_submit,
+        changed_message="Position changed; review the margin change again",
+    )
     if dry_run:
         return preview
-    fresh = build_preview()
-    if fresh != preview:
-        raise PositionChanged(
-            "Position changed; review the margin change again",
-            fresh,
-            active["evmAddress"],
-        )
-    before_submit(fresh)
-    result = intents.submit(endpoint, active, fresh["intent"])
-    result["quote"] = fresh["quote"]
+    result = intents.submit(endpoint, active, preview["intent"])
+    result["quote"] = preview["quote"]
     result["warning"] = MARGIN_WARNING
     return result
 
@@ -243,9 +285,10 @@ def partial_close(
     minimum position size, and re-checked before submitting.
     """
     active = get_session()
+    addr = active["evmAddress"]
 
-    def build_preview() -> dict[str, Any]:
-        state = margin.snapshot(endpoint, lcd_endpoint, active["evmAddress"], trade_id)
+    def build_preview() -> tuple[margin.PositionSnapshot, dict[str, Any]]:
+        state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
         raw = state.raw
         market_id = state.market["marketId"]
         markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
@@ -266,7 +309,7 @@ def partial_close(
             position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
         )
         delta = int(payload["body"]["collateral"]["amountUsdc"])
-        return {
+        return state, {
             "dryRun": True,
             "intent": payload,
             "quote": {
@@ -277,13 +320,15 @@ def partial_close(
             },
         }
 
-    preview = build_preview()
+    preview = _position_preview(
+        build_preview,
+        lcd_endpoint=lcd_endpoint,
+        addr=addr,
+        trade_id=trade_id,
+        dry_run=dry_run,
+        before_submit=before_submit,
+        changed_message="Position changed; review the reduction again",
+    )
     if dry_run:
         return preview
-    fresh = build_preview()
-    if fresh != preview:
-        raise PositionChanged(
-            "Position changed; review the reduction again", fresh, active["evmAddress"]
-        )
-    before_submit(fresh)
-    return intents.submit(endpoint, active, fresh["intent"])
+    return intents.submit(endpoint, active, preview["intent"])

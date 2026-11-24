@@ -55,6 +55,30 @@ class PositionSnapshot:
     contract: str
 
 
+def _read_position(
+    lcd: str, contract: str, trader: str, trade_id: int
+) -> dict[str, Any]:
+    return smart(
+        lcd, contract, {"get_trade_raw": {"trader": trader, "index": trade_id}}
+    )
+
+
+def position_unchanged(lcd: str, state: PositionSnapshot, trade_id: int) -> bool:
+    """Compare the bound position fields after the quote's network reads."""
+    latest = _read_position(lcd, state.contract, state.raw["user"], trade_id)
+    fields = (
+        "user",
+        "user_trade_index",
+        "market_index",
+        "collateral_index",
+        "collateral_amount",
+        "leverage",
+        "is_open",
+        "trade_type",
+    )
+    return all(latest.get(key) == state.raw[key] for key in fields)
+
+
 def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
     node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
@@ -87,7 +111,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
     trader = position["trader"]
     token = f"TokenIndex({collateral['id']})"
     contract = route["contractAddress"]
-    raw = smart(lcd, contract, {"get_trade_raw": {"trader": trader, "index": trade_id}})
+    raw = _read_position(lcd, contract, trader, trade_id)
     funds = smart(
         lcd,
         contract,
@@ -112,12 +136,97 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
     return PositionSnapshot(raw, funds, market, contract)
 
 
+def contract_decimal(value: Any) -> Decimal:
+    if not isinstance(value, str):
+        raise TypeError("Expected a contract decimal string")
+    return (
+        Decimal(0) if value == "0" else intents.positive(value, "Contract quote input")
+    )
+
+
+def leverage_inputs(
+    lcd: str, state: PositionSnapshot, trade_id: int
+) -> tuple[Decimal | None, dict[str, Any]]:
+    """Read the execution leverage and the contract inputs that determine it."""
+    raw = state.raw
+    inputs: dict[str, Any] = {
+        "marketIndex": raw["market_index"],
+        "collateralIndex": raw["collateral_index"],
+    }
+    stored = contract_decimal(raw["leverage"])
+    try:
+        effective = _effective_leverage(lcd, state, trade_id, stored, inputs)
+    except (ValueError, TypeError, KeyError):
+        # An unavailable query does not establish that the cap is inactive.
+        return None, {**inputs, "effectiveLeverage": None}
+    return effective, {**inputs, "effectiveLeverage": str(effective)}
+
+
+def _effective_leverage(
+    lcd: str,
+    state: PositionSnapshot,
+    trade_id: int,
+    stored: Decimal,
+    inputs: dict[str, Any],
+) -> Decimal:
+    """Mirror Perp's get_effective_leverage for an open, filled position."""
+    market_index = inputs["marketIndex"]
+    enabled = smart_value(
+        lcd, state.contract, {"is_after_hours_market": {"market_index": market_index}}
+    )
+    if not isinstance(enabled, bool):
+        raise TypeError("Expected the contract's after-hours flag")
+    inputs["afterHoursMarket"] = enabled
+    if not enabled:
+        return stored
+
+    market = smart(lcd, state.contract, {"get_market": {"index": market_index}})
+    opened, closed = market["block_last_opened"], market["block_last_closed"]
+    if any(value is not None and type(value) is not int for value in (opened, closed)):
+        raise ValueError("Expected the market's session blocks")
+    inputs.update(marketLastOpenedBlock=opened, marketLastClosedBlock=closed)
+    if opened is None or closed is None:
+        return stored
+    if opened > closed:
+        infos = smart_value(
+            lcd,
+            state.contract,
+            {
+                "get_trade_infos": {
+                    "trader": state.raw["user"],
+                    "start_idx": trade_id,
+                    "scan_limit": 1,
+                }
+            },
+        )
+        if (
+            not isinstance(infos, list)
+            or len(infos) != 1
+            or not isinstance(infos[0], dict)
+        ):
+            raise ValueError("Expected one trade info record")
+        created = infos[0]["created_block"]
+        if type(created) is not int:
+            raise ValueError("Expected the trade's last risk-modifying block")
+        inputs["positionRiskBlock"] = created
+        if created >= opened:
+            return stored
+
+    cap = contract_decimal(
+        smart_value(lcd, state.contract, {"get_after_hours_leverage": {}})
+    )
+    inputs["afterHoursLeverageCap"] = str(cap)
+    return min(stored, cap)
+
+
 def margin_quote(
     raw: dict[str, Any],
     funds: dict[str, Any],
     market: dict[str, Any],
     direction: str,
     amount: str,
+    *,
+    effective_leverage: Decimal,
 ) -> dict[str, str]:
     requested = intents.positive(amount, "Margin amount")
     scaled_amount = requested * 1_000_000
@@ -126,7 +235,10 @@ def margin_quote(
     delta = int(scaled_amount)
     collateral = int(raw["collateral_amount"])
     leverage_before = intents.positive(str(raw["leverage"]), "Current leverage")
-    old = int(leverage_before * 10**18)
+    if effective_leverage <= 0:
+        raise ValueError("Cannot quote a margin change with zero effective leverage")
+    numerator, denominator = effective_leverage.as_integer_ratio()
+    old = numerator * 10**18 // denominator
     if collateral <= 0 or direction not in ("add", "remove"):
         raise ValueError("Invalid margin input")
     if direction == "remove" and delta >= collateral:
@@ -138,6 +250,10 @@ def margin_quote(
         if direction == "add"
         else numerator // target
     )
+    if (direction == "add" and next_leverage > old) or (
+        direction == "remove" and next_leverage < old
+    ):
+        raise ValueError("Target leverage would reverse the requested margin direction")
     minimum = Decimal(str(market["minLeverage"])) * 10**18
     maximum = Decimal(str(market["maxLeverage"])) * 10**18
     if (
@@ -152,9 +268,8 @@ def margin_quote(
         raise ValueError("Margin change is too small after rounding")
     if direction == "add" and actual > int(funds["available_to_trade"]):
         raise ValueError("Insufficient balance on Sai")
-    leverage = format(Decimal(next_leverage) / Decimal(10**18), "f")
-    if "." in leverage:
-        leverage = leverage.rstrip("0").rstrip(".")
+    whole, fraction = divmod(next_leverage, 10**18)
+    leverage = f"{whole}.{fraction:018d}".rstrip("0").rstrip(".")
     return {
         "requestedLeverage": leverage,
         "collateralBefore": str(collateral),

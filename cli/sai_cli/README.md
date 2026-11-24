@@ -274,11 +274,12 @@ still needs the `previewDigest` of the preview the user confirmed.
 
 The partial-close digest covers the close percentage, starting collateral and
 leverage, and the contract inputs used to quote the requested slice. The
-margin digest covers the full quote, including starting collateral and
-leverage. If a quote changes before submission and the trade can still be
-quoted, the server returns `PREVIEW_MISMATCH` with the latest preview. This
-includes changes between the two reads during a trade call. The direct
-leverage tool confirms the requested target leverage.
+margin digest covers the full quote, including starting collateral, stored
+leverage, and the inputs that determine effective leverage. Both tools
+re-read the position after fetching the quote inputs. If a trade call finds
+a change, it returns `PREVIEW_MISMATCH` and includes the latest preview when
+the position can still be quoted. The direct leverage tool confirms the
+requested target leverage.
 
 ## Commands
 
@@ -303,12 +304,15 @@ the position before submission. Partial close accepts `--lcd-endpoint` like
 authoritative.
 
 `trade leverage TRADE_ID --leverage VALUE` sets a target leverage.
-`trade margin TRADE_ID --direction add|remove --amount USDC` reads the exact
-position and exchange balance from the Perp contract, then quotes a target
-leverage. The margin amount is a quote, not a cap: Keeper executes a leverage
-change, and the actual margin delta may differ if the position changes after
-the final check. `--dry-run` reads live state and prints the quote without
-submitting an intent. Use `--lcd-endpoint` to select the matching network's
+`trade margin TRADE_ID --direction add|remove --amount USDC` reads the
+position, exchange balance, and applicable after-hours cap from Perp. It uses
+the effective leverage to quote a target and refuses if it cannot verify
+the direction. When the after-hours guard is pending,
+`quote.marginChangeIsEstimate` is true because the guard can deduct fees
+before the leverage change. Keeper submits the target leverage. Perp uses
+effective leverage at execution to determine the direction and amount.
+`--dry-run` reads live state and prints the quote without submitting an
+intent. Use `--lcd-endpoint` to select the matching network's
 Nibiru REST service; the CLI checks that its chain matches Keeper.
 The CLI refuses the quote if the indexed position and contract disagree. Wait
 for the index to synchronize and retry; no margin intent has been submitted.
