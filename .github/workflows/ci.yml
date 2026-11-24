@@ -83,6 +83,23 @@ jobs:
       - run: uv run pytest
         if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
 
+      - name: Check parity in a loopback network namespace
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
+        run: |
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          unshare -Urn ip link set lo up
+          uv run pytest -m parity_namespace tests/parity
+          uv run python tests/parity/parity.py
+
   check:
     needs: changes
     if: ${{ !cancelled() }}

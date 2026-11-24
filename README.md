@@ -198,15 +198,16 @@ duration, each Keeper request and its outcome, and each status change of a
 trade intent. The session token is never written.
 
 ```bash
-sai logs tail                    # the last 20 events
+sai logs intent KEY              # follow one intent across CLI and MCP
+sai logs run ID                   # read a command run or one MCP call
+sai logs stats --since 24h        # Keeper latency and error counts
 sai logs tail -n 50 --surface mcp
-sai logs tail --event intent     # how each intent moved through its states
-sai logs path                    # where the files are
+sai logs path
 ```
 
 Files older than 14 days are deleted. `sai config set logs.enabled false`
-turns logging off. See [Logs](cli/sai_cli/README.md#logs) for the events and
-their fields.
+turns logging off. See the [log query guide](cli/sai_cli/README.md#logs)
+and the [event schema](docs/log-events.md).
 
 ## Development
 

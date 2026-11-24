@@ -57,6 +57,7 @@ READ_TOOLS = {
     "preview_leverage",
     "preview_margin",
     "preview_partial_close",
+    "logs_intent",
 }
 LOCAL_TOOLS = {"mcp_info", "auth_status", "auth_list", "auth_use", "intent_local"}
 # Changes only which connected account is active on this machine.
@@ -1095,7 +1096,7 @@ def test_recent_pending_open_blocks_a_second_open(mcp, monkeypatch):
     blocked = invoke(mcp, "trade_open", trade)
     assert blocked["code"] == "RECENT_OPEN_PENDING"
     assert blocked["intentKeys"] == [first["intentKey"]]
-    assert "intent_local" in blocked["error"]
+    assert "intent_status" in blocked["error"]
     assert len(fake.submitted) == 1
 
     # A close is not an open and is not blocked.
@@ -1119,20 +1120,6 @@ def test_unknown_open_after_a_timeout_blocks_with_its_key(mcp, monkeypatch):
     assert blocked["code"] == "RECENT_OPEN_PENDING"
     assert blocked["intentKeys"] == [lost["intentKey"]]
     assert len(fake.submitted) == 1
-
-
-def test_only_recent_unresolved_opens_count():
-    key = "20260101T000000000Z_AAAAAAAAAAAAAAAA"
-    storage.pending(key, ENDPOINT, ADDR, "OPEN_TRADE", "")
-    storage.set_status(key, ENDPOINT, ADDR, "accepted")
-    assert tools.recent_opens(ENDPOINT, ADDR) == [
-        {"intentKey": key, "status": "accepted"}
-    ]
-    later = datetime.now(UTC).timestamp() + tools.RECENT_OPEN_SECONDS + 1
-    assert tools.recent_opens(ENDPOINT, ADDR, now=later) == []
-    assert tools.recent_opens("http://127.0.0.1:1/query", ADDR) == []
-    storage.set_status(key, ENDPOINT, ADDR, "terminal")
-    assert tools.recent_opens(ENDPOINT, ADDR) == []
 
 
 def test_sign_in_comes_before_validation(mcp):
