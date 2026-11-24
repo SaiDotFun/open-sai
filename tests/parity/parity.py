@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import queue
+import select
 import shlex
 import shutil
 import signal
@@ -18,7 +19,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ from compare import (
 )
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
+from sai_cli.core import log
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import HERE, ROOT, Endpoints, child_env, loopback, seed_home
@@ -80,6 +82,10 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    absent_log_text: list[str] | None = None
+    interrupt_after: int | None = None
+    interrupt_on_request: bool = False
+    expected_overview_help: str | None = None
 
     @property
     def command(self) -> str:
@@ -92,6 +98,7 @@ class Observation:
     output: Any
     stderr: tuple[str, ...]
     files: dict[str, Entry]
+    raw: tuple[bytes, bytes] | None = None
 
 
 def invoke(
@@ -106,18 +113,72 @@ def invoke(
         env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
-        encoding="utf-8",
         timeout=20,
         umask=0o022,
         check=False,
     )
     check_sandbox_exit(result.returncode)
-    return result
+    return subprocess.CompletedProcess(
+        result.args, result.returncode, result.stdout.decode(), result.stderr.decode()
+    )
 
 
 def check_sandbox_exit(exit_code: int) -> None:
     if exit_code in {-signal.SIGSYS, 128 + signal.SIGSYS}:
         raise ValueError("attempted a blocked host socket")
+
+
+def interrupt_command(
+    binary: list[str],
+    args: list[str],
+    home: Path,
+    env: dict[str, str],
+    *,
+    snapshots: int = 0,
+    ready: threading.Event | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Interrupt after a fixture sees the request or after the requested snapshots."""
+    with subprocess.Popen(
+        restricted([*binary, *args]),
+        cwd=home,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        umask=0o022,
+    ) as proc:
+        assert proc.stdout is not None
+        deadline = time.monotonic() + 12
+        seen = bytearray()
+        received = 0
+        try:
+            if ready is not None and not ready.wait(8):
+                raise ValueError(
+                    "Timed out waiting for the interrupted command's request"
+                )
+            while received < snapshots:
+                remaining = max(0, deadline - time.monotonic())
+                if not select.select([proc.stdout], [], [], remaining)[0]:
+                    raise ValueError("Timed out waiting for a watch snapshot")
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise ValueError("Watch exited before the expected snapshots")
+                seen.extend(chunk)
+                received += chunk.count(b"\n")
+            for line in seen.split(b"\n")[:snapshots]:
+                if "data" not in json.loads(line):
+                    raise ValueError("Watch exited before the expected snapshots")
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, stderr = proc.communicate(timeout=4)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=4)
+        check_sandbox_exit(proc.returncode)
+        return subprocess.CompletedProcess(
+            args, proc.returncode, (seen + stdout).decode(), stderr.decode()
+        )
 
 
 def mcp_exchange(
@@ -265,6 +326,21 @@ def observe(
             finally:
                 admission.release.set()
             result = first.result()
+    elif case.interrupt_on_request:
+        try:
+            result = interrupt_command(
+                binary, args, home, env, ready=endpoints.interrupt_ready
+            )
+            if case.server != "interrupt-http" and not endpoints.interrupt_closed.wait(
+                4
+            ):
+                raise ValueError("WebSocket did not close after SIGINT")
+        finally:
+            endpoints.interrupt_closed.set()
+    elif case.interrupt_after is not None:
+        result = interrupt_command(
+            binary, args, home, env, snapshots=case.interrupt_after
+        )
     else:
         result = run(binary, args, home, env)
     ended_at = time.time()
@@ -288,6 +364,11 @@ def observe(
     normalize = Normalize(
         home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
     )
+    if case.absent_log_text:
+        for path in (home / "sai" / "logs").glob("*.jsonl"):
+            text = path.read_text(encoding="utf-8")
+            if any(value in text for value in case.absent_log_text):
+                raise ValueError("Fixture credential appeared in a log")
     files = snapshot(home / "sai", normalize)
     check_state(case.state or {}, files)
     try:
@@ -312,7 +393,9 @@ def observe(
         stderr += tuple(
             f"contender {category}" for category in stderr_category(contender.stderr)
         )
-    return Observation(result.returncode, output, stderr, files)
+    exact = case.command.split()[0] in {"market", "account", "watch"}
+    raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
+    return Observation(result.returncode, output, stderr, files, raw)
 
 
 def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
@@ -341,6 +424,12 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
         diffs.append(f"stderr {a} to {b}")
     if found := first_difference(reference.output, candidate.output, "stdout"):
         diffs.append(found)
+    if reference.raw is not None and candidate.raw is not None:
+        for stream, expected, actual in zip(
+            ("stdout", "stderr"), reference.raw, candidate.raw, strict=True
+        ):
+            if expected != actual:
+                diffs.append(f"{stream} bytes differ")
     missing = sorted(reference.files.keys() - candidate.files.keys())
     extra = sorted(candidate.files.keys() - reference.files.keys())
     diffs.extend(f"missing {name}" for name in missing)
@@ -356,6 +445,45 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
     return diffs
 
 
+def matches_overview_help_difference(
+    reference: Observation, candidate: Observation
+) -> bool:
+    if reference.raw is None or candidate.raw is None:
+        return False
+    overview_line = (
+        b"  overview   Show Sai funds, positions, orders, local blockers, and...\n"
+    )
+    stdout_bytes, stderr = reference.raw
+    adjusted_stderr = stderr.replace(overview_line, b"", 1)
+    # Keep all other output and event fields under the usual comparison.
+    if adjusted_stderr == stderr or adjusted_stderr != candidate.raw[1]:
+        return False
+    name = "logs/cli.jsonl"
+    entry = reference.files.get(name)
+    if entry is None or len(entry.data) != 2:
+        return False
+    start, end = entry.data
+    if end.get("event") != "command.end":
+        return False
+    original, adjusted = [
+        log.clean(
+            log.untrusted(text.partition(b"\nError: ")[2].decode().removesuffix("\n")),
+            (),
+        )
+        for text in (stderr, adjusted_stderr)
+    ]
+    if end.get("error") != original:
+        return False
+    files = {
+        **reference.files,
+        name: replace(entry, data=[start, {**end, "error": adjusted}]),
+    }
+    adjusted_reference = replace(
+        reference, files=files, raw=(stdout_bytes, adjusted_stderr)
+    )
+    return not differences(adjusted_reference, candidate)
+
+
 def safe_observe(
     case: Case,
     binary: list[str],
@@ -363,6 +491,8 @@ def safe_observe(
     endpoints: Endpoints,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
+    endpoints.interrupt_ready.clear()
+    endpoints.interrupt_closed.clear()
     endpoints.wire.clear()
     endpoints.admission.arrived.clear()
     endpoints.admission.release.clear()
@@ -388,7 +518,7 @@ def safe_observe(
 
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
-) -> tuple[list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str], str | None]:
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server) as endpoints,
@@ -415,12 +545,27 @@ def run_case(
                     else "LISTED"
                 )
     if left is None or right is None:
-        return [
-            f"{side} {error}"
-            for side, error in (("reference", left_error), ("candidate", right_error))
-            if error
-        ], tools
+        return (
+            [
+                f"{side} {error}"
+                for side, error in (
+                    ("reference", left_error),
+                    ("candidate", right_error),
+                )
+                if error
+            ],
+            tools,
+            None,
+        )
     diffs = differences(left, right)
+    expected = None
+    if (
+        diffs
+        and case.expected_overview_help
+        and matches_overview_help_difference(left, right)
+    ):
+        diffs = []
+        expected = case.expected_overview_help
     if left.exit_code != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
@@ -433,7 +578,7 @@ def run_case(
                 diffs.append(f"reference MCP call failed for {tool}")
             elif not diffs:
                 tools[tool] = "PASS"
-    return diffs, tools
+    return diffs, tools, expected
 
 
 def cli_commands(group: click.Group, prefix: str = "") -> set[str]:
@@ -513,15 +658,17 @@ def main() -> int:
     )
     print("| Command | Status | Diff summary |\n| --- | --- | --- |", flush=True)
     mismatches = 0
+    expected_differences = 0
     tools: dict[str, str] = {}
     for case in selected:
-        diffs, listed = run_case(case, reference, candidate)
+        diffs, listed, expected = run_case(case, reference, candidate)
         tools.update(listed)
         mismatches += bool(diffs)
+        expected_differences += bool(expected and not diffs)
         row(
             f"`sai {shlex.join(case.args)}` ({case.name})",
-            "DIFF" if diffs else "PASS",
-            ", ".join(diffs),
+            "DIFF" if diffs else "EXPECTED DIFF" if expected else "PASS",
+            ", ".join(diffs) if diffs else expected or "",
         )
     if not args.case:
         for name, reason in sorted(deferred.items()):
@@ -530,7 +677,10 @@ def main() -> int:
         print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
         for name, status in tools.items():
             row(f"`{name}`", status, "tools/call" if status == "PASS" else "tools/list")
-    print(f"\n{len(selected) - mismatches}/{len(selected)} cases passed.")
+    passed = len(selected) - mismatches - expected_differences
+    print(f"\n{passed}/{len(selected)} cases passed.")
+    if expected_differences:
+        print(f"Expected differences: {expected_differences}.")
     return int(bool(mismatches))
 
 

@@ -20,6 +20,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tar.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["io-util", "process"] }
+tokio = { workspace = true, features = ["io-util", "process", "signal"] }
 toml_edit.workspace = true
 url.workspace = true
+zmij = "1"

@@ -32,11 +32,10 @@ const QUEUE_CHARS: usize = 4 * 1024 * 1024;
 const MAX_LINE: usize = 16 * 1024;
 pub const EXIT_FLUSH: Duration = Duration::from_millis(300);
 
-const COMMON: [&str; 8] = [
-    "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
+const COMMON: [&str; 9] = [
+    "schema", "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
 ];
 static RUN_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
-static UPDATE_COMMAND_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static KNOWN: LazyLock<Mutex<Arc<[String]>>> = LazyLock::new(|| Mutex::new(Arc::new([])));
 
@@ -119,12 +118,14 @@ struct Event {
     level: Level,
     fields: Field,
     chars: usize,
+    v2: bool,
 }
 
 pub struct LogWriter {
     events: SyncSender<Event>,
     done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
+    command_id: Option<String>,
 }
 
 /// Log events that occur while handling a CLI command or an MCP call.
@@ -171,7 +172,14 @@ impl LogWriter {
             events,
             done: Mutex::new(done),
             queue,
+            command_id: None,
         })
+    }
+
+    /// Enable Python's v2 event metadata for a ported CLI command.
+    pub fn with_v2_command(mut self) -> Self {
+        self.command_id = Some(Uuid::new_v4().simple().to_string());
+        self
     }
 
     /// Queue an event without waiting for disk, queue space, or the writer.
@@ -186,9 +194,14 @@ impl LogWriter {
         let sequence = SEQUENCE.fetch_add(1, Relaxed);
         let known = KNOWN.try_lock().ok().map(|value| Arc::clone(&value));
         let mut budget = Budget::new();
+        let command = self
+            .command_id
+            .as_ref()
+            .map(|id| ("commandId", Field::Text(id.clone())));
         let fields = Field::Object(
             fields
                 .into_iter()
+                .chain(command)
                 .filter_map(|(key, field)| {
                     if COMMON.contains(&key) || matches!(&field, Field::Scalar(Value::Null)) {
                         None
@@ -215,6 +228,7 @@ impl LogWriter {
             level,
             fields,
             chars,
+            v2: self.command_id.is_some(),
         };
         if self.events.try_send(event).is_err() {
             self.queue.chars.fetch_sub(chars, Relaxed);
@@ -269,11 +283,9 @@ fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
 }
 
 fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
-    let fields = event.fields.clean(tokens);
     let mut line = Map::new();
-    if matches!(event.surface, Surface::Update) && fields["command"] == "update" {
+    if event.v2 {
         line.insert("schema".into(), json!(2));
-        line.insert("commandId".into(), json!(&*UPDATE_COMMAND_ID));
     }
     line.insert(
         "ts".into(),
@@ -286,7 +298,29 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
     line.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
     line.insert("runId".into(), json!(RUN_ID.as_str()));
     line.insert("seq".into(), json!(event.sequence));
-    if let Value::Object(fields) = fields {
+    let mut fields = event.fields;
+    if let Field::Object(entries) = &mut fields
+        && let Some(index) = entries
+            .iter()
+            .position(|(_, field)| matches!(field, Field::EndpointIdentity(_)))
+    {
+        let (key, field) = entries.swap_remove(index);
+        if event.v2
+            && let Field::EndpointIdentity(digest) = field
+            && let Ok(secret) = directory.endpoint_key()
+        {
+            let mac = ring::hmac::sign(
+                &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &secret),
+                &digest,
+            );
+            let mut id = String::from("h1_");
+            for byte in mac.as_ref() {
+                write!(id, "{byte:02x}").expect("writing to a string");
+            }
+            line.insert(key, json!(id));
+        }
+    }
+    if let Value::Object(fields) = fields.clean(tokens) {
         for (key, field) in fields {
             if !COMMON.contains(&key.as_str()) {
                 line.insert(key, field);

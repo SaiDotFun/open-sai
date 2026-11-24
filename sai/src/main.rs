@@ -1,5 +1,6 @@
 mod config;
 mod local;
+mod reads;
 #[cfg(unix)]
 mod update;
 
@@ -9,13 +10,14 @@ use clap::{
     Parser, Subcommand,
     error::{ContextKind, ContextValue, ErrorKind},
 };
-use sai_core::errors::{ExitCode, SaiError};
+use sai_core::errors::{Code, ExitCode, SaiError};
 use sai_core::log::{self, EXIT_FLUSH, EventContext, Field, Level, LogWriter, Surface};
 use sai_core::settings::{Environment, Flags, Settings, SettingsError, repr};
 use serde_json::{Value, json};
 
 use config::ConfigCommand;
 use local::{AuthCommand, IntentCommand};
+use reads::{AccountCommand, MarketCommand, WatchCommand};
 
 #[derive(Parser)]
 #[command(
@@ -46,6 +48,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect markets and prices.
+    Market {
+        #[command(subcommand)]
+        command: MarketCommand,
+    },
+    /// Inspect positions and account activity.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
+    /// Stream live Keeper updates as JSON lines.
+    Watch {
+        #[command(subcommand)]
+        command: WatchCommand,
+    },
     /// Install the latest sai-cli release over this install.
     #[cfg(unix)]
     Update(update::UpdateCommand),
@@ -94,6 +111,16 @@ fn main() -> process::ExitCode {
             .ok()
             .cloned()
             .and_then(LogWriter::start)
+            .map(|writer| {
+                if matches!(
+                    command.split(' ').next(),
+                    Some("market" | "account" | "watch" | "update")
+                ) {
+                    writer.with_v2_command()
+                } else {
+                    writer
+                }
+            })
     };
     let command_field = || {
         if command.is_empty() {
@@ -156,6 +183,9 @@ fn main() -> process::ExitCode {
                             local::intent(command, &flags, env, json, events)
                         }
                         Command::Config { command } => command.run(&flags, env, json),
+                        Command::Market { command } => command.run(&flags, env, json, events),
+                        Command::Account { command } => command.run(&flags, env, json, events),
+                        Command::Watch { command } => command.run(&flags, env, events),
                     }
                 });
             complete(result, command, json, home)
@@ -205,6 +235,10 @@ fn complete(
     };
     let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
     let message = redact(&error.message);
+    let interrupted = error.code == Code::InvalidRequest && error.message == "Aborted";
+    if interrupted {
+        eprintln!();
+    }
     if json_output {
         let mut body =
             json!({"code": error.code, "message": message, "retryable": error.retryable()});
@@ -218,6 +252,8 @@ fn complete(
             body["details"] = redact_details(&Value::Object((**details).clone()), &redact);
         }
         println!("{}", local::ascii_json(&json!({"error": body}).to_string()));
+    } else if interrupted {
+        eprintln!("Aborted!");
     } else {
         if error.exit_code == ExitCode::Usage {
             eprintln!(
@@ -235,8 +271,11 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" | "update" => "",
-        "intent status" | "intent local" | "auth use" => " ADDR",
+        "config list" | "auth status" | "auth list" | "market list" | "market prices"
+        | "update" => "",
+        "intent status" | "intent local" | "auth use" | "account positions" | "account history"
+        | "account balances" | "watch positions" | "watch balances" => " ADDR",
+        "watch price" => " TOKEN_ID",
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
@@ -314,10 +353,13 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return ("logs", &[]),
             "update" => return ("update", &args[index + 1..]),
-            "config" | "auth" | "intent" => {
+            "config" | "auth" | "intent" | "market" | "account" | "watch" => {
                 let group = match arg.as_str() {
                     "auth" => "auth",
                     "intent" => "intent",
+                    "market" => "market",
+                    "account" => "account",
+                    "watch" => "watch",
                     _ => "config",
                 };
                 let Some((index, leaf)) = args
@@ -339,6 +381,14 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("auth", "logout") => "auth logout",
                     ("intent", "local") => "intent local",
                     ("intent", "status") => "intent status",
+                    ("market", "list") => "market list",
+                    ("market", "prices") => "market prices",
+                    ("account", "positions") => "account positions",
+                    ("account", "history") => "account history",
+                    ("account", "balances") => "account balances",
+                    ("watch", "positions") => "watch positions",
+                    ("watch", "balances") => "watch balances",
+                    ("watch", "price") => "watch price",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);
@@ -372,7 +422,10 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
             } else {
                 let consumed = match command {
                     "config get" | "config unset" | "intent status" | "intent local"
-                    | "auth use" | "auth logout" => 1,
+                    | "auth use" | "auth logout" | "account positions" | "account history"
+                    | "account balances" | "watch positions" | "watch balances" | "watch price" => {
+                        1
+                    }
                     "config set" => 2,
                     _ => 0,
                 };
@@ -407,6 +460,7 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
     let mut operands = operands.iter().map(String::as_str);
     let mut options = true;
     let mut positional = Vec::new();
+    let websocket = command.starts_with("watch ") || command == "account balances";
     while let Some(arg) = operands.next() {
         match arg {
             "--" if options => options = false,
@@ -414,6 +468,10 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
                 operands.next();
             }
             arg if options && command == "intent status" && arg.starts_with("--key=") => {}
+            "--ws-endpoint" if options && websocket => {
+                operands.next();
+            }
+            arg if options && websocket && arg.starts_with("--ws-endpoint=") => {}
             "--json"
                 if options && (command.starts_with("intent ") || command.starts_with("auth ")) => {}
             _ => positional.push(arg),
@@ -429,7 +487,11 @@ fn print_parse_error(
     json: bool,
     home: Option<&Path>,
 ) -> (ExitCode, Option<SaiError>) {
-    let help = || config::help(command).or_else(|| local::intent_help(command));
+    let help = || {
+        config::help(command)
+            .or_else(|| local::intent_help(command))
+            .or_else(|| reads::help(command))
+    };
     match error.kind() {
         ErrorKind::DisplayHelp => {
             if let Some(help) = help() {
@@ -444,15 +506,23 @@ fn print_parse_error(
             return (ExitCode::Ok, None);
         }
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
-            if matches!(command, "config" | "intent")
-                && let Some(help) = help()
+            if matches!(
+                command,
+                "config" | "intent" | "market" | "account" | "watch"
+            ) && let Some(help) = help()
             {
                 let error = SaiError::usage(help);
-                if json {
-                    return complete(Err(error), command, true, home);
+                if json || matches!(command, "market" | "account" | "watch") {
+                    return complete(Err(error), command, json, home);
                 }
                 eprintln!("{}", error.message);
                 return (ExitCode::Usage, Some(error));
+            }
+        }
+        ErrorKind::MissingRequiredArgument if !json && operands.is_empty() => {
+            if let Some(help) = reads::help(command) {
+                eprintln!("{help}");
+                return (ExitCode::Usage, None);
             }
         }
         _ => {}
