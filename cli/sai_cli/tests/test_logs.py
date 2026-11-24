@@ -487,6 +487,46 @@ def test_urls_with_awkward_characters_do_not_reach_the_log(home, keeper_stub):
     assert events(home, "mcp.tool_call")[0]["arguments"] == {"addr": site}
 
 
+@pytest.mark.parametrize("command", [("config", "list"), ("mcp", "serve")])
+@pytest.mark.parametrize("flag", ["--endpoint", "--ws-endpoint", "--lcd-endpoint"])
+@pytest.mark.parametrize("inline", [False, True])
+def test_command_start_redacts_malformed_endpoint_flags(home, command, flag, inline):
+    marker = "fixture-endpoint-credential"
+    endpoint = f"keeper.invalid/graphql?credential={marker}"
+    option = [f"{flag}={endpoint}"] if inline else [flag, endpoint]
+    shown = [f"{flag}=[redacted]"] if inline else [flag, "[redacted]"]
+    if command == ("mcp", "serve"):
+        args = ["--json", *command, *option]
+        expected = ["--json", *command, *shown]
+    else:
+        args = ["--json", *option, *command]
+        expected = ["--json", *shown, *command]
+
+    assert run_cli(*args)[0] == 2
+    assert events(home, "command.start")[0]["argv"] == expected
+    assert marker not in raw_logs(home)
+
+
+@pytest.mark.parametrize("key", settings.KEYS)
+def test_command_start_redacts_rejected_config_set_values(home, key):
+    marker = "fixture-config-credential"
+    args = ["--json", "config", "set", "--", key]
+
+    assert run_cli(*args, marker)[0] == 2
+    assert events(home, "command.start")[0]["argv"] == [*args, "[redacted]"]
+    assert marker not in raw_logs(home)
+
+
+def test_command_start_keeps_only_the_configured_endpoint_origin(home):
+    marker = "fixture-config-credential"
+    args = ["--json", "config", "set", "keeper.endpoint", "--"]
+    url = f"https://keeper.invalid/graphql?credential={marker}"
+
+    assert run_cli(*args, url)[0] == 0
+    assert events(home, "command.start")[0]["argv"] == [*args, "https://keeper.invalid"]
+    assert marker not in raw_logs(home)
+
+
 def test_urls_are_reduced_to_their_origin():
     url = (
         f"https://user:{URL_PASSWORD}@keeper.example:8443/{PATH_KEY}/q?key={URL_KEY}#f"
@@ -696,17 +736,20 @@ def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper
 
 
 def test_command_path_skips_options_and_their_values():
-    assert command_path(main, ["--endpoint", "market", "market", "prices"]) == [
-        "market",
-        "prices",
-    ]
-    assert command_path(main, ["--json", "--endpoint=x", "auth", "use", "0xabc"]) == [
-        "auth",
-        "use",
-    ]
-    assert command_path(main, ["mcp", "serve", "--endpoint", "x"]) == ["mcp", "serve"]
-    assert command_path(main, []) == []
-    assert command_path(main, ["nope", "market"]) == []
+    assert command_path(main, ["--endpoint", "market", "market", "prices"]) == (
+        ["market", "prices"],
+        4,
+    )
+    assert command_path(main, ["--json", "--endpoint=x", "auth", "use", "0xabc"]) == (
+        ["auth", "use"],
+        4,
+    )
+    assert command_path(main, ["mcp", "serve", "--endpoint", "x"]) == (
+        ["mcp", "serve"],
+        2,
+    )
+    assert command_path(main, []) == ([], 0)
+    assert command_path(main, ["nope", "market"]) == ([], 0)
 
 
 def test_help_version_and_skill_write_nothing(home):

@@ -91,13 +91,13 @@ def session(ctx: click.Context) -> dict[str, str]:
     return sessions.load_active_session(keeper_url(ctx), ctx.obj["as_addr"])
 
 
-def command_path(group: click.Group, args: list[str]) -> list[str]:
-    """The command names in ARGS, such as ["market", "prices"], found by
-    walking GROUP's commands past options and their values."""
+def command_path(group: click.Group, args: list[str]) -> tuple[list[str], int]:
+    """Find the command names and the index after the last command name."""
     names: list[str] = []
     current: click.Command = group
     skip = False
-    for token in args:
+    tail = 0
+    for index, token in enumerate(args):
         if skip:
             skip = False
             continue
@@ -118,8 +118,49 @@ def command_path(group: click.Group, args: list[str]) -> list[str]:
         if found is None:
             break
         names.append(token)
+        tail = index + 1
         current = found
-    return names
+    return names, tail
+
+
+def audit_argv(args: list[str], config_set_at: int | None) -> list[log.Arg]:
+    """Prepare command.start arguments before Click validates their values."""
+    safe = args.copy()
+    if config_set_at is not None:
+        key_at = config_set_at
+        if safe[key_at : key_at + 1] == ["--"]:
+            key_at += 1
+        value_at = key_at + 1
+        if key_at == config_set_at and safe[value_at : value_at + 1] == ["--"]:
+            value_at += 1
+        if value_at < len(safe):
+            key = safe[key_at]
+            spec = sai_settings.BY_KEY.get(key)
+            if spec is None:
+                safe[value_at] = "[redacted]"
+            elif spec.kind == "url":
+                safe[value_at] = audit_origin(safe[value_at])
+            else:
+                try:
+                    sai_settings.parse_value(key, safe[value_at])
+                except sai_settings.InvalidSetting:
+                    safe[value_at] = "[redacted]"
+
+    endpoint_options = {option for option, _ in GLOBAL_FLAGS}
+    indexed = iter(enumerate(safe))
+    for index, token in indexed:
+        option, equals, value = token.partition("=")
+        if option in endpoint_options:
+            if equals:
+                safe[index] = f"{option}={audit_origin(value)}"
+            elif next(indexed, None) is not None:
+                safe[index + 1] = audit_origin(safe[index + 1])
+    return log.argv(safe)
+
+
+def audit_origin(value: str) -> str:
+    origin = log.origin(value)
+    return "[redacted]" if origin == log.REDACTED_URL else origin
 
 
 # Options that print something and exit before any command runs.
@@ -249,7 +290,7 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names = command_path(self, argv)
+        names, tail = command_path(self, argv)
         quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
@@ -261,7 +302,12 @@ class LoggedGroup(SaiGroup):
         def log_start() -> None:
             nonlocal start_logged
             if not quiet and not start_logged:
-                log.event("command.start", argv=log.argv(argv[:64]))
+                log.event(
+                    "command.start",
+                    argv=audit_argv(
+                        argv[:64], tail if names == ["config", "set"] else None
+                    ),
+                )
                 start_logged = True
 
         with (
