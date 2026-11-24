@@ -5,6 +5,7 @@ mod quote;
 const KEEPER_OWNER_MISMATCH: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER_MISMATCH: &str = "Contract position belongs to a different account";
 const NETWORK_MISMATCH: &str = "Keeper trading route and LCD network do not match";
+const CONTRACT_POSITION_MISMATCH: &str = "Position changed. Review the margin change again.";
 
 use serde_json::{Map, Value, json};
 
@@ -377,7 +378,10 @@ impl Trading<'_> {
             || raw["is_open"] != true
             || raw["trade_type"] != "trade"
         {
-            return Err(invalid("Position changed. Review the margin change again."));
+            return Err(SaiError::new(
+                Code::PreviewMismatch,
+                CONTRACT_POSITION_MISMATCH,
+            ));
         }
         let (funds, _) = lcd
             .smart(
@@ -391,7 +395,10 @@ impl Trading<'_> {
         require_object(&funds)?;
 
         if funds["collateral_index"] != token {
-            return Err(invalid("Position changed. Review the margin change again."));
+            return Err(SaiError::new(
+                Code::PreviewMismatch,
+                CONTRACT_POSITION_MISMATCH,
+            ));
         }
         if number_text(&raw["collateral_amount"])?
             != number_text(field(position, "collateralAmount")?)?

@@ -51,6 +51,7 @@ POSITION_SCENARIOS = {
     "position-foreign-contract-owner",
     "position-equivalent-owner",
     "position-wrong-index",
+    "position-wrong-contract-index",
     "position-chain-changed",
     "position-contract-changed",
     "position-scientific-reduction",
@@ -471,6 +472,8 @@ def loopback(
         contracts["get_trade_raw"].pop("long", None)
     if scenario == "position-foreign-contract-owner":
         contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
+    if scenario == "position-wrong-contract-index":
+        contracts["get_trade_raw"]["user_trade_index"] = "UserTradeIndex(8)"
     if scenario == "position-equivalent-owner":
         contracts["get_trade_raw"]["user"] = position["trader"]
     if scenario == "position-scientific-reduction":
