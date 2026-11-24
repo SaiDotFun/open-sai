@@ -44,7 +44,11 @@ override is invalid.
 | --- | --- | --- |
 | `SAI_UPDATE_AUTO=maybe` | 1 | `INVALID_REQUEST` with a validation message. |
 | Malformed Keeper URL in `--endpoint` or `SAI_ENDPOINT` | 2 | `INVALID_REQUEST` with an endpoint validation message. |
-| Invalid logging value, such as `SAI_LOG=maybe` | 0 | The settings report marks the logging setting's `source` as `invalid` and Sai turns logging off. |
+| `SAI_LOG=maybe` | 0 | Sai marks the `logs.enabled` source as `invalid` and turns logging off. |
+
+When logging is already disabled, Sai ignores an invalid `logs.keep_days`
+value. The command still exits 0 and reports the retention setting's
+source as `env` or `file`, depending on where it was set.
 
 Issue [#188](https://github.com/SaiDotFun/open-sai/issues/188) tracks making
 these results consistent.
