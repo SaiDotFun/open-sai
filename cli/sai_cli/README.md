@@ -335,9 +335,13 @@ endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 Put `--json` before the command to read errors on stdout. A failed command
 writes one JSON object with `error.code`, `error.message`, and
 `error.retryable`. The error includes `intentKey` when it refers to a
-recorded intent and `hint` when a command can help. If a stream such as
-`watch` has already emitted JSON lines, the error object is its final line.
-Without `--json`, error text goes to stderr.
+recorded intent and `hint` when a command can help. Failed doctor checks and
+MCP registration commands include their structured reports in
+`error.details`. The registration report includes `changed` per client and
+the aggregate `reconnectNeeded` flag. If a stream such as `watch` has already
+emitted JSON lines, the error object is its final line. Once `sai mcp serve`
+starts the stdio transport, stdout carries MCP protocol traffic. Without
+`--json`, error text goes to stderr.
 
 | Exit | Meaning | What to Do |
 | --- | --- | --- |

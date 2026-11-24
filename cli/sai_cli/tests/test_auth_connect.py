@@ -252,8 +252,12 @@ def test_agent_import_skips_binary_clipboard(env: Env) -> None:
 
 def test_agent_import_without_clipboard_asks_for_a_terminal(env: Env) -> None:
     result = env.run("auth", "import")
-    assert result.returncode != 0
+    assert result.returncode == 3
     assert "Ask the person to run `sai auth import`" in result.stderr
+    data = env.run("--json", "auth", "import")
+    assert data.returncode == 3 and data.stderr == ""
+    error = json.loads(data.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST" and error["hint"] == "sai auth import"
     assert not (env.home / "trader" / "sessions.json").exists()
 
 

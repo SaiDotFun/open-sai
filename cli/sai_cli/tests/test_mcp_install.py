@@ -408,6 +408,15 @@ def test_codex_has_no_project_scope(env: Env):
     message = failure(result)
     assert "codex (project): failed" in message
     assert "claude (project): added" in message
+    details = payload(result)["error"]["details"]
+    assert details["reconnectNeeded"] is True
+    assert [
+        (row["client"], row["scope"], row["action"], row["changed"])
+        for row in details["results"]
+    ] == [
+        ("codex", "project", "failed", False),
+        ("claude", "project", "added", True),
+    ]
     assert json.loads((env.project / ".mcp.json").read_text())["mcpServers"]["sai"]
 
 
@@ -858,3 +867,7 @@ def test_reconnect_is_needed_when_a_remove_ran_before_a_failed_add(env: Env):
     message = failure(result)
     assert "claude (user): failed" in message
     assert "Client registrations changed." in message
+    details = payload(result)["error"]["details"]
+    assert details["reconnectNeeded"] is True
+    [row] = details["results"]
+    assert row["action"] == "failed" and row["changed"] is True

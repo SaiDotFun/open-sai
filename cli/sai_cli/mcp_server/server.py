@@ -22,13 +22,14 @@ from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any, Literal
 
+from anyio import BrokenResourceError
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import ConfigDict
 
 from ..core import log as sai_log
 from ..core import settings as sai_settings
-from ..core.errors import Code, SaiError, describe
+from ..core.errors import Code, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
 
@@ -930,4 +931,10 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             websocket=sai_log.endpoint(settings.ws_endpoint),
             lcd=sai_log.endpoint(settings.lcd_endpoint),
         )
-        create_server(settings).run()
+        server = create_server(settings)
+        try:
+            server.run()
+        except* (KeyboardInterrupt, BrokenPipeError, BrokenResourceError):
+            pass
+        except* Exception as exc:
+            raise McpStdioError("Sai MCP stdio session failed") from exc

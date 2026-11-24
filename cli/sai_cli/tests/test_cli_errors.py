@@ -24,7 +24,14 @@ def assert_error(result: Result, exit_code: int, code: str) -> dict:
     assert set(envelope) == {"error"}
     error = envelope["error"]
     assert {"code", "message", "retryable"} <= set(error)
-    assert set(error) <= {"code", "message", "retryable", "hint", "intentKey"}
+    assert set(error) <= {
+        "code",
+        "message",
+        "retryable",
+        "hint",
+        "intentKey",
+        "details",
+    }
     assert error["code"] == code
     assert isinstance(error["message"], str) and error["message"]
     assert error["retryable"] is (exit_code == 4)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import select
 import shutil
 import signal
 import socket
@@ -521,6 +522,44 @@ def test_sigint_after_keeper_receives_intent_reports_unknown():
     )
     [entry] = storage.list_pending(endpoint, TRADE_ADDR)
     assert entry["intentKey"] == key and entry["status"] == "unknown"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+def test_mcp_stdio_sigint_after_initialize_exits_without_cli_output():
+    with subprocess.Popen(
+        [*_resolve_cli(), "--json", "mcp", "serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        assert process.stdin is not None and process.stdout is not None
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            },
+        }
+        try:
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0]
+            assert "result" in json.loads(process.stdout.readline())
+            process.stdin.write(
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+            )
+            process.stdin.flush()
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+    assert process.returncode == 0, stderr
+    assert stdout == stderr == ""
 
 
 def test_two_processes_cannot_reserve_same_position(tmp_path, monkeypatch):
