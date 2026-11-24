@@ -321,6 +321,8 @@ def close_estimates(
             height=height,
         )
         oracle = prices["market"]
+        if not isinstance(oracle, dict):
+            return result
         update_times = [
             time
             for key in ("base_last_update_time", "quote_last_update_time")

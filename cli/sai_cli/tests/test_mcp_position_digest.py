@@ -42,6 +42,7 @@ class Position:
     liquidation_threshold: str = "60"
     block_timestamp: int = 2_000_000_000
     oracle_base_age: int | None = None
+    null_market_price: bool = False
     oracle_quote_age: int | None = None
     oracle_ttl: int = 300
     snapshot_leverages: deque[str] = field(default_factory=deque)
@@ -214,7 +215,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 )
                 data = (
                     {
-                        "market": {
+                        "market": None
+                        if position.null_market_price
+                        else {
                             "base_per_quote": str(position.price),
                             "base_last_update_time": position.block_timestamp
                             - position.oracle_base_age
@@ -1397,5 +1400,26 @@ def test_leverage_liquidation_preview_requires_market_leverage_cap(position_serv
                 client, "preview_leverage", {"trade_id": 7, "leverage": "50"}
             )
             assert boundary["estimates"]["liquidationPrice"]["status"] == "estimate"
+
+    asyncio.run(scenario())
+
+
+def test_null_market_price_preserves_close_preview_and_refusal(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.null_market_price = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            args = {"trade_id": 7}
+            preview = await call(client, "preview_close", args)
+            assert preview["estimates"]["execution"]["status"] == "unavailable"
+            assert preview["estimates"]["fees"]["status"] == "unavailable"
+            result = await call(
+                client, "trade_close", {**args, "preview_digest": "wrong"}
+            )
+            assert result["code"] == "PREVIEW_MISMATCH"
+            assert result["preview"] == preview
+            assert position.submitted == []
 
     asyncio.run(scenario())
