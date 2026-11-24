@@ -1,0 +1,59 @@
+{
+  "pythonReference": "9b20dd771050724dc8684ffca8de3f34ae417ffa",
+  "cases": [
+    {
+      "command": "tpsl",
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "UPDATE_TRADE",
+          "target": {
+            "userTradeId": "7"
+          },
+          "body": {
+            "takeProfit": {
+              "operation": "set",
+              "value": "110.0100"
+            },
+            "stopLoss": {
+              "operation": "clear"
+            }
+          }
+        },
+        "positionRoute": {
+          "chainId": "cataclysm-1",
+          "contractAddress": "nibi1syntheticfixture"
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"stopLoss\":{\"operation\":\"clear\"},\"takeProfit\":{\"operation\":\"set\",\"value\":\"110.0100\"}},\"kind\":\"UPDATE_TRADE\",\"target\":{\"userTradeId\":\"7\"}},\"positionRoute\":{\"chainId\":\"cataclysm-1\",\"contractAddress\":\"nibi1syntheticfixture\"}}",
+      "digest": "4d7ba38df5792a6adcd67f45eefa4d8822327b883a6b172adca92835f1d00f43"
+    },
+    {
+      "command": "leverage",
+      "preview": {
+        "addr": "0xAA00000000000000000000000000000000000001",
+        "intent": {
+          "kind": "UPDATE_TRADE",
+          "target": {
+            "userTradeId": "7"
+          },
+          "body": {
+            "takeProfit": {
+              "operation": "keep"
+            },
+            "stopLoss": {
+              "operation": "keep"
+            },
+            "requestedLeverage": "10.00"
+          }
+        },
+        "positionRoute": {
+          "chainId": "cataclysm-1",
+          "contractAddress": "nibi1syntheticfixture"
+        }
+      },
+      "canonical": "{\"addr\":\"0xaa00000000000000000000000000000000000001\",\"intent\":{\"body\":{\"requestedLeverage\":\"10.00\",\"stopLoss\":{\"operation\":\"keep\"},\"takeProfit\":{\"operation\":\"keep\"}},\"kind\":\"UPDATE_TRADE\",\"target\":{\"userTradeId\":\"7\"}},\"positionRoute\":{\"chainId\":\"cataclysm-1\",\"contractAddress\":\"nibi1syntheticfixture\"}}",
+      "digest": "b62370e3735667dec3ce4a453119eec83f627f5dd6db9b403da32a284f95678c"
+    }
+  ]
+}

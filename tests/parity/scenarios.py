@@ -728,7 +728,16 @@ def loopback(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        if not same_variables(query, {name: contract_args[name]}):
+                        owner_check = (
+                            trade_replay is not None
+                            and name == "get_trade_raw"
+                            and same_variables(
+                                query, {name: {"trader": ADDRESS, "index": 7}}
+                            )
+                        )
+                        if not owner_check and not same_variables(
+                            query, {name: contract_args[name]}
+                        ):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
