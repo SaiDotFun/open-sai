@@ -562,6 +562,9 @@ class Replay:
         fixture = json.loads((TESTS / "fixtures" / "intent_outcomes.json").read_text())
         self.addr = fixture["address"]
         self.responses = {**fixture["recorded"], **fixture["replays"]}
+        self.nibi_addr = self.responses["filled"]["data"]["userIntents"][0][
+            "nibiAddress"
+        ]
         self.assets: dict[str, tuple[bytes, str]] = {}
         self.add_release(wheel, version)
         self.latest = version
@@ -589,6 +592,23 @@ class Replay:
             row = self.responses[self.lifecycle]["data"]["userIntents"][0]
             return [{**row, "intentKey": key}]
         return []
+
+    def history_page(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+        offset = arguments.get("offset", 0)
+        limit = arguments.get("limit", len(self.history))
+        if type(offset) is not int or type(limit) is not int or min(offset, limit) < 0:
+            raise ValueError("Invalid history pagination")
+        where = arguments.get("where")
+        trader = where.get("trader") if isinstance(where, dict) else None
+        if not isinstance(trader, str):
+            return []
+        aliases = {trader.lower()}
+        if trader.lower() in {self.addr, self.nibi_addr}:
+            aliases.update((self.addr, self.nibi_addr))
+        rows = [
+            row for row in self.history if row["trade"]["trader"].lower() in aliases
+        ]
+        return rows[offset : offset + limit]
 
     def handler(self) -> type[KeeperHandler]:
         replay = self
@@ -620,7 +640,12 @@ class Replay:
                     self.send_error(400)
                     return
                 roots = {field.name: field.children for field in selected}
-                perp = {field.name: field for field in roots.get("perp", ())}
+                perp = {
+                    child.name
+                    for root in selected
+                    if root.name == "perp"
+                    for child in root.children
+                }
                 if "recordUserIntent" in roots:
                     if self.headers.get("Authorization") != f"Bearer {SYNTHETIC_TOKEN}":
                         self.send_error(403)
@@ -663,21 +688,25 @@ class Replay:
                     self.reply({"data": data})
                     return
                 elif "tradeHistory" in perp:
-                    arguments = perp["tradeHistory"].arguments
-                    offset = arguments.get("offset", 0)
-                    limit = arguments.get("limit", len(replay.history))
-                    if (
-                        type(offset) is not int
-                        or type(limit) is not int
-                        or min(offset, limit) < 0
-                    ):
+                    try:
+                        data = {
+                            root.key: {
+                                field.key: project_fields(
+                                    replay.history_page(field.arguments), field.children
+                                )
+                                if field.name == "tradeHistory"
+                                else None
+                                for field in root.children
+                            }
+                            if root.name == "perp"
+                            else None
+                            for root in selected
+                        }
+                    except ValueError:
                         self.send_error(400)
                         return
-                    data = {
-                        "perp": {
-                            "tradeHistory": replay.history[offset : offset + limit]
-                        }
-                    }
+                    self.reply({"data": data})
+                    return
                 elif "oneClickTrading" in roots:
                     data = {
                         "oneClickTrading": {

@@ -655,6 +655,33 @@ query($trader:String!, $limit:Int!, $offset:Int!) {
                     rows = self.query(base, text, user=user, key=intent)["userIntents"]
                     self.assertEqual(rows, [{"intentKey": key} for key in expected])
 
+    def test_filters_each_history_selection_before_paginating(self) -> None:
+        other = "0x" + "b" * 40
+        self.replay.history = [
+            {"id": number, "trade": {"trader": trader}}
+            for number, trader in (
+                (3, other),
+                (2, self.replay.addr),
+                (1, self.replay.nibi_addr),
+            )
+        ]
+        query = """
+query($trader:String!, $other:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    matching: tradeHistory(where:{trader:$trader}, limit:$limit, offset:$offset) { id }
+    wrong: tradeHistory(where:{trader:$other}, limit:$limit, offset:$offset) { id }
+    missing: tradeHistory(limit:$limit, offset:$offset) { id }
+  }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            data = self.query(
+                base, query, trader=self.replay.addr, other=other, limit=1, offset=1
+            )
+        self.assertEqual(
+            data, {"perp": {"matching": [{"id": 1}], "wrong": [], "missing": []}}
+        )
+
     def test_checks_filters_independently_for_each_intent_alias(self) -> None:
         query = """
 query($user: String!, $key: String, $otherKey: String, $otherUser: String!) {
