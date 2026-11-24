@@ -1,10 +1,11 @@
+mod install;
 mod session;
 mod stdio;
 mod validation;
 
 use std::{
     borrow::Cow,
-    env, fs,
+    fs,
     future::pending,
     io::{self, IsTerminal},
     path::Path,
@@ -89,6 +90,7 @@ impl McpCommand {
             settings,
             env: env.clone(),
             writer,
+            install: install::Installation::detect(),
             ledger_slots: Arc::new(Semaphore::new(8)),
         };
         server.events().event(
@@ -121,6 +123,7 @@ struct SaiMcp {
     settings: Settings,
     env: Environment,
     writer: Option<Arc<LogWriter>>,
+    install: install::Installation,
     ledger_slots: Arc<Semaphore>,
 }
 
@@ -164,7 +167,7 @@ impl SaiMcp {
         let query = match name {
             "market_list" => keeper::MARKETS,
             "market_prices" => keeper::PRICES,
-            "mcp_info" => return Ok(self.info(&storage)),
+            "mcp_info" => return Ok(self.info(&storage).await),
             _ => {
                 let Some(read) = AccountRead::named(name) else {
                     return Ok(json!({
@@ -276,14 +279,14 @@ impl SaiMcp {
         .await
     }
 
-    fn info(&self, storage: &Storage<'_>) -> Value {
-        let exe = env::current_exe().ok();
-        let install_dir = exe
-            .as_deref()
-            .and_then(Path::parent)
-            .map(Path::to_string_lossy);
+    async fn info(&self, storage: &Storage<'_>) -> Value {
+        let install_dir = self.install.directory().map(Path::to_string_lossy);
         let home = &self.env.home;
-        let version = env!("CARGO_PKG_VERSION");
+        let version = install::RUNNING_VERSION;
+        let installed = self.install.version().await;
+        let restart_needed = installed
+            .as_deref()
+            .is_some_and(|installed| installed != version);
         let mut names: Vec<_> = TOOLS.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         let session = session::StoredSession::load(storage, self.settings.endpoint(), None);
@@ -291,8 +294,8 @@ impl SaiMcp {
             "name": "sai",
             "package": "sai-cli",
             "version": version,
-            "installedVersion": version,
-            "restartNeeded": false,
+            "installedVersion": installed.as_deref().unwrap_or("unknown"),
+            "restartNeeded": restart_needed,
             "latestVersion": latest_version(home),
             "mcpVersion": Implementation::from_build_env().version,
             "provenance": {"kind": "installed", "path": install_dir},
@@ -533,10 +536,5 @@ fn latest_version(home: &Path) -> Option<String> {
         return None;
     }
     let version = cache["latest"].as_str()?.strip_prefix("sai-cli/v")?;
-    let parts: Vec<_> = version.split('.').collect();
-    (parts.len() == 3
-        && parts
-            .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())))
-    .then(|| version.to_owned())
+    install::is_version(version).then(|| version.to_owned())
 }

@@ -274,3 +274,31 @@ def test_audit_boolean_coercion(native: Path, tmp_path: Path, offline: object) -
         refused = stdio.call(3, "logs_intent", key="fixture", offline=" True ")
         assert refused["isError"] is True
         assert refused["content"][0]["text"] == "Argument 'offline' must be a boolean."
+
+
+@pytest.mark.parametrize("symlink", [False, True], ids=["binary", "symlink"])
+def test_info_observes_launcher_replacement(
+    native: Path, tmp_path: Path, symlink: bool
+) -> None:
+    launcher = tmp_path / "sai"
+    if symlink:
+        launcher.symlink_to(native)
+    else:
+        shutil.copy2(native, launcher)
+    with (
+        loopback("normal") as endpoints,
+        server(launcher, tmp_path / "home", endpoints) as stdio,
+    ):
+        before = json.loads(stdio.call(2, "mcp_info")["content"][0]["text"])
+        assert before["version"] == before["installedVersion"]
+        assert before["restartNeeded"] is False
+
+        replacement = tmp_path / "replacement"
+        replacement.write_text("#!/bin/sh\nprintf 'sai 99.1.2\\n'\n")
+        replacement.chmod(0o700)
+        replacement.replace(launcher)
+
+        after = json.loads(stdio.call(3, "mcp_info")["content"][0]["text"])
+        assert after["version"] == before["version"]
+        assert after["installedVersion"] == "99.1.2"
+        assert after["restartNeeded"] is True
