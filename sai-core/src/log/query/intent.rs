@@ -122,7 +122,9 @@ fn attribution(row: &Row) -> Option<Attribution<'_>> {
         hash_event: (matches!(
             event,
             "intent.submitted" | "intent.wait.end" | "intent.keeper"
-        ) && row.get("txHash").and_then(keeper::request_hash).is_some())
+        ) && row
+            .get("txHash")
+            .is_some_and(|hash| keeper::request_hash(hash).0.is_some()))
         .then_some(event),
     })
 }
