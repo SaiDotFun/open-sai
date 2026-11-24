@@ -59,6 +59,7 @@ READ_TOOLS = {
     "preview_margin",
     "preview_partial_close",
     "logs_intent",
+    "intent_wait",
 }
 LOCAL_TOOLS = {"mcp_info", "auth_status", "auth_list", "auth_use", "intent_local"}
 # Changes only which connected account is active on this machine.
@@ -1199,7 +1200,7 @@ def test_lost_ack_reports_unknown_then_intent_status_reconciles(mcp, monkeypatch
     }
     fake.answers = {
         keeper.INTENTS: {"userIntents": [row]},
-        keeper.HISTORY: {"perp": {"tradeHistory": [trade]}},
+        keeper.INTENT_HISTORY: {"perp": {"tradeHistory": [trade]}},
     }
     status = invoke(mcp, "intent_status", {"key": key})
     assert status["matchedTradeHistory"] == [trade]

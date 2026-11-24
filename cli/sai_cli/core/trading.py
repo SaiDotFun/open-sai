@@ -13,6 +13,7 @@ from typing import Any
 
 from . import intents, keeper, margin, partial
 from . import preview as estimates
+from .errors import Code, SaiError
 
 SessionLoader = Callable[[], dict[str, str]]
 Notify = Callable[[str], None]
@@ -39,8 +40,14 @@ class PreviewRefused(ValueError):
         self.preview = preview
 
 
-class PositionChanged(PreviewRefused):
+class PositionChanged(SaiError, PreviewRefused):
     """A live recheck found a different position quote."""
+
+    code = Code.PREVIEW_MISMATCH
+
+    def __init__(self, message: str, preview: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.preview = preview
 
 
 def _checked(
@@ -381,7 +388,14 @@ def _position_preview(
         preview["estimates"] = estimate(state, inputs, preview)
         return preview
 
-    state, inputs, fresh = build()
+    try:
+        state, inputs, fresh = build()
+    except (
+        margin.IndexLag,
+        margin.PositionUnavailable,
+        margin.MarketUnavailable,
+    ) as exc:
+        raise PositionChanged(f"{changed_message}. {exc}") from exc
     changed = not margin.position_unchanged(lcd_endpoint, state, trade_id, inputs)
     if changed:
         try:
