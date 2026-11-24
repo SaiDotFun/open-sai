@@ -8,6 +8,10 @@ the CLI or the MCP tools. A mistake here spends the person's money.
 1. **Preview first.** With MCP tools, call the matching `preview_*` tool. In
    the CLI, run the trade command with `--dry-run`. Show the person the
    result and the account it names, and wait for an explicit yes.
+   During a collateral oracle outage, a partial-close preview can show a
+   USDC estimate, and Sai requires a verifiable collateral price to submit
+   the trade. Once Sai can verify the price, run a fresh preview and get
+   the person's confirmation before submitting.
 2. **Pin the account and the network on both calls.** Each call resolves
    the active account and the Keeper endpoint by itself. Another terminal or
    MCP client can switch the account, and a changed setting can point the
@@ -136,9 +140,15 @@ input `preview_digest`, and a market `trade_open` must also send the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
 intent, position quote, or quoted price fails the confirmation check.
-A refusal submits nothing. Show the returned `preview` if present. If the
-result omits it, call the matching `preview_*` tool and wait for a current
-quote before asking for confirmation again.
+Nothing is submitted on a refusal. Use the replacement `preview` only if
+Sai can verify the quote. For a partial close, check that
+`quote.collateralPriceUsd` has a value. A USDC estimate can still have a
+digest when that field is `null`.
+
+If the replacement is missing or lacks a verifiable quote, wait until Sai
+can verify the quote and call the matching `preview_*` tool again. Ask for
+confirmation only when the preview shows a verifiable quote, including the
+collateral price for a partial close. Discard the old digest.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
