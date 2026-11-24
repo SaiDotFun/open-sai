@@ -546,25 +546,36 @@ def stats(
 
     log.flush(1.0)
     scan = log.LogScan()
-    rows = [
-        (ts, line)
-        for line in scan.rows(
-            root,
-            first_day=first_day,
-            last_day=instant.date() if instant else None,
-            since=cutoff,
-            before=upper,
-        )
-        if (ts := _timestamp(line)) is not None
-    ]
+    gaps: list[tuple[str, LogLine]] = []
+    samples: list[tuple[str, str | None, str | None, int | None]] = []
+    for line in scan.rows(
+        root,
+        first_day=first_day,
+        last_day=instant.date() if instant else None,
+        since=cutoff,
+        before=upper,
+    ):
+        ts = _timestamp(line)
+        if ts is None:
+            continue
+        event = line.get("event")
+        if event == "log.dropped":
+            gaps.append(("gaps", line))
+            continue
+        code = _id(line, "code")
+        operation = None
+        duration = None
+        if event == "keeper.request":
+            name, ms = _id(line, "operation"), line.get("durationMs")
+            if name in OPERATIONS and type(ms) is int and ms >= 0:
+                operation, duration = name, ms
+        if code in CODES or operation is not None:
+            samples.append((ts, code, operation, duration))
     # Alternating between files can read sparse older rows before the
     # busiest file reaches the same timestamp. Defer those to the next page.
     frontier = scan.frontier if scan.truncated else None
-    gaps = [
-        ("gaps", line)
-        for ts, line in rows
-        if line.get("event") == "log.dropped" and (frontier is None or ts >= frontier)
-    ]
+    if frontier is not None:
+        gaps = [entry for entry in gaps if entry[1]["ts"] >= frontier]
     gaps.sort(key=lambda entry: log.event_order(entry[1]))
     report = _limit({"since": cutoff, "gaps": []}, gaps, scan.truncated, frontier)
 
@@ -572,21 +583,13 @@ def stats(
     page_start = report.get("nextBefore")
     durations: defaultdict[str, list[int]] = defaultdict(list)
     codes: Counter[str] = Counter()
-    for ts, line in rows:
-        event = line.get("event")
-        if event == "log.dropped" or (page_start is not None and ts < page_start):
+    for ts, code, operation, duration in samples:
+        if page_start is not None and ts < page_start:
             continue
-        if (code := _id(line, "code")) and code in CODES:
+        if code and code in CODES:
             codes[code] += 1
-        if event == "keeper.request":
-            operation, duration = _id(line, "operation"), line.get("durationMs")
-            if (
-                operation
-                and operation in OPERATIONS
-                and type(duration) is int
-                and duration >= 0
-            ):
-                durations[operation].append(duration)
+        if operation is not None and duration is not None:
+            durations[operation].append(duration)
     operations = {}
     for name, samples in sorted(durations.items()):
         samples.sort()

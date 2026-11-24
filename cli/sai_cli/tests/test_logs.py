@@ -16,6 +16,7 @@ import subprocess
 import sys
 import threading
 import time
+import tracemalloc
 from collections.abc import Iterator
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -2470,6 +2471,29 @@ def test_stats_caps_the_number_of_scanned_rows(home):
     }
     assert earlier["errors"] == {"KEEPER_ERROR": 3}
     assert "truncated" not in earlier
+
+
+def test_logs_stats_does_not_retain_decoded_request_payloads(home):
+    root = home / "logs"
+    root.mkdir()
+    row = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "ts": "2026-11-24T11:00:00.000Z",
+        "extra": "x" * 4096,
+    }
+    log.file_path("cli", date(2026, 11, 24), root).write_bytes(log.encode(row) * 2_000)
+
+    tracemalloc.start()
+    try:
+        report = log_queries.stats()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert report["keeper"]["prices"]["count"] == 2_000
+    assert peak < 4 * 1024 * 1024
 
 
 def test_logs_stats_counts_older_rows_once_when_gap_output_is_capped(home):
