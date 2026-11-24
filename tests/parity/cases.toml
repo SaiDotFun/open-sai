@@ -353,6 +353,7 @@ state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
 [[case]]
 name = "doctor-offline"
 args = ["--json","doctor","--offline","--no-fix"]
+state = { "trader" = "<absent>" }
 
 [[case]]
 name = "doctor-unknown-option"
