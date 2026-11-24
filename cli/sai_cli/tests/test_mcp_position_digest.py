@@ -35,6 +35,8 @@ CLI_POSITION_ACTIONS = (
     ("close", "7"),
     ("leverage", "7", "--leverage", "3"),
     ("tpsl", "7", "--take-profit", "120"),
+    ("margin", "7", "--direction", "add", "--amount", "1"),
+    ("partial-close", "7", "--percent", "50"),
 )
 MCP_POSITION_ACTIONS = (
     ("close", {"trade_id": 7}),
@@ -438,14 +440,7 @@ async def call(
     return json.loads(block.text)
 
 
-@pytest.mark.parametrize(
-    "command",
-    [
-        *CLI_POSITION_ACTIONS,
-        ("margin", "7", "--direction", "add", "--amount", "1"),
-        ("partial-close", "7", "--percent", "50"),
-    ],
-)
+@pytest.mark.parametrize("command", CLI_POSITION_ACTIONS)
 def test_cli_refuses_another_accounts_position(position_service, command):
     position, base_url = position_service
     endpoint = f"{base_url}/query"

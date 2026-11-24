@@ -463,8 +463,7 @@ def change_margin(
     The amount is a quote, not a cap. Before submitting, a second snapshot
     must match the first, or the change is refused for review.
     """
-    active = get_session()
-    addr = active["evmAddress"]
+    addr = get_session()["evmAddress"]
 
     def build_preview() -> PositionPreview:
         state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
@@ -512,7 +511,7 @@ def change_margin(
     )
     if dry_run:
         return preview
-    result = intents.submit(endpoint, active, preview["intent"])
+    result = intents.submit(endpoint, get_session(), preview["intent"])
     result["quote"] = preview["quote"]
     result["warning"] = MARGIN_WARNING
     return result
@@ -533,8 +532,7 @@ def partial_close(
     The reduction is sized from contract state, checked against the market's
     minimum position size, and re-checked before submitting.
     """
-    active = get_session()
-    addr = active["evmAddress"]
+    addr = get_session()["evmAddress"]
 
     def build_preview() -> PositionPreview:
         state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
@@ -593,7 +591,7 @@ def partial_close(
     )
     if dry_run:
         return preview
-    return intents.submit(endpoint, active, preview["intent"])
+    return intents.submit(endpoint, get_session(), preview["intent"])
 
 
 def _quoted_leverage(inputs: dict[str, Any]) -> Decimal | None:
