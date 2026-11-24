@@ -406,13 +406,17 @@ def command_help(
     home: Home, runner: Runtime, group: str, command: str, flag: str | None = None
 ) -> str | None:
     result = home.invoke(runner, group, command, "--help")
+    stderr_lines = result.stderr.splitlines()
     if (
         runner.rust
         and result.returncode == 2
-        and any(
-            f"unrecognized subcommand '{name}'" in result.stderr
-            or f"Error: No such command '{name}'." in result.stderr.splitlines()
-            for name in (group, command)
+        and (
+            "Error: No such command." in stderr_lines
+            or any(
+                f"unrecognized subcommand '{name}'" in result.stderr
+                or f"Error: No such command '{name}'." in stderr_lines
+                for name in (group, command)
+            )
         )
     ):
         help_text = None
