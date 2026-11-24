@@ -1,6 +1,8 @@
 //! One HTTP/1.1 request with timeouts on connection, socket reads, and writes.
 
-use std::{env, future::ready, io, io::Read as _, path::Path, sync::Arc, time::Duration};
+use std::{
+    env, ffi::OsStr, future::ready, io, io::Read as _, path::Path, sync::Arc, time::Duration,
+};
 
 use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use http_body_util::{BodyExt, Full};
@@ -78,9 +80,14 @@ pub(super) async fn post(
     let request = request
         .body(Full::new(Bytes::from(body)))
         .map_err(|_| request_failed())?;
-    let tls = Arc::new(tls_config()?);
+    let tls = Arc::new(keeper_tls_config()?);
     let socket = if let Some(proxy) = proxy {
-        let socket = connect(proxy.uri(), &tls, timeout).await?;
+        let proxy_tls = if proxy.uri().scheme_str() == Some("https") {
+            Arc::new(proxy_tls_config())
+        } else {
+            Arc::clone(&tls)
+        };
+        let socket = connect(proxy.uri(), &proxy_tls, timeout).await?;
         if forward {
             socket
         } else {
@@ -237,7 +244,7 @@ async fn receive(
     Ok((parts.status, bytes))
 }
 
-fn tls_config() -> Result<ClientConfig, SaiError> {
+fn keeper_tls_config() -> Result<ClientConfig, SaiError> {
     let mut roots = RootCertStore::empty();
     // HTTPX treats an explicit file or CA directory as the entire trust store.
     if let Some(file) = env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) {
@@ -246,15 +253,48 @@ fn tls_config() -> Result<ClientConfig, SaiError> {
             return Err(SaiError::internal());
         }
     } else if let Some(dirs) = env::var_os("SSL_CERT_DIR").filter(|value| !value.is_empty()) {
-        for dir in env::split_paths(&dirs).filter(|path| !path.as_os_str().is_empty()) {
-            ca_dir::add_roots(&mut roots, &dir);
-        }
+        append_ca_dirs(&mut roots, &dirs);
     } else {
         roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
         if roots.is_empty() {
             roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         }
     }
+    Ok(tls_config(roots))
+}
+
+fn proxy_tls_config() -> ClientConfig {
+    // HTTPcore creates the proxy's default SSL context with the OpenSSL
+    // default paths, then adds its bundled Mozilla roots. The environment
+    // can override the default file and directory independently.
+    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let file = env::var_os("SSL_CERT_FILE");
+    let dirs = env::var_os("SSL_CERT_DIR");
+    if file.is_none() && dirs.is_none() {
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    } else {
+        let defaults = openssl_probe::probe();
+        if let Some(file) = file.map(std::path::PathBuf::from).or(defaults.cert_file) {
+            let _ = add_pem_file(&mut roots, &file);
+        }
+        if let Some(dirs) = dirs {
+            append_ca_dirs(&mut roots, &dirs);
+        } else {
+            for dir in defaults.cert_dir {
+                ca_dir::add_roots(&mut roots, &dir);
+            }
+        }
+    }
+    tls_config(roots)
+}
+
+fn append_ca_dirs(roots: &mut RootCertStore, dirs: &OsStr) {
+    for dir in env::split_paths(dirs).filter(|path| !path.as_os_str().is_empty()) {
+        ca_dir::add_roots(roots, &dir);
+    }
+}
+
+fn tls_config(roots: RootCertStore) -> ClientConfig {
     let mut config =
         ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
             .with_safe_default_protocol_versions()
@@ -262,7 +302,7 @@ fn tls_config() -> Result<ClientConfig, SaiError> {
             .with_root_certificates(roots)
             .with_no_client_auth();
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    Ok(config)
+    config
 }
 
 fn add_pem_file(roots: &mut RootCertStore, path: &Path) -> Result<(), SaiError> {

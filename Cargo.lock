@@ -1129,6 +1129,7 @@ dependencies = [
  "hyper-timeout",
  "hyper-util",
  "num-bigint",
+ "openssl-probe",
  "regex",
  "ring",
  "rusqlite",

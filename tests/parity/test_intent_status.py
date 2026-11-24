@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import json
 import os
+import select
 import shutil
 import socket
 import sqlite3
@@ -817,36 +818,50 @@ def keeper_certificate(
             f"{name}.pem",
             "-addext",
             "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            "keyUsage=critical,keyCertSign,cRLSign",
         )
-    openssl(
-        "req",
-        "-new",
-        *key_args,
-        "-subj",
-        "/CN=127.0.0.1",
-        "-keyout",
-        "server.key",
-        "-out",
-        "server.csr",
+    (certs / "server.ext").write_text(
+        "subjectAltName=IP:127.0.0.1\n"
+        "basicConstraints=critical,CA:FALSE\n"
+        "keyUsage=critical,digitalSignature\n"
+        "extendedKeyUsage=serverAuth\n"
+        "authorityKeyIdentifier=keyid,issuer\n",
+        encoding="ascii",
     )
-    (certs / "server.ext").write_text("subjectAltName=IP:127.0.0.1\n", encoding="ascii")
-    openssl(
-        "x509",
-        "-req",
-        "-in",
-        "server.csr",
-        "-CA",
-        "keeper-ca.pem",
-        "-CAkey",
-        "keeper-ca.key",
-        "-CAcreateserial",
-        "-out",
-        "server.pem",
-        "-days",
-        "2",
-        "-extfile",
-        "server.ext",
-    )
+    for name, issuer in (("server", "keeper-ca"), ("proxy", "other-ca")):
+        openssl(
+            "req",
+            "-new",
+            *key_args,
+            "-subj",
+            "/CN=127.0.0.1",
+            "-keyout",
+            f"{name}.key",
+            "-out",
+            f"{name}.csr",
+        )
+        openssl(
+            "x509",
+            "-req",
+            "-in",
+            f"{name}.csr",
+            "-CA",
+            f"{issuer}.pem",
+            "-CAkey",
+            f"{issuer}.key",
+            "-CAcreateserial",
+            "-out",
+            f"{name}.pem",
+            "-days",
+            "2",
+            "-extfile",
+            "server.ext",
+        )
+    proxy_roots = certs / "proxy-roots"
+    proxy_roots.mkdir()
+    shutil.copy(certs / "other-ca.pem", proxy_roots / "other-ca.pem")
+    openssl("rehash", "proxy-roots")
     hashed = certs / "hashed"
     hashed.mkdir()
     shutil.copy(certs / "keeper-ca.pem", hashed / "keeper-ca.pem")
@@ -995,3 +1010,124 @@ def test_no_proxy_matches_keeper_destination(
                     wire(keeper.INTENTS, user=ADDR, key=None),
                 )
             ]
+
+
+@contextmanager
+def tls_proxy(
+    context: ssl.SSLContext, keeper_url: str
+) -> Iterator[tuple[str, list[str]]]:
+    authority = keeper_url.removeprefix("https://").split("/", 1)[0]
+    host, port = authority.split(":", 1)
+    requests: list[str] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_CONNECT(self) -> None:
+            requests.append(self.path)
+            if self.path != authority:
+                self.send_error(400)
+                return
+            with socket.create_connection((host, int(port)), timeout=3) as upstream:
+                self.send_response(200, "Connection established")
+                self.end_headers()
+                self.connection.settimeout(3)
+                # The proxy terminates its own TLS, then forwards opaque bytes
+                # for the separate TLS handshake and request with Keeper.
+                with suppress(OSError):
+                    while True:
+                        pending = self.connection.pending()
+                        readable = (
+                            [self.connection]
+                            if pending
+                            else select.select([self.connection, upstream], [], [], 3)[
+                                0
+                            ]
+                        )
+                        if not readable:
+                            return
+                        for source in readable:
+                            data = source.recv(16384)
+                            if not data:
+                                return
+                            peer = (
+                                upstream
+                                if source is self.connection
+                                else self.connection
+                            )
+                            peer.sendall(data)
+
+        def log_message(self, format: str, *args: Any) -> None:
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        worker = threading.Thread(
+            target=server.serve_forever, args=(0.01,), daemon=True
+        )
+        worker.start()
+        try:
+            yield f"https://127.0.0.1:{server.server_port}", requests
+        finally:
+            server.shutdown()
+            worker.join()
+
+
+@pytest.mark.parametrize(
+    "mode",
+    ["split_cas", "file_trusts_proxy", "dir_trusts_proxy", "keeper_ignores_proxy_dir"],
+)
+def test_https_proxy_and_keeper_use_httpx_trust_sources(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    mode: str,
+) -> None:
+    keeper_context, certs = keeper_certificate
+    proxy_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    same_ca = mode in {"file_trusts_proxy", "dir_trusts_proxy"}
+    leaf = "server" if same_ca else "proxy"
+    proxy_context.load_cert_chain(certs / f"{leaf}.pem", certs / f"{leaf}.key")
+    trust = {
+        "split_cas": {
+            "SSL_CERT_FILE": str(certs / "keeper-ca.pem"),
+            "SSL_CERT_DIR": str(certs / "proxy-roots"),
+        },
+        "file_trusts_proxy": {"SSL_CERT_FILE": str(certs / "keeper-ca.pem")},
+        "dir_trusts_proxy": {"SSL_CERT_DIR": str(certs / "hashed")},
+        "keeper_ignores_proxy_dir": {
+            "SSL_CERT_FILE": str(certs / "other-ca.pem"),
+            "SSL_CERT_DIR": str(certs / "hashed"),
+        },
+    }[mode]
+    accepted = mode != "keeper_ignores_proxy_dir"
+    with (
+        replay(keeper_context) as (endpoint, replies, requests),
+        tls_proxy(proxy_context, endpoint) as (proxy_url, connects),
+    ):
+        for index, cli in enumerate(cli_pair):
+            connects.clear()
+            requests.clear()
+            if accepted:
+                replies.append(response("absent"))
+            result = invoke(
+                cli,
+                tmp_path / str(index),
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "status",
+                ADDR,
+                overrides={**trust, "HTTPS_PROXY": proxy_url},
+            )
+            assert result.returncode == (0 if accepted else 4), result.stdout
+            assert not result.stderr
+            assert connects == [endpoint.removeprefix("https://").split("/", 1)[0]]
+            assert not replies
+            assert [request.body for request in requests] == (
+                [wire(keeper.INTENTS, user=ADDR, key=None)] if accepted else []
+            )
+            output = json.loads(result.stdout)
+            if accepted:
+                assert output == {"userIntents": []}
+            else:
+                assert output["error"]["code"] == "NOT_SENT"
