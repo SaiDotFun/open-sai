@@ -168,7 +168,9 @@ START_EVENTS = {"command.start", "mcp.tool_call"}
 def _scan(
     root: Path | None,
     before: str | None,
-    anchor: Callable[[LogLine], bool],
+    anchor: Callable[[LogLine], bool] | None = None,
+    *,
+    observe_context: Callable[[LogLine], None] | None = None,
 ) -> tuple[list[LogLine], bool, str | None, str | None]:
     instant = _before(before)
     cutoff = log.stamp(instant) if instant else None
@@ -178,13 +180,19 @@ def _scan(
         max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
         max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
     )
+
+    def accept_context(line: LogLine) -> bool:
+        if observe_context is not None:
+            observe_context(line)
+        return anchor is not None and anchor(line)
+
     log.flush(1.0)
     rows = [
         line
         for line in scan.rows(
             root,
             last_day=page_day,
-            accept=lambda line: _in_window(line, cutoff) or anchor(line),
+            accept=lambda line: _in_window(line, cutoff) or accept_context(line),
             frontier_before=cutoff,
         )
         if _timestamp(line)
@@ -204,7 +212,10 @@ def _scan(
         following = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
         rows.extend(
             following.rows(
-                root, days={page_day + timedelta(days=1)}, prefix=True, accept=anchor
+                root,
+                days={page_day + timedelta(days=1)},
+                prefix=True,
+                accept=accept_context,
             )
         )
         scan.visited.update(following.visited)
@@ -214,7 +225,8 @@ def _scan(
     missing = {
         invocation: date.fromisoformat(ts[:10]) - timedelta(days=1)
         for line in rows
-        if anchor(line)
+        if anchor is not None
+        and anchor(line)
         and (invocation := _invocation(line)) is not None
         and invocation not in starts
         and (ts := _timestamp(line))
@@ -457,11 +469,26 @@ def run(
     def matches_id(line: LogLine) -> bool:
         return identifier in (_id(line, "runId"), _id(line, "callId"))
 
-    rows, scan_truncated, cutoff, frontier = _scan(root, before, matches_id)
+    runs = {identifier}
+
+    def remember_call_run(line: LogLine) -> None:
+        # A newer call event can identify the parent of an earlier gap.
+        # The event itself does not need a slot in this page's row budget.
+        if (
+            _id(line, "callId") == identifier
+            and line.get("event") != "log.dropped"
+            and (run_id := _id(line, "runId"))
+            and _timestamp(line)
+        ):
+            runs.add(run_id)
+
+    rows, scan_truncated, cutoff, frontier = _scan(
+        root, before, observe_context=remember_call_run
+    )
     events = [
         line for line in rows if line.get("event") != "log.dropped" and matches_id(line)
     ]
-    runs = {identifier} | {_id(line, "runId") for line in events} - {None}
+    runs.update(run_id for line in events if (run_id := _id(line, "runId")))
     entries = [("events", line) for line in events if _in_window(line, cutoff)]
     entries.extend(
         ("gaps", line)

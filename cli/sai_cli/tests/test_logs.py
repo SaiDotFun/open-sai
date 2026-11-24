@@ -2247,6 +2247,57 @@ def test_log_reports_cap_rows_and_bytes_and_offer_earlier_timestamps(home):
     assert len(log_queries.run("process")["events"]) == log_queries.MAX_REPORT_ROWS
 
 
+def test_logs_run_before_skips_newer_rows_in_long_run(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    rows = [
+        {
+            "event": "command.start",
+            "runId": "process",
+            "seq": i,
+            "ts": log.stamp(start + timedelta(milliseconds=i)),
+        }
+        for i in range(21_000)
+    ]
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(log.encode(row) for row in rows)
+    )
+
+    before = log.stamp(start + timedelta(milliseconds=10))
+    code, output = run_cli("--json", "logs", "run", "process", "--before", before)
+    assert code == 0
+    report = json.loads(output)
+    assert report["events"] == rows[:10]
+    assert "truncated" not in report
+
+
+def test_logs_run_before_attributes_gap_using_later_call_event(home):
+    root = home / "logs"
+    root.mkdir()
+    gap = {
+        "event": "log.dropped",
+        "count": 2,
+        "runId": "process",
+        "ts": "2026-11-24T00:00:00.000Z",
+    }
+    result = {
+        "event": "mcp.tool_result",
+        "callId": "call",
+        "runId": "process",
+        "ts": "2026-11-24T00:00:01.000Z",
+    }
+    log.file_path("mcp", date(2026, 11, 24), root).write_bytes(
+        log.encode(gap) + log.encode(result)
+    )
+
+    code, output = run_cli("--json", "logs", "run", "call", "--before", result["ts"])
+    assert code == 0
+    report = json.loads(output)
+    assert report["events"] == []
+    assert report["gaps"] == [gap]
+
+
 def test_earlier_intent_page_keeps_same_day_invocation_anchor(home, keeper_stub):
     endpoint, state = keeper_stub
     state.intents = [
