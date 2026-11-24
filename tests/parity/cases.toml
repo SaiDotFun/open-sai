@@ -1076,9 +1076,9 @@ server = "position-index-lag"
 expect = 1
 wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw", "trade", "get_trade_raw", "trade", "get_trade_raw"]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted." }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted." }
 accepted_difference = "Python retries stale Keeper index reads. Rust refuses the stale snapshot immediately."
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.message" = "Indexed position differs from contract state; wait for synchronization and retry" } }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state; wait for synchronization and retry" } }
 
 [[case]]
 name = "trade-partial-close-market-minimum"
