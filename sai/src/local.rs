@@ -7,16 +7,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use chrono::Utc;
 use clap::Subcommand;
 use sai_core::{
     errors::{Code, ExitCode, SaiError},
     keeper,
     log::{EventContext, Field, Level},
     reconcile,
-    session::expired,
     settings::{Environment, Flags},
-    storage::{IntentStatus, RemovedSession, SessionSummary, Storage, StorageEvent},
+    storage::{IntentStatus, Storage, StorageEvent},
     wait,
 };
 use serde::Serialize;
@@ -25,18 +23,6 @@ use serde_json::{Value, json};
 use tokio::signal::unix::{self, Signal, SignalKind};
 
 use crate::{load_settings, usage};
-
-#[derive(Subcommand)]
-pub enum AuthCommand {
-    /// Show the current account and expiry.
-    Status,
-    /// List connected accounts and which one is active.
-    List,
-    /// Make a connected account active.
-    Use { addr: String },
-    /// Remove the specified account or the active account.
-    Logout { addr: Option<String> },
-}
 
 #[derive(Subcommand)]
 pub enum IntentCommand {
@@ -86,93 +72,6 @@ pub fn intent_help(command: &str) -> Option<String> {
     Some(format!("{}\n\n{help}", usage(command)))
 }
 
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct AccountRow<'a> {
-    #[serde(flatten)]
-    summary: SessionSummary<'a>,
-    active: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    expired: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    endpoint_matches: Option<bool>,
-}
-
-#[derive(Serialize)]
-struct AccountList<'a> {
-    accounts: Vec<AccountRow<'a>>,
-}
-
-#[derive(Serialize)]
-struct Logout {
-    removed: bool,
-    addr: Option<String>,
-    note: &'static str,
-}
-
-pub fn auth(
-    command: AuthCommand,
-    as_addr: Option<&str>,
-    flags: &Flags,
-    env: &Environment,
-    json: bool,
-    events: EventContext<'_>,
-) -> Result<(), SaiError> {
-    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
-    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
-    match command {
-        AuthCommand::Status => {
-            let settings = load_settings(flags, env)?;
-            let session = storage.load_active_session(settings.endpoint(), as_addr)?;
-            emit(&session.summary()?, json)
-        }
-        AuthCommand::List => {
-            let settings = load_settings(flags, env)?;
-            let accounts = storage.load_accounts()?;
-            let now = Utc::now();
-            let accounts = accounts
-                .iter()
-                .map(|(session, active)| {
-                    Ok(AccountRow {
-                        summary: session.summary()?,
-                        active,
-                        expired: Some(expired(session, now)?),
-                        endpoint_matches: Some(session.endpoint() == Some(settings.endpoint())),
-                    })
-                })
-                .collect::<Result<_, sai_core::storage::StorageError>>()?;
-            emit(&AccountList { accounts }, json)
-        }
-        AuthCommand::Use { addr } => {
-            let session = storage.use_session(&addr)?;
-            emit(
-                &AccountRow {
-                    summary: session.summary()?,
-                    active: true,
-                    expired: None,
-                    endpoint_matches: None,
-                },
-                json,
-            )
-        }
-        AuthCommand::Logout { addr } => {
-            let removed =
-                storage.delete_session(addr.as_deref().filter(|s| !s.is_empty()).or(as_addr))?;
-            emit(
-                &Logout {
-                    removed: removed.is_some(),
-                    addr: match removed {
-                        Some(RemovedSession::Account(addr)) => Some(addr),
-                        _ => None,
-                    },
-                    note: "Keeper cannot revoke session tokens yet; the token stays valid until it expires.",
-                },
-                json,
-            )
-        }
-    }
-}
-
 pub fn intent(
     command: IntentCommand,
     as_addr: Option<&str>,
@@ -181,8 +80,6 @@ pub fn intent(
     json: bool,
     events: EventContext<'_>,
 ) -> Result<ExitCode, SaiError> {
-    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
-    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let started = Instant::now();
     let timeout = if let IntentCommand::Wait { timeout, .. } = &command {
         let seconds = timeout.trim().parse::<f64>().map_err(|_| {
@@ -196,6 +93,10 @@ pub fn intent(
         None
     };
     let settings = load_settings(flags, env)?;
+    let log_storage = |event: StorageEvent<'_>| {
+        storage_event_with_endpoint(events, event, Some(settings.endpoint()))
+    };
+    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     match command {
         IntentCommand::Status { addr, key } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -391,7 +292,7 @@ fn wait_output(
         if let Some(addr) = body["addr"].as_str().filter(|addr| !addr.is_empty()) {
             args.extend(["--addr", addr]);
         }
-        body["hint"] = json!(Storage::new(&env.home).keeper_command_hint(endpoint, &args));
+        body["hint"] = json!(Storage::new(&env.home).trade_command_hint(endpoint, &args));
     }
     if let Some(message) = body["message"].as_str() {
         body["message"] = json!(sai_core::log::redact(&env.home, message));
@@ -498,15 +399,66 @@ pub(crate) fn storage_event_with_endpoint(
                     ("code", json!(Code::SessionExpired).into()),
                     ("addr", json!(addr).into()),
                     ("expiresAt", json!(expires_at).into()),
+                    ("endpointId", endpoint_id()),
                 ],
             );
         }
-        _ => {}
+        StorageEvent::SessionSaved {
+            addr,
+            expires_at,
+            endpoint,
+            connected_accounts,
+        } => {
+            events.event(
+                "session.saved",
+                Level::Info,
+                [
+                    ("addr", json!(addr).into()),
+                    ("expiresAt", json!(expires_at).into()),
+                    (
+                        "endpoint",
+                        endpoint
+                            .map_or_else(|| json!(null).into(), |url| Field::Endpoint(url.into())),
+                    ),
+                    ("connectedAccounts", json!(connected_accounts).into()),
+                ],
+            );
+        }
+        StorageEvent::SessionActive { addr } => {
+            events.event(
+                "session.active",
+                Level::Info,
+                [("addr", json!(addr).into())],
+            );
+        }
+        StorageEvent::SessionRemoved {
+            addr,
+            connected_accounts,
+        } => {
+            events.event(
+                "session.removed",
+                Level::Info,
+                [
+                    ("addr", json!(addr).into()),
+                    ("connectedAccounts", json!(connected_accounts).into()),
+                ],
+            );
+        }
+        StorageEvent::UnreadableSessionRemoved => {
+            events.event(
+                "session.removed",
+                Level::Warn,
+                [
+                    ("code", json!(Code::SessionUnavailable).into()),
+                    ("reason", json!("unreadable session file").into()),
+                ],
+            );
+        }
     }
 }
 
 // Match the spaces Python emits with json.dumps(indent=None).
-struct InlineJson;
+pub(crate) struct InlineJson;
 
 impl Formatter for InlineJson {
     fn begin_array_value<W: Write + ?Sized>(

@@ -115,7 +115,7 @@ fn signed_out_trade_hides_keeper_query_path_in_hint() {
 }
 
 #[test]
-fn signed_out_auth_retains_the_c4_query_hint() {
+fn signed_out_auth_hint_shows_only_the_keeper_origin() {
     let home = tempdir().unwrap();
     let endpoint = format!("{ENDPOINT}/query");
     let output = rust(home.path())
@@ -126,7 +126,9 @@ fn signed_out_auth_retains_the_c4_query_hint() {
     let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
     assert_eq!(
         error["hint"],
-        format!("sai --endpoint {endpoint} auth login NAME")
+        format!(
+            r#"sai --endpoint "${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {ENDPOINT}}}" auth login NAME"#
+        )
     );
     let output = rust(home.path())
         .args(["--json", "--endpoint", ENDPOINT, "auth", "status"])
@@ -136,7 +138,7 @@ fn signed_out_auth_retains_the_c4_query_hint() {
     let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
     assert_eq!(
         error["hint"],
-        r#"sai --endpoint "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME"#
+        format!("sai --endpoint {ENDPOINT} auth login NAME")
     );
 }
 

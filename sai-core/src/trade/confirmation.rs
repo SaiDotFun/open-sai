@@ -191,6 +191,9 @@ pub fn digest_bytes(preview: &TradePreview, account: Option<&str>) -> Vec<u8> {
     if let Some(quote) = &preview.quote {
         material["quote"] = quote.clone();
     }
+    if let Some(route) = &preview.position_route {
+        material["positionRoute"] = json!(route);
+    }
     material.sort_all_objects();
     let mut canonical = String::new();
     for ch in material.to_string().chars() {
@@ -243,6 +246,36 @@ mod tests {
             assert_eq!(
                 preview_digest(&preview, account),
                 case["digest"].as_str().unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn cancel_confirmation_refusal_carries_the_market_close_warning() {
+        use crate::trade::close_preview;
+
+        let account = "0xaa00000000000000000000000000000000000001";
+        let old = close_preview("8", true).unwrap();
+        let current = close_preview("7", true).unwrap();
+        let digest = preview_digest(&old, Some(account));
+        let refusal = Confirmation::new(&digest, None)
+            .unwrap()
+            .verify(&current, account)
+            .unwrap_err();
+        assert_eq!(refusal.code, Code::PreviewMismatch);
+        let replacement = &refusal.details.unwrap()["preview"];
+        assert_eq!(replacement["intent"]["target"]["userTradeId"], "7");
+        assert_eq!(
+            replacement["previewDigest"],
+            preview_digest(&current, Some(account))
+        );
+        for name in ["fees", "liquidationPrice", "worstCaseFill"] {
+            assert_eq!(
+                replacement["estimates"][name],
+                json!({
+                    "status": "unavailable",
+                    "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
+                })
             );
         }
     }

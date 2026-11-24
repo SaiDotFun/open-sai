@@ -29,17 +29,7 @@ impl Trading<'_> {
         self.storage
             .check_active_trade(session, self.keeper.endpoint())?;
         self.check_pending_order(session, preview).await?;
-        let unavailable = json!({
-            "status": "unavailable",
-            "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
-        });
-        let mut output = preview.output(Some(session.addr()));
-        output["estimates"] = json!({
-            "fees": unavailable,
-            "liquidationPrice": unavailable,
-            "worstCaseFill": unavailable,
-        });
-        Ok(output)
+        Ok(preview.output(Some(session.addr())))
     }
 
     pub(super) async fn check_pending_order(
@@ -77,11 +67,10 @@ impl Trading<'_> {
             .ok_or_else(|| incomplete("TypeError"))?
             .get("enabled")
             .ok_or_else(|| incomplete("KeyError"))?;
-        let info = node["default_node_info"].as_object();
+        let network = node["default_node_info"]["network"].as_str();
         if !keeper::truthy(enabled)
-            || info.is_none()
-            || &node["default_node_info"]["network"]
-                != route.get("chainId").ok_or_else(|| incomplete("KeyError"))?
+            || !network
+                .is_some_and(|id| !id.trim().is_empty() && route["chainId"].as_str() == Some(id))
         {
             return Err(invalid("Keeper trading route and LCD network do not match"));
         }
@@ -91,6 +80,12 @@ impl Trading<'_> {
             .as_str()
             .ok_or_else(|| incomplete("TypeError"))?;
         let trade = read_cancel_target(lcd, contract, session.addr(), id).await?;
+        let owner = trade["user"].as_str().and_then(keeper::canonical_account);
+        if owner.is_none() || owner != keeper::canonical_account(session.addr()) {
+            return Err(invalid(&format!(
+                "Trade {id} was not found for this account."
+            )));
+        }
         if trade["user_trade_index"] != format!("UserTradeIndex({id})")
             || trade["is_open"].as_bool() != Some(true)
             || !matches!(trade["trade_type"].as_str(), Some("limit" | "stop"))
@@ -101,6 +96,18 @@ impl Trading<'_> {
         }
         Ok(())
     }
+}
+
+pub(super) fn estimates() -> Value {
+    let unavailable = json!({
+        "status": "unavailable",
+        "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
+    });
+    json!({
+        "fees": unavailable,
+        "liquidationPrice": unavailable,
+        "worstCaseFill": unavailable,
+    })
 }
 
 async fn read_cancel_target(
@@ -149,7 +156,7 @@ fn read_object(success: bool, bytes: &[u8]) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-fn lcd_url(raw: &str) -> Result<Url, SaiError> {
+pub(super) fn lcd_url(raw: &str) -> Result<Url, SaiError> {
     let Some(endpoint) = Endpoint::split(raw).filter(|endpoint| {
         endpoint.scheme == "https"
             || (endpoint.scheme == "http"

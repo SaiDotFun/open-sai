@@ -399,6 +399,11 @@ def check_url(url: str, label: str, secure: str = "https") -> None:
         raise ValueError(f"Credentials are not allowed in the {label} URL")
 
 
+@dataclass
+class RequestAttempt:
+    transport_started: bool = False
+
+
 def request(
     endpoint: str,
     query: str,
@@ -407,6 +412,7 @@ def request(
     timeout: float = 20,
     *,
     trace_intent: bool = True,
+    attempt: RequestAttempt | None = None,
 ) -> dict[str, Any]:
     """Send one GraphQL request; TIMEOUT applies to each phase in seconds.
 
@@ -418,7 +424,7 @@ def request(
     started = time.monotonic()
     outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
     try:
-        data = _request(endpoint, query, variables, token, timeout, outcome)
+        data = _request(endpoint, query, variables, token, timeout, outcome, attempt)
         outcome["status"] = "ok"
         del outcome["code"]
         return data
@@ -429,13 +435,19 @@ def request(
         outcome.update(status="rejected", code=exc.code)
         raise
     except KeeperError as exc:
+        may_have_sent = query == SUBMIT and (
+            attempt is None or attempt.transport_started
+        )
         outcome.update(
-            error=str(exc), code=Code.OUTCOME_UNKNOWN if query == SUBMIT else exc.code
+            error=str(exc), code=Code.OUTCOME_UNKNOWN if may_have_sent else exc.code
         )
         raise
     except KeyboardInterrupt:
         if query == SUBMIT:
-            outcome["code"] = Code.OUTCOME_UNKNOWN
+            if attempt is not None and not attempt.transport_started:
+                outcome.update(status="not_sent", code=Code.NOT_SENT)
+            else:
+                outcome["code"] = Code.OUTCOME_UNKNOWN
         raise
     finally:
         _log_request(endpoint, query, variables, token, started, outcome, trace_intent)
@@ -497,6 +509,7 @@ def _request(
     token: str | None,
     timeout: float,
     outcome: dict[str, Any],
+    attempt: RequestAttempt | None,
 ) -> dict[str, Any]:
     """Send the request and record what Keeper answered in OUTCOME."""
     try:
@@ -504,10 +517,13 @@ def _request(
     except ValueError as exc:
         raise KeeperError(str(exc)) from exc
     headers = {"Authorization": f"Bearer {token}"} if token else {}
+    payload = {"query": query, "variables": variables or {}}
     try:
+        if attempt is not None:
+            attempt.transport_started = True
         response = httpx.post(
             endpoint,
-            json={"query": query, "variables": variables or {}},
+            json=payload,
             headers=headers,
             timeout=timeout,
         )
@@ -738,6 +754,12 @@ def canonical_account(value: object) -> str | None:
     for symbol in symbols[:-6]:
         payload = (payload << 5) | symbol
     return "0x" + payload.to_bytes(20, "big").hex()
+
+
+def same_account(first: object, second: object) -> bool:
+    """Compare two valid EVM or Nibiru addresses by account identity."""
+    account = canonical_account(first)
+    return account is not None and account == canonical_account(second)
 
 
 @dataclass(frozen=True)

@@ -23,8 +23,8 @@ use uuid::Uuid;
 use crate::settings::{self, Environment};
 
 use files::LogDir;
-pub use privacy::Field;
 use privacy::{Budget, EVENT_CHARS, prefix};
+pub use privacy::{Field, origin};
 use session_tokens::{FileStamp, Tokens, stamp};
 
 const QUEUE_SIZE: usize = 2048;
@@ -32,8 +32,17 @@ const QUEUE_CHARS: usize = 4 * 1024 * 1024;
 const MAX_LINE: usize = 16 * 1024;
 pub const EXIT_FLUSH: Duration = Duration::from_millis(300);
 
-const COMMON: [&str; 8] = [
-    "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
+const COMMON: [&str; 10] = [
+    "ts",
+    "level",
+    "event",
+    "surface",
+    "pid",
+    "version",
+    "runId",
+    "seq",
+    "schema",
+    "commandId",
 ];
 static RUN_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -118,12 +127,15 @@ struct Event {
     level: Level,
     fields: Field,
     chars: usize,
+    endpoint_digest: Option<[u8; 32]>,
+    command_bound: bool,
 }
 
 pub struct LogWriter {
-    events: SyncSender<Event>,
+    events: SyncSender<QueueItem>,
     done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
+    command_schema: bool,
 }
 
 /// Log events that occur while handling a CLI command or an MCP call.
@@ -152,17 +164,42 @@ impl EventContext<'_> {
 impl LogWriter {
     /// Start a writer for one Sai home. Filesystem work stays on its thread.
     pub fn start(env: Environment) -> Option<Self> {
+        Self::start_bound(env, None, settings::log_keep_days)
+    }
+
+    /// Start a writer with the v2 CLI command envelope.
+    pub fn start_command(env: Environment) -> Option<Self> {
+        Self::start_bound(
+            env,
+            Some(Uuid::new_v4().simple().to_string()),
+            settings::log_keep_days,
+        )
+    }
+
+    pub fn start_diagnostic_command(env: Environment) -> Option<Self> {
+        Self::start_bound(env, Some(Uuid::new_v4().simple().to_string()), |env| {
+            let (enabled, days) = settings::doctor_log_settings(env);
+            enabled.then(|| days.as_u64().unwrap_or(u64::MAX))
+        })
+    }
+
+    fn start_bound(
+        env: Environment,
+        command_id: Option<String>,
+        log_days: fn(&Environment) -> Option<u64>,
+    ) -> Option<Self> {
         if settings::log_disabled_in_env(&env) {
             return None;
         }
         let (events, pending) = mpsc::sync_channel(QUEUE_SIZE);
         let (done_signal, done) = mpsc::channel();
         let queue = Arc::new(Queue::default());
+        let command_schema = command_id.is_some();
         let worker_queue = Arc::clone(&queue);
         thread::Builder::new()
             .name("sai-log".into())
             .spawn(move || {
-                drain(env, pending, &worker_queue);
+                drain(env, pending, &worker_queue, command_id.as_deref(), log_days);
                 let _ = done_signal.send(());
             })
             .ok()?;
@@ -170,6 +207,7 @@ impl LogWriter {
             events,
             done: Mutex::new(done),
             queue,
+            command_schema,
         })
     }
 
@@ -185,6 +223,8 @@ impl LogWriter {
         let sequence = SEQUENCE.fetch_add(1, Relaxed);
         let known = KNOWN.try_lock().ok().map(|value| Arc::clone(&value));
         let mut budget = Budget::new();
+        let mut endpoint_digest = None;
+        let mut command_bound = false;
         let fields = Field::Object(
             fields
                 .into_iter()
@@ -196,6 +236,24 @@ impl LogWriter {
                     }
                 })
                 .take(65)
+                .inspect(|(key, field)| {
+                    command_bound |= *key == "command";
+                    if self.command_schema
+                        && matches!(name, "keeper.request" | "intent.keeper")
+                        && *key == "endpoint"
+                        && let Field::Endpoint(url) = field
+                        && let Field::EndpointIdentity(digest) = Field::endpoint_identity(url)
+                    {
+                        endpoint_digest = Some(digest);
+                    }
+                    if self.command_schema
+                        && *key == "endpointId"
+                        && let Field::EndpointIdentity(digest) = field
+                    {
+                        endpoint_digest = Some(*digest);
+                    }
+                })
+                .filter(|(_, field)| !matches!(field, Field::EndpointIdentity(_)))
                 .collect(),
         )
         .snapshot(&mut budget, known.as_deref().unwrap_or_default(), 0);
@@ -214,10 +272,20 @@ impl LogWriter {
             level,
             fields,
             chars,
+            endpoint_digest,
+            command_bound,
         };
-        if self.events.try_send(event).is_err() {
+        if self.events.try_send(QueueItem::Event(event)).is_err() {
             self.queue.chars.fetch_sub(chars, Relaxed);
             self.queue.dropped.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Wait for already queued diagnostics before inspecting log files.
+    pub fn flush(&self, timeout: Duration) {
+        let (ack, done) = mpsc::channel();
+        if self.events.try_send(QueueItem::Flush(ack)).is_ok() {
+            let _ = done.recv_timeout(timeout);
         }
     }
 
@@ -230,19 +298,37 @@ impl LogWriter {
     }
 }
 
-fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
+enum QueueItem {
+    Event(Event),
+    Flush(mpsc::Sender<()>),
+}
+
+fn drain(
+    env: Environment,
+    events: Receiver<QueueItem>,
+    queue: &Queue,
+    command_id: Option<&str>,
+    log_days: fn(&Environment) -> Option<u64>,
+) {
     let config_path = env.path();
     let log_path = env.home.join("logs");
     let mut config: Option<(Option<FileStamp>, Option<u64>)> = None;
     let mut checked_day = None;
     let mut tokens = Tokens::default();
-    for event in events {
+    for item in events {
+        let event = match item {
+            QueueItem::Event(event) => event,
+            QueueItem::Flush(ack) => {
+                let _ = ack.send(());
+                continue;
+            }
+        };
         queue.chars.fetch_sub(event.chars, Relaxed);
         let current_stamp = stamp(&config_path);
         let keep = match config {
             Some((previous, keep)) if previous == current_stamp => keep,
             _ => {
-                let keep = settings::log_keep_days(&env);
+                let keep = log_days(&env);
                 config = Some((current_stamp, keep));
                 keep
             }
@@ -258,6 +344,7 @@ fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
             event,
             known.as_deref().unwrap_or_default(),
             queue,
+            command_id,
         );
         let today: NaiveDate = Utc::now().date_naive();
         if Some(today) != checked_day {
@@ -267,7 +354,13 @@ fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
     }
 }
 
-fn write(directory: &LogDir, mut event: Event, tokens: &[String], queue: &Queue) {
+fn write(
+    directory: &LogDir,
+    event: Event,
+    tokens: &[String],
+    queue: &Queue,
+    command_id: Option<&str>,
+) {
     let mut line = Map::new();
     line.insert(
         "ts".into(),
@@ -280,23 +373,22 @@ fn write(directory: &LogDir, mut event: Event, tokens: &[String], queue: &Queue)
     line.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
     line.insert("runId".into(), json!(RUN_ID.as_str()));
     line.insert("seq".into(), json!(event.sequence));
-    if let Field::Object(fields) = &mut event.fields
-        && let Some(index) = fields.iter().position(|(name, field)| {
-            name == "endpointId" && matches!(field, Field::EndpointIdentity(_))
-        })
-        && let (_, Field::EndpointIdentity(identity)) = fields.remove(index)
-    {
-        #[cfg(unix)]
-        if let Ok(key) = directory.endpoint_key() {
-            use ring::hmac;
-
-            let mut id = String::from("h1_");
-            let hash = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &key), &identity);
-            for byte in hash.as_ref() {
-                let _ = write!(id, "{byte:02x}");
-            }
-            line.insert("endpointId".into(), json!(id));
+    if let Some(command_id) = command_id {
+        line.insert("schema".into(), json!(2));
+        if event.command_bound {
+            line.insert("commandId".into(), json!(command_id));
         }
+    }
+    if let Some(digest) = event.endpoint_digest
+        && let Ok(key) = directory.endpoint_key()
+    {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key);
+        let signature = ring::hmac::sign(&key, &digest);
+        let mut encoded = String::from("h1_");
+        for byte in signature.as_ref() {
+            let _ = write!(encoded, "{byte:02x}");
+        }
+        line.insert("endpointId".into(), json!(encoded));
     }
     if let Value::Object(fields) = event.fields.clean(tokens) {
         for (key, field) in fields {

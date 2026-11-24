@@ -3,6 +3,8 @@
 mod actions;
 mod cancel;
 mod confirmation;
+mod position;
+mod update;
 
 use std::future::{Future, pending};
 
@@ -20,6 +22,7 @@ use crate::{
 
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
+pub use update::{leverage_preview, tpsl_preview};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TradeIntent {
@@ -55,6 +58,8 @@ pub struct TradePreview {
     pub reference_price: Option<String>,
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
+    position_route: Option<position::PositionRoute>,
+    estimates: Option<Value>,
 }
 
 impl TradePreview {
@@ -64,6 +69,8 @@ impl TradePreview {
             reference_price: None,
             quote: None,
             warning: None,
+            position_route: None,
+            estimates: None,
         }
     }
 
@@ -82,11 +89,20 @@ impl TradePreview {
         if let Some(warning) = self.warning {
             output["warning"] = json!(warning);
         }
+        if self.intent.kind == "CANCEL_PENDING_TRADE" {
+            output["estimates"] = cancel::estimates();
+        }
+        if let Some(estimates) = &self.estimates {
+            output["estimates"] = estimates.clone();
+        }
         output
     }
 
     pub fn confirmed_output(&self, account: Option<&str>) -> Value {
         let mut output = self.output(account);
+        if let Some(route) = &self.position_route {
+            output["positionRoute"] = json!(route);
+        }
         output["previewDigest"] = json!(preview_digest(self, account));
         output
     }
@@ -130,7 +146,7 @@ impl<'a> Trading<'a> {
         }
     }
 
-    /// Select the LCD used to verify a cancellation against the live contract.
+    /// Select the LCD used for live contract checks and preview estimates.
     pub fn with_lcd_endpoint(mut self, endpoint: &'a str) -> Self {
         self.lcd_endpoint = Some(endpoint);
         self
@@ -179,14 +195,22 @@ impl<'a> Trading<'a> {
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
         let cancelling = preview.intent.kind == "CANCEL_PENDING_TRADE";
+        let market = preview.requires_market_price_refresh();
         if cancelling {
             self.check_pending_order(session, preview).await?;
         }
+        let update = if preview.is_standalone_position_update() {
+            Some(
+                self.preflight_position_update(account, preview, options.confirmation.is_some())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut prepared;
-        let preview = if preview.requires_market_price_refresh() {
+        let preview = if market {
             prepared = preview.clone();
             self.refresh_market_open(&mut prepared).await?;
-            self.storage.check_active_trade(session, endpoint)?;
             let price = prepared
                 .reference_price
                 .as_deref()
@@ -194,23 +218,29 @@ impl<'a> Trading<'a> {
             positive_decimal(price, "Current price")?;
             prepared.intent.body["intentPrice"] = json!(price);
             &prepared
+        } else if let Some(update) = &update {
+            &update.preview
         } else {
             preview
         };
-        if let Some(confirmation) = options.confirmation {
-            // A logout or account expiry during a refresh invalidates confirmation.
-            self.load_session(Some(account))?;
-            confirmation.verify(preview, account)?;
-        }
-        // Cancellation reads can outlive the session. Reload the pinned
-        // account and use its current token for submission.
+        // Live reads can outlast the session. Reload the pinned account
+        // before confirmation and reserve with its current token.
         let reloaded;
-        let session = if cancelling {
+        let session = if cancelling || market || update.is_some() || options.confirmation.is_some()
+        {
             reloaded = self.load_session(Some(account))?;
             &reloaded
         } else {
             session
         };
+        if let Some(confirmation) = options.confirmation
+            && let Err(error) = confirmation.verify(preview, account)
+        {
+            return Err(match update {
+                Some(update) => self.update_refusal(account, update, error).await,
+                None => error,
+            });
+        }
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;

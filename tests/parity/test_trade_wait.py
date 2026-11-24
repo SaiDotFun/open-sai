@@ -155,6 +155,7 @@ def cancel_lcd(request: Request, *, trade_type: str = "limit") -> Reply:
     return response(
         {
             "data": {
+                "user": ADDR,
                 "user_trade_index": "UserTradeIndex(17)",
                 "is_open": True,
                 "trade_type": trade_type,

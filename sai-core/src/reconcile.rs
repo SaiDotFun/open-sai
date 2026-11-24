@@ -620,6 +620,7 @@ fn log_keeper(
         ("intentKey", json!(key).into()),
         ("addr", json!(addr).into()),
         ("endpoint", Field::Endpoint(endpoint.into())),
+        ("endpointId", Field::endpoint_identity(endpoint)),
     ];
     if let Some((row, outcome)) = observed {
         if wait {

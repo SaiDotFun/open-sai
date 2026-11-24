@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import socket
 import sqlite3
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 
@@ -151,8 +153,26 @@ elif MUTATION.startswith("network-"):
     except OSError:
         pass
 
+
+def run() -> None:
+    if MUTATION not in {"stdout-key-order", "stderr-duplicate"}:
+        main()
+        return
+    output, diagnostics = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(output), redirect_stderr(diagnostics):
+            main()
+    finally:
+        stdout = output.getvalue()
+        if MUTATION == "stdout-key-order":
+            stdout = json.dumps(json.loads(stdout), sort_keys=True) + "\n"
+        stderr = diagnostics.getvalue()
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr * (2 if MUTATION == "stderr-duplicate" else 1))
+
+
 try:
-    main()
+    run()
 finally:
     if MUTATION in {"ledger-rowid", "ledger-index", "ledger-version"}:
         change_schema()
@@ -160,3 +180,5 @@ finally:
         change_config()
     elif MUTATION == "stale-log":
         stamp_logs_in_past()
+    elif MUTATION == "doctor-create-trader":
+        (SAI_HOME / "trader").mkdir(mode=0o700, exist_ok=True)

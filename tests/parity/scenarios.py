@@ -6,13 +6,17 @@ import base64
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -22,6 +26,7 @@ from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
 from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
+from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection
 
 HERE = Path(__file__).resolve().parent
@@ -30,6 +35,7 @@ PROTOCOL = fixture("synthetic_protocol.json")
 ADDRESS = PROTOCOL["address"]
 OTHER_ADDRESS = "0x" + "2" * 40
 INTENT = "parity-close-7"
+HISTORY_SESSION_TOKEN = "e7" * 32
 CONTRACT = "nibi1syntheticfixture"
 TRADE_REQUEST_HASH = "AB" * 32
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
@@ -72,10 +78,18 @@ class Endpoints:
     errors: list[str] = field(default_factory=list)
     wire: list[WireRequest] = field(default_factory=list)
     admission: Admission = field(default_factory=Admission)
+    near_expiry: str = field(
+        default_factory=lambda: (
+            datetime.now(UTC) + timedelta(hours=50, minutes=30)
+        ).isoformat()
+    )
+    interrupt_ready: threading.Event = field(default_factory=threading.Event)
+    interrupt_closed: threading.Event = field(default_factory=threading.Event)
+    keeper_path: str = "/query"
 
     @property
     def keeper(self) -> str:
-        return self.http + "/query"
+        return self.http + self.keeper_path
 
     def expand(self, value: str) -> str:
         for key, replacement in {
@@ -85,6 +99,7 @@ class Endpoints:
             "{keeper}": self.keeper,
             "{http}": self.http,
             "{ws}": self.ws,
+            "{ws_http}": self.ws.replace("ws://", "http://", 1),
         }.items():
             value = value.replace(key, replacement)
         return value
@@ -118,6 +133,37 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
     sai_home.mkdir(mode=0o700)
     if seed == "empty":
         return
+    if seed == "doctor-malformed-toml":
+        config = sai_home / "config.toml"
+        config.write_text("[keeper\n")
+        config.chmod(0o600)
+        return
+    if seed == "doctor-invalid-endpoint":
+        config = sai_home / "config.toml"
+        config.write_text('[keeper]\nendpoint = "https://fixture.invalid:bad/api"\n')
+        config.chmod(0o600)
+        return
+    if seed == "doctor-ledger-v0":
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o700)
+        with sqlite3.connect(path := trader / "intents.sqlite3") as conn:
+            conn.execute(
+                "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL,"
+                " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+                " entity TEXT NOT NULL)"
+            )
+        path.chmod(0o600)
+        return
+    if seed == "doctor-loose-profile":
+        sai_home.chmod(0o750)
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o755)
+        history = trader / "history"
+        history.touch(mode=0o644)
+        return
     if seed == "legacy":
         shutil.copytree(HERE / "v0.1.0", sai_home, dirs_exist_ok=True)
         sai_home.chmod(0o700)
@@ -133,22 +179,39 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         return
     session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
     sessions = []
-    if seed in {"session", "accounts"}:
+    if seed in {
+        "session",
+        "accounts",
+        "doctor-near-expiry",
+        "doctor-ledger-session",
+        "history-token",
+    }:
         sessions.append({**session, "endpoint": endpoints.keeper})
+        if seed == "doctor-near-expiry":
+            sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
+        if seed == "history-token":
+            sessions[0]["token"] = HISTORY_SESSION_TOKEN
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+    env = child_env(home, endpoints)
+    if seed in {"doctor-near-expiry", "doctor-ledger-session"}:
+        env["SAI_LOG"] = "false"
+    if seed == "doctor-ledger-session":
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
     subprocess.run(
         [sys.executable, "-c", SEED],
         input=json.dumps(
             {
                 "sessions": sessions,
-                "ledger": seed == "ledger",
+                "ledger": seed in {"ledger", "doctor-ledger-session"},
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
             }
         ),
-        env=child_env(home, endpoints),
+        env=env,
         cwd=home,
         text=True,
         capture_output=True,
@@ -167,7 +230,13 @@ def loopback(
     errors: list[str] = []
     wire: list[WireRequest] = []
     admission = Admission()
+    interrupt_ready, interrupt_closed = threading.Event(), threading.Event()
     scope = f"/parity/{uuid.uuid4().hex}"
+    keeper_path = (
+        "/query/fixture-path-key?key=fixture-query-key"
+        if scenario == "keeper-echo-error"
+        else "/query"
+    )
     markets = fixture("mainnet_markets_http.json")
     prices = fixture("mainnet_prices_http.json")
     position = PROTOCOL["account_positions_response"]["data"]["perp"]["trades"][0]
@@ -186,12 +255,14 @@ def loopback(
         "txHash": status["txHash"],
         "trade": {"id": 7, "trader": ADDRESS},
     }
+    chains = {"unknown-chain": None, "empty-chain": ""}
+    chain = chains.get(cancel_target, "cataclysm-1")
     responses = {
         "oneClickTrading": {
             "data": {
                 "oneClickTrading": {
                     "enabled": True,
-                    "chainId": "cataclysm-1",
+                    "chainId": chain,
                     "contractAddress": CONTRACT,
                 }
             }
@@ -212,6 +283,54 @@ def loopback(
             }
         },
     }
+    if scenario == "history-projection":
+        responses["tradeHistory"] = {
+            "data": {
+                "unexpected": HISTORY_SESSION_TOKEN,
+                "perp": {
+                    "unexpected": HISTORY_SESSION_TOKEN,
+                    "tradeHistory": [
+                        {
+                            "id": "001-23:4",
+                            "intentKey": "20261120T102030123Z_0123456789ABCDEF",
+                            "tradeChangeType": "position_liquidated",
+                            "txHash": "0X" + "AB" * 32,
+                            "evmTxHash": "unvalidated",
+                            "trade": {"id": 7, "trader": ADDRESS, "unexpected": "omit"},
+                            "block": {
+                                "block": 42,
+                                "block_ts": "2026-11-20T15:43:31.123456789+23:59",
+                                "unexpected": "omit",
+                            },
+                        },
+                        {
+                            "id": 2**63,
+                            "txHash": HISTORY_SESSION_TOKEN,
+                            "tradeChangeType": "unknown",
+                            "trade": {"id": True, "trader": "invalid"},
+                            "block": {"block": -1, "block_ts": "2026-11-20 15:43:31Z"},
+                        },
+                        {"block": {"block_ts": "2026-11-20T15:43:60Z"}},
+                        {"block": {"block_ts": "0000-01-01T00:00:00Z"}},
+                        {"block": {"block_ts": None}},
+                        None,
+                        "skip non-objects",
+                        {"unexpected": "preserve the empty projected row"},
+                    ],
+                },
+            },
+        }
+    elif scenario == "history-null":
+        responses["tradeHistory"] = {
+            "data": {"perp": {"tradeHistory": None, "extra": 1}}
+        }
+    elif scenario == "history-null-perp":
+        responses["tradeHistory"] = {"data": {"perp": None, "extra": 1}}
+    elif scenario == "history-invalid":
+        responses["tradeHistory"] = {
+            "data": {"perp": {"tradeHistory": True}, "extra": 1}
+        }
+
     responses["intentTradeHistory"] = responses["tradeHistory"]
     responses["waitUserIntents"] = responses["userIntents"]
     variables = {
@@ -231,15 +350,32 @@ def loopback(
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
     cancel_trader = OTHER_ADDRESS if cancel_target == "other-account" else ADDRESS
-    pending_order = scenario == "pending-order" or cancel_target == "pending"
+    pending_order = scenario == "pending-order" or cancel_target in {
+        "pending",
+        "foreign-owner",
+        "unknown-chain",
+        "empty-chain",
+    }
     contracts = {
         "get_trade_raw": {
-            "user": ADDRESS if cancel_target is not None else position["trader"],
+            "user": (
+                OTHER_ADDRESS
+                if cancel_target == "foreign-owner"
+                else ADDRESS
+                if cancel_target is not None or pending_order
+                else position["trader"]
+            ),
             "user_trade_index": "UserTradeIndex(7)",
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
-            "trade_type": "limit" if pending_order else "trade",
+            "trade_type": (
+                "stop"
+                if cancel_target == "foreign-owner"
+                else "limit"
+                if pending_order
+                else "trade"
+            ),
             "collateral_amount": str(position["collateralAmount"]),
             "leverage": str(position["leverage"]),
             "open_price": str(position["openPrice"]),
@@ -267,7 +403,8 @@ def loopback(
         "get_trade_raw": {
             "trader": (
                 cancel_trader
-                if scenario == "pending-order" or cancel_target is not None
+                if scenario in {"pending-order", "concurrent-close"}
+                or cancel_target is not None
                 else position["trader"]
             ),
             "index": 7,
@@ -297,7 +434,7 @@ def loopback(
         def reply(
             self, value: object, status_code: int = 200, *, lcd: bool = False
         ) -> None:
-            body = json.dumps(value).encode()
+            body = value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             if lcd:
@@ -354,6 +491,11 @@ def loopback(
                 self.reject("Wrong fixture authorization")
                 return
             key = variables["input"]["intentKey"]
+            if scenario == "trade-reconcile-offline":
+                admission.key = key
+                admission.arrived.set()
+                self.close_connection = True
+                return
             if scenario == "trade-timeout" and not admission.arrived.is_set():
                 admission.key = key
                 admission.arrived.set()
@@ -385,11 +527,11 @@ def loopback(
 
         def do_POST(self) -> None:
             if not self.path.startswith("/") or (
-                self.path.startswith(scope) and self.path != f"{scope}/query"
+                self.path.startswith(scope) and self.path != scope + keeper_path
             ):
                 self.reject("Unexpected HTTP POST")
                 return
-            if self.path != f"{scope}/query":
+            if self.path != scope + keeper_path:
                 self.reply({}, 404)
                 return
             try:
@@ -407,7 +549,10 @@ def loopback(
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
                     self.admit_trade(request.variables)
                     return
-                if name == "userIntents" and scenario == "trade-timeout":
+                if name == "userIntents" and scenario in {
+                    "trade-timeout",
+                    "trade-reconcile-offline",
+                }:
                     if not admission.arrived.is_set() or not same_variables(
                         request.variables, {"user": ADDRESS, "key": admission.key}
                     ):
@@ -416,20 +561,95 @@ def loopback(
                         row = {
                             **status,
                             "intentKey": admission.key,
-                            "kind": "OPEN_TRADE",
+                            "kind": "OPEN_TRADE"
+                            if scenario == "trade-timeout"
+                            else "CLOSE_POSITION",
                             "lifecycleStep": "exec_fail",
                             "execActor": "server",
                             "nibiAddress": None,
                             "errorCode": "chain_execution_failed",
                         }
+                        if scenario == "trade-reconcile-offline":
+                            row["txHash"] = TRADE_REQUEST_HASH
                         self.reply({"data": {"userIntents": [row]}})
                     return
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):
                         self.reject(f"Wrong Keeper variables for {name}")
+                    elif scenario == "interrupt-http":
+                        interrupt_ready.set()
+                        interrupt_closed.wait(8)
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif scenario == "keeper-echo-error":
+                        self.reply(
+                            {
+                                "errors": [
+                                    {
+                                        "message": f"Rejected request {self.path}",
+                                        "extensions": {"code": "FORBIDDEN"},
+                                    },
+                                    {
+                                        "extensions": {
+                                            "code": self.path.partition("?key=")[2]
+                                        }
+                                    },
+                                ]
+                            }
+                        )
+                    elif (
+                        scenario == "read-number-spelling" and name == "tokenPricesUsd"
+                    ):
+                        self.reply(
+                            b'{"data":{"oracle":{"tokenPricesUsd":['
+                            b'{"priceUsd":0.000001},{"priceUsd":1.2300},'
+                            b'{"priceUsd":0.00001230},{"priceUsd":1e16},'
+                            b'{"priceUsd":-0.00},{"priceUsd":1e400},'
+                            b'{"priceUsd":18446744073709551616123456},'
+                            b'{"priceUsd":"1.2300"}]}}}'
+                        )
+                    elif (scenario, name) in {
+                        ("history-graphql-errors", "tradeHistory"),
+                        ("doctor-graphql-errors", "oneClickTrading"),
+                    }:
+                        self.reply(
+                            {
+                                **responses[name],
+                                "errors": [
+                                    {
+                                        "message": "opaque Keeper diagnostic",
+                                        "extensions": {
+                                            "code": "GRAPHQL_VALIDATION_FAILED"
+                                        },
+                                    },
+                                    {
+                                        "message": "opaque Keeper diagnostic",
+                                        "extensions": {"code": "unvalidated"},
+                                    },
+                                    {"message": "opaque Keeper diagnostic"},
+                                    {"extensions": {"code": "FORBIDDEN"}},
+                                ],
+                            }
+                        )
+                    elif scenario == "read-partial-error":
+                        self.reply(
+                            {**responses[name], "errors": [{"message": "partial read"}]}
+                        )
+                    elif scenario == "read-partial" and name == "trades":
+                        partial = {
+                            **position,
+                            "state": None,
+                            "collateralAmount": "18446744073709551616123456",
+                        }
+                        self.reply({"data": {"perp": {"trades": [partial]}}})
+                    elif scenario == "read-empty" and name == "tradeHistory":
+                        self.reply({"data": {"perp": {"tradeHistory": []}}})
                     else:
+                        if scenario == "trade-market-session" and name == "borrowings":
+                            admission.arrived.set()
+                            if not admission.release.wait(5):
+                                self.reject("Market session gate timed out")
+                                return
                         self.reply(responses[name])
                     return
             except (ValueError, KeyError, TypeError):
@@ -443,9 +663,22 @@ def loopback(
             path = urlsplit(self.path).path
             if path.startswith(scope):
                 path = path.removeprefix(scope)
+                if (
+                    scenario == "doctor-lcd-unreachable"
+                    and path == "/private-fixture-credential" + NODE_INFO
+                ):
+                    wire.append(WireRequest("node_info"))
+                    self.reply({}, 503)
+                    return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
-                    self.reply({"default_node_info": {"network": "cataclysm-1"}})
+                    self.reply(
+                        {
+                            "default_node_info": {}
+                            if chain is None
+                            else {"network": chain}
+                        }
+                    )
                     return
                 if path == RELEASES:
                     wire.append(WireRequest("releases"))
@@ -504,12 +737,52 @@ def loopback(
         def log_message(self, format: str, *args: object) -> None:
             pass
 
+    redirect_path = f"{scope}/subscriptions?moved=1"
+
+    def websocket_redirect(
+        connection: ServerConnection, request: Request
+    ) -> Response | None:
+        if scenario == "ws-redirect-limit":
+            location = request.path
+        elif scenario == "ws-redirect" and request.path == f"{scope}/query":
+            location = "subscriptions?moved=1"
+        else:
+            return None
+        wire.append(WireRequest("ws:redirect"))
+        response = connection.respond(HTTPStatus.TEMPORARY_REDIRECT, "Use another path")
+        response.headers["Location"] = location
+        return response
+
+    def websocket_response(
+        _connection: ServerConnection, request: Request, response: Response
+    ) -> None:
+        if scenario not in {"ws-no-subprotocol", "ws-wrong-subprotocol"}:
+            return
+        if request.headers.get("Sec-WebSocket-Protocol") != "graphql-transport-ws":
+            errors.append("Expected graphql-transport-ws in the upgrade request")
+        if response.status_code == HTTPStatus.SWITCHING_PROTOCOLS:
+            del response.headers["Sec-WebSocket-Protocol"]
+            if scenario == "ws-wrong-subprotocol":
+                response.headers["Sec-WebSocket-Protocol"] = "wrong-protocol"
+
+    class StalledClose(ServerConnection):
+        def send_data(self) -> None:
+            if self.protocol.close_rcvd is None:
+                super().send_data()
+            else:
+                # Keep the socket open without acknowledging the client's close.
+                self.protocol.data_to_send()
+                interrupt_ready.set()
+
+    disconnected_at = 0.0
+
     def websocket(connection: ServerConnection) -> None:
+        nonlocal disconnected_at
         try:
-            if (
-                connection.request is None
-                or connection.request.path != f"{scope}/query"
-            ):
+            expected_path = (
+                redirect_path if scenario == "ws-redirect" else f"{scope}/query"
+            )
+            if connection.request is None or connection.request.path != expected_path:
                 connection.close()
                 return
             initial = json.loads(connection.recv(timeout=5))
@@ -517,6 +790,17 @@ def loopback(
                 errors.append("Expected WebSocket connection_init")
                 return
             wire.append(WireRequest("ws:init"))
+            if scenario == "doctor-ws-timeout":
+                connection.recv(timeout=7)
+                return
+            if scenario == "interrupt-handshake":
+                interrupt_ready.set()
+                connection.recv(timeout=8)
+                errors.append("Watch continued the handshake after SIGINT")
+                return
+            if scenario == "ws-no-ack":
+                connection.send(json.dumps({"type": "connection_error"}))
+                return
             connection.send(json.dumps({"type": "connection_ack"}))
             subscription = json.loads(connection.recv(timeout=5))
             if subscription["type"] != "subscribe":
@@ -542,23 +826,78 @@ def loopback(
                     )
                 )
                 return
+            if scenario == "interrupt-balance":
+                interrupt_ready.set()
+                connection.recv(timeout=8)
+                errors.append("Balance read continued the subscription after SIGINT")
+                return
             payload = queue_payloads[name]
-            connection.send(
-                json.dumps({"id": request_id, "type": "next", "payload": payload})
-            )
-            if scenario == "watch":
+            if scenario == "ws-partial":
+                connection.send(json.dumps({"type": "ping"}))
+                if json.loads(connection.recv(timeout=5)) != {"type": "pong"}:
+                    errors.append("Expected GraphQL pong")
+                    return
+                wire.append(WireRequest("ws:pong"))
+                payload = {**payload, "errors": [{"message": "partial balance"}]}
+            count = sum(item.label == "ws:userBalances" for item in wire)
+            if scenario == "watch-reconnect":
+                if count > 1 and not 1.9 <= time.monotonic() - disconnected_at < 7:
+                    errors.append("Watch did not reconnect after the two-second delay")
+                    return
+                payload = {"data": {"userBalances": [{"amount": str(count)}]}}
+            message = json.dumps({"id": request_id, "type": "next", "payload": payload})
+            if scenario == "watch-number-spelling":
+                message = (
+                    f'{{"id":{json.dumps(request_id)},"type":"next",'
+                    '"payload":{"data":{"userBalances":[{"amount":1E-7}]}}}'
+                )
+            connection.send(message)
+            if scenario in {
+                "watch",
+                "watch-number-spelling",
+                "ws-redirect",
+                "ws-no-subprotocol",
+            }:
                 connection.send(json.dumps({"id": request_id, "type": "complete"}))
-        except ConnectionClosed:
+            if scenario == "watch-reconnect" and count == 1:
+                disconnected_at = time.monotonic()
+                connection.close()
+            if scenario in {"watch-idle", "watch-reconnect", "interrupt-balance-close"}:
+                # Wait for the interrupted client to close the connection.
+                connection.recv(timeout=10)
+        except ConnectionClosed as exc:
+            if scenario in {
+                "interrupt-handshake",
+                "interrupt-balance",
+                "interrupt-balance-close",
+            }:
+                if exc.rcvd is None or exc.rcvd.code != 1011:
+                    errors.append("Expected WebSocket close code 1011 after SIGINT")
+                else:
+                    wire.append(WireRequest("ws:close"))
+                interrupt_closed.set()
             # Doctor only needs the handshake, and balances closes after its snapshot.
-            pass
         except (ValueError, KeyError, StopIteration, TimeoutError, TypeError):
             errors.append("Unsupported Keeper WebSocket exchange")
 
-    with http_server(Handler) as http, graphql_ws(websocket) as ws:
+    with (
+        http_server(Handler) as http,
+        graphql_ws(
+            websocket,
+            process_request=websocket_redirect,
+            process_response=websocket_response,
+            create_connection=StalledClose
+            if scenario == "interrupt-balance-close"
+            else None,
+        ) as ws,
+    ):
         yield Endpoints(
             http + scope,
             ws.removesuffix("/query") + scope + "/query",
             errors,
             wire,
             admission,
+            interrupt_ready=interrupt_ready,
+            interrupt_closed=interrupt_closed,
+            keeper_path=keeper_path,
         )

@@ -7,10 +7,12 @@ import json
 import os
 import select
 import shutil
+import signal
 import socket
 import sqlite3
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -24,6 +26,10 @@ from typing import Any
 
 import pytest
 from sai_cli.core import keeper, log, reconcile, storage
+from sai_cli.tests.loopback import graphql_ws
+from websockets.http11 import Request as UpgradeRequest
+from websockets.http11 import Response as UpgradeResponse
+from websockets.sync.server import ServerConnection
 
 FIXTURE = json.loads(
     (
@@ -183,7 +189,7 @@ def cli_environment(
     }
 
 
-def read_events(home: Path) -> list[dict[str, Any]]:
+def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
@@ -191,6 +197,10 @@ def read_events(home: Path) -> list[dict[str, Any]]:
     ]
     groups: dict[str, list[int]] = {}
     for event in events:
+        if c4_reference:
+            # The C4 pin predates the v2 envelope and keyed endpoint identity.
+            for field in ("schema", "commandId", "endpointId"):
+                event.pop(field, None)
         run = event["runId"]
         event["runId"] = list(groups).index(run) if run in groups else len(groups)
         seq = groups.setdefault(run, [])
@@ -205,7 +215,10 @@ def read_events(home: Path) -> list[dict[str, Any]]:
 
 def read_state(home: Path) -> tuple[Any, ...]:
     files = {
-        str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
+        str(path.relative_to(home)): path.stat().st_mode
+        for path in home.rglob("*")
+        if path.relative_to(home).as_posix()
+        not in {"logs/.endpoint-key", "logs/.endpoint-key.lock"}
     }
     db = home / "trader/intents.sqlite3"
     if not db.exists():
@@ -245,7 +258,7 @@ def response(payload: str | dict[str, Any] | Reply) -> Reply:
     return Reply(json.dumps(payload).encode())
 
 
-def wire(query: str, **variables: str | None) -> bytes:
+def wire(query: str, **variables: str | int | None) -> bytes:
     return json.dumps(
         {"query": query, "variables": variables},
         separators=(",", ":"),
@@ -387,7 +400,7 @@ def compare(
                 if index == 0 and step.code == 0:
                     stdout = public_intent_output(stdout, compact=step.json_output)
                 runs.append((stdout, result.stderr, list(requests), state))
-            observed.append((runs, read_events(home)))
+            observed.append((runs, read_events(home, c4_reference=True)))
         assert observed[0] == observed[1]
 
 
@@ -602,18 +615,6 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
         ((Reply(b"malformed"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
-        (
-            (
-                {
-                    "errors": [
-                        {"message": "Keeper failure", "extensions": {"code": "FIXTURE"}}
-                    ]
-                },
-            ),
-            "unknown",
-            "KEEPER_ERROR",
-        ),
-        (({"errors": [{"message": "denied"}], "data": {}},), "unknown", "KEEPER_ERROR"),
         (({"data": {"userIntents": 123}},), "unknown", "INCOMPLETE_DATA"),
         (({"data": {"userIntents": [None]}},), "unknown", "INTERNAL_ERROR"),
         (("outcome_not_indexed", {"data": {}}), "pending", "INCOMPLETE_DATA"),
@@ -635,6 +636,75 @@ def test_request_and_data_failures(
     compare(
         cli_pair, tmp_path, monkeypatch, (Step(replies, local, code=1, error=error),)
     )
+
+
+@pytest.mark.parametrize("operation", ["intents", "history"])
+def test_intent_status_logs_only_public_graphql_codes(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, operation: str
+) -> None:
+    diagnostic = "synthetic Keeper diagnostic"
+    failure = {
+        "data": {"userIntents": [], "perp": {"tradeHistory": []}},
+        "errors": [
+            {"message": diagnostic, "extensions": {"code": "FORBIDDEN"}},
+            {"message": diagnostic, "extensions": {"code": "PRIVATE_CODE"}},
+            {"message": diagnostic},
+            {"message": diagnostic, "extensions": {"code": "BAD_USER_INPUT"}},
+        ],
+    }
+    # The Python checkout has the current logging policy. C4's pinned CLI
+    # predates it and remains the reference for the other reconciliation tests.
+    candidate = cli_pair[1]
+    reference = (sys.executable, "-m", "sai_cli.sai_cli")
+    with replay() as (endpoint, replies, requests):
+        for index, cli in enumerate((reference, candidate)):
+            home = tmp_path / str(index)
+            requests.clear()
+            expected_requests = [wire(keeper.INTENTS, user=ADDR, key=KEY)]
+            if operation == "history":
+                replies.append(response("outcome_not_indexed"))
+                history_request = (
+                    wire(keeper.INTENT_HISTORY, trader=ADDR, limit=25, offset=0)
+                    if index == 0
+                    else wire(keeper.HISTORY, trader=ADDR)
+                )
+                expected_requests.append(history_request)
+            replies.append(response(failure))
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "status",
+                ADDR,
+                "--key",
+                KEY,
+            )
+            assert not replies
+            assert [request.body for request in requests] == expected_requests
+            assert result.stderr == b""
+            document = json.loads(result.stdout)
+            if operation == "intents":
+                assert result.returncode == 1
+                assert document["error"]["code"] == "KEEPER_ERROR"
+            else:
+                assert result.returncode == 0
+                assert document["outcome"] == "pending"
+            [event] = [
+                event
+                for event in read_events(home)
+                if event["event"] == "keeper.request"
+                and event["operation"] == operation
+            ]
+            assert event["code"] == "KEEPER_ERROR"
+            assert event["keeperErrors"] == [
+                {"code": "FORBIDDEN"},
+                {"code": "KEEPER_ERROR"},
+                {"code": "KEEPER_ERROR"},
+            ]
+            assert event["keeperErrorCount"] == 4
 
 
 def test_compressed_keeper_response(
@@ -661,7 +731,7 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert result.stderr == b""
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
-            outputs.append((result.stdout, read_events(home)))
+            outputs.append((result.stdout, read_events(home, c4_reference=True)))
         assert outputs[0] == outputs[1]
 
 
@@ -719,8 +789,19 @@ def test_cli_errors_share_one_envelope(
         assert result.returncode == exit_code
         assert not result.stderr
         assert len(result.stdout.splitlines()) == 1
-        assert json.loads(result.stdout)["error"]["code"] == code
-        outputs.append(result.stdout)
+        payload = json.loads(result.stdout)
+        assert payload["error"]["code"] == code
+        if code == "SIGNED_OUT":
+            endpoint = keeper.MAINNET_HTTP
+            expected_hint = (
+                f"sai --endpoint {endpoint} auth login NAME"
+                if index == 0
+                else origin_login_hint(endpoint.removesuffix("/query"))
+            )
+            assert payload["error"].pop("hint") == expected_hint
+            outputs.append(payload)
+        else:
+            outputs.append(result.stdout)
     assert outputs[0] == outputs[1]
 
 
@@ -739,6 +820,14 @@ def test_intent_help(
     assert outputs[0] == outputs[1]
 
 
+def origin_login_hint(origin: str) -> str:
+    return (
+        'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
+        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
+        " auth login NAME"
+    )
+
+
 @pytest.mark.parametrize("path", ["/query", "/private/query"])
 def test_expired_auth_status(
     cli_pair: tuple[CLI, CLI],
@@ -746,7 +835,8 @@ def test_expired_auth_status(
     monkeypatch: pytest.MonkeyPatch,
     path: str,
 ) -> None:
-    endpoint = f"http://127.0.0.1:9{path}"
+    origin = "http://127.0.0.1:9"
+    endpoint = origin + path
     fixture = tmp_path / "fixture"
     monkeypatch.setenv("SAI_HOME", str(fixture))
     with log.silenced():
@@ -765,10 +855,19 @@ def test_expired_auth_status(
         result = invoke(cli, home, "--json", "--endpoint", endpoint, "auth", "status")
         assert result.returncode == 6
         assert result.stderr == b""
-        error = json.loads(result.stdout)["error"]
-        assert error["code"] == "SESSION_EXPIRED"
-        assert error["hint"].endswith(f"auth login NAME --addr {ADDR}")
-        observed.append((result.stdout, read_events(home)))
+        payload = json.loads(result.stdout)
+        assert payload["error"]["code"] == "SESSION_EXPIRED"
+        if index == 1:
+            login = origin_login_hint(origin)
+        elif path == "/query":
+            login = f"sai --endpoint {endpoint} auth login NAME"
+        else:
+            login = (
+                'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
+                'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
+            )
+        assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
+        observed.append((payload, read_events(home)))
     assert observed[0] == observed[1]
 
 
@@ -883,6 +982,62 @@ def test_public_history_projects_after_raw_hash_correlation(
     )
 
 
+@pytest.mark.parametrize(
+    ("change", "projected"),
+    [("synthetic-keeper-text", None), ("position_liquidated", "position_liquidated")],
+)
+def test_public_history_preserves_liquidation_label(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+    projected: str | None,
+) -> None:
+    opaque = "synthetic-keeper-text"
+    intent = RESPONSES["outcome_not_indexed"]["data"]["userIntents"][0]
+    history = {
+        "intentKey": KEY,
+        "id": opaque,
+        "tradeChangeType": change,
+        "txHash": opaque,
+        "evmTxHash": "0X" + "CD" * 32,
+        "trade": {"id": opaque, "trader": ADDR, "note": opaque},
+        "block": {"block": "2142-2", "block_ts": opaque},
+        "debug": opaque,
+    }
+
+    with replay() as (endpoint, replies, _requests):
+        for index, cli in enumerate(cli_pair):
+            home = tmp_path / str(index)
+            home.mkdir(mode=0o700)
+            seed(home, endpoint, monkeypatch, "unknown")
+            replies.clear()
+            replies.extend(
+                [
+                    response({"data": {"userIntents": [{**intent, "txHash": opaque}]}}),
+                    response({"data": {"perp": {"tradeHistory": [history]}}}),
+                ]
+            )
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "status",
+                ADDR,
+                "--key",
+                KEY,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            [row] = json.loads(result.stdout)["matchedTradeHistory"]
+            if index == 0:
+                # The pinned Python CLI returns raw rows. Apply its public projection.
+                row = keeper.safe_intent_history(row)
+            assert row.get("tradeChangeType") == projected
+
+
 @pytest.fixture(scope="module")
 def keeper_certificate(
     tmp_path_factory: pytest.TempPathFactory,
@@ -976,6 +1131,108 @@ def keeper_certificate(
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certs / "server.pem", certs / "server.key")
     return context, certs
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a process-group SIGINT")
+def test_watch_reports_tls_certificate_failure(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+) -> None:
+    context, certs = keeper_certificate
+    with replay(context) as (endpoint, _replies, requests):
+        ws = endpoint.replace("https://", "wss://", 1)
+        for index, cli in enumerate(cli_pair):
+            assert_watch_disconnect(
+                cli,
+                tmp_path / str(index),
+                ws,
+                "SSLCertVerificationError",
+                overrides={"SSL_CERT_FILE": str(certs / "other-ca.pem")},
+            )
+        assert not requests
+
+
+def assert_watch_disconnect(
+    cli: CLI,
+    home: Path,
+    ws: str,
+    error_type: str,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> None:
+    with subprocess.Popen(
+        [*cli, "--json", "--ws-endpoint", ws, "watch", "balances", ADDR],
+        env={
+            "PATH": os.defpath,
+            "HOME": str(home.parent),
+            "SAI_HOME": str(home),
+            "SAI_LOG": "1",
+            **(overrides or {}),
+        },
+        cwd=home.parent,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as proc:
+        assert proc.stderr is not None
+        try:
+            assert select.select([proc.stderr], [], [], 8)[0]
+            warning = proc.stderr.readline()
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, _ = proc.communicate(timeout=5)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+    assert proc.returncode == 1
+    assert json.loads(stdout)["error"]["message"] == "Aborted"
+    assert warning == (
+        f"Disconnected ({error_type}); data may be stale; reconnecting in 2s\n".encode()
+    )
+    assert [
+        (event["code"], event["errorType"])
+        for event in read_events(home)
+        if event["event"] == "watch.disconnected"
+    ] == [("STREAM_ERROR", error_type)]
+
+
+@pytest.mark.parametrize(
+    ("header", "values", "error_type"),
+    [
+        ("Connection", (), "InvalidUpgrade"),
+        ("Connection", ("keep-alive",), "InvalidUpgrade"),
+        ("Upgrade", (), "InvalidUpgrade"),
+        ("Upgrade", ("websocket", "other/2"), "InvalidUpgrade"),
+        ("Upgrade", ("websocket trailing",), "InvalidHeaderFormat"),
+        ("Sec-WebSocket-Accept", (), "InvalidHeader"),
+        ("Sec-WebSocket-Accept", ("first", "second"), "InvalidHeader"),
+        ("Sec-WebSocket-Accept", ("wrong",), "InvalidHeaderValue"),
+    ],
+)
+def test_watch_reports_rejected_upgrade(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    header: str,
+    values: tuple[str, ...],
+    error_type: str,
+) -> None:
+    def replace_header(
+        _connection: ServerConnection,
+        _request: UpgradeRequest,
+        response: UpgradeResponse,
+    ) -> None:
+        del response.headers[header]
+        for value in values:
+            response.headers[header] = value
+
+    def wait_for_client_disconnect(connection: ServerConnection) -> None:
+        # A server close frame can race with Python's failed handshake cleanup.
+        connection.wait_closed()
+
+    with graphql_ws(wait_for_client_disconnect, process_response=replace_header) as ws:
+        for index, cli in enumerate(cli_pair):
+            assert_watch_disconnect(cli, tmp_path / str(index), ws, error_type)
 
 
 @pytest.mark.parametrize(

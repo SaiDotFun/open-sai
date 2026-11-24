@@ -2,31 +2,56 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
+import logging
 import re
+import socket
 import time
 from collections.abc import Callable
+from concurrent.futures import Future
+from contextlib import closing, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from secrets import token_hex
-from typing import Any
-from urllib.parse import quote
+from threading import BoundedSemaphore, Thread
+from typing import Any, Literal, TypedDict
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
 from . import intents, keeper
 from .errors import Code, SaiError
+from .log import origin
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
 BLOCK_PATH = "/cosmos/base/tendermint/v1beta1/blocks/"
+NODE_INFO_PATH = "/cosmos/base/tendermint/v1beta1/node_info"
 INDEX_RETRY_DELAYS = (0.25, 0.5)
 INDEX_RETRY_BUDGET = 2.0
 INDEX_LAG = (
     "Indexed position differs from contract state. Retry after Keeper"
     " synchronizes. No intent was submitted."
+)
+_LCD_DNS_SLOTS = BoundedSemaphore(8)
+_LOG = logging.getLogger(__name__)
+_LCD_REQUEST: ContextVar[bool] = ContextVar("sai_lcd_request", default=False)
+# HTTPX logs the complete URL at INFO. Filter at its logger before host
+# handlers receive the record, with the filter scoped to each LCD request.
+logging.getLogger("httpx").addFilter(lambda _: not _LCD_REQUEST.get())
+_AddressInfo = (
+    tuple[Literal[socket.AF_INET], socket.SocketKind, int, str, tuple[str, int]]
+    | tuple[
+        Literal[socket.AF_INET6],
+        socket.SocketKind,
+        int,
+        str,
+        tuple[str, int, int, int] | tuple[int, bytes],
+    ]
 )
 
 
@@ -44,14 +69,93 @@ class PositionUnavailable(ValueError):
     """Keeper has no open position for this ID."""
 
 
+class PositionOwnerMismatch(SaiError):
+    """The position could not be attributed to the selected account."""
+
+    code = Code.INVALID_REQUEST
+
+
 class MarketUnavailable(ValueError):
     """Keeper has no open market for the position."""
+
+
+class TradingNetworkMismatch(ValueError):
+    """Keeper and the LCD reported different valid chain IDs."""
 
 
 class QueryHeightMismatch(SaiError, ValueError):
     """The LCD answered a pinned query at an unverified height."""
 
     code = Code.PREVIEW_MISMATCH
+
+
+class LCDTimeout(ValueError):
+    """An overview LCD request ran out of time."""
+
+
+class _LCDStatusError(ValueError):
+    def __init__(self, endpoint: str, response: httpx.Response) -> None:
+        super().__init__(f"LCD at {endpoint} returned HTTP {response.status_code}")
+        self.body = response.text
+
+
+async def _resolve_lcd_host(
+    host: str | bytes | None,
+    port: str | bytes | int | None,
+    *,
+    family: int = 0,
+    type: int = 0,
+    proto: int = 0,
+    flags: int = 0,
+) -> list[_AddressInfo]:
+    if not _LCD_DNS_SLOTS.acquire(blocking=False):
+        raise TimeoutError("LCD DNS slots are busy")
+    result: Future[list[_AddressInfo]] = Future()
+
+    def resolve() -> None:
+        try:
+            if result.set_running_or_notify_cancel():
+                result.set_result(
+                    socket.getaddrinfo(host, port, family, type, proto, flags)
+                )
+        except Exception as exc:  # noqa: BLE001 - forward the resolver's exception
+            result.set_exception(exc)
+        finally:
+            _LCD_DNS_SLOTS.release()
+
+    # System DNS can outlive the HTTP request. Keep its permit until the lookup
+    # returns, and let the CLI exit even if a resolver is still blocked.
+    try:
+        Thread(target=resolve, name="sai-lcd-dns", daemon=True).start()
+    except RuntimeError as exc:
+        _LCD_DNS_SLOTS.release()
+        raise TimeoutError("Could not start LCD DNS lookup") from exc
+    return await asyncio.wrap_future(result)
+
+
+def _get_before_deadline(
+    url: httpx.URL,
+    deadline: float,
+    headers: dict[str, str] | None,
+) -> httpx.Response:
+    async def request() -> httpx.Response:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("LCD read deadline exceeded")
+        async with asyncio.timeout(remaining):
+            async with httpx.AsyncClient(timeout=None) as client:
+                return await client.get(url, headers=headers)
+
+    with closing(asyncio.new_event_loop()) as loop:
+        loop.getaddrinfo = _resolve_lcd_host
+        task = loop.create_task(request())
+        try:
+            return loop.run_until_complete(task)
+        except KeyboardInterrupt:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                loop.run_until_complete(task)
+            raise
 
 
 def _get_json(url: str, timeout: float = 20, *, fresh: bool = False) -> dict[str, Any]:
@@ -65,25 +169,54 @@ def _get_json_at_height(
     height: str | None = None,
     fresh: bool = False,
     allow_unprefixed_height: bool = False,
+    deadline: float | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     keeper.check_url(url, "LCD")
     try:
         headers = {BLOCK_HEIGHT_HEADER: height} if height is not None else None
         # The mainnet LCD caches by URI and can omit metadata on a hit.
         # Give every confirmation read a fresh URI, including the height anchor.
-        params = {"_sai_query": token_hex(16)} if fresh or height is not None else None
-        response = httpx.get(url, timeout=timeout, headers=headers, params=params)
-        response.raise_for_status()
+        request_url = httpx.URL(url)
+        if fresh or height is not None:
+            query = request_url.query
+            separator = b"&" if query else b""
+            nonce = token_hex(16).encode("ascii")
+            request_url = request_url.copy_with(
+                query=query + separator + b"_sai_query=" + nonce
+            )
+        request_token = _LCD_REQUEST.set(True)
+        try:
+            if deadline is None:
+                response = httpx.get(request_url, timeout=timeout, headers=headers)
+            else:
+                response = _get_before_deadline(request_url, deadline, headers)
+        finally:
+            _LCD_REQUEST.reset(request_token)
+        site = origin(url)
+        _LOG.info("LCD HTTP response from %s (status %d)", site, response.status_code)
+        if not 200 <= response.status_code < 300:
+            raise _LCDStatusError(site, response)
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
-    except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
+    except (
+        httpx.HTTPError,
+        httpx.InvalidURL,
+        TimeoutError,
+        ValueError,
+        TypeError,
+    ) as exc:
+        if deadline is not None and isinstance(
+            exc, (TimeoutError, httpx.TimeoutException)
+        ):
+            raise LCDTimeout("LCD read timed out") from None
+        cause = exc if isinstance(exc, _LCDStatusError) else None
         if height is not None or fresh:
             raise QueryHeightMismatch(
                 "Unable to verify contract state during confirmation."
                 " Retry the preview and confirmation."
-            ) from exc
-        raise ValueError("Unable to read contract state") from exc
+            ) from cause
+        raise ValueError("Unable to read contract state") from cause
     query_height = response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}")
     if query_height is None and allow_unprefixed_height:
         query_height = response.headers.get(BLOCK_HEIGHT_HEADER)
@@ -95,12 +228,18 @@ def _get_json_at_height(
     return result, query_height
 
 
+def lcd_url(lcd: str, route: str) -> str:
+    """Append a REST route to the LCD path and keep its query parameters."""
+    parts = urlsplit(lcd)
+    return urlunsplit(parts._replace(path=parts.path.rstrip("/") + route))
+
+
 def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
-    return f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
+    return lcd_url(lcd, f"/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}")
 
 
 def smart_value(
@@ -119,10 +258,13 @@ def smart_value(
     return _get_json_at_height(url, timeout, height=height)[0].get("data")
 
 
-def block_header(lcd: str, height: int | str, *, timeout: float = 3) -> dict[str, Any]:
-    data = _get_json(
-        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}", timeout, fresh=height == "latest"
-    )["block"]["header"]
+def block_header(lcd: str, height: int | str, *, deadline: float) -> dict[str, Any]:
+    result, _ = _get_json_at_height(
+        lcd_url(lcd, f"{BLOCK_PATH}{height}"),
+        fresh=height == "latest",
+        deadline=deadline,
+    )
+    data = result["block"]["header"]
     if not isinstance(data, dict):
         raise TypeError("Invalid LCD block header")
     return data
@@ -134,14 +276,14 @@ def smart_data(
     message: dict[str, Any],
     *,
     height: int,
-    timeout: float,
+    deadline: float,
 ) -> Any:
-    """Read overview state at the chosen block, within its request timeout."""
+    """Read overview state at the chosen block before the request deadline."""
     data, _ = _get_json_at_height(
         _smart_url(lcd, contract, message),
-        timeout,
         height=str(height),
         allow_unprefixed_height=True,
+        deadline=deadline,
     )
     return data.get("data")
 
@@ -168,9 +310,9 @@ def pair_leverage_cap(
         )
     except ValueError as exc:
         failure = exc.__cause__
-        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+        if isinstance(failure, _LCDStatusError) and re.search(
             r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found",
-            failure.response.text,
+            failure.body,
         ):
             return Decimal(0)
         raise
@@ -189,9 +331,9 @@ def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> A
     except QueryHeightMismatch as exc:
         failure = exc.__cause__
         # The wasm gRPC gateway can wrap Perp query errors in HTTP 500.
-        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+        if isinstance(failure, _LCDStatusError) and re.search(
             rf"Trade not found for trader \S+ with index {trade_id}\b",
-            failure.response.text,
+            failure.body,
         ):
             raise ValueError(
                 f"Trade {trade_id} was not found for this account."
@@ -199,13 +341,22 @@ def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> A
         raise ValueError(f"Unable to read pending order {trade_id} from Perp.") from exc
 
 
+class PositionRoute(TypedDict):
+    chainId: str
+    contractAddress: str
+
+
 @dataclass(frozen=True)
 class PositionSnapshot:
     raw: dict[str, Any]
     funds: dict[str, Any]
     market: dict[str, Any]
-    contract: str
+    route: PositionRoute
     observed_at: str | None = None
+
+    @property
+    def contract(self) -> str:
+        return self.route["contractAddress"]
 
 
 def _read_position(
@@ -229,6 +380,8 @@ def _latest_position(
     raw = result.get("data")
     if not isinstance(raw, dict):
         raise TypeError("Contract returned invalid state")
+    if not keeper.same_account(state.raw["user"], raw.get("user")):
+        raise PositionOwnerMismatch("Contract position belongs to a different account")
     if height is not None and (
         not height.isascii() or not height.isdecimal() or not height.lstrip("0")
     ):
@@ -241,7 +394,6 @@ def _latest_position(
 
 def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
     fields = (
-        "user",
         "user_trade_index",
         "market_index",
         "collateral_index",
@@ -295,9 +447,7 @@ def position_unchanged(
 
 def block_timestamp(lcd: str, height: str) -> int:
     """Read the UTC timestamp of a specific LCD block."""
-    result = _get_json(
-        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/blocks/{height}"
-    )
+    result = _get_json(lcd_url(lcd, f"{BLOCK_PATH}{height}"))
     block = result.get("sdk_block") or result.get("block")
     if not isinstance(block, dict):
         raise TypeError("LCD block header is unavailable")
@@ -308,22 +458,77 @@ def block_timestamp(lcd: str, height: str) -> int:
     return int(time.timestamp())
 
 
-def trading_contract(endpoint: str, lcd: str) -> str:
+def trading_route(endpoint: str, lcd: str) -> PositionRoute:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
-    node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
+    node = _get_json(lcd_url(lcd, NODE_INFO_PATH))
     info = node.get("default_node_info")
+    chain_id = route.get("chainId")
+    network = info.get("network") if isinstance(info, dict) else None
     if (
-        not route["enabled"]
-        or not isinstance(info, dict)
-        or info.get("network") != route["chainId"]
+        route["enabled"] is not True
+        or not isinstance(chain_id, str)
+        or not chain_id
+        or not isinstance(network, str)
+        or not network
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
-    return route["contractAddress"]
+    contract = route.get("contractAddress")
+    if not isinstance(contract, str) or not contract:
+        raise ValueError("Keeper trading route has no contract address")
+    if network != chain_id:
+        raise TradingNetworkMismatch(
+            "Keeper trading route and LCD network do not match"
+        )
+    return {"chainId": chain_id, "contractAddress": contract}
 
 
-def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
-    contract = trading_contract(endpoint, lcd)
-    position = _position(endpoint, addr, trade_id, timeout=20)
+def trading_contract(endpoint: str, lcd: str) -> str:
+    return trading_route(endpoint, lcd)["contractAddress"]
+
+
+@dataclass(frozen=True)
+class VerifiedPosition:
+    route: PositionRoute
+    raw: dict[str, Any]
+
+
+def verify_position_owner(
+    endpoint: str, lcd: str, addr: str, trade_id: int
+) -> VerifiedPosition:
+    """Read the live target and check its trade index and owner."""
+    route = trading_route(endpoint, lcd)
+    raw = smart_value(
+        lcd,
+        route["contractAddress"],
+        {"get_trade_raw": {"trader": addr, "index": trade_id}},
+        fresh=True,
+    )
+    if (
+        not isinstance(raw, dict)
+        or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+    ):
+        raise ValueError(f"Unable to verify contract position {trade_id}")
+    if not keeper.same_account(addr, raw.get("user")):
+        raise PositionOwnerMismatch("Contract position belongs to a different account")
+    return VerifiedPosition(route, raw)
+
+
+def snapshot(
+    endpoint: str,
+    lcd: str,
+    addr: str,
+    trade_id: int,
+    *,
+    indexed: dict[str, Any] | None = None,
+    verified: VerifiedPosition | None = None,
+) -> PositionSnapshot:
+    """Read contract state, reusing any position data checked by the caller."""
+    route = trading_route(endpoint, lcd) if verified is None else verified.route
+    contract = route["contractAddress"]
+    position = (
+        indexed if indexed is not None else indexed_position(endpoint, addr, trade_id)
+    )
+    _require_open_position(position)
     borrowing = position["perpBorrowing"]
     collateral = borrowing["collateralToken"]
     if collateral["symbol"] != "USDC":
@@ -344,11 +549,15 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
     ):
         raise MarketUnavailable("Open market data is unavailable")
 
-    def raw_trade(timeout: float) -> dict[str, Any]:
-        raw = _read_position(lcd, contract, trader, trade_id, timeout)
+    def raw_trade(timeout: float, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+        if raw is None:
+            raw = _read_position(lcd, contract, trader, trade_id, timeout)
+        if not keeper.same_account(addr, raw.get("user")):
+            raise PositionOwnerMismatch(
+                "Contract position belongs to a different account"
+            )
         if (
-            raw.get("user") != trader
-            or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+            raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
             or raw.get("market_index") != f"MarketIndex({borrowing['marketId']})"
             or raw.get("collateral_index") != token
             or raw.get("is_open") is not True
@@ -357,7 +566,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
             raise PositionChanged("Position changed. Review the margin change again.")
         return raw
 
-    raw = raw_trade(20)
+    raw = raw_trade(20, None if verified is None else verified.raw)
     if not _same_margin(raw, position):
         end = time.monotonic() + INDEX_RETRY_BUDGET
         for delay in INDEX_RETRY_DELAYS:
@@ -367,8 +576,9 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
             left = end - time.monotonic()
             if left <= 0:
                 break
-            position = _position(endpoint, addr, trade_id, timeout=left)
-            if position["trader"] != trader or position["perpBorrowing"] != borrowing:
+            position = indexed_position(endpoint, addr, trade_id, timeout=left)
+            _require_open_position(position)
+            if position["perpBorrowing"] != borrowing:
                 raise PositionChanged(
                     "Position changed. Review the margin change again."
                 )
@@ -388,7 +598,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
     )
     if funds.get("collateral_index") != token:
         raise PositionChanged("Position changed. Review the margin change again.")
-    return PositionSnapshot(raw, funds, market, contract, observed_at)
+    return PositionSnapshot(raw, funds, market, route, observed_at)
 
 
 def contract_decimal(value: Any) -> Decimal:
@@ -490,15 +700,25 @@ def _effective_leverage(
     return min(stored, cap)
 
 
-def _position(
-    endpoint: str, addr: str, trade_id: int, *, timeout: float
+def indexed_position(
+    endpoint: str, addr: str, trade_id: int, *, timeout: float = 20
 ) -> dict[str, Any]:
+    """Look up a position and verify that its trader and index match."""
     position = keeper.request(
         endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}, timeout=timeout
     )["perp"]["trade"]
-    if not position or not position["isOpen"] or position["tradeType"] != "trade":
-        raise PositionUnavailable("Open position not found")
+    if not position:
+        raise PositionUnavailable("Position not found for this account")
+    if not keeper.same_account(addr, position.get("trader")):
+        raise PositionOwnerMismatch("Keeper position belongs to a different account")
+    if type(position.get("id")) is not int or position["id"] != trade_id:
+        raise PositionUnavailable("Keeper returned a different position index")
     return position
+
+
+def _require_open_position(position: dict[str, Any]) -> None:
+    if not position["isOpen"] or position["tradeType"] != "trade":
+        raise PositionUnavailable("Open position not found")
 
 
 def _same_margin(raw: dict[str, Any], position: dict[str, Any]) -> bool:

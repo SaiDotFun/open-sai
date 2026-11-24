@@ -130,6 +130,29 @@ def test_numeric_keeper_price_rounds_to_even(
             )
 
 
+def test_market_open_refuses_logout_during_price_refresh(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    _, rust = trade_pair
+    with loopback("trade-market-session") as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(run, rust, home, endpoints, OPEN, python=False)
+            try:
+                assert endpoints.admission.arrived.wait(5)
+                assert (
+                    run(rust, home, endpoints, ("auth", "logout"), python=False)[0] == 0
+                )
+            finally:
+                endpoints.admission.release.set()
+            code, output, _ = result.result(timeout=10)
+        assert (code, output.get("error", {}).get("code")) == (6, "SIGNED_OUT")
+        assert [request.label for request in endpoints.wire] == ["borrowings"]
+        assert not endpoints.errors
+        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+
 def test_python_reads_rust_trade_events_offline(
     trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
@@ -156,6 +179,50 @@ def test_python_reads_rust_trade_events_offline(
         endpoint_key = home / "sai" / "logs" / ".endpoint-key"
         assert endpoint_key.stat().st_size == 32
         assert endpoint_key.stat().st_mode & 0o777 == 0o600
+
+
+def test_python_reads_rust_reconciliation_evidence_offline(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    python, rust = trade_pair
+    with loopback("trade-reconcile-offline") as endpoints:
+        home = tmp_path / "shared"
+        seed_home(home, endpoints, "session")
+        code, result, _ = run(rust, home, endpoints, CLOSE, python=False)
+        assert code == 5
+        key = result["error"]["intentKey"]
+        assert rows(home)[0][2] == "unknown"
+
+        status = ("intent", "status", ADDRESS, "--key", key)
+        assert run(rust, home, endpoints, status, python=False)[0] == 0
+        assert rows(home)[0][2] == "terminal"
+        code, report, _ = run(
+            python, home, endpoints, ("logs", "intent", key, "--offline"), python=True
+        )
+        assert code == 0
+        assert report["intentKey"] == key
+        assert report["txHash"] == TRADE_REQUEST_HASH.lower()
+        assert "scopeWarning" not in report
+        assert {entry["event"] for entry in report["events"]} >= {
+            "intent.reserved",
+            "intent.keeper",
+            "intent.status",
+        }
+        assert [request.label for request in endpoints.wire] == [
+            "recordUserIntent",
+            "userIntents",
+        ]
+        assert not endpoints.errors
+        events = [
+            json.loads(line)
+            for path in (home / "sai" / "logs").glob("cli-*.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        scoped = [
+            row for row in events if row["event"].startswith(("intent.", "keeper."))
+        ]
+        assert len(scoped) >= 5
+        assert len({row["endpointId"] for row in scoped}) == 1
 
 
 def trade_events(home: Path, key: str, endpoint: str) -> list[tuple[str, str | None]]:
@@ -383,6 +450,65 @@ def test_cancel_refuses_non_pending_target(
             )
             assert not endpoints.errors
             assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+
+def test_cancel_refuses_an_lcd_response_for_another_owner(
+    cancel_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    python, rust = cancel_pair
+    with loopback("trade-accepted", cancel_target="foreign-owner") as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        code, output, stderr = run(rust, home, endpoints, CANCEL, python=False)
+        assert (code, stderr) == (1, "")
+        assert output["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": "Trade 7 was not found for this account.",
+            "retryable": False,
+        }
+        assert [request.label for request in endpoints.wire] == CANCEL_READS
+        assert not endpoints.errors
+        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+    # The pinned Python guard accepts an order returned for a different owner.
+    with loopback("trade-accepted", cancel_target="foreign-owner") as endpoints:
+        home = tmp_path / "python"
+        seed_home(home, endpoints, "session")
+        assert run(python, home, endpoints, CANCEL, python=True)[0] == 0
+        assert [request.label for request in endpoints.wire] == [
+            *CANCEL_READS,
+            "recordUserIntent",
+        ]
+
+
+@pytest.mark.parametrize("target", ["unknown-chain", "empty-chain"])
+def test_cancel_requires_matching_known_chain_ids(
+    cancel_pair: tuple[CLI, CLI], tmp_path: Path, target: str
+) -> None:
+    python, rust = cancel_pair
+    with loopback("trade-accepted", cancel_target=target) as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        code, output, stderr = run(rust, home, endpoints, CANCEL, python=False)
+        assert (code, stderr) == (1, "")
+        assert output["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": "Keeper trading route and LCD network do not match",
+            "retryable": False,
+        }
+        assert [request.label for request in endpoints.wire] == CANCEL_READS[:2]
+        assert not endpoints.errors
+        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+    # The pinned Python guard treats matching absent or empty values as success.
+    with loopback("trade-accepted", cancel_target=target) as endpoints:
+        home = tmp_path / "python"
+        seed_home(home, endpoints, "session")
+        assert run(python, home, endpoints, CANCEL, python=True)[0] == 0
+        assert [request.label for request in endpoints.wire] == [
+            *CANCEL_READS,
+            "recordUserIntent",
+        ]
 
 
 def test_cancel_rechecks_the_pinned_account_after_reading(

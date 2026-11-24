@@ -3,6 +3,7 @@ use std::sync::LazyLock;
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use url::Host;
 
 use crate::endpoint::Endpoint;
 
@@ -59,22 +60,25 @@ impl From<Value> for Field {
 }
 
 impl Field {
-    /// Keep only the intermediate digest until the writer keys it.
-    pub fn endpoint_identity(endpoint: &str) -> Self {
-        let site = origin(endpoint);
-        if site != REDACTED_URL
-            && let Some(url) = Endpoint::split(endpoint.trim())
-        {
-            let path = if url.path.is_empty() { "/" } else { &url.path };
-            return Self::EndpointIdentity(
-                Sha256::digest(format!("{site}{path}?{}", url.query)).into(),
-            );
-        }
-        Self::Scalar(Value::Null)
-    }
-
     pub fn argv(args: impl IntoIterator<Item = String>) -> Self {
         Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Arg).collect())
+    }
+
+    pub fn endpoint_identity(value: &str) -> Self {
+        let site = origin(value);
+        if site == REDACTED_URL {
+            return Self::Scalar(Value::Null);
+        }
+        let Some(endpoint) = Endpoint::split(value.trim()) else {
+            return Self::Scalar(Value::Null);
+        };
+        let path = if endpoint.path.is_empty() {
+            "/"
+        } else {
+            &endpoint.path
+        };
+        let digest = Sha256::digest(format!("{site}{path}?{}", endpoint.query));
+        Self::EndpointIdentity(digest.into())
     }
 
     pub(super) fn snapshot(self, budget: &mut Budget, tokens: &[String], depth: usize) -> Self {
@@ -84,8 +88,8 @@ impl Field {
             Self::Text(text) => Self::Text(copy_text(&text, budget, tokens)),
             Self::Untrusted(text) => Self::Untrusted(copy_text(&text, budget, tokens)),
             Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
-            Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
             Self::EndpointIdentity(_) => self,
+            Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
             Self::Scalar(Value::Number(number))
                 if number.is_i64()
                     || number.is_u64()
@@ -216,11 +220,18 @@ pub(super) fn replace_tokens(text: &str, tokens: &[String]) -> String {
     text
 }
 
-fn origin(text: &str) -> String {
+/// Strip credentials, path, query, and fragment for a public endpoint report.
+pub fn origin(text: &str) -> String {
     let Some(url) = Endpoint::split(text.trim()) else {
         return REDACTED_URL.into();
     };
-    let (host, port) = url.host_port();
+    let (mut host, port) = url.host_port();
+    if !host.is_ascii() && !host.starts_with('[') {
+        let Ok(encoded) = Host::parse(&host) else {
+            return REDACTED_URL.into();
+        };
+        host = encoded.to_string();
+    }
     if !HOST.is_match(&host) {
         return REDACTED_URL.into();
     }

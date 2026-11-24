@@ -1,9 +1,11 @@
 //! Keeper GraphQL requests and their transport verdicts.
 
 mod ca_dir;
+mod diagnostics;
 mod proxy;
 mod public;
 mod queries;
+pub mod stream;
 mod transport;
 
 use std::{
@@ -20,8 +22,9 @@ use crate::{
     log::{self, EventContext, Field, Level},
 };
 
-pub use public::public_intent_status;
+pub use diagnostics::{lcd_network, websocket_handshake};
 pub(crate) use public::{intent_history, intent_record, request_hash, wait_error_code};
+pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
 pub(crate) use transport::get as lcd_get;
 
@@ -57,6 +60,30 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(query, variables, token, timeout, std::future::pending())
+            .await
+    }
+
+    /// Make an interruptible public read.
+    pub async fn read_until(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        timeout: Duration,
+        interrupt: impl Future<Output = SaiError>,
+    ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(query, variables, None, timeout, interrupt)
+            .await
+    }
+
+    async fn request_with(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        token: Option<&str>,
+        timeout: Duration,
+        interrupt: impl Future<Output = SaiError>,
+    ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
         if let Some(token) = token {
@@ -67,17 +94,24 @@ impl<'a> Keeper<'a> {
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
         let mut response = ResponseLog::default();
-        let wait_read = matches!(query, WAIT_INTENTS | INTENT_HISTORY);
-        let post = self.post(query, &variables, token, timeout, &mut response);
-        let result = if wait_read {
-            tokio::time::timeout(timeout, post)
-                .await
-                .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))
-        } else {
-            post.await
+        let post = async {
+            let post = self.post(query, &variables, token, timeout, &mut response);
+            if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
+                tokio::time::timeout(timeout, post)
+                    .await
+                    .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))
+            } else {
+                post.await
+            }
+        };
+        let (result, interrupted) = tokio::select! {
+            biased;
+            error = interrupt => (Err(error), true),
+            result = post => (result, false),
         };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
+            Err(_) if interrupted => ("error", Level::Warn, Some(Code::InternalError), None),
             Ok(_) => ("ok", Level::Info, None, None),
             Err(error) => match error.code {
                 Code::NotSent => ("not_sent", Level::Warn, Some(error.code), None),
@@ -107,6 +141,7 @@ impl<'a> Keeper<'a> {
             [
                 ("operation", json!(queries::operation(query)).into()),
                 ("endpoint", Field::Endpoint(self.endpoint.into())),
+                ("endpointId", Field::endpoint_identity(self.endpoint)),
                 ("addr", json!(addr).into()),
                 ("intentKey", json!(intent_key).into()),
                 ("authenticated", json!(token.is_some()).into()),
@@ -146,8 +181,8 @@ impl<'a> Keeper<'a> {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
+            log.error_count = Some(errors.as_array().map_or(1, Vec::len));
             log.errors = if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
-                log.error_count = Some(errors.as_array().map_or(1, Vec::len));
                 Some(wait_graphql_errors(errors))
             } else {
                 Some(graphql_errors(errors))
@@ -177,24 +212,50 @@ impl<'a> Keeper<'a> {
 }
 
 fn check_url(endpoint: &str) -> Result<(), SaiError> {
+    check_transport(endpoint, ProbeEndpoint::Keeper).map_err(keeper_error)
+}
+
+enum ProbeEndpoint {
+    Keeper,
+    Lcd,
+    WebSocket,
+}
+
+fn check_transport(endpoint: &str, service: ProbeEndpoint) -> Result<(), &'static str> {
+    let (secure, plain, insecure, credentials) = match service {
+        ProbeEndpoint::Keeper => (
+            "https",
+            "http",
+            "Keeper endpoint must use HTTPS, except on loopback",
+            "Credentials are not allowed in the Keeper URL",
+        ),
+        ProbeEndpoint::Lcd => (
+            "https",
+            "http",
+            "LCD endpoint must use HTTPS, except on loopback",
+            "Credentials are not allowed in the LCD URL",
+        ),
+        ProbeEndpoint::WebSocket => (
+            "wss",
+            "ws",
+            "WebSocket endpoint must use WSS, except on loopback",
+            "Credentials are not allowed in the WebSocket URL",
+        ),
+    };
     let Some(url) = Endpoint::split(endpoint).filter(|url| {
-        url.scheme == "https"
-            || (url.scheme == "http"
+        url.scheme == secure
+            || (url.scheme == plain
                 && matches!(
                     url.host_port().0.as_str(),
                     "localhost" | "127.0.0.1" | "[::1]"
                 ))
     }) else {
-        return Err(keeper_error(
-            "Keeper endpoint must use HTTPS, except on loopback",
-        ));
+        return Err(insecure);
     };
     if let Some((userinfo, _)) = url.authority.rsplit_once('@')
         && !matches!(userinfo, "" | ":")
     {
-        return Err(keeper_error(
-            "Credentials are not allowed in the Keeper URL",
-        ));
+        return Err(credentials);
     }
     Ok(())
 }
@@ -214,22 +275,29 @@ fn not_sent() -> SaiError {
     )
 }
 
+const GRAPHQL_ERROR_CODES: &[&str] = &[
+    "GRAPHQL_PARSE_FAILED",
+    "GRAPHQL_VALIDATION_FAILED",
+    "INTENT_NOT_ACCEPTED",
+    "BAD_USER_INPUT",
+    "FORBIDDEN",
+    "INTERNAL_SERVER_ERROR",
+    "UNAUTHENTICATED",
+];
+
 fn graphql_errors(errors: &Value) -> Field {
     let entries = errors.as_array().into_iter().flatten().take(3);
     Field::Array(
         entries
             .filter_map(Value::as_object)
             .map(|item| {
-                let code = item.get("extensions").and_then(|value| value.get("code"));
-                let code = code.filter(|value| !value.is_null()).map(stringify);
-                let message = item.get("message").map_or_else(String::new, stringify);
-                Field::Object(vec![
-                    (
-                        "code".into(),
-                        code.map_or(Field::Scalar(Value::Null), Field::Untrusted),
-                    ),
-                    ("message".into(), Field::Untrusted(message)),
-                ])
+                let code = item
+                    .get("extensions")
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str)
+                    .filter(|value| GRAPHQL_ERROR_CODES.contains(value))
+                    .map_or_else(|| json!(Code::KeeperError), |value| json!(value));
+                json!({"code": code}).into()
             })
             .collect(),
     )
@@ -283,7 +351,7 @@ pub(crate) fn truthy(value: &Value) -> bool {
     }
 }
 
-fn is_evm_address(value: &str) -> bool {
+pub(crate) fn is_evm_address(value: &str) -> bool {
     value
         .strip_prefix("0x")
         .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
