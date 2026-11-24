@@ -10,6 +10,7 @@ import queue
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,7 @@ from compare import (
     stderr_category,
     stdout,
 )
+from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import HERE, ROOT, Endpoints, child_env, loopback, seed_home
 
@@ -75,15 +77,7 @@ class Case:
 
     @property
     def command(self) -> str:
-        args = [arg for arg in self.args if arg != "--json"]
-        group = python_cli.commands.get(args[0])
-        if (
-            isinstance(group, click.Group)
-            and len(args) > 1
-            and args[1] in group.commands
-        ):
-            return " ".join(args[:2])
-        return args[0]
+        return " ".join(command_path(python_cli, self.args)) or self.args[0]
 
 
 @dataclass(frozen=True)
@@ -199,9 +193,12 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
                 actual = actual[int(key)]
             else:
                 actual = actual.get(key, absent) if isinstance(actual, dict) else absent
-        if expected == "<absent>" and actual is absent:
-            continue
-        if first_difference(actual, expected, selector):
+        mismatch = (
+            actual is not absent
+            if expected == "<absent>"
+            else first_difference(actual, expected, selector)
+        )
+        if mismatch:
             raise ValueError(f"Persisted state differs from expectation at {selector}")
 
 
@@ -343,7 +340,7 @@ def safe_observe(
         return None, f"fixture setup exited {exc.returncode}"
     except ValueError as exc:
         return None, str(exc)
-    except OSError as exc:
+    except (OSError, sqlite3.Error, AttributeError, KeyError, TypeError) as exc:
         return None, type(exc).__name__
 
 
