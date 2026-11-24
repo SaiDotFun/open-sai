@@ -104,10 +104,12 @@ def test_bool_setting_text_output():
     assert "update.auto = false  # file, SAI_UPDATE_AUTO" in text
 
 
-def test_list_shows_only_keeper_origins():
+def test_list_shows_only_endpoint_origins():
     path_key, query_key = "fixture-path-key", "fixture-query-key"
     endpoint = f"https://[::1]:9443/{path_key}/query?key={query_key}"
     assert sai("config", "set", "keeper.endpoint", endpoint).exit_code == 0
+    lcd = f"https://lcd.example:8443/{path_key}?key={query_key}"
+    assert sai("config", "set", "lcd.endpoint", lcd).exit_code == 0
 
     text = sai("config", "list")
     structured = sai("--json", "config", "list")
@@ -117,10 +119,13 @@ def test_list_shows_only_keeper_origins():
 
     assert 'keeper.endpoint = "https://[::1]:9443"' in text.stdout
     assert 'keeper.ws_endpoint = "wss://[::1]:9443"' in text.stdout
+    assert 'lcd.endpoint = "https://lcd.example:8443"' in text.stdout
     shown = json.loads(structured.stdout)["settings"]
     assert shown["keeper.endpoint"]["value"] == "https://[::1]:9443"
     assert shown["keeper.ws_endpoint"]["value"] == "wss://[::1]:9443"
     assert shown["keeper.ws_endpoint"]["source"] == "derived"
+    assert shown["lcd.endpoint"]["value"] == "https://lcd.example:8443"
+    assert sai("config", "get", "lcd.endpoint").stdout == lcd + "\n"
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 import tomlkit
@@ -450,32 +450,13 @@ def load(
 # Redacted output
 
 
-def public_url(url: str | None) -> str | None:
-    """Return URL without user info, query, or fragment, which can hold
-    credentials such as API keys."""
-    if url is None:
-        return None
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if ":" in host:
-        host = f"[{host}]"
-    try:
-        port = parts.port
-    except ValueError:
-        port = None
-    netloc = host if port is None else f"{host}:{port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
-
-
 def public(settings: Settings) -> dict[str, dict[str, Any]]:
     """Every key with its display value, source, variable, and default."""
 
     def shown(spec: Setting, value: Any) -> Any:
         if spec.kind != "url" or value is None:
             return value
-        if spec.section == "keeper":
-            return log.origin(value)
-        return public_url(value)
+        return log.origin(value)
 
     return {
         spec.key: {

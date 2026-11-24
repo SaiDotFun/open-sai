@@ -9,8 +9,7 @@ and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
 
-Rendered diagnostics redact session tokens. Keeper endpoints are shown as
-origins.
+Rendered diagnostics redact session tokens and show endpoint origins.
 
 To add a check, write a function that takes a `Context` and returns a
 `Check` or a list of them (a check that repeats, such as one per MCP client),
@@ -51,7 +50,7 @@ from .core import (
     update,
     updater,
 )
-from .core.settings import Settings, public_url
+from .core.settings import Settings
 from .mcp_server import info, tools
 
 SCHEMA_VERSION = 1
@@ -1201,7 +1200,7 @@ def check_websocket(ctx: Context) -> Check:
 
 
 def check_lcd(ctx: Context) -> Check:
-    url = public_url(ctx.config.lcd_endpoint)
+    url = log.origin(ctx.config.lcd_endpoint)
     start = time.monotonic()
     try:
         node = margin.node_info(ctx.config.lcd_endpoint, timeout=NETWORK_TIMEOUT)

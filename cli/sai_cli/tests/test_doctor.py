@@ -1375,11 +1375,12 @@ def blocked_on(endpoint: str) -> None:
 @pytest.mark.parametrize(
     "matches", [False, True], ids=["same-origin-mismatch", "match"]
 )
-def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
+def test_doctor_shows_only_endpoint_origins_in_reports_and_hints(
     http_stub, matches, request
 ):
     base, state = http_stub
     path_key, query_key = "fixture-keeper-path", "fixture-keeper-query"
+    lcd_path_key, lcd_query_key = "fixture-lcd-path", "fixture-lcd-query"
     stored_path_key = "fixture-stored-path"
     route = f"/{path_key}/query?key={query_key}"
     endpoint = base + route
@@ -1400,12 +1401,18 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
             "--ws-endpoint",
             ws_origin + route,
             "--lcd-endpoint",
-            base,
+            f"{base}/{lcd_path_key}?key={lcd_query_key}",
         )
         assert code == 1
         assert ws_origin in output
-        assert path_key not in output and query_key not in output
-        assert stored_path_key not in output
+        for secret in (
+            path_key,
+            query_key,
+            stored_path_key,
+            lcd_path_key,
+            lcd_query_key,
+        ):
+            assert secret not in output
         assert "${SAI_RECONCILE_ENDPOINT:?" in output
         if flags:
             checks = {
@@ -1417,6 +1424,8 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
             assert session["endpoint"] == base and session["endpointMatches"] is matches
             assert checks["websocket"]["status"] == "pass"
             assert checks["websocket"]["details"]["endpoint"] == ws_origin
+            assert checks["lcd"]["status"] == "pass"
+            assert checks["lcd"]["details"]["endpoint"] == base
             fix = checks["intents" if matches else "session"]["fix"]
             command = (
                 f"intent status {ADDR} --key {KEY}" if matches else "auth login NAME"
