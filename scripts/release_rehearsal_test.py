@@ -14,6 +14,7 @@ import unittest
 import urllib.request
 from contextlib import suppress
 from pathlib import Path
+from threading import Event
 from typing import Any
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -326,6 +327,55 @@ class BaselineTest(unittest.TestCase):
         )
         self.assertIn("incomplete or invalid GitHub HTTP response", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+
+    def test_signals_interrupt_a_stalled_default_lookup(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+        request_arrived = Event()
+        unblock = Event()
+
+        class SlowRelease(keeper_handler):
+            def do_GET(self) -> None:
+                request_arrived.set()
+                unblock.wait(timeout=10)
+
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            request_arrived.clear()
+            unblock.clear()
+            with (
+                self.subTest(signal=signum.name),
+                REHEARSAL["keeper_server"](SlowRelease) as base,
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                wheel = Path(temp) / "sai_cli-0.1.2-py3-none-any.whl"
+                wheel.touch()
+                with subprocess.Popen(
+                    [
+                        sys.executable,
+                        "-c",
+                        RUN_WITH_RELEASE_API,
+                        str(SCRIPT),
+                        base,
+                        str(wheel),
+                    ],
+                    env={"HOME": temp, "TMPDIR": temp, "PATH": ""},
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                ) as process:
+                    try:
+                        self.assertTrue(request_arrived.wait(timeout=5))
+                        process.send_signal(signum)
+                        stdout, stderr = process.communicate(timeout=3)
+                    finally:
+                        unblock.set()
+                        if process.poll() is None:
+                            process.kill()
+                self.assertEqual(process.returncode, 128 + signum)
+                self.assertEqual(stdout, "")
+                self.assertEqual(
+                    stderr, f"Release rehearsal interrupted by {signum.name}\n"
+                )
+                self.assertCountEqual(Path(temp).iterdir(), [wheel])
 
 
 class SessionTest(unittest.TestCase):

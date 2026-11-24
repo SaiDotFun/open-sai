@@ -96,12 +96,18 @@ def latest_tag(releases: list[Any]) -> str | None:
     return best[1] if best else None
 
 
-def within(seconds: float, what: str, work: Callable[[float], T]) -> T:
+def within(
+    seconds: float,
+    what: str,
+    work: Callable[[float], T],
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> T:
     """Run WORK(deadline) and give up after SECONDS of wall-clock time.
 
     Socket timeouts only bound each read, so a server that keeps sending a
     little could hold a request open forever. WORK runs in a daemon thread
-    that this stops waiting for at the deadline.
+    that this stops waiting for at the deadline or when CHECK_CANCELLED raises.
     """
     deadline = time.monotonic() + seconds
     outcome: dict[str, Any] = {}
@@ -114,9 +120,15 @@ def within(seconds: float, what: str, work: Callable[[float], T]) -> T:
 
     worker = threading.Thread(target=run, name="sai-install", daemon=True)
     worker.start()
-    worker.join(seconds)
-    if worker.is_alive():
-        raise LookupFailed(f"timed out {what}")
+    while worker.is_alive():
+        if check_cancelled is not None:
+            check_cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LookupFailed(f"timed out {what}")
+        worker.join(min(0.1, remaining) if check_cancelled is not None else remaining)
+    if check_cancelled is not None:
+        check_cancelled()
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
@@ -224,7 +236,11 @@ def any_release(web_base: str, deadline: float) -> bool:
 
 
 def find_latest(
-    api_base: str = API_BASE, web_base: str = WEB_BASE, timeout: float = TOTAL_TIMEOUT
+    api_base: str = API_BASE,
+    web_base: str = WEB_BASE,
+    timeout: float = TOTAL_TIMEOUT,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> str | None:
     """Return the latest sai-cli release tag, or None when there is none yet."""
 
@@ -236,7 +252,9 @@ def find_latest(
             raise LookupFailed(RATE_LIMITED)
         return None
 
-    return within(timeout, "looking up the latest release", work)
+    return within(
+        timeout, "looking up the latest release", work, check_cancelled=check_cancelled
+    )
 
 
 def version_of(tag: str) -> str:

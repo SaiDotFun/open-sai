@@ -206,7 +206,9 @@ def resolve_baseline(
     api_base: str = release_install.API_BASE, web_base: str = release_install.WEB_BASE
 ) -> str:
     try:
-        tag = release_install.find_latest(api_base, web_base)
+        tag = release_install.find_latest(
+            api_base, web_base, check_cancelled=CANCELLATION.check
+        )
     except release_install.LookupFailed as exc:
         raise RehearsalError(
             f"Could not resolve the latest published sai-cli release: {exc}. "
@@ -226,6 +228,7 @@ def verify_published_baseline(version: str, api_base: str) -> None:
             release_install.TOTAL_TIMEOUT,
             f"checking release {tag}",
             lambda deadline: release_install.request(url, "GET", deadline),
+            check_cancelled=CANCELLATION.check,
         )
     except release_install.LookupFailed as exc:
         raise RehearsalError(f"{error}: {exc}") from exc
@@ -1486,22 +1489,25 @@ def main(*, api_base: str = release_install.API_BASE) -> int:
     version = match[1]
 
     def work() -> int:
-        baseline = (
-            args.baseline if args.baseline is not None else resolve_baseline(api_base)
-        )
-        require(
-            tuple(map(int, version.split("."))) > tuple(map(int, baseline.split("."))),
-            f"Candidate sai {version} must be newer than baseline sai {baseline}",
-        )
-        if args.baseline is not None:
-            verify_published_baseline(baseline, api_base)
-        diagnostics = None
-        if args.verbose:
-            directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
-            diagnostics = directory / "child-output.log"
-            diagnostics.touch(mode=0o600)
-            print(f"Child output log: {diagnostics}", file=sys.stderr)
         with cancel_on_signal(), cleanup_stack() as cleanup:
+            baseline = (
+                args.baseline
+                if args.baseline is not None
+                else resolve_baseline(api_base)
+            )
+            require(
+                tuple(map(int, version.split(".")))
+                > tuple(map(int, baseline.split("."))),
+                f"Candidate sai {version} must be newer than baseline sai {baseline}",
+            )
+            if args.baseline is not None:
+                verify_published_baseline(baseline, api_base)
+            diagnostics = None
+            if args.verbose:
+                directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
+                diagnostics = directory / "child-output.log"
+                diagnostics.touch(mode=0o600)
+                print(f"Child output log: {diagnostics}", file=sys.stderr)
             scratch = cleanup.enter_context(
                 tempfile.TemporaryDirectory(
                     prefix="sai-release-rehearsal-",
