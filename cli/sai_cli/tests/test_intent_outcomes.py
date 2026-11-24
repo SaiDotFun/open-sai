@@ -5,12 +5,17 @@ from __future__ import annotations
 import asyncio
 import json
 import multiprocessing
+import os
+import signal
 import subprocess
 import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
+from contextlib import closing, suppress
+from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from multiprocessing.queues import Queue
 from pathlib import Path
@@ -21,7 +26,7 @@ from click.testing import CliRunner
 from loopback_keeper import KeeperHandler, keeper_server
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
-from sai_cli.core import keeper, reconcile, settings, storage
+from sai_cli.core import keeper, log, reconcile, settings, storage, wait
 from sai_cli.mcp_server import server
 from sai_cli.sai_cli import main
 
@@ -36,7 +41,18 @@ RESPONSES = {**FIXTURE["recorded"], **FIXTURE["replays"]}
 NIBI_ADDR = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
 OTHER_ADDR = "0x" + "b" * 40
 OTHER_NIBI_ADDR = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
-Reply = str | dict[str, Any] | Callable[[], dict[str, Any]]
+
+
+@dataclass
+class SlowBody:
+    response: str = "filled"
+    hold: bool = False
+    started: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+    finished: threading.Event = field(default_factory=threading.Event)
+
+
+Reply = str | dict[str, Any] | Callable[[], dict[str, Any]] | SlowBody
 MARKET = {
     "data": {
         "perp": {
@@ -85,44 +101,93 @@ def submitted_keys() -> list[str]:
 @pytest.fixture
 def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]]]:
     replies: deque[Reply] = deque()
+    active_key = KEY
+    offset = 0
 
     class Handler(KeeperHandler):
         def do_POST(self) -> None:
-            request = self.read_json()
+            nonlocal active_key, offset
+            try:
+                request = self.read_json()
+            except (ConnectionResetError, json.JSONDecodeError):
+                return
             if request["query"] == keeper.SUBMIT:
-                submitted_keys.append(request["variables"]["input"]["intentKey"])
-            queued = replies.popleft()
-            if queued == "admission_ack":
+                active_key = request["variables"]["input"]["intentKey"]
+                submitted_keys.append(active_key)
+            replay = replies.popleft()
+            slow = replay if isinstance(replay, SlowBody) else None
+            if isinstance(replay, SlowBody):
+                replay = replay.response
+            if replay == "drop_ack":
+                self.close_connection = True
+                return
+            reply: dict[str, Any]
+            if replay == "reject":
                 assert request["query"] == keeper.SUBMIT
-                submitted = request["variables"]["input"]
-                assert submitted["intent"]["kind"] == "OPEN_TRADE"
-                assert submitted["intent"]["body"]["orderType"] == "market"
-                reply = {
-                    "data": {
-                        "recordUserIntent": {
-                            "intentKey": submitted["intentKey"],
-                            "evmAddress": ADDR,
-                            "lifecycleStep": "jwt_pass",
-                            "execActor": "server",
-                        }
-                    }
-                }
-            elif isinstance(queued, str):
-                reply = RESPONSES[queued]
-            elif isinstance(queued, dict):
-                reply = queued
+                reply = {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+            elif replay in ("ack", "admission_ack"):
+                assert request["query"] == keeper.SUBMIT
+                if replay == "admission_ack":
+                    submitted = request["variables"]["input"]["intent"]
+                    assert submitted["kind"] == "OPEN_TRADE"
+                    assert submitted["body"]["orderType"] == "market"
+                row = RESPONSES["accepted"]["data"]["userIntents"][0]
+                reply = {"data": {"recordUserIntent": {**row, "intentKey": active_key}}}
             else:
-                reply = queued()
-            if "userIntents" in reply["data"]:
-                assert request["query"] == keeper.INTENTS
+                if isinstance(replay, str):
+                    reply = deepcopy(RESPONSES[replay])
+                elif isinstance(replay, dict):
+                    reply = deepcopy(replay)
+                else:
+                    reply = deepcopy(replay())
+            data: dict[str, Any] = reply.get("data", {})
+            if "userIntents" in data:
+                assert request["query"] in (keeper.INTENTS, keeper.WAIT_INTENTS)
                 assert request["variables"]["user"].lower() in (ADDR, NIBI_ADDR)
-                assert request["variables"]["key"] in (KEY, None, *submitted_keys)
-            elif "tradeHistory" in reply["data"].get("perp", {}):
-                assert request["query"] == keeper.HISTORY
-                assert request["variables"] == {"trader": ADDR}
-            elif "borrowings" in reply["data"].get("perp", {}):
+                key = request["variables"]["key"]
+                assert key in (KEY, None, *submitted_keys)
+                for row in data["userIntents"]:
+                    if row["intentKey"] == KEY:
+                        row["intentKey"] = key or active_key
+                offset = 0
+            elif "tradeHistory" in data.get("perp", {}):
+                assert request["query"] == keeper.INTENT_HISTORY
+                assert request["variables"]["trader"].lower() in (ADDR, NIBI_ADDR)
+                assert request["variables"]["limit"] == reconcile.HISTORY_PAGE_SIZE
+                assert request["variables"]["offset"] == offset
+                rows = data["perp"]["tradeHistory"]
+                for row in rows:
+                    if row.get("intentKey") == KEY:
+                        row["intentKey"] = active_key
+                offset = (
+                    offset + reconcile.HISTORY_PAGE_SIZE
+                    if len(rows) == reconcile.HISTORY_PAGE_SIZE
+                    else 0
+                )
+                if offset == reconcile.HISTORY_PAGE_SIZE * reconcile.HISTORY_MAX_PAGES:
+                    offset = 0
+            elif "borrowings" in data.get("perp", {}):
                 assert request["query"] == keeper.MARKETS
-            self.reply(reply)
+            if slow is None:
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    self.reply(reply)
+                return
+            body = json.dumps(reply).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            slow.started.set()
+            try:
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    if slow.hold:
+                        slow.release.wait(10)
+                    chunk = max(1, len(body) // 8)
+                    for start in range(0, len(body), chunk):
+                        slow.release.wait(0.08)
+                        self.wfile.write(body[start : start + chunk])
+            finally:
+                slow.finished.set()
 
     with keeper_server(Handler) as base:
         yield f"{base}/query", replies
@@ -432,6 +497,62 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert submitted_keys == [key, allowed["intentKey"]]
 
 
+@pytest.mark.parametrize(
+    ("surface", "lock"),
+    [
+        ("cli", "IMMEDIATE"),
+        ("cli-wait", "IMMEDIATE"),
+        ("cli-wait", "DEFERRED"),
+        ("mcp", "IMMEDIATE"),
+        ("mcp", "EXCLUSIVE"),
+    ],
+)
+def test_locked_ledger_reports_open_was_not_sent(
+    connected_replay: tuple[str, deque[Reply]],
+    submitted_keys: list[str],
+    surface: str,
+    lock: str,
+) -> None:
+    endpoint, replies = connected_replay
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    if surface == "mcp":
+        replies.append(MARKET)
+        preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
+        args = {
+            **OPEN_ARGS,
+            "preview_digest": preview["previewDigest"],
+            "reference_price": preview["referencePrice"],
+        }
+
+    # IMMEDIATE lets MCP's precheck read the ledger, then blocks reservation.
+    # DEFERRED with a read blocks the commit. EXCLUSIVE blocks the precheck.
+    if lock != "EXCLUSIVE":
+        replies.append(MARKET)
+    with closing(storage.db()) as connection, connection, storage.busy_timeout(0):
+        connection.execute(f"BEGIN {lock}")
+        if lock == "DEFERRED":
+            connection.execute("SELECT count(*) FROM intents").fetchone()
+        if surface == "mcp":
+            response = call_mcp(mcp, "trade_open", args)
+            error, message = response, response["error"]
+        else:
+            flags = ["--wait"] if surface == "cli-wait" else []
+            result = CliRunner().invoke(
+                main, ["--endpoint", endpoint, "--json", *CLI_OPEN, *flags]
+            )
+            assert result.exit_code == 1, result.output
+            response = json.loads(result.stdout)
+            error, message = response["error"], response["error"]["message"]
+
+    assert not submitted_keys
+    assert not storage.list_pending(endpoint, ADDR)
+    assert error["code"] == "INTERNAL_ERROR"
+    assert "database is locked" in message
+    assert "Nothing was sent" in message
+    assert "intentKey" not in response and "intentKey" not in error
+    assert "hint" not in error and "next" not in error
+
+
 def _open_with_mcp(
     endpoint: str, args: dict[str, Any], results: Queue[dict[str, Any]]
 ) -> None:
@@ -638,3 +759,954 @@ def test_market_pending_repairs_an_old_terminal_row(keeper_replay, provisional):
     assert status(endpoint) == "terminal"
     replies.append("pending_exec")
     assert reconcile.reconcile(endpoint, ADDR, KEY)["localStatus"] == "terminal"
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.elapsed = 0.0
+        self.delays: list[float] = []
+
+    def now(self) -> float:
+        return self.elapsed
+
+    def sleep(self, delay: float) -> None:
+        self.delays.append(delay)
+        self.elapsed += delay
+
+
+def test_wait_keeps_confirmation_when_optional_history_uses_remaining_budget(
+    keeper_replay,
+):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    clock = FakeClock()
+
+    def confirmed():
+        clock.elapsed = 0.9
+        response = deepcopy(RESPONSES["filled"])
+        response["data"]["userIntents"][0]["body"] = {"orderType": "market"}
+        return response
+
+    def late_history():
+        clock.elapsed = 1.1
+        return RESPONSES["not_yet_in_history"]
+
+    replies.extend((confirmed, late_history))
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, timeout=1, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "succeeded"
+    assert result["receipt"]["execution"]["block"] == 50109596
+    assert result["receipt"]["fill"] is None
+    assert status(endpoint) == "terminal"
+
+
+def test_wait_reports_aged_absence_when_ledger_releases_block(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint, expired=True)
+    clock = FakeClock()
+    replies.append("absent")
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == status(endpoint) == "absent"
+    assert "local block was released" in result["message"]
+    storage.pending("next-open", endpoint, ADDR, "OPEN_TRADE", "")
+
+
+@pytest.mark.parametrize(
+    ("disposition", "code"),
+    [
+        ("rejected", "ADMISSION_REJECTED"),
+        ("not_sent", "NOT_SENT"),
+    ],
+)
+@pytest.mark.parametrize("during_wait", [False, True])
+def test_wait_reports_definitive_submit_disposition(
+    keeper_replay, disposition, code, during_wait
+):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    clock = FakeClock()
+
+    def submitter_finishes():
+        storage.set_status(KEY, endpoint, ADDR, disposition)
+        return RESPONSES["started"]
+
+    if during_wait:
+        replies.append(submitter_finishes)
+    else:
+        storage.set_status(KEY, endpoint, ADDR, disposition)
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, timeout=0.25, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == status(endpoint) == disposition
+    assert result["intentKey"] == KEY
+    assert result["code"] == code
+    storage.pending("next-open", endpoint, ADDR, "OPEN_TRADE", "")
+
+
+@pytest.mark.parametrize("recorded", ["terminal", "absent"])
+def test_wait_reports_a_released_local_block_when_keeper_is_unreachable(
+    keeper_replay, recorded
+):
+    endpoint, replies = keeper_replay
+    reserve(endpoint, expired=True)
+    if recorded == "terminal":
+        storage.set_status(KEY, endpoint, ADDR, "terminal")
+    else:
+        storage.mark_absent(KEY, endpoint, ADDR, keeper.ABSENT_AFTER_SECONDS)
+    replies.append("drop_ack")
+    clock = FakeClock()
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, timeout=0.25, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == recorded
+    assert result.get("code") != "OUTCOME_UNKNOWN"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+@pytest.mark.parametrize(
+    ("admission", "before_interrupt", "held_response", "outcome", "exit_code"),
+    [
+        ("admission_ack", ["filled"], "filled_history", "terminal", 1),
+        ("drop_ack", [], "accepted", "unknown", 5),
+    ],
+)
+def test_sigint_during_trade_wait_preserves_original_key(
+    keeper_replay, admission, before_interrupt, held_response, outcome, exit_code
+):
+    endpoint, replies = keeper_replay
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    market = {
+        "data": {
+            "perp": {
+                "borrowings": [
+                    {
+                        "marketId": 0,
+                        "collateralToken": {"symbol": "USDC"},
+                        "isOpen": True,
+                        "price": 100,
+                    }
+                ]
+            }
+        }
+    }
+    slow = SlowBody(response=held_response, hold=True)
+    replies.extend((market, admission, *before_interrupt, slow))
+    command = [
+        sys.executable,
+        "-c",
+        "from sai_cli.sai_cli import main; main()",
+        "--endpoint",
+        endpoint,
+        "--json",
+        "trade",
+        "open",
+        "--market",
+        "0",
+        "--side",
+        "long",
+        "--type",
+        "market",
+        "--amount",
+        "10",
+        "--leverage",
+        "2",
+        "--slippage",
+        "1",
+        "--wait",
+    ]
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        try:
+            assert slow.started.wait(5)
+            [entry] = storage.list_pending(endpoint, ADDR)
+            assert entry["status"] == outcome
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            slow.release.set()
+            if process.poll() is None:
+                process.kill()
+    assert process.returncode == exit_code, (stdout, stderr)
+    result = json.loads(stdout)
+    assert result["interrupted"] is True
+    assert result["outcome"] == outcome
+    assert result["error"]["intentKey"] == result["intentKey"] == entry["intentKey"]
+    assert result["error"]["hint"] == storage.intent_status_hint(
+        endpoint, ADDR, entry["intentKey"]
+    )
+    if outcome == "unknown":
+        assert result["error"]["code"] == "OUTCOME_UNKNOWN"
+
+
+# Inject in the child at function entry or return. Keeper traffic and SQLite
+# writes still run through the installed CLI code with a disposable SAI_HOME.
+WAIT_FAULT_DRIVER = """
+import signal
+import sqlite3
+import sys
+
+from sai_cli.core import keeper, storage
+from sai_cli.sai_cli import main
+
+module, name, event, selector, failure = sys.argv[1:6]
+sys.argv[1:6] = []
+ledger_lock = None
+
+def inject(frame, what, arg):
+    global ledger_lock
+    if what != event or frame.f_code.co_name != name:
+        return
+    if frame.f_globals.get("__name__") != module:
+        return
+    if selector == "history" and frame.f_locals.get("query") != keeper.INTENT_HISTORY:
+        return
+    if selector.startswith("caller:") and frame.f_back.f_code.co_name != selector[7:]:
+        return
+    if selector == "reserved" and frame.f_locals.get("name") != "intent.reserved":
+        return
+    if selector == "submit" and frame.f_locals.get("query") != keeper.SUBMIT:
+        return
+    sys.setprofile(None)
+    if failure == "sigint":
+        signal.raise_signal(signal.SIGINT)
+        return
+    if failure == "commit-result-lost-locked":
+        ledger_lock = storage.db()
+        ledger_lock.execute("BEGIN IMMEDIATE")
+    if failure.startswith("commit-result-lost"):
+        raise sqlite3.OperationalError("Lost reservation result")
+    raise RuntimeError("Injected failure")
+
+sys.setprofile(inject)
+if failure == "commit-result-lost-locked":
+    with storage.busy_timeout(0):
+        main()
+else:
+    main()
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+@pytest.mark.parametrize(
+    ("hook", "fault", "json_output"),
+    [
+        (("log", "event", "call", "reserved"), "sigint", True),
+        (("keeper", "_request", "call", "submit"), "sigint", True),
+        (("storage", "pending", "return", ""), "commit-result-lost", True),
+        (("storage", "pending", "return", ""), "commit-result-lost-locked", True),
+        (("storage", "pending", "return", ""), "commit-result-lost-locked", False),
+    ],
+)
+def test_trade_recovers_reservation_when_stopped_before_transport(
+    connected_replay: tuple[str, deque[Reply]],
+    submitted_keys: list[str],
+    hook: tuple[str, str, str, str],
+    fault: str,
+    json_output: bool,
+) -> None:
+    endpoint, replies = connected_replay
+    replies.append(MARKET)
+    module, *target = hook
+    output_flags = ["--json"] if json_output else []
+    args = ["--endpoint", endpoint, *output_flags, *CLI_OPEN]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            WAIT_FAULT_DRIVER,
+            f"sai_cli.core.{module}",
+            *target,
+            fault,
+            *args,
+            "--wait",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert submitted_keys == []
+    [entry] = storage.list_pending(endpoint, ADDR)
+    key = entry["intentKey"]
+    cleanup_locked = fault == "commit-result-lost-locked"
+    assert entry["status"] == ("unknown" if cleanup_locked else "not_sent")
+    hint = storage.intent_status_hint(endpoint, ADDR, key)
+    if not json_output:
+        assert "Nothing was sent" in result.stderr
+        assert hint in result.stderr
+        return
+
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == (
+        "INVALID_REQUEST" if fault == "sigint" else "INTERNAL_ERROR"
+    )
+    assert "Nothing was sent" in error["message"]
+    if cleanup_locked:
+        assert error["intentKey"] == key
+        assert error["hint"] == hint
+    else:
+        assert "intentKey" not in error and "hint" not in error
+        replies.extend((MARKET, "admission_ack"))
+        retry = CliRunner().invoke(main, args)
+        assert retry.exit_code == 0, retry.output
+        assert submitted_keys == [json.loads(retry.stdout)["intentKey"]]
+        assert key not in submitted_keys
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+@pytest.mark.parametrize("failure", ["sigint", "exception"])
+@pytest.mark.parametrize(
+    ("module", "name", "event", "selector", "phase"),
+    [
+        ("sai_cli.core.keeper", "request_hash", "call", "", "submit"),
+        ("sai_cli.core.intents", "_record_submission_status", "call", "", "submit"),
+        (
+            "sai_cli.core.intents",
+            "_record_submission_status",
+            "return",
+            "",
+            "submit_return",
+        ),
+        ("sai_cli.core.intents", "submit", "return", "", "submit_return"),
+        ("sai_cli.sai_cli", "emit_trade", "call", "", "waiting"),
+        ("sai_cli.core.wait", "for_intent", "call", "", "both"),
+        ("sai_cli.core.wait", "for_intent_async", "call", "", "both"),
+        ("asyncio.tasks", "sleep", "call", "caller:for_intent_async", "waiting"),
+        ("sai_cli.core.storage", "intent_record", "call", "", "both"),
+        ("httpx._client", "__aenter__", "call", "", "waiting"),
+        ("sai_cli.core.wait", "_reconcile", "call", "", "both"),
+        ("asyncio.tasks", "sleep", "call", "caller:_reconcile", "waiting"),
+        ("sai_cli.core.reconcile", "poll_steps", "call", "", "waiting"),
+        ("sai_cli.core.keeper", "read_async", "call", "", "both"),
+        ("sai_cli.core.wait", "pause", "call", "", "backoff"),
+        ("sai_cli.core.keeper", "read_async", "call", "history", "history"),
+        ("sai_cli.core.wait", "pause", "call", "", "history_backoff"),
+        ("sai_cli.core.receipt", "success", "call", "", "terminal"),
+        ("httpx._client", "__aexit__", "call", "", "terminal"),
+        ("sai_cli.core.receipt", "build", "call", "", "terminal"),
+        ("sai_cli.core.wait", "for_intent", "return", "", "terminal"),
+        ("sai_cli.sai_cli", "emit_wait", "call", "", "terminal"),
+        ("sai_cli.sai_cli", "emit_wait", "call", "", "lost_terminal"),
+        ("sai_cli.sai_cli", "emit", "call", "", "terminal"),
+        ("json", "dumps", "call", "caller:emit", "terminal"),
+        ("click.utils", "echo", "call", "caller:emit", "terminal"),
+        ("click.utils", "echo", "return", "caller:emit", "terminal"),
+    ],
+    ids=lambda value: value if value else None,
+)
+def test_trade_wait_keeps_key_through_final_print(
+    keeper_replay, module, name, event, selector, phase, failure
+):
+    endpoint, replies = keeper_replay
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    market = {
+        "data": {
+            "perp": {
+                "borrowings": [
+                    {
+                        "marketId": 0,
+                        "collateralToken": {"symbol": "USDC"},
+                        "isOpen": True,
+                        "price": 100,
+                    }
+                ]
+            }
+        }
+    }
+    replies.extend(
+        (market, "drop_ack" if phase in ("both", "lost_terminal") else "admission_ack")
+    )
+    if phase == "backoff":
+        replies.append("accepted")
+    if phase in ("history", "history_backoff", "terminal", "lost_terminal"):
+        replies.append("filled")
+    if phase == "history_backoff":
+        replies.append("not_yet_in_history")
+    if phase in ("terminal", "lost_terminal"):
+        replies.append(fill_history())
+    command = [
+        sys.executable,
+        "-c",
+        WAIT_FAULT_DRIVER,
+        module,
+        name,
+        event,
+        selector,
+        failure,
+        "--endpoint",
+        endpoint,
+        "--json",
+        "trade",
+        "open",
+        "--market",
+        "0",
+        "--side",
+        "long",
+        "--type",
+        "market",
+        "--amount",
+        "10",
+        "--leverage",
+        "2",
+        "--slippage",
+        "1",
+        "--wait",
+    ]
+    process = subprocess.run(
+        command, capture_output=True, text=True, timeout=10, check=False
+    )
+    [entry] = storage.list_pending(endpoint, ADDR)
+    recorded = (
+        "terminal"
+        if phase in ("history", "history_backoff", "terminal", "lost_terminal")
+        else ("unknown" if phase in ("submit", "both") else "accepted")
+    )
+    outcome = "terminal" if recorded == "terminal" else "unknown"
+    assert entry["status"] == recorded
+    assert process.returncode == (1 if outcome == "terminal" else 5), process
+    if name == "echo":
+        result = json.loads(process.stderr)
+        if event == "return":
+            assert json.loads(process.stdout)["intentKey"] == entry["intentKey"]
+        else:
+            assert process.stdout == ""
+    else:
+        result = json.loads(process.stdout)
+    assert result["outcome"] == outcome
+    assert result["localStatus"] == recorded
+    assert result["interrupted"] == (failure == "sigint")
+    assert result["error"]["intentKey"] == entry["intentKey"]
+    assert result["error"]["hint"] == storage.intent_status_hint(
+        endpoint, ADDR, entry["intentKey"]
+    )
+
+
+def fill_history() -> dict:
+    response = deepcopy(RESPONSES["filled_history"])
+    history = response["data"]["perp"]["tradeHistory"][0]
+    history["marketOrder"] = {
+        "orderReqBlock": 50109595,
+        "orderReqTxHash": history["txHash"],
+        "orderExecBlock": 50109596,
+        "sequence": 49,
+        "execPrice": 81000.5,
+        "collateralAmount": 4000000,
+    }
+    history.update(openingFeeUsd=0.05, closingFeeUsd=0, borrowingFeeUsd=0)
+    history["trade"].update(
+        isOpen=True,
+        openBlock={"block": 50109596},
+        openPrice=81001.25,
+        openCollateralAmount=3950000,
+        collateralAmount=3950000,
+        leverage=2,
+    )
+    return response
+
+
+def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    replies.extend(
+        (
+            "pending_exec",
+            "outcome_not_indexed",
+            "not_yet_in_history",
+            "not_yet_in_history",
+            "filled",
+            fill_history(),
+        )
+    )
+    clock = FakeClock()
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "filled"
+    assert "code" not in result
+    receipt = result["receipt"]
+    assert receipt["requestTxHash"] == "a" * 64
+    assert receipt["requestBlock"] == 50109595
+    assert receipt["execution"]["block"] == 50109596
+    assert receipt["execution"]["historyId"] == 1007
+    assert receipt["execution"]["marketOrderSequence"] == 49
+    assert receipt["fill"] == {
+        "price": None,
+        "oraclePrice": 81000.5,
+        "sizeCollateralBaseUnits": None,
+        "escrowedCollateralBaseUnits": 4000000,
+    }
+    assert receipt["positionFeesUsd"] == {"opening": 0.05, "closing": 0, "borrowing": 0}
+    assert receipt["positionNow"]["id"] == 7
+    assert clock.delays == [0.25, 0.25, 0.5]
+    assert status(endpoint) == "terminal"
+    start, end = log.tail(2, name="intent.wait")
+    assert (start["event"], end["event"], end["status"]) == (
+        "intent.wait.start",
+        "intent.wait.end",
+        "filled",
+    )
+    assert start["intentKey"] == end["intentKey"] == KEY
+
+
+def test_wait_projects_receipt_fields_from_keeper(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    opaque = "opaque upstream value"
+    history = fill_history()
+    row = history["data"]["perp"]["tradeHistory"][0]
+    row["marketOrder"]["execPrice"] = opaque
+    row["trade"].update(openPrice=opaque, unrelated=opaque)
+    row["openingFeeUsd"] = opaque
+    replies.extend(("filled", history))
+
+    outcome = wait.for_intent(endpoint, ADDR, KEY)
+    assert outcome["outcome"] == "filled"
+    receipt = outcome["receipt"]
+    assert receipt["execution"]["historyId"] == 1007
+    assert receipt["fill"]["oraclePrice"] is None
+    assert receipt["positionNow"]["openPrice"] is None
+    assert opaque not in json.dumps(outcome)
+
+
+def test_wait_times_out_with_unknown_and_keeps_pending_ledger(keeper_replay):
+    endpoint, replies = keeper_replay
+    replies.extend(("pending_exec", "pending_exec"))
+    reserve(endpoint)
+    clock = FakeClock()
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, timeout=0.75, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "unknown"
+    assert result["code"] == "OUTCOME_UNKNOWN"
+    assert result["receipt"]["execution"] is None
+    assert result["receipt"]["requestBlock"] == 50109595
+    assert clock.delays == [0.25, 0.5]
+    assert status(endpoint) == "pending"
+    assert log.tail(1, name="intent.wait.end")[0]["status"] == "unknown"
+
+
+def test_intent_wait_cli_returns_confirmed_failure(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    failed = deepcopy(RESPONSES["market_order_fill_failed"])
+    failed["data"]["userIntents"][0]["errorMsg"] = "opaque upstream error details"
+    replies.extend(("pending_exec", failed))
+    result = CliRunner().invoke(
+        main, ["--endpoint", endpoint, "--json", "intent", "wait", KEY]
+    )
+    assert result.exit_code == 1, result.output
+    value = json.loads(result.output)
+    assert value["outcome"] == "failed"
+    assert value["keeperErrorCode"] == "market_order_fill_failed"
+    assert "opaque upstream error details" not in result.output
+    assert value["receipt"]["fill"] is None
+    assert status(endpoint) == "terminal"
+
+
+def mcp_wait(endpoint: str, **args: Any) -> dict:
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    return call_mcp(mcp, "intent_wait", {"key": KEY, **args})
+
+
+def test_mcp_wait_caps_timeout_and_paginates_history(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    noise = {
+        "data": {
+            "perp": {
+                "tradeHistory": [
+                    {"intentKey": "another-intent", "trade": {"id": index}}
+                    for index in range(reconcile.HISTORY_PAGE_SIZE)
+                ]
+            }
+        }
+    }
+    replies.extend(("filled", noise, noise, fill_history()))
+    result = mcp_wait(endpoint, timeout=300)
+    assert result["addrSource"] == "ledger"
+    assert result["outcome"] == "filled"
+    assert result["receipt"]["execution"]["historyId"] == 1007
+    assert (
+        log.tail(1, name="intent.wait.start")[0]["timeoutMs"]
+        == wait.MCP_MAX_TIMEOUT * 1000
+    )
+
+
+@pytest.mark.parametrize("surface", ["cli", "mcp"])
+def test_wait_unknown_returns_call_again_hint(keeper_replay, surface):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    # The server drops the read before a response, so there is no outcome to infer.
+    # The wait has only one poll before its first backoff reaches the deadline.
+    replies.append("drop_ack")
+    if surface == "cli":
+        command = CliRunner().invoke(
+            main,
+            [
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "wait",
+                KEY,
+                "--timeout",
+                "0.2",
+            ],
+        )
+        assert command.exit_code == 5, command.output
+        result = json.loads(command.output)
+        assert result["hint"].endswith(f"intent wait {KEY} --addr {ADDR}")
+        assert "SAI_RECONCILE_ENDPOINT" in result["hint"]
+        assert endpoint not in result["hint"]
+        assert result["error"]["intentKey"] == KEY
+    else:
+        result = mcp_wait(endpoint, timeout=0.2)
+        assert "Call intent_wait again" in result["hint"]
+    assert result["outcome"] == "unknown"
+    assert result["code"] == "OUTCOME_UNKNOWN"
+    assert status(endpoint) == "unknown"
+
+
+def test_wait_times_out_during_a_slow_mcp_response(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    slow = SlowBody()
+    replies.append(slow)
+    started = time.monotonic()
+    try:
+        result = mcp_wait(endpoint, timeout=0.25)
+        elapsed = time.monotonic() - started
+    finally:
+        slow.release.set()
+    assert slow.finished.wait(2)
+    assert slow.started.is_set()
+    assert elapsed < 0.5
+    assert result["outcome"] == "unknown"
+    assert status(endpoint) == "unknown"
+
+
+def test_mcp_cancelled_read_cannot_commit_a_keeper_outcome(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    slow = SlowBody()
+    replies.append(slow)
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+
+    async def cancel():
+        task = asyncio.create_task(mcp.call_tool("intent_wait", {"key": KEY}))
+        try:
+            assert await asyncio.to_thread(slow.started.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            slow.release.set()
+        assert await asyncio.to_thread(slow.finished.wait, 2)
+        # Allow the server's remaining bytes to be delivered after cancellation.
+        await asyncio.sleep(0.1)
+
+    asyncio.run(cancel())
+    assert status(endpoint) == "unknown"
+
+
+def test_mcp_wait_does_not_block_on_initial_ledger_lookup(keeper_replay):
+    endpoint, _ = keeper_replay
+    reserve(endpoint)
+    with storage.db() as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        result = mcp_wait(endpoint, timeout=0.25)
+        assert time.monotonic() - started < 0.5
+    assert result["outcome"] == "unknown"
+    assert status(endpoint) == "unknown"
+
+
+def test_cli_wait_budgets_initial_locked_ledger_lookup(keeper_replay):
+    endpoint, _ = keeper_replay
+    reserve(endpoint)
+    with storage.db() as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        with storage.busy_timeout(1):
+            command = CliRunner().invoke(
+                main,
+                [
+                    "--endpoint",
+                    endpoint,
+                    "--json",
+                    "intent",
+                    "wait",
+                    KEY,
+                    "--timeout",
+                    "0.02",
+                ],
+            )
+        assert time.monotonic() - started < 0.5
+    assert command.exit_code == 5, command.output
+    result = json.loads(command.stdout)
+    assert result["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert result["error"]["intentKey"] == KEY
+    hint = result["error"]["hint"]
+    assert hint.endswith(f"intent wait {KEY}")
+    assert "SAI_RECONCILE_ENDPOINT" in hint
+    assert endpoint not in hint
+    assert status(endpoint) == "unknown"
+
+
+def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    history = fill_history()
+    position = history["data"]["perp"]["tradeHistory"][0]["trade"]
+    position.update(
+        openPrice=87000, openCollateralAmount=6000000, collateralAmount=6000000
+    )
+    replies.extend(("filled", history))
+    result = wait.for_intent(endpoint, ADDR, KEY)
+    receipt = result["receipt"]
+    assert receipt["execution"]["historyId"] == 1007
+    assert receipt["fill"]["price"] is None
+    assert receipt["fill"]["sizeCollateralBaseUnits"] is None
+    assert receipt["fill"]["oraclePrice"] == 81000.5
+    assert receipt["positionNow"]["openPrice"] == 87000
+    assert receipt["positionNow"]["openCollateralAmount"] == 6000000
+
+
+@pytest.mark.parametrize(
+    ("change", "outcome", "exit_code"),
+    [
+        ("position_liquidated", "liquidated", 1),
+        ("position_closed_user", "unexpected", 1),
+        ("trade_size_increase", "unexpected", 1),
+        ("trade_size_decrease", "filled", 0),
+    ],
+)
+def test_partial_close_wait_reports_observed_history(
+    keeper_replay, change, outcome, exit_code
+):
+    endpoint, replies = keeper_replay
+    storage.pending(KEY, endpoint, ADDR, "DECREASE_POSITION_SIZE", "7")
+    completed = deepcopy(RESPONSES["filled"])
+    completed["data"]["userIntents"][0]["kind"] = "DECREASE_POSITION_SIZE"
+    history = fill_history()
+    rows = history["data"]["perp"]["tradeHistory"]
+    rows[0]["tradeChangeType"] = change
+    rows[0]["trade"]["isOpen"] = change not in (
+        "position_liquidated",
+        "position_closed_user",
+    )
+    if outcome != "filled":
+        # A plausible row must not hide another observed effect of this intent.
+        rows.insert(
+            0, {**rows[0], "id": 1006, "tradeChangeType": "trade_size_decrease"}
+        )
+    replies.extend((completed, history))
+    command = CliRunner().invoke(
+        main, ["--endpoint", endpoint, "--json", "intent", "wait", KEY]
+    )
+    assert command.exit_code == exit_code, command.output
+    result = json.loads(command.stdout)
+    assert result["outcome"] == outcome
+    assert result["receipt"]["execution"]["tradeChangeType"] == change
+    assert (result["receipt"]["fill"] is not None) == (outcome == "filled")
+    if exit_code:
+        assert result["error"]["code"] == "KEEPER_ERROR"
+    assert status(endpoint) == "terminal"
+
+
+def test_leverage_wait_flags_a_take_profit_update(keeper_replay):
+    endpoint, replies = keeper_replay
+    storage.pending(KEY, endpoint, ADDR, "UPDATE_TRADE", "7")
+    completed = deepcopy(RESPONSES["filled"])
+    row = completed["data"]["userIntents"][0]
+    row.update(kind="UPDATE_TRADE", body={"requestedLeverage": "2"})
+    history = fill_history()
+    history["data"]["perp"]["tradeHistory"][0]["tradeChangeType"] = "tp_updated"
+    replies.extend((completed, history))
+    result = wait.for_intent(endpoint, ADDR, KEY)
+    assert result["outcome"] == "unexpected"
+    assert result["receipt"]["execution"]["tradeChangeType"] == "tp_updated"
+    assert status(endpoint) == "terminal"
+
+
+@pytest.mark.parametrize("pages", ["single", "split", "retry_split"])
+@pytest.mark.parametrize(
+    ("changes", "selected", "outcome", "exit_code"),
+    [
+        (
+            ["after_hours_risk_trigger", "leverage_updated"],
+            "leverage_updated",
+            "succeeded",
+            0,
+        ),
+        (
+            ["leverage_updated", "after_hours_risk_trigger"],
+            "leverage_updated",
+            "succeeded",
+            0,
+        ),
+        (
+            ["after_hours_risk_trigger", "leverage_updated", "position_liquidated"],
+            "position_liquidated",
+            "liquidated",
+            1,
+        ),
+        (["after_hours_risk_trigger"], "after_hours_risk_trigger", "unexpected", 1),
+    ],
+)
+def test_leverage_wait_reports_after_hours_adjustment_as_an_extra_effect(
+    keeper_replay, changes, selected, outcome, exit_code, pages
+):
+    endpoint, replies = keeper_replay
+    storage.pending(KEY, endpoint, ADDR, "UPDATE_TRADE", "7")
+    completed = deepcopy(RESPONSES["filled"])
+    completed["data"]["userIntents"][0].update(
+        kind="UPDATE_TRADE", body={"requestedLeverage": "2"}
+    )
+    history = fill_history()
+    rows = history["data"]["perp"]["tradeHistory"]
+    base = rows[0]
+    rows[:] = [
+        {**base, "tradeChangeType": change, "id": 2000 + index}
+        for index, change in enumerate(changes)
+    ]
+    rows.append(
+        {
+            **base,
+            "tradeChangeType": "after_hours_risk_trigger",
+            "id": 999,
+            "block": {"block": 50109520},
+        }
+    )
+    replies.append(completed)
+    if pages == "retry_split":
+        replies.append("not_yet_in_history")
+    if pages != "single":
+        first = rows.pop(0)
+        noise = [
+            {**base, "intentKey": "unrelated", "id": 3000 + index}
+            for index in range(reconcile.HISTORY_PAGE_SIZE - 1)
+        ]
+        replies.append({"data": {"perp": {"tradeHistory": [*noise, first]}}})
+    replies.append(history)
+    command = CliRunner().invoke(
+        main, ["--endpoint", endpoint, "--json", "intent", "wait", KEY]
+    )
+    assert command.exit_code == exit_code, command.output
+    result = json.loads(command.stdout)
+    assert result["outcome"] == outcome
+    execution = result["receipt"]["execution"]
+    assert execution["tradeChangeType"] == selected
+    assert execution["historyId"] == 2000 + changes.index(selected)
+    assert execution["extraEffects"] == (
+        []
+        if selected == "after_hours_risk_trigger"
+        else [
+            {
+                "tradeChangeType": "after_hours_risk_trigger",
+                "historyId": 2000 + changes.index("after_hours_risk_trigger"),
+                "block": 50109596,
+            }
+        ]
+    )
+    assert status(endpoint) == "terminal"
+
+
+def test_wait_returns_conditional_order_placement_without_fill(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    replies.extend(("limit_placement_exec_pass", "limit_placement_history"))
+    clock = FakeClock()
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "placed"
+    assert result["receipt"]["action"] == {"kind": "OPEN_TRADE", "orderType": "limit"}
+    assert result["receipt"]["execution"]["tradeChangeType"] == "limit_order_created"
+    assert result["receipt"]["fill"] is None
+    assert status(endpoint) == "terminal"
+
+
+@pytest.mark.parametrize("order_type", ["limit", "stop"])
+def test_wait_reports_placement_even_when_history_is_empty(keeper_replay, order_type):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    completed = deepcopy(RESPONSES["limit_placement_exec_pass"])
+    completed["data"]["userIntents"][0]["body"] = {"orderType": order_type}
+    replies.extend((completed, "not_yet_in_history", "not_yet_in_history"))
+    clock = FakeClock()
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "placed"
+    assert result["receipt"]["action"] == {
+        "kind": "OPEN_TRADE",
+        "orderType": order_type,
+    }
+    assert result["receipt"]["fill"] is None
+    assert status(endpoint) == "terminal"
+
+
+@pytest.mark.parametrize(
+    ("admission", "exit_code", "outcome"),
+    [
+        ("ack", 0, "filled"),
+        ("drop_ack", 0, "filled"),
+        ("reject", 4, "rejected"),
+    ],
+)
+def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, outcome):
+    endpoint, replies = keeper_replay
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    replies.append(admission)
+    if outcome == "filled":
+        completed = deepcopy(RESPONSES["filled"])
+        completed["data"]["userIntents"][0]["kind"] = "CLOSE_POSITION"
+        history = fill_history()
+        row = history["data"]["perp"]["tradeHistory"][0]
+        row["tradeChangeType"] = "position_closed_user"
+        row["trade"].update(
+            isOpen=False, closeBlock={"block": 50109596}, closePrice=81001.25
+        )
+        replies.extend((completed, history))
+    result = CliRunner().invoke(
+        main, ["--endpoint", endpoint, "--json", "trade", "close", "7", "--wait"]
+    )
+    assert result.exit_code == exit_code, result.output
+    value = json.loads(result.output)
+    assert value["outcome"] == value["status"] == outcome
+    local = storage.list_pending(endpoint, ADDR)
+    assert [row["intentKey"] for row in local] == [value["intentKey"]]
+    assert local[0]["status"] == ("terminal" if outcome == "filled" else "rejected")
+    if outcome == "filled":
+        assert value["receipt"]["fill"]["price"] is None
+        assert value["receipt"]["positionNow"]["isOpen"] is False

@@ -56,7 +56,8 @@ def test_tpsl_has_keeper_field_patch():
 
 
 def test_admission_ack_and_key(session, monkeypatch):
-    def fake(endpoint, query, variables, token):
+    def fake(endpoint, query, variables, token, *, attempt):
+        attempt.transport_started = True
         assert token == session["token"]
         submitted = variables["input"]
         assert re.fullmatch(
@@ -84,7 +85,8 @@ def test_admission_ack_and_key(session, monkeypatch):
 
 
 def test_uncertain_submission_blocks_retry(session, monkeypatch):
-    def fail(*args, **kwargs):
+    def fail(*args, attempt):
+        attempt.transport_started = True
         raise keeper.KeeperError("network")
 
     monkeypatch.setattr(keeper, "request", fail)
@@ -486,7 +488,7 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
 
 
 def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
-    def gql(endpoint, query, variables=None, token=None):
+    def gql(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.ROUTE:
             return {
                 "oneClickTrading": {
@@ -544,7 +546,9 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
     monkeypatch.setattr(
         margin,
         "smart",
-        lambda lcd, contract, message: raw if "get_trade_raw" in message else funds,
+        lambda lcd, contract, message, **kwargs: (
+            raw if "get_trade_raw" in message else funds
+        ),
     )
     snapshot = margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7)
     assert snapshot.raw == raw

@@ -4,6 +4,7 @@ mod ca_dir;
 mod proxy;
 mod public;
 mod queries;
+pub mod stream;
 mod transport;
 
 use std::time::{Duration, Instant};
@@ -17,7 +18,7 @@ use crate::{
     log::{self, EventContext, Field, Level},
 };
 
-pub use public::public_intent_status;
+pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
@@ -32,6 +33,7 @@ pub struct Keeper<'a> {
 struct ResponseLog {
     http_status: Option<u16>,
     errors: Option<Field>,
+    error_count: Option<usize>,
 }
 
 impl<'a> Keeper<'a> {
@@ -51,6 +53,30 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(query, variables, token, timeout, std::future::pending())
+            .await
+    }
+
+    /// Make an interruptible public read.
+    pub async fn read_until(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        timeout: Duration,
+        interrupt: impl Future<Output = SaiError>,
+    ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(query, variables, None, timeout, interrupt)
+            .await
+    }
+
+    async fn request_with(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        token: Option<&str>,
+        timeout: Duration,
+        interrupt: impl Future<Output = SaiError>,
+    ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
         if let Some(token) = token {
@@ -61,11 +87,14 @@ impl<'a> Keeper<'a> {
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
         let mut response = ResponseLog::default();
-        let result = self
-            .post(query, &variables, token, timeout, &mut response)
-            .await;
+        let (result, interrupted) = tokio::select! {
+            biased;
+            error = interrupt => (Err(error), true),
+            result = self.post(query, &variables, token, timeout, &mut response) => (result, false),
+        };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
+            Err(_) if interrupted => ("error", Level::Warn, Some(Code::InternalError), None),
             Ok(_) => ("ok", Level::Info, None, None),
             Err(error) => match error.code {
                 Code::NotSent => ("not_sent", Level::Warn, Some(error.code), None),
@@ -88,6 +117,7 @@ impl<'a> Keeper<'a> {
             [
                 ("operation", json!(queries::operation(query)).into()),
                 ("endpoint", Field::Endpoint(self.endpoint.into())),
+                ("endpointId", Field::endpoint_identity(self.endpoint)),
                 ("addr", json!(addr).into()),
                 ("authenticated", json!(token.is_some()).into()),
                 ("durationMs", json!(duration).into()),
@@ -99,6 +129,7 @@ impl<'a> Keeper<'a> {
                     "keeperErrors",
                     response.errors.unwrap_or(Field::Scalar(Value::Null)),
                 ),
+                ("keeperErrorCount", json!(response.error_count).into()),
             ],
         );
         result
@@ -126,6 +157,7 @@ impl<'a> Keeper<'a> {
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
             log.errors = Some(graphql_errors(errors));
+            log.error_count = Some(errors.as_array().map_or(1, Vec::len));
             if query == SUBMIT
                 && !result.get("data").is_some_and(truthy)
                 && errors.as_array().is_some_and(|items| {
@@ -188,22 +220,29 @@ fn not_sent() -> SaiError {
     )
 }
 
+const GRAPHQL_ERROR_CODES: &[&str] = &[
+    "GRAPHQL_PARSE_FAILED",
+    "GRAPHQL_VALIDATION_FAILED",
+    "INTENT_NOT_ACCEPTED",
+    "BAD_USER_INPUT",
+    "FORBIDDEN",
+    "INTERNAL_SERVER_ERROR",
+    "UNAUTHENTICATED",
+];
+
 fn graphql_errors(errors: &Value) -> Field {
     let entries = errors.as_array().into_iter().flatten().take(3);
     Field::Array(
         entries
             .filter_map(Value::as_object)
             .map(|item| {
-                let code = item.get("extensions").and_then(|value| value.get("code"));
-                let code = code.filter(|value| !value.is_null()).map(stringify);
-                let message = item.get("message").map_or_else(String::new, stringify);
-                Field::Object(vec![
-                    (
-                        "code".into(),
-                        code.map_or(Field::Scalar(Value::Null), Field::Untrusted),
-                    ),
-                    ("message".into(), Field::Untrusted(message)),
-                ])
+                let code = item
+                    .get("extensions")
+                    .and_then(|value| value.get("code"))
+                    .and_then(Value::as_str)
+                    .filter(|value| GRAPHQL_ERROR_CODES.contains(value))
+                    .map_or_else(|| json!(Code::KeeperError), |value| json!(value));
+                json!({"code": code}).into()
             })
             .collect(),
     )
