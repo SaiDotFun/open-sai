@@ -3,11 +3,12 @@ use std::{collections::HashSet, future::ready, io};
 use rmcp::{
     ErrorData, RoleServer,
     model::{
-        ClientJsonRpcMessage, ClientNotification, ErrorCode, JsonRpcMessage, RequestId,
-        ServerJsonRpcMessage,
+        ClientJsonRpcMessage, ClientNotification, ClientRequest, ErrorCode, JsonRpcMessage,
+        RequestId, ServerJsonRpcMessage,
     },
     transport::Transport,
 };
+use serde_json::{Value, json};
 use tokio::{
     io::{self as tokio_io, AsyncBufReadExt, AsyncWriteExt, BufReader, Stdin, Stdout},
     sync::mpsc,
@@ -42,6 +43,42 @@ impl Stdio {
             .send(frame)
             .map_err(|_| io::ErrorKind::BrokenPipe.into())
     }
+    fn reject_request(&self, id: RequestId) -> io::Result<()> {
+        let error = ErrorData::invalid_params("Invalid request parameters", Some(json!("")));
+        self.enqueue(ServerJsonRpcMessage::error(error, Some(id)))
+    }
+
+    fn report_invalid_frame(&self) -> io::Result<()> {
+        match serde_json::from_slice::<Value>(&self.line) {
+            Ok(value) => {
+                if value.get("method").is_some()
+                    && let Ok(id) = serde_json::from_value(value["id"].clone())
+                {
+                    self.reject_request(id)?;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                eprintln!(
+                    "Invalid MCP JSON at line {}, column {}",
+                    error.line(),
+                    error.column()
+                );
+                self.enqueue(parse_diagnostic())
+            }
+        }
+    }
+}
+
+// The pinned Python server uses the legacy MCP logging notification on parse errors.
+#[allow(deprecated)]
+fn parse_diagnostic() -> ServerJsonRpcMessage {
+    use rmcp::model::{LoggingLevel, LoggingMessageNotification, LoggingMessageNotificationParam};
+
+    let params =
+        LoggingMessageNotificationParam::new(LoggingLevel::Error, json!("Internal Server Error"))
+            .with_logger("mcp.server.exception_handler");
+    ServerJsonRpcMessage::notification(LoggingMessageNotification::new(params).into())
 }
 
 pub(super) fn cancelled() -> ErrorData {
@@ -73,9 +110,22 @@ impl Transport<RoleServer> for Stdio {
             {
                 return None;
             }
-            let frame = serde_json::from_slice(&self.line);
+            let frame = serde_json::from_slice::<ClientJsonRpcMessage>(&self.line);
+            let frame = match frame {
+                Ok(JsonRpcMessage::Request(request))
+                    if matches!(request.request, ClientRequest::CustomRequest(_)) =>
+                {
+                    self.reject_request(request.id).ok()?;
+                    None
+                }
+                Ok(frame) => Some(frame),
+                Err(_) => {
+                    self.report_invalid_frame().ok()?;
+                    None
+                }
+            };
             self.line.clear();
-            let Ok(frame) = frame else { continue };
+            let Some(frame) = frame else { continue };
             match &frame {
                 JsonRpcMessage::Request(request) => {
                     self.pending.insert(request.id.clone());

@@ -169,3 +169,44 @@ def test_cancelling_market_read_closes_keeper_connection(
         assert endpoints.interrupt_closed.wait(3), "Keeper connection remained open"
         stdio.send("ping", id_=3)
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+@pytest.mark.parametrize("use_python", [False, True], ids=["native", "python"])
+def test_invalid_request_frames(native: Path, tmp_path: Path, use_python: bool) -> None:
+    executable = native
+    if use_python:
+        reference = shutil.which(os.getenv("SAI_MCP_PARITY_PYTHON", ""))
+        if not reference:
+            pytest.skip("Requires the pinned Python MCP reference")
+        executable = Path(reference).absolute()
+    with (
+        loopback("normal") as endpoints,
+        server(executable, tmp_path / "home", endpoints) as stdio,
+    ):
+        stdio.send("fixture/unknown", id_=2)
+        stdio.send("tools/call", id_=3, name="market_list", arguments=[])
+        for id_ in (2, 3):
+            assert stdio.receive() == {
+                "jsonrpc": "2.0",
+                "id": id_,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid request parameters",
+                    "data": "",
+                },
+            }
+        stdio.write(b"{broken")
+        assert stdio.receive() == {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "error",
+                "logger": "mcp.server.exception_handler",
+                "data": "Internal Server Error",
+            },
+        }
+        assert stdio.proc.stderr is not None
+        assert select.select([stdio.proc.stderr], [], [], 3)[0]
+        assert stdio.proc.stderr.readline()
+        stdio.send("ping", id_=4)
+        assert stdio.receive() == {"jsonrpc": "2.0", "id": 4, "result": {}}
