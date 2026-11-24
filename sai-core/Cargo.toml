@@ -1,0 +1,46 @@
+[package]
+name = "sai-core"
+description = "Shared logic for the Sai CLI and MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { workspace = true, features = ["zeroize"] }
+base64.workspace = true
+bech32.workspace = true
+chrono.workspace = true
+num-bigint.workspace = true
+openssl-probe.workspace = true
+regex.workspace = true
+flate2.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-timeout.workspace = true
+hyper-util.workspace = true
+rustls.workspace = true
+ring.workspace = true
+rustls-native-certs.workspace = true
+url.workspace = true
+webpki-roots.workspace = true
+x509-cert.workspace = true
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror = "2"
+tokio.workspace = true
+tokio-rustls.workspace = true
+tower.workspace = true
+toml_edit.workspace = true
+toml_parser.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

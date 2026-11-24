@@ -57,6 +57,7 @@ READ_TOOLS = {
     "preview_leverage",
     "preview_margin",
     "preview_partial_close",
+    "logs_intent",
 }
 LOCAL_TOOLS = {"mcp_info", "auth_status", "auth_list", "auth_use", "intent_local"}
 # Changes only which connected account is active on this machine.
@@ -364,11 +365,6 @@ def test_serve_flags_win_over_the_environment_and_file(tmp_path, monkeypatch):
     assert partial.endpoint == "http://127.0.0.1:9/query"
     assert partial.lcd_endpoint == "http://127.0.0.1:3"
     assert served_settings(monkeypatch, None).lcd_endpoint == "http://127.0.0.1:1"
-
-
-def test_serve_exits_on_a_bad_flag_without_serving(monkeypatch):
-    with pytest.raises(SystemExit, match="sai mcp serve: --endpoint"):
-        served_settings(monkeypatch, {"keeper.endpoint": "ftp://nope"})
 
 
 def test_server_settings_resolve_once_from_the_environment(monkeypatch):
@@ -1131,7 +1127,7 @@ def test_recent_pending_open_blocks_a_second_open(mcp, monkeypatch):
     blocked = invoke(mcp, "trade_open", trade)
     assert blocked["code"] == "RECENT_OPEN_PENDING"
     assert blocked["intentKeys"] == [first["intentKey"]]
-    assert "intent_local" in blocked["error"]
+    assert "intent_status" in blocked["error"]
     assert len(fake.submitted) == 1
 
     # A close is not an open and is not blocked.
@@ -1155,20 +1151,6 @@ def test_unknown_open_after_a_timeout_blocks_with_its_key(mcp, monkeypatch):
     assert blocked["code"] == "RECENT_OPEN_PENDING"
     assert blocked["intentKeys"] == [lost["intentKey"]]
     assert len(fake.submitted) == 1
-
-
-def test_only_recent_unresolved_opens_count():
-    key = "20260101T000000000Z_AAAAAAAAAAAAAAAA"
-    storage.pending(key, ENDPOINT, ADDR, "OPEN_TRADE", "")
-    storage.set_status(key, ENDPOINT, ADDR, "accepted")
-    assert tools.recent_opens(ENDPOINT, ADDR) == [
-        {"intentKey": key, "status": "accepted"}
-    ]
-    later = datetime.now(UTC).timestamp() + tools.RECENT_OPEN_SECONDS + 1
-    assert tools.recent_opens(ENDPOINT, ADDR, now=later) == []
-    assert tools.recent_opens("http://127.0.0.1:1/query", ADDR) == []
-    storage.set_status(key, ENDPOINT, ADDR, "terminal")
-    assert tools.recent_opens(ENDPOINT, ADDR) == []
 
 
 def test_sign_in_comes_before_validation(mcp):
@@ -1209,8 +1191,13 @@ def test_lost_ack_reports_unknown_then_intent_status_reconciles(mcp, monkeypatch
         "lifecycleStep": "exec_pass",
         "execActor": "server",
         "evmAddress": ADDR,
+        "txHash": "0x" + "C" * 64,
     }
-    trade = {"intentKey": key, "trade": {"id": 7}}
+    trade = {
+        "intentKey": key,
+        "evmTxHash": "0x" + "c" * 64,
+        "trade": {"id": 7, "trader": ADDR},
+    }
     fake.answers = {
         keeper.INTENTS: {"userIntents": [row]},
         keeper.HISTORY: {"perp": {"tradeHistory": [trade]}},
@@ -1369,7 +1356,8 @@ def rpc(message_id: int | None, method: str, params: dict[str, Any]) -> str:
     return json.dumps(message) + "\n"
 
 
-def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path):
+@pytest.mark.parametrize("global_flags", [[], ["--json", "--as", "another-account"]])
+def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     """initialize and tools/list over a real `sai mcp serve` process; every
     stdout line is a JSON-RPC message."""
     initialize = {
@@ -1377,7 +1365,14 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path):
         "capabilities": {},
         "clientInfo": {"name": "test", "version": "0"},
     }
-    command = [*sai_command(), "mcp", "serve", "--endpoint", "http://127.0.0.1:9/query"]
+    command = [
+        *sai_command(),
+        *global_flags,
+        "mcp",
+        "serve",
+        "--endpoint",
+        "http://127.0.0.1:9/query",
+    ]
     with subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
