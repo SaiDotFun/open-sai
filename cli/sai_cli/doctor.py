@@ -358,6 +358,7 @@ MANAGED = (
     "intents.sqlite3-journal",
     "history",
 )
+TRADER_DATA = ("intents.sqlite3", "sessions.json", "session.json")
 PROFILE_FILES = {
     "": (
         settings.FILE_NAME,
@@ -411,14 +412,14 @@ def loose_modes(paths: Sequence[Path]) -> list[tuple[Path, int, int]]:
 
 def tighten(
     root: Path, names: Sequence[str], *, apply: bool = True
-) -> tuple[list[str], list[str]]:
+) -> tuple[list[str], list[str], bool]:
     """Apply or plan mode repairs on ROOT and its managed files.
 
     Every chmod goes through a descriptor opened with O_NOFOLLOW, and the
     files open relative to the directory's descriptor, so a path swapped for
     a symlink after the checks fails to open instead of redirecting the
-    chmod. Return changes or safe commands, followed by paths needing manual
-    attention.
+    chmod. Return changes or safe commands, paths needing manual attention,
+    and whether the parent is eligible for a mode repair.
     """
     changes: list[str] = []
     failed: list[str] = []
@@ -426,8 +427,9 @@ def tighten(
     try:
         dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
     except OSError:
-        return changes, [f"Could not open {root} safely; inspect it by hand"]
+        return changes, [f"Could not open {root} safely; inspect it by hand"], False
     try:
+        eligible = recognized_profile(root.parent, child=(root.name, os.fstat(dir_fd)))
         for name in (None, *names):
             path = root if name is None else root / name
             try:
@@ -457,7 +459,7 @@ def tighten(
                     failed.append(f"{path} is not a regular file; fix by hand")
                     continue
                 mode = stat.S_IMODE(info_.st_mode)
-                if mode & 0o077:
+                if eligible and mode & 0o077:
                     if apply:
                         os.fchmod(fd, mode & ~0o077)
                         changes.append(f"chmod {path} {mode:o} -> {mode & ~0o077:o}")
@@ -470,7 +472,7 @@ def tighten(
                     os.close(fd)
     finally:
         os.close(dir_fd)
-    return changes, failed
+    return changes, failed, eligible
 
 
 @contextmanager
@@ -499,6 +501,28 @@ def trader_file_is_evidence(fd: int, name: str, info: os.stat_result) -> bool:
                 storage.is_session_envelope(name, json.load(source))
             )
     except (LedgerChanged, OSError, RecursionError, ValueError, sqlite3.Error):
+        return False
+
+
+def is_sai_log(fd: int, name: str, info: os.stat_result, surface: str) -> bool:
+    if info.st_nlink != 1:
+        return False
+    try:
+        with open_regular(name, dir_fd=fd) as source:
+            if not os.path.samestat(info, os.fstat(source.fileno())):
+                return False
+            line = source.readline(log.MAX_LINE + 1)
+        if not line.endswith(b"\n"):
+            return False
+        row = json.loads(line)
+        return (
+            isinstance(row, dict)
+            # Sai v0.1.0 wrote the same common fields without a schema marker.
+            and row.get("schema", log.SCHEMA_VERSION) == log.SCHEMA_VERSION
+            and row.get("surface") == surface
+            and all(key in row for key in log.COMMON if key != "schema")
+        )
+    except (OSError, RecursionError, ValueError):
         return False
 
 
@@ -533,17 +557,86 @@ def profile_has_data(
                 os.close(child)
         elif not stat.S_ISREG(info.st_mode) or not (
             name in PROFILE_FILES.get(directory, ())
-            or (directory == "logs" and log.parse_name(name) is not None)
+            or (
+                directory == "logs"
+                and (parsed := log.parse_name(name)) is not None
+                and is_sai_log(fd, name, info, parsed[1])
+            )
             or (directory == "cache/wheels" and update.is_wheel_name(name))
         ):
             return None
-        elif (
-            not has_data
-            and directory == "trader"
-            and name in ("intents.sqlite3", "sessions.json", "session.json")
-        ):
-            has_data = trader_file_is_evidence(fd, name, info)
+        elif directory == "trader" and name in TRADER_DATA:
+            if not trader_file_is_evidence(fd, name, info):
+                return None
+            has_data = True
     return has_data
+
+
+def dedicated_profile(
+    fd: int, path: Path, *, allow_loose_trader: bool
+) -> os.stat_result | None:
+    info = os.fstat(fd)
+    if info.st_uid != os.getuid() or info.st_mode & PROFILE_SHARED_MODE:
+        return None
+    if (
+        profile_has_data(fd, info.st_uid, allow_loose_trader=allow_loose_trader)
+        and os.fstat(fd).st_mode == info.st_mode
+        and os.path.samestat(info, path.lstat())
+    ):
+        return info
+    return None
+
+
+def recognized_profile(
+    path: Path, *, child: tuple[str, os.stat_result] | None = None
+) -> bool:
+    if os.name == "nt":
+        return False
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            if dedicated_profile(fd, path, allow_loose_trader=True) is None:
+                return False
+            if child is None:
+                return True
+            name, opened = child
+            return os.path.samestat(
+                opened, os.stat(name, dir_fd=fd, follow_symlinks=False)
+            )
+        finally:
+            os.close(fd)
+    except OSError:
+        return False
+
+
+def can_log_to_profile() -> bool:
+    """Avoid the writer's automatic chmod in an existing, ambiguous logs directory."""
+    if os.name == "nt":
+        return True
+    root = log.directory()
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not info.st_mode & 0o077:
+            # Existing private Sai logs still accept diagnostics while signed out.
+            paths = [path for _, _, path in log.log_files(root)]
+            if (
+                info.st_uid == os.getuid()
+                and not loose_modes(paths)
+                and profile_has_data(fd, info.st_uid, "logs") is not None
+                and os.path.samestat(info, root.lstat())
+            ):
+                return True
+        return recognized_profile(root.parent, child=(root.name, info))
+    except OSError:
+        return False
+    finally:
+        os.close(fd)
 
 
 def repair_profile_root(path: Path, *, apply: bool) -> str | None:
@@ -551,21 +644,10 @@ def repair_profile_root(path: Path, *, apply: bool) -> str | None:
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
-            info = os.fstat(fd)
+            info = dedicated_profile(fd, path, allow_loose_trader=not apply)
+            if info is None or not info.st_mode & 0o077:
+                return None
             mode = stat.S_IMODE(info.st_mode)
-            if (
-                info.st_uid != os.getuid()
-                or mode & PROFILE_SHARED_MODE
-                or not mode & 0o077
-            ):
-                return None
-            has_data = profile_has_data(fd, info.st_uid, allow_loose_trader=not apply)
-            if (
-                not has_data
-                or os.fstat(fd).st_mode != info.st_mode
-                or not os.path.samestat(info, path.lstat())
-            ):
-                return None
             if not apply:
                 return f"chmod go-rwx {shlex.quote(str(path))}"
             private_mode = mode & ~0o077
@@ -603,9 +685,12 @@ def check_home(ctx: Context) -> Check:
     trader_exists = root.is_dir()
     changes: list[str] = []
     failed: list[str] = []
+    eligible = True
     if trader_exists and trader_loose:
-        changes, failed = tighten(root, MANAGED, apply=ctx.fix)
-    if home_loose and not failed:
+        changes, failed, eligible = tighten(root, MANAGED, apply=ctx.fix)
+        if not eligible and not failed:
+            home_fix = SAI_HOME_MODE_FIX
+    if home_loose and eligible and not failed:
         change = repair_profile_root(sai_home, apply=ctx.fix)
         if change is not None:
             if ctx.fix:
@@ -633,7 +718,8 @@ def check_home(ctx: Context) -> Check:
                 details,
             )
         home_exists = sai_home.is_dir()
-        storage.directory()
+        paths.private_directory(sai_home, profile_root=True)
+        paths.private_directory(root, only_new=True)
         if not home_exists:
             changes.append(f"created {sai_home} with mode {paths.PRIVATE_MODE:o}")
         changes.append(f"created {root} with mode {paths.PRIVATE_MODE:o}")
@@ -650,7 +736,7 @@ def check_home(ctx: Context) -> Check:
         return Check(
             "home",
             "warn",
-            f"{sai_home} is accessible by other users",
+            f"{sai_home if home_loose else root} is accessible by other users",
             home_fix,
             details,
             changes=changes,
@@ -728,23 +814,23 @@ def check_logs(ctx: Context) -> Check:
     private = Check("logs", "pass", f"{root} is private{off}", None, details)
     if not loose:
         return private
-    if not ctx.fix:
+    changes, failed, eligible = tighten(root, names, apply=ctx.fix)
+    if not failed and (not eligible or not ctx.fix):
         return Check(
             "logs",
             "warn",
             f"{plural(len(loose), 'path')} under {root} readable by other users",
-            "; ".join(f"chmod go-rwx {path}" for path, _, _ in loose),
+            "; ".join(changes) if eligible else SAI_HOME_MODE_FIX,
             details,
         )
-    changes, failed = tighten(root, names)
     if failed:
         return Check(
             "logs",
             "fail",
             f"Could not make {plural(len(failed), 'path')} private",
-            "; ".join(failed),
+            "; ".join([*failed, *changes] if not ctx.fix else failed),
             details,
-            changes=changes,
+            changes=changes if ctx.fix else [],
         )
     if not changes:
         return private
@@ -971,7 +1057,7 @@ class WriteGate:
                 raise TimeoutError("doctor's deadline passed; not writing")
             # A write that waits on another process's lock gives up at the
             # deadline instead of holding the gate past it.
-            with storage.busy_timeout(left):
+            with storage.busy_timeout(left), storage.keep_ledger_modes():
                 yield
 
 
@@ -1119,7 +1205,8 @@ def check_intents(ctx: Context) -> Check:
         if version < storage.SCHEMA_VERSION and ctx.fix:
             if refused := moved():
                 return refused
-            storage.db().close()
+            with storage.keep_ledger_modes():
+                storage.db().close()
             changes.append(
                 f"migrated the ledger from schema {version} to {storage.SCHEMA_VERSION}"
             )

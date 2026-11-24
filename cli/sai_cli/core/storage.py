@@ -476,6 +476,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
 # Seconds a ledger write waits for another process's SQLite lock. A caller
 # with a deadline, such as `sai doctor`, lowers it with `busy_timeout`.
 _BUSY_TIMEOUT: ContextVar[float] = ContextVar("busy_timeout", default=10)
+_KEEP_MODES: ContextVar[bool] = ContextVar("keep_modes", default=False)
 
 
 @contextmanager
@@ -489,13 +490,26 @@ def busy_timeout(seconds: float) -> Generator[None]:
         _BUSY_TIMEOUT.reset(token)
 
 
+@contextmanager
+def keep_ledger_modes() -> Generator[None]:
+    """Use the existing ledger without changing its or its directory's mode."""
+    token = _KEEP_MODES.set(True)
+    try:
+        yield
+    finally:
+        _KEEP_MODES.reset(token)
+
+
 def db() -> sqlite3.Connection:
-    path = directory() / "intents.sqlite3"
-    connection = sqlite3.connect(path, timeout=_BUSY_TIMEOUT.get())
+    keep_modes = _KEEP_MODES.get()
+    path = (home() if keep_modes else directory()) / "intents.sqlite3"
+    target = f"{path.absolute().as_uri()}?mode=rw" if keep_modes else str(path)
+    connection = sqlite3.connect(target, uri=keep_modes, timeout=_BUSY_TIMEOUT.get())
     try:
         # Closing a separate file descriptor would release any POSIX locks
         # that another connection in this process holds on the ledger.
-        path.chmod(0o600)
+        if not keep_modes:
+            path.chmod(0o600)
         _migrate(connection)
     except BaseException:
         connection.close()

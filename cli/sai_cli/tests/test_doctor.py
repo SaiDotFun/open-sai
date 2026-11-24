@@ -455,6 +455,72 @@ def test_doctor_leaves_a_foreign_sqlite_ledger_unmodified(isolated_home, schema)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize("log_enabled", ["0", "1"])
+@pytest.mark.parametrize(
+    ("directory", "filename", "content", "exit_code", "check_id", "sai_ledger"),
+    [
+        ("trader", "sessions.json", '{"saved_filters":[]}', 1, "home", False),
+        ("logs", "application.log", "application startup\n", 0, "logs", False),
+        ("logs", None, '{"other_application":"request"}\n', 0, "logs", True),
+    ],
+)
+def test_doctor_reports_foreign_subdirectories_without_tightening(
+    isolated_home,
+    monkeypatch,
+    log_enabled,
+    directory,
+    filename,
+    content,
+    exit_code,
+    check_id,
+    sai_ledger,
+):
+    monkeypatch.setenv("SAI_LOG", log_enabled)
+    if sai_ledger:
+        storage.db().close()
+    if filename is None:
+        filename = log.file_name("cli", datetime.now(UTC).date())
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+    child = isolated_home / directory
+    child.mkdir(mode=0o755)
+    artifact = child / filename
+    artifact.write_text(content)
+    artifact.chmod(0o644)
+
+    for flags in [("--no-fix",), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == exit_code
+        assert log.flush()
+        report = json.loads(output)
+        if exit_code:
+            report = report["error"]["details"]
+        check = next(c for c in report["checks"] if c["id"] == check_id)
+        assert check["status"] == "warn"
+        assert check["fix"] == doctor.SAI_HOME_MODE_FIX
+        assert check["changes"] == []
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+        assert child.stat().st_mode & 0o777 == 0o755
+        assert artifact.stat().st_mode & 0o777 == 0o644
+        assert artifact.read_text() == content
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_logging_leaves_a_foreign_archive_alone(isolated_home, monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "1")
+    root = isolated_home / "logs"
+    root.mkdir(mode=0o700)
+    archive = root / "cli-2020-01-01.jsonl"
+    contents = '{"other_application":"archived request"}\n'
+    archive.write_text(contents)
+    archive.chmod(0o600)
+
+    assert run_cli("doctor", "--offline")[0] == 0
+    assert log.flush()
+    assert archive.read_text() == contents
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 @pytest.mark.parametrize(
     ("key", "expected_code"), [("keeper.endpoint", 0), ("bogus", 2)]
 )
@@ -540,8 +606,11 @@ def test_doctor_reports_and_preserves_an_existing_shared_or_ambiguous_root(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
-    storage.db().close()
-    history = isolated_home / "trader" / "history"
+    ledger_path = old_ledger(isolated_home)
+    ledger_path.chmod(0o640)
+    trader = ledger_path.parent
+    trader.chmod(0o755)
+    history = trader / "history"
     history.touch()
     history.chmod(0o644)
     isolated_home.chmod(0o2770)
@@ -556,7 +625,7 @@ def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "warn"
-    assert check["fix"] == f"{root_advice} chmod go-rwx {history}"
+    assert check["fix"] == root_advice
     assert history.stat().st_mode & 0o777 == 0o644
     assert isolated_home.stat().st_mode & 0o7777 == 0o2770
 
@@ -565,7 +634,11 @@ def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "warn"
     assert check["fix"] == root_advice
-    assert history.stat().st_mode & 0o777 == 0o600
+    assert check["changes"] == []
+    assert user_version(ledger_path) == storage.SCHEMA_VERSION
+    assert ledger_path.stat().st_mode & 0o777 == 0o640
+    assert trader.stat().st_mode & 0o777 == 0o755
+    assert history.stat().st_mode & 0o777 == 0o644
     assert isolated_home.stat().st_mode & 0o7777 == 0o2770
 
 
@@ -588,19 +661,26 @@ def test_fix_makes_the_directory_and_files_private(isolated_home):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
-def test_fix_keeps_owner_bits_and_skips_files_sai_does_not_manage(isolated_home):
+@pytest.mark.parametrize("mixed", [False, True])
+def test_fix_keeps_owner_bits_and_preserves_a_mixed_trader(isolated_home, mixed):
+    storage.db().close()
     root = isolated_home / "trader"
-    root.mkdir(mode=0o700)
     history = root / "history"
     history.write_text("")
     history.chmod(0o754)
     tool = root / "notes.sh"
-    tool.write_text("#!/bin/sh\n")
-    tool.chmod(0o755)
+    if mixed:
+        tool.write_text("#!/bin/sh\n")
+        tool.chmod(0o755)
     check = one(doctor.check_home, ctx(fix=True))
-    assert check.changes == [f"chmod {history} 754 -> 700"]
-    assert history.stat().st_mode & 0o777 == 0o700
-    assert tool.stat().st_mode & 0o777 == 0o755
+    if mixed:
+        assert check.fix == doctor.SAI_HOME_MODE_FIX
+        assert check.changes == []
+        assert history.stat().st_mode & 0o777 == 0o754
+        assert tool.stat().st_mode & 0o777 == 0o755
+    else:
+        assert check.changes == [f"chmod {history} 754 -> 700"]
+        assert history.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -671,8 +751,9 @@ def test_tighten_refuses_a_path_swapped_for_a_symlink(isolated_home, tmp_path_fa
     root = isolated_home / "trader"
     root.mkdir(mode=0o700)
     (root / "session.json").symlink_to(target)
-    changes, failed = doctor.tighten(root, doctor.MANAGED)
+    changes, failed, eligible = doctor.tighten(root, doctor.MANAGED)
     assert changes == []
+    assert not eligible
     assert failed == [
         f"Could not open {root / 'session.json'} safely; inspect it by hand"
     ]
@@ -683,6 +764,7 @@ def test_tighten_refuses_a_path_swapped_for_a_symlink(isolated_home, tmp_path_fa
     assert doctor.tighten(linked, doctor.MANAGED) == (
         [],
         [f"Could not open {linked} safely; inspect it by hand"],
+        False,
     )
     assert outside.stat().st_mode & 0o777 == 0o755
 

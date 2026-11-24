@@ -273,6 +273,10 @@ class LoggedGroup(SaiGroup):
         names = command_path(self, argv)
         private_args = auth_attempt(names, argv)
         quiet = unlogged(names, argv)
+        if names == ["doctor"] and not quiet:
+            from .doctor import can_log_to_profile
+
+            quiet = not can_log_to_profile()
         command = " ".join(names) or ("repl" if not argv else None)
         # Keep only command words for auth, even if a parent parser fails.
         logged_argv = names if private_args else argv
@@ -291,7 +295,10 @@ class LoggedGroup(SaiGroup):
         with (
             log.silenced()
             if quiet
-            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
+            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex),
+            log.keep_existing_modes()
+            if command == "doctor"
+            else contextlib.nullcontext(),
         ):
             if command == "doctor" and not quiet:
                 # Let doctor report directory creation before logging creates

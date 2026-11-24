@@ -4342,11 +4342,36 @@ def test_logs_tail_plain_output_is_one_line_per_event(home):
 
 
 @posix_only
-def test_doctor_makes_the_logs_directory_and_files_private(home):
+@pytest.mark.parametrize("directory_mode", [0o700, 0o755])
+def test_doctor_log_writer_keeps_existing_modes(home, directory_mode):
     log.event("probe")
     assert log.flush(60)
     root = home / "logs"
     path = log.file_path("cli", datetime.now(UTC).date(), root)
+    before = path.read_bytes()
+    root.chmod(directory_mode)
+    path.chmod(0o644)
+
+    with log.keep_existing_modes():
+        log.event("probe")
+    assert log.flush(60)
+    assert stat.S_IMODE(root.stat().st_mode) == directory_mode
+    assert stat.S_IMODE(path.stat().st_mode) == 0o644
+    assert path.read_bytes() == before
+
+
+@posix_only
+@pytest.mark.parametrize("legacy", [False, True])
+def test_doctor_makes_the_logs_directory_and_files_private(home, legacy):
+    storage.db().close()
+    log.event("probe")
+    assert log.flush(60)
+    root = home / "logs"
+    path = log.file_path("cli", datetime.now(UTC).date(), root)
+    if legacy:
+        row = json.loads(path.read_text())
+        del row["schema"]
+        path.write_text(json.dumps(row) + "\n")
     root.chmod(0o755)
     path.chmod(0o644)
     report = doctor.check_logs(doctor.context(settings.load({}), "", fix=False))
