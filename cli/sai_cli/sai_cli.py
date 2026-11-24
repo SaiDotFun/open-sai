@@ -186,12 +186,33 @@ def unlogged(names: list[str], argv: list[str]) -> bool:
     )
 
 
-class LoggedGroup(click.Group):
+class HelpOnMissingInput(click.Command):
+    """Show full help when Click requires input and the command received none."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        bare = not args
+        try:
+            return super().parse_args(ctx, args)
+        except click.MissingParameter:
+            if not bare or ctx.find_root().params.get("json_output"):
+                raise
+            click.echo(ctx.get_help(), err=True, color=ctx.color)
+            ctx.exit(ExitCode.USAGE)
+
+
+class SaiGroup(click.Group):
+    command_class = HelpOnMissingInput
+    group_class = type
+
+
+class LoggedGroup(SaiGroup):
     """The root group: logs `command.start` and `command.end` for each run.
 
     Events written while the command runs carry its `command`. `sai mcp
     serve` logs to the `mcp` surface and `sai update` to `update`.
     """
+
+    group_class = SaiGroup
 
     def main(
         self,
@@ -208,7 +229,7 @@ class LoggedGroup(click.Group):
         command = " ".join(names) or ("repl" if not argv else None)
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
         started = time.monotonic()
-        exit_code = ExitCode.OK
+        exit_code: int = ExitCode.OK
         failure: SaiError | None = None
         with log.silenced() if quiet else log.bind(surface=surface, command=command):
             if not quiet:
@@ -229,6 +250,9 @@ class LoggedGroup(click.Group):
                     raise
                 show_failure(exc, failure, json_requested(argv))
             else:
+                # With standalone mode disabled, Click returns explicit exit codes.
+                if isinstance(result, int):
+                    exit_code = result
                 if not standalone_mode:
                     return result
             finally:
