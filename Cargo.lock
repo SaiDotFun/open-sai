@@ -1129,6 +1129,7 @@ dependencies = [
  "chrono",
  "clap",
  "rpassword",
+ "rustix",
  "sai-core",
  "serde",
  "serde_json",

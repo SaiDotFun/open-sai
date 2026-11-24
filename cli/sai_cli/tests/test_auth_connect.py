@@ -18,6 +18,7 @@ import termios
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -49,6 +50,7 @@ class Env:
 
     def __init__(self, root: Path, command: tuple[str, ...] | None = None) -> None:
         self.command = command or (sys.executable, "-m", "sai_cli")
+        self.extra_env: dict[str, str] = {}
         self.home = root / "sai-home"
         self.bin = root / "bin"
         self.clip = root / "clipboard.txt"
@@ -77,6 +79,7 @@ class Env:
             "SAI_HOME": str(self.home),
             "PATH": str(self.bin),
             "HOME": str(self.home),
+            **self.extra_env,
         }
 
     def run(
@@ -94,7 +97,11 @@ class Env:
         )
 
     def run_tty(
-        self, *args: str, typed: list[str | Callable[[], object]]
+        self,
+        *args: str,
+        typed: list[str | Callable[[], object]],
+        immediate_prompt: bool = False,
+        transcript: bytearray | None = None,
     ) -> tuple[int, str, str]:
         """Run with a pseudo-terminal on stdin and answer each hidden prompt.
 
@@ -103,6 +110,8 @@ class Env:
         previous answer, which `getpass` only does after reading it, and echo
         is off again for the next prompt. A callable entry runs once that
         next prompt is showing, before the line that answers it.
+        To check prompt ordering, send input immediately after seeing the prompt
+        and capture any echo from the PTY master separately from stderr.
         """
         primary, secondary = pty.openpty()
         proc = subprocess.Popen(
@@ -129,18 +138,27 @@ class Env:
                 deadline = time.monotonic() + 20
                 while proc.poll() is None and time.monotonic() < deadline:
                     echo = termios.tcgetattr(primary)[3] & termios.ECHO
-                    if len(errors) > mark and not echo:
+                    if len(errors) > mark and (immediate_prompt or not echo):
                         break
                     time.sleep(0.01)
                 if callable(line):
                     line()
                     continue
+                if immediate_prompt:
+                    assert errors[mark:].endswith(b": "), "hidden prompt did not appear"
                 os.write(primary, (line + "\n").encode())
+                if immediate_prompt:
+                    assert not echo, "terminal echo was enabled at the prompt"
                 mark = len(errors)
             assert proc.stdout
             stdout = proc.stdout.read()
             proc.wait(timeout=30)
             reader.join(timeout=5)
+            if transcript is not None:
+                os.set_blocking(primary, False)
+                with suppress(BlockingIOError, OSError):
+                    while chunk := os.read(primary, 4096):
+                        transcript.extend(chunk)
         finally:
             proc.kill()
             os.close(primary)

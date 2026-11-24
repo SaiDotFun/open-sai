@@ -11,6 +11,7 @@ publish = false
 chrono.workspace = true
 clap.workspace = true
 rpassword = "7.5.5"
+rustix = { workspace = true, features = ["termios"] }
 sai-core = { path = "../sai-core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true

@@ -5,6 +5,7 @@ use std::{
 
 use chrono::Utc;
 use clap::Subcommand;
+use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
 use sai_core::{
     auth::{self, CLIPBOARD_NAMES, Clipboard, LoginError},
     errors::{Code, ExitCode, SaiError},
@@ -250,13 +251,40 @@ async fn import(
     emit(&summary, json)
 }
 
+struct HiddenInput<'a> {
+    stdin: &'a io::Stdin,
+    original: Termios,
+}
+
+impl<'a> HiddenInput<'a> {
+    fn new(stdin: &'a io::Stdin) -> io::Result<Self> {
+        let original = tcgetattr(stdin)?;
+        let mut hidden = original.clone();
+        hidden
+            .local_modes
+            .remove(LocalModes::ECHO | LocalModes::ECHONL);
+        tcsetattr(stdin, OptionalActions::Flush, &hidden)?;
+        Ok(Self { stdin, original })
+    }
+}
+
+impl Drop for HiddenInput<'_> {
+    fn drop(&mut self) {
+        let _ = tcsetattr(self.stdin, OptionalActions::Now, &self.original);
+    }
+}
+
 async fn read_token() -> Result<Zeroizing<String>, SaiError> {
-    let terminal = io::stdin().is_terminal();
+    let stdin = io::stdin();
+    let terminal = stdin.is_terminal();
     if terminal {
         // rpassword turns Ctrl-C into SIGINT after restoring the terminal.
         // Catch it so a canceled prompt uses the CLI's normal error format.
         let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
             .map_err(|_| SaiError::internal())?;
+        // rpassword prints the prompt before setting its terminal mode.
+        let hidden =
+            HiddenInput::new(&stdin).map_err(|_| SaiError::new(Code::InvalidRequest, "Aborted"))?;
         let config = rpassword::ConfigBuilder::new()
             .input_file_path("/dev/stdin")
             .output_writer(io::stderr())
@@ -272,6 +300,7 @@ async fn read_token() -> Result<Zeroizing<String>, SaiError> {
             }
             SaiError::new(Code::InvalidRequest, "Aborted")
         })?;
+        drop(hidden);
         if !typed.trim().is_empty() {
             return Ok(Zeroizing::new(typed.trim().to_owned()));
         }

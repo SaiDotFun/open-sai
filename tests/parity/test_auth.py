@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -223,6 +224,49 @@ def test_auth_summaries_hide_keeper_path(
         )
         results.append(outputs)
     assert results[0] == results[1]
+
+
+def test_import_disables_echo_before_showing_prompt(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI]
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    cc = shutil.which("cc")
+    if sys.platform == "linux" and cc:
+        # Make the old prompt-before-echo-off window deterministic. The
+        # subprocess still reads and writes through a real pseudo-terminal.
+        source = tmp_path / "delay-termios.c"
+        source.write_text(
+            "#include <dlfcn.h>\n"
+            "#include <termios.h>\n"
+            "#include <unistd.h>\n"
+            "int tcsetattr(int fd, int action, const struct termios *mode) {\n"
+            "    int (*apply)(int, int, const struct termios *) = "
+            'dlsym(RTLD_NEXT, "tcsetattr");\n'
+            "    if (!(mode->c_lflag & ECHO)) usleep(250000);\n"
+            "    return apply(fd, action, mode);\n"
+            "}\n"
+        )
+        library = tmp_path / "delay-termios.so"
+        subprocess.run(
+            [cc, "-shared", "-fPIC", str(source), "-o", str(library), "-ldl"],
+            check=True,
+            timeout=20,
+        )
+        rust.extra_env["LD_PRELOAD"] = str(library)
+
+    token = fixture_token(ADDR)
+    transcript = bytearray()
+    result = rust.run_tty(
+        "--json",
+        "auth",
+        "import",
+        typed=[token],
+        immediate_prompt=True,
+        transcript=transcript,
+    )
+    assert result[0] == 0
+    assert token.encode() not in transcript
+    assert_unexposed(rust, result[1] + result[2], token)
 
 
 @pytest.mark.parametrize("entry", ["clipboard", "hidden", "enter", "changed"])
