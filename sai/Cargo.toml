@@ -11,13 +11,13 @@ publish = false
 chrono.workspace = true
 clap.workspace = true
 libc.workspace = true
+rusqlite = { version = "0.38", features = ["bundled"] }
 rustix = { workspace = true, features = ["termios"] }
 sai-core = { path = "../sai-core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+tempfile.workspace = true
+toml_edit = { workspace = true, features = ["display"] }
 tokio = { workspace = true, features = ["signal"] }
 zeroize.workspace = true
 zmij = "1"
-
-[dev-dependencies]
-tempfile.workspace = true
