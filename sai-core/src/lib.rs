@@ -1,3 +1,4 @@
+pub mod auth;
 mod endpoint;
 pub mod errors;
 pub mod files;

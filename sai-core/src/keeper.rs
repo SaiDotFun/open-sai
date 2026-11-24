@@ -297,7 +297,7 @@ pub(crate) fn truthy(value: &Value) -> bool {
     }
 }
 
-fn is_evm_address(value: &str) -> bool {
+pub(crate) fn is_evm_address(value: &str) -> bool {
     value
         .strip_prefix("0x")
         .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
