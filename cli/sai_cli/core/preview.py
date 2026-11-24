@@ -295,9 +295,12 @@ def close_estimates(
                 ),
             }
 
-        # Voluntary settlement runs the after-hours guard after checking for liquidation.
+        # A full close settles directly at effective leverage. A partial close runs the guard.
         effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
-        if effective is None or effective != margin.contract_decimal(raw["leverage"]):
+        if effective is None or (
+            reduce_by is not None
+            and effective != margin.contract_decimal(raw["leverage"])
+        ):
             guarded = unavailable(
                 "The after-hours guard can change or close this position."
             )

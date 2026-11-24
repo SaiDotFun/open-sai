@@ -1210,3 +1210,27 @@ def test_cancel_refuses_logout_during_the_last_lcd_read(position_service):
             assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+def test_full_close_fees_use_carried_positions_effective_leverage(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.after_hours = True
+    position.collateral = 100_000_000
+    position.leverage = "20"
+    position.cap = "5"
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, "preview_close", {"trade_id": 7})
+            estimates = quote["estimates"]
+            assert estimates["execution"]["status"] == "voluntary_close"
+            assert estimates["fees"]["amountUsdc"] == "1"
+            assert estimates["liquidationPrice"]["status"] == "not_applicable"
+            partial = await call(
+                client, "preview_partial_close", {"trade_id": 7, "percent": 50}
+            )
+            assert partial["estimates"]["fees"]["status"] == "unavailable"
+            assert position.submitted == []
+
+    asyncio.run(scenario())
