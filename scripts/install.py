@@ -39,6 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import quote, urlsplit
@@ -156,6 +157,10 @@ def request(
     except urllib.error.HTTPError as error:
         found = {name.lower(): value for name, value in error.headers.items()}
         return error.code, found, b""
+    except HTTPException as error:
+        raise LookupFailed(
+            f"incomplete or invalid GitHub HTTP response: {type(error).__name__}"
+        ) from error
     except (OSError, ValueError) as error:
         raise LookupFailed(f"could not reach GitHub: {type(error).__name__}") from error
 

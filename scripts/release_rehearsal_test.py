@@ -289,6 +289,44 @@ class BaselineTest(unittest.TestCase):
                     )
                     self.assertCountEqual(Path(temp).iterdir(), [wheel])
 
+    def test_truncated_release_response_reports_baseline_lookup_failure(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class TruncatedRelease(keeper_handler):
+            def do_GET(self) -> None:
+                self.send_response(200)
+                self.send_header("Transfer-Encoding", "chunked")
+                self.end_headers()
+                self.wfile.write(b"10\r\n[\r\n")
+                self.close_connection = True
+
+        with (
+            REHEARSAL["keeper_server"](TruncatedRelease) as base,
+            tempfile.TemporaryDirectory() as temp,
+        ):
+            wheel = Path(temp) / "sai_cli-0.1.2-py3-none-any.whl"
+            wheel.touch()
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    RUN_WITH_RELEASE_API,
+                    str(SCRIPT),
+                    base,
+                    str(wheel),
+                ],
+                timeout=5,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "Could not resolve the latest published sai-cli release", result.stderr
+        )
+        self.assertIn("incomplete or invalid GitHub HTTP response", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
 
 class SessionTest(unittest.TestCase):
     def test_changed_or_missing_session_file_fails_without_exposing_token(self) -> None:
