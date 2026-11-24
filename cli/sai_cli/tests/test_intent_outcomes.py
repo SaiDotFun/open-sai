@@ -596,6 +596,38 @@ def test_wait_reports_aged_absence_when_ledger_releases_block(keeper_replay):
     storage.pending("next-open", endpoint, ADDR, "OPEN_TRADE", "")
 
 
+@pytest.mark.parametrize(
+    ("disposition", "code"),
+    [
+        ("rejected", "ADMISSION_REJECTED"),
+        ("not_sent", "NOT_SENT"),
+    ],
+)
+@pytest.mark.parametrize("during_wait", [False, True])
+def test_wait_reports_definitive_submit_disposition(
+    keeper_replay, disposition, code, during_wait
+):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    clock = FakeClock()
+
+    def submitter_finishes():
+        storage.set_status(KEY, endpoint, ADDR, disposition)
+        return RESPONSES["started"]
+
+    if during_wait:
+        replies.append(submitter_finishes)
+    else:
+        storage.set_status(KEY, endpoint, ADDR, disposition)
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, timeout=0.25, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == status(endpoint) == disposition
+    assert result["intentKey"] == KEY
+    assert result["code"] == code
+    storage.pending("next-open", endpoint, ADDR, "OPEN_TRADE", "")
+
+
 @pytest.mark.parametrize("recorded", ["terminal", "absent"])
 def test_wait_reports_a_released_local_block_when_keeper_is_unreachable(
     keeper_replay, recorded

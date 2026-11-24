@@ -149,9 +149,9 @@ async def for_intent_async(
         try:
             await asyncio.sleep(0)
             with write():
-                local = storage.intent_record(endpoint, key)
-            if local == (account, "rejected"):
-                outcome = "rejected"
+                recorded = _recorded_outcome(endpoint, account, key)
+            if recorded in ("rejected", "not_sent"):
+                outcome = recorded
             else:
                 async with httpx.AsyncClient() as client:
                     while remaining() > 0:
@@ -209,17 +209,7 @@ async def for_intent_async(
             if not ledger_busy(exc):
                 raise
         if outcome == "unknown":
-            with storage.busy_timeout(0):
-                try:
-                    final = storage.intent_record(endpoint, key)
-                except sqlite3.OperationalError as exc:
-                    if not ledger_busy(exc):
-                        raise
-                    final = None
-            if final == (account, "terminal"):
-                outcome = "terminal"
-            elif final == (account, "absent"):
-                outcome = "absent"
+            outcome = _recorded_outcome(endpoint, account, key) or "unknown"
     finally:
         log.event(
             "intent.wait.end",
