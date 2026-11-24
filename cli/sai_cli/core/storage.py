@@ -363,9 +363,55 @@ def db() -> sqlite3.Connection:
     return connection
 
 
-def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> None:
+class PendingOpen(ValueError):
+    def __init__(self, keys: list[str], pending_fill: bool) -> None:
+        self.keys = keys
+        self.pending_fill = pending_fill
+        super().__init__(
+            f"Reconcile uncertain intent {keys[0]} with sai intent wait before opening another trade"
+        )
+
+
+def _check_open(
+    connection: sqlite3.Connection,
+    endpoint: str,
+    account: str,
+    allow_concurrent_open: bool,
+) -> None:
+    opens = connection.execute(
+        "SELECT id, COALESCE(keeper_status,status) FROM intents"
+        " WHERE endpoint=? AND account=? AND kind='OPEN_TRADE'"
+        " AND COALESCE(keeper_status,status) IN ('unknown','pending','accepted')"
+        " AND (?=0 OR status<>'accepted') ORDER BY rowid DESC",
+        (endpoint, account.lower(), allow_concurrent_open),
+    ).fetchall()
+    if opens:
+        raise PendingOpen(
+            [key for key, _ in opens],
+            any(status == "pending" for _, status in opens),
+        )
+
+
+def check_open(endpoint: str, account: str, *, allow_concurrent_open: bool) -> None:
+    """Report a local blocker before a live open reads Keeper."""
+    if (home() / "intents.sqlite3").exists():
+        with db() as connection:
+            _check_open(connection, endpoint, account, allow_concurrent_open)
+
+
+def pending(
+    key: str,
+    endpoint: str,
+    account: str,
+    kind: str,
+    entity: str,
+    *,
+    allow_concurrent_open: bool = False,
+) -> None:
     with db() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        if kind == "OPEN_TRADE":
+            _check_open(connection, endpoint, account, allow_concurrent_open)
         unresolved = connection.execute(
             "SELECT id FROM intents WHERE endpoint=? AND account=?"
             " AND (status='unknown' OR keeper_status='pending'"

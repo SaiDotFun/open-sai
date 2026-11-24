@@ -1127,18 +1127,19 @@ def test_unknown_open_after_a_timeout_blocks_with_its_key(mcp, monkeypatch):
     assert len(fake.submitted) == 1
 
 
-def test_only_recent_unresolved_opens_count():
+def test_old_acknowledged_open_blocks_until_terminal():
     key = "20260101T000000000Z_AAAAAAAAAAAAAAAA"
     storage.pending(key, ENDPOINT, ADDR, "OPEN_TRADE", "")
     storage.set_status(key, ENDPOINT, ADDR, "accepted")
-    assert tools.recent_opens(ENDPOINT, ADDR) == [
-        {"intentKey": key, "status": "accepted"}
-    ]
-    later = datetime.now(UTC).timestamp() + tools.RECENT_OPEN_SECONDS + 1
-    assert tools.recent_opens(ENDPOINT, ADDR, now=later) == []
-    assert tools.recent_opens("http://127.0.0.1:1/query", ADDR) == []
+    with storage.db() as connection:
+        connection.execute("UPDATE intents SET created_at=0 WHERE id=?", (key,))
+    with pytest.raises(storage.PendingOpen, match=key):
+        storage.pending("next", ENDPOINT, ADDR, "OPEN_TRADE", "")
+    storage.pending(
+        "other-endpoint", "http://127.0.0.1:1/query", ADDR, "OPEN_TRADE", ""
+    )
     storage.set_status(key, ENDPOINT, ADDR, "terminal")
-    assert tools.recent_opens(ENDPOINT, ADDR) == []
+    storage.pending("next", ENDPOINT, ADDR, "OPEN_TRADE", "")
 
 
 def test_sign_in_comes_before_validation(mcp):

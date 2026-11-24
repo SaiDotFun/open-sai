@@ -19,9 +19,11 @@ TRADER = "nibi1trader"
 NETWORK = "cataclysm-1"
 
 
-@pytest.mark.parametrize("catches_up", [True, False])
-def test_remove_margin_when_index_lags(catches_up):
+@pytest.mark.parametrize("scenario", ["catches_up", "lags", "changes_at_market_lookup"])
+def test_remove_margin_when_index_lags_or_changes(scenario):
     indexed_reads = 0
+    market_reads = 0
+    collateral = 11000000
     submitted: list[dict] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -50,7 +52,7 @@ def test_remove_margin_when_index_lags(catches_up):
                             "user_trade_index": "UserTradeIndex(7)",
                             "market_index": "MarketIndex(0)",
                             "collateral_index": "TokenIndex(1)",
-                            "collateral_amount": "11000000",
+                            "collateral_amount": str(collateral),
                             "trade_type": "trade",
                             "is_open": True,
                             "leverage": "5",
@@ -72,7 +74,7 @@ def test_remove_margin_when_index_lags(catches_up):
                 )
 
         def do_POST(self):
-            nonlocal indexed_reads
+            nonlocal collateral, indexed_reads, market_reads
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             query = request["query"]
             if query == keeper.ROUTE:
@@ -97,9 +99,10 @@ def test_remove_margin_when_index_lags(catches_up):
                                 "isOpen": True,
                                 "tradeType": "trade",
                                 "leverage": 5,
-                                "collateralAmount": 11000000
-                                if catches_up and indexed_reads > 1
-                                else 10000000,
+                                "collateralAmount": 10000000
+                                if scenario == "lags"
+                                or (scenario == "catches_up" and indexed_reads == 1)
+                                else collateral,
                                 "perpBorrowing": {
                                     "marketId": 0,
                                     "collateralToken": {"id": 1, "symbol": "USDC"},
@@ -109,6 +112,9 @@ def test_remove_margin_when_index_lags(catches_up):
                     }
                 )
             elif query == keeper.MARKET:
+                market_reads += 1
+                if scenario == "changes_at_market_lookup" and market_reads == 2:
+                    collateral = 10000000
                 self.reply(
                     {
                         "perp": {
@@ -176,13 +182,18 @@ def test_remove_margin_when_index_lags(catches_up):
             thread.join()
 
     assert indexed_reads == 3
-    if catches_up:
+    if scenario == "catches_up":
         assert result.exit_code == 0, result.output
         assert json.loads(result.output)["quote"]["collateralBefore"] == "11000000"
         assert len(submitted) == 1
         assert submitted[0]["intent"]["body"]["requestedLeverage"] == "5.5"
-    else:
+    elif scenario == "lags":
         assert result.exit_code == 1, result.output
         assert "Retry after Keeper synchronizes" in result.output
+        assert submitted == []
+        assert storage.list_pending(endpoint, ADDR) == []
+    else:
+        assert result.exit_code == 1, result.output
+        assert json.loads(result.output)["code"] == "PREVIEW_MISMATCH"
         assert submitted == []
         assert storage.list_pending(endpoint, ADDR) == []

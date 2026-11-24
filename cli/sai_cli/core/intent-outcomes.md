@@ -54,8 +54,10 @@ Both terminal outcomes store `terminal`. A row in `pending` blocks new
 trades for its account and Keeper endpoint. The SQLite row stores
 `status='unknown'` and `keeper_status='pending'` so the v0.1.0 trade guard
 blocks it until that version reconciles the intent using its own lifecycle
-rules. A row in `unknown` blocks at the same scope. Admission
-retains the existing `accepted` rule for a matching trade ID.
+rules. A row in `unknown` blocks at the same scope. An `accepted` row
+blocks another mutation for the same trade ID. An `accepted` open blocks
+new opens for that account and endpoint until reconciliation confirms a
+final outcome or the user explicitly allows a concurrent open.
 
 An expired `unknown` can become `absent` on an empty Keeper read. A later
 admission restores an account-wide block as `pending`. Keeper can still

@@ -14,7 +14,7 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
-from . import intents, keeper, margin
+from . import intents, keeper, margin, storage
 
 SessionLoader = Callable[[], dict[str, str]]
 Notify = Callable[[str], None]
@@ -86,6 +86,7 @@ def open_trade(
     dry_run: bool,
     notify: Notify = _ignore,
     before_submit: SubmitCheck = _accept,
+    allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
     """Open a market, limit, or stop trade.
 
@@ -104,27 +105,31 @@ def open_trade(
         take_profit,
         stop_loss,
     )
-    if order_type != "market":
-        return preview_or_submit(endpoint, get_session, payload, dry_run, before_submit)
+    preview = {"dryRun": True, "intent": payload}
+    if order_type == "market":
+        preview["requiresMarketPriceRefresh"] = True
     if dry_run:
-        return {"dryRun": True, "requiresMarketPriceRefresh": True, "intent": payload}
+        return preview
     active = get_session()
-    if price is not None:
-        notify(MARKET_PRICE_NOTICE)
-    current = open_usdc_market(endpoint, market_id)
-    current_price = format(Decimal(str(current["price"])), "f")
-    intents.positive(current_price, "Current price")
-    payload["body"]["intentPrice"] = current_price
-    before_submit(
-        {
-            "dryRun": True,
-            "requiresMarketPriceRefresh": True,
-            "intent": payload,
-            "referencePrice": current_price,
-        }
+    storage.check_open(
+        endpoint,
+        active["evmAddress"],
+        allow_concurrent_open=allow_concurrent_open,
     )
-    result = intents.submit(endpoint, active, payload)
-    result["referencePrice"] = current_price
+    if order_type == "market":
+        if price is not None:
+            notify(MARKET_PRICE_NOTICE)
+        current = open_usdc_market(endpoint, market_id)
+        current_price = format(Decimal(str(current["price"])), "f")
+        intents.positive(current_price, "Current price")
+        payload["body"]["intentPrice"] = current_price
+        preview["referencePrice"] = current_price
+    before_submit(preview)
+    result = intents.submit(
+        endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
+    )
+    if "referencePrice" in preview:
+        result["referencePrice"] = preview["referencePrice"]
     return result
 
 
@@ -205,18 +210,30 @@ def change_margin(
     }
     if dry_run:
         return preview
-    fresh_raw, fresh_funds, fresh_market = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
-    )
-    fresh_quote = margin.margin_quote(
-        fresh_raw, fresh_funds, fresh_market, direction, amount
-    )
+    try:
+        fresh_raw, fresh_funds, fresh_market = margin.snapshot(
+            endpoint, lcd_endpoint, active["evmAddress"], trade_id
+        )
+    except (
+        margin.IndexLag,
+        margin.PositionUnavailable,
+        margin.MarketUnavailable,
+    ) as exc:
+        raise margin.PositionChanged("Position changed. " + str(exc)) from exc
+    try:
+        fresh_quote = margin.margin_quote(
+            fresh_raw, fresh_funds, fresh_market, direction, amount
+        )
+    except ValueError as exc:
+        raise margin.PositionChanged("Margin quote changed. " + str(exc)) from exc
     if (
         fresh_raw["collateral_amount"] != raw["collateral_amount"]
         or fresh_raw["leverage"] != raw["leverage"]
         or fresh_quote != quoted
     ):
-        raise ValueError("Position changed; review the margin change again")
+        raise margin.PositionChanged(
+            "Position changed. Review the margin change again."
+        )
     before_submit(preview)
     result = intents.submit(endpoint, active, payload)
     result["quote"] = quoted

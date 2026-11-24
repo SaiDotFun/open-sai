@@ -322,21 +322,32 @@ trade command to submit once and wait up to 30 seconds for that key. With
 MCP, call `intent_wait` after the trade returns its key. The tool caps each
 call at 10 seconds.
 
-The result contains an `outcome` and a `receipt`. On timeout it returns
-`unknown` with code `OUTCOME_UNKNOWN` and exits 5 in the CLI. Call wait
-again with the same key and account. A confirmed failure exits 1, an
-admission rejection exits 4, and a successful outcome exits 0. For a limit
-or stop order, success confirms placement. The order may still be waiting
-for its trigger.
+The result contains an `outcome` and a `receipt`. An unresolved timeout
+returns `unknown` with code `OUTCOME_UNKNOWN` and exits 5 in the CLI. Call
+wait again with the same key and account. If reconciliation releases the
+local block after the admission grace period, the wait returns `absent`
+and exits 1. A delayed admission can still appear.
+If the ledger already has a final outcome and Keeper is unavailable, the
+wait returns `terminal` and exits 1 with the execution details unavailable.
+
+A confirmed failure exits 1, and an admission rejection exits 4. The
+outcomes `filled`, `placed`, and `succeeded` exit 0. A limit or stop
+order can return `placed` before its trigger. The receipt's `action`
+identifies the intent kind and order type when available.
+
+An acknowledged open blocks another open for the same account and Keeper
+endpoint. The refusal gives the existing intent key. Use
+`--allow-concurrent-open` or the MCP argument `allow_concurrent_open=true`
+only after confirming a second open. Unknown or pending outcomes still block.
 
 The receipt's `requestTxHash` identifies the transaction that submitted
 the request. For a next-oracle fill, `execution.block` is the later block
 that filled it. When history is available, `execution.historyId` identifies
-the matching row and `position` shows Keeper's latest state for that trade.
-For market opens and closes, the fill can include the execution price and
-collateral size in base units. `fill.oraclePrice` is the oracle quote when
-Keeper provides it. `fill.positionFeesUsd` contains Keeper's cumulative
-position fees in USD. Fields without indexed evidence are null.
+the matching row. `positionNow` shows Keeper's latest state for that trade,
+and `positionFeesUsd` gives cumulative fees. The fill can include an oracle
+quote and the escrowed collateral in base units from the matching market
+order. Actual fill price and size remain null when Keeper exposes only the
+current position.
 
 ### Doctor
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 TRADE_FILLS = {
     "position_opened",
@@ -10,6 +10,56 @@ TRADE_FILLS = {
     "trade_size_increase",
     "trade_size_decrease",
 }
+PLACEMENTS = {"limit_order_created": "limit", "stop_order_created": "stop"}
+FILL_KINDS = {"CLOSE_POSITION", "INCREASE_POSITION_SIZE", "DECREASE_POSITION_SIZE"}
+
+
+def _indexed(row: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
+    # A row confirming the canonical execution block takes precedence if the
+    # same intent key happens to appear on multiple history rows.
+    canonical_block = (
+        row.get("execBlock") if row.get("lifecycleStep") == "exec_pass" else None
+    )
+    return next(
+        (
+            item
+            for item in history
+            if canonical_block is None
+            or (item.get("block") or {}).get("block") == canonical_block
+        ),
+        {},
+    )
+
+
+def _action(row: dict[str, Any], indexed: dict[str, Any]) -> dict[str, Any]:
+    kind = row.get("kind")
+    body = row.get("body")
+    order_type = (
+        body.get("orderType")
+        if kind == "OPEN_TRADE" and isinstance(body, dict)
+        else None
+    )
+    return {
+        "kind": kind,
+        "orderType": order_type or PLACEMENTS.get(indexed.get("tradeChangeType")),
+    }
+
+
+def success(
+    row: dict[str, Any], history: list[dict[str, Any]], request_block: int | None
+) -> Literal["filled", "placed", "succeeded"]:
+    indexed = _indexed(row, history)
+    action = _action(row, indexed)
+    if action["orderType"] in ("limit", "stop"):
+        return "placed"
+    if (
+        indexed.get("tradeChangeType") in TRADE_FILLS
+        or action["kind"] in FILL_KINDS
+        or action["orderType"] == "market"
+        or (action["kind"] == "OPEN_TRADE" and request_block is not None)
+    ):
+        return "filled"
+    return "succeeded"
 
 
 def build(
@@ -21,26 +71,12 @@ def build(
     request_block: int | None,
 ) -> dict[str, Any]:
     """Keep the request transaction distinct from execution and fill data."""
-    # A row confirming the canonical execution block takes precedence if the
-    # same intent key happens to appear on multiple history rows.
-    canonical_block = (
-        row.get("execBlock") if row.get("lifecycleStep") == "exec_pass" else None
-    )
-    indexed = next(
-        (
-            item
-            for item in history
-            if canonical_block is None
-            or (item.get("block") or {}).get("block") == canonical_block
-        ),
-        {},
-    )
+    indexed = _indexed(row, history)
     order = indexed.get("marketOrder") or {}
     block = indexed.get("block") or {}
     change = indexed.get("tradeChangeType")
-    position = indexed.get("trade")
     execution = None
-    if outcome in ("filled", "failed"):
+    if outcome in ("filled", "placed", "succeeded", "failed"):
         execution = {
             "source": "trade_history" if indexed else "keeper_intent",
             "block": block.get("block")
@@ -53,56 +89,30 @@ def build(
             "marketOrderSequence": order.get("sequence"),
         }
     fill = None
-    if outcome == "filled" and (
-        change in TRADE_FILLS or order or (not indexed and request_block)
-    ):
-        fill = _fill(change, position or {}, order, indexed)
+    if outcome == "filled":
+        # Keeper's history joins the current position, so its entry price and
+        # collateral can change after this fill. The oracle quote and escrow
+        # in the correlated market order describe the indexed execution.
+        fill = {
+            "price": None,
+            "sizeCollateralBaseUnits": None,
+            "oraclePrice": order.get("execPrice"),
+            "escrowedCollateralBaseUnits": order.get("collateralAmount"),
+        }
+    fees = {
+        "opening": indexed.get("openingFeeUsd"),
+        "closing": indexed.get("closingFeeUsd"),
+        "borrowing": indexed.get("borrowingFeeUsd"),
+    }
     return {
         "requestTxHash": request_tx_hash
         or order.get("orderReqTxHash")
         or indexed.get("txHash"),
         "requestBlock": request_block or order.get("orderReqBlock"),
+        "action": _action(row, indexed),
         "execution": execution,
         "fill": fill,
-        "position": position,
-    }
-
-
-def _fill(
-    change: str | None,
-    position: dict[str, Any],
-    order: dict[str, Any],
-    history: dict[str, Any],
-) -> dict[str, Any]:
-    # The indexed trade is the latest position. Only use its entry or exit
-    # price when the matching action is the one that recorded that price.
-    block = (history.get("block") or {}).get("block")
-    price = None
-    size = None
-    if (
-        change == "position_opened"
-        and block is not None
-        and block == (position.get("openBlock") or {}).get("block")
-    ):
-        price = position.get("openPrice")
-        size = position.get("openCollateralAmount")
-    if (
-        change == "position_closed_user"
-        and block is not None
-        and block == (position.get("closeBlock") or {}).get("block")
-    ):
-        price = position.get("closePrice")
-        size = position.get("collateralAmount")
-    fees = {
-        "opening": history.get("openingFeeUsd"),
-        "closing": history.get("closingFeeUsd"),
-        "borrowing": history.get("borrowingFeeUsd"),
-    }
-    return {
-        "price": price,
-        "oraclePrice": order.get("execPrice"),
-        "sizeCollateralBaseUnits": size,
-        "escrowedCollateralBaseUnits": order.get("collateralAmount"),
+        "positionNow": indexed.get("trade"),
         "positionFeesUsd": fees
         if any(value is not None for value in fees.values())
         else None,

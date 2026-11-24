@@ -23,6 +23,7 @@ from .core import (
     clipboard,
     keeper,
     log,
+    margin,
     reconcile,
     storage,
     stream,
@@ -858,8 +859,8 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
             "Run sai intent wait again with the same key and account. Do not resubmit."
         )
     emit(ctx, result)
-    if outcome != "filled":
-        ctx.exit({"unknown": 5, "rejected": 4, "failed": 1}[outcome])
+    if outcome not in ("filled", "placed", "succeeded"):
+        ctx.exit({"unknown": 5, "rejected": 4}.get(outcome, 1))
 
 
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
@@ -892,6 +893,19 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
 
 
 def trade_error(ctx: click.Context, exc: Exception) -> None:
+    if isinstance(exc, margin.PositionChanged) and ctx.obj["json"]:
+        emit(ctx, {"error": str(exc), "code": "PREVIEW_MISMATCH"})
+        ctx.exit(1)
+    if isinstance(exc, storage.PendingOpen) and ctx.obj["json"]:
+        emit(
+            ctx,
+            {
+                "error": str(exc),
+                "code": "RECENT_OPEN_PENDING",
+                "intentKey": exc.keys[0],
+            },
+        )
+        ctx.exit(1)
     if ctx.meta.get("wait_for_trade") and isinstance(
         exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected)
     ):
@@ -925,6 +939,11 @@ def warn(message: str) -> None:
 @click.option("--slippage", required=True, help="Maximum slippage percentage.")
 @click.option("--take-profit")
 @click.option("--stop-loss")
+@click.option(
+    "--allow-concurrent-open",
+    is_flag=True,
+    help="Allow another open after Keeper acknowledged the previous one.",
+)
 @click.option("--dry-run", is_flag=True)
 @wait_option
 @click.pass_context
@@ -939,6 +958,7 @@ def trade_open(
     slippage: str,
     take_profit: str | None,
     stop_loss: str | None,
+    allow_concurrent_open: bool,
     dry_run: bool,
 ) -> None:
     """Open a market, limit, or stop trade."""
@@ -959,6 +979,7 @@ def trade_open(
                 stop_loss=stop_loss,
                 dry_run=dry_run,
                 notify=warn,
+                allow_concurrent_open=allow_concurrent_open,
             ),
         )
     except (ValueError, KeyError, keeper.KeeperError) as exc:

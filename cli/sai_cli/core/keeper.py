@@ -42,7 +42,7 @@ INTENT_HISTORY = """query($trader:String!, $limit:Int!, $offset:Int!) {
     }
   }
 }"""
-INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
+INTENTS = """query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
 SESSION = """mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }"""
 SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }"""
@@ -242,6 +242,39 @@ def _request(
         raise NotSent("Could not connect to Keeper; the request was not sent") from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise KeeperError("Keeper request failed or returned invalid JSON") from exc
+    return _response_data(query, result, outcome)
+
+
+async def read_async(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    query: str,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    """Read Keeper without a worker thread or an authentication token."""
+    started = time.monotonic()
+    outcome: dict[str, Any] = {"status": "error"}
+    try:
+        check_url(endpoint, "Keeper")
+        response = await client.post(
+            endpoint, json={"query": query, "variables": variables}
+        )
+        outcome["httpStatus"] = response.status_code
+        response.raise_for_status()
+        data = _response_data(query, response.json(), outcome)
+        outcome["status"] = "ok"
+        return data
+    except (httpx.HTTPError, ValueError) as exc:
+        outcome["error"] = "Keeper request failed or returned invalid JSON"
+        raise KeeperError(outcome["error"]) from exc
+    except KeeperError as exc:
+        outcome["error"] = str(exc)
+        raise
+    finally:
+        _log_request(endpoint, query, variables, None, started, outcome)
+
+
+def _response_data(query: str, result: Any, outcome: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise KeeperError("Keeper returned an invalid response")
     if result.get("errors"):

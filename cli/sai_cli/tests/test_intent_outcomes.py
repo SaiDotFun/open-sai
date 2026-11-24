@@ -7,8 +7,10 @@ import json
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from contextlib import suppress
 from copy import deepcopy
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -33,7 +35,16 @@ RESPONSES = {**FIXTURE["recorded"], **FIXTURE["replays"]}
 NIBI_ADDR = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
 OTHER_ADDR = "0x" + "b" * 40
 OTHER_NIBI_ADDR = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
-Reply = str | dict[str, Any]
+
+
+@dataclass
+class SlowBody:
+    started: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+    finished: threading.Event = field(default_factory=threading.Event)
+
+
+Reply = str | dict[str, Any] | Callable[[], dict[str, Any]] | SlowBody
 
 
 @pytest.fixture
@@ -47,6 +58,9 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
             nonlocal active_key, offset
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             replay = replies.popleft()
+            slow = replay if isinstance(replay, SlowBody) else None
+            if isinstance(replay, SlowBody):
+                replay = "filled"
             if request["query"] == keeper.SUBMIT:
                 active_key = request["variables"]["input"]["intentKey"]
             if replay == "drop_ack":
@@ -65,9 +79,12 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
                 row = RESPONSES["accepted"]["data"]["userIntents"][0]
                 reply = {"data": {"recordUserIntent": {**row, "intentKey": active_key}}}
             else:
-                reply = deepcopy(
-                    RESPONSES[replay] if isinstance(replay, str) else replay
-                )
+                if isinstance(replay, str):
+                    reply = deepcopy(RESPONSES[replay])
+                elif isinstance(replay, dict):
+                    reply = deepcopy(replay)
+                else:
+                    reply = deepcopy(replay())
             data: dict[str, Any] = reply.get("data", {})
             if "userIntents" in data:
                 assert request["query"] == keeper.INTENTS
@@ -101,7 +118,18 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            self.wfile.write(body)
+            if slow is None:
+                self.wfile.write(body)
+                return
+            slow.started.set()
+            try:
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    chunk = max(1, len(body) // 8)
+                    for start in range(0, len(body), chunk):
+                        slow.release.wait(0.08)
+                        self.wfile.write(body[start : start + chunk])
+            finally:
+                slow.finished.set()
 
         def log_message(self, format: str, *args: Any) -> None:
             pass
@@ -330,7 +358,6 @@ def test_unkeyed_cli_status_blocks_a_second_acknowledged_open(
     assert "Do not resubmit" in row["hint"]
     assert status(endpoint) == "pending"
 
-    replies.append(market)
     blocked = cli.invoke(main, [*options, *trade])
     assert blocked.exit_code != 0
     assert f"Reconcile uncertain intent {key}" in blocked.output
@@ -353,7 +380,6 @@ def test_unkeyed_cli_status_blocks_a_second_acknowledged_open(
         reference_price=preview["referencePrice"],
     )
     for allow in (False, True):
-        replies.append(market)
         result = call_mcp(mcp, "trade_open", {**args, "allow_concurrent_open": allow})
         assert result["code"] == "RECENT_OPEN_PENDING"
         assert result["intentKeys"] == [key]
@@ -517,6 +543,130 @@ class FakeClock:
         self.elapsed += delay
 
 
+def test_wait_reports_fill_when_optional_history_uses_remaining_budget(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    clock = FakeClock()
+
+    def confirmed():
+        clock.elapsed = 0.9
+        response = deepcopy(RESPONSES["filled"])
+        response["data"]["userIntents"][0]["body"] = {"orderType": "market"}
+        return response
+
+    def late_history():
+        clock.elapsed = 1.1
+        return RESPONSES["not_yet_in_history"]
+
+    replies.extend((confirmed, late_history))
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, timeout=1, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "filled"
+    assert result["receipt"]["execution"]["block"] == 50109596
+    assert status(endpoint) == "terminal"
+
+
+def test_wait_reports_aged_absence_when_ledger_releases_block(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint, expired=True)
+    clock = FakeClock()
+    replies.append("absent")
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == status(endpoint) == "absent"
+    assert "local block was released" in result["message"]
+    storage.pending("next-open", endpoint, ADDR, "OPEN_TRADE", "")
+
+
+@pytest.mark.parametrize("recorded", ["terminal", "absent"])
+def test_wait_reports_a_released_local_block_when_keeper_is_unreachable(
+    keeper_replay, recorded
+):
+    endpoint, replies = keeper_replay
+    reserve(endpoint, expired=True)
+    if recorded == "terminal":
+        storage.set_status(KEY, endpoint, ADDR, "terminal")
+    else:
+        storage.mark_absent(KEY, endpoint, ADDR, keeper.ABSENT_AFTER_SECONDS)
+    replies.append("drop_ack")
+    clock = FakeClock()
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, timeout=0.25, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == recorded
+    assert result.get("code") != "OUTCOME_UNKNOWN"
+
+
+def test_cli_retry_with_wait_reports_acknowledged_open_key(keeper_replay):
+    endpoint, replies = keeper_replay
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    market = {
+        "data": {
+            "perp": {
+                "borrowings": [
+                    {
+                        "marketId": 0,
+                        "collateralToken": {"symbol": "USDC"},
+                        "isOpen": True,
+                        "price": 100,
+                    }
+                ]
+            }
+        }
+    }
+    args = [
+        "--endpoint",
+        endpoint,
+        "--json",
+        "trade",
+        "open",
+        "--market",
+        "0",
+        "--side",
+        "long",
+        "--type",
+        "market",
+        "--amount",
+        "10",
+        "--leverage",
+        "2",
+        "--slippage",
+        "1",
+    ]
+    runner = CliRunner()
+    replies.extend((market, "admission_ack"))
+    first = runner.invoke(main, args)
+    assert first.exit_code == 0, first.output
+    key = json.loads(first.output)["intentKey"]
+
+    clock = FakeClock()
+    replies.append("accepted")
+    result = wait.for_intent(
+        endpoint, ADDR, key, timeout=0.25, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "unknown"
+    assert status(endpoint) == "accepted"
+
+    retry = runner.invoke(main, [*args, "--wait"])
+    assert retry.exit_code == 1, retry.output
+    assert json.loads(retry.output)["intentKey"] == key
+    assert len(storage.list_pending(endpoint, ADDR)) == 1
+
+    replies.extend((market, "admission_ack"))
+    allowed = runner.invoke(main, [*args, "--allow-concurrent-open"])
+    assert allowed.exit_code == 0, allowed.output
+    assert json.loads(allowed.output)["intentKey"] != key
+
+
 def fill_history() -> dict:
     response = deepcopy(RESPONSES["filled_history"])
     history = response["data"]["perp"]["tradeHistory"][0]
@@ -566,13 +716,13 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert receipt["execution"]["historyId"] == 1007
     assert receipt["execution"]["marketOrderSequence"] == 49
     assert receipt["fill"] == {
-        "price": 81001.25,
+        "price": None,
         "oraclePrice": 81000.5,
-        "sizeCollateralBaseUnits": 3950000,
+        "sizeCollateralBaseUnits": None,
         "escrowedCollateralBaseUnits": 4000000,
-        "positionFeesUsd": {"opening": 0.05, "closing": 0, "borrowing": 0},
     }
-    assert receipt["position"]["id"] == 7
+    assert receipt["positionFeesUsd"] == {"opening": 0.05, "closing": 0, "borrowing": 0}
+    assert receipt["positionNow"]["id"] == 7
     assert clock.delays == [0.25, 0.25, 0.5]
     assert status(endpoint) == "terminal"
     start, end = log.tail(2, name="intent.wait")
@@ -677,6 +827,78 @@ def test_wait_unknown_returns_call_again_hint(keeper_replay, surface):
     assert status(endpoint) == "unknown"
 
 
+def test_wait_times_out_during_a_slow_mcp_response(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    slow = SlowBody()
+    replies.append(slow)
+    started = time.monotonic()
+    try:
+        result = mcp_wait(endpoint, timeout=0.25)
+        elapsed = time.monotonic() - started
+    finally:
+        slow.release.set()
+    assert slow.started.is_set()
+    assert elapsed < 0.5
+    assert result["outcome"] == "unknown"
+    assert status(endpoint) == "unknown"
+
+
+def test_mcp_cancelled_read_cannot_commit_a_keeper_outcome(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    slow = SlowBody()
+    replies.append(slow)
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+
+    async def cancel():
+        task = asyncio.create_task(mcp.call_tool("intent_wait", {"key": KEY}))
+        try:
+            assert await asyncio.to_thread(slow.started.wait, 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        finally:
+            slow.release.set()
+        assert await asyncio.to_thread(slow.finished.wait, 2)
+        # Allow the server's remaining bytes to be delivered after cancellation.
+        await asyncio.sleep(0.1)
+
+    asyncio.run(cancel())
+    assert status(endpoint) == "unknown"
+
+
+def test_mcp_wait_does_not_block_on_initial_ledger_lookup(keeper_replay):
+    endpoint, _ = keeper_replay
+    reserve(endpoint)
+    with storage.db() as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        result = mcp_wait(endpoint, timeout=0.25)
+        assert time.monotonic() - started < 0.5
+    assert result["outcome"] == "unknown"
+    assert status(endpoint) == "unknown"
+
+
+def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    history = fill_history()
+    position = history["data"]["perp"]["tradeHistory"][0]["trade"]
+    position.update(
+        openPrice=87000, openCollateralAmount=6000000, collateralAmount=6000000
+    )
+    replies.extend(("filled", history))
+    result = wait.for_intent(endpoint, ADDR, KEY)
+    receipt = result["receipt"]
+    assert receipt["execution"]["historyId"] == 1007
+    assert receipt["fill"]["price"] is None
+    assert receipt["fill"]["sizeCollateralBaseUnits"] is None
+    assert receipt["fill"]["oraclePrice"] == 81000.5
+    assert receipt["positionNow"]["openPrice"] == 87000
+    assert receipt["positionNow"]["openCollateralAmount"] == 6000000
+
+
 def test_wait_returns_conditional_order_placement_without_fill(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)
@@ -685,8 +907,29 @@ def test_wait_returns_conditional_order_placement_without_fill(keeper_replay):
     result = wait.for_intent(
         endpoint, ADDR, KEY, clock=wait.Clock(clock.now, clock.sleep)
     )
-    assert result["outcome"] == "filled"
+    assert result["outcome"] == "placed"
+    assert result["receipt"]["action"] == {"kind": "OPEN_TRADE", "orderType": "limit"}
     assert result["receipt"]["execution"]["tradeChangeType"] == "limit_order_created"
+    assert result["receipt"]["fill"] is None
+    assert status(endpoint) == "terminal"
+
+
+@pytest.mark.parametrize("order_type", ["limit", "stop"])
+def test_wait_reports_placement_even_when_history_is_empty(keeper_replay, order_type):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    completed = deepcopy(RESPONSES["limit_placement_exec_pass"])
+    completed["data"]["userIntents"][0]["body"] = {"orderType": order_type}
+    replies.extend((completed, "not_yet_in_history", "not_yet_in_history"))
+    clock = FakeClock()
+    result = wait.for_intent(
+        endpoint, ADDR, KEY, clock=wait.Clock(clock.now, clock.sleep)
+    )
+    assert result["outcome"] == "placed"
+    assert result["receipt"]["action"] == {
+        "kind": "OPEN_TRADE",
+        "orderType": order_type,
+    }
     assert result["receipt"]["fill"] is None
     assert status(endpoint) == "terminal"
 
@@ -730,5 +973,5 @@ def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, out
     assert [row["intentKey"] for row in local] == [value["intentKey"]]
     assert local[0]["status"] == ("terminal" if outcome == "filled" else "rejected")
     if outcome == "filled":
-        assert value["receipt"]["fill"]["price"] == 81001.25
-        assert value["receipt"]["position"]["isOpen"] is False
+        assert value["receipt"]["fill"]["price"] is None
+        assert value["receipt"]["positionNow"]["isOpen"] is False

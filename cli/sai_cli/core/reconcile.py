@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import time
-from collections.abc import Callable, Mapping
-from contextlib import AbstractContextManager, nullcontext
+from collections.abc import Callable, Generator, Mapping
+from contextlib import AbstractContextManager, closing, nullcontext
+from dataclasses import dataclass
 from typing import Any, Literal
 
 from . import keeper, log, storage
@@ -13,6 +14,17 @@ WriteGate = Callable[[], AbstractContextManager[object]]
 IntentOutcome = Literal[
     "accepted", "pending", "terminal-filled", "terminal-failed", "unknown"
 ]
+
+
+@dataclass(frozen=True)
+class Read:
+    query: str
+    variables: dict[str, Any]
+    timeout: float
+
+
+# A float is a retry delay. Each read resumes with its GraphQL data or an error.
+Steps = Generator[Read | float, dict[str, Any] | None, dict[str, Any]]
 
 FAILED_STEPS = ("exec_fail", "exec_req_fail")
 ACCEPTED_STEPS = ("jwt_pass", "exec_req_pass")
@@ -91,15 +103,13 @@ def _hash(value: str | None) -> str:
 
 
 def _read_history(
-    endpoint: str,
     addr: str,
     account: str,
     row: dict[str, Any],
     timeout: float,
     clock: Callable[[], float],
-    sleep: Callable[[float], None],
     remaining: Callable[[], float] | None,
-) -> list[dict[str, Any]]:
+) -> Generator[Read | float, dict[str, Any] | None, list[dict[str, Any]]]:
     request_hash = _hash(row.get("txHash"))
     if not request_hash:
         return []
@@ -124,7 +134,7 @@ def _read_history(
     # Keeper filters by trader. Re-read the newest page once for rows arriving
     # in the index while we check the recent pages.
     for offset in range(0, HISTORY_PAGE_SIZE * HISTORY_MAX_PAGES, HISTORY_PAGE_SIZE):
-        page = _history_page(endpoint, addr, offset, left())
+        page = yield from _history_page(addr, offset, left())
         if page is None:
             return []
         matches = matching(page)
@@ -133,27 +143,26 @@ def _read_history(
         if len(page) < HISTORY_PAGE_SIZE:
             break
     if left() > HISTORY_RETRY_DELAY:
-        sleep(HISTORY_RETRY_DELAY)
-        return matching(_history_page(endpoint, addr, 0, left()) or [])
+        yield HISTORY_RETRY_DELAY
+        return matching((yield from _history_page(addr, 0, left())) or [])
     return []
 
 
 def _history_page(
-    endpoint: str, addr: str, offset: int, timeout: float
-) -> list[dict[str, Any]] | None:
+    addr: str, offset: int, timeout: float
+) -> Generator[Read, dict[str, Any] | None, list[dict[str, Any]] | None]:
     if timeout <= 0:
         return None
     try:
-        history = keeper.request(
-            endpoint,
+        history = yield Read(
             keeper.INTENT_HISTORY,
             {"trader": addr, "limit": HISTORY_PAGE_SIZE, "offset": offset},
-            timeout=timeout,
+            timeout,
         )
     except keeper.KeeperError:
         # The lifecycle still carries the best available outcome.
         return None
-    perp = history.get("perp")
+    perp = (history or {}).get("perp")
     page = perp.get("tradeHistory") if isinstance(perp, dict) else None
     return page if isinstance(page, list) else None
 
@@ -191,6 +200,47 @@ def reconcile(
     sleep: Callable[[float], None] = time.sleep,
     remaining: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
+    """Run reconciliation with the synchronous Keeper client."""
+    steps = poll_steps(
+        endpoint,
+        addr,
+        key,
+        timeout=timeout,
+        write=write,
+        clock=clock,
+        remaining=remaining,
+    )
+    data = None
+    failure = None
+    with closing(steps):
+        while True:
+            try:
+                step = steps.throw(failure) if failure else steps.send(data)
+            except StopIteration as done:
+                return done.value
+            data, failure = None, None
+            try:
+                if isinstance(step, Read):
+                    data = keeper.request(
+                        endpoint, step.query, step.variables, timeout=step.timeout
+                    )
+                else:
+                    sleep(step)
+            except keeper.KeeperError as exc:
+                failure = exc
+
+
+def poll_steps(
+    endpoint: str,
+    addr: str,
+    key: str | None = None,
+    *,
+    timeout: float = 20,
+    write: WriteGate = nullcontext,
+    clock: Callable[[], float] = time.monotonic,
+    remaining: Callable[[], float] | None = None,
+    include_action: bool = False,
+) -> Steps:
     """Read Keeper's latest intent records for ADDR.
 
     An account list records pending observations and restores blocks on late
@@ -202,9 +252,10 @@ def reconcile(
         timeout = min(timeout, remaining())
         if timeout <= 0:
             raise TimeoutError
-    data = keeper.request(
-        endpoint, keeper.INTENTS, {"user": addr, "key": key}, timeout=timeout
-    )
+    variables: dict[str, Any] = {"user": addr, "key": key}
+    if include_action:
+        variables["includeAction"] = True
+    data = (yield Read(keeper.INTENTS, variables, timeout)) or {}
     rows = data.get("userIntents")
     if rows is None:
         return data
@@ -288,8 +339,8 @@ def reconcile(
     if (
         outcome == "terminal-filled" and (kind is None or kind in PERP_HISTORY_KINDS)
     ) or (outcome == "pending" and step != "pending_exec"):
-        matches = _read_history(
-            endpoint, addr, account, row, timeout, clock, sleep, remaining
+        matches = yield from _read_history(
+            addr, account, row, timeout, clock, remaining
         )
         data["matchedTradeHistory"] = matches
         if matches and outcome == "pending":

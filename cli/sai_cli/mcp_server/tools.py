@@ -17,14 +17,14 @@ import copy
 import hashlib
 import json
 import logging
-import time
+import sqlite3
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from ..core import intents, keeper, reconcile, storage, stream, trading, wait
+from ..core import intents, keeper, margin, reconcile, storage, stream, trading, wait
 from ..core import log as sai_log
 from ..core import session as sessions
 from ..core.settings import Settings, public_url
@@ -69,10 +69,8 @@ MISMATCH = (
     " again, then retry with its previewDigest."
 )
 RECENT_OPEN = (
-    "An open-trade intent for this account from the last {minutes} minutes"
-    " is still {statuses}, so this open was not submitted: after a timeout or"
-    " error the first request may have gone through. Call intent_local, then"
-    " intent_status with each key in intentKeys."
+    "This account has an unresolved open. Call intent_local, then"
+    " intent_wait with each key in intentKeys."
 )
 PENDING_OPEN = (
     "An open for this account is pending at the next oracle price or waiting"
@@ -127,6 +125,14 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
 
 def describe(exc: Exception) -> dict[str, Any]:
     """Map a known error to a stable code; messages carry no secrets."""
+    if isinstance(exc, margin.PositionChanged):
+        return error(str(exc), "PREVIEW_MISMATCH")
+    if isinstance(exc, storage.PendingOpen):
+        return error(
+            PENDING_OPEN if exc.pending_fill else RECENT_OPEN,
+            "RECENT_OPEN_PENDING",
+            intentKeys=exc.keys,
+        )
     if isinstance(exc, keeper.OutcomeUnknown):
         key = exc.intent_key
         return error(
@@ -416,17 +422,32 @@ def intent_status(
     }
 
 
-def intent_wait(
-    settings: Settings, key: str, addr: str | None, timeout: float
+async def intent_wait(
+    settings: Settings, key: str, addr: str | None, timeout: float, started: float
 ) -> dict[str, Any]:
     timeout = min(wait.validate_timeout(timeout), wait.MCP_MAX_TIMEOUT)
-    local = storage.intent_record(settings.endpoint, key) if addr is None else None
-    account = (
-        {"addr": local[0], "addrSource": "ledger"}
-        if local
-        else resolve_addr(settings, addr)
-    )
-    result = wait.for_intent(settings.endpoint, account["addr"], key, timeout=timeout)
+    try:
+        with storage.busy_timeout(0):
+            local = (
+                storage.intent_record(settings.endpoint, key) if addr is None else None
+            )
+        account = (
+            {"addr": local[0], "addrSource": "ledger"}
+            if local
+            else resolve_addr(settings, addr)
+        )
+        result = await wait.for_intent_async(
+            settings.endpoint,
+            account["addr"],
+            key,
+            timeout=timeout,
+            started=started,
+        )
+    except sqlite3.OperationalError as exc:
+        if not wait.ledger_busy(exc):
+            raise
+        account = {}
+        result = wait.unknown_result(key, addr)
     if result["outcome"] == "unknown":
         result["hint"] = (
             "Call intent_wait again with the same key and address. Do not resubmit."
@@ -549,74 +570,6 @@ def submit_check(
     return bound(load, digest, reference_price, slippage)
 
 
-# The admission window bounds the recent-open check. A pending fill keeps
-# blocking until Keeper provides a final outcome.
-RECENT_OPEN_SECONDS = keeper.ABSENT_AFTER_SECONDS
-
-
-def recent_opens(
-    endpoint: str, account: str, now: float | None = None
-) -> list[dict[str, str]]:
-    """Return this account's OPEN_TRADE intents that may still fill.
-
-    Recent unknown or accepted opens count, and a known pending open counts
-    at any age.
-    """
-    current = time.time() if now is None else now
-    with storage.db() as connection:
-        rows = connection.execute(
-            "SELECT id, COALESCE(keeper_status,status), created_at FROM intents"
-            " WHERE endpoint=? AND account=? AND kind='OPEN_TRADE'"
-            " AND COALESCE(keeper_status,status) IN ('unknown', 'accepted', 'pending')"
-            " ORDER BY rowid DESC",
-            (endpoint, account.lower()),
-        ).fetchall()
-    recent: list[dict[str, str]] = []
-    for key, status, created in rows:
-        stamp = created if created is not None else storage._key_time(key)
-        if (
-            status == "pending"
-            or stamp is None
-            or current - stamp <= RECENT_OPEN_SECONDS
-        ):
-            recent.append({"intentKey": key, "status": status})
-    return recent
-
-
-def no_recent_open(
-    settings: Settings, load: AccountSession, *, allow_concurrent_open: bool
-) -> trading.SubmitCheck:
-    """Return a check for pending and recent opens."""
-
-    def check(_preview: dict[str, Any]) -> None:
-        account = load()["evmAddress"]
-        opens = recent_opens(settings.endpoint, account)
-        pending = [row["intentKey"] for row in opens if row["status"] == "pending"]
-        if pending:
-            raise Refused(PENDING_OPEN, "RECENT_OPEN_PENDING", intentKeys=pending)
-        if opens and not allow_concurrent_open:
-            statuses = " or ".join(sorted({row["status"] for row in opens}))
-            raise Refused(
-                RECENT_OPEN.format(
-                    minutes=RECENT_OPEN_SECONDS // 60, statuses=statuses
-                ),
-                "RECENT_OPEN_PENDING",
-                intentKeys=[row["intentKey"] for row in opens],
-            )
-
-    return check
-
-
-def both(
-    first: trading.SubmitCheck, second: trading.SubmitCheck
-) -> trading.SubmitCheck:
-    def check(preview: dict[str, Any]) -> None:
-        first(preview)
-        second(preview)
-
-    return check
-
-
 def finish(
     load: AccountSession, dry_run: bool, result: dict[str, Any]
 ) -> dict[str, Any]:
@@ -661,11 +614,6 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
-    if not dry_run:
-        check = both(
-            no_recent_open(settings, load, allow_concurrent_open=allow_concurrent_open),
-            check,
-        )
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
@@ -682,6 +630,7 @@ def open_trade(
         dry_run=dry_run,
         notify=notices.append,
         before_submit=check,
+        allow_concurrent_open=allow_concurrent_open,
     )
     if dry_run and market:
         # Read-only: the price a live submit would refresh to now.

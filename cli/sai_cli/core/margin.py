@@ -22,6 +22,22 @@ INDEX_LAG = (
 )
 
 
+class IndexLag(ValueError):
+    """Keeper's position did not catch up within the re-read budget."""
+
+
+class PositionChanged(ValueError):
+    """The current position no longer matches the quote."""
+
+
+class PositionUnavailable(ValueError):
+    """Keeper has no open position for this ID."""
+
+
+class MarketUnavailable(ValueError):
+    """Keeper has no open market for the position."""
+
+
 def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
     keeper.check_url(url, "LCD")
     try:
@@ -71,6 +87,19 @@ def snapshot(
     contract = route["contractAddress"]
     trade_query = {"get_trade_raw": {"trader": trader, "index": trade_id}}
 
+    market = keeper.request(
+        endpoint,
+        keeper.MARKET,
+        {"market": borrowing["marketId"], "collateral": collateral["id"]},
+    )["perp"]["borrowing"]
+    if (
+        not market
+        or market["marketId"] != borrowing["marketId"]
+        or market["collateralToken"]["id"] != collateral["id"]
+        or not market["isOpen"]
+    ):
+        raise MarketUnavailable("Open market data is unavailable")
+
     def raw_trade(timeout: float) -> dict[str, Any]:
         raw = smart(lcd, contract, trade_query, timeout=timeout)
         if (
@@ -81,7 +110,7 @@ def snapshot(
             or raw.get("is_open") is not True
             or raw.get("trade_type") != "trade"
         ):
-            raise ValueError("Position changed; review the margin change again")
+            raise PositionChanged("Position changed. Review the margin change again.")
         return raw
 
     raw = raw_trade(20)
@@ -96,7 +125,9 @@ def snapshot(
                 break
             position = _position(endpoint, addr, trade_id, timeout=left)
             if position["trader"] != trader or position["perpBorrowing"] != borrowing:
-                raise ValueError("Position changed; review the margin change again")
+                raise PositionChanged(
+                    "Position changed. Review the margin change again."
+                )
             left = end - time.monotonic()
             if left <= 0:
                 break
@@ -104,27 +135,14 @@ def snapshot(
             if _same_margin(raw, position) and time.monotonic() < end:
                 break
         if time.monotonic() >= end or not _same_margin(raw, position):
-            raise ValueError(INDEX_LAG)
-
-    market = keeper.request(
-        endpoint,
-        keeper.MARKET,
-        {"market": borrowing["marketId"], "collateral": collateral["id"]},
-    )["perp"]["borrowing"]
-    if (
-        not market
-        or market["marketId"] != borrowing["marketId"]
-        or market["collateralToken"]["id"] != collateral["id"]
-        or not market["isOpen"]
-    ):
-        raise ValueError("Open market data is unavailable")
+            raise IndexLag(INDEX_LAG)
     funds = smart(
         lcd,
         contract,
         {"get_exchange_balance": {"user": trader, "collateral_index": token}},
     )
     if funds.get("collateral_index") != token:
-        raise ValueError("Position changed; review the margin change again")
+        raise PositionChanged("Position changed. Review the margin change again.")
     return raw, funds, market
 
 
@@ -135,7 +153,7 @@ def _position(
         endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}, timeout=timeout
     )["perp"]["trade"]
     if not position or not position["isOpen"] or position["tradeType"] != "trade":
-        raise ValueError("Open position not found")
+        raise PositionUnavailable("Open position not found")
     return position
 
 

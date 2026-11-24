@@ -57,7 +57,7 @@ to check for a final outcome.
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
 retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
-Wait for a final outcome on pending fills. For recent accepted opens, use \
+Wait for a final outcome on pending fills. For acknowledged opens, use \
 allow_concurrent_open=true only after the user confirms another position.
 - The user can connect several accounts; one is active. auth_list shows \
 them. Preview and trade tools act on the active account unless given \
@@ -242,7 +242,17 @@ async def intent_wait(
         addr: EVM or Nibiru address. Defaults to the local intent account, then the active account.
         timeout: Wait in seconds, capped at 10.
     """
-    return await call(tools.intent_wait, key, addr, timeout)
+    started = time.monotonic()
+    try:
+        config = server_settings()
+    except sai_settings.SettingsError as exc:
+        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+    try:
+        result = await tools.intent_wait(config, key, addr, timeout, started)
+    except Exception as exc:  # noqa: BLE001 - tools return structured errors
+        result = tools.describe(exc)
+        result["error"] = sai_log.redact(result["error"])
+    return json.dumps(result, default=str)
 
 
 # Previews and trades share one implementation per action.
@@ -321,8 +331,8 @@ async def trade_open(
     from the confirmed preview, and, for a market order, PRICE_MOVED when
     Keeper's current price moved from reference_price by more than the
     slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an open is pending, or a recent open is still
-    unknown or accepted. Check its key with intent_status before retrying.
+    RECENT_OPEN_PENDING while an earlier open is unresolved. Check its key
+    with intent_wait before retrying.
 
     Args:
         market_id: Market id from market_list.
@@ -338,7 +348,7 @@ async def trade_open(
         preview_digest: previewDigest from the confirmed preview_open.
         reference_price: referencePrice from the confirmed preview_open;
             required for market orders only.
-        allow_concurrent_open: True to submit with a recent accepted open,
+        allow_concurrent_open: True to submit with an accepted open,
             after checking its status and getting confirmation for another
             position. Unknown outcomes and pending fills still block trades.
         addr: Connected account to act as (0x...). Defaults to the

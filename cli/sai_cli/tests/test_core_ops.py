@@ -334,7 +334,11 @@ def test_before_submit_sees_the_submitted_intent_and_can_refuse(monkeypatch):
         )
     with pytest.raises(Refused):
         trading.open_trade(
-            ENDPOINT, session_for, **open_args(dry_run=False), before_submit=refuse
+            ENDPOINT,
+            session_for,
+            **open_args(dry_run=False),
+            before_submit=refuse,
+            allow_concurrent_open=True,
         )
     assert len(fake.submitted) == 1
     assert storage.list_pending(ENDPOINT, ADDR)[0]["status"] == "accepted"
@@ -378,7 +382,7 @@ def test_margin_refuses_a_position_that_changed(monkeypatch):
     fake = FakeKeeper()
     monkeypatch.setattr(keeper, "request", fake)
     snapshots(monkeypatch, "2000000", "2500000")
-    with pytest.raises(ValueError, match="review the margin change"):
+    with pytest.raises(ValueError, match="Review the margin change"):
         trading.change_margin(
             ENDPOINT,
             session_for,
