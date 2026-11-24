@@ -147,7 +147,7 @@ both the indented output and `--json` include these fields.
 
 | Field | Inputs and precision |
 | --- | --- |
-| `fees.amountUsdc` | Keeper's indexed market fee rates and the Perp collateral oracle. Perp floors each component to six-decimal USDC base units. Opens and closes show undiscounted execution fees. The `excludes` list names omitted costs and discounts. |
+| `fees.amountUsdc` | Perp's decimal fee rates and collateral oracle. Perp floors each component to six-decimal USDC base units. Opens and closes show undiscounted execution fees. The `excludes` list names omitted costs and discounts. |
 | `liquidationPrice.price` | Perp's 90% PnL threshold and two 5% liquidation fee components, floored separately. Opens use the reference or trigger as the entry and deduct the estimated opening fees from collateral. Position changes use the stored entry price and the projected collateral and leverage. The estimate excludes accrued borrowing fees. |
 | `worstCaseFill.price` | Keeper's market price, the supplied CLI market reference, or the order trigger. Perp rounds each slippage distance down to 18 decimal places. The `side` field identifies an upper bound for a long or a lower bound for a short. |
 

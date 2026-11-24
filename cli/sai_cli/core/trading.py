@@ -352,7 +352,6 @@ def _estimate_position(
         except estimates.READ_ERRORS:
             pass
     return estimates.position_estimates(
-        endpoint,
         lcd or "",
         state,
         effective,
@@ -455,7 +454,6 @@ def change_margin(
         before_submit=before_submit,
         changed_message="Position changed; review the margin change again",
         estimate=lambda state, inputs, fresh: estimates.position_estimates(
-            endpoint,
             lcd_endpoint,
             state,
             _quoted_leverage(inputs),
@@ -536,7 +534,6 @@ def partial_close(
         before_submit=before_submit,
         changed_message="Position changed; review the reduction again",
         estimate=lambda state, inputs, fresh: estimates.position_estimates(
-            endpoint,
             lcd_endpoint,
             state,
             _quoted_leverage(inputs),

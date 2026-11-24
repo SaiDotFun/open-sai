@@ -189,18 +189,6 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         },
         "borrowings": markets,
         "borrowing": {"data": {"perp": {"borrowing": market}}},
-        "previewFees": {
-            "data": {
-                "perp": {
-                    "borrowing": {
-                        "minPositionSizeUSD": market["minPositionSizeUSD"],
-                        "openFeePct": market["openFeePct"],
-                        "closeFeePct": market["closeFeePct"],
-                        "triggerOrderFeePct": 0.0,
-                    }
-                }
-            },
-        },
         "tokenPricesUsd": prices,
         "tradeHistory": {"data": {"perp": {"tradeHistory": [history]}}},
         "trades": PROTOCOL["account_positions_response"],
@@ -220,10 +208,6 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "trades": {"trader": ADDRESS},
         "trade": {"trader": ADDRESS, "id": 7},
         "borrowing": {"market": borrowing["marketId"], "collateral": collateral["id"]},
-        "previewFees": {
-            "market": borrowing["marketId"],
-            "collateral": collateral["id"],
-        },
         "userIntents": {"user": ADDRESS, "key": INTENT},
     }
     queue_payloads = {
@@ -252,6 +236,13 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         },
         "is_after_hours_market": False,
         "get_collateral_price": "1",
+        "get_market": {"fee_index": "FeeIndex(0)"},
+        "get_fees": {
+            "min_position_size_usd": str(market["minPositionSizeUSD"]),
+            "open_fee_p": str(market["openFeePct"]),
+            "close_fee_p": str(market["closeFeePct"]),
+            "trigger_order_fee_p": "0",
+        },
     }
     contract_args = {
         "get_trade_raw": {
@@ -264,6 +255,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         },
         "is_after_hours_market": {"market_index": market_index},
         "get_collateral_price": {"collateral_index": token_index},
+        "get_market": {"index": market_index},
+        "get_fees": {"index": "FeeIndex(0)"},
     }
 
     class Handler(BaseHTTPRequestHandler):

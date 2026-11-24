@@ -12,7 +12,6 @@ ATOM = Decimal("1e-18")
 LIQUIDATION_THRESHOLD = Decimal("0.90")
 LIQUIDATION_FEE_RATE = Decimal("0.05")
 READ_ERRORS = (ValueError, TypeError, KeyError, DecimalException, keeper.KeeperError)
-FEE_FIELDS = ("openFeePct", "closeFeePct", "triggerOrderFeePct", "minPositionSizeUSD")
 
 
 def unavailable(reason: str) -> dict[str, Any]:
@@ -101,16 +100,11 @@ def base_fees(
     """Perp's minimum fee basis and undiscounted execution fee components."""
     with localcontext() as context:
         context.prec = 90
-        open_rate = Decimal(str(row["openFeePct"]))
-        close_rate = Decimal(str(row["closeFeePct"]))
-        trigger_rate = Decimal(str(row["triggerOrderFeePct"]))
-        minimum_usd = int(row["minPositionSizeUSD"])
-        rates = (open_rate, close_rate, trigger_rate)
-        if (
-            minimum_usd < 0
-            or notional <= 0
-            or any(not rate.is_finite() or rate < 0 for rate in rates)
-        ):
+        open_rate = margin.contract_decimal(row["open_fee_p"])
+        close_rate = margin.contract_decimal(row["close_fee_p"])
+        trigger_rate = margin.contract_decimal(row["trigger_order_fee_p"])
+        minimum_usd = int(row["min_position_size_usd"])
+        if minimum_usd < 0 or notional <= 0:
             raise ValueError("Invalid fee basis")
         minimum_fee = int(minimum_usd * (2 * open_rate + trigger_rate))
         basis = max(notional, int(minimum_fee / Decimal(collateral_price["price"])))
@@ -120,7 +114,7 @@ def base_fees(
         return fee, {
             "status": "estimate",
             "amountUsdc": format(Decimal(fee).scaleb(-6).normalize(), "f"),
-            "basis": "Undiscounted execution fees using Keeper's indexed Perp fee schedule.",
+            "basis": "Undiscounted execution fees using Perp's contract fee schedule.",
             "collateralPriceUsd": collateral_price,
             "excludes": (
                 ["Trader discounts", "absolute exposure fees", "network fees"]
@@ -150,16 +144,9 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
     return price_input(price, "Sai Perp collateral oracle", intents.now())
 
 
-def fee_schedule(endpoint: str, market: int, collateral: int) -> dict[str, Any]:
-    fees = keeper.request(
-        endpoint,
-        keeper.PREVIEW_FEES,
-        {"market": market, "collateral": collateral},
-        timeout=QUOTE_TIMEOUT,
-    )["perp"]["borrowing"]
-    if not isinstance(fees, dict) or any(field not in fees for field in FEE_FIELDS):
-        raise ValueError("Preview fee schedule is unavailable")
-    return fees
+def fee_schedule(lcd: str, contract: str, market: str) -> dict[str, Any]:
+    pair = margin.smart(lcd, contract, {"get_market": {"index": market}})
+    return margin.smart(lcd, contract, {"get_fees": {"index": pair["fee_index"]}})
 
 
 def _notional(collateral: int, leverage: Decimal) -> int:
@@ -195,8 +182,8 @@ def open_estimates(
     if lcd and row is not None:
         try:
             token_id = row["collateralToken"]["id"]
-            schedule = fee_schedule(endpoint, row["marketId"], token_id)
             contract = margin.trading_contract(endpoint, lcd)
+            schedule = fee_schedule(lcd, contract, body["market"]["marketIndex"])
             token = f"TokenIndex({token_id})"
             collateral_price = read_collateral_price(lcd, contract, token)
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))
@@ -220,7 +207,6 @@ def open_estimates(
 
 
 def position_estimates(
-    endpoint: str,
     lcd: str,
     state: margin.PositionSnapshot | None,
     effective: Decimal | None,
@@ -275,11 +261,7 @@ def position_estimates(
         collateral = int(raw["collateral_amount"])
         if target is None:
             try:
-                schedule = fee_schedule(
-                    endpoint,
-                    state.market["marketId"],
-                    state.market["collateralToken"]["id"],
-                )
+                schedule = fee_schedule(lcd, state.contract, raw["market_index"])
                 price = read_collateral_price(
                     lcd, state.contract, raw["collateral_index"]
                 )

@@ -44,6 +44,7 @@ class Position:
     reported_height: int | None = 120
     cap_query_heights: list[str | None] = field(default_factory=list)
     collateral_price: str | None = "1"
+    close_fee: str = "0.002"
     preview_inputs: bool = False
     malformed_node_info: bool = False
     price: float | str = 100.5
@@ -89,9 +90,6 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     market_row = {
                         **market,
                         "price": position.price,
-                        "openFeePct": 0.001,
-                        "closeFeePct": 0.002,
-                        "triggerOrderFeePct": 0.003,
                     }
                 data = {
                     keeper.ROUTE: {
@@ -114,7 +112,6 @@ def position_service() -> Iterator[tuple[Position, str]]:
                         }
                     },
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
-                    keeper.PREVIEW_FEES: {"perp": {"borrowing": market_row}},
                     keeper.MARKETS: {"perp": {"borrowings": [market_row]}},
                 }[request["query"]]
             self.reply({"data": data})
@@ -163,7 +160,23 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 data = position.after_hours
             elif "get_market" in message:
                 assert message["get_market"] == {"index": "MarketIndex(0)"}
-                data = {"block_last_opened": 110, "block_last_closed": 100}
+                data = {
+                    "block_last_opened": 110,
+                    "block_last_closed": 100,
+                    "fee_index": "FeeIndex(0)",
+                }
+            elif "get_fees" in message:
+                assert message["get_fees"] == {"index": "FeeIndex(0)"}
+                data = (
+                    {
+                        "open_fee_p": "0.001",
+                        "close_fee_p": position.close_fee,
+                        "trigger_order_fee_p": "0.003",
+                        "min_position_size_usd": "1",
+                    }
+                    if position.preview_inputs
+                    else None
+                )
             elif "get_trade_infos" in message:
                 assert message["get_trade_infos"] == {
                     "trader": TRADER,
@@ -963,5 +976,19 @@ def test_position_mutations_show_no_zero_fee_without_an_inactive_guard(
                     assert "guard" in item["reason"]
                     assert "amountUsdc" not in item
             assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_close_fee_uses_exact_perp_rate(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.close_fee = "0.019999999999999999"
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, "preview_close", {"trade_id": 7})
+            assert quote["estimates"]["fees"]["amountUsdc"] == "3.999999"
 
     asyncio.run(scenario())
