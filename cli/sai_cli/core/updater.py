@@ -591,8 +591,13 @@ class Outcome:
                                     else {}
                                 ),
                                 **(
-                                    {"directory": str(repair.directory)}
-                                    if repair.directory is not None
+                                    {"configPath": str(repair.config_path)}
+                                    if repair.config_path is not None
+                                    else {}
+                                ),
+                                **(
+                                    {"fields": list(repair.fields)}
+                                    if repair.fields
                                     else {}
                                 ),
                                 **(
@@ -1177,9 +1182,14 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
                     sai_home=repair["saiHome"]
                     if isinstance(repair.get("saiHome"), str)
                     else None,
-                    directory=Path(repair["directory"])
-                    if isinstance(repair.get("directory"), str)
+                    config_path=Path(repair["configPath"])
+                    if isinstance(repair.get("configPath"), str)
                     else None,
+                    fields=tuple(
+                        value for value in repair["fields"] if isinstance(value, str)
+                    )
+                    if isinstance(repair.get("fields"), list)
+                    else (),
                     launcher=repair["launcher"]
                     if isinstance(repair.get("launcher"), str)
                     else None,

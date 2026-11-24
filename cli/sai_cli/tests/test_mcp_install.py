@@ -329,7 +329,7 @@ def test_doctor_reports_claude_and_repairs_codex_and_cursor_registrations(
         if name == OLD_COMMAND:
             assert f"--scope user --repair-existing {name}" in checks["claude"]["fix"]
         else:
-            assert f"claude mcp remove --scope user {name}" in checks["claude"]["fix"]
+            assert "claude mcp remove" not in checks["claude"]["fix"]
             assert f"claude mcp add --scope user {name}" in checks["claude"]["fix"]
         entries = doctor_entries(env)
         for registrations in (entries["codex"], entries["cursor"]):
@@ -478,9 +478,8 @@ def test_doctor_reports_exact_claude_repairs_for_each_scope(env: Env, monkeypatc
     assert [user_file.read_bytes(), project_file.read_bytes()] == before
     commands = check["fix"].split("`")[1::2]
     for scope in ("user", "project", "local"):
-        assert any(
-            f"claude mcp remove --scope {scope} sai" in command for command in commands
-        )
+        assert f"Remove the existing {scope} sai entry" in check["fix"]
+        assert "claude mcp remove" not in check["fix"]
         add = (
             f"claude mcp add --scope {scope} sai --env=SAI_HOME={home}"
             f" -- {shlex.quote(str(env.sai))} mcp serve"
@@ -1240,6 +1239,8 @@ def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.Monke
     [command] = row["fix"].split("`")[1::2]
     shell = shutil.which("sh", path=os.defpath)
     assert shell is not None
+    assert f"The user sai entry in {config} differs in env, cwd." in row["fix"]
+    config.write_text('{"mcpServers": {}}')
     subprocess.run([shell, "-c", command], cwd=env.project, check=True)
     assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
         serve(env), {"SAI_HOME": str(profile)}
@@ -1266,17 +1267,16 @@ def test_claude_printed_profile_matches_normal_install(
     shell = shutil.which("sh", path=os.defpath)
     assert shell
     monkeypatch.delenv("SAI_HOME")
-    subprocess.run([shell, "-c", " && ".join(commands)], cwd=env.home, check=True)
+    config.write_text('{"mcpServers": {}}')
+    [command] = commands
+    subprocess.run([shell, "-c", command], cwd=env.home, check=True)
     assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": expected_home}
     monkeypatch.setenv("SAI_HOME", profile)
     assert actions(invoke("mcp", "install", "claude")) == {"claude": "unchanged"}
 
 
-@pytest.mark.parametrize("missing_launcher", [False, True])
-def test_claude_replacement_checks_absolute_launcher_before_remove(
-    env: Env,
-    monkeypatch: pytest.MonkeyPatch,
-    missing_launcher: bool,
+def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
+    env: Env, monkeypatch: pytest.MonkeyPatch
 ):
     profile = env.root / "inline profile"
     monkeypatch.setenv("SAI_HOME", str(profile))
@@ -1287,8 +1287,19 @@ def test_claude_replacement_checks_absolute_launcher_before_remove(
     failure(result)
     [row] = payload(result)["error"]["details"]["results"]
     [command] = row["fix"].split("`")[1::2]
-    assert command.startswith(f"test -f {env.sai} && test -x {env.sai} && ")
-    assert "claude mcp remove --scope user sai && claude mcp add" in command
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "sai",
+        f"--env=SAI_HOME={profile}",
+        "--",
+        *serve(env),
+    ]
+    assert config.read_text() == before and not env.calls()
+
     shell = shutil.which("sh", path=os.defpath)
     assert shell
     client_bin = env.root / "client bin"
@@ -1296,36 +1307,26 @@ def test_claude_replacement_checks_absolute_launcher_before_remove(
     shutil.copy2(env.bin / "claude", client_bin / "claude")
     monkeypatch.delenv("SAI_HOME")
     monkeypatch.setenv("PATH", str(client_bin))
-    if missing_launcher:
-        env.sai.unlink()
-
-    finished = subprocess.run([shell, "-c", command], cwd=env.project, check=False)
-
-    if missing_launcher:
-        assert finished.returncode != 0
-        assert config.read_text() == before
-        assert not env.calls()
-    else:
-        assert finished.returncode == 0
-        assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
-            serve(env), {"SAI_HOME": str(profile)}
-        )
+    config.write_text('{"mcpServers": {}}')
+    subprocess.run([shell, "-c", command], cwd=env.project, check=True)
+    assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
+        serve(env), {"SAI_HOME": str(profile)}
+    )
 
 
 @pytest.mark.parametrize("surface", ["install", "doctor"])
-def test_claude_local_replacement_targets_git_root(
+def test_claude_local_report_reads_the_git_root_entry(
     env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
 ):
     git = shutil.which("git", path=os.defpath)
-    shell = shutil.which("sh", path=os.defpath)
-    assert git and shell
+    assert git
     subprocess.run([git, "-C", str(env.project), "init", "--quiet"], check=True)
     nested = env.project / "nested checkout"
     nested.mkdir()
     monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
     monkeypatch.chdir(nested)
     root_entry = claude_entry(["missing-root-wrapper"])
-    nested_entry = claude_entry(["untouched-nested-wrapper"])
+    nested_entry = claude_entry(serve(env))
     original = {
         "projects": {
             str(env.project): {"mcpServers": {"sai": root_entry}},
@@ -1345,12 +1346,76 @@ def test_claude_local_replacement_targets_git_root(
         [row] = payload(result)["error"]["details"]["results"]
         fix = row["fix"]
     assert env.claude_json() == original
-    commands = fix.split("`")[1::2]
-    assert all(command.startswith(f"(cd {env.project} && ") for command in commands)
-    subprocess.run([shell, "-c", " && ".join(commands)], cwd=env.root, check=True)
-    projects = env.claude_json()["projects"]
-    assert projects[str(env.project)]["mcpServers"]["sai"] == claude_entry(serve(env))
-    assert projects[str(nested)]["mcpServers"]["sai"] == nested_entry
+    [command] = fix.split("`")[1::2]
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "local",
+        "sai",
+        "--",
+        *serve(env),
+    ]
+    assert "claude mcp remove" not in fix
+    assert "directory you normally use" in fix
+
+
+@pytest.mark.parametrize("surface", ["install", "doctor", "update"])
+def test_claude_report_names_the_relative_config_without_changing_directory(
+    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+):
+    git = shutil.which("git", path=os.defpath)
+    assert git
+    subprocess.run([git, "-C", str(env.project), "init", "--quiet"], check=True)
+    nested = env.project / "subdir"
+    nested.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "profile")
+    monkeypatch.chdir(nested)
+    nested_file = nested / "profile" / ".claude.json"
+    root_file = env.project / "profile" / ".claude.json"
+    for path, entry in (
+        (nested_file, claude_entry(["missing-wrapper"], {"PRIVATE": SECRET})),
+        (root_file, claude_entry(serve(env))),
+    ):
+        path.parent.mkdir()
+        path.write_text(
+            json.dumps({"projects": {str(env.project): {"mcpServers": {"sai": entry}}}})
+        )
+    files = (nested_file, root_file)
+    before = [path.read_bytes() for path in files]
+
+    if surface == "install":
+        result = invoke("mcp", "install", "claude", "--scope", "local")
+        failure(result)
+        [row] = payload(result)["error"]["details"]["results"]
+        assert row["path"] == str(nested_file)
+        fix = row["fix"]
+    elif surface == "doctor":
+        fix = mcp_checks(invoke("doctor", "--offline"))["claude"]["fix"]
+    else:
+        outcome = updater.repair_after_update(
+            updater.Outcome(updater.UPDATED, "updated"), env.sai, False
+        )
+        fix = updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes)
+    assert f"The local sai entry in {nested_file} differs in command, args, env." in fix
+    assert str(root_file) not in fix and SECRET not in fix
+    [command] = fix.split("`")[1::2]
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "local",
+        "sai",
+        "--",
+        *serve(env),
+    ]
+    assert "claude mcp remove" not in fix
+    assert "Remove the existing local sai entry" in fix
+    assert [path.read_bytes() for path in files] == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Claude uses a local key on Windows")
@@ -1467,7 +1532,8 @@ def test_doctor_reports_remote_claude_entries_without_a_launcher_repair(env: Env
     result = invoke("doctor", "--offline")
     check = mcp_checks(result)["claude"]
     assert check["status"] == "fail"
-    assert "claude mcp remove --scope user sai" in check["fix"]
+    assert "claude mcp remove" not in check["fix"]
+    assert "differs in command, args, url, type" in check["fix"]
     assert "--repair-existing" not in check["fix"]
     assert SECRET not in result.output
     assert config.read_text() == original
@@ -2289,7 +2355,9 @@ def test_claude_install_reports_scoped_commands_without_credentials(
         row = {"action": "failed", "fix": result.output}
         output = result.output
     assert row["action"] == "failed"
-    assert f"claude mcp remove --scope {scope} sai" in row["fix"]
+    assert "claude mcp remove" not in row["fix"]
+    assert f"Remove the existing {scope} sai entry" in row["fix"]
+    assert f"The {scope} sai entry in {config} differs in env." in row["fix"]
     assert (
         f"claude mcp add --scope {scope} sai {shlex.quote(f'--env=SAI_HOME={profile}')}"
         f" -- {shlex.quote(str(env.sai))} mcp serve"

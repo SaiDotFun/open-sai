@@ -382,11 +382,11 @@ only the `sai` entry's command, args, `SAI_HOME`, and the names of any other
 environment settings, and never run `claude mcp get`, which starts the
 server. The only environment value output shows is `SAI_HOME`, a path; other
 settings appear by name in `staleEnv`. For Claude Code, install leaves a
-differing `sai` entry in place and prints one scoped shell command. The
-command checks the absolute launcher before running `claude mcp remove` and
-runs `claude mcp add` only if removal succeeds. It includes an absolute
-`SAI_HOME` when the target uses one. Install adds missing entries and reports matching ones
-as unchanged. `list` shows every
+differing `sai` entry in place and reports its scope, config file, and
+differing fields. Remove the existing entry in Claude from the project
+directory you normally use, then run the printed `claude mcp add` command.
+The add includes `SAI_HOME` when the target uses one. Install adds missing
+entries and reports matching ones as unchanged. `list` shows every
 scope's entry under `registrations` and marks the one the client uses as
 `effective` (Claude Code: local, then project, then user; Cursor: project,
 then user). `uninstall` removes every scope's entry unless `--scope` names

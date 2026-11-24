@@ -300,8 +300,9 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         else:
             repair_entry["replaceEntry"] = True
             repair_entry["launcher"] = str(tool.sai)
+            repair_entry["configPath"] = str(config)
+            repair_entry["fields"] = ["command", "args", "env"]
             commands = [
-                f"claude mcp remove --scope {scope} {name}",
                 f"claude mcp add --scope {scope} {name} -- {tool.sai} mcp serve",
             ]
         assert claude["manualRepairs"] == [repair_entry]

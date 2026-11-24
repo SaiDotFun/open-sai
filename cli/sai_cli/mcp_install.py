@@ -189,7 +189,8 @@ class ClaudeRepair:
     reset_args: bool = False
     replace_entry: bool = False
     sai_home: str | None = None
-    directory: Path | None = None
+    config_path: Path | None = None
+    fields: tuple[str, ...] = ()
     launcher: str | None = None
 
 
@@ -205,88 +206,94 @@ class RegistrationCheck:
     manual_repairs: tuple[ClaudeRepair, ...] = ()
 
 
-def claude_replacement_command(entry: ClaudeRepair) -> str | None:
-    if entry.launcher is None or not os.path.isabs(entry.launcher):
-        return None
-    if entry.scope != "user" and (
-        entry.directory is None or not entry.directory.is_absolute()
-    ):
-        return None
-    if entry.sai_home is not None and not os.path.isabs(entry.sai_home):
-        return None
-    scope_and_name = shlex.join(["--scope", entry.scope, entry.name])
-    launcher = shlex.quote(entry.launcher)
-    profile = (
-        f" {shlex.quote(f'--env=SAI_HOME={entry.sai_home}')}"
-        if entry.sai_home is not None
-        else ""
-    )
-    commands = [
-        f"test -f {launcher}",
-        f"test -x {launcher}",
-        f"claude mcp remove {scope_and_name}",
-        f"claude mcp add {scope_and_name}{profile} -- {launcher} mcp serve",
-    ]
-    if entry.directory is not None:
-        cd = f"cd {shlex.quote(str(entry.directory))}"
-        commands.insert(0, cd)
-        return f"({' && '.join(commands)})"
-    return " && ".join(commands)
-
-
 def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
-    commands = []
-    needs_doctor = False
+    hints = []
     for entry in entries:
         if entry.replace_entry:
-            command = claude_replacement_command(entry)
-            if command is None:
-                needs_doctor = True
+            label = f"{entry.scope} {entry.name} entry"
+            source = f" in {entry.config_path}" if entry.config_path is not None else ""
+            fields = f" in {', '.join(entry.fields)}" if entry.fields else ""
+            hint = f"The {label}{source} differs{fields}."
+            if entry.launcher is None or not os.path.isabs(entry.launcher):
+                hints.append(
+                    hint + " Run `sai doctor` for current replacement instructions."
+                )
                 continue
-        else:
-            command = (
-                f"sai mcp install --client claude --scope {entry.scope}"
-                f" --repair-existing {entry.name}"
-                f"{' --reset-args' if entry.reset_args else ''}"
+            profile = (
+                [f"--env=SAI_HOME={entry.sai_home}"]
+                if entry.sai_home is not None
+                else []
             )
-        commands.append(f"`{command}`")
-    hint = "Run " + " and ".join(commands) + "." if commands else ""
-    if needs_doctor:
+            add = shlex.join(
+                [
+                    "claude",
+                    "mcp",
+                    "add",
+                    "--scope",
+                    entry.scope,
+                    entry.name,
+                    *profile,
+                    "--",
+                    entry.launcher,
+                    "mcp",
+                    "serve",
+                ]
+            )
+            hints.append(
+                f"{hint} Remove the existing {label} in Claude from the project"
+                f" directory you normally use, then run `{add}`."
+            )
+            continue
         hint = (
-            hint + " Run `sai doctor` for current replacement instructions."
-        ).strip()
-    if any(entry.scope != "user" for entry in entries):
-        hint += " Run project and local commands from the project directory."
-    if any(entry.reset_args for entry in entries):
-        hint += (
-            " The --reset-args flag replaces unsupported arguments with the defaults."
+            f"Run `sai mcp install --client claude --scope {entry.scope}"
+            f" --repair-existing {entry.name}"
+            f"{' --reset-args' if entry.reset_args else ''}`."
         )
-    return hint
+        if entry.scope != "user":
+            hint += " Run this from the project directory."
+        if entry.reset_args:
+            hint += " The --reset-args flag replaces unsupported arguments with the defaults."
+        hints.append(hint)
+    return " ".join(hints)
+
+
+def claude_differing_fields(existing: Registration, target: Target) -> tuple[str, ...]:
+    fields = []
+    if not existing.argv or normalize_launcher(existing.argv[0]) != normalize_launcher(
+        target.argv[0]
+    ):
+        fields.append("command")
+    if existing.argv[1:] != target.argv[1:]:
+        fields.append("args")
+    if existing.stale_env or not existing.matches_sai_home(target.env):
+        fields.append("env")
+    return (*fields, *existing.extra_settings)
 
 
 def report_different_claude_entry(
-    client: Claude, result: Result, scope: str, target: Target
+    client: Claude, result: Result, existing: Registration, target: Target
 ) -> Result:
     launcher: str | None = target.argv[0]
     if target.explicit_command:
         # An explicit override can contain private arguments or paths.
         default_launcher = shutil.which("sai", path=client.environ.get("PATH"))
         launcher = os.path.abspath(default_launcher) if default_launcher else None
+    scope = existing.scope
+    path = client.registration_path(scope)
     entry = ClaudeRepair(
         scope,
         NAME,
         replace_entry=True,
         sai_home=target.env.get("SAI_HOME"),
-        directory=client.scope_directory(scope),
+        config_path=path,
+        fields=claude_differing_fields(existing, target),
         launcher=launcher,
     )
     hint = claude_repair_hint((entry,))
     if target.explicit_command:
-        hint += (
-            " For a custom launcher, update the executable checks and substitute"
-            " your requested command after `--`."
-        )
+        hint += " For a custom launcher, substitute your requested command after --."
     result.command = None
+    result.path = str(path)
     result.error = f"The existing {scope} Claude Code sai registration differs from the requested settings"
     result.fix = hint
     return result
@@ -622,6 +629,13 @@ class Claude(Client):
         configured = self.environ.get("CLAUDE_CONFIG_DIR")
         return (Path(configured) if configured else self.home) / ".claude.json"
 
+    def registration_path(self, scope: str) -> Path:
+        if scope == "project":
+            if self.cwd is None:
+                raise ClientError("No working directory for the project registration")
+            return self.cwd / ".mcp.json"
+        return self.config_path().absolute()
+
     def scope_directory(self, scope: str) -> Path | None:
         if self.cwd is None or scope == "user":
             return None
@@ -693,17 +707,15 @@ class Claude(Client):
     def read_entry(
         entry: Any, scope: str, name: str, disabled: bool
     ) -> Registration | None:
-        extras = ()
-        if (
-            name == NAME
-            and isinstance(entry, dict)
-            and (
-                entry.keys() - {"type", "command", "args", "env"}
-                or entry.get("type", "stdio") != "stdio"
-            )
-        ):
-            extras = ("custom settings",)
-        return entry_registration(entry, scope, disabled, extra_settings=extras)
+        extras = []
+        if name == NAME and isinstance(entry, dict):
+            known = ("cwd", "url", "headers")
+            extras.extend(key for key in known if key in entry)
+            if entry.get("type", "stdio") != "stdio":
+                extras.append("type")
+            if entry.keys() - {"type", "command", "args", "env", *known}:
+                extras.append("custom settings")
+        return entry_registration(entry, scope, disabled, extra_settings=tuple(extras))
 
     def project_disabled(self, name: str) -> bool:
         assert self.cwd is not None
@@ -1069,7 +1081,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.action = "unchanged"
             return result
         if isinstance(client, Claude) and existing is not None:
-            return report_different_claude_entry(client, result, scope, target)
+            return report_different_claude_entry(client, result, existing, target)
         action = "added" if existing is None else "replaced"
         if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
@@ -1414,12 +1426,7 @@ def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
 
 def repair_path(client: Client, scope: str) -> Path:
     if isinstance(client, Claude):
-        if scope == "project" and client.cwd is None:
-            raise ClientError("No working directory for the project registration")
-        if scope == "project":
-            assert client.cwd is not None
-            return client.cwd / ".mcp.json"
-        return client.config_path()
+        return client.registration_path(scope)
     assert isinstance(client, Cursor)
     return client.config_path(scope)
 
@@ -1503,7 +1510,7 @@ def repair_claude_existing(
                     "Review MCP approvals and settings in the client."
                 )
             if not existing.matches(target):
-                return report_different_claude_entry(client, result, scope, target)
+                return report_different_claude_entry(client, result, existing, target)
             result.action = "unchanged"
             return result
         if not existing.stdio:
@@ -1570,7 +1577,8 @@ def check_claude_differences(
                             if home is not None
                             else None
                         ),
-                        directory=directory,
+                        config_path=client.registration_path(reg.scope),
+                        fields=claude_differing_fields(reg, expected) or ("command",),
                         launcher=expected.argv[0],
                     )
                 )
