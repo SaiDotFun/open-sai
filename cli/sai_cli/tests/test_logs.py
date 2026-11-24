@@ -2005,6 +2005,42 @@ def test_keeper_lifecycle_codes_and_user_actor_survive_mcp_and_audit(home, keepe
     assert "opaque-upstream-error" not in raw_logs(home)
 
 
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "market_order_expired",
+        "market_order_fill_failed",
+        "market_order_trading_paused",
+        "market_order_market_closed",
+        "market_order_trade_not_open",
+    ],
+)
+def test_keeper_cancellation_codes_survive_intent_status_and_audit(
+    keeper_stub, error_code
+):
+    endpoint, state = keeper_stub
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "execActor": "server",
+            "lifecycleStep": "exec_fail",
+            "errorCode": error_code,
+            "errorMsg": "opaque-keeper-diagnostic",
+        }
+    ]
+    args = {"key": key, "addr": ADDR}
+    records = [
+        call(mcp, "intent_status", args)["userIntents"][0],
+        call(mcp, "logs_intent", args)["keeper"],
+    ]
+    for record in records:
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
 def test_mcp_audit_omits_invalid_arguments_from_call_log(home):
     mcp = server.create_server()
     marker = "opaque-audit-argument-secret"
