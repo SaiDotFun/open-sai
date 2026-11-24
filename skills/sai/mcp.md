@@ -80,8 +80,10 @@ The server lists every tool whether or not anyone is signed in. Each
 `trade_*` call checks the session of the account it acts as.
 
 If `mcp_info.session.expiryWarning` is present, tell the person when the
-session expires. To renew, use the same Keeper endpoint. The v0.1.2
-`renewalCommand` can include explanatory text after the command.
+session expires. Renew against the same Keeper endpoint. In v0.1.2,
+`renewalCommand` can include explanatory text after the command. On `main`,
+pass along the `renewalCommand` and any `renewalGuidance` separately when
+the report includes them.
 
 | `mcp_info.trading.reason` | What It Means for the Active Account |
 | --- | --- |
