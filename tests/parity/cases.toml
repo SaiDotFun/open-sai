@@ -761,8 +761,9 @@ args = ["--json","trade","margin","7","--direction","add","--amount","1","--dry-
 seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_market", "get_group",
-    "get_pair_custom_max_leverage", "get_fees",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market",
+    "market_order_config", "get_perp_prices", "is_after_hours_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees", "quote_trade", "get_exchange_balance",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
@@ -773,7 +774,7 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price", "get_trade_raw", "get_perp_prices", "get_liquidation_price",
+    "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
     "is_after_hours_market", "get_market", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
@@ -784,7 +785,12 @@ args = ["--json", "trade", "close", "7"]
 seed = "session"
 server = "concurrent-close"
 wire = [
-    "trade", "oneClickTrading", "node_info", "get_trade_raw", "recordUserIntent",
-    "trade", "oneClickTrading", "node_info", "get_trade_raw",
+    "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
+    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
+    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "recordUserIntent",
+    "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
+    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
+    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

@@ -776,8 +776,14 @@ def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper
     key = error["intentKey"]
     assert storage.list_pending(base, ADDR)[0]["status"] == "rejected"
     assert events(home, "intent.status")[0]["intentKey"] == key
-    for event in ("keeper.request", "intent.status", "command.end"):
-        assert events(home, event)[-1]["code"] == error["code"]
+    [submit] = [
+        request
+        for request in events(home, "keeper.request")
+        if request["operation"] == "submit"
+    ]
+    assert submit["code"] == error["code"]
+    for event in ("intent.status", "command.end"):
+        assert events(home, event)[0]["code"] == error["code"]
 
 
 def test_command_path_skips_options_and_their_values():
