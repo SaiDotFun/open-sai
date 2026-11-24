@@ -22,7 +22,6 @@ pub enum TradeCommand {
     Open(Open),
     /// Close a position or cancel a pending order.
     Close {
-        #[arg(allow_negative_numbers = true)]
         trade_id: String,
         /// Cancel a pending order instead of closing a position.
         #[arg(long)]
@@ -35,7 +34,6 @@ pub enum TradeCommand {
     },
     /// Cancel a pending order.
     Cancel {
-        #[arg(allow_negative_numbers = true)]
         trade_id: String,
         #[arg(long)]
         dry_run: bool,

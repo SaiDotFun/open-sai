@@ -31,6 +31,7 @@ ADDRESS = PROTOCOL["address"]
 OTHER_ADDRESS = "0x" + "2" * 40
 INTENT = "parity-close-7"
 CONTRACT = "nibi1syntheticfixture"
+TRADE_REQUEST_HASH = "AB" * 32
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 RELEASES = "/repos/SaiDotFun/open-sai/releases"
 CONFIG = """# Keep this comment when editing
@@ -297,6 +298,35 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             ack = PROTOCOL["admission_ack"]["data"]["recordUserIntent"]
             self.reply({"data": {"recordUserIntent": {**ack, "intentKey": key}}})
 
+        def admit_trade(self, variables: Any) -> None:
+            session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
+            if self.headers.get("Authorization") != f"Bearer {session['token']}":
+                self.reject("Wrong fixture authorization")
+                return
+            key = variables["input"]["intentKey"]
+            if scenario == "trade-disconnect":
+                self.close_connection = True
+                return
+            if scenario == "trade-rejected":
+                self.reply(
+                    {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+                )
+                return
+            ack = PROTOCOL["admission_ack"]["data"]["recordUserIntent"]
+            if scenario == "trade-bad-ack":
+                key = "wrong-intent"
+            self.reply(
+                {
+                    "data": {
+                        "recordUserIntent": {
+                            **ack,
+                            "intentKey": key,
+                            "txHash": TRADE_REQUEST_HASH,
+                        }
+                    }
+                }
+            )
+
         def do_POST(self) -> None:
             if not self.path.startswith("/") or (
                 self.path.startswith(scope) and self.path != f"{scope}/query"
@@ -317,6 +347,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 name = request.label
                 if name == "recordUserIntent" and scenario == "concurrent-close":
                     self.admit_close(request.variables)
+                    return
+                if name == "recordUserIntent" and scenario.startswith("trade-"):
+                    self.admit_trade(request.variables)
                     return
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):
