@@ -305,6 +305,7 @@ def test_ledger_compares_collations_in_view_definitions(tmp_path: Path) -> None:
             (
                 "CREATE INDEX indexed ON intents(status) WHERE ((status <> 'failed'))",
                 "CREATE INDEX indexed ON intents(status) WHERE \"status\" <> 'failed'",
+                "CREATE INDEX indexed ON intents(status) WHERE (status) <> ('failed')",
             ),
             "CREATE INDEX indexed ON intents(status) WHERE status <> 'status'",
         ),
@@ -315,6 +316,11 @@ def test_ledger_compares_collations_in_view_definitions(tmp_path: Path) -> None:
                 'CREATE INDEX indexed ON intents(lower("STATUS") DESC)',
             ),
             "CREATE INDEX indexed ON intents(lower('status') DESC)",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(lower(status) COLLATE NOCASE)",
+            ("CREATE INDEX indexed ON intents(((lower((status)))) COLLATE NOCASE)",),
+            "CREATE INDEX indexed ON intents(lower(status) COLLATE BINARY)",
         ),
         (
             "CREATE INDEX indexed ON intents(17 DESC, lower(état))",
@@ -328,6 +334,13 @@ def test_ledger_compares_collations_in_view_definitions(tmp_path: Path) -> None:
                 'CREATE VIEW projected AS SELECT lower("status") AS "label" FROM [intents] WHERE `priority` + 1 * 2 > 3',
             ),
             "CREATE VIEW projected AS SELECT lower(status) AS label FROM intents WHERE (priority + 1) * 2 > 3",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT lower(intents.status) COLLATE NOCASE AS label FROM intents WHERE priority IN (-2)",
+            (
+                "CREATE VIEW projected AS SELECT (lower((intents.status))) COLLATE NOCASE AS label FROM intents WHERE (priority) IN ((-2))",
+            ),
+            "CREATE VIEW projected AS SELECT lower(intents.status) COLLATE NOCASE AS label FROM intents WHERE priority IN (3)",
         ),
         (
             "CREATE VIEW projected AS SELECT label FROM (SELECT lower(status) label FROM intents)",

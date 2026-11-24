@@ -45,6 +45,54 @@ SQLITE_SYNTAX = (
     r"|->>|->|<=|>=|<>|!=|==|\|\||<<|>>|."
 )
 ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+SQLITE_OPERAND_PREFIXES = {
+    "(",
+    ",",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "~",
+    "&",
+    "|",
+    "<<",
+    ">>",
+    "||",
+    "->",
+    "->>",
+    "=",
+    "==",
+    "!=",
+    "<>",
+    "<",
+    "<=",
+    ">",
+    ">=",
+    "ALL",
+    "AND",
+    "BETWEEN",
+    "BY",
+    "DISTINCT",
+    "ELSE",
+    "ESCAPE",
+    "GLOB",
+    "HAVING",
+    "IS",
+    "LIKE",
+    "LIMIT",
+    "MATCH",
+    "NOT",
+    "OFFSET",
+    "ON",
+    "OR",
+    "REGEXP",
+    "SELECT",
+    "THEN",
+    "WHEN",
+    "WHERE",
+}
+SQLITE_NUMERIC_START = re.compile(r"[0-9]|\.[0-9]")
 
 
 class InvalidReservationTime(ValueError):
@@ -523,7 +571,7 @@ def view_expressions(tokens: list[str]) -> list[str]:
         if following and following[0] not in ends:
             alias = following[0]
             if not (
-                (alias[0] in {'"', "`", "["} or unquoted_sqlite_name(alias))
+                sqlite_name_token(alias)
                 and (len(following) == 1 or following[1] in ends)
             ):
                 continue
@@ -537,6 +585,47 @@ def view_expressions(tokens: list[str]) -> list[str]:
 def unquoted_sqlite_name(token: str) -> bool:
     match = sqlite_tokenizer().fullmatch(token)
     return match is not None and match.lastgroup == "name"
+
+
+def sqlite_name_token(token: str) -> bool:
+    return token[0] in {'"', "`", "["} or unquoted_sqlite_name(token)
+
+
+def strip_operand_parentheses(tokens: list[str]) -> list[str]:
+    """Try ungrouping individual operands within larger SQL expressions."""
+    pairs = dict(parenthesis_pairs(tokens))
+    removed = set()
+    for opening, close_index in pairs.items():
+        # Function argument lists and IN lists have structural parentheses.
+        if opening and tokens[opening - 1] not in SQLITE_OPERAND_PREFIXES:
+            continue
+        start, end = opening + 1, close_index - 1
+        while start in removed and end in removed:
+            start += 1
+            end -= 1
+        if start > end:
+            continue
+        first = tokens[start]
+        if start == end:
+            operand = (
+                sqlite_name_token(first)
+                or first.startswith(("'", "x'", "X'"))
+                or SQLITE_NUMERIC_START.match(first) is not None
+            )
+        elif start + 1 == end and first in {"+", "-"}:
+            operand = SQLITE_NUMERIC_START.match(tokens[end]) is not None
+        elif pairs.get(start + 1) == end:
+            operand = sqlite_name_token(first)
+        else:
+            parts = tokens[start : end + 1]
+            operand = (
+                len(parts) in {3, 5}
+                and all(token == "." for token in parts[1::2])
+                and all(sqlite_name_token(token) for token in parts[::2])
+            )
+        if operand:
+            removed.update((opening, close_index))
+    return [token for i, token in enumerate(tokens) if i not in removed]
 
 
 def normalize_expression_sql(
@@ -556,20 +645,25 @@ def normalize_expression_sql(
     # SQLite can treat an unresolved double-quoted token as a string, and an
     # unquoted name can be a keyword. Only accept rewrites with the same program.
     # Collation names are identifiers by grammar and are normalized separately.
-    quoted = {
-        i
-        for i, token in enumerate(ungrouped)
-        if token[0] in {'"', "`", "["} and (i == 0 or ungrouped[i - 1] != "COLLATE")
-    }
-    if not quoted and ungrouped == original:
+    def quoted_names(tokens: list[str]) -> list[int]:
+        return [
+            i
+            for i, token in enumerate(tokens)
+            if token[0] in {'"', "`", "["} and (i == 0 or tokens[i - 1] != "COLLATE")
+        ]
+
+    operands = strip_operand_parentheses(ungrouped)
+    if operands == original and not quoted_names(original):
         return normalize_collations(original)
     reference = program(original)
     if reference is None:
         return normalize_collations(original)
-    if ungrouped != original and program(ungrouped) != reference:
-        return normalize_expression_sql(conn, original, original, as_select)
-    normalized = ungrouped.copy()
-    for i in sorted(quoted):
+    normalized = next(
+        candidate.copy()
+        for candidate in (operands, ungrouped, original)
+        if candidate == original or program(candidate) == reference
+    )
+    for i in quoted_names(normalized):
         token = normalized[i]
         name = sqlite_identifier(token)
         # Keep a canonical quoted spelling for names that require quoting.
