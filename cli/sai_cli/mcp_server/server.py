@@ -207,6 +207,16 @@ async def account_balances(addr: str | None = None) -> str:
     return await call(tools.account_balances, addr)
 
 
+async def account_overview(addr: str | None = None) -> str:
+    """Read Sai funds, position risk, pending and queued orders, local blockers,
+    and session expiry. Check each section for its fetch time and any error.
+
+    Args:
+        addr: EVM addr (0x...). Defaults to the active account for this endpoint.
+    """
+    return await call(tools.account_overview, addr)
+
+
 async def intent_local(addr: str | None = None) -> str:
     """List intents this machine recorded, with their local status.
 
@@ -703,6 +713,7 @@ READ_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
     (preview_margin, read_only("Preview Margin Change")),
     (preview_partial_close, read_only("Preview Partial Close")),
     (logs_intent, read_only("Intent Log Trail")),
+    (account_overview, read_only("Account Overview")),
 )
 
 TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (

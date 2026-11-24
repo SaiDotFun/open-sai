@@ -49,6 +49,7 @@ READ_TOOLS = {
     "account_positions",
     "account_history",
     "account_balances",
+    "account_overview",
     "intent_local",
     "intent_status",
     "preview_open",
@@ -1331,12 +1332,23 @@ def test_mcp_info_reports_versions_without_network(mcp, monkeypatch):
 def test_session_reports_never_include_the_token(mcp):
     storage.save_session(stored_session())
     status = invoke(mcp, "auth_status")
-    assert set(status) == {"addr", "expiresAt", "endpoint"}
-    assert status["addr"] == ADDR
-    assert status["endpoint"] == "https://sai-keeper.nibiru.fi"
+    assert set(status) == {
+        "addr",
+        "expiresAt",
+        "endpoint",
+        "expiryWarning",
+        "renewalCommand",
+    }
+    assert (status["addr"], status["endpoint"]) == (
+        ADDR,
+        ENDPOINT.removesuffix("/query"),
+    )
     info = invoke(mcp, "mcp_info")
     assert info["session"]["addr"] == ADDR
     assert info["session"]["usable"] is True
+    assert "expires in" in info["session"]["expiryWarning"]
+    assert info["session"]["renewalCommand"] == status["renewalCommand"]
+    assert "expiryWarning" in invoke(mcp, "auth_list")["accounts"][0]
     assert info["provenance"]["kind"] in ("source-checkout", "installed")
     assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"
 

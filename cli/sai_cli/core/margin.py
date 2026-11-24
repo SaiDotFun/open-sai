@@ -18,6 +18,7 @@ from .errors import Code, SaiError
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
+BLOCK_PATH = "/cosmos/base/tendermint/v1beta1/blocks/"
 
 
 class QueryHeightMismatch(SaiError, ValueError):
@@ -31,7 +32,12 @@ def _get_json(url: str, timeout: float = 20, *, fresh: bool = False) -> dict[str
 
 
 def _get_json_at_height(
-    url: str, timeout: float = 20, *, height: str | None = None, fresh: bool = False
+    url: str,
+    timeout: float = 20,
+    *,
+    height: str | None = None,
+    fresh: bool = False,
+    allow_unprefixed_height: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     keeper.check_url(url, "LCD")
     try:
@@ -44,7 +50,7 @@ def _get_json_at_height(
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
-    except (httpx.HTTPError, ValueError, TypeError) as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
         if height is not None or fresh:
             raise QueryHeightMismatch(
                 "Unable to verify contract state during confirmation."
@@ -52,6 +58,8 @@ def _get_json_at_height(
             ) from exc
         raise ValueError("Unable to read contract state") from exc
     query_height = response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}")
+    if query_height is None and allow_unprefixed_height:
+        query_height = response.headers.get(BLOCK_HEIGHT_HEADER)
     if height is not None and query_height != height:
         raise QueryHeightMismatch(
             "LCD did not serve the requested contract query height."
@@ -82,6 +90,33 @@ def smart_value(
         result = _get_json(url, fresh=True) if fresh else _get_json(url)
         return result.get("data")
     return _get_json_at_height(url, height=height)[0].get("data")
+
+
+def block_header(lcd: str, height: int | str, *, timeout: float = 3) -> dict[str, Any]:
+    data = _get_json(
+        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}", timeout, fresh=height == "latest"
+    )["block"]["header"]
+    if not isinstance(data, dict):
+        raise TypeError("Invalid LCD block header")
+    return data
+
+
+def smart_data(
+    lcd: str,
+    contract: str,
+    message: dict[str, Any],
+    *,
+    height: int,
+    timeout: float,
+) -> Any:
+    """Read overview state at the chosen block, within its request timeout."""
+    data, _ = _get_json_at_height(
+        _smart_url(lcd, contract, message),
+        timeout,
+        height=str(height),
+        allow_unprefixed_height=True,
+    )
+    return data.get("data")
 
 
 def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:

@@ -52,7 +52,7 @@ def isolated_home(tmp_path, monkeypatch) -> Path:
     return tmp_path
 
 
-def save(hours: float = 48, endpoint: str = ENDPOINT, addr: str = ADDR) -> None:
+def save(hours: float = 96, endpoint: str = ENDPOINT, addr: str = ADDR) -> None:
     storage.save_session(
         {
             "token": TOKEN,
@@ -226,7 +226,11 @@ def test_expired_session_fails():
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
     assert "expired" in check.summary
-    assert check.fix and "sai auth login" in check.fix
+    assert check.fix and check.fix.startswith(
+        'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
+    )
+    assert "auth login NAME" in check.fix
+    assert ENDPOINT not in check.fix
 
 
 def test_session_for_other_endpoint_fails():
@@ -260,11 +264,12 @@ def test_session_without_an_endpoint_reports_a_missing_endpoint():
     assert check["details"]["endpointMatches"] is False
 
 
-def test_session_expiring_within_a_day_warns():
-    save(hours=0.5)
+@pytest.mark.parametrize(("hours", "unit"), [(0.5, "min"), (48, " h")])
+def test_session_expiring_within_three_days_warns(hours, unit):
+    save(hours=hours)
     check = one(doctor.check_session, ctx())
     assert check.status == "warn"
-    assert "expires in" in check.summary and "min" in check.summary
+    assert "expires in" in check.summary and unit in check.summary
 
 
 @pytest.mark.parametrize(
@@ -1558,12 +1563,15 @@ def test_json_report_shape_and_exit_code():
     error = json.loads(output)["error"]
     assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
     assert "expired" in error["message"]
-    assert "sai auth login NAME" in error["message"]
+    assert "auth login NAME" in error["message"]
     details = error["details"]
     assert details["schemaVersion"] == 1 and details["overall"] == "fail"
     checks = {check["id"]: check for check in details["checks"]}
     assert checks["session"]["status"] == "fail"
-    assert "sai auth login NAME" in checks["session"]["fix"]
+    recovery = checks["session"]["fix"]
+    assert recovery.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert "auth login NAME" in recovery
+    assert ENDPOINT not in recovery
     assert checks["keeper"]["status"] == "skipped"
 
 

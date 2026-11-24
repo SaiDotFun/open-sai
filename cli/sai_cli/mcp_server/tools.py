@@ -23,7 +23,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from ..core import intents, keeper, reconcile, storage, stream, trading
+from ..core import intents, keeper, overview, reconcile, storage, stream, trading
 from ..core import log as sai_log
 from ..core import session as sessions
 from ..core.errors import Code, SaiError, SessionError
@@ -184,7 +184,7 @@ def trading_state(settings: Settings, addr: str | None = None) -> dict[str, Any]
         if not storage.session_exists():
             return {"available": False, "reason": "signed-out", "addr": None}
         stored = storage.load_session(addr)
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except (ValueError, KeyError) as exc:
         detail = (
             f"Stored session is malformed; {storage.SIGN_IN_AGAIN}"
@@ -278,7 +278,7 @@ def resolve_addr(settings: Settings, addr: str | None) -> dict[str, Any]:
         if not storage.session_exists():
             raise SessionUnavailable(NO_ADDR)
         stored = storage.load_session()
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except SessionUnavailable:
         raise
     except ValueError as exc:
@@ -299,10 +299,11 @@ def session_state(settings: Settings) -> dict[str, Any]:
         if not storage.session_exists():
             return {"signedIn": False}
         stored = storage.load_session()
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except ValueError as exc:
         return {"signedIn": False, "error": str(exc)}
-    expired = expiry <= datetime.now(UTC)
+    now = datetime.now(UTC)
+    expired = expiry <= now
     matches = stored.get("endpoint") == settings.endpoint
     try:
         connected = len(storage.load_accounts()["sessions"])
@@ -315,11 +316,17 @@ def session_state(settings: Settings) -> dict[str, Any]:
         **sessions.summary(stored),
         "expired": expired,
         "endpointMatches": matches,
+        **({"renewalCommand": sessions.renewal_command(stored)} if expired else {}),
+        **(sessions.expiry_fields(stored, now) if matches else {}),
     }
 
 
 def auth_status(settings: Settings, addr: str | None = None) -> dict[str, Any]:
-    return sessions.summary(session_loader(settings, addr)())
+    stored = session_loader(settings, addr)()
+    return {
+        **sessions.summary(stored),
+        **sessions.expiry_fields(stored),
+    }
 
 
 def account_rows(settings: Settings) -> dict[str, Any]:
@@ -328,7 +335,7 @@ def account_rows(settings: Settings) -> dict[str, Any]:
     now = datetime.now(UTC)
     rows = []
     for key, result in sorted(accounts["sessions"].items()):
-        expired = datetime.fromisoformat(result["expiresAt"]) <= now
+        expired = sessions.expiry_time(result) <= now
         matches = result.get("endpoint") == settings.endpoint
         rows.append(
             {
@@ -337,6 +344,7 @@ def account_rows(settings: Settings) -> dict[str, Any]:
                 "expired": expired,
                 "endpointMatches": matches,
                 "usable": matches and not expired,
+                **sessions.expiry_fields(result, now),
             }
         )
     return {"accounts": rows}
@@ -382,6 +390,13 @@ def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
         **account,
         **stream.snapshot(settings.ws_endpoint, stream.BALANCES, variables),
     }
+
+
+def account_overview(settings: Settings, addr: str | None) -> dict[str, Any]:
+    try:
+        return overview.account_overview(settings, addr)
+    except overview.AccountUnavailable as exc:
+        raise SessionUnavailable(f"{exc}. Pass addr explicitly.") from exc
 
 
 def intent_local(settings: Settings, addr: str | None) -> dict[str, Any]:
