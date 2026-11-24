@@ -60,6 +60,28 @@ def test_no_json_command_does_not_open_the_repl():
     assert_error(result, 2, "INVALID_REQUEST")
 
 
+@pytest.mark.parametrize("args", [("auth", "status"), ("trade", "close", "7")])
+@pytest.mark.parametrize("endpoint", [OVERRIDE, PRIVATE_OVERRIDE])
+def test_explicit_account_sign_in_hint_pins_the_selected_keeper(
+    monkeypatch, args, endpoint
+):
+    monkeypatch.setenv("SAI_ENDPOINT", "http://127.0.0.1:1/query")
+    result = CliRunner().invoke(
+        main, ["--json", "--endpoint", endpoint, "--as", ADDR, *args]
+    )
+    error = assert_error(result, 6, "SIGNED_OUT")
+    assert f"{ADDR} is not connected" in error["message"]
+    if endpoint == OVERRIDE:
+        assert (
+            error["hint"] == f"sai --endpoint {endpoint} auth login NAME --addr {ADDR}"
+        )
+    else:
+        assert error["hint"].startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+        assert error["hint"].endswith(f"auth login NAME --addr {ADDR}")
+        assert PRIVATE_PATH not in result.output
+        assert endpoint not in result.output
+
+
 def test_click_usage_remains_on_stderr_in_text_mode():
     result = CliRunner().invoke(main, ["market", "missing"])
     assert result.exit_code == 2

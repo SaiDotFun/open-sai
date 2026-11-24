@@ -249,7 +249,11 @@ def load_session(addr: str | None = None) -> dict[str, str]:
     """Return the session for ADDR, or the active account's session."""
     accounts = load_accounts()
     if addr is not None:
-        return accounts["sessions"][_find(accounts, addr)]
+        try:
+            key = _find(accounts, addr)
+        except ValueError as exc:
+            raise SessionError(str(exc), Code.SIGNED_OUT) from exc
+        return accounts["sessions"][key]
     if accounts["active"] is None:
         if accounts["sessions"]:
             raise SessionError(
