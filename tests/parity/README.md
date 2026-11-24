@@ -92,6 +92,11 @@ To compare every selected manifest case against that same executable, run
 with `SAI_PARITY_BIN` set to the Rust binary. The explicit reference applies
 to the CLI cases and the MCP transcripts.
 
+The focused Rust CI comparison uses `--release-xfails`. The file
+`release-xfails.toml` maps exact failing pytest IDs to the open PR that owns
+each gap. The cases still run, and an unexpected pass fails CI so the fixing
+PR can remove its mark. Run without the option to see the raw failures.
+
 ## Auth Subprocess Cases
 
 Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.

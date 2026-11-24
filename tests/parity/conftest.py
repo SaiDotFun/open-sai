@@ -5,9 +5,43 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--release-xfails",
+        action="store_true",
+        help="Apply the strict expected failures for the v0.1.2 Rust CI comparison",
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    if not config.getoption("--release-xfails"):
+        return
+    path = Path(__file__).with_name("release-xfails.toml")
+    with path.open("rb") as file:
+        owners = tomllib.load(file)["pull_request"]
+    reasons = {
+        f"tests/parity/{case}": f"https://github.com/SaiDotFun/open-sai/pull/{pr}"
+        for pr, cases in owners.items()
+        for case in cases
+    }
+    for item in items:
+        if reason := reasons.pop(item.nodeid, None):
+            item.add_marker(
+                pytest.mark.xfail(reason=reason, strict=True, raises=AssertionError)
+            )
+    if reasons:
+        raise pytest.UsageError(
+            "Stale release expected-failure IDs: " + ", ".join(sorted(reasons))
+        )
 
 
 @pytest.fixture

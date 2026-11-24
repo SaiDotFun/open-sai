@@ -268,4 +268,4 @@ jobs:
             printf '%s ' "$parity_checkout"
             git -C "$parity_checkout" rev-parse HEAD
           done
-          uv run --locked pytest tests/parity --verbose -rxX
+          uv run --locked pytest tests/parity --release-xfails --verbose -rxX
