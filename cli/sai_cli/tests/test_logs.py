@@ -3293,6 +3293,55 @@ def test_intent_cursor_keeps_anchors_from_each_scan_window(home):
     assert sorted(seen) == list(range(258))
 
 
+@pytest.mark.parametrize("before", [None, "2026-11-24T23:59:59.999Z"])
+def test_intent_cursor_bounds_following_day_to_original_files(home, before):
+    root = home / "logs"
+    root.mkdir()
+    older = date(2026, 11, 24)
+    newer = older + timedelta(days=1)
+    row = {
+        "event": "command.start",
+        "ts": f"{older}T23:59:59.000Z",
+        "surface": "cli",
+        "runId": "process",
+        "commandId": "command",
+    }
+    log.file_path("cli", older, root).write_bytes(
+        b"".join(log.encode({**row, "seq": seq}) for seq in range(129))
+    )
+    anchor = {
+        **row,
+        "event": "intent.keeper",
+        "ts": f"{newer}T00:00:00.000Z",
+        "seq": 129,
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    next_file = log.file_path("cli", newer, root)
+    next_file.write_bytes(log.encode(anchor))
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    first_flags = ("--before", before) if before else ()
+    code, output = run_cli(*args, *first_flags)
+    assert code == 0
+    continuation = ("--before", json.loads(output)["nextBefore"])
+    code, output = run_cli(*args, *continuation)
+    assert code == 0
+    expected = json.loads(output)
+    assert [line["seq"] for line in expected["events"]] == ([0] if before else [0, 1])
+    assert "nextBefore" not in expected
+
+    with next_file.open("ab") as stream:
+        stream.write(log.encode({**anchor, "addr": OTHER, "seq": 130}))
+    log.file_path("mcp", newer, root).write_bytes(
+        log.encode({**anchor, "addr": OTHER, "surface": "mcp", "seq": 131})
+    )
+    code, output = run_cli(*args, *continuation)
+    assert code == 0 and json.loads(output) == expected
+    code, output = run_cli(*args, *first_flags)
+    assert code == 0 and "ambiguous" in json.loads(output)["scopeWarning"]
+
+
 def test_log_stats_scan_continues_inside_one_millisecond(home):
     root = home / "logs"
     root.mkdir()

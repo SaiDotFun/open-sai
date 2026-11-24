@@ -812,13 +812,13 @@ class LogDir:
         finally:
             os.close(fd)
 
-    def is_regular(self, name: str) -> bool:
+    def file_size(self, name: str) -> int | None:
         target, extra = self._target(name)
         try:
             info = os.stat(target, follow_symlinks=False, **extra)
         except OSError:
-            return False
-        return stat.S_ISREG(info.st_mode)
+            return None
+        return info.st_size if stat.S_ISREG(info.st_mode) else None
 
     def unlink(self, name: str) -> bool:
         target, extra = self._target(name)
@@ -856,7 +856,7 @@ class LogDir:
         found: list[tuple[date, str, str]] = []
         for name in self.names():
             parsed = parse_name(name)
-            if parsed is not None and self.is_regular(name):
+            if parsed is not None and self.file_size(name) is not None:
                 found.append((*parsed, name))
         return sorted(found)
 
@@ -1366,8 +1366,26 @@ class RowPosition:
     size: int
 
 
+FileEnds = dict[date, tuple[int, ...]]
+NO_FILES = (0,) * len(SURFACES)
+
+
+def snapshot_ends(root: Path | None) -> FileEnds:
+    """Record the extent of each daily file without reading its contents."""
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        return {}
+    ends: dict[date, list[int]] = {}
+    with opened:
+        for name in opened.names():
+            if (parsed := parse_name(name)) and (size := opened.file_size(name)):
+                day, surface = parsed
+                ends.setdefault(day, list(NO_FILES))[SURFACES.index(surface)] = size
+    return {day: tuple(offsets) for day, offsets in ends.items()}
+
+
 def read_rows_at(
-    root: Path | None, positions: list[RowPosition]
+    root: Path | None, positions: list[RowPosition], ends: FileEnds
 ) -> Iterator[tuple[RowPosition, dict[str, Any]]]:
     """Read the individual lines that supplied attribution on earlier pages."""
     if not positions:
@@ -1385,6 +1403,8 @@ def read_rows_at(
                 continue
             try:
                 for position in group:
+                    if position.offset + position.size > ends.get(day, NO_FILES)[slot]:
+                        continue
                     os.lseek(fd, position.offset, os.SEEK_SET)
                     raw = os.read(fd, position.size)
                     if len(raw) != position.size or not raw.endswith(b"\n"):
@@ -1408,20 +1428,28 @@ def read_prefix(
     *,
     max_bytes: int,
     max_rows: int,
-) -> tuple[list[dict[str, Any]], bool]:
+    ends: tuple[int, ...] | None = None,
+) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
     """Read bounded attribution context from the start of one day's files."""
-    rows: list[dict[str, Any]] = []
+    rows: list[tuple[RowPosition, dict[str, Any]]] = []
     truncated = False
     opened = LogDir.open(root or directory())
     if opened is None:
         return rows, truncated
     with opened:
-        files = [name for found, _, name in reversed(opened.files()) if found == day]
-        for name in files:
+        files = [
+            (slot, name)
+            for found, surface, name in reversed(opened.files())
+            for slot in (SURFACES.index(surface),)
+            if found == day and (ends is None or ends[slot] > 0)
+        ]
+        for slot, name in files:
             try:
                 fd = opened.read_fd(name)
                 try:
                     size = os.fstat(fd).st_size
+                    if ends is not None:
+                        size = min(size, ends[slot])
                     data = os.read(fd, min(size, max_bytes // len(files)))
                     truncated |= len(data) < size
                 finally:
@@ -1429,7 +1457,10 @@ def read_prefix(
             except OSError:
                 truncated = True
                 continue
+            offset = 0
             for raw in data.split(b"\n")[:-1]:
+                position = RowPosition(day, slot, offset, len(raw) + 1)
+                offset += position.size
                 if len(raw) > MAX_LINE:
                     continue
                 try:
@@ -1439,7 +1470,7 @@ def read_prefix(
                 if isinstance(line, dict) and accept(line):
                     if len(rows) == max_rows:
                         return rows, True
-                    rows.append(line)
+                    rows.append((position, line))
     return rows, truncated
 
 
@@ -1460,6 +1491,7 @@ class PageScan:
         last_day: date | None = None,
         since: str | None = None,
         before: str | None = None,
+        ends: FileEnds | None = None,
         observe: Callable[[RowPosition, dict[str, Any]], None] | None = None,
     ) -> Generator[tuple[ScanPosition, dict[str, Any]]]:
         """Merge reverse file reads one day at a time and checkpoint each file."""
@@ -1557,6 +1589,9 @@ class PageScan:
                 if (first_day is None or day >= first_day)
                 and (last_day is None or day <= last_day)
                 and (start is None or day <= start.day)
+                and (
+                    ends is None or ends.get(day, NO_FILES)[SURFACES.index(surface)] > 0
+                )
             )
             for day, daily in itertools.groupby(files, key=lambda item: item[0]):
                 names = list(daily)
@@ -1575,6 +1610,8 @@ class PageScan:
                             fd = opened.read_fd(name)
                             active.callback(os.close, fd)
                             end = os.fstat(fd).st_size
+                            if ends is not None:
+                                end = min(end, ends[day][slot])
                             if (
                                 start is not None
                                 and day == start.day
