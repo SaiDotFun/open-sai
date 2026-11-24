@@ -335,10 +335,24 @@ def loopback(
     market = {**recorded_markets[0], "marketId": borrowing["marketId"]}
     if market_price is not None:
         market["price"] = market_price
+    if scenario == "quote-null-price":
+        market["price"] = None
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
+    if scenario == "quote-foreign-keeper-owner":
+        trade["trader"] = OTHER_ADDRESS
+    if scenario == "quote-wrong-position-index":
+        trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
+    if scenario == "mcp-reads":
+        status = {**status, "txHash": TRADE_REQUEST_HASH}
+    elif scenario == "mcp-pending-malformed-hash":
+        status = {
+            **status,
+            "lifecycleStep": "exec_fail",
+            "errorCode": "market_order_outcome_not_indexed",
+        }
     history = {
         "id": 7,
         "intentKey": INTENT,
@@ -503,6 +517,29 @@ def loopback(
             "trigger_order_fee_p": "0",
         },
     }
+    if scenario == "quote-close-only":
+        contracts["get_market"]["market_trading_state"] = "close_only"
+    if scenario == "quote-pair-cap":
+        contracts["get_pair_custom_max_leverage"] = "1.5"
+    if scenario == "quote-minimum":
+        contracts["get_fees"]["min_position_size_usd"] = "10000000000"
+    if scenario == "quote-trigger-fee":
+        contracts["get_fees"]["trigger_order_fee_p"] = "0.0007"
+    if scenario == "quote-liquidation":
+        contracts["get_liquidation_price"]["liquidation_price"] = "100"
+    if scenario in {"quote-stale", "quote-queued"}:
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["get_group"]["stale_price_expiration_secs"] = 30
+        contracts["market_order_config"] = {
+            "fill_at_next_oracle_price": scenario == "quote-queued"
+        }
+    if scenario == "quote-after-hours":
+        contracts.update(is_after_hours_market=True, get_after_hours_leverage="1.1")
+        contracts["get_market"].update(block_last_opened=50, block_last_closed=100)
+    if scenario == "quote-close-fee-cap":
+        contracts["get_fees"]["close_fee_p"] = "2"
+    if scenario == "quote-foreign-contract-owner":
+        contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
     contract_args = {
         "get_trade_raw": {
             "trader": (
@@ -543,6 +580,7 @@ def loopback(
             },
         },
         "get_fees": {"index": "FeeIndex(0)"},
+        "get_after_hours_leverage": {},
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -553,7 +591,12 @@ def loopback(
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             if lcd:
-                self.send_header("grpc-metadata-x-cosmos-block-height", "120")
+                height = "120"
+                if scenario == "quote-height-mismatch" and self.headers.get(
+                    "x-cosmos-block-height"
+                ):
+                    height = "121"
+                self.send_header("grpc-metadata-x-cosmos-block-height", height)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -834,6 +877,19 @@ def loopback(
                         }
                     )
                     return
+                if path == "/cosmos/base/tendermint/v1beta1/blocks/120":
+                    wire.append(WireRequest("block"))
+                    self.reply(
+                        {
+                            "block": {
+                                "header": {
+                                    "height": "120",
+                                    "time": "2026-01-01T00:00:00Z",
+                                }
+                            }
+                        }
+                    )
+                    return
                 if path == RELEASES:
                     wire.append(WireRequest("releases"))
                     self.reply(
@@ -856,17 +912,60 @@ def loopback(
                         expected = [{name: contract_args[name]}]
                         # Ownership uses the account address. The next read
                         # uses Perp's stored owner to pin the quote.
+                        owner_read = (
+                            scenario.startswith("quote-")
+                            and name == "get_trade_raw"
+                            and query == {name: {"trader": ADDRESS, "index": 7}}
+                        )
                         if name == "get_trade_raw":
                             if scenario == "concurrent-close":
                                 expected.append(
                                     {name: {"trader": position["trader"], "index": 7}}
                                 )
-                            if trade_replay is not None:
+                            if trade_replay is not None or owner_read:
                                 expected.append({name: {"trader": ADDRESS, "index": 7}})
                         if not any(same_variables(query, args) for args in expected):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
+                        if scenario.startswith("quote-"):
+                            pinned = name == "get_perp_prices" or any(
+                                request.label == "get_perp_prices" for request in wire
+                            )
+                            anchor = name == "get_trade_raw" and any(
+                                request.label == "get_exchange_balance"
+                                for request in wire
+                            )
+                            if (
+                                pinned
+                                and self.headers.get("x-cosmos-block-height") != "120"
+                            ):
+                                self.reject(f"Quote must pin {name} to block 120")
+                                return
+                            if (
+                                pinned or anchor or owner_read
+                            ) and "_sai_query" not in parse_qs(
+                                urlsplit(self.path).query
+                            ):
+                                self.reject(f"Expected a fresh {name} query")
+                                return
                         wire.append(WireRequest(name, variables=query))
+                        if (
+                            name == "get_pair_custom_max_leverage"
+                            and scenario == "quote-absent-cap"
+                        ):
+                            self.reply(
+                                {
+                                    "message": "type: cosmwasm_std::math::decimal::Decimal; key: [00] not found"
+                                },
+                                500,
+                            )
+                            return
+                        if name == "get_fees" and scenario == "quote-fee-read-error":
+                            self.reply({}, 503)
+                            return
+                        if owner_read and scenario == "quote-owner-read-error":
+                            self.reply({}, 503)
+                            return
                         if name == "get_trade_raw" and cancel_target is not None:
                             [nonce] = parse_qs(urlsplit(self.path).query).get(
                                 "_sai_query", [""]
