@@ -988,6 +988,33 @@ def test_claude_install_reports_a_disabled_project_alias(env: Env, settings_path
     assert not env.calls()
 
 
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_claude_install_leaves_a_disabled_canonical_project_entry_in_place(
+    env: Env, dry_run: bool
+):
+    config = env.project / ".mcp.json"
+    entry = claude_entry(
+        [*serve(env), "--endpoint", f"https://private.example/{SECRET}"]
+    )
+    config.write_text(json.dumps({"mcpServers": {"sai": entry}}))
+    policy = env.project / ".claude" / "settings.local.json"
+    policy.parent.mkdir()
+    policy.write_text(json.dumps({"disabledMcpjsonServers": ["sai"]}))
+    before = config.read_bytes(), policy.read_bytes()
+    flags = ("--dry-run",) if dry_run else ()
+
+    result = invoke("mcp", "install", "claude", "--scope", "project", *flags)
+
+    assert "Claude Code has disabled the project sai registration" in failure(result)
+    details = payload(result)["error"]["details"]
+    assert not details["reconnectNeeded"]
+    [row] = details["results"]
+    assert row["scope"] == "project" and not row["changed"] and "argv" not in row
+    assert (config.read_bytes(), policy.read_bytes()) == before
+    assert not env.calls()
+    assert SECRET not in result.output
+
+
 @pytest.mark.parametrize("stale", [False, True])
 def test_ordinary_claude_install_preserves_the_legacy_entry(env: Env, stale: bool):
     config = env.home / ".claude.json"

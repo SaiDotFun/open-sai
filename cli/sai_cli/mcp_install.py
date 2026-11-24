@@ -861,6 +861,11 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             legacy = client.effective(client.registrations(RETIRED_NAME))
             if legacy is not None:
                 return report_legacy_install(client, legacy, target)
+        elif isinstance(client, Claude) and existing.disabled:
+            raise ClientError(
+                "Claude Code has disabled the project sai registration. "
+                "Review MCP approvals and settings in the client."
+            )
         winner = client.effective(found)
         if (
             winner is not None
