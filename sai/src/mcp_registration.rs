@@ -1102,23 +1102,13 @@ impl Clients {
         } else {
             "added"
         };
-        let mut steps = Vec::new();
-        if client == Client::Claude {
+        let mut step = None;
+        if client == Client::Claude && existing.is_none() {
             let exe = client
                 .executable()
                 .ok_or("`claude` is not on PATH")?
                 .to_string_lossy()
                 .into_owned();
-            if existing.is_some() {
-                steps.push(vec![
-                    exe.clone(),
-                    "mcp".into(),
-                    "remove".into(),
-                    "--scope".into(),
-                    scope.name().into(),
-                    NAMES[0].into(),
-                ]);
-            }
             let mut add = vec![
                 exe,
                 "mcp".into(),
@@ -1132,8 +1122,8 @@ impl Clients {
             }
             add.push("--".into());
             add.extend(target.argv.iter().cloned());
-            steps.push(add);
-            result.report["argv"] = json!(steps);
+            result.report["argv"] = json!([add]);
+            step = Some(add);
         } else {
             result.report["path"] = json!(client.path(scope, &self.home, &self.cwd));
         }
@@ -1141,15 +1131,14 @@ impl Clients {
             result.planned(action);
             return Ok(());
         }
-        if client == Client::Claude {
-            for step in steps {
-                client::run_step(&step, &self.cwd, deadline)?;
-                result.changed = true;
-            }
+        if let Some(step) = step {
+            client::run_step(&step, &self.cwd, deadline)?;
+        } else if let Some(old) = existing.filter(|_| client == Client::Claude) {
+            client.replace_claude(&self.home, &self.cwd, NAMES[0], target, old)?;
         } else {
             client.write(scope, &self.home, &self.cwd, NAMES[0], target, None)?;
-            result.changed = true;
         }
+        result.changed = true;
         self.verify(client, scope, NAMES[0], target, deadline)?;
         result.report["action"] = json!(action);
         Ok(())

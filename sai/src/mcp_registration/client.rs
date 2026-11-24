@@ -14,6 +14,11 @@ use super::{Client, Registration, Scope, Target};
 
 pub(super) type Result<T> = std::result::Result<T, String>;
 
+enum JsonUpdate<'a> {
+    Install(Option<&'a Registration>),
+    Repair(&'a Registration),
+}
+
 impl Client {
     pub(super) fn codex_neutral(self, home: &Path) -> PathBuf {
         let directory = self.directory(home);
@@ -121,8 +126,45 @@ impl Client {
         if self == Self::Codex {
             return edit(&path, true, |source| edit_codex(source, name, target, old));
         }
-        edit(&path, old.is_none(), |source| {
-            let mut doc = json_object(source, &path)?;
+        let update = old.map_or(JsonUpdate::Install(None), JsonUpdate::Repair);
+        self.write_json(&path, cwd, scope, name, target, update)
+    }
+
+    pub(super) fn replace_claude(
+        self,
+        home: &Path,
+        cwd: &Path,
+        name: &str,
+        target: &Target,
+        old: &Registration,
+    ) -> Result<()> {
+        let scope = old.scope;
+        let path = self.path(scope, home, cwd);
+        self.write_json(
+            &path,
+            cwd,
+            scope,
+            name,
+            target,
+            JsonUpdate::Install(Some(old)),
+        )
+    }
+
+    fn write_json(
+        self,
+        path: &Path,
+        cwd: &Path,
+        scope: Scope,
+        name: &str,
+        target: &Target,
+        update: JsonUpdate<'_>,
+    ) -> Result<()> {
+        let existing = match update {
+            JsonUpdate::Install(old) => old,
+            JsonUpdate::Repair(old) => Some(old),
+        };
+        edit(path, existing.is_none(), |source| {
+            let mut doc = json_object(source, path)?;
             let holder = if scope == Scope::Local {
                 doc["projects"][cwd.to_string_lossy().as_ref()]
                     .as_object_mut()
@@ -133,33 +175,46 @@ impl Client {
             let entries = holder
                 .entry("mcpServers")
                 .or_insert_with(|| Value::Object(Map::new()));
-            if old.is_none() && !entries.is_object() {
+            if existing.is_none() && !entries.is_object() {
                 *entries = Value::Object(Map::new());
             }
             let entries = entries
                 .as_object_mut()
                 .ok_or("Expected a table of MCP servers")?;
-            if let Some(old) = old {
-                let entry = entries
-                    .get_mut(name)
-                    .filter(|entry| {
-                        if self == Self::Claude {
-                            **entry == old.raw
-                        } else {
-                            super::argv(entry) == old.argv
-                        }
-                    })
-                    .and_then(Value::as_object_mut)
-                    .ok_or("The Sai registration changed concurrently")?;
-                entry.insert("command".into(), Value::from(target.argv[0].clone()));
-                entry.insert("args".into(), serde_json::json!(target.argv[1..]));
+            let current = if let Some(old) = existing {
+                Some(
+                    entries
+                        .get_mut(name)
+                        .filter(|entry| {
+                            if self == Self::Claude {
+                                **entry == old.raw
+                            } else {
+                                super::argv(entry) == old.argv
+                            }
+                        })
+                        .and_then(Value::as_object_mut)
+                        .ok_or("The Sai registration changed concurrently")?,
+                )
             } else {
-                let mut entry =
-                    serde_json::json!({"command": target.argv[0], "args": target.argv[1..]});
-                if let Some(profile) = &target.profile {
-                    entry["env"] = serde_json::json!({"SAI_HOME": profile});
+                None
+            };
+            match update {
+                JsonUpdate::Repair(_) => {
+                    let entry = current.expect("existing registration checked");
+                    entry.insert("command".into(), Value::from(target.argv[0].clone()));
+                    entry.insert("args".into(), serde_json::json!(target.argv[1..]));
                 }
-                entries.insert(name.to_owned(), entry);
+                JsonUpdate::Install(_) => {
+                    let mut entry =
+                        serde_json::json!({"command": target.argv[0], "args": target.argv[1..]});
+                    if self == Self::Claude {
+                        entry["type"] = serde_json::json!("stdio");
+                    }
+                    if let Some(profile) = &target.profile {
+                        entry["env"] = serde_json::json!({"SAI_HOME": profile});
+                    }
+                    entries.insert(name.to_owned(), entry);
+                }
             }
             let rendered =
                 serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
