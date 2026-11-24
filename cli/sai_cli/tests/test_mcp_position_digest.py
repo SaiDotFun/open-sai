@@ -703,6 +703,157 @@ def position_cli_args(base_url: str, command: list[str]) -> list[str]:
     ]
 
 
+OPEN_ARGS = {
+    "market_id": 0,
+    "side": "long",
+    "amount": "10",
+    "leverage": "2",
+    "slippage": "1",
+}
+OPEN_COMMAND = [
+    "open",
+    "--market",
+    "0",
+    "--side",
+    "long",
+    "--amount",
+    "10",
+    "--leverage",
+    "2",
+    "--slippage",
+    "1",
+]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("chain_id", "test-2"),
+        ("contract_address", "nibi1replacement"),
+        ("lcd_chain_id", "test-2"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("tool", "args", "command"),
+    [
+        pytest.param("close", {"trade_id": 7}, ["close", "7"], id="close"),
+        pytest.param(
+            "close",
+            {"trade_id": 7, "cancel_order": True},
+            ["close", "7", "--cancel-order"],
+            id="cancel",
+        ),
+        pytest.param(
+            "leverage",
+            {"trade_id": 7, "leverage": "3"},
+            ["leverage", "7", "--leverage", "3"],
+            id="leverage",
+        ),
+        pytest.param(
+            "tpsl",
+            {"trade_id": 7, "take_profit": "120"},
+            ["tpsl", "7", "--take-profit", "120"],
+            id="tpsl",
+        ),
+        pytest.param(
+            "open",
+            {**OPEN_ARGS, "order_type": "market"},
+            [*OPEN_COMMAND, "--type", "market"],
+            id="market-open",
+        ),
+        pytest.param(
+            "open",
+            {**OPEN_ARGS, "order_type": "limit", "price": "100"},
+            [*OPEN_COMMAND, "--type", "limit", "--price", "100"],
+            id="limit-open",
+        ),
+        pytest.param(
+            "open",
+            {**OPEN_ARGS, "order_type": "stop", "price": "101"},
+            [*OPEN_COMMAND, "--type", "stop", "--price", "101"],
+            id="stop-open",
+        ),
+    ],
+)
+def test_trade_confirmation_binds_verified_route(
+    position_service: tuple[Position, str],
+    field: str,
+    value: str,
+    tool: str,
+    args: dict[str, Any],
+    command: list[str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    if args.get("cancel_order"):
+        position.trade_type = "limit"
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, command)
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            cli_preview = cli.invoke(main, [*cli_args, "--dry-run"])
+            assert cli_preview.exit_code == 0, cli_preview.output
+            digest = preview["previewDigest"]
+            assert json.loads(cli_preview.stdout)["previewDigest"] == digest
+            assert preview["positionRoute"] == {
+                "chainId": CHAIN_ID,
+                "contractAddress": "nibi1contract",
+            }
+            trade_args = {**args, "preview_digest": digest}
+            if args.get("order_type") == "market":
+                trade_args["reference_price"] = preview["referencePrice"]
+
+            setattr(position, field, value)
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            mcp_error = await call(client, f"trade_{tool}", trade_args)
+            assert cli_error["code"] == mcp_error["code"] == "PREVIEW_MISMATCH"
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+            if field == "contract_address" and tool != "open":
+                position.contract_position_unavailable = True
+                cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+                assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+                assert (
+                    json.loads(cli_refusal.stdout)["error"]["code"]
+                    == "PREVIEW_MISMATCH"
+                )
+                missing_target = await call(client, f"trade_{tool}", trade_args)
+                assert missing_target["code"] == "PREVIEW_MISMATCH"
+                assert "preview" not in missing_target
+                assert position.submitted == []
+                assert not (storage.home() / "intents.sqlite3").exists()
+                position.contract_position_unavailable = False
+
+            if field == "lcd_chain_id":
+                assert "Use an LCD on Keeper's chain" in cli_error["message"]
+                assert "preview" not in mcp_error
+                setattr(position, field, None)
+                accepted = await call(client, f"trade_{tool}", trade_args)
+                assert accepted["status"] == "accepted", accepted
+            else:
+                fresh = await call(client, f"preview_{tool}", args)
+                assert fresh["previewDigest"] == mcp_error["preview"]["previewDigest"]
+                assert fresh["previewDigest"] != digest
+                assert fresh["intent"] == preview["intent"]
+                assert fresh["positionRoute"] == {
+                    "chainId": position.chain_id,
+                    "contractAddress": position.contract_address,
+                }
+                accepted = cli.invoke(
+                    main, [*cli_args, "--preview-digest", fresh["previewDigest"]]
+                )
+                assert accepted.exit_code == 0, accepted.output
+                assert json.loads(accepted.stdout)["status"] == "accepted"
+            assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("field", "value", "route_key"),
     [
@@ -1504,10 +1655,9 @@ def test_mcp_position_estimates_do_not_change_confirmed_terms(
     asyncio.run(scenario())
 
 
-def test_malformed_lcd_keeps_the_limit_preview_and_digest_refusal(position_service):
+def test_malformed_lcd_keeps_the_limit_preview_without_a_digest(position_service):
     position, base_url = position_service
     position.preview_inputs = True
-    position.malformed_node_info = True
     args = {
         "market_id": 0,
         "side": "long",
@@ -1520,28 +1670,20 @@ def test_malformed_lcd_keeps_the_limit_preview_and_digest_refusal(position_servi
 
     async def scenario():
         async with connected_client(base_url) as client:
+            verified = await call(client, "preview_open", args)
+            position.malformed_node_info = True
             quote = await call(client, "preview_open", args)
             assert quote["estimates"]["fees"]["status"] == "unavailable"
+            assert "previewDigest" not in quote
+            assert "positionRoute" not in quote
             refusal = await call(
                 client,
                 "trade_open",
-                {
-                    **args,
-                    "amount": "11",
-                    "preview_digest": quote["previewDigest"],
-                },
+                {**args, "preview_digest": verified["previewDigest"]},
             )
-            assert refusal["code"] == "PREVIEW_MISMATCH"
-            fresh = refusal["preview"]
-            assert fresh["estimates"]["fees"]["status"] == "unavailable"
-            assert fresh["previewDigest"] != quote["previewDigest"]
-            assert (
-                fresh["previewDigest"]
-                == (await call(client, "preview_open", {**args, "amount": "11"}))[
-                    "previewDigest"
-                ]
-            )
+            assert refusal["code"] == "INVALID_REQUEST"
             assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
 
     asyncio.run(scenario())
 

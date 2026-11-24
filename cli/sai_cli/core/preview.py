@@ -220,8 +220,8 @@ def _notional(collateral: int, leverage: Decimal) -> int:
 
 
 def open_estimates(
-    endpoint: str,
     lcd: str | None,
+    contract: str | None,
     body: dict[str, Any],
     row: dict[str, Any] | None,
     market_reference: dict[str, Any] | None,
@@ -244,10 +244,9 @@ def open_estimates(
     )
     fees = unavailable("Perp fee schedule or collateral oracle price is unavailable.")
     liq = unavailable("An entry price and opening fee estimate are required.")
-    if lcd and row is not None:
+    if lcd and contract and row is not None:
         try:
             token_id = row["collateralToken"]["id"]
-            contract = margin.trading_contract(endpoint, lcd)
             pair = contract_market(lcd, contract, body["market"]["marketIndex"])
             if (
                 order_type != "market"

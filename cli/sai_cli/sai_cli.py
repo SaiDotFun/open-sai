@@ -1178,7 +1178,7 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
         return
     output = {"addr": account, **result}
-    if "positionRoute" in result:
+    if confirmation.is_confirmable(output):
         output = confirmation.with_digest(output)
     emit(ctx, output)
 
@@ -1210,6 +1210,27 @@ def warn(message: str) -> None:
     click.echo(message, err=True)
 
 
+def trade_submit_check(
+    load: PinnedSession, digest: str | None
+) -> trading.SubmitCheck | None:
+    if digest is None:
+        return None
+
+    def check(preview: dict[str, Any]) -> None:
+        if digest != confirmation.preview_digest({**preview, "addr": load.addr}):
+            raise trading.PositionChanged(
+                "The trade no longer matches the confirmed preview. Run with"
+                " --dry-run to review a new preview before submitting."
+            )
+
+    return check
+
+
+preview_digest_option = click.option(
+    "--preview-digest", help="Submit only if the trade matches this dry-run digest."
+)
+
+
 @trade.command("open")
 @click.option("--market", "market_id", type=int, required=True)
 @click.option("--side", type=click.Choice(["long", "short"]), required=True)
@@ -1236,6 +1257,7 @@ def warn(message: str) -> None:
     " including a late acknowledgement.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_open(
@@ -1251,6 +1273,7 @@ def trade_open(
     stop_loss: str | None,
     allow_concurrent_open: bool,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Open a market, limit, or stop trade."""
     try:
@@ -1272,6 +1295,7 @@ def trade_open(
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 notify=warn,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, keeper.KeeperError) as exc:
@@ -1286,10 +1310,15 @@ def trade_open(
     help="Cancel a pending order instead of closing a position.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_close(
-    ctx: click.Context, trade_id: int, cancel_order: bool, dry_run: bool
+    ctx: click.Context,
+    trade_id: int,
+    cancel_order: bool,
+    dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Close a position or cancel a pending order."""
     try:
@@ -1302,6 +1331,7 @@ def trade_close(
                 cancel_order=cancel_order,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1315,6 +1345,7 @@ def trade_close(
 @click.option("--clear-take-profit", is_flag=True)
 @click.option("--clear-stop-loss", is_flag=True)
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_tpsl(
@@ -1325,6 +1356,7 @@ def trade_tpsl(
     clear_take_profit: bool,
     clear_stop_loss: bool,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Set or clear take-profit and stop-loss prices."""
     try:
@@ -1340,6 +1372,7 @@ def trade_tpsl(
                 clear_stop_loss=clear_stop_loss,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1350,10 +1383,15 @@ def trade_tpsl(
 @click.argument("trade_id", type=int)
 @click.option("--leverage", required=True, help="Target leverage as a decimal.")
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_leverage(
-    ctx: click.Context, trade_id: int, leverage: str, dry_run: bool
+    ctx: click.Context,
+    trade_id: int,
+    leverage: str,
+    dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Set target leverage without changing TP or SL."""
     try:
@@ -1366,31 +1404,11 @@ def trade_leverage(
                 leverage=leverage,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
         trade_error(ctx, exc)
-
-
-def position_submit_check(
-    load: PinnedSession, digest: str | None
-) -> trading.SubmitCheck | None:
-    if digest is None:
-        return None
-
-    def check(preview: dict[str, Any]) -> None:
-        if digest != confirmation.preview_digest({**preview, "addr": load.addr}):
-            raise trading.PositionChanged(
-                "The trade no longer matches the confirmed preview. Run with"
-                " --dry-run to review a new preview before submitting."
-            )
-
-    return check
-
-
-position_digest_option = click.option(
-    "--preview-digest", help="Submit only if the trade matches this dry-run digest."
-)
 
 
 @trade.command("margin")
@@ -1407,7 +1425,7 @@ position_digest_option = click.option(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
-@position_digest_option
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_margin(
@@ -1434,7 +1452,7 @@ def trade_margin(
                 amount=amount,
                 lcd_endpoint=lcd_url(ctx, lcd_endpoint),
                 dry_run=dry_run,
-                before_submit=position_submit_check(loader(ctx), preview_digest),
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1450,7 +1468,7 @@ def trade_margin(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
-@position_digest_option
+@preview_digest_option
 @wait_option
 @click.pass_context
 def partial_close(
@@ -1472,7 +1490,7 @@ def partial_close(
                 percent=percent,
                 lcd_endpoint=lcd_url(ctx, lcd_endpoint),
                 dry_run=dry_run,
-                before_submit=position_submit_check(loader(ctx), preview_digest),
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:

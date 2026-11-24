@@ -552,9 +552,11 @@ def finish(
     if not dry_run:
         return {**result, "addr": load.pinned}
     preview = {**result, "addr": load.account()}
-    if preview.get("positionOwnerVerified") is False:
-        return preview
-    return confirmation.with_digest(preview)
+    return (
+        confirmation.with_digest(preview)
+        if confirmation.is_confirmable(preview)
+        else preview
+    )
 
 
 # Trading: each action previews with dry_run and submits without it. A
@@ -592,12 +594,6 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
-    if not dry_run:
-        storage.check_open_pending(
-            settings.endpoint,
-            load()["evmAddress"],
-            allow_concurrent_open=allow_concurrent_open,
-        )
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
