@@ -17,8 +17,8 @@ use sai_core::{
     wait,
 };
 use serde::Serialize;
-use serde_json::json;
 use serde_json::ser::{Formatter, PrettyFormatter};
+use serde_json::{Value, json};
 
 use crate::{load_settings, usage};
 
@@ -288,12 +288,44 @@ pub fn intent(
 }
 
 pub(crate) fn emit_wait(
-    wait::ResultReceipt { outcome, mut body }: wait::ResultReceipt,
+    receipt: wait::ResultReceipt,
     endpoint: &str,
     env: &Environment,
     json: bool,
     recovered: bool,
 ) -> Result<ExitCode, SaiError> {
+    let confirmation = match receipt.outcome {
+        outcome @ (wait::Outcome::Rejected | wait::Outcome::NotSent) => Some(outcome),
+        _ => None,
+    };
+    let (body, exit) = wait_output(receipt, endpoint, env, json, recovered);
+    let text = encode(&body, json)?;
+    let mut stdout = io::stdout().lock();
+    if writeln!(stdout, "{}", ascii_json(&text))
+        .and_then(|()| stdout.flush())
+        .is_ok()
+    {
+        return Ok(exit);
+    }
+    let (Some(addr), Some(key)) = (body["addr"].as_str(), body["intentKey"].as_str()) else {
+        return Err(SaiError::internal());
+    };
+    let storage = Storage::new(&env.home);
+    let interrupted = body["interrupted"].as_bool().unwrap_or(false);
+    let receipt = wait::recovery_result(&storage, endpoint, addr, key, interrupted, confirmation);
+    let (body, exit) = wait_output(receipt, endpoint, env, json, true);
+    let text = encode(&body, json)?;
+    let _ = writeln!(io::stderr().lock(), "{}", ascii_json(&text));
+    Ok(exit)
+}
+
+fn wait_output(
+    wait::ResultReceipt { outcome, mut body }: wait::ResultReceipt,
+    endpoint: &str,
+    env: &Environment,
+    json: bool,
+    recovered: bool,
+) -> (Value, ExitCode) {
     let key = body["intentKey"]
         .as_str()
         .expect("receipt intent key")
@@ -304,6 +336,9 @@ pub(crate) fn emit_wait(
             args.extend(["--addr", addr]);
         }
         body["hint"] = json!(Storage::new(&env.home).keeper_command_hint(endpoint, &args));
+    }
+    if let Some(message) = body["message"].as_str() {
+        body["message"] = json!(sai_core::log::redact(&env.home, message));
     }
     let mut exit = ExitCode::Ok;
     if let Some(code) = outcome.code() {
@@ -328,8 +363,7 @@ pub(crate) fn emit_wait(
             body["error"] = error;
         }
     }
-    emit(&body, json)?;
-    Ok(exit)
+    (body, exit)
 }
 
 pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
@@ -428,6 +462,11 @@ impl Formatter for InlineJson {
 }
 
 pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
+    println!("{}", ascii_json(&encode(value, json)?));
+    Ok(())
+}
+
+fn encode(value: &impl Serialize, json: bool) -> Result<String, SaiError> {
     let mut bytes = Vec::new();
     if json {
         value.serialize(&mut serde_json::Serializer::with_formatter(
@@ -440,9 +479,7 @@ pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
         ))
     }
     .map_err(|_| SaiError::internal())?;
-    let text = String::from_utf8(bytes).map_err(|_| SaiError::internal())?;
-    println!("{}", ascii_json(&text));
-    Ok(())
+    String::from_utf8(bytes).map_err(|_| SaiError::internal())
 }
 
 pub fn ascii_json(text: &str) -> std::borrow::Cow<'_, str> {
