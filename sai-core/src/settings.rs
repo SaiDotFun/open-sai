@@ -116,7 +116,7 @@ impl Key {
         let text = raw.trim();
         let name = self.spec().name;
         match self.spec().kind {
-            Kind::Url(_) => self.check_url(text),
+            Kind::Url(_) => self.check_url(raw),
             Kind::Bool => match parse_bool(text) {
                 Some(value) => Ok(Value::Bool(value)),
                 None => Err(SettingsError::invalid(format!(
@@ -199,11 +199,29 @@ impl Key {
         let Kind::Url(schemes) = self.spec().kind else {
             unreachable!()
         };
-        if Endpoint::split(value).is_some_and(|url| schemes.contains(&url.scheme.as_str())) {
+        let error = |detail: &str| {
+            SettingsError::endpoint(format!("Invalid value for {}: {detail}", self.spec().name))
+        };
+        if self.section_and_name().0 == "keeper" && value.contains('#') {
+            return Err(error("remove the URL fragment"));
+        }
+        if value
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+        {
+            return Err(error("URL contains whitespace or control characters"));
+        }
+        if Endpoint::split(value).is_some_and(|url| {
+            let (host, port) = url.host_port();
+            schemes.contains(&url.scheme.as_str())
+                && !host.is_empty()
+                && port.is_ok()
+                && !url.authority.contains('\\')
+        }) {
             return Ok(json!(value));
         }
-        Err(self.expected(&format!(
-            "a URL starting with {}:// or {}://",
+        Err(error(&format!(
+            "expected a URL starting with {}:// or {}://",
             schemes[0], schemes[1]
         )))
     }
@@ -211,7 +229,9 @@ impl Key {
     fn read_value(self, item: &Item, document: &ParsedDocument) -> Result<Value, SettingsError> {
         match self.spec().kind {
             Kind::Url(_) => {
-                self.check_url(item.as_str().ok_or_else(|| self.expected("a URL string"))?)
+                self.check_url(item.as_str().ok_or_else(|| {
+                    SettingsError::endpoint(self.expected("a URL string").message)
+                })?)
             }
             Kind::Bool => item
                 .as_bool()
@@ -286,6 +306,7 @@ fn parse_bool(raw: &str) -> Option<bool> {
 pub struct SettingsError {
     message: String,
     uneditable: bool,
+    invalid_endpoint: bool,
 }
 
 impl SettingsError {
@@ -293,6 +314,21 @@ impl SettingsError {
         Self {
             message,
             uneditable: false,
+            invalid_endpoint: false,
+        }
+    }
+
+    fn endpoint(message: String) -> Self {
+        Self {
+            invalid_endpoint: true,
+            ..Self::invalid(message)
+        }
+    }
+
+    fn with_origin(self, origin: impl fmt::Display) -> Self {
+        Self {
+            message: format!("{origin}: {}", self.message),
+            ..self
         }
     }
 
@@ -313,6 +349,11 @@ impl From<SettingsError> for crate::errors::SaiError {
     fn from(error: SettingsError) -> Self {
         if error.is_uneditable() {
             Self::usage(error.to_string())
+        } else if error.invalid_endpoint {
+            Self {
+                show_usage: false,
+                ..Self::usage(error.to_string())
+            }
         } else {
             Self::new(crate::errors::Code::InvalidRequest, error.to_string())
         }
@@ -436,7 +477,7 @@ impl Settings {
                     } else {
                         key.spec().env
                     };
-                    return Err(SettingsError::invalid(format!("{origin}: {error}")));
+                    return Err(error.with_origin(origin));
                 }
             };
         }
@@ -509,7 +550,7 @@ impl FileSettings {
                     let entry = key.read_value(item, &parsed);
                     if let Err(ref error) = entry {
                         if !key.is_log() {
-                            return Err(SettingsError::invalid(format!("{path}: {error}")));
+                            return Err(error.clone().with_origin(path));
                         }
                         file.warnings
                             .push(format!("{path}: {error}; logging is off until it is fixed"));
@@ -548,10 +589,18 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
     if let Some(raw) = flags.value(key) {
         (key.parse_value(raw), Source::Flag)
     } else if let Some(raw) = env.raw(key) {
-        let value = raw
-            .to_str()
-            .and_then(|raw| key.parse_value(raw).ok())
-            .ok_or_else(|| key.invalid_env_value());
+        let value = raw.to_str().map_or_else(
+            || Err(key.invalid_env_value()),
+            |raw| {
+                key.parse_value(raw).map_err(|error| {
+                    if error.invalid_endpoint {
+                        error
+                    } else {
+                        key.invalid_env_value()
+                    }
+                })
+            },
+        );
         (value, Source::Env)
     } else if let Some(value) = file {
         (value.clone(), Source::File)

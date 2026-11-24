@@ -216,6 +216,7 @@ fn uneditable(section: &str, path: &Path) -> SettingsError {
             path.display()
         ),
         uneditable: true,
+        invalid_endpoint: false,
     }
 }
 

@@ -615,3 +615,28 @@ def test_local_usage_matches_click(
         result = invoke(cli, tmp_path / str(index), *args)
         outputs.append((result.returncode, result.stdout, result.stderr))
     assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--json", "config", "set", "keeper.endpoint", "https://fixture.invalid:abc"),
+        ("--json", "config", "set", "keeper.endpoint", "https://fixture.invalid:65536"),
+        ("--json", "config", "set", "keeper.endpoint", "https://host space.invalid"),
+        ("--json", "--endpoint", "https://fixture.invalid:abc", "config", "list"),
+        ("--endpoint", "https://fixture.invalid/#fragment", "config", "list"),
+    ],
+)
+def test_malformed_endpoints(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    args: tuple[str, ...],
+) -> None:
+    outputs = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        result = invoke(cli, root, *args)
+        assert result.returncode == 2
+        assert not (root / "sai-home").exists()
+        outputs.append((result.stdout, result.stderr))
+    assert outputs[0] == outputs[1]
