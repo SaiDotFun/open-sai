@@ -34,14 +34,15 @@ pub(crate) fn help(command: &str) -> Option<String> {
         entry = entry.find_subcommand(leaf)?;
     }
     let description = entry.get_about()?;
-    let mut text = format!("{}\n\n  {description}\n\nOptions:\n", usage(command));
+    // Clap strips the final period from each doc comment's short help.
+    let mut text = format!("{}\n\n  {description}.\n\nOptions:\n", usage(command));
     let help_column = if let Some(arg) = entry
         .get_arguments()
         .find(|arg| arg.get_long() == Some("ws-endpoint"))
     {
         text.push_str("  --ws-endpoint TEXT");
         if let Some(help) = arg.get_help() {
-            write!(text, "  {help}").ok()?;
+            write!(text, "  {help}.").ok()?;
         }
         text.push('\n');
         18
@@ -61,7 +62,7 @@ pub(crate) fn help(command: &str) -> Option<String> {
         for child in children {
             write!(
                 text,
-                "\n  {:<width$}  {}",
+                "\n  {:<width$}  {}.",
                 child.get_name(),
                 child.get_about()?,
             )
@@ -174,7 +175,6 @@ pub(crate) enum WatchCommand {
     },
     /// Follow the current price of TOKEN_ID.
     Price {
-        #[arg(allow_negative_numbers = true)]
         token_id: String,
         #[arg(long, overrides_with = "ws_endpoint")]
         ws_endpoint: Option<String>,
