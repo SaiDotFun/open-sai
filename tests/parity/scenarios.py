@@ -12,8 +12,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -265,6 +265,8 @@ def write_seed(
 def loopback(
     scenario: str,
     *,
+    trade_replay: Callable[[WireRequest, str | None], dict[str, Any] | None]
+    | None = None,
     market_price: float | None = None,
     cancel_target: str | None = None,
     close_target: str | None = None,
@@ -612,8 +614,35 @@ def loopback(
                     return
                 wire.append(request)
                 name = request.label
+                if trade_replay is not None and name in {
+                    "recordUserIntent",
+                    "userIntents",
+                    "waitUserIntents",
+                    "tradeHistory",
+                    "intentTradeHistory",
+                }:
+                    try:
+                        reply = trade_replay(request, self.headers.get("Authorization"))
+                    except (TypeError, ValueError) as exc:
+                        self.reject(str(exc))
+                    else:
+                        if reply is None:
+                            self.close_connection = True
+                        else:
+                            with suppress(BrokenPipeError, ConnectionResetError):
+                                self.reply(reply)
+                    return
                 if name == "recordUserIntent" and scenario == "concurrent-close":
                     self.admit_close(request.variables)
+                    return
+                if (
+                    scenario == "confirmation-account-change"
+                    and name == "trade"
+                    and same_variables(
+                        request.variables, {"trader": OTHER_ADDRESS, "id": 7}
+                    )
+                ):
+                    self.reply({"data": {"perp": {"trade": None}}})
                     return
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
                     self.admit_trade(request.variables)
@@ -786,17 +815,17 @@ def loopback(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        expected = {name: contract_args[name]}
+                        expected = [{name: contract_args[name]}]
                         # Ownership uses the account address. The next read
                         # uses Perp's stored owner to pin the quote.
-                        if (
-                            scenario == "concurrent-close"
-                            and name == "get_trade_raw"
-                            and query
-                            == {name: {"trader": position["trader"], "index": 7}}
-                        ):
-                            expected = query
-                        if not same_variables(query, expected):
+                        if name == "get_trade_raw":
+                            if scenario == "concurrent-close":
+                                expected.append(
+                                    {name: {"trader": position["trader"], "index": 7}}
+                                )
+                            if trade_replay is not None:
+                                expected.append({name: {"trader": ADDRESS, "index": 7}})
+                        if not any(same_variables(query, args) for args in expected):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
