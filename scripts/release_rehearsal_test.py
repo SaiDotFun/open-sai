@@ -754,7 +754,7 @@ class KeeperReplayTest(unittest.TestCase):
     def test_projects_nested_and_aliased_fields(self) -> None:
         fields = REHEARSAL["selection_set"](
             "query TradeStatus($key: String) {\n"
-            " rows: userIntents(where:{intentKey:$key}) { intentKey # errorCode\n"
+            ' rows: userIntents(where:{user:"fixture", intentKey:$key}) { intentKey # errorCode\n'
             " trade { owner: trader } } }"
         )
         payload = {
@@ -1038,6 +1038,38 @@ query($user: String!, $key: String, $other: DECLARATION) {
                     ):
                         with self.assertRaises(HTTPError) as error:
                             self.query(base, invalid_query, filter=invalid_filters)
+                        with error.exception as response:
+                            self.assertEqual(response.code, 400)
+
+    def test_invalid_inline_filters_reject_all_aliases(self) -> None:
+        self.replay.history = [{"id": 1, "trade": {"trader": self.replay.addr}}]
+        cases = (
+            (
+                """query($trader:String!, $key:String) { perp {
+                  matching: tradeHistory(where:{trader:$trader}) { id }
+                  other: tradeHistory(where:FILTER) { id }
+                } }""",
+                ("{trader:$trader, intentKey:$key}", "{}", "{trader:null}", "[]"),
+            ),
+            (
+                """query($trader:String!, $key:String) {
+                  matching: userIntents(where:{user:$trader, intentKey:$key}) { intentKey }
+                  other: userIntents(where:FILTER) { intentKey }
+                }""",
+                ("{user:$trader, intentKey:ENUM}", "{}", "null"),
+            ),
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for query, filters in cases:
+                for filter_text in filters:
+                    with self.subTest(filter=filter_text):
+                        with self.assertRaises(HTTPError) as error:
+                            self.query(
+                                base,
+                                query.replace("FILTER", filter_text),
+                                trader=self.replay.addr,
+                                key=self.key,
+                            )
                         with error.exception as response:
                             self.assertEqual(response.code, 400)
 

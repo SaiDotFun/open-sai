@@ -486,14 +486,14 @@ def expected_variable_type(path: tuple[str, ...]) -> str | None:
     return None
 
 
-def validate_variable(type_name: str, item: Any) -> None:
+def validate_input(type_name: str, item: Any) -> None:
     name = type_name.removesuffix("!")
     if item is None:
         if name != type_name:
             raise ValueError(f"Missing value for non-null GraphQL type {type_name}")
     elif name.startswith("["):
         for element in item if isinstance(item, list) else [item]:
-            validate_variable(name[1:-1], element)
+            validate_input(name[1:-1], element)
     elif name in VARIABLE_SCALARS and type(item) is not VARIABLE_SCALARS[name]:
         raise ValueError(f"Invalid value for GraphQL scalar {name}")
     elif name in FILTER_INPUT_FIELDS:
@@ -501,7 +501,7 @@ def validate_variable(type_name: str, item: Any) -> None:
         if not isinstance(item, dict) or item.keys() - fields.keys():
             raise ValueError(f"Invalid value for GraphQL input object {name}")
         for field, field_type in fields.items():
-            validate_variable(field_type, item.get(field))
+            validate_input(field_type, item.get(field))
 
 
 def selection_set(
@@ -554,7 +554,7 @@ def selection_set(
             if tokens[0] == "=":
                 tokens.popleft()
                 default = value(None)
-                validate_variable(type_name, default)
+                validate_input(type_name, default)
             if name in declared:
                 raise ValueError("Duplicate GraphQL variable declaration")
             declared[name] = type_name, default
@@ -562,7 +562,7 @@ def selection_set(
         # Coerce all declared variables before evaluating any selection.
         for name, (type_name, default) in declared.items():
             bound = supplied.get(name, default)
-            validate_variable(type_name, bound)
+            validate_input(type_name, bound)
             bindings[name] = bound
 
     def named_values(end: str, path: tuple[str, ...] | None) -> dict[str, Any]:
@@ -593,7 +593,7 @@ def selection_set(
                     raise ValueError(
                         f"Expected a {expected} variable at {'.'.join(path)}"
                     )
-                validate_variable(expected, bindings[name])
+                validate_input(expected, bindings[name])
             return bindings[name]
         if token == "{":
             return named_values("}", path)
@@ -604,10 +604,8 @@ def selection_set(
             tokens.popleft()
             return items
         if re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", token):
-            # Keep enum defaults distinct from null during variable validation.
-            return {"true": True, "false": False, "null": None}.get(
-                token, ENUM_LITERAL if path is None else None
-            )
+            # An enum literal is distinct from both null and a string.
+            return {"true": True, "false": False, "null": None}.get(token, ENUM_LITERAL)
         return json.loads(token)
 
     def included() -> bool:
@@ -622,7 +620,7 @@ def selection_set(
             if arguments.keys() != {"if"}:
                 raise ValueError("Expected an 'if' argument for the GraphQL directive")
             condition = arguments["if"]
-            validate_variable("Boolean!", condition)
+            validate_input("Boolean!", condition)
             directives[name] = condition
         return directives.get("include", True) and not directives.get("skip", False)
 
@@ -640,6 +638,8 @@ def selection_set(
             if tokens[0] == "(":
                 tokens.popleft()
                 arguments = named_values(")", (name,))
+            if filter_type := FILTER_ARGUMENT_TYPES.get(name):
+                validate_input(filter_type, arguments.get("where"))
             include = included()
             children = fields() if tokens[0] == "{" else None
             if include:
