@@ -91,7 +91,15 @@ def session(ctx: click.Context) -> dict[str, str]:
     return sessions.load_active_session(keeper_url(ctx), ctx.obj["as_addr"])
 
 
-def command_path(group: click.Group, args: list[str]) -> tuple[list[str], int]:
+def command_path(group: click.Group, args: list[str]) -> list[str]:
+    """Find the command names past the options and their values."""
+    names, _ = _command_path_and_tail(group, args)
+    return names
+
+
+def _command_path_and_tail(
+    group: click.Group, args: list[str]
+) -> tuple[list[str], int]:
     """Find the command names and the index after the last command name."""
     names: list[str] = []
     current: click.Command = group
@@ -290,7 +298,7 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names, tail = command_path(self, argv)
+        names, tail = _command_path_and_tail(self, argv)
         quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")

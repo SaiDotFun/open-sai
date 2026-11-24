@@ -17,7 +17,16 @@ from compare import (
     sqlite_schema,
     stdout,
 )
-from parity import Observation, differences
+from parity import Case, Observation, differences
+
+
+def test_case_command_skips_global_options() -> None:
+    case = Case(
+        name="config-list",
+        args=["--endpoint", "https://keeper.invalid", "--json", "config", "list"],
+    )
+
+    assert case.command == "config list"
 
 
 @pytest.mark.parametrize(

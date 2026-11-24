@@ -751,20 +751,17 @@ def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper
 
 
 def test_command_path_skips_options_and_their_values():
-    assert command_path(main, ["--endpoint", "market", "market", "prices"]) == (
-        ["market", "prices"],
-        4,
-    )
-    assert command_path(main, ["--json", "--endpoint=x", "auth", "use", "0xabc"]) == (
-        ["auth", "use"],
-        4,
-    )
-    assert command_path(main, ["mcp", "serve", "--endpoint", "x"]) == (
-        ["mcp", "serve"],
-        2,
-    )
-    assert command_path(main, []) == ([], 0)
-    assert command_path(main, ["nope", "market"]) == ([], 0)
+    assert command_path(main, ["--endpoint", "market", "market", "prices"]) == [
+        "market",
+        "prices",
+    ]
+    assert command_path(main, ["--json", "--endpoint=x", "auth", "use", "0xabc"]) == [
+        "auth",
+        "use",
+    ]
+    assert command_path(main, ["mcp", "serve", "--endpoint", "x"]) == ["mcp", "serve"]
+    assert command_path(main, []) == []
+    assert command_path(main, ["nope", "market"]) == []
 
 
 def test_help_version_and_skill_write_nothing(home):
