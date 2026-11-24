@@ -330,12 +330,22 @@ def test_c11_rejects_endpoints_before_network_io(
         ("l·l.example", True),
         ("bücher.xn--bcher-kva", True),
         ("bücher.xn--n3h", False),
+        ("999.0.0.1", False),
+        ("127.0.0.01", False),
+        ("192.168.001.1", False),
+        ("0177.0.0.1", False),
+        ("127.0.256.1", False),
+        ("127.0.0.1", True),
+        ("0.0.0.0", True),
+        ("255.255.255.255", True),
+        ("host_1.localhost", True),
+        ("123.45.67.example", True),
     ],
 )
-def test_c11_http_idna_hostname(
+def test_c11_http_hostname(
     c11_cli_pair: tuple[CLI, CLI], tmp_path: Path, host: str, accepted: bool
 ) -> None:
-    endpoint = f"http://{host}/query"
+    endpoint = f"https://{host}/query"
     for index, cli in enumerate(c11_cli_pair):
         result = invoke(
             cli,

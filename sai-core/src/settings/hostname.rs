@@ -1,6 +1,6 @@
 //! The hostname checks HTTPX applies to HTTP endpoint settings.
 
-use std::sync::LazyLock;
+use std::{net::Ipv4Addr, sync::LazyLock};
 
 use regex::Regex;
 use unicode_normalization::is_nfc;
@@ -15,7 +15,11 @@ pub(super) fn valid_http_host(authority: &str, host: &str) -> bool {
     }
     // HTTPX chooses its ASCII branch before lowercasing the registered name.
     if authority.is_ascii() {
-        return true;
+        let ipv4_style = host.split('.').count() == 4
+            && host
+                .split('.')
+                .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()));
+        return !ipv4_style || host.parse::<Ipv4Addr>().is_ok();
     }
 
     const DOTS: [char; 4] = ['.', '\u{3002}', '\u{FF0E}', '\u{FF61}'];
