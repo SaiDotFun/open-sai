@@ -31,6 +31,11 @@ TOKEN = "fake-token"
 CHAIN_ID = "test-1"
 TRADER = "nibi1424242424242424242424242424242422mldj0"
 OTHER_TRADER = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
+CLI_POSITION_ACTIONS = (
+    ("close", "7"),
+    ("leverage", "7", "--leverage", "3"),
+    ("tpsl", "7", "--take-profit", "120"),
+)
 
 
 @dataclass
@@ -42,6 +47,7 @@ class Position:
     trade_type: str = "trade"
     keeper_market_open: bool = True
     market_trading_state: str = "open"
+    switch_and_logout_on_keeper_read: str | None = None
     logout_on_position_read: bool = False
     missing_trade_status: int = 400
     leverage: str = "2"
@@ -99,6 +105,10 @@ def position_service() -> Iterator[tuple[Position, str]]:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             indexed_collateral = position.collateral
             if request["query"] == keeper.POSITION:
+                if position.switch_and_logout_on_keeper_read is not None:
+                    storage.use_session(position.switch_and_logout_on_keeper_read)
+                    assert storage.delete_session(ADDR) == ADDR
+                    position.switch_and_logout_on_keeper_read = None
                 if position.snapshot_leverages:
                     position.leverage = position.snapshot_leverages.popleft()
                 if position.snapshot_traders:
@@ -422,9 +432,7 @@ async def call(
 @pytest.mark.parametrize(
     "command",
     [
-        ("close", "7"),
-        ("leverage", "7", "--leverage", "3"),
-        ("tpsl", "7", "--take-profit", "120"),
+        *CLI_POSITION_ACTIONS,
         ("margin", "7", "--direction", "add", "--amount", "1"),
         ("partial-close", "7", "--percent", "50"),
     ],
@@ -446,6 +454,26 @@ def test_cli_refuses_another_accounts_position(position_service, command):
         assert error["message"] == "Keeper position belongs to a different account"
 
     assert position.position_reads == 0
+    assert position.submitted == []
+    assert not (storage.home() / "intents.sqlite3").exists()
+
+
+@pytest.mark.parametrize("command", CLI_POSITION_ACTIONS)
+def test_cli_refuses_logout_during_keeper_position_read(position_service, command):
+    position, base_url = position_service
+    endpoint = f"{base_url}/query"
+    save_session(endpoint)
+    other_account = "0x" + "b" * 40
+    storage.save_session({**storage.load_session(), "evmAddress": other_account})
+    storage.use_session(ADDR)
+    position.switch_and_logout_on_keeper_read = other_account
+
+    args = ["--json", "--endpoint", endpoint, "--lcd-endpoint", base_url, "trade"]
+    result = CliRunner().invoke(main, [*args, *command])
+    assert position.switch_and_logout_on_keeper_read is None
+    assert storage.load_session()["evmAddress"] == other_account
+    assert result.exit_code == 6, result.output
+    assert json.loads(result.stdout)["error"]["code"] == "SIGNED_OUT"
     assert position.submitted == []
     assert not (storage.home() / "intents.sqlite3").exists()
 

@@ -356,19 +356,19 @@ def _position_intent(
     target: Decimal | None = None,
     updates_triggers: bool = False,
 ) -> dict[str, Any]:
-    active = get_session()
-    addr = active["evmAddress"]
+    addr = get_session()["evmAddress"]
     indexed = margin.indexed_position(endpoint, addr, trade_id)
-    return preview_or_submit(
-        endpoint,
-        lambda: active,
-        payload,
-        dry_run,
-        before_submit,
-        lambda _: _estimate_position(
+    preview = {"dryRun": True, "intent": payload}
+
+    def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
+        return _estimate_position(
             endpoint, lcd, addr, trade_id, indexed, target, updates_triggers
-        ),
-    )
+        )
+
+    if dry_run:
+        return {**preview, "estimates": estimate(preview)}
+    _checked(before_submit, preview, estimate)
+    return intents.submit(endpoint, get_session(), payload)
 
 
 def _estimate_position(
