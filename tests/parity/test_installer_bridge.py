@@ -571,6 +571,84 @@ def pre_bridge_files() -> tuple[Path, Path]:
     return baseline / f"sai_cli-{PRE_BRIDGE}-py3-none-any.whl", baseline / "install.py"
 
 
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_native_updater_recovers_an_interrupted_bridge(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel, shim = artifact("BRIDGE"), artifact("SHIM")
+    binary = artifact("RECOVERY_RUST")
+    prepare_uv(install, python_wheel, replay)
+    profile, contents = save_profile(install, replay)
+    previous = install.launcher.resolve(strict=True)
+    version = add_shim(replay, shim, binary)
+    kill_after_uv = """
+import os, signal, sys
+from sai_cli.sai_cli import main
+launcher, *args = sys.argv[1:]
+def interrupt(event, values):
+    if (event == 'subprocess.Popen'
+        and [os.fsdecode(value) for value in values[1]] == [launcher, '--version']):
+        os.kill(os.getpid(), signal.SIGKILL)
+sys.addaudithook(interrupt)
+sys.argv = [launcher, *args]
+main()
+"""
+    result = install.run(
+        install.tools / "sai-cli" / "bin" / "python",
+        "-I",
+        "-c",
+        kill_after_uv,
+        install.launcher,
+        "update",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    pre_mcp_xfail(result)
+    assert result.returncode == -9, (result.stdout, result.stderr)
+    record = install.tools / ".sai-cli-native-pending.json"
+    assert json.loads(record.read_text())["next"]["version"] == version
+    del replay.assets[
+        f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+    ]
+    install.pin(version)
+    result = install.run(
+        install.launcher,
+        "--json",
+        "update",
+        "--recover",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert json.loads(ok(result))["status"] == "recovered"
+    install.pin(wheel_version(python_wheel))
+    assert install.launcher.resolve(strict=True) == previous
+    assert profile.read_bytes() == contents
+    assert not record.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_requires_an_offline_rollback_install(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel, shim = artifact("BRIDGE"), artifact("SHIM")
+    prepare_uv(install, python_wheel, replay)
+    add_shim(replay, shim, artifact("RUST"))
+    install.env["UV_CACHE_DIR"] = str(install.home / "empty-uv-cache")
+    result = install.update(replay)
+    pre_mcp_xfail(result)
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert (
+        "rollback wheel failed its offline trial install"
+        in json.loads(result.stdout)["error"]["message"]
+    )
+    install.pin(wheel_version(python_wheel))
+    assert not (install.tools / ".sai-cli-native-pending.json").exists()
+
+
 def test_python_bridge_rejects_cross_origin_manifest_redirect(
     install: Install, replay: Replay
 ) -> None:
