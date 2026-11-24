@@ -112,7 +112,7 @@ jobs:
           archives=(dist/native/sai-*.tar.gz)
           wheels=(dist/native-shim/sai_cli-*.whl)
           UV="$(command -v uv)" SAI_NATIVE_ARCHIVE="${archives[0]}" SAI_NATIVE_WHEEL="${wheels[0]}" \
-            uv run --locked pytest tests/parity/test_native_distribution.py
+            uv run --locked pytest -rx tests/parity/test_native_distribution.py
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: native-part-${{ matrix.target }}

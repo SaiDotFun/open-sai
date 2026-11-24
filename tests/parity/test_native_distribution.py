@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 BASELINE = "0.1.1"
 # Published full Python release, which predates the handoff to native Sai.
 BASELINE_COMMIT = "9ee5a356fd41a22697483e467652d367035909bd"
+MCP_PENDING = "Native MCP startup requires C8 (PR #120)"
 
 
 @pytest.fixture
@@ -75,6 +76,44 @@ def offline_env(distribution: SimpleNamespace, base: str, proxy: socket.socket) 
         distribution.rehearsal.loopback_env(base, proxy.getsockname()[1])
     )
     distribution.tool.env["SAI_NATIVE_RELEASE_BASE"] = base
+
+
+def verify_mcp_startup(distribution: SimpleNamespace) -> None:
+    d = distribution
+    command = (d.tool.sai, "mcp", "serve")
+    initialize = {"jsonrpc": "2.0", **d.rehearsal.MCP_REQUESTS[0]}
+    try:
+        with d.tool.stdio("Initialize native MCP", *command) as (send, receive):
+            send.write((json.dumps(initialize) + "\n").encode())
+            send.flush()
+            reply = json.loads(receive.line("MCP initialize"))
+    except (d.rehearsal.RehearsalError, BrokenPipeError):
+        # C8 adds this module. Once it lands, even a missing command is a
+        # failure. Until then, only the known missing-command error is xfail.
+        if not (ROOT / "sai" / "src" / "mcp.rs").is_file():
+            probe = d.tool.run("Check missing MCP command", *command, check=False)
+            if (
+                probe.returncode == 2
+                and not probe.stdout
+                and "No such command 'mcp'" in probe.stderr
+            ):
+                pytest.xfail(MCP_PENDING)
+        raise
+    assert reply["jsonrpc"] == "2.0" and reply["id"] == initialize["id"]
+    assert reply["result"]["protocolVersion"]
+    assert reply["result"]["serverInfo"]["name"]
+
+
+def test_native_archive_initializes_mcp(distribution: SimpleNamespace) -> None:
+    d = distribution
+    d.replay.add_release(d.wheel, d.version, d.archive)
+    with (
+        d.rehearsal.keeper_server(d.replay.handler()) as base,
+        closing(socket.socket()) as proxy,
+    ):
+        offline_env(d, base, proxy)
+        run(d.tool, "Install the shim wheel", d.tool.uv, "tool", "install", d.wheel)
+        verify_mcp_startup(d)
 
 
 @pytest.mark.parametrize(
@@ -349,8 +388,10 @@ def test_native_shim_rejects_invalid_release_or_cache(
         assert replay.get_requests == []
 
 
-def test_published_python_updater_can_skip_bridge_and_roll_back_offline(
+@pytest.mark.parametrize("check_mcp", [False, True], ids=["rollback", "mcp-startup"])
+def test_published_python_updater_can_skip_bridge(
     distribution: SimpleNamespace,
+    check_mcp: bool,
 ) -> None:
     baseline_dir = os.environ.get("SAI_NATIVE_BASELINE")
     if not baseline_dir:
@@ -452,6 +493,9 @@ def test_published_python_updater_can_skip_bridge_and_roll_back_offline(
             )
             assert config.read_bytes() == configured
             assert ledger.stat().st_ino == inode
+            if check_mcp:
+                verify_mcp_startup(d)
+                return
 
         tool.verify_version(d.version)
         # Reinstall the baseline wheel already verified and kept by the old installer.
