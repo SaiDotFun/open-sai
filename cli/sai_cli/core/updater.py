@@ -1104,6 +1104,11 @@ def _install(
         )
         return Outcome(FAILED, message, installed, target), False
 
+    def available() -> tuple[Outcome, bool]:
+        discard()
+        message = f"sai {target} is available. Run `sai update` to install it."
+        return Outcome(AVAILABLE, message, installed, target), False
+
     if options.source:
         # The full ref: a branch named like the tag must not shadow it.
         spec = f"git+{options.git_url}@refs/tags/{release.tag}"
@@ -1148,9 +1153,7 @@ def _install(
     try:
         if options.allowed is not None and not options.allowed():
             # Turned off while this run downloaded and tested the release.
-            discard()
-            message = f"sai {target} is available. Run `sai update` to install it."
-            return Outcome(AVAILABLE, message, installed, target), False
+            return available()
 
         def failed(reason: str) -> tuple[Outcome, bool]:
             """Report REASON after making sure the previous version runs."""
@@ -1192,6 +1195,9 @@ def _install(
                     )
                 previous, kept = record_bridge(current, rollback.wheel, wheel)
                 pending_written = True
+                if options.allowed is not None and not options.allowed():
+                    clear_bridge_record(prefix)
+                    return available()
                 rollback = replace(
                     rollback, wheel=(rollback.wheel[0], rollback.wheel[1], previous)
                 )

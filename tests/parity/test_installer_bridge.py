@@ -785,6 +785,49 @@ def test_bridge_requires_an_offline_rollback_install(
     assert not (install.tools / ".sai-cli-native-pending.json").exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_honors_opt_out_during_the_offline_rollback_trial(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    add_shim(replay, artifact("SHIM"), artifact("RUST"))
+    profile, _ = save_profile(install, replay)
+    opt_out = """
+import sys
+from pathlib import Path
+from sai_cli.sai_cli import main
+profile, launcher, *args = sys.argv[1:]
+def during_trial(event, values):
+    if event == 'subprocess.Popen' and list(values[1])[1:4] == ['pip', 'install', '--offline']:
+        with Path(profile).open('a') as config:
+            config.write('\\n[update]\\nauto = false\\n')
+sys.addaudithook(during_trial)
+sys.argv = [launcher, *args]
+main()
+"""
+    result = install.run(
+        install.tools / "sai-cli" / "bin" / "python",
+        "-I",
+        "-c",
+        opt_out,
+        profile,
+        install.launcher,
+        "update",
+        "--background",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    ok(result)
+    assert "auto = false" in profile.read_text()
+    state = json.loads((install.profile / "update.json").read_text())
+    assert state["result"]["status"] == "available"
+    install.pin(wheel_version(python_wheel))
+    assert not (install.tools / ".sai-cli-native-pending.json").exists()
+
+
 def test_python_bridge_rejects_cross_origin_manifest_redirect(
     install: Install, replay: Replay
 ) -> None:
