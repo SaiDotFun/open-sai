@@ -22,7 +22,7 @@ the CLI or the MCP tools. A mistake here spends the person's money.
      confirmation, and check that the preview's `addr` is the account the
      person named. Trade IDs are per account and per network: `trade close
      42` elsewhere closes a different position.
-3. **State the worst-case fill of a market order.** Two separate checks apply,
+3. **Show the worst-case fill from the preview.** Two checks apply to market opens,
    and neither holds the fill to the quoted price plus one slippage.
    - The quote check, MCP only: `trade_open` refuses with `PRICE_MOVED` when
      the price it reads at submit differs from the confirmed
@@ -34,11 +34,12 @@ the CLI or the MCP tools. A mistake here spends the person's money.
      check at 60,600, and can then fill up to 61,206. Through MCP the worst
      case is the confirmed price moved by the slippage twice,
      `reference × (1 + s)²` for a long and `reference × (1 − s)²` for a
-     short. Through the CLI there is no quote check: the dry run shows no
-     price, and the worst case is the market price at submit moved by the
-     slippage once, with no tie to any price the person saw.
-   - Before asking for confirmation, compute the worst-case fill and give
-     the person that number, not only the quote.
+     short. A CLI dry run estimates the fill using one application of
+     slippage to the current Keeper price or to the supplied `--price`.
+     The live CLI uses the price it reads at submit, so this estimate can
+     move between dry run and submit.
+   - Before asking for confirmation, give the person the reported
+     `estimates.worstCaseFill` and explain its status.
    - No order type gives a hard price ceiling. To keep an MCP market long
      under a ceiling `C` from reference `R`, the slippage must satisfy
      `R × (1 + s)² ≤ C`, so `s ≤ sqrt(C / R) − 1`, rounded down. For a
@@ -56,6 +57,7 @@ the CLI or the MCP tools. A mistake here spends the person's money.
      below 60,600 to 62,000, a long stop at 60,600 fills near 62,000. Tell
      the person the stop price is where the order starts, not where it
      fills.
+   - Keeper's full and partial close intents carry no slippage limit.
    - Prefer MCP tools `preview_open` and `trade_open` when approval depends
      on a quoted price.
 4. **Accepted is not executed.** `accepted` means Keeper admitted the intent.
@@ -118,6 +120,32 @@ leverage, and the contract inputs used to quote the requested slice. The quote
 uses the applicable after-hours leverage cap, collateral/USD oracle price, and
 Perp's rounding. A change to those inputs requires a new confirmation.
 [mcp.md](mcp.md#preview-confirm-then-trade) lists what each digest covers.
+
+## Reading the Estimates
+
+CLI dry runs and MCP previews return the `estimates` object. In the CLI,
+both the indented output and `--json` include these fields.
+
+| Field | Inputs and precision |
+| --- | --- |
+| `fees.amountUsdc` | Keeper's indexed market fee rates and the Perp collateral oracle. Perp floors each component to six-decimal USDC base units. Opens and closes show undiscounted execution fees. The `excludes` list names omitted costs and discounts. |
+| `liquidationPrice.price` | Perp's 90% PnL threshold and two 5% liquidation fee components, floored separately. Opens use the reference or trigger as the entry and deduct the estimated opening fees from collateral. Position changes use the stored entry price and the projected collateral and leverage. The estimate excludes accrued borrowing fees. |
+| `worstCaseFill.price` | Keeper's market price, the supplied CLI market reference, or the order trigger. Perp rounds each slippage distance down to 18 decimal places. The `side` field identifies an upper bound for a long or a lower bound for a short. |
+
+The `observedAt` field gives the UTC time the CLI or MCP server read a
+price. Oracle publication can predate that read. User-supplied references
+and triggers have no observation timestamp.
+
+Show `unavailable` when a required input is missing. An `unbounded` fill has
+no advance price limit. A full close leaves no liquidation price. TP/SL
+changes leave the liquidation price unchanged, and margin and leverage
+updates have no fill price. For partial closes, the liquidation estimate
+assumes the closed slice covers its own losses and fees. An after-hours
+leverage adjustment can change that projection or close the position.
+
+MCP binds the existing intent, reference price, and position quote. The
+`estimates` object is informational. If its figures affect the person's
+decision, refresh the preview and confirm the updated figures.
 
 ## CLI Trade Commands
 
@@ -193,8 +221,8 @@ took a while to answer, and ask again when it differs.
 What each command checks:
 
 - **Market open.** The CLI refreshes the market price before admission and
-  includes the reference price in the accepted response. A dry run reports
-  that a price refresh is still required and shows no price. See rule 3.
+  includes the reference price in the accepted response. A dry run can
+  show a reference price and still reports that submit must refresh it.
 - **Partial close.** It reads the live position from the Perp contract, in
   dry-run mode too, and refuses while Keeper's index lags the contract.
 - **Margin.** It quotes from live contract state, in dry-run mode too, and

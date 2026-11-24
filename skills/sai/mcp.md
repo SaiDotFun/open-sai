@@ -87,8 +87,8 @@ for the token and never returns it.
    every preview and trade. Without `addr` a tool acts on whichever account
    is active at that moment, and another terminal or client can switch it.
 2. Show the person the preview, the `addr` it names, and the network from
-   `mcp_info`. For a market open, also give the worst-case fill described
-   below. Wait for explicit confirmation.
+   `mcp_info`. Give the fees, liquidation price, and worst-case fill from
+   `estimates` where available. Wait for explicit confirmation.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
@@ -117,6 +117,9 @@ the one the person confirmed. The digest covers:
   including the applicable after-hours cap and collateral/USD oracle price.
   Show the quoted notional and say whether `quote.closedNotionalIsEstimate`
   is true.
+
+The `estimates` object is informational. The price sources, time fields,
+and fee exclusions are in [Reading the Estimates](trading-safety.md#reading-the-estimates).
 
 ### Market Opens: Quote Check and Fill Bound
 
