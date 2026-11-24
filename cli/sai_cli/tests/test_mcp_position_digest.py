@@ -6,7 +6,7 @@ import asyncio
 import base64
 import json
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -138,7 +138,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
 
 
 @asynccontextmanager
-async def connected_client(base_url: str) -> AsyncIterator[ClientSession]:
+async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
     endpoint = f"{base_url}/query"
     storage.save_session(
         {
