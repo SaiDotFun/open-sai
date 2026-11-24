@@ -475,7 +475,11 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
         keeper,
         "request",
         lambda *args, **kwargs: {
-            "oneClickTrading": {"enabled": True, "chainId": "cataclysm-1"}
+            "oneClickTrading": {
+                "enabled": True,
+                "chainId": "cataclysm-1",
+                "contractAddress": "test-contract",
+            }
         },
     )
     monkeypatch.setattr(
@@ -483,7 +487,7 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
         "_get_json",
         lambda url: {"default_node_info": {"network": "nibiru-testnet-2"}},
     )
-    with pytest.raises(ValueError, match="network do not match"):
+    with pytest.raises(margin.TradingNetworkMismatch, match="network do not match"):
         margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 1)
 
 

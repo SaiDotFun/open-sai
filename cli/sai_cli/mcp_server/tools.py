@@ -148,7 +148,7 @@ def describe(exc: Exception) -> dict[str, Any]:
         if exc.preview is None:
             return error(failure.message, Code.PREVIEW_MISMATCH)
         return error(
-            "The position or quote changed during confirmation, so nothing was"
+            "The position, quote, or route changed during confirmation, so nothing was"
             " submitted. Show the user the latest preview, get their confirmation"
             " again, then retry with its previewDigest.",
             Code.PREVIEW_MISMATCH,

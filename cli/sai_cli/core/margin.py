@@ -64,6 +64,10 @@ class MarketUnavailable(ValueError):
     """Keeper has no open market for the position."""
 
 
+class TradingNetworkMismatch(ValueError):
+    """Keeper and the LCD reported different valid chain IDs."""
+
+
 class QueryHeightMismatch(SaiError, ValueError):
     """The LCD answered a pinned query at an unverified height."""
 
@@ -419,17 +423,22 @@ def trading_route(endpoint: str, lcd: str) -> PositionRoute:
     node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
     info = node.get("default_node_info")
     chain_id = route.get("chainId")
+    network = info.get("network") if isinstance(info, dict) else None
     if (
         route["enabled"] is not True
         or not isinstance(chain_id, str)
         or not chain_id
-        or not isinstance(info, dict)
-        or info.get("network") != chain_id
+        or not isinstance(network, str)
+        or not network
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
     contract = route.get("contractAddress")
     if not isinstance(contract, str) or not contract:
         raise ValueError("Keeper trading route has no contract address")
+    if network != chain_id:
+        raise TradingNetworkMismatch(
+            "Keeper trading route and LCD network do not match"
+        )
     return {"chainId": chain_id, "contractAddress": contract}
 
 

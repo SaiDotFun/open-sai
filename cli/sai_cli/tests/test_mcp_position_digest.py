@@ -36,6 +36,8 @@ TRADER = "nibi1trader"
 class Position:
     chain_id: str = CHAIN_ID
     contract_address: str = "nibi1contract"
+    lcd_chain_id: str | None = None
+    lcd_chain_ids: deque[str] = field(default_factory=deque)
     collateral: int = 4_000_000
     trade_type: str = "trade"
     keeper_market_open: bool = True
@@ -146,11 +148,14 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
             if path == "/cosmos/base/tendermint/v1beta1/node_info":
+                network = position.lcd_chain_id or position.chain_id
+                if position.lcd_chain_ids:
+                    network = position.lcd_chain_ids.popleft()
                 self.reply(
                     {
                         "default_node_info": None
                         if position.malformed_node_info
-                        else {"network": position.chain_id}
+                        else {"network": network}
                     }
                 )
                 return
@@ -403,14 +408,7 @@ async def call(
     return json.loads(block.text)
 
 
-@pytest.mark.parametrize(
-    ("field", "value", "route_key"),
-    [
-        ("chain_id", "test-2", "chainId"),
-        ("contract_address", "nibi1replacement", "contractAddress"),
-    ],
-)
-@pytest.mark.parametrize(
+position_commands = pytest.mark.parametrize(
     ("tool", "args", "command"),
     [
         (
@@ -425,6 +423,28 @@ async def call(
         ),
     ],
 )
+
+
+def position_cli_args(base_url: str, command: list[str]) -> list[str]:
+    return [
+        "--json",
+        "--endpoint",
+        f"{base_url}/query",
+        "--lcd-endpoint",
+        base_url,
+        "trade",
+        *command,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "route_key"),
+    [
+        ("chain_id", "test-2", "chainId"),
+        ("contract_address", "nibi1replacement", "contractAddress"),
+    ],
+)
+@position_commands
 def test_position_confirmation_binds_keeper_route(
     position_service: tuple[Position, str],
     field: str,
@@ -436,15 +456,7 @@ def test_position_confirmation_binds_keeper_route(
 ) -> None:
     position, base_url = position_service
     cli = CliRunner()
-    cli_args = [
-        "--json",
-        "--endpoint",
-        f"{base_url}/query",
-        "--lcd-endpoint",
-        base_url,
-        "trade",
-        *command,
-    ]
+    cli_args = position_cli_args(base_url, command)
 
     async def scenario() -> None:
         async with connected_client(base_url) as client:
@@ -482,6 +494,81 @@ def test_position_confirmation_binds_keeper_route(
             assert json.loads(accepted.stdout)["status"] == "accepted"
             (submitted,) = position.submitted
             assert {key: submitted[key] for key in fresh["intent"]} == fresh["intent"]
+
+    asyncio.run(scenario())
+
+
+@position_commands
+def test_position_confirmation_refuses_lcd_only_network_switch(
+    position_service: tuple[Position, str],
+    tool: str,
+    args: dict[str, Any],
+    command: list[str],
+) -> None:
+    position, base_url = position_service
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, command)
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            digest = preview["previewDigest"]
+            trade_args = {**args, "preview_digest": digest}
+
+            position.lcd_chain_id = "test-2"
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            mcp_error = await call(client, f"trade_{tool}", trade_args)
+            assert cli_error["code"] == mcp_error["code"] == "PREVIEW_MISMATCH"
+            assert cli_error["message"] == mcp_error["error"]
+            assert "Use an LCD on Keeper's chain" in cli_error["message"]
+            assert "details" not in cli_error and "preview" not in mcp_error
+
+            for flags in ([], ["--dry-run"]):
+                cli_invalid = cli.invoke(main, [*cli_args, *flags])
+                assert (
+                    json.loads(cli_invalid.stdout)["error"]["code"] == "INVALID_REQUEST"
+                )
+            assert (await call(client, f"preview_{tool}", args))[
+                "code"
+            ] == "INVALID_REQUEST"
+
+            position.lcd_chain_id = None
+            position.malformed_node_info = True
+            malformed = await call(client, f"trade_{tool}", trade_args)
+            assert malformed["code"] == "INVALID_REQUEST"
+            position.malformed_node_info = False
+            position.leverage = "2.5"
+            position.lcd_chain_ids.append("test-2")
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            assert cli_error["code"] == "PREVIEW_MISMATCH"
+
+            position.lcd_chain_ids.append("test-2")
+            mcp_error = await call(client, f"trade_{tool}", trade_args)
+            assert mcp_error["code"] == "PREVIEW_MISMATCH"
+            fresh = await call(client, f"preview_{tool}", args)
+            assert cli_error["details"]["preview"] == mcp_error["preview"] == fresh
+            assert fresh["previewDigest"] != digest
+            assert fresh["positionRoute"] == preview["positionRoute"]
+
+            position.lcd_chain_ids.append("test-2")
+            plain_refusal = cli.invoke(
+                main, [*cli_args[1:], "--preview-digest", digest]
+            )
+            assert plain_refusal.exit_code == ExitCode.REJECTED
+            assert "Run with --dry-run" in plain_refusal.stderr
+
+            position.trade_type = "limit"
+            position.lcd_chain_ids.append("test-2")
+            unavailable = await call(client, f"trade_{tool}", trade_args)
+            assert unavailable["code"] == "PREVIEW_MISMATCH"
+            assert "Could not refresh the position preview" in unavailable["error"]
+            assert "preview" not in unavailable
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
 
     asyncio.run(scenario())
 

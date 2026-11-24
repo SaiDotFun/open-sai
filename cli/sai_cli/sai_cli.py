@@ -1184,6 +1184,11 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
 
 
 def trade_error(ctx: click.Context, exc: Exception) -> None:
+    if isinstance(exc, trading.PositionChanged) and exc.preview is not None:
+        if ctx.obj["json"]:
+            exc.details = {"preview": confirmation.with_digest(exc.preview)}
+        else:
+            exc.message += " Run with --dry-run to review a fresh preview."
     if (
         ctx.meta.get("wait_for_trade")
         and isinstance(exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected))
@@ -1369,11 +1374,12 @@ def trade_leverage(
 
 def position_submit_check(
     load: PinnedSession, digest: str | None
-) -> trading.SubmitCheck:
+) -> trading.SubmitCheck | None:
+    if digest is None:
+        return None
+
     def check(preview: dict[str, Any]) -> None:
-        if digest is not None and digest != confirmation.preview_digest(
-            {**preview, "addr": load.addr}
-        ):
+        if digest != confirmation.preview_digest({**preview, "addr": load.addr}):
             raise trading.PositionChanged(
                 "The trade no longer matches the confirmed preview. Run with"
                 " --dry-run to review a new preview before submitting."
