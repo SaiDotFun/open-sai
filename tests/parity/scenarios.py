@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -14,11 +15,12 @@ import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
@@ -35,6 +37,7 @@ OTHER_ADDRESS = "0x" + "2" * 40
 INTENT = "parity-close-7"
 HISTORY_SESSION_TOKEN = "e7" * 32
 CONTRACT = "nibi1syntheticfixture"
+TRADE_REQUEST_HASH = "AB" * 32
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 RELEASES = "/repos/SaiDotFun/open-sai/releases"
 CONFIG = """# Keep this comment when editing
@@ -75,6 +78,11 @@ class Endpoints:
     errors: list[str] = field(default_factory=list)
     wire: list[WireRequest] = field(default_factory=list)
     admission: Admission = field(default_factory=Admission)
+    near_expiry: str = field(
+        default_factory=lambda: (
+            datetime.now(UTC) + timedelta(hours=50, minutes=30)
+        ).isoformat()
+    )
     interrupt_ready: threading.Event = field(default_factory=threading.Event)
     interrupt_closed: threading.Event = field(default_factory=threading.Event)
     keeper_path: str = "/query"
@@ -125,6 +133,37 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
     sai_home.mkdir(mode=0o700)
     if seed == "empty":
         return
+    if seed == "doctor-malformed-toml":
+        config = sai_home / "config.toml"
+        config.write_text("[keeper\n")
+        config.chmod(0o600)
+        return
+    if seed == "doctor-invalid-endpoint":
+        config = sai_home / "config.toml"
+        config.write_text('[keeper]\nendpoint = "https://fixture.invalid:bad/api"\n')
+        config.chmod(0o600)
+        return
+    if seed == "doctor-ledger-v0":
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o700)
+        with sqlite3.connect(path := trader / "intents.sqlite3") as conn:
+            conn.execute(
+                "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL,"
+                " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+                " entity TEXT NOT NULL)"
+            )
+        path.chmod(0o600)
+        return
+    if seed == "doctor-loose-profile":
+        sai_home.chmod(0o750)
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o755)
+        history = trader / "history"
+        history.touch(mode=0o644)
+        return
     if seed == "legacy":
         shutil.copytree(HERE / "v0.1.0", sai_home, dirs_exist_ok=True)
         sai_home.chmod(0o700)
@@ -140,24 +179,39 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         return
     session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
     sessions = []
-    if seed in {"session", "accounts", "history-token"}:
+    if seed in {
+        "session",
+        "accounts",
+        "doctor-near-expiry",
+        "doctor-ledger-session",
+        "history-token",
+    }:
         sessions.append({**session, "endpoint": endpoints.keeper})
+        if seed == "doctor-near-expiry":
+            sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+    env = child_env(home, endpoints)
+    if seed in {"doctor-near-expiry", "doctor-ledger-session"}:
+        env["SAI_LOG"] = "false"
+    if seed == "doctor-ledger-session":
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
     subprocess.run(
         [sys.executable, "-c", SEED],
         input=json.dumps(
             {
                 "sessions": sessions,
-                "ledger": seed == "ledger",
+                "ledger": seed in {"ledger", "doctor-ledger-session"},
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
             }
         ),
-        env=child_env(home, endpoints),
+        env=env,
         cwd=home,
         text=True,
         capture_output=True,
@@ -167,7 +221,12 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
 
 
 @contextmanager
-def loopback(scenario: str) -> Generator[Endpoints]:
+def loopback(
+    scenario: str,
+    *,
+    market_price: float | None = None,
+    cancel_target: str | None = None,
+) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
     admission = Admission()
@@ -184,6 +243,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     borrowing = position["perpBorrowing"]
     recorded_markets = markets["data"]["perp"]["borrowings"]
     market = {**recorded_markets[0], "marketId": borrowing["marketId"]}
+    if market_price is not None:
+        market["price"] = market_price
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
@@ -194,12 +255,14 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "txHash": status["txHash"],
         "trade": {"id": 7, "trader": ADDRESS},
     }
+    chains = {"unknown-chain": None, "empty-chain": ""}
+    chain = chains.get(cancel_target, "cataclysm-1")
     responses = {
         "oneClickTrading": {
             "data": {
                 "oneClickTrading": {
                     "enabled": True,
-                    "chainId": "cataclysm-1",
+                    "chainId": chain,
                     "contractAddress": CONTRACT,
                 }
             }
@@ -286,14 +349,33 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     }
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
+    cancel_trader = OTHER_ADDRESS if cancel_target == "other-account" else ADDRESS
+    pending_order = scenario == "pending-order" or cancel_target in {
+        "pending",
+        "foreign-owner",
+        "unknown-chain",
+        "empty-chain",
+    }
     contracts = {
         "get_trade_raw": {
-            "user": position["trader"],
+            "user": (
+                OTHER_ADDRESS
+                if cancel_target == "foreign-owner"
+                else ADDRESS
+                if cancel_target is not None or pending_order
+                else position["trader"]
+            ),
             "user_trade_index": "UserTradeIndex(7)",
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
-            "trade_type": "limit" if scenario == "pending-order" else "trade",
+            "trade_type": (
+                "stop"
+                if cancel_target == "foreign-owner"
+                else "limit"
+                if pending_order
+                else "trade"
+            ),
             "collateral_amount": str(position["collateralAmount"]),
             "leverage": str(position["leverage"]),
             "open_price": str(position["openPrice"]),
@@ -304,9 +386,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "collateral_index": token_index,
         },
         "is_after_hours_market": False,
+        "market_order_config": {"fill_at_next_oracle_price": False},
         "get_collateral_price": "1",
         "get_perp_prices": {"market": {"base_per_quote": "100"}, "collateral": "1"},
         "get_liquidation_price": {"liquidation_price": "60"},
+        "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
         "get_market": {"fee_index": "FeeIndex(0)", "group_index": "GroupIndex(0)"},
         "get_group": {"min_leverage": "1", "max_leverage": "100"},
         "get_pair_custom_max_leverage": "0",
@@ -319,7 +403,12 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     }
     contract_args = {
         "get_trade_raw": {
-            "trader": ADDRESS if scenario == "pending-order" else position["trader"],
+            "trader": (
+                cancel_trader
+                if scenario in {"pending-order", "concurrent-close"}
+                or cancel_target is not None
+                else position["trader"]
+            ),
             "index": 7,
         },
         "get_exchange_balance": {
@@ -327,6 +416,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "collateral_index": token_index,
         },
         "is_after_hours_market": {"market_index": market_index},
+        "market_order_config": {},
         "get_collateral_price": {"collateral_index": token_index},
         "get_market": {"index": market_index},
         "get_group": {"index": "GroupIndex(0)"},
@@ -339,6 +429,16 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "trade_id": "UserTradeIndex(7)",
             "trader": position["trader"],
             "include_borrowing_fees": True,
+        },
+        "quote_trade": {
+            "trader": position["trader"],
+            "funds": [],
+            "action": {
+                "update_leverage": {
+                    "trade_index": "UserTradeIndex(7)",
+                    "new_leverage": "1.818181818181818182",
+                }
+            },
         },
         "get_fees": {"index": "FeeIndex(0)"},
     }
@@ -398,6 +498,46 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             ack = PROTOCOL["admission_ack"]["data"]["recordUserIntent"]
             self.reply({"data": {"recordUserIntent": {**ack, "intentKey": key}}})
 
+        def admit_trade(self, variables: Any) -> None:
+            session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
+            if self.headers.get("Authorization") != f"Bearer {session['token']}":
+                self.reject("Wrong fixture authorization")
+                return
+            key = variables["input"]["intentKey"]
+            if scenario == "trade-reconcile-offline":
+                admission.key = key
+                admission.arrived.set()
+                self.close_connection = True
+                return
+            if scenario == "trade-timeout" and not admission.arrived.is_set():
+                admission.key = key
+                admission.arrived.set()
+                admission.release.wait(35)
+                self.close_connection = True
+                return
+            if scenario == "trade-disconnect":
+                self.close_connection = True
+                return
+            if scenario == "trade-rejected":
+                self.reply(
+                    {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+                )
+                return
+            ack = PROTOCOL["admission_ack"]["data"]["recordUserIntent"]
+            if scenario == "trade-bad-ack":
+                key = "wrong-intent"
+            self.reply(
+                {
+                    "data": {
+                        "recordUserIntent": {
+                            **ack,
+                            "intentKey": key,
+                            "txHash": TRADE_REQUEST_HASH,
+                        }
+                    }
+                }
+            )
+
         def do_POST(self) -> None:
             if not self.path.startswith("/") or (
                 self.path.startswith(scope) and self.path != scope + keeper_path
@@ -418,6 +558,33 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 name = request.label
                 if name == "recordUserIntent" and scenario == "concurrent-close":
                     self.admit_close(request.variables)
+                    return
+                if name == "recordUserIntent" and scenario.startswith("trade-"):
+                    self.admit_trade(request.variables)
+                    return
+                if name == "userIntents" and scenario in {
+                    "trade-timeout",
+                    "trade-reconcile-offline",
+                }:
+                    if not admission.arrived.is_set() or not same_variables(
+                        request.variables, {"user": ADDRESS, "key": admission.key}
+                    ):
+                        self.reject("Wrong timed-out intent lookup")
+                    else:
+                        row = {
+                            **status,
+                            "intentKey": admission.key,
+                            "kind": "OPEN_TRADE"
+                            if scenario == "trade-timeout"
+                            else "CLOSE_POSITION",
+                            "lifecycleStep": "exec_fail",
+                            "execActor": "server",
+                            "nibiAddress": None,
+                            "errorCode": "chain_execution_failed",
+                        }
+                        if scenario == "trade-reconcile-offline":
+                            row["txHash"] = TRADE_REQUEST_HASH
+                        self.reply({"data": {"userIntents": [row]}})
                     return
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):
@@ -454,9 +621,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             b'{"priceUsd":18446744073709551616123456},'
                             b'{"priceUsd":"1.2300"}]}}}'
                         )
-                    elif (
-                        scenario == "history-graphql-errors" and name == "tradeHistory"
-                    ):
+                    elif (scenario, name) in {
+                        ("history-graphql-errors", "tradeHistory"),
+                        ("doctor-graphql-errors", "oneClickTrading"),
+                    }:
                         self.reply(
                             {
                                 **responses[name],
@@ -490,6 +658,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     elif scenario == "read-empty" and name == "tradeHistory":
                         self.reply({"data": {"perp": {"tradeHistory": []}}})
                     else:
+                        if scenario == "trade-market-session" and name == "borrowings":
+                            admission.arrived.set()
+                            if not admission.release.wait(5):
+                                self.reject("Market session gate timed out")
+                                return
                         self.reply(responses[name])
                     return
             except (ValueError, KeyError, TypeError):
@@ -503,9 +676,22 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             path = urlsplit(self.path).path
             if path.startswith(scope):
                 path = path.removeprefix(scope)
+                if (
+                    scenario == "doctor-lcd-unreachable"
+                    and path == "/private-fixture-credential" + NODE_INFO
+                ):
+                    wire.append(WireRequest("node_info"))
+                    self.reply({}, 503)
+                    return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
-                    self.reply({"default_node_info": {"network": "cataclysm-1"}})
+                    self.reply(
+                        {
+                            "default_node_info": {}
+                            if chain is None
+                            else {"network": chain}
+                        }
+                    )
                     return
                 if path == RELEASES:
                     wire.append(WireRequest("releases"))
@@ -526,10 +712,42 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        if not same_variables(query, {name: contract_args[name]}):
+                        expected = {name: contract_args[name]}
+                        # Ownership uses the account address. The next read
+                        # uses Perp's stored owner to pin the quote.
+                        if (
+                            scenario == "concurrent-close"
+                            and name == "get_trade_raw"
+                            and query
+                            == {name: {"trader": position["trader"], "index": 7}}
+                        ):
+                            expected = query
+                        if not same_variables(query, expected):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
+                        if name == "get_trade_raw" and cancel_target is not None:
+                            [nonce] = parse_qs(urlsplit(self.path).query).get(
+                                "_sai_query", [""]
+                            )
+                            if len(nonce) != 32 or any(
+                                c not in "0123456789abcdef" for c in nonce
+                            ):
+                                self.reject("Expected a fresh cancellation query")
+                                return
+                            if cancel_target in {"missing", "other-account"}:
+                                self.reply(
+                                    {
+                                        "message": f"Trade not found for trader {cancel_trader} with index 7"
+                                    },
+                                    500,
+                                )
+                                return
+                            if scenario == "trade-cancel-session":
+                                admission.arrived.set()
+                                if not admission.release.wait(5):
+                                    self.reject("Cancellation session gate timed out")
+                                    return
                         self.reply({"data": contracts[name]}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):
@@ -595,6 +813,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 errors.append("Expected WebSocket connection_init")
                 return
             wire.append(WireRequest("ws:init"))
+            if scenario == "doctor-ws-timeout":
+                connection.recv(timeout=7)
+                return
             if scenario == "interrupt-handshake":
                 interrupt_ready.set()
                 connection.recv(timeout=8)
@@ -699,7 +920,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             errors,
             wire,
             admission,
-            interrupt_ready,
-            interrupt_closed,
+            interrupt_ready=interrupt_ready,
+            interrupt_closed=interrupt_closed,
             keeper_path=keeper_path,
         )

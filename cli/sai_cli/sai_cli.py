@@ -23,6 +23,7 @@ import click
 from . import mcp_install, skill
 from .core import (
     clipboard,
+    confirmation,
     intents,
     keeper,
     log,
@@ -406,7 +407,7 @@ def show_expiry_notice(ctx: click.Context, fields: Mapping[str, Any]) -> None:
         and sys.stdin.isatty()
         and sys.stderr.isatty()
     ):
-        warn(f"{fields['expiryWarning']} Run {fields['renewalCommand']}.")
+        warn(sessions.expiry_notice_text(fields))
 
 
 # Commands that never start or announce an automatic update. `mcp` serves
@@ -566,22 +567,30 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         endpoint = keeper_url(ctx)
         if stored.get("endpoint") != endpoint:
             raise SessionError("Stored session belongs to another Keeper endpoint")
+        if not keeper.is_address(stored["evmAddress"]):
+            raise ValueError(sessions.INVALID_RENEWAL_ADDRESS)
         name = stored.get("keyName")
         if not name:
+            fields = sessions.renewal_fields(stored)
+            command = fields["renewalCommand"]
+            guidance = fields.get("renewalGuidance", "")
             if stored.get("source") == "imported":
-                raise ValueError(
-                    f"This session was imported. Run {sessions.renewal_command(stored)} with a fresh token."
+                message = (
+                    f"This session was imported. Run `{command}` with a fresh token."
                 )
-            raise ValueError(
-                f"This session has no saved key name. Run {sessions.renewal_command(stored)}."
-            )
+            else:
+                message = f"This session has no saved key name. Run `{command}`."
+            raise ValueError(f"{message} {guidance}".rstrip())
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
+        fields = sessions.renewal_fields(stored)
+        command = fields["renewalCommand"]
+        guidance = fields.get("renewalGuidance", "")
         raise SaiError(
-            f"{exc} Run {sessions.renewal_command(stored)} in a terminal.",
+            f"{exc} Run `{command}` in a terminal. {guidance}".rstrip(),
             Code.SESSION_UNAVAILABLE,
         ) from exc
 
@@ -769,8 +778,11 @@ def read_token() -> str:
 
 
 @auth.command("import")
+@click.option(
+    "--addr", metavar="ADDR", help="Require the token to match this EVM address."
+)
 @click.pass_context
-def import_token(ctx: click.Context) -> None:
+def import_token(ctx: click.Context, addr: str | None) -> None:
     """Connect with a session token copied from Sai Web.
 
     In a terminal, paste the token at the hidden prompt or press Enter to read
@@ -780,6 +792,8 @@ def import_token(ctx: click.Context) -> None:
     """
     token = read_token()
     result = sessions.import_session(token, keeper_url(ctx))
+    if addr is not None and addr.lower() != result["evmAddress"].lower():
+        raise ValueError("The Sai session token is for a different account than --addr")
     storage.save_session(result)
     # Re-read: the person may have copied something else since, and that
     # must survive.
@@ -1176,10 +1190,18 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         metadata = {key: value for key, value in result.items() if key != "message"}
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
         return
-    emit(ctx, {"addr": account, **result})
+    output = {"addr": account, **result}
+    if "positionRoute" in result:
+        output = confirmation.with_digest(output)
+    emit(ctx, output)
 
 
 def trade_error(ctx: click.Context, exc: Exception) -> None:
+    if isinstance(exc, trading.PositionChanged) and exc.preview is not None:
+        if ctx.obj["json"]:
+            exc.details = {"preview": confirmation.with_digest(exc.preview)}
+        else:
+            exc.message += " Run with --dry-run to review a fresh preview."
     if (
         ctx.meta.get("wait_for_trade")
         and isinstance(exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected))
@@ -1363,6 +1385,27 @@ def trade_leverage(
         trade_error(ctx, exc)
 
 
+def position_submit_check(
+    load: PinnedSession, digest: str | None
+) -> trading.SubmitCheck | None:
+    if digest is None:
+        return None
+
+    def check(preview: dict[str, Any]) -> None:
+        if digest != confirmation.preview_digest({**preview, "addr": load.addr}):
+            raise trading.PositionChanged(
+                "The trade no longer matches the confirmed preview. Run with"
+                " --dry-run to review a new preview before submitting."
+            )
+
+    return check
+
+
+position_digest_option = click.option(
+    "--preview-digest", help="Submit only if the trade matches this dry-run digest."
+)
+
+
 @trade.command("margin")
 @click.argument("trade_id", type=int)
 @click.option("--direction", type=click.Choice(["add", "remove"]), required=True)
@@ -1377,6 +1420,7 @@ def trade_leverage(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@position_digest_option
 @wait_option
 @click.pass_context
 def trade_margin(
@@ -1386,6 +1430,7 @@ def trade_margin(
     amount: str,
     lcd_endpoint: str | None,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Add or remove margin through a target-leverage intent.
 
@@ -1402,6 +1447,7 @@ def trade_margin(
                 amount=amount,
                 lcd_endpoint=lcd_url(ctx, lcd_endpoint),
                 dry_run=dry_run,
+                before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1417,6 +1463,7 @@ def trade_margin(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@position_digest_option
 @wait_option
 @click.pass_context
 def partial_close(
@@ -1425,6 +1472,7 @@ def partial_close(
     percent: int,
     lcd_endpoint: str | None,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Reduce an open USDC position by a whole percentage."""
     try:
@@ -1437,6 +1485,7 @@ def partial_close(
                 percent=percent,
                 lcd_endpoint=lcd_url(ctx, lcd_endpoint),
                 dry_run=dry_run,
+                before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1636,7 +1685,7 @@ def config_file() -> Path:
 def config_list(ctx: click.Context) -> None:
     """Show every setting with its value and source.
 
-    The source is flag, env, file, default, or derived. Keeper URLs are
+    The source is flag, env, file, default, or derived. Endpoint URLs are
     shown as origins. `sai config get` prints the exact value.
     """
     shown = sai_settings.public(settings(ctx))
@@ -1686,7 +1735,15 @@ def config_set(ctx: click.Context, key: str, value: str) -> None:
         )
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    report_change(ctx, spec, {"key": spec.key, "value": parsed, "path": str(path)})
+    report_change(
+        ctx,
+        spec,
+        {
+            "key": spec.key,
+            "value": sai_settings.public_value(spec, parsed),
+            "path": str(path),
+        },
+    )
 
 
 @config_group.command("unset")
@@ -2197,7 +2254,7 @@ def print_log_limit(report: dict[str, Any]) -> None:
 @click.argument("key")
 @click.option("--offline", is_flag=True, help="Read local logs only.")
 @click.option("--addr", help="EVM address to use for the Keeper lookup.")
-@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_intent(
     ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None

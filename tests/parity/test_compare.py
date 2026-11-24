@@ -256,6 +256,151 @@ def test_ledger_ignores_equivalent_index_collations(
 
 
 @requires_sqlite_schema
+def test_ledger_compares_index_predicates_and_expressions(tmp_path: Path) -> None:
+    ddl = """
+        CREATE INDEX by_status ON intents (
+            id, replace(status COLLATE RTRIM, 'where, )', 'COLLATE') COLLATE NOCASE
+        ) WHERE status <> 'failed';
+    """
+
+    def read(name: str, index: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE intents (id TEXT PRIMARY KEY, status TEXT)")
+            db.execute(index)
+            db.execute("INSERT INTO intents VALUES ('saved', 'pending')")
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read("reference.sqlite3", ddl)
+    formatted = """
+        create index by_status on intents
+            (ID, REPLACE ( STATUS collate [rtrim] , 'where, )', 'COLLATE' )
+                collate /* index order */ "nocase")
+        where /* partial index */ STATUS<>'failed';
+    """
+    assert reference == read("formatted.sqlite3", formatted)
+
+    for filename, changed, field in (
+        ("predicate", ddl.replace("'failed'", "'rejected'"), "where"),
+        ("expression", ddl.replace("replace(status", "substr(status"), "expressions.1"),
+        ("collation", ddl.replace("RTRIM", "BINARY"), "expressions.1"),
+    ):
+        actual = read(f"{filename}.sqlite3", changed)
+        assert reference["tables"] == actual["tables"]
+        difference = first_difference(reference, actual, "ledger")
+        assert difference and difference.startswith(
+            f"ledger.schema.tables.intents.indexes.by_status.{field}"
+        )
+
+
+@requires_sqlite_schema
+def test_ledger_compares_collations_in_view_definitions(tmp_path: Path) -> None:
+    def read(name: str, view: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE intents (status TEXT)")
+            db.execute(view)
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read(
+        "reference.sqlite3",
+        "CREATE VIEW statuses AS SELECT status COLLATE NOCASE AS label FROM intents",
+    )
+    assert reference == read(
+        "formatted.sqlite3",
+        "create view statuses as select STATUS collate /* label */ [nocase]\n"
+        " as label from intents",
+    )
+    changed = read(
+        "changed.sqlite3",
+        "CREATE VIEW statuses AS SELECT status COLLATE BINARY AS label FROM intents",
+    )
+    difference = first_difference(reference, changed, "ledger")
+    assert difference and difference.startswith(
+        "ledger.schema.tables.statuses.definition"
+    )
+
+
+@requires_sqlite_schema
+@pytest.mark.parametrize(
+    ("reference_sql", "equivalent", "changed"),
+    (
+        (
+            "CREATE INDEX indexed ON intents(status) WHERE status <> 'failed'",
+            (
+                "CREATE INDEX indexed ON intents(status) WHERE ((status <> 'failed'))",
+                "CREATE INDEX indexed ON intents(status) WHERE \"status\" <> 'failed'",
+                "CREATE INDEX indexed ON intents(status) WHERE (status) <> ('failed')",
+            ),
+            "CREATE INDEX indexed ON intents(status) WHERE status <> 'status'",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(lower(status) DESC)",
+            (
+                "CREATE INDEX indexed ON intents((lower(status)) DESC)",
+                'CREATE INDEX indexed ON intents(lower("STATUS") DESC)',
+            ),
+            "CREATE INDEX indexed ON intents(lower('status') DESC)",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(lower(status) COLLATE NOCASE)",
+            ("CREATE INDEX indexed ON intents(((lower((status)))) COLLATE NOCASE)",),
+            "CREATE INDEX indexed ON intents(lower(status) COLLATE BINARY)",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(17 DESC, lower(état))",
+            ('CREATE INDEX indexed ON intents(((17)) DESC, lower("état"))',),
+            "CREATE INDEX indexed ON intents(18 DESC, lower(état))",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT lower(status) AS label FROM intents WHERE priority + 1 * 2 > 3",
+            (
+                "CREATE VIEW projected AS SELECT (lower(status)) AS label FROM intents WHERE (priority + 1 * 2 > 3)",
+                'CREATE VIEW projected AS SELECT lower("status") AS "label" FROM [intents] WHERE `priority` + 1 * 2 > 3',
+            ),
+            "CREATE VIEW projected AS SELECT lower(status) AS label FROM intents WHERE (priority + 1) * 2 > 3",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT lower(intents.status) COLLATE NOCASE AS label FROM intents WHERE priority IN (-2)",
+            (
+                "CREATE VIEW projected AS SELECT (lower((intents.status))) COLLATE NOCASE AS label FROM intents WHERE (priority) IN ((-2))",
+            ),
+            "CREATE VIEW projected AS SELECT lower(intents.status) COLLATE NOCASE AS label FROM intents WHERE priority IN (3)",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT label FROM (SELECT lower(status) label FROM intents)",
+            (
+                'CREATE VIEW projected AS SELECT label FROM (SELECT (lower("status")) label FROM intents)',
+            ),
+            "CREATE VIEW projected AS SELECT label FROM (SELECT upper(status) label FROM intents)",
+        ),
+        (
+            'CREATE VIEW projected AS SELECT "true" AS label FROM intents',
+            ('CREATE VIEW projected AS SELECT ("true") AS label FROM intents',),
+            "CREATE VIEW projected AS SELECT true AS label FROM intents",
+        ),
+    ),
+)
+def test_schema_normalizes_only_safe_expression_formatting(
+    tmp_path: Path, reference_sql: str, equivalent: tuple[str, ...], changed: str
+) -> None:
+    def read(name: str, sql: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute(
+                "CREATE TABLE intents (status TEXT, priority INTEGER, état TEXT)"
+            )
+            db.execute(sql)
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read("reference.sqlite3", reference_sql)
+    for i, sql in enumerate(equivalent):
+        assert reference == read(f"equivalent-{i}.sqlite3", sql)
+    difference = first_difference(reference, read("changed.sqlite3", changed), "ledger")
+    assert difference and difference.startswith("ledger.schema.tables.")
+
+
+@requires_sqlite_schema
 def test_ledger_detects_added_or_changed_check_constraints(tmp_path: Path) -> None:
     ddl = """
         CREATE TABLE intents (

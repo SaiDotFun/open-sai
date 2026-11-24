@@ -11,6 +11,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from sai_cli.core import keeper, margin, reconcile, session, storage, stream, trading
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
@@ -54,6 +60,17 @@ def test_load_active_session_checks_endpoint_and_expiry():
     storage.save_session(session_for(hours=-1))
     with pytest.raises(ValueError, match="expired"):
         session.load_active_session(ENDPOINT)
+
+
+def test_renewal_guidance_omits_an_origin_with_a_known_token():
+    token = "synthetic-session-token-for-renewal"
+    stored = session_for(endpoint=f"https://{token}.example.invalid")
+    stored.update(token=token, source="imported")
+    storage.save_session(stored)
+
+    fields = session.renewal_fields(stored)
+    assert "SAI_RECONCILE_ENDPOINT" in fields["renewalCommand"]
+    assert fields["renewalGuidance"] == "Reuse the Keeper endpoint used to sign in."
 
 
 def test_passphrase_session_is_refused_without_a_prompt():
@@ -119,6 +136,11 @@ class FakeKeeper:
                     "evmAddress": ADDR,
                 }
             }
+        if query == keeper.POSITION and query not in self.answers:
+            assert variables is not None
+            return position_data(variables)
+        if query == keeper.ROUTE and query not in self.answers:
+            return POSITION_ROUTE
         return json.loads(json.dumps(self.answers[query]))
 
     def intent(self) -> dict[str, Any]:
@@ -291,9 +313,10 @@ def test_preview_is_exactly_what_is_submitted(
 ):
     fake = FakeKeeper()
     monkeypatch.setattr(keeper, "request", fake)
-    preview = action(ENDPOINT, no_session, dry_run=True, **args)
+    preview = action(ENDPOINT, session_for, dry_run=True, **args)
     assert preview["dryRun"] is True
-    result = action(ENDPOINT, session_for, dry_run=False, **args)
+    with keeper_server(PositionKeeperHandler) as lcd:
+        result = action(ENDPOINT, session_for, dry_run=False, lcd_endpoint=lcd, **args)
     assert result["status"] == "accepted"
     assert fake.intent() == preview["intent"]
 
@@ -318,22 +341,24 @@ def test_before_submit_sees_the_submitted_intent_and_can_refuse(monkeypatch):
     def refuse(_preview: dict[str, Any]) -> None:
         raise Refused
 
-    with pytest.raises(Refused):
+    with keeper_server(PositionKeeperHandler) as lcd, pytest.raises(Refused):
         trading.close_trade(
             ENDPOINT,
             session_for,
             trade_id=3,
             cancel_order=False,
             dry_run=False,
+            lcd_endpoint=lcd,
             before_submit=refuse,
         )
-    with pytest.raises(Refused):
+    with keeper_server(PositionKeeperHandler) as lcd, pytest.raises(Refused):
         trading.set_leverage(
             ENDPOINT,
             session_for,
             trade_id=3,
             leverage="4",
             dry_run=False,
+            lcd_endpoint=lcd,
             before_submit=refuse,
         )
     with pytest.raises(Refused):
@@ -361,12 +386,12 @@ def snapshots(monkeypatch, *collaterals: str) -> Iterator[margin.PositionSnapsho
             },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
-            "test-contract",
+            {"chainId": "test-1", "contractAddress": "test-contract"},
         )
         for amount in collaterals
     )
 
-    def snapshot(*args: Any) -> margin.PositionSnapshot:
+    def snapshot(*args: Any, **kwargs: Any) -> margin.PositionSnapshot:
         nonlocal current
         current = next(states)
         return current
