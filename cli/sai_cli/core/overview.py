@@ -218,7 +218,7 @@ def _balances(settings: Settings, addr: str) -> dict[str, dict[str, Any]]:
         if token["type"] == "sai" and token["name"] in BALANCE_KEYS:
             balances[BALANCE_KEYS[token["name"]]] = {
                 "usd": _number(row["usd_value"]),
-                "block": row["lastUpdatedBlock"],
+                "block": row.get("lastUpdatedBlock"),
             }
     return balances
 
@@ -784,15 +784,19 @@ def _trade_sections(
 ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
     snapshot = _read(lambda: _trades(settings.endpoint, addr))
     if "error" in snapshot:
-        return snapshot, snapshot.copy(), {"fetchedAt": None, "data": []}
+        return (
+            snapshot,
+            snapshot.copy(),
+            _skipped_prices("Positions and pending orders could not be loaded."),
+        )
     trades = snapshot["data"].rows
     unindexed_fill = _fill_awaits_indexing(settings.endpoint, addr)
     prices = (
         _read(lambda: _prices(settings.endpoint))
         if trades
-        else {"fetchedAt": None, "data": {}}
+        else _skipped_prices("No positions or pending orders were available to price.")
     )
-    quotes = prices.get("data", {})
+    quotes = prices.get("data") or {}
     chain = get_chain()
     indexed_ids = {trade["id"] for trade in trades if trade["tradeType"] == "trade"}
     membership = _membership_check(chain, addr, indexed_ids)
@@ -852,7 +856,7 @@ def _trade_sections(
             else None,
             "unrealizedPnlBasis": "grossBeforeFees",
         }
-    if "data" in prices:
+    if prices["fetchedAt"] is not None:
         used_ids = set()
         for row in [*items, *orders.get("data", [])]:
             if row["collateralToken"] != "USDC" and "collateralPriceSource" not in row:
@@ -877,6 +881,10 @@ def _trade_sections(
                 "Keeper has no positive USD price for one or more tokens",
             )
     return positions, orders, prices
+
+
+def _skipped_prices(reason: str) -> dict[str, Any]:
+    return {"fetchedAt": None, "data": [], "status": "skipped", "skipReason": reason}
 
 
 def _queued_rows(endpoint: str, addr: str) -> Pages:
@@ -1017,6 +1025,7 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
     positions, orders, prices = _trade_sections(settings, addr, get_chain, lookup)
     if "data" in balances:
         rows = balances["data"]
+        fetched = balances["fetchedAt"]
         # An independent WebSocket override may be served by another chain.
         balance_lookup = lookup if same_keeper else None
         if not rows:
@@ -1024,22 +1033,18 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
                 Code.INCOMPLETE_DATA,
                 "Keeper returned no Sai balance rows. Funds are unknown.",
             )
-        balances["data"] = {
-            key: {
-                "usd": rows.get(key, {}).get("usd"),
-                **_block_source(
-                    rows.get(key, {}), balances["fetchedAt"], balance_lookup
-                ),
-            }
-            for key in BALANCE_KEYS.values()
-        }
+        balances["data"] = {}
+        for key in BALANCE_KEYS.values():
+            row = rows.get(key, {})
+            stamp = _block_source(row, fetched, balance_lookup)
+            if row and stamp["sourceAt"] is None:
+                stamp.update(sourceAt=fetched, sourceAtBasis="fetchedAt")
+            balances["data"][key] = {"usd": row.get("usd"), **stamp}
     queued = _queued_orders(settings.endpoint, addr, lookup)
     intents = _read(lambda: _blocking_intents(settings.endpoint, addr))
     for row in intents.get("data", []):
         row.update(_age(_unix_instant(row.pop("createdAt")), intents["fetchedAt"]))
-    return {
-        "addr": addr,
-        "addrSource": source,
+    sections = {
         "balances": balances,
         "positions": positions,
         "pendingOrders": orders,
@@ -1048,3 +1053,7 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
         "blockingIntents": intents,
         "session": session_section,
     }
+    for section in sections.values():
+        if section["fetchedAt"] is not None:
+            section["sourceAt"] = section["fetchedAt"]
+    return {"addr": addr, "addrSource": source, **sections}
