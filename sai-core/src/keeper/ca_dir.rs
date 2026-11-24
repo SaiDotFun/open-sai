@@ -2,17 +2,15 @@
 
 use std::{collections::BTreeMap, fs, path::Path};
 
-use rustls::{
-    RootCertStore,
-    pki_types::{CertificateDer, pem::PemObject},
-};
 use x509_cert::{
     Certificate,
     der::{Decode, Encode, Tag, Tagged, asn1::Any},
     name::RelativeDistinguishedName,
 };
 
-pub(super) fn add_roots(roots: &mut RootCertStore, dir: &Path) {
+use super::{ca_pem, ca_store::CaStore};
+
+pub(super) fn add_roots(store: &mut CaStore, dir: &Path) {
     let mut groups = BTreeMap::<u32, BTreeMap<usize, _>>::new();
     for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = entry.file_name();
@@ -25,14 +23,14 @@ pub(super) fn add_roots(roots: &mut RootCertStore, dir: &Path) {
             if expected != index || !path.is_file() {
                 break;
             }
-            let Ok(certs) = CertificateDer::pem_file_iter(path) else {
+            let Ok(certs) = ca_pem::certificates(&path) else {
                 break;
             };
             let mut loaded = false;
             for cert in certs.flatten() {
                 loaded = true;
-                if subject_hash(&cert) == Some(hash) {
-                    let _ = roots.add(cert);
+                if subject_hash(&cert.der) == Some(hash) {
+                    let _ = store.add(cert);
                 }
             }
             if !loaded {

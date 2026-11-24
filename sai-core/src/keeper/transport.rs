@@ -12,10 +12,7 @@ use hyper_util::{
     client::legacy::connect::{Connected, Connection, proxy::Tunnel},
     rt::TokioIo,
 };
-use rustls::{
-    ClientConfig, RootCertStore,
-    pki_types::{CertificateDer, ServerName, pem::PemObject},
-};
+use rustls::{ClientConfig, pki_types::ServerName};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpStream, lookup_host},
@@ -25,7 +22,7 @@ use tokio_rustls::TlsConnector;
 use tower::{ServiceExt, service_fn};
 use url::Url;
 
-use super::{ca_dir, not_sent, proxy, request_failed};
+use super::{ca_dir, ca_pem, ca_store::CaStore, not_sent, proxy, request_failed};
 use crate::errors::SaiError;
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -245,72 +242,69 @@ async fn receive(
 }
 
 fn keeper_tls_config() -> Result<ClientConfig, SaiError> {
-    let mut roots = RootCertStore::empty();
+    let mut store = CaStore::new();
     // HTTPX treats an explicit file or CA directory as the entire trust store.
     if let Some(file) = env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) {
-        add_pem_file(&mut roots, Path::new(&file))?;
-        if roots.is_empty() {
-            return Err(SaiError::internal());
-        }
+        add_pem_file(&mut store, Path::new(&file))?;
     } else if let Some(dirs) = env::var_os("SSL_CERT_DIR").filter(|value| !value.is_empty()) {
-        append_ca_dirs(&mut roots, &dirs);
+        append_ca_dirs(&mut store, &dirs);
     } else {
-        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
-        if roots.is_empty() {
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        store
+            .roots
+            .add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        if store.roots.is_empty() {
+            store.add_bundled_roots();
         }
     }
-    Ok(tls_config(roots))
+    Ok(store.tls_config())
 }
 
 fn proxy_tls_config() -> ClientConfig {
     // HTTPcore creates the proxy's default SSL context with the OpenSSL
     // default paths, then adds its bundled Mozilla roots. The environment
     // can override the default file and directory independently.
-    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut store = CaStore::new();
     let file = env::var_os("SSL_CERT_FILE");
     let dirs = env::var_os("SSL_CERT_DIR");
     if file.is_none() && dirs.is_none() {
-        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        store
+            .roots
+            .add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        store.add_bundled_roots();
     } else {
         let defaults = openssl_probe::probe();
         if let Some(file) = file.map(std::path::PathBuf::from).or(defaults.cert_file) {
-            let _ = add_pem_file(&mut roots, &file);
+            let _ = add_pem_file(&mut store, &file);
         }
+        store.add_bundled_roots();
         if let Some(dirs) = dirs {
-            append_ca_dirs(&mut roots, &dirs);
+            append_ca_dirs(&mut store, &dirs);
         } else {
             for dir in defaults.cert_dir {
-                ca_dir::add_roots(&mut roots, &dir);
+                ca_dir::add_roots(&mut store, &dir);
             }
         }
     }
-    tls_config(roots)
+    store.tls_config()
 }
 
-fn append_ca_dirs(roots: &mut RootCertStore, dirs: &OsStr) {
+fn append_ca_dirs(store: &mut CaStore, dirs: &OsStr) {
     for dir in env::split_paths(dirs).filter(|path| !path.as_os_str().is_empty()) {
-        ca_dir::add_roots(roots, &dir);
+        ca_dir::add_roots(store, &dir);
     }
 }
 
-fn tls_config(roots: RootCertStore) -> ClientConfig {
-    let mut config =
-        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-            .with_safe_default_protocol_versions()
-            .expect("valid Rustls protocol versions")
-            .with_root_certificates(roots)
-            .with_no_client_auth();
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    config
-}
-
-fn add_pem_file(roots: &mut RootCertStore, path: &Path) -> Result<(), SaiError> {
-    let certs = CertificateDer::pem_file_iter(path).map_err(|_| SaiError::internal())?;
+fn add_pem_file(store: &mut CaStore, path: &Path) -> Result<(), SaiError> {
+    let certs = ca_pem::certificates(path).map_err(|_| SaiError::internal())?;
+    let mut loaded = false;
     for cert in certs {
-        roots
+        store
             .add(cert.map_err(|_| SaiError::internal())?)
             .map_err(|_| SaiError::internal())?;
+        loaded = true;
+    }
+    if !loaded {
+        return Err(SaiError::internal());
     }
     Ok(())
 }

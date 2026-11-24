@@ -14,6 +14,7 @@ base64 = "0.22"
 bech32 = "0.11"
 clap = { version = "4.6", features = ["derive"] }
 chrono = { version = "0.4", default-features = false, features = ["now", "std"] }
+der = { version = "0.7", features = ["alloc", "derive", "oid"] }
 num-bigint = "0.4"
 openssl-probe = "0.2"
 regex = "1"
