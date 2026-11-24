@@ -61,7 +61,16 @@ def expiry_notice_text(fields: Mapping[str, str]) -> str:
         fields.get("renewalGuidance"),
         f"Run {fields['renewalCommand']}",
     )
-    return " ".join(part for part in parts if part)
+    return escape_warning_text(" ".join(part for part in parts if part))
+
+
+def escape_warning_text(value: str) -> str:
+    return "".join(
+        ascii(c)[1:-1]
+        if ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029"
+        else c
+        for c in value
+    )
 
 
 def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
@@ -76,7 +85,8 @@ def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
         if minutes < 120
         else f"{minutes // 60} h"
     )
-    return f"Sai session for {result['evmAddress']} expires in {when}."
+    addr = escape_warning_text(result["evmAddress"])
+    return f"Sai session for {addr} expires in {when}."
 
 
 def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str]:
@@ -116,19 +126,17 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
             addr=result.get("evmAddress"),
             expiresAt=result["expiresAt"],
         )
-        fields = renewal_fields(result)
         message = "Trading session expired; sign in again"
-        if guidance := fields.get("renewalGuidance"):
-            message += f". {guidance}"
-        raise SessionError(
-            message,
-            Code.SESSION_EXPIRED,
-            hint=fields["renewalCommand"]
-            if result.get("keyName") or result.get("source") == "imported"
-            else storage.keeper_command_hint(
+        if result.get("keyName") or result.get("source") == "imported":
+            fields = renewal_fields(result)
+            if guidance := fields.get("renewalGuidance"):
+                message += f". {guidance}"
+            hint = fields["renewalCommand"]
+        else:
+            hint = storage.keeper_command_hint(
                 endpoint, "auth", "login", "NAME", "--addr", result["evmAddress"]
-            ),
-        )
+            )
+        raise SessionError(message, Code.SESSION_EXPIRED, hint=hint)
     return result
 
 

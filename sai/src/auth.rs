@@ -42,7 +42,11 @@ pub enum AuthCommand {
         addr: Option<String>,
     },
     /// Connect with a session token copied from Sai Web.
-    Import,
+    Import {
+        /// Require the token to match this EVM address.
+        #[arg(long)]
+        addr: Option<String>,
+    },
     /// Renew the selected account's session with its saved key name.
     Renew { addr: Option<String> },
     /// Show the current account and expiry.
@@ -126,7 +130,9 @@ pub fn dispatch(
             storage.save_session(session)?;
             emit(&summary, json)
         }
-        AuthCommand::Import => runtime()?.block_on(import(&storage, flags, env, json)),
+        AuthCommand::Import { addr } => {
+            runtime()?.block_on(import(&storage, flags, env, json, addr.as_deref()))
+        }
         AuthCommand::Renew { addr } => {
             let stored = storage
                 .load_session(addr.as_deref().filter(|s| !s.is_empty()).or(as_addr))
@@ -140,12 +146,15 @@ pub fn dispatch(
                 ));
             }
             let Some(name) = stored.key_name() else {
-                let command = storage.renewal_command(&stored);
-                let message = if stored.is_imported() {
-                    format!("This session was imported. Run {command} with a fresh token.")
+                let (command, guidance) = storage.renewal_fields(&stored);
+                let mut message = if stored.is_imported() {
+                    format!("This session was imported. Run `{command}` with a fresh token.")
                 } else {
-                    format!("This session has no saved key name. Run {command}.")
+                    format!("This session has no saved key name. Run `{command}`.")
                 };
+                if let Some(guidance) = guidance {
+                    message.push_str(&format!(" {guidance}"));
+                }
                 return Err(SaiError::new(Code::InvalidRequest, message));
             };
             let keeper = Keeper::new(endpoint, events);
@@ -153,13 +162,12 @@ pub fn dispatch(
                 .block_on(login(&keeper, name, Some(stored.addr())))
                 .map_err(|error| {
                     if matches!(error, LoginError::NeedsTerminal(_)) {
-                        SaiError::new(
-                            Code::SessionUnavailable,
-                            format!(
-                                "{error} Run {} in a terminal.",
-                                storage.renewal_command(&stored)
-                            ),
-                        )
+                        let (command, guidance) = storage.renewal_fields(&stored);
+                        let mut message = format!("{error} Run `{command}` in a terminal.");
+                        if let Some(guidance) = guidance {
+                            message.push_str(&format!(" {guidance}"));
+                        }
+                        SaiError::new(Code::SessionUnavailable, message)
                     } else {
                         login_failure(error)
                     }
@@ -248,7 +256,7 @@ fn show_expiry_notice(notice: Option<&ExpiryNotice>, json: bool) {
         && io::stdin().is_terminal()
         && io::stderr().is_terminal()
     {
-        eprintln!("{} Run {}.", notice.expiry_warning, notice.renewal_command);
+        eprintln!("{}", notice.text());
     }
 }
 
@@ -296,12 +304,13 @@ async fn import(
     flags: &Flags,
     env: &Environment,
     json: bool,
+    addr: Option<&str>,
 ) -> Result<(), SaiError> {
     let mut terminate = signal(SignalKind::terminate()).map_err(|_| SaiError::internal())?;
     let result = tokio::select! {
         biased;
         _ = terminate.recv() => None,
-        result = import_with_interrupt(storage, flags, env, json) => Some(result),
+        result = import_with_interrupt(storage, flags, env, json, addr) => Some(result),
     };
     // The import future has been dropped, restoring the terminal if it was in use.
     result.unwrap_or_else(|| terminate_import())
@@ -323,6 +332,7 @@ async fn import_with_interrupt(
     flags: &Flags,
     env: &Environment,
     json: bool,
+    addr: Option<&str>,
 ) -> Result<(), SaiError> {
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| SaiError::internal())?;
     let (token, summary) = tokio::select! {
@@ -335,6 +345,9 @@ async fn import_with_interrupt(
             let token = read_token().await?;
             let settings = load_settings(flags, env)?;
             let session = auth::import_session(token.clone(), settings.endpoint())?;
+            if addr.is_some_and(|expected| !expected.eq_ignore_ascii_case(session.addr())) {
+                return Err(SaiError::new(Code::InvalidRequest, "The Sai session token is for a different account than --addr"));
+            }
             let summary = serde_json::to_value(session.summary()).map_err(|_| SaiError::internal())?;
             log::remember([token.to_string()]);
             storage.save_session_async(session).await?;
@@ -497,7 +510,8 @@ Commands:
   the token. Prints the addr, expiry, and endpoint, never the token.
 
 Options:
-  --help  Show this message and exit."#
+  --addr ADDR  Require the token to match this EVM address.
+  --help       Show this message and exit."#
         }
         "auth list" => {
             r#"  List connected accounts, their expiry, and which one is active.

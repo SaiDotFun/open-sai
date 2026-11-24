@@ -1,11 +1,14 @@
 //! Endpoint and expiry checks shared by the CLI and other front ends.
 
+use std::fmt::Write as _;
+
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
 use serde::Serialize;
 
 use crate::{
     errors::{Code, SaiError},
     log,
+    settings::{Environment, Flags, Settings},
     storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
 
@@ -26,6 +29,20 @@ pub fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> 
 pub struct ExpiryNotice {
     pub expiry_warning: String,
     pub renewal_command: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_guidance: Option<String>,
+}
+
+impl ExpiryNotice {
+    pub fn text(&self) -> String {
+        let mut notice = self.expiry_warning.clone();
+        if let Some(guidance) = &self.renewal_guidance {
+            notice.push(' ');
+            notice.push_str(guidance);
+        }
+        let _ = write!(notice, " Run {}", self.renewal_command);
+        escape_warning_text(&notice)
+    }
 }
 
 fn expiry_warning_time(left: TimeDelta) -> Option<String> {
@@ -37,6 +54,25 @@ fn expiry_warning_time(left: TimeDelta) -> Option<String> {
         minutes @ 1..120 => format!("{minutes} min"),
         minutes => format!("{} h", minutes / 60),
     })
+}
+
+fn escape_warning_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{2028}' | '\u{2029}' => {
+                let _ = write!(escaped, "\\u{:04x}", u32::from(c));
+            }
+            c if c.is_control() => {
+                let _ = write!(escaped, "\\x{:02x}", u32::from(c));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 // Stored Keeper expiries follow Python's datetime.fromisoformat. Convert to
@@ -177,7 +213,11 @@ impl Storage<'_> {
                 "Trading session expired; sign in again",
             );
             error.hint = Some(if session.key_name().is_some() || session.is_imported() {
-                self.renewal_command(session)
+                let (command, guidance) = self.renewal_fields(session);
+                if let Some(guidance) = guidance {
+                    error.message.push_str(&format!(". {guidance}"));
+                }
+                command
             } else {
                 self.sign_in_hint(endpoint, Some(session.addr()))
             });
@@ -222,64 +262,60 @@ impl Storage<'_> {
         format!("sai --endpoint {flag} {}", shell_join(args))
     }
 
-    pub fn renewal_command(&self, session: &Session) -> String {
-        if session.key_name().is_none()
-            && session.is_imported()
-            && let Some(endpoint) = session.endpoint()
-        {
-            return self.keeper_command_hint(endpoint, &["auth", "import"]);
-        }
-        let origin = session.endpoint().and_then(keeper_origin);
-        let (prefix, suffix) = match origin.as_deref() {
-            Some(origin) if session.endpoint() == Some(origin) => (
-                format!("sai --endpoint {}", shell_quote(origin)),
-                String::new(),
-            ),
-            origin => (
-                "sai".into(),
-                format!(
-                    " (reuse the Keeper endpoint{} configured when this session was stored)",
-                    keeper_location(origin)
-                ),
-            ),
+    pub fn renewal_fields(&self, session: &Session) -> (String, Option<String>) {
+        let args: &[&str] = if session.key_name().is_some() {
+            &["auth", "renew", session.addr()]
+        } else if session.is_imported() {
+            &["auth", "import"]
+        } else {
+            &["auth", "import", "--addr", session.addr()]
         };
-        let command =
-            renewal_instructions(session, |args| format!("{prefix} {}", shell_join(args)));
-        format!("{command}{suffix}")
+        let home = self.trader.parent();
+        // Pasting the command can change which Keeper overrides are in effect.
+        let saved_settings = home.and_then(|home| {
+            Settings::load(
+                &Flags::default(),
+                &Environment::new(home.to_path_buf(), |_| None),
+            )
+            .ok()
+        });
+        let saved_endpoint = saved_settings.as_ref().map(Settings::endpoint);
+        let endpoint = session.endpoint().filter(|value| !value.is_empty());
+        let mut guidance = Vec::new();
+        let command = match endpoint.filter(|value| Some(*value) != saved_endpoint) {
+            Some(endpoint) => {
+                let origin = keeper_origin(endpoint)
+                    .filter(|origin| home.is_some_and(|home| log::redact(home, origin) == *origin));
+                if origin.as_deref() != Some(endpoint) {
+                    let location = keeper_location(origin.as_deref());
+                    guidance.push(format!(
+                        "Reuse the Keeper endpoint{location} used to sign in."
+                    ));
+                }
+                self.keeper_command(endpoint, origin.as_deref(), "", args)
+            }
+            None => format!("sai {}", shell_join(args)),
+        };
+        if endpoint.is_none() {
+            guidance.push("Reuse the Keeper endpoint used to sign in.".into());
+        }
+        if session.key_name().is_none() && !session.is_imported() {
+            guidance.push("You can also sign in again with your Foundry keystore.".into());
+        }
+        (command, (!guidance.is_empty()).then(|| guidance.join(" ")))
     }
 
     pub fn expiry_notice(&self, session: &Session, left: TimeDelta) -> Option<ExpiryNotice> {
         let when = expiry_warning_time(left)?;
-        let expiry_warning = format!("Sai session for {} expires in {when}.", session.addr());
-        let endpoint = session.endpoint().filter(|value| !value.is_empty());
-        let origin = endpoint.and_then(keeper_origin);
-        let mut renewal_command = renewal_instructions(session, |args| match endpoint {
-            Some(endpoint) => self.keeper_command(endpoint, origin.as_deref(), "", args),
-            None => format!("sai {}", shell_join(args)),
-        });
-        if endpoint.is_none() || endpoint != origin.as_deref() {
-            let location = keeper_location(origin.as_deref());
-            renewal_command.push_str(&format!(
-                " (reuse the Keeper endpoint{location} configured when this session was stored)"
-            ));
-        }
+        let (renewal_command, renewal_guidance) = self.renewal_fields(session);
         Some(ExpiryNotice {
-            expiry_warning,
+            expiry_warning: format!(
+                "Sai session for {} expires in {when}.",
+                escape_warning_text(session.addr())
+            ),
             renewal_command,
+            renewal_guidance,
         })
-    }
-}
-
-fn renewal_instructions(session: &Session, command: impl Fn(&[&str]) -> String) -> String {
-    if session.key_name().is_some() {
-        command(&["auth", "renew", session.addr()])
-    } else {
-        let import = command(&["auth", "import"]);
-        if session.is_imported() {
-            import
-        } else {
-            format!("{} or {import}", command(&["auth", "login", "NAME"]))
-        }
     }
 }
 

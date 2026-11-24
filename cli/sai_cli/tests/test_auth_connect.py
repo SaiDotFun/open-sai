@@ -1093,19 +1093,26 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     env.clipboard()
     env.clip.write_text(make_token(hours=48))
     assert env.run("auth", "import").returncode == 0
-    primary, secondary = pty.openpty()
     flags = ["--json"] if json_output else []
+    result, error = run_expiry_notice_on_terminal(
+        env, *flags, "config", "get", "keeper.endpoint"
+    )
+    assert "expires in" not in result.stdout
+    if json_output:
+        assert error == ""
+    else:
+        assert len(error.splitlines()) == 1
+        assert "expires in" in error
+        assert error.splitlines()[0].endswith("Run sai auth import")
+
+
+def run_expiry_notice_on_terminal(
+    env: Env, *args: str
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    primary, secondary = pty.openpty()
     try:
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sai_cli",
-                *flags,
-                "config",
-                "get",
-                "keeper.endpoint",
-            ],
+            [sys.executable, "-m", "sai_cli", *args],
             env={**env.vars(), "CI": "1"},
             stdin=secondary,
             stderr=secondary,
@@ -1122,13 +1129,37 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     finally:
         os.close(primary)
         os.close(secondary)
-    assert "expires in" not in result.stdout
-    if json_output:
-        assert error == ""
-    else:
-        assert len(error.splitlines()) == 1
-        assert "expires in" in error
-        assert error.splitlines()[0].endswith("Run sai auth import")
+    return result, error
+
+
+@pytest.mark.parametrize("auth", ["status", "list"])
+def test_expiry_notice_with_control_characters_and_path_endpoint(
+    env: Env, keeper_auth, auth: str
+):
+    addr = ADDR[:-4] + "\n\r\x1b\u2028"
+    endpoint = f"{keeper_auth['endpoint']}/private-path"
+    args = ("--endpoint", endpoint, "auth")
+    env.clipboard()
+    env.clip.write_text(make_token(addr, hours=48))
+    assert env.run(*args, "import").returncode == 0
+
+    result, error = run_expiry_notice_on_terminal(env, *args, auth)
+    assert len(error.splitlines()) == 1
+    assert rf"{ADDR[:-4]}\n\r\x1b\u2028 expires in" in error
+    assert "private-path" not in result.stdout + error
+    data = json.loads(result.stdout)
+    row = data if auth == "status" else data["accounts"][0]
+    assert row["addr"] == addr
+    command = row["renewalCommand"]
+    assert error.splitlines()[0].endswith(f" Run {command}")
+
+    env.clip.write_text(make_token(hours=720))
+    renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["addr"] == ADDR
+    current = env.run("--json", *args, "status")
+    assert current.returncode == 0
+    assert "expiryWarning" not in json.loads(current.stdout)
 
 
 @pytest.mark.parametrize(
