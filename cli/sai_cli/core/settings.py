@@ -16,7 +16,7 @@ import re
 import sys
 import tempfile
 import tomllib
-from collections.abc import Callable, Generator, Mapping
+from collections.abc import Callable, Collection, Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -283,13 +283,16 @@ def config_path(env: Mapping[str, str]) -> Path:
     return sai_home(env) / FILE_NAME
 
 
-def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
+def parse_file(
+    text: str, path: Path | str, *, overridden: Collection[str] = ()
+) -> tuple[dict[str, Any], list[str]]:
     """Return the known keys set in config TEXT and warnings for unknown ones.
 
     A file that is not TOML, or a known key with a bad value, is an error
     naming PATH. Unknown keys are only warned about, so an older sai keeps
     working with a file a newer one wrote. A bad `logs.*` value is a warning
     too: it comes back as `Invalid`, and `resolve` turns logging off.
+    Skip value validation for keys superseded by flags or environment variables.
     """
     try:
         data = tomllib.loads(text)
@@ -301,12 +304,18 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
     warnings: list[str] = []
     for section, table in data.items():
         if not isinstance(table, dict):
+            active_keys = [
+                spec.key
+                for spec in SETTINGS
+                if spec.section == section and spec.key not in overridden
+            ]
+            if section in SECTIONS and not active_keys:
+                continue
             if section in LENIENT_SECTIONS:
                 # Not worth stopping a trade for: the feature goes off.
                 message = f"{section!r} must be a table, such as [{section}]"
-                for spec in SETTINGS:
-                    if spec.section == section:
-                        values[spec.key] = Invalid(message)
+                for key in active_keys:
+                    values[key] = Invalid(message)
                 warnings.append(f"{path}: {message}; logging is off until it is fixed")
                 continue
             if section in SECTIONS:
@@ -321,6 +330,8 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
             if key not in BY_KEY:
                 warnings.append(f"{path}: ignoring unknown setting {key!r}")
                 continue
+            if key in overridden:
+                continue
             try:
                 values[key] = check_value(key, value)
             except InvalidSetting as exc:
@@ -331,7 +342,9 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
     return values, warnings
 
 
-def read_file(path: Path) -> tuple[dict[str, Any], list[str]]:
+def read_file(
+    path: Path, *, overridden: Collection[str] = ()
+) -> tuple[dict[str, Any], list[str]]:
     """Read the config file at PATH; a missing file sets nothing."""
     try:
         text = path.read_text(encoding="utf-8")
@@ -344,7 +357,30 @@ def read_file(path: Path) -> tuple[dict[str, Any], list[str]]:
         raise ConfigError(
             "Could not read config.toml", f"Cannot read {path}: {exc.strerror}"
         ) from None
-    return parse_file(text, path)
+    return parse_file(text, path, overridden=overridden)
+
+
+def _override(
+    spec: Setting, flags: Mapping[str, str | None], env: Mapping[str, str]
+) -> tuple[str, str] | None:
+    raw_flag = flags.get(spec.key)
+    if raw_flag is not None:
+        return raw_flag, "flag"
+    raw_env = env.get(spec.env, "")
+    if raw_env.strip():
+        return raw_env, "env"
+    return None
+
+
+def read_effective_file(
+    path: Path, flags: Mapping[str, str | None], env: Mapping[str, str]
+) -> tuple[dict[str, Any], list[str]]:
+    """Read the config file, skipping values that cannot affect resolution."""
+    overridden = {spec.key for spec in SETTINGS if _override(spec, flags, env)}
+    if "keeper.endpoint" in overridden:
+        # Even with no explicit WebSocket override, derive it from the HTTP URL.
+        overridden.add("keeper.ws_endpoint")
+    return read_file(path, overridden=overridden)
 
 
 def resolve(
@@ -367,41 +403,36 @@ def resolve(
     """
     values: dict[str, str | bool | int | None] = {}
     sources: dict[str, str] = {}
+    http_key, ws_key = "keeper.endpoint", "keeper.ws_endpoint"
     for spec in SETTINGS:
-        raw_flag = flags.get(spec.key)
-        raw_env = env.get(spec.env, "")
+        override = _override(spec, flags, env)
+        source = override[1] if override else "file" if spec.key in file else "default"
+        # SETTINGS lists the HTTP endpoint before its dependent WebSocket.
+        if spec.key == ws_key and (
+            source == "default" or _RANK[source] > _RANK[sources[http_key]]
+        ):
+            values[ws_key] = stream.derive_ws(str(values[http_key]))
+            sources[ws_key] = "derived"
+            continue
         try:
-            if raw_flag is not None:
-                values[spec.key], sources[spec.key] = (
-                    parse_value(spec.key, raw_flag, source=spec.flag or spec.key),
-                    "flag",
-                )
-            elif raw_env.strip():
-                values[spec.key], sources[spec.key] = (
-                    parse_value(spec.key, raw_env, source=spec.env),
-                    "env",
-                )
-            elif spec.key in file:
+            if override is not None:
+                origin = (spec.flag or spec.key) if source == "flag" else spec.env
+                values[spec.key] = parse_value(spec.key, override[0], source=origin)
+            elif source == "file":
                 if isinstance(file[spec.key], Invalid):
                     raise InvalidSetting(file[spec.key].message)
-                values[spec.key], sources[spec.key] = (
-                    check_value(spec.key, file[spec.key], source=FILE_NAME),
-                    "file",
+                values[spec.key] = check_value(
+                    spec.key, file[spec.key], source=FILE_NAME
                 )
             else:
-                values[spec.key], sources[spec.key] = spec.default, "default"
-        except InvalidSetting:
-            if spec.section in LENIENT_SECTIONS:
                 values[spec.key] = spec.default
-                sources[spec.key] = "invalid"
-                continue
-            raise
+        except InvalidSetting:
+            if spec.section not in LENIENT_SECTIONS:
+                raise
+            values[spec.key] = spec.default
+            source = "invalid"
+        sources[spec.key] = source
     logs_valid = "invalid" not in (sources["logs.enabled"], sources["logs.keep_days"])
-    ws_key, http_key = "keeper.ws_endpoint", "keeper.endpoint"
-    ws_rank = _RANK[sources[ws_key]]
-    if values[ws_key] is None or ws_rank > _RANK[sources[http_key]]:
-        values[ws_key] = stream.derive_ws(str(values[http_key]))
-        sources[ws_key] = "derived"
     return Settings(
         endpoint=str(values[http_key]),
         ws_endpoint=str(values[ws_key]),
@@ -420,8 +451,9 @@ def load(
 ) -> Settings:
     """Read the config file named by ENV (default: os.environ) and resolve."""
     values = os.environ if env is None else env
-    file, warnings = read_file(config_path(values))
-    resolved = resolve(flags or {}, values, file)
+    overrides = flags or {}
+    file, warnings = read_effective_file(config_path(values), overrides, values)
+    resolved = resolve(overrides, values, file)
     for spec in SETTINGS:
         from_env = values.get(spec.env, "").strip()
         if resolved.sources[spec.key] == "invalid" and from_env:

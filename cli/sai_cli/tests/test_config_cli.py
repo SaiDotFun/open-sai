@@ -408,6 +408,31 @@ def test_flag_and_env_override_the_file(monkeypatch):
     assert "SAI_ENDPOINT is set and overrides keeper.endpoint" in result.stderr
 
 
+@pytest.mark.parametrize("source", ["env", "file"])
+def test_only_the_effective_websocket_setting_is_validated(
+    tmp_path, monkeypatch, source
+):
+    value = "fixture-malformed-websocket"
+    if source == "env":
+        origin = "SAI_WS_ENDPOINT"
+        monkeypatch.setenv(origin, value)
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f'[keeper]\nws_endpoint = "{value}"\n')
+        origin = str(path)
+
+    entry = listed("--endpoint", "https://keeper.invalid/query")["settings"][
+        "keeper.ws_endpoint"
+    ]
+    assert (entry["value"], entry["source"]) == ("wss://keeper.invalid", "derived")
+
+    result = sai("--json", "config", "list")
+    assert result.exit_code == 2
+    message = json.loads(result.stdout)["error"]["message"]
+    assert f"{origin}: Invalid value for keeper.ws_endpoint" in message
+    assert value not in result.output
+
+
 @pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
 @pytest.mark.parametrize("source", ["flag", "env", "file"])
 @pytest.mark.parametrize(

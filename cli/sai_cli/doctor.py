@@ -112,12 +112,12 @@ CheckFn = Callable[[Context], "Check | Sequence[Check]"]
 def check_config(
     flags: dict[str, str | None],
 ) -> tuple[Check, Settings | None]:
-    """Validate file settings before resolving flag and environment overrides."""
+    """Validate the settings that apply to this invocation."""
     path = settings.config_path(os.environ)
     file_fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
     fix = file_fix
     try:
-        values, warnings = settings.read_file(path)
+        values, warnings = settings.read_effective_file(path, flags, os.environ)
         fix = "Check the settings listed by `sai config --help`"
         config = settings.resolve(flags, os.environ, values)
     except settings.ConfigError as exc:

@@ -48,8 +48,8 @@ TOKEN = f"{HEADER}.{PAYLOAD}.{SIGNATURE}"
 def isolated_home(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
     monkeypatch.setenv("PATH", "")
-    for name in ("SAI_ENDPOINT", "SAI_WS_ENDPOINT", "SAI_LCD_ENDPOINT"):
-        monkeypatch.delenv(name, raising=False)
+    for spec in settings.SETTINGS:
+        monkeypatch.delenv(spec.env, raising=False)
     return tmp_path
 
 
@@ -142,12 +142,10 @@ def run_cli(*args: str) -> tuple[int, str]:
     ],
 )
 def test_config_check_reports_file_errors_without_echoing_values(
-    isolated_home, monkeypatch, content, expected, exit_code, summary
+    isolated_home, content, expected, exit_code, summary
 ):
     path = isolated_home / "config.toml"
     path.write_bytes(content)
-    # File validation still applies to keys shadowed by an environment value.
-    monkeypatch.setenv("SAI_UPDATE_AUTO", "false")
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
     report = json.loads(output)
     if expected == "fail":
@@ -187,6 +185,19 @@ def test_config_check_names_invalid_environment_override(monkeypatch, json_outpu
         assert result.stdout == ""
         assert message in result.stderr
     assert value not in result.output
+
+
+def test_config_check_ignores_an_invalid_file_value_overridden_by_env(
+    isolated_home, monkeypatch
+):
+    (isolated_home / "config.toml").write_text('[update]\nauto = "fixture-invalid"\n')
+    monkeypatch.setenv("SAI_UPDATE_AUTO", "false")
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 0
+    config = next(c for c in json.loads(output)["checks"] if c["id"] == "config")
+    assert config["status"] == "pass"
 
 
 def test_unusable_config_skips_checks_that_need_resolved_settings(isolated_home):
