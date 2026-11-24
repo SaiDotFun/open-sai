@@ -148,6 +148,26 @@ fn key_time(key: &str) -> Option<f64> {
 }
 
 impl Storage<'_> {
+    /// Find a recorded account and its effective status on this Keeper endpoint.
+    pub fn intent_record(
+        &self,
+        endpoint: &str,
+        key: &str,
+    ) -> Result<Option<(String, String)>, StorageError> {
+        if !self.trader.join(LEDGER_FILE).try_exists()? {
+            return Ok(None);
+        }
+        Ok(self
+            .open_ledger()?
+            .query_row(
+                "SELECT account, COALESCE(keeper_status, status) FROM intents
+                 WHERE id=?1 AND endpoint=?2",
+                params![key, endpoint],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Open and migrate the ledger.
     pub fn open_ledger(&self) -> Result<Connection, StorageError> {
         self.remaining_busy_timeout()?;
