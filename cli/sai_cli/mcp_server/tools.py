@@ -665,7 +665,7 @@ def open_trade(
     if preview["addr"] is not None:
         return confirmation.with_digest(preview)
     preview["confirmationStatus"] = "informational"
-    if estimates.rejection_reason(preview.get("estimates", {})) is None:
+    if estimates.rejection_reason(result.get("estimates", {})) is None:
         preview["recovery"] = {
             "action": "connect_and_preview",
             "message": "Connect a Sai account, then call preview_open again for that account.",
