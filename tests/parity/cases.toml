@@ -199,6 +199,84 @@ wire = [
 state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
 
 [[case]]
+name = "account-overview-paginated"
+args = ["account", "overview", "--json"]
+seed = "overview-blockers"
+server = "overview-paginated"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+[case.overview_expected]
+"positions.data.items.@len" = 2
+"positions.data.unrealizedPnlUsd" = 7.0
+"pendingOrders.data.@len" = 99
+"pendingOrders.data.98.id" = 100
+"blockingIntents.data.@len" = 3
+"blockingIntents.data.0.scope" = "allTrades"
+"blockingIntents.data.1.scope" = "openTrades"
+"blockingIntents.data.1.tradeId" = "<null>"
+"blockingIntents.data.2.scope" = "sameTrade"
+"blockingIntents.data.2.tradeId" = "1"
+
+[[case]]
+name = "account-overview-confirmation-fails"
+args = ["account", "overview", "--json"]
+seed = "overview-session"
+server = "overview-confirmation-fails"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+[case.overview_expected]
+"positions.data.items.@len" = 2
+"positions.data.unrealizedPnlUsd" = "<null>"
+"positions.error.code" = "INCOMPLETE_DATA"
+"pendingOrders.error.code" = "INCOMPLETE_DATA"
+"pendingOrders.data.@len" = 99
+"pendingOrders.data.98.id" = 100
+
+[[case]]
 name = "account-overview-pnl-total"
 args = ["account", "overview", "--json"]
 seed = "overview-session"

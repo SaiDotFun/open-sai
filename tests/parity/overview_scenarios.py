@@ -22,6 +22,7 @@ from sai_cli.tests.test_overview import (
 ORACLE = "nibi1oraclefixture"
 BLOCKS = "/cosmos/base/tendermint/v1beta1/blocks/"
 SMART = "/cosmwasm/wasm/v1/contract/"
+PAGINATED = {"overview-paginated", "overview-confirmation-fails"}
 
 
 class OverviewReplay:
@@ -80,7 +81,25 @@ class OverviewReplay:
         self.trades = self.state["http"][keeper.OVERVIEW_TRADES]
         self.orders = self.state["http"][keeper.PENDING_MARKET_ORDERS]
 
-    def keeper(self, name: str, variables: Any) -> dict[str, Any] | None:
+        if self.scenario in PAGINATED:
+            rows = self.trades["data"]["perp"]["trades"]
+            pending = rows[-1]
+            rows.extend({**pending, "id": index} for index in range(len(rows), 101))
+
+    def keeper(
+        self, name: str, variables: Any, requests: list[WireRequest]
+    ) -> dict[str, Any] | None:
+        if name == "overviewTrades" and self.scenario in PAGINATED:
+            calls = sum(request.label == name for request in requests)
+            # First scan and confirmation each require offsets 0 and 100.
+            offset = 0 if calls in (1, 3) else 100
+            expected = {"trader": self.addr, "limit": 100, "offset": offset}
+            if calls not in (1, 2, 3, 4) or not same_variables(variables, expected):
+                raise ValueError("Unexpected pagination request for overviewTrades")
+            if self.scenario == "overview-confirmation-fails" and calls == 4:
+                return {"errors": [{"message": "confirmation page unavailable"}]}
+            rows = self.trades["data"]["perp"]["trades"]
+            return {"data": {"perp": {"trades": rows[offset : offset + 100]}}}
         args = {
             "overviewTrades": {"trader": self.addr, "limit": 100, "offset": 0},
             "pendingMarketOrders": {"trader": self.addr, "limit": 100, "offset": 0},

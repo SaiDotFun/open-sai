@@ -57,6 +57,13 @@ data = json.load(sys.stdin)
 for session in data["sessions"]:
     storage.save_session(session)
 if data["ledger"]:
+    if data.get("accepted_blockers"):
+        for key, kind, entity in (
+            ("accepted-close", "CLOSE_POSITION", "1"),
+            ("accepted-open", "OPEN_TRADE", ""),
+        ):
+            storage.pending(key, data["endpoint"], data["address"], kind, entity)
+            storage.set_status(key, data["endpoint"], data["address"], "accepted")
     storage.pending(data["key"], data["endpoint"], data["address"], "CLOSE_POSITION", "7")
     with storage.db() as conn:
         conn.execute("UPDATE intents SET created_at=946684800")
@@ -153,7 +160,7 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
-    if seed in {"overview-session", "overview-expiry"}:
+    if seed in {"overview-session", "overview-expiry", "overview-blockers"}:
         expires_at = (
             endpoints.overview_expiry
             if seed == "overview-expiry"
@@ -174,7 +181,8 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         input=json.dumps(
             {
                 "sessions": sessions,
-                "ledger": seed in {"ledger", "overview-session"},
+                "ledger": seed in {"ledger", "overview-session", "overview-blockers"},
+                "accepted_blockers": seed == "overview-blockers",
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
@@ -464,7 +472,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                         self.reject("Unexpected authorization on overview read")
                         return
                     try:
-                        response = overview.keeper(name, request.variables)
+                        response = overview.keeper(name, request.variables, wire)
                     except ValueError as exc:
                         self.reject(str(exc))
                         return

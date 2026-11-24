@@ -82,6 +82,7 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    overview_expected: dict[str, Any] | None = None
     absent_log_text: list[str] | None = None
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
@@ -279,6 +280,27 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
             raise ValueError(f"Persisted state differs from expectation at {selector}")
 
 
+def check_overview_fields(fields: dict[str, Any], output: Any) -> None:
+    absent = object()
+    for selector, expected in fields.items():
+        value = output
+        for key in selector.split("."):
+            if isinstance(value, dict):
+                value = value.get(key, absent)
+            elif isinstance(value, list) and key == "@len":
+                value = len(value)
+            elif isinstance(value, list) and key.isdecimal() and int(key) < len(value):
+                value = value[int(key)]
+            else:
+                value = absent
+        if first_difference(
+            value, None if expected == "<null>" else expected, selector
+        ):
+            raise ValueError(
+                f"Overview field {selector} differs from the fixture expectation"
+            )
+
+
 def observe(
     case: Case, binary: list[str], home: Path, endpoints: Endpoints
 ) -> Observation:
@@ -388,6 +410,8 @@ def observe(
         raise ValueError(
             f"Invalid {case.mode} stdout (exit {result.returncode})"
         ) from None
+    if case.overview_expected:
+        check_overview_fields(case.overview_expected, output)
     if case.mode == "mcp":
         mcp_tools(output)
     stderr = stderr_category(result.stderr)
