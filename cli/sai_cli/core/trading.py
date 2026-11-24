@@ -241,13 +241,15 @@ def close_trade(
                 raise ValueError("Cannot verify the pending order without an LCD")
             addr = get_session()["evmAddress"]
             contract = margin.trading_contract(endpoint, lcd_endpoint)
-            trade = margin.smart(
+            trade = margin.smart_value(
                 lcd_endpoint,
                 contract,
                 {"get_trade_raw": {"trader": addr, "index": trade_id}},
+                fresh=True,
             )
             if (
-                trade.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+                not isinstance(trade, dict)
+                or trade.get("user_trade_index") != f"UserTradeIndex({trade_id})"
                 or trade.get("is_open") is not True
                 or trade.get("trade_type") not in ("limit", "stop")
             ):
@@ -349,7 +351,10 @@ def _estimate_position(
             addr = get_session()["evmAddress"]
             state = margin.snapshot(endpoint, lcd, addr, trade_id)
             if target is not None or updates_triggers:
-                effective, _ = margin.leverage_inputs(lcd, state, trade_id)
+                height = margin.verified_position_height(lcd, state, trade_id)
+                effective, _ = margin.leverage_inputs(
+                    lcd, state, trade_id, height=height
+                )
         except estimates.READ_ERRORS:
             pass
     if target is None and not updates_triggers:
@@ -377,21 +382,19 @@ def _position_preview(
         preview["estimates"] = estimate(state, inputs, preview)
         return preview
 
-    state, leverage_inputs, fresh = build()
-    changed = not margin.position_unchanged(
-        lcd_endpoint, state, trade_id, leverage_inputs
-    )
+    state, inputs, fresh = build()
+    changed = not margin.position_unchanged(lcd_endpoint, state, trade_id, inputs)
     if changed:
         try:
-            state, leverage_inputs, fresh = build()
+            state, inputs, fresh = build()
         except (ValueError, keeper.KeeperError, KeyError, TypeError) as exc:
             raise PositionChanged(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
     if changed or fresh != preview:
-        fresh["estimates"] = estimate(state, leverage_inputs, fresh)
+        fresh["estimates"] = estimate(state, inputs, fresh)
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
-    _checked(before_submit, fresh, lambda _: estimate(state, leverage_inputs, fresh))
+    _checked(before_submit, fresh, lambda _: estimate(state, inputs, fresh))
     return fresh
 
 
@@ -506,9 +509,10 @@ def partial_close(
         )
         delta = int(payload["body"]["collateral"]["amountUsdc"])
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
+        notional = partial.notional_quote(lcd_endpoint, state, delta, leverage)
         return (
             state,
-            inputs,
+            {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
             {
                 "dryRun": True,
                 "intent": payload,
@@ -517,7 +521,7 @@ def partial_close(
                     "collateralBefore": str(raw["collateral_amount"]),
                     "leverageBefore": str(raw["leverage"]),
                     **inputs,
-                    **partial.notional_quote(lcd_endpoint, state, delta, leverage),
+                    **notional,
                 },
             },
         )
