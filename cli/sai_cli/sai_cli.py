@@ -485,6 +485,15 @@ def repl_args(line: str) -> list[str]:
     return args
 
 
+def store_repl_line_immediately(line: str) -> bool:
+    """Defer auth history until the command has run."""
+    try:
+        args = repl_args(line)
+    except ValueError:
+        return False
+    return not auth_attempt(command_path(main, args), args)
+
+
 def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> None:
     """Run the interactive shell.
 
@@ -496,7 +505,9 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
     skin.print_banner()
     click.echo("Enter a command, 'help', or 'exit'.")
     pt_session = (
-        skin.create_prompt_session(input=pt_input, output=pt_output)
+        skin.create_prompt_session(
+            history_filter=store_repl_line_immediately, input=pt_input, output=pt_output
+        )
         if pt_input is not None or sys.stdin.isatty()
         else None
     )
@@ -514,11 +525,19 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
         try:
             args = repl_args(line)
             if args:
-                main.main(
+                result = main.main(
                     args=[*forwarded_flags(ctx.obj), *args],
                     prog_name="sai",
                     standalone_mode=False,
                 )
+                names = command_path(main, args)
+                if (
+                    pt_session is not None
+                    and result is None
+                    and names[:1] == ["auth"]
+                    and names != ["auth", "import"]
+                ):
+                    pt_session.history.record(line)
         except (click.Abort, KeyboardInterrupt):
             click.echo("Interrupted", err=True)
         except Exception as exc:  # noqa: BLE001 - keep the REPL open
