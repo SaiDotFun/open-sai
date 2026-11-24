@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import re
 import sqlite3
+from collections.abc import Generator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from secrets import choice
@@ -11,6 +15,29 @@ from typing import Any
 
 from . import keeper, log, storage
 from .errors import Code
+
+IntentIdentity = tuple[str, str, str]  # Keeper endpoint, account, key
+
+
+@dataclass
+class SubmissionTrace:
+    identity: IntentIdentity | None = None
+
+
+_SUBMISSION_TRACE: ContextVar[SubmissionTrace | None] = ContextVar(
+    "submission_trace", default=None
+)
+
+
+@contextmanager
+def track_submission() -> Generator[SubmissionTrace]:
+    """Keep the generated intent key available for the caller's recovery."""
+    trace = SubmissionTrace()
+    token = _SUBMISSION_TRACE.set(trace)
+    try:
+        yield trace
+    finally:
+        _SUBMISSION_TRACE.reset(token)
 
 
 def now() -> str:
@@ -176,14 +203,17 @@ def submit(
     *,
     allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
+    account = session["evmAddress"]
+    trace = _SUBMISSION_TRACE.get()
     instant = datetime.now(UTC)
     key = (
         instant.strftime("%Y%m%dT%H%M%S")
         + f"{instant.microsecond // 1000:03d}Z_"
         + "".join(choice("0123456789ABCDEFGHJKMNPQRSTVWXYZ") for _ in range(16))
     )
+    if trace is not None:
+        trace.identity = (endpoint, account, key)
     stamp = now()
-    account = session["evmAddress"]
     envelope = {
         "intentKey": key,
         "intent": {"intentSchemaVersion": "v0", "tsIntentInit": stamp, **intent},

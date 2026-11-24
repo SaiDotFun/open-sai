@@ -247,12 +247,30 @@ def save_session(session: dict[str, str]) -> None:
         accounts["sessions"][addr] = session
         accounts["active"] = addr
         _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def replace_session(previous: dict[str, str], session: dict[str, str]) -> None:
+    """Renew the same stored session without switching the active account."""
+    with _locked():
+        accounts = load_accounts()
+        addr = previous["evmAddress"].lower()
+        if accounts["sessions"].get(addr) != previous:
+            raise ValueError(
+                "Stored session changed during renewal. Run sai auth status."
+            )
+        accounts["sessions"][addr] = session
+        _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def _log_saved(session: dict[str, str], count: int) -> None:
     log.event(
         "session.saved",
         addr=session["evmAddress"],
         expiresAt=session["expiresAt"],
         endpoint=log.endpoint(session.get("endpoint")),
-        connectedAccounts=len(accounts["sessions"]),
+        connectedAccounts=count,
     )
 
 
@@ -585,6 +603,19 @@ def list_pending(endpoint: str, account: str) -> list[dict[str, Any]]:
     return [{"intentKey": row[0], "kind": row[1], "status": row[2]} for row in rows]
 
 
+def intent_record(endpoint: str, key: str) -> tuple[str, str] | None:
+    """Return the recorded account and status for KEY on this endpoint."""
+    if not (home() / "intents.sqlite3").exists():
+        return None
+    with db() as connection:
+        row = connection.execute(
+            "SELECT account, COALESCE(keeper_status,status) FROM intents"
+            " WHERE id=? AND endpoint=?",
+            (key, endpoint),
+        ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
 def _key_time(key: str) -> float | None:
     """Read the reservation time embedded in an intent key, if it has one."""
     try:
@@ -592,6 +623,45 @@ def _key_time(key: str) -> float | None:
     except ValueError:
         return None
     return stamp.replace(tzinfo=UTC).timestamp()
+
+
+def unresolved_intents(endpoint: str, account: str) -> list[dict[str, Any]]:
+    """Read unknown, accepted, and pending intents without migrating a ledger."""
+    path = home() / "intents.sqlite3"
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return []
+    with contextlib.closing(
+        sqlite3.connect(
+            f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT.get()
+        )
+    ) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise ValueError("Intent database was written by a newer sai version")
+        created_column = "created_at" if version >= 1 else "NULL"
+        status = (
+            "COALESCE(keeper_status,status)"
+            if "keeper_status" in _intent_columns(connection)
+            else "status"
+        )
+        rows = connection.execute(
+            f"SELECT id, kind, {status}, entity, {created_column} FROM intents"
+            f" WHERE endpoint=? AND account=? AND {status} IN ('unknown', 'accepted', 'pending')"
+            " ORDER BY rowid DESC",
+            (endpoint, account.lower()),
+        ).fetchall()
+    return [
+        {
+            "intentKey": key,
+            "kind": kind,
+            "status": status,
+            "entity": entity,
+            "createdAt": created,
+        }
+        for key, kind, status, entity, created in rows
+    ]
 
 
 def mark_absent(
