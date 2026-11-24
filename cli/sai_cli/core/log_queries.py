@@ -292,14 +292,12 @@ class _Cursor:
                 exit_code=ExitCode.USAGE,
             ) from None
 
-    def bounds(self) -> tuple[str | None, date | None]:
-        upper = self.upper
-        if self.timestamp is not None:
-            instant = datetime.fromisoformat(self.timestamp)
-            if instant.date() < date.max:
-                edge = log.stamp(instant + timedelta(milliseconds=1))
-                upper = min(upper, edge) if upper else edge
-        return upper, date.fromisoformat(self.upper[:10]) if self.upper else None
+    @property
+    def last_day(self) -> date | None:
+        # Only an explicit timestamp filter bounds which rows can be returned.
+        # The position cursor's timestamp describes the last consumed row,
+        # and an unread row can have a later timestamp.
+        return date.fromisoformat(self.upper[:10]) if self.upper else None
 
     def encode(self, position: log.ScanPosition, timestamp: str, parent: str) -> str:
         offsets = (
@@ -555,7 +553,7 @@ def run(
         raise SaiError("Invalid log run or call ID.", Code.INVALID_REQUEST)
 
     cursor = _Cursor.parse(before)
-    cutoff, last_day = cursor.bounds()
+    last_day = cursor.last_day
     parent = cursor.parent
 
     def parent_key(run_id: str) -> str:
@@ -596,7 +594,7 @@ def run(
         root,
         start=cursor.position,
         last_day=last_day,
-        before=cutoff,
+        before=cursor.upper,
         observe=remember_call_run,
     ):
         if (ts := _timestamp(line)) is None:
@@ -650,7 +648,6 @@ def stats(
 ) -> LogLine:
     """Summarize the timed samples and coded failures within the scan budget."""
     cursor = _Cursor.parse(before)
-    upper, last_day = cursor.bounds()
     first_day = None
     cutoff = None
     if since is not None:
@@ -673,9 +670,9 @@ def stats(
             root,
             start=cursor.position,
             first_day=first_day,
-            last_day=last_day,
+            last_day=cursor.last_day,
             since=cutoff,
-            before=upper,
+            before=cursor.upper,
         )
     ) as rows:
         for position, line in rows:

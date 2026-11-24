@@ -2651,6 +2651,41 @@ def test_log_stats_scan_continues_inside_one_millisecond(home):
     assert "nextBefore" not in second
 
 
+def test_logs_stats_continuation_keeps_out_of_order_appends(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    buried_at = 101
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(
+            {
+                **sample,
+                "operation": "markets",
+                "ts": log.stamp(start + timedelta(milliseconds=buried_at)),
+            }
+        )
+        + b"".join(
+            log.encode({**sample, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(log.MAX_SCAN_ROWS + 1)
+            if i != buried_at
+        )
+    )
+
+    first = log_queries.stats()
+    assert first["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    assert first["errors"] == {"KEEPER_ERROR": log.MAX_SCAN_ROWS}
+    earlier = log_queries.stats(before=first["nextBefore"])
+    assert earlier["keeper"] == {"markets": {"count": 1, "p50Ms": 7, "p95Ms": 7}}
+    assert earlier["errors"] == {"KEEPER_ERROR": 1}
+    assert "nextBefore" not in earlier
+
+
 def test_mcp_log_concurrency_leaves_normal_tools_available(keeper_stub):
     endpoint, state = keeper_stub
     state.intents_block = threading.Event()
