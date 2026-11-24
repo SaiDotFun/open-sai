@@ -8,6 +8,22 @@ pub const POSITION: &str = "query($trader:String!, $id:Int!) { perp { trade(trad
 pub const ROUTE: &str = "query { oneClickTrading { enabled chainId contractAddress } }";
 pub const HISTORY: &str = "query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }";
 pub const INTENTS: &str = "query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
+pub const WAIT_INTENTS: &str = "query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
+pub const INTENT_HISTORY: &str = "query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) {
+      id intentKey tradeChangeType txHash evmTxHash block { block block_ts }
+      marketOrder { orderReqBlock orderReqTxHash orderExecBlock sequence execPrice collateralAmount }
+      openingFeeUsd closingFeeUsd borrowingFeeUsd
+      trade {
+        id trader tradeType isOpen isLong collateralAmount openCollateralAmount
+        leverage openPrice closePrice tp sl openBlock { block } closeBlock { block }
+        perpBorrowing { marketId collateralToken { symbol } }
+      }
+    }
+  }
+}";
 pub const CHALLENGE: &str = "mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }";
 pub const SESSION: &str = "mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }";
 pub const SUBMIT: &str = "mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }";
@@ -15,8 +31,8 @@ pub const SUBMIT: &str = "mutation($input:RecordUserIntentInput!) { recordUserIn
 pub(super) fn operation(query: &str) -> &'static str {
     match query {
         CHALLENGE => "challenge",
-        HISTORY => "history",
-        INTENTS => "intents",
+        HISTORY | INTENT_HISTORY => "history",
+        INTENTS | WAIT_INTENTS => "intents",
         MARKET => "market",
         MARKETS => "markets",
         POSITION => "position",

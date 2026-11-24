@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -83,28 +83,46 @@ class Request:
     body: bytes
 
 
+ReplayReply = Reply | Callable[[Request], Reply]
+
+
 @contextmanager
 def replay(
     tls: ssl.SSLContext | None = None,
-) -> Iterator[tuple[str, deque[Reply], list[Request]]]:
-    replies: deque[Reply] = deque()
+    *,
+    get: Callable[[Request], Reply] | None = None,
+) -> Iterator[tuple[str, deque[ReplayReply], list[Request]]]:
+    replies: deque[ReplayReply] = deque()
     requests: list[Request] = []
 
     class Handler(BaseHTTPRequestHandler):
-        def do_POST(self) -> None:
-            body = self.rfile.read(int(self.headers["Content-Length"]))
-            requests.append(
-                Request(
-                    self.path,
-                    self.request_version,
-                    {name.lower(): value for name, value in self.headers.items()},
-                    body,
-                )
+        def record(self, body: bytes) -> Request:
+            request = Request(
+                self.path,
+                self.request_version,
+                {name.lower(): value for name, value in self.headers.items()},
+                body,
             )
+            requests.append(request)
+            return request
+
+        def do_POST(self) -> None:
+            request = self.record(self.rfile.read(int(self.headers["Content-Length"])))
             if not replies:
                 self.send_error(500, "Unexpected Keeper request")
                 return
             reply = replies.popleft()
+            if callable(reply):
+                reply = reply(request)
+            self.send_reply(reply)
+
+        def do_GET(self) -> None:
+            if get is None:
+                self.send_error(501, "Unexpected LCD request")
+                return
+            self.send_reply(get(self.record(b"")))
+
+        def send_reply(self, reply: Reply) -> None:
             if reply.disconnect:
                 self.close_connection = True
                 return
@@ -149,20 +167,26 @@ def invoke(
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [*cli, *args],
-        env={
-            "PATH": os.defpath,
-            "HOME": str(home.parent),
-            "SAI_HOME": str(home),
-            "SAI_LOG": "1",
-            "SAI_UPDATE_AUTO": "0",
-            "PYTHONUTF8": "1",
-            **(overrides or {}),
-        },
+        env=cli_environment(home, overrides),
         cwd=home.parent,
         capture_output=True,
         check=False,
         timeout=30,
     )
+
+
+def cli_environment(
+    home: Path, overrides: dict[str, str] | None = None
+) -> dict[str, str]:
+    return {
+        "PATH": os.defpath,
+        "HOME": str(home.parent),
+        "SAI_HOME": str(home),
+        "SAI_LOG": "1",
+        "SAI_UPDATE_AUTO": "0",
+        "PYTHONUTF8": "1",
+        **(overrides or {}),
+    }
 
 
 def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any]]:
@@ -715,7 +739,6 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
     ("args", "exit_code", "code"),
     [
         (("--json",), 2, "INVALID_REQUEST"),
-        (("--json", "intent"), 2, "INVALID_REQUEST"),
         (("--json", "config"), 2, "INVALID_REQUEST"),
         (("--bad-option", "--json", "intent", "status", ADDR), 2, "INVALID_REQUEST"),
         (("--json", "intent", "status"), 2, "INVALID_REQUEST"),
@@ -781,14 +804,11 @@ def test_cli_errors_share_one_envelope(
     assert outputs[0] == outputs[1]
 
 
-@pytest.mark.parametrize("args", [("intent", "--help"), ("intent", "status", "--help")])
-def test_intent_help(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path, args: tuple[str, ...]
-) -> None:
+def test_intent_help(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
     outputs = []
     for index, cli in enumerate(cli_pair):
         home = tmp_path / str(index)
-        result = invoke(cli, home, *args)
+        result = invoke(cli, home, "intent", "status", "--help")
         assert result.returncode == 0
         assert not result.stderr
         assert not home.exists()

@@ -4,6 +4,7 @@
 "auth import" = "Successful imports are compared with a fixture clipboard and PTY in test_auth.py."
 "auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
 "auth renew" = "Compared with Python main in test_auth.py."
+"intent wait" = "Covered by the pinned, stateful replays in test_intent_wait.py."
 "mcp uninstall" = "Requires a client registration fixture."
 "logs intent" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
 "logs run" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
