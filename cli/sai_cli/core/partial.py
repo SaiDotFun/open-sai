@@ -19,14 +19,15 @@ def _format_micros(amount: int) -> str:
 
 
 def notional_quote(
-    lcd: str, state: margin.PositionSnapshot, trade_id: int, collateral_delta: int
+    lcd: str,
+    state: margin.PositionSnapshot,
+    collateral_delta: int,
+    effective_leverage: Decimal | None,
 ) -> dict[str, Any]:
     """Quote the requested slice with the Perp after-hours rule and oracle."""
     raw = state.raw
     stored_leverage = Decimal(str(raw["leverage"]))
     collateral_index = raw["collateral_index"]
-    effective_leverage, inputs = margin.leverage_inputs(lcd, state, trade_id)
-
     try:
         price = margin.contract_decimal(
             margin.smart_value(
@@ -42,7 +43,6 @@ def notional_quote(
     leverage = stored_leverage if effective_leverage is None else effective_leverage
     size = _floor_product(collateral_delta, leverage)
     return {
-        **inputs,
         "collateralPriceUsd": str(price) if price is not None else None,
         "closedNotionalUsdc": _format_micros(size),
         "closedNotionalUsd": _format_micros(_floor_product(size, price))

@@ -550,7 +550,9 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
         current = next(states)
         return current
 
-    def contract_reply(lcd: str, contract: str, query: dict[str, Any]) -> Any:
+    def contract_reply(
+        lcd: str, contract: str, query: dict[str, Any], **kwargs: Any
+    ) -> Any:
         if "get_trade_raw" in query:
             assert current is not None
             return current.raw
@@ -558,6 +560,11 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
 
     monkeypatch.setattr(margin, "snapshot", snapshot)
     monkeypatch.setattr(margin, "smart_value", contract_reply)
+    monkeypatch.setattr(
+        margin,
+        "_latest_position",
+        lambda *args: (contract_reply("", "", {"get_trade_raw": {}}), "120"),
+    )
 
 
 def confirm(

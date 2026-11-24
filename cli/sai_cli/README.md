@@ -275,10 +275,12 @@ still needs the `previewDigest` of the preview the user confirmed.
 The partial-close digest covers the close percentage, starting collateral and
 leverage, and the contract inputs used to quote the requested slice. The
 margin digest covers the full quote, including starting collateral, stored
-leverage, and the inputs that determine effective leverage. Both tools
-re-read the position after fetching the quote inputs. If a trade call finds
-a change, it returns `PREVIEW_MISMATCH` and includes the latest preview when
-the position can still be quoted. The direct leverage tool confirms the
+leverage, and the inputs that determine effective leverage. Before submitting,
+both tools re-read the position and the effective-leverage inputs, including
+the applicable after-hours cap, at the same block. Submission requires an LCD
+that reports the query height and serves height-pinned queries. If a trade call
+finds a change, it returns `PREVIEW_MISMATCH` and includes the latest preview
+when it can still quote the position. The direct leverage tool confirms the
 requested target leverage.
 
 ## Commands

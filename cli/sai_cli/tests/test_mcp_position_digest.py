@@ -37,6 +37,9 @@ class Position:
     after_hours: bool = False
     risk_block: int = 90
     cap: str | None = "5"
+    caps_on_position_read: deque[str | None] = field(default_factory=deque)
+    reported_height: int | None = 120
+    cap_query_heights: list[str | None] = field(default_factory=list)
     collateral_price: str | None = "1"
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
@@ -108,6 +111,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
             assert self.path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(self.path[len(prefix) :])))
             if "get_trade_raw" in message:
+                if position.caps_on_position_read:
+                    cap = position.caps_on_position_read.popleft()
+                    if cap is not None:
+                        position.cap = cap
+                        if position.reported_height is not None:
+                            position.reported_height += 1
                 data = {
                     "user": TRADER,
                     "user_trade_index": "UserTradeIndex(7)",
@@ -139,6 +148,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 }
                 data = [{"created_block": position.risk_block}]
             elif "get_after_hours_leverage" in message:
+                position.cap_query_heights.append(
+                    self.headers.get("x-cosmos-block-height")
+                )
                 data = position.cap
             else:
                 assert message == {
@@ -152,13 +164,18 @@ def position_service() -> Iterator[tuple[Position, str]]:
             if data is None:
                 self.send_error(400, "contract query unavailable")
                 return
-            self.reply({"data": data})
+            self.reply({"data": data}, position.reported_height)
 
-        def reply(self, value: dict[str, Any]) -> None:
+        def reply(self, value: dict[str, Any], height: int | None = None) -> None:
+            requested_height = self.headers.get("x-cosmos-block-height")
+            if requested_height is not None:
+                assert requested_height == str(height)
             data = json.dumps(value).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
+            if height is not None:
+                self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
             self.end_headers()
             self.wfile.write(data)
 
@@ -323,6 +340,78 @@ def test_partial_close_rechecks_position_after_the_last_oracle_read(
             assert accepted["status"] == "accepted"
             (submitted,) = position.submitted
             assert submitted["body"]["collateral"]["amountUsdc"] == "1600000"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "5"}),
+    ],
+)
+@pytest.mark.parametrize("reported_height", [120, None])
+def test_trade_rechecks_cap_after_reading_unchanged_position(
+    position_service: tuple[Position, str],
+    tool: str,
+    args: dict[str, Any],
+    reported_height: int | None,
+) -> None:
+    position, base_url = position_service
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    position.reported_height = reported_height
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            assert preview["quote"]["afterHoursLeverageCap"] == "5"
+            # Both rebuilt quotes see 5x. The cap changes as the final
+            # contract position read starts, with the stored trade intact.
+            position.caps_on_position_read.extend([None, None, "4"])
+            result = await call(
+                client,
+                f"trade_{tool}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert result.get("code") == "PREVIEW_MISMATCH", result
+            assert position.submitted == []
+            assert position.cap_query_heights == [
+                None,
+                None,
+                None,
+                "121" if reported_height is not None else None,
+                None,
+            ]
+            fresh = result["preview"]
+            assert fresh["previewDigest"] != preview["previewDigest"]
+            assert (
+                fresh["quote"]["effectiveLeverage"]
+                == fresh["quote"]["afterHoursLeverageCap"]
+                == "4"
+            )
+            if tool == "margin":
+                assert Decimal(preview["quote"]["requestedLeverage"]) > 4
+                assert Decimal(fresh["quote"]["requestedLeverage"]) < 4
+            else:
+                assert preview["quote"]["closedNotionalUsd"] == "250"
+                assert fresh["quote"]["closedNotionalUsd"] == "200"
+                assert fresh["intent"] == preview["intent"]
+            assert fresh == await call(client, f"preview_{tool}", args)
+            accepted = await call(
+                client,
+                f"trade_{tool}",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
+            if reported_height is None:
+                assert accepted.get("code") == "INVALID_REQUEST", accepted
+                assert "same block" in accepted["error"]
+                assert position.submitted == []
+            else:
+                assert accepted["status"] == "accepted"
+                assert len(position.submitted) == 1
 
     asyncio.run(scenario())
 

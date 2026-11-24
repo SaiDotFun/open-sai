@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
@@ -14,30 +15,54 @@ import httpx
 from . import intents, keeper
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
+BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
+
+
+class QueryHeightMismatch(ValueError):
+    """The LCD answered a pinned query at an unverified height."""
 
 
 def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
+    return _get_json_at_height(url, timeout)[0]
+
+
+def _get_json_at_height(
+    url: str, timeout: float = 20, *, height: str | None = None
+) -> tuple[dict[str, Any], str | None]:
     keeper.check_url(url, "LCD")
     try:
-        response = httpx.get(url, timeout=timeout)
+        headers = {BLOCK_HEIGHT_HEADER: height} if height is not None else None
+        response = httpx.get(url, timeout=timeout, headers=headers)
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
-        return result
     except (httpx.HTTPError, ValueError, TypeError) as exc:
         raise ValueError("Unable to read contract state") from exc
+    query_height = response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}")
+    if height is not None and query_height != height:
+        raise QueryHeightMismatch(
+            "LCD did not serve the requested contract query height"
+        )
+    return result, query_height
 
 
-def smart_value(lcd: str, contract: str, message: dict[str, Any]) -> Any:
-    """Read a CosmWasm smart query, including scalar and array responses."""
+def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
-    return _get_json(
-        f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
-    ).get("data")
+    return f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
+
+
+def smart_value(
+    lcd: str, contract: str, message: dict[str, Any], *, height: str | None = None
+) -> Any:
+    """Read a CosmWasm smart query, including scalar and array responses."""
+    url = _smart_url(lcd, contract, message)
+    if height is None:
+        return _get_json(url).get("data")
+    return _get_json_at_height(url, height=height)[0].get("data")
 
 
 def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
@@ -63,9 +88,22 @@ def _read_position(
     )
 
 
-def position_unchanged(lcd: str, state: PositionSnapshot, trade_id: int) -> bool:
-    """Compare the bound position fields after the quote's network reads."""
-    latest = _read_position(lcd, state.contract, state.raw["user"], trade_id)
+def _latest_position(
+    lcd: str, state: PositionSnapshot, trade_id: int
+) -> tuple[dict[str, Any], str | None]:
+    message = {"get_trade_raw": {"trader": state.raw["user"], "index": trade_id}}
+    result, height = _get_json_at_height(_smart_url(lcd, state.contract, message))
+    raw = result.get("data")
+    if not isinstance(raw, dict):
+        raise TypeError("Contract returned invalid state")
+    if height is not None and (
+        not height.isascii() or not height.isdecimal() or not height.lstrip("0")
+    ):
+        raise QueryHeightMismatch("LCD returned an invalid contract query height")
+    return raw, height
+
+
+def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
     fields = (
         "user",
         "user_trade_index",
@@ -76,7 +114,25 @@ def position_unchanged(lcd: str, state: PositionSnapshot, trade_id: int) -> bool
         "is_open",
         "trade_type",
     )
-    return all(latest.get(key) == state.raw[key] for key in fields)
+    return all(latest.get(key) == prior[key] for key in fields)
+
+
+def position_unchanged(
+    lcd: str, state: PositionSnapshot, trade_id: int, quoted_leverage: dict[str, Any]
+) -> bool:
+    """Recheck the position and effective-leverage inputs after quoting."""
+    latest, height = _latest_position(lcd, state, trade_id)
+    if not _same_position(state.raw, latest):
+        return False
+    _, inputs = leverage_inputs(lcd, state, trade_id, height=height)
+    if inputs != quoted_leverage:
+        return False
+    if height is None:
+        raise ValueError(
+            "Cannot confirm the position and leverage at the same block."
+            " Use an LCD that reports the contract query height."
+        )
+    return True
 
 
 def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
@@ -145,7 +201,7 @@ def contract_decimal(value: Any) -> Decimal:
 
 
 def leverage_inputs(
-    lcd: str, state: PositionSnapshot, trade_id: int
+    lcd: str, state: PositionSnapshot, trade_id: int, *, height: str | None = None
 ) -> tuple[Decimal | None, dict[str, Any]]:
     """Read the execution leverage and the contract inputs that determine it."""
     raw = state.raw
@@ -154,8 +210,16 @@ def leverage_inputs(
         "collateralIndex": raw["collateral_index"],
     }
     stored = contract_decimal(raw["leverage"])
+
+    def query(message: dict[str, Any]) -> Any:
+        if height is None:
+            return smart_value(lcd, state.contract, message)
+        return smart_value(lcd, state.contract, message, height=height)
+
     try:
-        effective = _effective_leverage(lcd, state, trade_id, stored, inputs)
+        effective = _effective_leverage(query, raw["user"], trade_id, stored, inputs)
+    except QueryHeightMismatch:
+        raise
     except (ValueError, TypeError, KeyError):
         # An unavailable query does not establish that the cap is inactive.
         return None, {**inputs, "effectiveLeverage": None}
@@ -163,24 +227,24 @@ def leverage_inputs(
 
 
 def _effective_leverage(
-    lcd: str,
-    state: PositionSnapshot,
+    query: Callable[[dict[str, Any]], Any],
+    trader: str,
     trade_id: int,
     stored: Decimal,
     inputs: dict[str, Any],
 ) -> Decimal:
     """Mirror Perp's get_effective_leverage for an open, filled position."""
     market_index = inputs["marketIndex"]
-    enabled = smart_value(
-        lcd, state.contract, {"is_after_hours_market": {"market_index": market_index}}
-    )
+    enabled = query({"is_after_hours_market": {"market_index": market_index}})
     if not isinstance(enabled, bool):
         raise TypeError("Expected the contract's after-hours flag")
     inputs["afterHoursMarket"] = enabled
     if not enabled:
         return stored
 
-    market = smart(lcd, state.contract, {"get_market": {"index": market_index}})
+    market = query({"get_market": {"index": market_index}})
+    if not isinstance(market, dict):
+        raise TypeError("Expected the contract market")
     opened, closed = market["block_last_opened"], market["block_last_closed"]
     if any(value is not None and type(value) is not int for value in (opened, closed)):
         raise ValueError("Expected the market's session blocks")
@@ -188,12 +252,10 @@ def _effective_leverage(
     if opened is None or closed is None:
         return stored
     if opened > closed:
-        infos = smart_value(
-            lcd,
-            state.contract,
+        infos = query(
             {
                 "get_trade_infos": {
-                    "trader": state.raw["user"],
+                    "trader": trader,
                     "start_idx": trade_id,
                     "scan_limit": 1,
                 }
@@ -212,9 +274,7 @@ def _effective_leverage(
         if created >= opened:
             return stored
 
-    cap = contract_decimal(
-        smart_value(lcd, state.contract, {"get_after_hours_leverage": {}})
-    )
+    cap = contract_decimal(query({"get_after_hours_leverage": {}}))
     inputs["afterHoursLeverageCap"] = str(cap)
     return min(stored, cap)
 

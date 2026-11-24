@@ -1233,6 +1233,9 @@ def test_request_and_get_json_pass_the_timeout(monkeypatch):
     class Response:
         status_code = 200
 
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
+
         def raise_for_status(self) -> None:
             return None
 

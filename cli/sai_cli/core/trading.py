@@ -18,6 +18,7 @@ Notify = Callable[[str], None]
 # Called with the preview of the exact intent about to be submitted, after
 # every refresh and recheck; raising stops the submission.
 SubmitCheck = Callable[[dict[str, Any]], None]
+PositionPreview = tuple[margin.PositionSnapshot, dict[str, Any], dict[str, Any]]
 
 MARGIN_WARNING = (
     "The request authorizes target leverage, not an amount cap; the actual"
@@ -181,7 +182,7 @@ def set_leverage(
 
 
 def _position_preview(
-    build: Callable[[], tuple[margin.PositionSnapshot, dict[str, Any]]],
+    build: Callable[[], PositionPreview],
     *,
     lcd_endpoint: str,
     addr: str,
@@ -190,15 +191,17 @@ def _position_preview(
     before_submit: SubmitCheck,
     changed_message: str,
 ) -> dict[str, Any]:
-    _, preview = build()
+    _, _, preview = build()
     if dry_run:
         return preview
 
-    state, fresh = build()
-    changed = not margin.position_unchanged(lcd_endpoint, state, trade_id)
+    state, leverage_inputs, fresh = build()
+    changed = not margin.position_unchanged(
+        lcd_endpoint, state, trade_id, leverage_inputs
+    )
     if changed:
         try:
-            _, fresh = build()
+            _, _, fresh = build()
         except (ValueError, keeper.KeeperError, KeyError, TypeError) as exc:
             raise PositionChanged(
                 f"{changed_message}. Could not quote the latest position. {exc}"
@@ -228,7 +231,7 @@ def change_margin(
     active = get_session()
     addr = active["evmAddress"]
 
-    def build_preview() -> tuple[margin.PositionSnapshot, dict[str, Any]]:
+    def build_preview() -> PositionPreview:
         state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         if leverage is None:
@@ -241,16 +244,21 @@ def change_margin(
             amount,
             effective_leverage=leverage,
         )
-        return state, {
-            "dryRun": True,
-            "quote": {
-                **quote,
-                **inputs,
-                "marginChangeIsEstimate": leverage < Decimal(quote["leverageBefore"]),
+        return (
+            state,
+            inputs,
+            {
+                "dryRun": True,
+                "quote": {
+                    **quote,
+                    **inputs,
+                    "marginChangeIsEstimate": leverage
+                    < Decimal(quote["leverageBefore"]),
+                },
+                "intent": intents.leverage_intent(trade_id, quote["requestedLeverage"]),
+                "warning": MARGIN_WARNING,
             },
-            "intent": intents.leverage_intent(trade_id, quote["requestedLeverage"]),
-            "warning": MARGIN_WARNING,
-        }
+        )
 
     preview = _position_preview(
         build_preview,
@@ -287,7 +295,7 @@ def partial_close(
     active = get_session()
     addr = active["evmAddress"]
 
-    def build_preview() -> tuple[margin.PositionSnapshot, dict[str, Any]]:
+    def build_preview() -> PositionPreview:
         state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
         raw = state.raw
         market_id = state.market["marketId"]
@@ -309,16 +317,22 @@ def partial_close(
             position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
         )
         delta = int(payload["body"]["collateral"]["amountUsdc"])
-        return state, {
-            "dryRun": True,
-            "intent": payload,
-            "quote": {
-                "percent": percent,
-                "collateralBefore": str(raw["collateral_amount"]),
-                "leverageBefore": str(raw["leverage"]),
-                **partial.notional_quote(lcd_endpoint, state, trade_id, delta),
+        leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
+        return (
+            state,
+            inputs,
+            {
+                "dryRun": True,
+                "intent": payload,
+                "quote": {
+                    "percent": percent,
+                    "collateralBefore": str(raw["collateral_amount"]),
+                    "leverageBefore": str(raw["leverage"]),
+                    **inputs,
+                    **partial.notional_quote(lcd_endpoint, state, delta, leverage),
+                },
             },
-        }
+        )
 
     preview = _position_preview(
         build_preview,

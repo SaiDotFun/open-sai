@@ -602,6 +602,7 @@ def test_leverage_is_separate_update_intent():
 
 def test_margin_dry_run_and_recheck(session, monkeypatch):
     raw = {
+        "user": "nibi1trader",
         "collateral_amount": "10000000",
         "leverage": "10",
         "market_index": "MarketIndex(0)",
@@ -662,10 +663,11 @@ def test_margin_refuses_changed_position(session, monkeypatch):
     )
     monkeypatch.setattr("sai_cli.sai_cli.session", lambda ctx: session)
     monkeypatch.setattr(margin, "snapshot", lambda *args: next(items))
+    monkeypatch.setattr(margin, "_latest_position", lambda *args: (newer, "120"))
     monkeypatch.setattr(
         margin,
         "smart_value",
-        lambda lcd, contract, query: newer if "get_trade_raw" in query else False,
+        lambda lcd, contract, query, **kwargs: False,
     )
     result = CliRunner().invoke(
         main, ["trade", "margin", "7", "--direction", "add", "--amount", "5"]
