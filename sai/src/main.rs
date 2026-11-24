@@ -179,11 +179,7 @@ fn execute(
         let outcome = complete(skill::show(None), Some("skill show"), requested_json, home);
         return (outcome.0 as u8).into();
     }
-    let parsed = Cli::try_parse_from(args);
-    let event_command = if parsed
-        .as_ref()
-        .is_ok_and(|cli| cli.command.is_none() && !cli.json)
-    {
+    let event_command = if argv.is_empty() {
         Some("repl")
     } else {
         (!command.is_empty()).then_some(command)
@@ -240,7 +236,7 @@ fn execute(
     if command != "doctor" {
         start_log();
     }
-    let outcome = match parsed {
+    let outcome = match Cli::try_parse_from(args) {
         Ok(cli) => {
             let json = cli.json || matches!(&cli.command, Some(Command::Intent { json: true, .. }));
             let usage_command =

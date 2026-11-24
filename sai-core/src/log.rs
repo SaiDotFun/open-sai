@@ -259,7 +259,7 @@ impl LogWriter {
         let known = KNOWN.try_lock().ok().map(|value| Arc::clone(&value));
         let mut budget = Budget::new();
         let mut endpoint_digest = None;
-        let mut command_bound = false;
+        let mut command_bound = matches!(name, "command.start" | "command.end");
         let fields = Field::Object(
             fields
                 .into_iter()

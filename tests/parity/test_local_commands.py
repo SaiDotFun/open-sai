@@ -1385,13 +1385,14 @@ def test_repl_commands_share_run_but_keep_command_ids(
             for line in path.read_bytes().splitlines()
         ]
         assert [row["seq"] for row in rows] == list(range(1, 7))
-        assert [row["command"] for row in rows] == [
-            "repl",
+        shell_command = None if flags else "repl"
+        assert [row.get("command") for row in rows] == [
+            shell_command,
             "config get",
             "config get",
             "config get",
             "config get",
-            "repl",
+            shell_command,
         ]
         ids = [row["commandId"] for row in rows]
         assert ids[0] == ids[-1] and ids[1] == ids[2] and ids[3] == ids[4]
