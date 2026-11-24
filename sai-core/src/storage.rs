@@ -211,8 +211,7 @@ impl<'a> Storage<'a> {
         {
             crate::session::shell_quote(endpoint)
         } else {
-            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-                .into()
+            crate::session::ORIGINAL_KEEPER_HINT.into()
         }
     }
 

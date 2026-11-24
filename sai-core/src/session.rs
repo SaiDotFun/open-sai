@@ -1,11 +1,17 @@
 //! Endpoint and expiry checks shared by the CLI and other front ends.
 
+use std::sync::LazyLock;
+
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
+use regex::Regex;
 
 use crate::{
     errors::{Code, SaiError},
     storage::{Session, SessionError, Storage, StorageError, StorageEvent},
 };
+
+pub(crate) const ORIGINAL_KEEPER_HINT: &str =
+    r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#;
 
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
     let expires_at = parse_expiry(session.expires_at())
@@ -125,19 +131,61 @@ impl Storage<'_> {
         endpoint: &str,
         addr: Option<&str>,
     ) -> Result<Session, StorageError> {
+        self.load_active_session_with_hint(endpoint, addr, |addr| {
+            self.sign_in_hint(endpoint, addr, false)
+        })
+    }
+
+    pub(crate) fn load_active_trade_session(
+        &self,
+        endpoint: &str,
+        addr: Option<&str>,
+    ) -> Result<Session, StorageError> {
+        self.load_active_session_with_hint(endpoint, addr, |addr| {
+            self.sign_in_hint(endpoint, addr, true)
+        })
+    }
+
+    fn load_active_session_with_hint(
+        &self,
+        endpoint: &str,
+        addr: Option<&str>,
+        hint: impl Fn(Option<&str>) -> String,
+    ) -> Result<Session, StorageError> {
         let session = self.load_session(addr).map_err(|mut error| {
             if let StorageError::Session(SessionError(failure)) = &mut error
                 && failure.code == Code::SignedOut
             {
-                failure.hint = Some(self.sign_in_hint(endpoint, addr));
+                failure.hint = Some(hint(addr));
             }
             error
         })?;
-        self.check_active(&session, endpoint)?;
+        self.check_active_with_hint(&session, endpoint, hint)?;
         Ok(session)
     }
 
     pub fn check_active(&self, session: &Session, endpoint: &str) -> Result<(), SessionError> {
+        self.check_active_with_hint(session, endpoint, |addr| {
+            self.sign_in_hint(endpoint, addr, false)
+        })
+    }
+
+    pub(crate) fn check_active_trade(
+        &self,
+        session: &Session,
+        endpoint: &str,
+    ) -> Result<(), SessionError> {
+        self.check_active_with_hint(session, endpoint, |addr| {
+            self.sign_in_hint(endpoint, addr, true)
+        })
+    }
+
+    fn check_active_with_hint(
+        &self,
+        session: &Session,
+        endpoint: &str,
+        hint: impl FnOnce(Option<&str>) -> String,
+    ) -> Result<(), SessionError> {
         if session.endpoint() != Some(endpoint) {
             return Err(SessionError::new(
                 "Stored session belongs to another Keeper endpoint",
@@ -152,14 +200,29 @@ impl Storage<'_> {
                 Code::SessionExpired,
                 "Trading session expired; sign in again",
             );
-            error.hint = Some(self.sign_in_hint(endpoint, Some(session.addr())));
+            error.hint = Some(hint(Some(session.addr())));
             return Err(SessionError(error));
         }
         Ok(())
     }
 
-    fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>) -> String {
-        let flag = self.keeper_hint_flag(endpoint);
+    fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>, origin_only: bool) -> String {
+        static PLAIN_KEEPER_URL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\Ahttps?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query\z")
+                .expect("valid Keeper URL pattern")
+        });
+        let flag = if origin_only {
+            self.keeper_hint_flag(endpoint)
+        } else if PLAIN_KEEPER_URL.is_match(endpoint)
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
+        {
+            shell_quote(endpoint)
+        } else {
+            ORIGINAL_KEEPER_HINT.into()
+        };
         let mut hint = format!("sai --endpoint {flag} auth login NAME");
         if let Some(addr) = addr {
             hint.push_str(" --addr ");
