@@ -313,6 +313,34 @@ def test_logs_tail_redacts_retained_endpoint(
                 assert b"user:fixture" not in result.stdout
 
 
+def test_logs_run_keeps_events_with_non_utf8_argv(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    python, _ = local_pair
+    result = invoke(
+        python,
+        tmp_path,
+        "config",
+        "get",
+        "invalid-" + os.fsdecode(b"\xff"),
+        logging="1",
+    )
+    assert result.returncode == 2
+    rows = [
+        row
+        for path in (tmp_path / "sai-home/logs").glob("cli-*.jsonl")
+        for row in path.read_bytes().splitlines()
+    ]
+    start = next(row for row in rows if json.loads(row)["event"] == "command.start")
+    assert b"\\udcff" in start
+    run_id = json.loads(start)["runId"]
+    for cli in local_pair:
+        report = cli_json(cli, tmp_path, "logs", "run", run_id)
+        events = report["events"]
+        assert [row["event"] for row in events] == ["command.start", "command.end"]
+        assert "argv" not in events[0]
+
+
 def test_logs_run_same_stamp_cursor(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:

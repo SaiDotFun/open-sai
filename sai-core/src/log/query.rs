@@ -6,7 +6,8 @@ use std::{collections::BTreeMap, path::Path, sync::LazyLock};
 
 use chrono::{DateTime, Datelike, Days, NaiveDate, SecondsFormat, TimeDelta, Utc};
 use regex::Regex;
-use serde_json::{Map, Value, json};
+use serde::de::{MapAccess, Visitor};
+use serde_json::{Map, Value, json, value::RawValue};
 use sha2::{Digest, Sha256};
 
 use crate::{
@@ -206,8 +207,46 @@ fn nonfinite(value: &Value) -> bool {
     }
 }
 
+// Python's Unix argv can contain surrogate escapes for non-UTF-8 bytes.
+fn decode_python_row(raw: &[u8]) -> Option<Row> {
+    struct RetainedRow;
+
+    impl<'de> Visitor<'de> for RetainedRow {
+        type Value = Row;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a retained log object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Row, A::Error> {
+            let mut row = Row::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "argv" {
+                    let raw = map.next_value::<&RawValue>()?;
+                    if let Ok(value) = serde_json::from_str(raw.get()) {
+                        row.insert(key, value);
+                    } else {
+                        row.remove(&key);
+                    }
+                } else {
+                    row.insert(key, map.next_value()?);
+                }
+            }
+            Ok(row)
+        }
+    }
+
+    use serde::Deserializer;
+    let mut parser = serde_json::Deserializer::from_slice(raw);
+    let row = parser.deserialize_map(RetainedRow).ok()?;
+    parser.end().ok()?;
+    Some(row)
+}
+
 fn decode_row(raw: &[u8]) -> Option<Row> {
-    let row: Row = serde_json::from_slice(raw).ok()?;
+    let row: Row = serde_json::from_slice(raw)
+        .ok()
+        .or_else(|| decode_python_row(raw))?;
     if row.values().any(nonfinite) {
         return None;
     }
