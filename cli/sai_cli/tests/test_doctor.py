@@ -11,8 +11,9 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from click.testing import CliRunner
 from sai_cli import doctor
 from sai_cli.core import keeper, margin, settings, storage, stream, update, updater
 from sai_cli.sai_cli import main
+from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
 
@@ -844,7 +846,13 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
     thread.join()
 
 
-def ws_stub(ack: bool, *, close_with_target: bool = False) -> tuple[str, Any]:
+def ws_stub(
+    ack: bool,
+    *,
+    close_with_target: bool = False,
+    process_response: Callable[[ServerConnection, Request, Response], Response]
+    | None = None,
+) -> tuple[str, Any]:
     release = threading.Event()
 
     def handler(connection: ServerConnection) -> None:
@@ -858,7 +866,11 @@ def ws_stub(ack: bool, *, close_with_target: bool = False) -> tuple[str, Any]:
         release.wait(10)
 
     server = serve(
-        handler, "127.0.0.1", 0, subprotocols=[Subprotocol("graphql-transport-ws")]
+        handler,
+        "127.0.0.1",
+        0,
+        subprotocols=[Subprotocol("graphql-transport-ws")],
+        process_response=process_response,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1075,6 +1087,48 @@ def test_doctor_omits_peer_websocket_close_reason(http_stub):
             assert code == 1
             assert f"{origin} sent no connection_ack" in output
             assert "ConnectionClosedError (close code 1008)" in output
+            assert path_key not in output and query_key not in output
+    finally:
+        stop()
+
+
+@pytest.mark.parametrize(
+    ("status", "diagnostic"),
+    [
+        (HTTPStatus.SWITCHING_PROTOCOLS, "InvalidHeaderFormat"),
+        (HTTPStatus.FORBIDDEN, "InvalidStatus (HTTP status 403)"),
+    ],
+)
+def test_doctor_omits_peer_websocket_handshake_text(http_stub, status, diagnostic):
+    base, _state = http_stub
+    path_key, query_key = "fixture-handshake-path", "fixture-handshake-query"
+
+    def respond(
+        connection: ServerConnection, request: Request, reply: Response
+    ) -> Response:
+        if status == HTTPStatus.FORBIDDEN:
+            return connection.respond(status, request.path)
+        del reply.headers["Sec-WebSocket-Protocol"]
+        reply.headers["Sec-WebSocket-Protocol"] = request.path
+        return reply
+
+    ws, stop = ws_stub(ack=False, process_response=respond)
+    origin = ws.removesuffix("/query")
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                f"{base}/query",
+                "doctor",
+                "--no-fix",
+                "--ws-endpoint",
+                f"{origin}/{path_key}?key={query_key}",
+                "--lcd-endpoint",
+                base,
+            )
+            assert code == 1
+            assert f"{origin} sent no connection_ack: {diagnostic}" in output
             assert path_key not in output and query_key not in output
     finally:
         stop()

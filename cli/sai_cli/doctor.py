@@ -36,7 +36,7 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from . import mcp_install
 from .core import (
@@ -1049,21 +1049,17 @@ def check_keeper(ctx: Context) -> Check:
 
 
 def check_websocket(ctx: Context) -> Check:
-    try:
-        ws = ctx.config.ws_endpoint
-    except stream.StreamError as exc:
-        return Check("websocket", "fail", str(exc), "Pass --ws-endpoint")
+    ws = ctx.config.ws_endpoint
     url = log.origin(ws)
     start = time.monotonic()
     try:
         stream.handshake(ws, NETWORK_TIMEOUT)
     except (stream.StreamError, *stream.DISCONNECTS) as exc:
         reason = type(exc).__name__
-        if isinstance(exc, ConnectionClosed):
-            if exc.rcvd is not None:
-                reason += f" (close code {exc.rcvd.code})"
-        else:
-            reason = log.scrub(log.Untrusted(str(exc) or reason))
+        if isinstance(exc, ConnectionClosed) and exc.rcvd is not None:
+            reason += f" (close code {exc.rcvd.code})"
+        elif isinstance(exc, InvalidStatus):
+            reason += f" (HTTP status {exc.response.status_code})"
         return Check(
             "websocket",
             "fail",
