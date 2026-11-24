@@ -18,7 +18,34 @@ from compare import (
     sqlite_schema,
     stdout,
 )
-from parity import Observation, differences
+from parity import Case, Observation, differences
+
+
+def test_case_command_skips_global_options() -> None:
+    case = Case(
+        name="config-list",
+        args=["--endpoint", "https://keeper.invalid", "--json", "config", "list"],
+    )
+
+    assert case.command == "config list"
+
+
+def test_start_log_compares_command_and_argv_shape(tmp_path: Path) -> None:
+    normalize = Normalize(tmp_path)
+    start = {
+        "ts": "2026-11-24T01:00:00.000Z",
+        "event": "command.start",
+        "command": "mcp install",
+        "argv": ["mcp", "install", "--scope", "project"],
+    }
+    expected = normalize.log_event(start)
+    names_only = {**start, "argv": ["mcp", "install", "--scope="]}
+
+    assert normalize.log_event(names_only) == expected
+    assert normalize.log_event({**names_only, "command": "mcp list"}) != expected
+    assert normalize.log_event({**names_only, "argv": [42]}) != expected
+    end = {**names_only, "event": "command.end"}
+    assert normalize.log_event(end)["argv"] == names_only["argv"]
 
 
 @pytest.mark.parametrize(
