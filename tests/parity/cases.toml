@@ -301,6 +301,27 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 
 [[case]]
+name = "account-overview-conflicting-height"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+seed = "empty"
+server = "overview-conflicting-height"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_trade",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
 name = "account-overview-deadline"
 args = ["--json", "account", "overview", "--as", "{addr}"]
 seed = "empty"

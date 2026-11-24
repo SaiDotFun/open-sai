@@ -381,12 +381,17 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             *,
             lcd: bool = False,
             height: int = 120,
+            duplicate_height: int | None = None,
         ) -> None:
             body = value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             if lcd:
                 self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
+            if duplicate_height is not None:
+                self.send_header(
+                    "grpc-metadata-x-cosmos-block-height", str(duplicate_height)
+                )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -591,7 +596,19 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                         ):
                             self.drip_lcd()
                             return
-                        self.reply(response, lcd=height is not None, height=height or 0)
+                        duplicate_height = (
+                            height - 1
+                            if height is not None
+                            and scenario == "overview-conflicting-height"
+                            and request.label == "get_trade"
+                            else None
+                        )
+                        self.reply(
+                            response,
+                            lcd=height is not None,
+                            height=height or 0,
+                            duplicate_height=duplicate_height,
+                        )
                         return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))

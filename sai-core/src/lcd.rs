@@ -77,15 +77,18 @@ async fn read(
     if !parts.status.is_success() {
         return Err(ReadError::Invalid);
     }
-    if let Some(height) = height
-        && parts
-            .headers
-            .get(METADATA_HEIGHT)
-            .or_else(|| parts.headers.get(HEIGHT))
-            .and_then(|value| value.to_str().ok())
-            != Some(height)
-    {
-        return Err(ReadError::Invalid);
+    if let Some(height) = height {
+        let header = if parts.headers.contains_key(METADATA_HEIGHT) {
+            METADATA_HEIGHT
+        } else {
+            HEIGHT
+        };
+        let values = parts.headers.get_all(header);
+        let mut values = values.iter();
+        let served = values.next().and_then(|value| value.to_str().ok());
+        if served != Some(height) || values.next().is_some() {
+            return Err(ReadError::Invalid);
+        }
     }
     let result: Value = serde_json::from_slice(&bytes).map_err(|_| ReadError::Invalid)?;
     if !result.is_object() {
