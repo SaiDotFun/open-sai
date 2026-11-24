@@ -36,6 +36,7 @@ const COMMON: [&str; 8] = [
     "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
 ];
 static RUN_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
+static UPDATE_COMMAND_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static KNOWN: LazyLock<Mutex<Arc<[String]>>> = LazyLock::new(|| Mutex::new(Arc::new([])));
 
@@ -269,6 +270,10 @@ fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
 
 fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
     let mut line = Map::new();
+    if matches!(event.surface, Surface::Update) {
+        line.insert("schema".into(), json!(2));
+        line.insert("commandId".into(), json!(&*UPDATE_COMMAND_ID));
+    }
     line.insert(
         "ts".into(),
         json!(event.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),

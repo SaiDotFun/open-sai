@@ -1,5 +1,7 @@
 mod config;
 mod local;
+#[cfg(unix)]
+mod update;
 
 use std::{env, path::Path, process, time::Instant};
 
@@ -44,6 +46,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Install the latest sai-cli release over this install.
+    #[cfg(unix)]
+    Update(update::UpdateCommand),
     /// Manage local Sai sessions.
     Auth {
         #[arg(long, global = true, help = "Print machine-readable JSON")]
@@ -102,14 +107,19 @@ fn main() -> process::ExitCode {
         }
         .into()
     };
+    let surface = if command == "update" {
+        Surface::Update
+    } else {
+        Surface::Cli
+    };
     let events = EventContext {
         writer: writer.as_ref(),
-        surface: Surface::Cli,
+        surface,
         command: (!command.is_empty()).then_some(command),
     };
     if let Some(writer) = &writer {
         writer.event(
-            Surface::Cli,
+            surface,
             "command.start",
             Level::Info,
             [
@@ -134,7 +144,11 @@ fn main() -> process::ExitCode {
                         ws_endpoint: cli.ws_endpoint,
                         lcd_endpoint: cli.lcd_endpoint,
                     };
+                    #[cfg(unix)]
+                    update::tick(command, json, &env.home, events);
                     match cli.command {
+                        #[cfg(unix)]
+                        Command::Update(command) => command.run(&flags, env, json, events),
                         Command::Auth { command, .. } => {
                             local::auth(command, cli.account.as_deref(), &flags, env, json, events)
                         }
@@ -148,7 +162,7 @@ fn main() -> process::ExitCode {
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
-    finish(writer, command_field(), started, outcome)
+    finish(writer, surface, command_field(), started, outcome)
 }
 
 fn json_requested(args: &[String]) -> bool {
@@ -221,7 +235,7 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" => "",
+        "config list" | "auth status" | "auth list" | "update" => "",
         "intent status" | "intent local" | "auth use" => " ADDR",
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -259,6 +273,7 @@ fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
 
 fn finish(
     writer: Option<LogWriter>,
+    surface: Surface,
     command: Field,
     started: Instant,
     (code, error): (ExitCode, Option<SaiError>),
@@ -282,7 +297,7 @@ fn finish(
                 fields.push(("intentKey", Field::Text(key)));
             }
         }
-        writer.event(Surface::Cli, "command.end", level, fields);
+        writer.event(surface, "command.end", level, fields);
         writer.finish(EXIT_FLUSH);
     }
     (code as u8).into()
@@ -298,6 +313,7 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return ("logs", &[]),
+            "update" => return ("update", &args[index + 1..]),
             "config" | "auth" | "intent" => {
                 let group = match arg.as_str() {
                     "auth" => "auth",
