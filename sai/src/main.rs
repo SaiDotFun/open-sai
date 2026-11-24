@@ -231,7 +231,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "trade open" => "",
-        "trade close" | "trade cancel" => " TRADE_ID",
+        "trade close" | "trade cancel" | "trade margin" | "trade partial-close" => " TRADE_ID",
         "intent status" | "intent local" | "auth use" => " ADDR",
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -337,6 +337,8 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("trade", "open") => "trade open",
                     ("trade", "close") => "trade close",
                     ("trade", "cancel") => "trade cancel",
+                    ("trade", "margin") => "trade margin",
+                    ("trade", "partial-close") => "trade partial-close",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);
@@ -390,6 +392,11 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
                 return None;
             };
             let first = args.first()?.trim_matches(['<', '>']);
+            if matches!(command, "trade margin" | "trade partial-close")
+                && let Some(error) = trade::missing_position_option(first)
+            {
+                return Some(error);
+            }
             format!("Missing argument {}.", repr(first))
         }
         ErrorKind::InvalidValue => {

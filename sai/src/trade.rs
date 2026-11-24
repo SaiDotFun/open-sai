@@ -2,9 +2,12 @@ use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
     errors::{Code, SaiError},
     log::EventContext,
-    settings::{Environment, Flags},
+    settings::{Environment, Flags, Key, Settings, repr},
     storage::{Session, Storage, StorageEvent},
-    trade::{self, OpenTrade, SubmitOptions, TradePreview, Trading, close_preview},
+    trade::{
+        self, MarginDirection, OpenTrade, PositionAction, PositionMode, SubmitOptions,
+        TradePreview, Trading, close_preview,
+    },
 };
 use serde_json::json;
 
@@ -31,6 +34,36 @@ pub enum TradeCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Add or remove margin through a target-leverage intent.
+    Margin {
+        #[command(flatten)]
+        position: Position,
+        /// Direction of the margin change, add or remove.
+        #[arg(long)]
+        direction: String,
+        /// USDC amount for a leverage quote, not an execution cap.
+        #[arg(long, allow_negative_numbers = true)]
+        amount: String,
+    },
+    /// Reduce an open USDC position by a whole percentage.
+    PartialClose {
+        #[command(flatten)]
+        position: Position,
+        /// Whole percentage to close, from 1 to 99.
+        #[arg(long, allow_negative_numbers = true)]
+        percent: String,
+    },
+}
+
+#[derive(Args)]
+pub struct Position {
+    #[arg(allow_negative_numbers = true)]
+    trade_id: String,
+    /// Nibiru REST endpoint for exact contract state. Defaults to lcd.endpoint.
+    #[arg(long)]
+    lcd_endpoint: Option<String>,
+    #[arg(long)]
+    dry_run: bool,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -132,6 +165,43 @@ pub fn run(
         TradeCommand::Cancel { trade_id, dry_run } => {
             (close_preview(&trade_id, true)?, dry_run, false, false)
         }
+        TradeCommand::Margin {
+            position,
+            direction,
+            amount,
+        } => {
+            let direction = match direction.as_str() {
+                "add" => MarginDirection::Add,
+                "remove" => MarginDirection::Remove,
+                _ => {
+                    return Err(SaiError::usage(format!(
+                        "Invalid value for '--direction': {} is not one of 'add', 'remove'.",
+                        repr(&direction),
+                    )));
+                }
+            };
+            return position.run(
+                &trading,
+                &settings,
+                account,
+                PositionAction::Margin {
+                    direction,
+                    amount: &amount,
+                },
+                json,
+            );
+        }
+        TradeCommand::PartialClose { position, percent } => {
+            return position.run(
+                &trading,
+                &settings,
+                account,
+                PositionAction::PartialClose {
+                    percent: partial_percent(&percent)?,
+                },
+                json,
+            );
+        }
     };
     let session = match trading.load_session(account) {
         Ok(session) => Some(session),
@@ -172,6 +242,67 @@ pub fn run(
         output["referencePrice"] = json!(price);
     }
     local::emit(&output, json)
+}
+
+pub fn missing_position_option(argument: &str) -> Option<SaiError> {
+    let option = argument.split_whitespace().next()?;
+    let message = match option {
+        "--direction" => "Missing option '--direction'. Choose from:\n\tadd,\n\tremove".into(),
+        "--amount" | "--percent" => format!("Missing option {}.", repr(option)),
+        _ => return None,
+    };
+    Some(SaiError::usage(message))
+}
+
+fn partial_percent(input: &str) -> Result<u8, SaiError> {
+    let parsed = input.trim().replace('_', "").parse::<i128>().map_err(|_| {
+        SaiError::usage(format!(
+            "Invalid value for '--percent': {} is not a valid integer range.",
+            repr(input),
+        ))
+    })?;
+    if !(1..=99).contains(&parsed) {
+        return Err(SaiError::usage(format!(
+            "Invalid value for '--percent': {parsed} is not in the range 1<=x<=99."
+        )));
+    }
+    Ok(parsed as u8)
+}
+
+impl Position {
+    fn run(
+        self,
+        trading: &Trading<'_>,
+        settings: &Settings,
+        account: Option<&str>,
+        action: PositionAction<'_>,
+        json: bool,
+    ) -> Result<(), SaiError> {
+        if let Some(endpoint) = &self.lcd_endpoint {
+            Key::LcdEndpoint.parse_value(endpoint)?;
+        }
+        let lcd_endpoint = self
+            .lcd_endpoint
+            .as_deref()
+            .unwrap_or_else(|| settings.lcd_endpoint());
+        let mode = if self.dry_run {
+            PositionMode::DryRun
+        } else {
+            PositionMode::Submit(None)
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|_| SaiError::internal())?;
+        let result = runtime.block_on(trading.position_trade(
+            account,
+            lcd_endpoint,
+            &self.trade_id,
+            action,
+            mode,
+        ))?;
+        local::emit(&result, json)
+    }
 }
 
 fn session_error(code: Code) -> bool {
