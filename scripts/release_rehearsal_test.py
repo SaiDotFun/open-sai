@@ -741,9 +741,7 @@ class KeeperReplayTest(unittest.TestCase):
         self.key = "20261124T080000000Z_ABCDEFGHJKMNPQRS"
         self.replay.submitted.append(self.key)
 
-    def query(
-        self, base: str, text: str, **variables: str | int | None
-    ) -> dict[str, Any]:
+    def query(self, base: str, text: str, **variables: object) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{base}/query",
             data=json.dumps({"query": text, "variables": variables}).encode(),
@@ -933,6 +931,57 @@ query($user: String!, $key: String, $other: DECLARATION) {
                     with error.exception as response:
                         self.assertEqual(response.code, 400)
 
+    def test_checks_declared_intent_and_history_filter_object_types(self) -> None:
+        self.replay.history = [{"id": 1, "trade": {"trader": self.replay.addr}}]
+        cases = (
+            (
+                "UserIntentsFilter!",
+                "{ matched: userIntents(where: $filter) { intentKey } }",
+                {"user": self.replay.addr, "intentKey": self.key},
+                {"matched": [{"intentKey": self.key}]},
+            ),
+            (
+                "PerpTradeHistoryFilter",
+                "{ perp { matched: tradeHistory(where: $filter) { id } } }",
+                {"trader": self.replay.addr},
+                {"perp": {"matched": [{"id": 1}]}},
+            ),
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for declaration, selection, filters, expected in cases:
+                with self.subTest(declaration=declaration):
+                    query = f"query($filter: {declaration}) {selection}"
+                    self.assertEqual(self.query(base, query, filter=filters), expected)
+                    for invalid_query, invalid_filters in (
+                        (f"query($filter: Int) {selection}", filters),
+                        (f"query($filter: Int) {selection}", 1),
+                        (query, {}),
+                    ):
+                        with self.assertRaises(HTTPError) as error:
+                            self.query(base, invalid_query, filter=invalid_filters)
+                        with error.exception as response:
+                            self.assertEqual(response.code, 400)
+
+    def test_invalid_required_variable_rejects_all_aliases(self) -> None:
+        query = """
+query($user: String!, $goodKey: String!, $key: String!) {
+  matched: userIntents(where: {user: $user, intentKey: $goodKey}) { intentKey }
+  other: userIntents(where: {user: $user, intentKey: $key}) { intentKey }
+}
+"""
+        variables = {"user": self.replay.addr, "goodKey": self.key}
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            self.assertEqual(
+                self.query(base, query, **variables, key="another-key"),
+                {"matched": [{"intentKey": self.key}], "other": []},
+            )
+            for invalid in ({}, {"key": None}, {"key": 123}):
+                with self.subTest(variables=invalid):
+                    with self.assertRaises(HTTPError) as error:
+                        self.query(base, query, **variables, **invalid)
+                    with error.exception as response:
+                        self.assertEqual(response.code, 400)
+
     def test_user_filter_requires_a_non_null_declaration_or_default(self) -> None:
         query = """
 query($account: DECLARATION, $key: String) {
@@ -957,6 +1006,10 @@ query($account: DECLARATION, $key: String) {
                 self.query(base, defaulted, key=self.key),
                 {"matched": [{"intentKey": self.key}]},
             )
+            with self.assertRaises(HTTPError) as error:
+                self.query(base, defaulted, account=None, key=self.key)
+            with error.exception as response:
+                self.assertEqual(response.code, 400)
 
     def test_uses_intent_filter_defaults_only_for_omitted_variables(self) -> None:
         query = (

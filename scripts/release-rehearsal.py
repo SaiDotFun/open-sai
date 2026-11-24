@@ -461,12 +461,54 @@ class SelectedField(NamedTuple):
     children: tuple[SelectedField, ...]
 
 
+FILTER_ARGUMENT_TYPES = {
+    "userIntents": "UserIntentsFilter!",
+    "tradeHistory": "PerpTradeHistoryFilter",
+}
+FILTER_INPUT_FIELDS = {
+    "UserIntentsFilter": {"user": "String!", "intentKey": "String"},
+    "PerpTradeHistoryFilter": {"trader": "String!"},
+}
+VARIABLE_SCALARS = {"String": str, "Int": int, "Boolean": bool}
+ENUM_LITERAL = object()
+
+
+def filter_variable_type(path: tuple[str, ...]) -> str | None:
+    if len(path) < 2 or path[1] != "where":
+        return None
+    argument_type = FILTER_ARGUMENT_TYPES.get(path[0])
+    if argument_type is None or len(path) == 2:
+        return argument_type
+    if len(path) == 3:
+        return FILTER_INPUT_FIELDS[argument_type.removesuffix("!")].get(path[2])
+    return None
+
+
+def validate_variable(type_name: str, item: Any) -> None:
+    name = type_name.removesuffix("!")
+    if item is None:
+        if name != type_name:
+            raise ValueError(f"Missing value for non-null GraphQL type {type_name}")
+    elif name.startswith("["):
+        for element in item if isinstance(item, list) else [item]:
+            validate_variable(name[1:-1], element)
+    elif name in VARIABLE_SCALARS and type(item) is not VARIABLE_SCALARS[name]:
+        raise ValueError(f"Invalid value for GraphQL scalar {name}")
+    elif name in FILTER_INPUT_FIELDS:
+        fields = FILTER_INPUT_FIELDS[name]
+        if not isinstance(item, dict) or item.keys() - fields.keys():
+            raise ValueError(f"Invalid value for GraphQL input object {name}")
+        for field, field_type in fields.items():
+            validate_variable(field_type, item.get(field))
+
+
 def selection_set(
     query: str, variables: dict[str, Any] | None = None
 ) -> tuple[SelectedField, ...]:
     """Parse inline field selections and resolve their supplied variables."""
-    bindings = variables or {}
-    declared: dict[str, tuple[str | None, Any]] = {}
+    supplied = variables or {}
+    declared: dict[str, tuple[str, Any]] = {}
+    bindings: dict[str, Any] = {}
     tokens = deque(
         token
         for token in re.findall(
@@ -487,18 +529,16 @@ def selection_set(
         if tokens.popleft() != token:
             raise ValueError(f"Expected the GraphQL token {token!r}")
 
-    def variable_type() -> str | None:
+    def variable_type() -> str:
         if tokens[0] == "[":
             tokens.popleft()
-            variable_type()
+            type_name = f"[{variable_type()}]"
             expect("]")
-            type_name = None
         else:
             type_name = take_name()
         if tokens[0] == "!":
             tokens.popleft()
-            if type_name is not None:
-                return f"{type_name}!"
+            return f"{type_name}!"
         return type_name
 
     def variable_definitions() -> None:
@@ -511,61 +551,59 @@ def selection_set(
             default = None
             if tokens[0] == "=":
                 tokens.popleft()
-                if type_name in {"String", "String!"} and not (
-                    tokens[0].startswith('"')
-                    or (type_name == "String" and tokens[0] == "null")
-                ):
-                    raise ValueError("Invalid GraphQL String default")
-                default = value()
+                default = value(None)
+                validate_variable(type_name, default)
             if name in declared:
                 raise ValueError("Duplicate GraphQL variable declaration")
             declared[name] = type_name, default
         expect(")")
+        # Coerce all declared variables before evaluating any selection.
+        for name, (type_name, default) in declared.items():
+            bound = supplied.get(name, default)
+            validate_variable(type_name, bound)
+            bindings[name] = bound
 
-    def named_values(end: str, path: tuple[str, ...]) -> dict[str, Any]:
+    def named_values(end: str, path: tuple[str, ...] | None) -> dict[str, Any]:
         result = {}
         while tokens[0] != end:
             name = take_name()
             if tokens.popleft() != ":" or name in result:
                 raise ValueError("Expected a unique GraphQL name followed by ':'")
-            result[name] = value((*path, name))
+            result[name] = value(None if path is None else (*path, name))
         tokens.popleft()
         return result
 
-    def value(path: tuple[str, ...] = ()) -> Any:
+    def value(path: tuple[str, ...] | None) -> Any:
         token = tokens.popleft()
         if token == "$":
             name = take_name()
-            if name not in declared:
+            if path is None:
+                raise ValueError("A GraphQL default must be constant")
+            if name not in bindings:
                 raise ValueError("Undeclared GraphQL variable")
             type_name, default = declared[name]
-            if type_name not in {"String", "String!"} and path in (
-                ("userIntents", "where", "user"),
-                ("userIntents", "where", "intentKey"),
-            ):
-                raise ValueError(
-                    "Expected a String variable for the userIntents filter"
-                )
-            if (
-                path == ("userIntents", "where", "user")
-                and type_name == "String"
-                and default is None
-            ):
-                raise ValueError(
-                    "Expected a non-null declaration or default for the user filter"
-                )
-            return bindings.get(name, default)
+            if expected := filter_variable_type(path):
+                if type_name.removesuffix("!") != expected.removesuffix("!") or (
+                    expected.endswith("!")
+                    and not type_name.endswith("!")
+                    and default is None
+                ):
+                    raise ValueError(f"Expected a {expected} variable for the filter")
+                validate_variable(expected, bindings[name])
+            return bindings[name]
         if token == "{":
             return named_values("}", path)
         if token == "[":
             items = []
             while tokens[0] != "]":
-                items.append(value())
+                items.append(value(None if path is None else ()))
             tokens.popleft()
             return items
         if re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", token):
-            # Enum names do not satisfy the replay's string filters.
-            return {"true": True, "false": False}.get(token)
+            # Keep enum defaults distinct from null during variable validation.
+            return {"true": True, "false": False, "null": None}.get(
+                token, ENUM_LITERAL if path is None else None
+            )
         return json.loads(token)
 
     def fields() -> tuple[SelectedField, ...]:
@@ -685,7 +723,9 @@ class Replay:
                     return
                 request = self.read_json()
                 query = request.get("query")
-                variables = request.get("variables") or {}
+                variables = request.get("variables")
+                if variables is None:
+                    variables = {}
                 if not isinstance(query, str) or not isinstance(variables, dict):
                     self.send_error(400)
                     return
