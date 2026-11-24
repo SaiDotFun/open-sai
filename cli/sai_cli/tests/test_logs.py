@@ -17,9 +17,11 @@ import sys
 import threading
 import time
 import tracemalloc
+import zlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
+from hashlib import sha256
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -3389,6 +3391,49 @@ def test_intent_cursor_rejects_changed_unread_files(home, change):
     code, output = run_cli(*args, *continuation)
     assert code == 2 and "Start a new intent log query" in output
     assert "events" not in json.loads(output)
+
+
+def test_intent_cursor_cache_evicts_old_states_and_refuses_oversize_reads(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    row = {
+        "ts": f"{day}T00:00:00.000Z",
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    path = log.file_path("cli", day, root)
+    path.write_bytes(log.encode(row) * 129)
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    cursors = []
+    for _ in range(log_queries.MAX_CURSOR_STATES + 2):
+        code, output = run_cli(*args)
+        assert code == 0
+        cursors.append(json.loads(output)["nextBefore"])
+        with path.open("ab") as stream:
+            stream.write(log.encode(row))
+
+    cache = root / ".intent-cursors"
+    assert len(list(cache.iterdir())) == log_queries.MAX_CURSOR_STATES
+    code, output = run_cli(*args, "--before", cursors[0])
+    assert code == 2 and "Start a new intent log query" in output
+    code, output = run_cli(*args, "--before", cursors[-1])
+    assert code == 0 and json.loads(output)["events"]
+
+    base, separator, name = cursors[-1].partition(log_queries.CURSOR_STATE_SUFFIX)
+    raw = zlib.decompress((cache / name).read_bytes())
+    for size, level in (
+        (log_queries.MAX_CURSOR_FILE_BYTES, 0),
+        (log_queries.MAX_CURSOR_STATE_BYTES, 9),
+    ):
+        # Use valid state with matching digests so the size check must reject it.
+        compressed = zlib.compress(raw + b" " * size, level)
+        oversized = f"{day.isoformat()}_{sha256(compressed).hexdigest()}"
+        (cache / oversized).write_bytes(compressed)
+        code, output = run_cli(*args, "--before", base + separator + oversized)
+        assert code == 2 and "Start a new intent log query" in output
 
 
 def test_intent_replay_and_page_share_one_read_budget(home, monkeypatch):

@@ -280,6 +280,10 @@ class _Cursor:
 
 CURSOR_STATE_SUFFIX = "~s2~"
 CURSOR_STATE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9a-f]{64})")
+MAX_CURSOR_STATES = 128
+MAX_CURSOR_CACHE_BYTES = 16 * 1024 * 1024
+MAX_CURSOR_FILE_BYTES = 1024 * 1024
+MAX_CURSOR_STATE_BYTES = 8 * 1024 * 1024
 LinkPositions = dict[str, set[log.RowPosition]]
 LINK_TAG = re.compile(r"[0-9a-f]{16}")
 
@@ -315,12 +319,23 @@ def _read_cursor_state(root: Path | None, name: str) -> bytes:
     for opened in _cursor_directories(root):
         with opened:
             try:
-                with os.fdopen(opened.read_fd(name), "rb") as stream:
-                    data = stream.read()
-            except OSError:
+                with os.fdopen(opened.read_fd(name), "rb", buffering=0) as stream:
+                    data = stream.read(MAX_CURSOR_FILE_BYTES + 1)
+                if (
+                    len(data) > MAX_CURSOR_FILE_BYTES
+                    or hashlib.sha256(data).hexdigest() != match[2]
+                ):
+                    continue
+                inflater = zlib.decompressobj()
+                raw = inflater.decompress(data, MAX_CURSOR_STATE_BYTES + 1)
+                if (
+                    inflater.eof
+                    and not inflater.unused_data
+                    and len(raw) <= MAX_CURSOR_STATE_BYTES
+                ):
+                    return raw
+            except (OSError, zlib.error):
                 continue
-            if hashlib.sha256(data).hexdigest() == match[2]:
-                return zlib.decompress(data)
     raise SaiError(
         "Log cursor state is unavailable. Start a new intent log query.",
         Code.INVALID_REQUEST,
@@ -328,10 +343,42 @@ def _read_cursor_state(root: Path | None, name: str) -> bytes:
     )
 
 
+def _prune_cursor_states(opened: log.LogDir, keep: str, oldest: str) -> None:
+    candidates = []
+    for name in opened.names():
+        if (
+            not CURSOR_STATE_NAME.fullmatch(name)
+            or (info := opened.file_info(name)) is None
+        ):
+            continue
+        if info.st_size > MAX_CURSOR_FILE_BYTES or (
+            name != keep and name[:10] < oldest
+        ):
+            opened.unlink(name)
+            continue
+        candidates.append((name == keep, info.st_mtime_ns, name, info.st_size))
+
+    retained = used_bytes = 0
+    for _, _, name, size in sorted(candidates, reverse=True):
+        if retained == MAX_CURSOR_STATES or used_bytes + size > MAX_CURSOR_CACHE_BYTES:
+            opened.unlink(name)
+        else:
+            retained += 1
+            used_bytes += size
+
+
 def _write_cursor_state(
     root: Path | None, raw: bytes, snapshot: log.FileSnapshot
 ) -> str:
+    if len(raw) > MAX_CURSOR_STATE_BYTES:
+        raise SaiError(
+            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
+        )
     data = zlib.compress(raw)
+    if len(data) > MAX_CURSOR_FILE_BYTES:
+        raise SaiError(
+            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
+        )
     name = f"{max(snapshot)[0].isoformat()}_{hashlib.sha256(data).hexdigest()}"
     for opened in _cursor_directories(root, create=True):
         with opened:
@@ -340,11 +387,9 @@ def _write_cursor_state(
             except OSError:
                 continue
             # A snapshot cannot refer to a file newer than the day in its name.
-            if retained := log.snapshot_files(root):
-                oldest = min(retained)[0].isoformat()
-                for previous in opened.names():
-                    if previous[:10] < oldest and CURSOR_STATE_NAME.fullmatch(previous):
-                        opened.unlink(previous)
+            retained = log.snapshot_files(root)
+            oldest = min(retained)[0].isoformat() if retained else ""
+            _prune_cursor_states(opened, name, oldest)
             return name
     raise SaiError("Could not save the intent log continuation.", Code.INTERNAL_ERROR)
 
