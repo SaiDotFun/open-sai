@@ -1,8 +1,9 @@
 mod config;
 mod local;
+mod mcp;
 mod reads;
 
-use std::{env, path::Path, process, time::Instant};
+use std::{env, path::Path, process, sync::Arc, time::Instant};
 
 use clap::{
     Parser, Subcommand,
@@ -80,6 +81,11 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Serve Sai tools to an agent client.
+    Mcp {
+        #[command(subcommand)]
+        command: mcp::McpCommand,
+    },
 }
 
 fn main() -> process::ExitCode {
@@ -94,6 +100,11 @@ fn main() -> process::ExitCode {
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
     let started = Instant::now();
+    let surface = if command == "mcp serve" {
+        Surface::Mcp
+    } else {
+        Surface::Cli
+    };
     let writer = if command == "logs"
         || argv
             .iter()
@@ -109,13 +120,14 @@ fn main() -> process::ExitCode {
             .map(|writer| {
                 if matches!(
                     command.split(' ').next(),
-                    Some("market" | "account" | "watch")
+                    Some("market" | "account" | "watch" | "mcp")
                 ) {
                     writer.with_v2_command()
                 } else {
                     writer
                 }
             })
+            .map(Arc::new)
     };
     let command_field = || {
         if command.is_empty() {
@@ -129,14 +141,14 @@ fn main() -> process::ExitCode {
         }
         .into()
     };
-    let events = EventContext {
-        writer: writer.as_ref(),
-        surface: Surface::Cli,
-        command: (!command.is_empty()).then_some(command),
-    };
+    let events = EventContext::new(
+        writer.as_deref(),
+        surface,
+        (!command.is_empty()).then_some(command),
+    );
     if let Some(writer) = &writer {
         writer.event(
-            Surface::Cli,
+            surface,
             "command.start",
             Level::Info,
             [
@@ -172,13 +184,20 @@ fn main() -> process::ExitCode {
                         Command::Market { command } => command.run(&flags, env, json, events),
                         Command::Account { command } => command.run(&flags, env, json, events),
                         Command::Watch { command } => command.run(&flags, env, events),
+                        Command::Mcp { command } => command.run(flags, env, writer.clone()),
                     }
                 });
-            complete(result, command, json, home)
+            complete(result, command, json && command != "mcp serve", home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
-    finish(writer, command_field(), started, outcome)
+    finish(
+        writer.and_then(Arc::into_inner),
+        surface,
+        command_field(),
+        started,
+        outcome,
+    )
 }
 
 fn json_requested(args: &[String]) -> bool {
@@ -257,7 +276,8 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" | "market list" | "market prices" => "",
+        "config list" | "auth status" | "auth list" | "market list" | "market prices"
+        | "mcp serve" => "",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
         "watch price" => " TOKEN_ID",
@@ -297,6 +317,7 @@ fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
 
 fn finish(
     writer: Option<LogWriter>,
+    surface: Surface,
     command: Field,
     started: Instant,
     (code, error): (ExitCode, Option<SaiError>),
@@ -320,7 +341,7 @@ fn finish(
                 fields.push(("intentKey", Field::Text(key)));
             }
         }
-        writer.event(Surface::Cli, "command.end", level, fields);
+        writer.event(surface, "command.end", level, fields);
         writer.finish(EXIT_FLUSH);
     }
     (code as u8).into()
@@ -336,13 +357,14 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return ("logs", &[]),
-            "config" | "auth" | "intent" | "market" | "account" | "watch" => {
+            "config" | "auth" | "intent" | "market" | "account" | "watch" | "mcp" => {
                 let group = match arg.as_str() {
                     "auth" => "auth",
                     "intent" => "intent",
                     "market" => "market",
                     "account" => "account",
                     "watch" => "watch",
+                    "mcp" => "mcp",
                     _ => "config",
                 };
                 let Some((index, leaf)) = args
@@ -372,6 +394,7 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("watch", "positions") => "watch positions",
                     ("watch", "balances") => "watch balances",
                     ("watch", "price") => "watch price",
+                    ("mcp", "serve") => "mcp serve",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);

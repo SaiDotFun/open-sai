@@ -12,11 +12,7 @@ use sai_core::{
 };
 use serde_json::{Map, Value};
 
-const EVENTS: EventContext<'_> = EventContext {
-    writer: None,
-    surface: Surface::Cli,
-    command: None,
-};
+const EVENTS: EventContext<'_> = EventContext::new(None, Surface::Cli, None);
 
 fn listener() -> TcpListener {
     TcpListener::bind(("127.0.0.1", 0)).unwrap()

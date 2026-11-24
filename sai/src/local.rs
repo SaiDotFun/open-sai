@@ -181,7 +181,7 @@ pub fn intent(
     }
 }
 
-fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
     match event {
         StorageEvent::IntentStatus {
             key,

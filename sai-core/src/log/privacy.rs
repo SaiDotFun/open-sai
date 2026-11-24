@@ -219,7 +219,8 @@ pub(super) fn replace_tokens(text: &str, tokens: &[String]) -> String {
     text
 }
 
-fn origin(text: &str) -> String {
+/// Strip credentials, path, query, and fragment for a public endpoint report.
+pub fn origin(text: &str) -> String {
     let Some(url) = Endpoint::split(text.trim()) else {
         return REDACTED_URL.into();
     };

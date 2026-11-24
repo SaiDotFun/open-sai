@@ -24,6 +24,7 @@ use crate::settings::{self, Environment};
 
 use files::LogDir;
 pub use privacy::Field;
+pub use privacy::origin as endpoint_origin;
 use privacy::{Budget, EVENT_CHARS, prefix};
 use session_tokens::{FileStamp, Tokens, stamp};
 
@@ -97,6 +98,10 @@ pub fn redact(home: &std::path::Path, text: &str) -> String {
     privacy::replace_tokens(text, &known)
 }
 
+pub fn enabled(env: &Environment) -> bool {
+    settings::log_keep_days(env).is_some()
+}
+
 /// Use the event writer's privacy rules for Keeper-controlled display fields.
 pub fn scrubber(home: &std::path::Path) -> impl Fn(Field) -> Value {
     Tokens::default().refresh(home);
@@ -131,23 +136,53 @@ pub struct LogWriter {
 /// Log events that occur while handling a CLI command or an MCP call.
 #[derive(Clone, Copy)]
 pub struct EventContext<'a> {
-    pub writer: Option<&'a LogWriter>,
-    pub surface: Surface,
-    pub command: Option<&'a str>,
+    writer: Option<&'a LogWriter>,
+    surface: Surface,
+    command: Option<&'a str>,
+    tool_call: Option<(&'a str, &'a str)>,
 }
 
-impl EventContext<'_> {
-    pub fn event<'a>(
+impl<'a> EventContext<'a> {
+    pub const fn new(
+        writer: Option<&'a LogWriter>,
+        surface: Surface,
+        command: Option<&'a str>,
+    ) -> Self {
+        Self {
+            writer,
+            surface,
+            command,
+            tool_call: None,
+        }
+    }
+
+    pub fn with_tool(mut self, tool: &'a str, call_id: &'a str) -> Self {
+        self.tool_call = Some((tool, call_id));
+        self
+    }
+
+    pub fn event<'b>(
         self,
         name: &str,
         level: Level,
-        fields: impl IntoIterator<Item = (&'a str, Field)>,
+        fields: impl IntoIterator<Item = (&'b str, Field)>,
     ) {
         let Some(writer) = self.writer else { return };
         let command = self
             .command
             .map(|command| ("command", Field::Text(command.into())));
-        writer.event(self.surface, name, level, command.into_iter().chain(fields));
+        let call = self.tool_call.into_iter().flat_map(|(tool, call_id)| {
+            [
+                ("tool", Field::Text(tool.into())),
+                ("callId", Field::Text(call_id.into())),
+            ]
+        });
+        writer.event(
+            self.surface,
+            name,
+            level,
+            command.into_iter().chain(call).chain(fields),
+        );
     }
 }
 
