@@ -1,9 +1,16 @@
 mod config;
 mod local;
 mod logs;
+mod repl;
 mod skill;
 
-use std::{env, path::Path, process, time::Instant};
+use std::{
+    env,
+    ffi::OsString,
+    path::Path,
+    process,
+    time::{Duration, Instant},
+};
 
 use clap::{
     Parser, Subcommand,
@@ -22,10 +29,12 @@ use local::{AuthCommand, IntentCommand};
     version,
     about,
     disable_help_subcommand = true,
-    after_help = "Use --skill to print the bundled agent skill and exit.",
     args_override_self = true
 )]
 struct Cli {
+    /// Print the bundled agent skill and exit.
+    #[arg(long)]
+    skill: bool,
     /// Print compact machine-readable JSON.
     #[arg(long)]
     json: bool,
@@ -42,7 +51,7 @@ struct Cli {
     #[arg(long = "as", value_name = "ADDR")]
     account: Option<String>,
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Subcommand)]
@@ -79,21 +88,42 @@ enum Command {
 }
 
 fn main() -> process::ExitCode {
-    let args: Vec<_> = env::args_os().collect();
+    let environment = Environment::from_process();
+    let writer = environment
+        .as_ref()
+        .ok()
+        .cloned()
+        .and_then(LogWriter::start);
+    let code = execute(env::args_os().collect(), &environment, writer.as_ref());
+    if let Some(writer) = writer {
+        writer.finish(EXIT_FLUSH);
+    }
+    (code as u8).into()
+}
+
+fn execute(
+    args: Vec<OsString>,
+    environment: &Result<Environment, SettingsError>,
+    writer: Option<&LogWriter>,
+) -> ExitCode {
     let argv: Vec<_> = args
         .iter()
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let (command, operands) = command_path(&argv);
-    let environment = Environment::from_process();
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
     if eager_skill(&argv) {
-        return (complete(skill::show(None), "skill show", requested_json, home).0 as u8).into();
+        return complete(skill::show(None), "skill show", requested_json, home).0;
     }
     let started = Instant::now();
-    let writer = if command.starts_with("logs")
+    if command.starts_with("logs")
+        && let Some(writer) = writer
+    {
+        writer.flush(Duration::from_secs(1));
+    }
+    let events_writer = if command.starts_with("logs")
         || command == "skill show"
         || argv
             .iter()
@@ -101,11 +131,7 @@ fn main() -> process::ExitCode {
     {
         None
     } else {
-        environment
-            .as_ref()
-            .ok()
-            .cloned()
-            .and_then(LogWriter::start)
+        writer
     };
     let command_field = || {
         if command.is_empty() {
@@ -121,12 +147,12 @@ fn main() -> process::ExitCode {
     };
     let command_id = log::command_id();
     let events = EventContext {
-        writer: writer.as_ref(),
+        writer: events_writer,
         surface: Surface::Cli,
         command: (!command.is_empty()).then_some(command),
         command_id: Some(&command_id),
     };
-    if let Some(writer) = &writer {
+    if let Some(writer) = events_writer {
         writer.event(
             Surface::Cli,
             "command.start",
@@ -143,7 +169,7 @@ fn main() -> process::ExitCode {
             let json = cli.json
                 || matches!(
                     &cli.command,
-                    Command::Auth { json: true, .. } | Command::Intent { json: true, .. }
+                    Some(Command::Auth { json: true, .. } | Command::Intent { json: true, .. })
                 );
             let result = environment
                 .as_ref()
@@ -155,24 +181,35 @@ fn main() -> process::ExitCode {
                         lcd_endpoint: cli.lcd_endpoint,
                     };
                     match cli.command {
-                        Command::Auth { command, .. } => {
+                        Some(Command::Auth { command, .. }) => {
                             local::auth(command, cli.account.as_deref(), &flags, env, json, events)
                         }
-                        Command::Intent { command, .. } => {
+                        Some(Command::Intent { command, .. }) => {
                             local::intent(command, &flags, env, json, events)
                         }
-                        Command::Config { command } => command.run(&flags, env, json),
-                        Command::Skill { command } => command.run(json),
-                        Command::Logs { command } => {
+                        Some(Command::Config { command }) => command.run(&flags, env, json),
+                        Some(Command::Skill { command }) => command.run(json),
+                        Some(Command::Logs { command }) => {
                             command.run(env, &flags, cli.account.as_deref(), json)
                         }
+                        None if cli.skill => skill::show(None),
+                        None if json => Err(SaiError::usage("Pass a command when using --json.")),
+                        None => repl::run(&env.home, &flags, cli.account.as_deref(), |args| {
+                            execute(args, environment, writer);
+                        }),
                     }
                 });
             complete(result, command, json, home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
-    finish(writer, command_field(), &command_id, started, outcome)
+    finish(
+        events_writer,
+        command_field(),
+        &command_id,
+        started,
+        outcome,
+    )
 }
 
 fn eager_skill(argv: &[String]) -> bool {
@@ -229,6 +266,13 @@ fn complete(
     let Err(error) = result else {
         return (ExitCode::Ok, None);
     };
+    if repl::active()
+        && error.code == sai_core::errors::Code::InvalidRequest
+        && error.message == "Aborted"
+    {
+        eprintln!("Interrupted");
+        return (error.exit_code, Some(error));
+    }
     let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
     let message = redact(&error.message);
     if json_output {
@@ -302,12 +346,12 @@ fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
 }
 
 fn finish(
-    writer: Option<LogWriter>,
+    writer: Option<&LogWriter>,
     command: Field,
     command_id: &str,
     started: Instant,
     (code, error): (ExitCode, Option<SaiError>),
-) -> process::ExitCode {
+) -> ExitCode {
     if let Some(writer) = writer {
         let duration_ms = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let level = if code == ExitCode::Ok {
@@ -329,9 +373,8 @@ fn finish(
             }
         }
         writer.event(Surface::Cli, "command.end", level, fields);
-        writer.finish(EXIT_FLUSH);
     }
-    (code as u8).into()
+    code
 }
 
 fn command_path(args: &[String]) -> (&'static str, &[String]) {

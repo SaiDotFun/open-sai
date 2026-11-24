@@ -640,3 +640,126 @@ def test_malformed_endpoints(
         assert not (root / "sai-home").exists()
         outputs.append((result.stdout, result.stderr))
     assert outputs[0] == outputs[1]
+
+
+def test_repl_pipe(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    outputs = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        endpoint = "http://127.0.0.1:1/graphql"
+        result = invoke(
+            cli,
+            root,
+            "--endpoint",
+            endpoint,
+            stdin=b"help config get\nconfig get 'keeper.endpoint'\nconfig get 'bad\nquit\n",
+        )
+        assert result.returncode == 0
+        assert b"Sai " in result.stdout
+        assert b"Usage: sai config get [OPTIONS] KEY" in result.stdout
+        assert endpoint.encode() in result.stdout
+        assert result.stderr == b"Error: No closing quotation\n"
+        trader = root / "sai-home/trader"
+        assert stat.S_IMODE(trader.stat().st_mode) == 0o700
+        assert not (trader / "history").exists()
+        stdout = result.stdout.split(b"Enter a command", 1)[1]
+        outputs.append((stdout, result.stderr))
+        assert invoke(cli, root, stdin=b"").stdout.endswith("> sai ❯ \n".encode())
+        missing = invoke(cli, root, "--json")
+        assert missing.returncode == 2 and missing.stderr == b""
+        assert (
+            json.loads(missing.stdout)["error"]["message"]
+            == "Pass a command when using --json."
+        )
+    assert outputs[0] == outputs[1]
+
+
+def test_repl_keeps_terminal_history_and_recovers_from_interrupt(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    import errno
+    import pty
+    import select
+    import time
+
+    def recv(master: int, pending: bytearray, needle: bytes) -> None:
+        deadline = time.monotonic() + 8
+        while needle not in pending and time.monotonic() < deadline:
+            if not select.select([master], [], [], 0.2)[0]:
+                continue
+            try:
+                pending.extend(os.read(master, 4096))
+            except OSError as exc:
+                if exc.errno != errno.EIO:
+                    raise
+                break
+        assert needle in pending, bytes(pending)
+        end = pending.index(needle) + len(needle)
+        del pending[:end]
+
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        root.mkdir(mode=0o700)
+        master, slave = pty.openpty()
+        with subprocess.Popen(
+            cli,
+            cwd=root,
+            env={**case_env(root, logging="0"), "TERM": "xterm-256color"},
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        ) as process:
+            os.close(slave)
+            pending = bytearray()
+
+            try:
+                recv(master, pending, "❯".encode())
+                os.write(master, b"discard-me\x03")
+                recv(master, pending, "❯".encode())
+                os.write(master, b"config get keeper.endpoint\r")
+                recv(master, pending, b"https://sai-keeper.nibiru.fi/query")
+                recv(master, pending, "❯".encode())
+                os.write(master, b"\x04")
+                assert process.wait(timeout=8) == 0
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                os.close(master)
+        history = root / "sai-home/trader/history"
+        assert stat.S_IMODE(history.stat().st_mode) == 0o600
+        assert b"+config get keeper.endpoint\n" in history.read_bytes()
+        assert b"discard-me" not in history.read_bytes()
+
+
+def test_repl_commands_share_run_but_keep_command_ids(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        result = invoke(
+            cli,
+            root,
+            stdin=b"config get logs.enabled\nconfig get logs.keep_days\nquit\n",
+            logging="1",
+        )
+        assert result.returncode == 0 and not result.stderr
+        rows = [
+            json.loads(line)
+            for path in sorted((root / "sai-home/logs").glob("cli-*.jsonl"))
+            for line in path.read_bytes().splitlines()
+        ]
+        assert [row["seq"] for row in rows] == list(range(1, 7))
+        assert [row["command"] for row in rows] == [
+            "repl",
+            "config get",
+            "config get",
+            "config get",
+            "config get",
+            "repl",
+        ]
+        ids = [row["commandId"] for row in rows]
+        assert ids[0] == ids[-1] and ids[1] == ids[2] and ids[3] == ids[4]
+        assert len(set(ids)) == 3
+        assert len({row["runId"] for row in rows}) == 1

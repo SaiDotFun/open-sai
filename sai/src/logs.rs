@@ -127,14 +127,14 @@ impl LogsCommand {
                     .enable_all()
                     .build()
                     .map_err(|_| SaiError::internal())?;
-                let report = runtime.block_on(query::intent(
+                let report = runtime.block_on(crate::repl::interruptible(query::intent(
                     &env.home,
                     &key,
                     endpoint,
                     account,
                     offline,
                     before.as_deref(),
-                ))?;
+                )))?;
                 if json_output {
                     return local::emit(&report, true);
                 }

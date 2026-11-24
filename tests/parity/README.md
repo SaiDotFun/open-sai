@@ -100,6 +100,7 @@ checked on both sides.
 | --- | --- |
 | Text and structured output | The run's absolute temporary home path |
 | Stdout from `--version`, `skill source`, `update --check`, `doctor`, and MCP initialization | Running or installed CLI versions at the documented fields |
+| `skill source` | Absolute package location. Python reports a directory, and Rust reports the binary that embeds the files. |
 | Doctor checks | `generatedAt` and check durations, including durations embedded in network-check summaries |
 | `update.json` | `checkedAt` |
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
@@ -113,3 +114,13 @@ within a run. An event with the wrong call ID or an output with a different
 intent key can therefore differ even when both IDs have valid shapes.
 `LOG_VOLATILE_FIELDS` in `compare.py` assigns normalization rules to the
 volatile fields listed in `docs/log-events.json` and to generated intent keys.
+
+## C9b Python Reference
+
+Commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` is the Python
+reference for logs, skill management, and the REPL. It contains the logging
+v2 schema from PR #69 and the paging fixes from PR #93. In CI,
+`test_local_commands.py` uses the installed Python in the current checkout.
+To reproduce the pinned comparison, install Python from that commit and set
+`SAI_C9B_PARITY_PYTHON` to its `sai` launcher. The C4 tests still use
+`SAI_PARITY_PYTHON` for the older Keeper baseline.

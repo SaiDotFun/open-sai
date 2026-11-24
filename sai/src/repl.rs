@@ -1,0 +1,337 @@
+use std::{
+    cell::Cell,
+    env,
+    ffi::OsString,
+    fs::{self, File},
+    future::Future,
+    io::{self, IsTerminal, Read, Write},
+    path::Path,
+};
+
+use chrono::Utc;
+use rustyline::{Config, Editor, error::ReadlineError, history::MemHistory};
+use sai_core::{
+    errors::{Code, SaiError},
+    settings::Flags,
+};
+
+thread_local! {
+    static ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+pub fn active() -> bool {
+    ACTIVE.get()
+}
+
+pub async fn interruptible<T>(
+    operation: impl Future<Output = Result<T, SaiError>>,
+) -> Result<T, SaiError> {
+    if !active() {
+        return operation.await;
+    }
+    tokio::select! {
+        signal = tokio::signal::ctrl_c() => {
+            signal.map_err(|_| SaiError::internal())?;
+            Err(SaiError::new(Code::InvalidRequest, "Aborted"))
+        }
+        result = operation => result
+    }
+}
+
+fn argument_error(message: &str) -> SaiError {
+    SaiError::new(Code::InvalidRequest, message)
+}
+
+// This is the POSIX shlex grammar used by Python's REPL. In a quoted
+// string only a backslash before a quote or backslash is removed.
+fn arguments(line: &str) -> Result<Vec<String>, SaiError> {
+    let mut args = Vec::new();
+    let mut input = line.chars().peekable();
+    while let Some(&next) = input.peek() {
+        if matches!(next, ' ' | '\t' | '\r' | '\n') {
+            input.next();
+            continue;
+        }
+        let mut word = String::new();
+        let mut quote = None;
+        while let Some(current) = input.next() {
+            if let Some(delimiter) = quote {
+                if current == delimiter {
+                    quote = None;
+                } else if current == '\\' && delimiter == '"' {
+                    let next = input
+                        .next()
+                        .ok_or_else(|| argument_error("No escaped character"))?;
+                    if !matches!(next, '"' | '\\') {
+                        word.push('\\');
+                    }
+                    word.push(next);
+                } else {
+                    word.push(current);
+                }
+            } else {
+                match current {
+                    ' ' | '\t' | '\r' | '\n' => break,
+                    '\'' | '"' => quote = Some(current),
+                    '\\' => word.push(
+                        input
+                            .next()
+                            .ok_or_else(|| argument_error("No escaped character"))?,
+                    ),
+                    other => word.push(other),
+                }
+            }
+        }
+        if quote.is_some() {
+            return Err(argument_error("No closing quotation"));
+        }
+        args.push(word);
+    }
+    if args
+        .first()
+        .is_some_and(|command| matches!(command.as_str(), "help" | "?"))
+    {
+        args.remove(0);
+        args.push("--help".into());
+    }
+    Ok(args)
+}
+
+fn banner(color: bool) {
+    const DARK: &str = "\x1b[38;5;240m";
+    const LIGHT: &str = "\x1b[38;5;250m";
+    const BRAND: &str = "\x1b[38;5;80m\x1b[1m";
+    const ACCENT: &str = "\x1b[38;5;75m\x1b[1m";
+    const MAGENTA: &str = "\x1b[38;5;176m";
+    let paint = |code: &str, text: &str| {
+        if color {
+            format!("{code}{text}\x1b[0m")
+        } else {
+            text.to_owned()
+        }
+    };
+    let border = paint(DARK, "│");
+    let row = |text: String, width: usize| {
+        println!(
+            "{border}{text}{:padding$}{border}",
+            "",
+            padding = 72_usize.saturating_sub(width)
+        );
+    };
+    println!("{}", paint(DARK, &format!("╭{}╮", "─".repeat(72))));
+    row(
+        format!(
+            " {}  {} {} {}",
+            paint(BRAND, "◆"),
+            paint(BRAND, "Sai"),
+            paint(DARK, "·"),
+            paint(ACCENT, "Trader CLI")
+        ),
+        20,
+    );
+    let version = format!("   v{}", env!("CARGO_PKG_VERSION"));
+    row(format!(" {}", paint(DARK, &version)), version.len() + 1);
+    for (label, detail) in [
+        (
+            "Install:",
+            "npx skills add SaiDotFun/open-sai --skill sai -g -y",
+        ),
+        ("Global skill:", "~/.agents/skills/sai/SKILL.md"),
+    ] {
+        row(
+            format!(
+                " {} {} {}",
+                paint(MAGENTA, "◇"),
+                paint(DARK, label),
+                paint(LIGHT, detail)
+            ),
+            4 + label.len() + detail.len(),
+        );
+    }
+    row(String::new(), 0);
+    let hint = "   Type help for commands, quit to exit";
+    row(format!(" {}", paint(DARK, hint)), hint.len() + 1);
+    println!(
+        "{}\n\nEnter a command, 'help', or 'exit'.",
+        paint(DARK, &format!("╰{}╯", "─".repeat(72)))
+    );
+}
+
+fn history_directory(home: &Path) -> io::Result<std::path::PathBuf> {
+    let trader = home.join("trader");
+    #[cfg(unix)]
+    {
+        use rustix::{
+            fs::{Mode, OFlags, open},
+            process::geteuid,
+        };
+        use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(home)?;
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW;
+        let profile = File::from(open(home, flags, Mode::empty())?);
+        if profile.metadata()?.uid() != geteuid().as_raw() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        builder.create(&trader)?;
+        let directory = File::from(open(&trader, flags, Mode::empty())?);
+        if directory.metadata()?.uid() != geteuid().as_raw() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        directory.set_permissions(fs::Permissions::from_mode(0o700))?;
+    }
+    #[cfg(not(unix))]
+    fs::create_dir_all(&trader)?;
+    Ok(trader)
+}
+
+fn open_history(directory: &Path) -> io::Result<File> {
+    let path = directory.join("history");
+    #[cfg(unix)]
+    {
+        use rustix::{
+            fs::{Mode, OFlags, open},
+            process::geteuid,
+        };
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let flags =
+            OFlags::RDWR | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+        let file = File::from(open(path, flags, Mode::RUSR | Mode::WUSR)?);
+        let info = file.metadata()?;
+        if !info.is_file() || info.nlink() != 1 || info.uid() != geteuid().as_raw() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    fs::OpenOptions::new()
+        .read(true)
+        .append(true)
+        .create(true)
+        .open(path)
+}
+
+fn load_history(file: &mut File, editor: &mut Editor<(), MemHistory>) -> Result<(), SaiError> {
+    let mut stored = Vec::new();
+    file.read_to_end(&mut stored)
+        .map_err(|_| SaiError::internal())?;
+    let stored = String::from_utf8_lossy(&stored);
+    let mut entry = Vec::new();
+    for line in stored.lines().chain([""]) {
+        if let Some(line) = line.strip_prefix('+') {
+            entry.push(line);
+        } else if !entry.is_empty() {
+            editor
+                .add_history_entry(entry.join("\n"))
+                .map_err(|_| SaiError::internal())?;
+            entry.clear();
+        }
+    }
+    Ok(())
+}
+
+fn record_history(history: &mut File, line: &str) -> io::Result<()> {
+    let time = Utc::now().format("%Y-%m-%d %H:%M:%S%.6f");
+    let mut entry = format!("\n# {time}\n");
+    for line in line.split('\n') {
+        entry.push('+');
+        entry.push_str(line);
+        entry.push('\n');
+    }
+    history.write_all(entry.as_bytes())
+}
+
+pub fn run(
+    home: &Path,
+    flags: &Flags,
+    account: Option<&str>,
+    mut dispatch: impl FnMut(Vec<OsString>),
+) -> Result<(), SaiError> {
+    let directory = history_directory(home).map_err(|_| SaiError::internal())?;
+    banner(
+        io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
+    );
+    let terminal = io::stdin().is_terminal();
+    let mut session: Option<(Editor<(), MemHistory>, File)> = if terminal {
+        let config = Config::builder()
+            .max_history_size(usize::MAX)
+            .map_err(|_| SaiError::internal())?
+            .build();
+        let mut editor = Editor::with_config(config).map_err(|_| SaiError::internal())?;
+        let mut history = open_history(&directory).map_err(|_| SaiError::internal())?;
+        load_history(&mut history, &mut editor)?;
+        Some((editor, history))
+    } else {
+        None
+    };
+    let mut forwarded = vec![OsString::from("sai")];
+    for (option, value) in [
+        ("--endpoint", flags.endpoint.as_deref()),
+        ("--ws-endpoint", flags.ws_endpoint.as_deref()),
+        ("--lcd-endpoint", flags.lcd_endpoint.as_deref()),
+        ("--as", account.filter(|account| !account.is_empty())),
+    ] {
+        if let Some(value) = value {
+            forwarded.extend([OsString::from(option), OsString::from(value)]);
+        }
+    }
+
+    loop {
+        let line = if let Some((editor, history)) = &mut session {
+            match editor.readline("◆ sai ❯ ") {
+                Ok(line) => {
+                    if !line.is_empty()
+                        && editor
+                            .add_history_entry(&line)
+                            .map_err(|_| SaiError::internal())?
+                    {
+                        record_history(history, &line).map_err(|_| SaiError::internal())?;
+                    }
+                    line
+                }
+                Err(ReadlineError::Interrupted) => continue,
+                Err(ReadlineError::Eof) => {
+                    println!();
+                    break;
+                }
+                Err(_) => return Err(SaiError::internal()),
+            }
+        } else {
+            print!("> sai ❯ ");
+            io::stdout().flush().map_err(|_| SaiError::internal())?;
+            let mut line = String::new();
+            match io::stdin().read_line(&mut line) {
+                Ok(0) => {
+                    println!();
+                    break;
+                }
+                Ok(_) => line,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(_) => return Err(SaiError::internal()),
+            }
+        };
+        let line = line.trim();
+        if matches!(line, "exit" | "quit") {
+            break;
+        }
+        match arguments(line) {
+            Ok(arguments) if !arguments.is_empty() => ACTIVE.with(|active| {
+                let previous = active.replace(true);
+                dispatch(
+                    forwarded
+                        .iter()
+                        .cloned()
+                        .chain(arguments.into_iter().map(OsString::from))
+                        .collect(),
+                );
+                active.set(previous);
+            }),
+            Ok(_) => {}
+            Err(error) => eprintln!("Error: {}", error.message),
+        }
+    }
+    Ok(())
+}
