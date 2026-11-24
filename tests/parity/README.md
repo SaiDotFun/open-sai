@@ -139,12 +139,21 @@ to run the release replay:
 | `SAI_C10B_SHIM` | Shim wheel or a directory containing it. Build it from PR #116 or its merged source. For loopback downloads, substitute the fixture release source from `tests/parity/native_release_source.py` before building. |
 | `SAI_C10B_BRIDGE` | Full Python wheel or a directory containing it. Build it from the branch under test at a lower version than the shim. |
 | `SAI_C10B_PRE_BRIDGE` | Directory with the Python wheel and `install.py` from the pinned pre-bridge commit `8557a7e13dceab0accc369191182c8e01423c91b`, and that commit SHA in a file named `commit`. |
-| `SAI_C10B_MUTANT` | A build of the same Rust source that fails `mcp serve` only when invoked via the installed standalone launcher or the persistent uv tool environment. |
+| `SAI_C10B_MUTANT` | A build of the same Rust source that fails `mcp serve` only when invoked from an installed standalone version directory or the persistent uv tool environment. |
 
 The fixture builder derives rehearsal versions from `pyproject.toml`. Both
 workflows build the wheels locally and run the compatibility checks with
 real uv launchers. Native MCP startup is an
 expected failure when a build from before PR #120 reports a missing command.
+
+## Released Intent Status Cases
+
+Run `tests/parity/test_intent_status_v012.py` with `SAI_PARITY_BIN` set to
+the Rust binary and `SAI_PARITY_PYTHON` set to the Python executable from
+tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
+The Rust CI job runs this file separately because the existing intent
+status replay expects the older, unpaginated history request from its
+pre-release Python reference.
 
 ## Comparison Rules
 
