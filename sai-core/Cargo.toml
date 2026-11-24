@@ -11,15 +11,19 @@ publish = false
 aes = { version = "0.8", features = ["zeroize"] }
 aes-gcm = { workspace = true, features = ["zeroize"] }
 base64.workspace = true
+bech32.workspace = true
 chrono.workspace = true
 num-bigint.workspace = true
 regex.workspace = true
+reqwest.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 thiserror = "2"
+tokio.workspace = true
+tower.workspace = true
 toml_edit.workspace = true
 toml_parser.workspace = true
 unicode-normalization.workspace = true

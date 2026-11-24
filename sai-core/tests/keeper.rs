@@ -1,0 +1,165 @@
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::{TcpListener, TcpStream},
+    thread,
+    time::Duration,
+};
+
+use sai_core::{
+    errors::Code,
+    keeper::{INTENTS, Keeper, SUBMIT},
+    log::{EventContext, Surface},
+};
+use serde_json::{Map, Value};
+
+const EVENTS: EventContext<'_> = EventContext {
+    writer: None,
+    surface: Surface::Cli,
+    command: None,
+};
+
+fn listener() -> TcpListener {
+    TcpListener::bind(("127.0.0.1", 0)).unwrap()
+}
+
+fn read_request(stream: &mut TcpStream) -> (Vec<String>, Vec<u8>) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut reader = BufReader::new(stream);
+    let mut lines = Vec::new();
+    loop {
+        let mut line = String::new();
+        assert_ne!(reader.read_line(&mut line).unwrap(), 0);
+        if line == "\r\n" {
+            break;
+        }
+        lines.push(line.trim_end().into());
+    }
+    let length = lines
+        .iter()
+        .find_map(|line: &String| {
+            line.to_ascii_lowercase()
+                .strip_prefix("content-length: ")?
+                .parse()
+                .ok()
+        })
+        .unwrap();
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).unwrap();
+    (lines, body)
+}
+
+#[tokio::test]
+async fn tls_connect_timeout_is_not_sent() {
+    let listener = listener();
+    let endpoint = format!("https://{}/query", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut hello = [0];
+        stream.read_exact(&mut hello).unwrap();
+        assert_eq!(hello[0], 0x16, "TLS handshake record");
+        thread::sleep(Duration::from_millis(400));
+    });
+    let error = Keeper::new(&endpoint, EVENTS)
+        .request(INTENTS, Map::new(), None, Duration::from_millis(150))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::NotSent);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn timeout_after_sending_is_a_keeper_error() {
+    let listener = listener();
+    let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        thread::sleep(Duration::from_millis(400));
+    });
+    let error = Keeper::new(&endpoint, EVENTS)
+        .request(INTENTS, Map::new(), None, Duration::from_millis(150))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, Code::KeeperError);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn body_progress_resets_the_read_timeout() {
+    let listener = listener();
+    let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        read_request(&mut stream);
+        let body = b"{\"data\": {\"count\": 12345}}";
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .unwrap();
+        for chunk in body.chunks(4) {
+            thread::sleep(Duration::from_millis(80));
+            stream.write_all(chunk).unwrap();
+        }
+    });
+    let data = Keeper::new(&endpoint, EVENTS)
+        .request(INTENTS, Map::new(), None, Duration::from_millis(350))
+        .await
+        .unwrap();
+    assert_eq!(data["count"], 12345);
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn admission_requires_explicit_rejection_and_no_data() {
+    for (body, expected) in [
+        (
+            r#"{"errors":[{"extensions":{"code":"INTENT_NOT_ACCEPTED"}}]}"#,
+            Code::AdmissionRejected,
+        ),
+        (
+            r#"{"errors":[{"extensions":{"code":"INTENT_NOT_ACCEPTED"}},{}]}"#,
+            Code::KeeperError,
+        ),
+        (
+            r#"{"errors":[{"extensions":{"code":"INTENT_NOT_ACCEPTED"}}],"data":{"recordUserIntent":null}}"#,
+            Code::KeeperError,
+        ),
+    ] {
+        let listener = listener();
+        let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let (headers, bytes) = read_request(&mut stream);
+            assert!(headers[0] == "POST /query HTTP/1.1");
+            assert!(
+                headers
+                    .iter()
+                    .any(|line| line.eq_ignore_ascii_case("authorization: Bearer fixture-token"))
+            );
+            let request: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(request["query"], SUBMIT);
+            assert_eq!(request["variables"], serde_json::json!({}));
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            )
+            .unwrap();
+        });
+        let error = Keeper::new(&endpoint, EVENTS)
+            .request(
+                SUBMIT,
+                Map::new(),
+                Some("fixture-token"),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, expected);
+        server.join().unwrap();
+    }
+}

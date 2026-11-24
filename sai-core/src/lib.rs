@@ -1,5 +1,6 @@
 mod endpoint;
 pub mod errors;
+pub mod keeper;
 pub mod log;
 pub mod session;
 pub mod settings;
