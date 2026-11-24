@@ -72,6 +72,7 @@ GLOBAL_FLAGS = (
     ("--ws-endpoint", "keeper.ws_endpoint"),
     ("--lcd-endpoint", "lcd.endpoint"),
 )
+LCD_TRADE_COMMANDS = frozenset({"trade margin", "trade partial-close"})
 
 
 def settings(ctx: click.Context) -> sai_settings.Settings:
@@ -321,6 +322,7 @@ class LoggedGroup(SaiGroup):
         obj = extra.get("obj")
         if not isinstance(obj, dict):
             obj = extra["obj"] = {}
+        obj["command"] = command
 
         def log_start() -> None:
             nonlocal start_logged
@@ -435,14 +437,11 @@ def main(
     passed = (endpoint, ws_endpoint, lcd_endpoint)
     flags = {key: value for (_, key), value in zip(GLOBAL_FLAGS, passed, strict=True)}
     ctx.obj.update(flags=flags, settings=None, json=json_output, as_addr=as_addr)
-    if ctx.invoked_subcommand not in {
-        "account",
-        "auth",
-        "doctor",
-        "mcp",
-        "logs",
-        "skill",
-    }:
+    if (
+        ctx.invoked_subcommand
+        not in {"account", "auth", "doctor", "mcp", "logs", "skill"}
+        and ctx.obj.get("command") not in LCD_TRADE_COMMANDS
+    ):
         session_notice(ctx, as_addr)
     if ctx.invoked_subcommand != "account" and auto_update_applies(
         ctx.invoked_subcommand, json_output
@@ -1477,6 +1476,16 @@ position_digest_option = click.option(
 )
 
 
+def lcd_trade_settings(
+    ctx: click.Context, lcd_endpoint: str | None
+) -> sai_settings.Settings:
+    """Apply a position command's LCD flag before resolving its settings."""
+    if lcd_endpoint is not None:
+        ctx.obj["flags"]["lcd.endpoint"] = lcd_endpoint
+    session_notice(ctx, ctx.obj["as_addr"])
+    return settings(ctx)
+
+
 @trade.command("margin")
 @click.argument("trade_id", type=int)
 @click.option("--direction", type=click.Choice(["add", "remove"]), required=True)
@@ -1507,16 +1516,17 @@ def trade_margin(
 
     The amount is a quote, not a cap: collateral can change before execution.
     """
+    resolved = lcd_trade_settings(ctx, lcd_endpoint)
     try:
         emit_trade(
             ctx,
             trading.change_margin(
-                keeper_url(ctx),
+                resolved.endpoint,
                 loader(ctx),
                 trade_id=trade_id,
                 direction=direction,
                 amount=amount,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
                 before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
@@ -1546,15 +1556,16 @@ def partial_close(
     preview_digest: str | None,
 ) -> None:
     """Reduce an open USDC position by a whole percentage."""
+    resolved = lcd_trade_settings(ctx, lcd_endpoint)
     try:
         emit_trade(
             ctx,
             trading.partial_close(
-                keeper_url(ctx),
+                resolved.endpoint,
                 loader(ctx),
                 trade_id=trade_id,
                 percent=percent,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
                 before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
@@ -1700,14 +1711,6 @@ def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
         )
         return ws_endpoint
     return settings(ctx).ws_endpoint
-
-
-def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
-    """The command's --lcd-endpoint, else the resolved LCD setting."""
-    if lcd_endpoint is not None:
-        sai_settings.check_value("lcd.endpoint", lcd_endpoint, source="--lcd-endpoint")
-        return lcd_endpoint
-    return settings(ctx).lcd_endpoint
 
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
