@@ -3034,8 +3034,11 @@ def test_intent_page_finds_start_and_anchor_in_two_utc_days(home):
     following.write_bytes(log.encode(noise) * log.MAX_SCAN_ROWS + log.encode(anchor))
     assert log_queries.intent("KEY", before=anchor["ts"])["events"] == [start]
     report = log_queries.intent("KEY")
-    assert report["truncated"] and report["events"] == [start, anchor]
-    assert report["nextBefore"] == anchor["ts"]
+    assert report["truncated"] and report["events"] == [anchor]
+    assert report["nextBefore"].startswith(anchor["ts"] + "~")
+    earlier = log_queries.intent("KEY", before=report["nextBefore"])
+    assert earlier["events"] == [start]
+    assert "nextBefore" not in earlier
 
 
 def test_stats_does_not_spend_row_budget_on_stale_other_surface(home):
@@ -3166,21 +3169,26 @@ def test_logs_stats_counts_older_rows_once_when_gap_output_is_capped(home):
     assert "truncated" not in earlier
 
 
-@pytest.mark.parametrize("query", ["run", "stats"])
+@pytest.mark.parametrize("query", ["run", "stats", "intent"])
 def test_log_reports_resume_inside_one_millisecond(home, query):
     root = home / "logs"
     root.mkdir()
     stamp = "2026-11-24T11:00:00.000Z"
-    name = "command.start" if query == "run" else "log.dropped"
+    name = {"run": "command.start", "stats": "log.dropped", "intent": "intent.keeper"}[
+        query
+    ]
     row = {"event": name, "runId": "process", "ts": stamp}
+    if query == "intent":
+        row.update(intentKey="KEY", addr=ADDR, endpointId="h1_" + "a" * 64)
     # Split the timestamp across files and leave one row on the second page.
     total = log_queries.MAX_REPORT_ROWS + 1
     for parity, surface in enumerate(("cli", "mcp")):
         log.file_path(surface, date(2026, 11, 24), root).write_bytes(
             b"".join(log.encode({**row, "seq": i}) for i in range(parity, total, 2))
         )
-    args = ("--json", "logs", query, *(("process",) if query == "run" else ()))
-    field = "events" if query == "run" else "gaps"
+    positionals = {"run": ("process",), "intent": ("KEY", "--offline"), "stats": ()}
+    args = ("--json", "logs", query, *positionals[query])
+    field = "gaps" if query == "stats" else "events"
     code, output = run_cli(*args)
     assert code == 0
     first = json.loads(output)
@@ -3196,6 +3204,40 @@ def test_log_reports_resume_inside_one_millisecond(home, query):
     code, output = run_cli(*args, "--before", stamp)
     assert code == 0
     assert json.loads(output)[field] == []
+
+
+def test_intent_cursor_keeps_invocation_attribution_from_prior_page(home):
+    root = home / "logs"
+    root.mkdir()
+    row = {
+        "event": "command.start",
+        "ts": "2026-11-24T11:00:00.000Z",
+        "surface": "cli",
+        "runId": "process",
+        "commandId": "command",
+    }
+    total = log_queries.MAX_REPORT_ROWS + 1
+    expected = [{**row, "seq": seq} for seq in range(total)]
+    expected[-1].update(
+        event="intent.keeper",
+        intentKey="KEY",
+        addr=ADDR,
+        endpointId="h1_" + "a" * 64,
+    )
+    log.file_path("cli", date(2026, 11, 24), root).write_bytes(
+        b"".join(map(log.encode, expected))
+    )
+
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0
+    first = json.loads(output)
+    assert first["events"] == expected[1:]
+    code, output = run_cli(*args, "--before", first["nextBefore"])
+    assert code == 0
+    second = json.loads(output)
+    assert second["events"] == expected[:1]
+    assert "nextBefore" not in second
 
 
 def test_log_stats_scan_continues_inside_one_millisecond(home):
@@ -3530,7 +3572,9 @@ def test_log_readers_project_retained_keeper_errors(home):
         assert [
             (item["keeperErrorCount"], item["keeperErrors"]) for item in rows
         ] == expected
-        assert [item["endpoint"] for item in rows] == ["https://keeper.example:8443"] * 2
+        assert [item["endpoint"] for item in rows] == [
+            "https://keeper.example:8443"
+        ] * 2
 
     mcp = server.create_server(settings.load())
     report = call(mcp, "logs_intent", {"key": "KEY", "offline": True})

@@ -68,7 +68,7 @@ import uuid
 from collections.abc import Callable, Generator, Iterator, Mapping
 from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
@@ -1329,170 +1329,64 @@ MAX_SCAN_FILES = 128
 _TS_HEADER = re.compile(rb'^\{"(?:schema":[0-9]+,"|)ts":"([0-9TZ:.-]{24})"')
 
 
-@dataclass
-class LogScan:
-    max_bytes: int = MAX_SCAN_BYTES
-    max_rows: int = MAX_SCAN_ROWS
-    max_files: int = MAX_SCAN_FILES
-    truncated: bool = False
-    frontier: str | None = None
-    visited: set[str] = field(default_factory=set)
-
-    def _stop_at_frontier(self, pending: Mapping[str, str | None]) -> None:
-        # A fully read sparse file cannot advance a cursor past an
-        # unfinished busy file on the same UTC day.
-        known = [ts for ts in pending.values() if ts is not None]
-        if known and len(known) == len(pending):
-            self.frontier = max(known)
-
-    def rows(
-        self,
-        root: Path | None = None,
-        *,
-        first_day: date | None = None,
-        last_day: date | None = None,
-        since: str | None = None,
-        before: str | None = None,
-        days: set[date] | None = None,
-        skip: set[str] | None = None,
-        prefix: bool = False,
-        accept: Callable[[dict[str, Any]], bool] | None = None,
-        frontier_before: str | None = None,
-    ) -> Iterator[dict[str, Any]]:
-        """Read bounded snapshots in UTC day order, alternating surfaces."""
-        opened = LogDir.open(root or directory())
-        if opened is None:
-            return
-        remaining_bytes, remaining_rows = self.max_bytes, self.max_rows
-        lower = since.encode() if since else None
-        upper = before.encode() if before else None
-        byte_limit = False
-
-        def read(fd: int, size: int) -> bytes:
-            nonlocal remaining_bytes, byte_limit
-            if size > remaining_bytes:
-                self.truncated = True
-                byte_limit = True
-                return b""
-            data = os.read(fd, size)
-            remaining_bytes -= len(data)
-            return data
-
-        with opened:
-            files = [
-                (day, name)
-                for day, _, name in reversed(opened.files())
-                if (first_day is None or day >= first_day)
-                and (last_day is None or day <= last_day)
-                and (days is None or day in days)
-                and (skip is None or name not in skip)
-            ]
-            self.truncated = len(files) > self.max_files
-            for _, daily in itertools.groupby(
-                files[: self.max_files], key=lambda item: item[0]
-            ):
-                if remaining_bytes == 0:
-                    self.truncated = True
-                    return
-                names = [name for _, name in daily]
-                with ExitStack() as active:
-                    readers = []
-                    for name in names:
-                        try:
-                            fd = opened.read_fd(name)
-                            active.callback(os.close, fd)
-                            size = os.fstat(fd).st_size
-                            if not size:
-                                continue
-                            if prefix:
-                                # Context after midnight starts at the head of each file.
-                                length = min(size, self.max_bytes // len(names))
-                                data = read(fd, length)
-                                self.truncated |= len(data) < size
-                                readers.append((name, iter([data.split(b"\n")[:-1]])))
-                            else:
-                                os.lseek(fd, size - 1, os.SEEK_SET)
-                                complete = read(fd, 1) == b"\n"
-                                readers.append(
-                                    (
-                                        name,
-                                        _line_blocks(
-                                            fd,
-                                            TAIL_CHUNK,
-                                            end=size,
-                                            read=read,
-                                            max_line=MAX_LINE,
-                                            complete_end=complete,
-                                        ),
-                                    )
-                                )
-                        except OSError:
-                            self.truncated = True
-                    # Read one chunk per surface before advancing a busy file.
-                    pending: dict[str, str | None] = {name: None for name, _ in readers}
-
-                    while readers:
-                        next_readers = []
-                        for name, reader in readers:
-                            try:
-                                block = next(reader)
-                            except StopIteration:
-                                if byte_limit:
-                                    self._stop_at_frontier(pending)
-                                    return
-                                pending.pop(name)
-                                continue
-                            except OSError:
-                                self.truncated = True
-                                continue
-                            self.visited.add(name)
-                            next_readers.append((name, reader))
-                            for raw in block:
-                                if len(raw) > MAX_LINE:
-                                    continue
-                                if (lower or upper) and (
-                                    header := _TS_HEADER.match(raw)
-                                ):
-                                    ts = header[1]
-                                    if lower and ts < lower or upper and ts >= upper:
-                                        continue
-                                try:
-                                    line = decode_row(raw)
-                                except (ValueError, RecursionError):
-                                    continue
-                                if not isinstance(line, dict):
-                                    continue
-                                if since or before:
-                                    ts = line.get("ts")
-                                    if not isinstance(ts, str) or (
-                                        since and ts < since or before and ts >= before
-                                    ):
-                                        continue
-                                if accept is not None and not accept(line):
-                                    continue
-                                if remaining_rows == 0:
-                                    self.truncated = True
-                                    self._stop_at_frontier(pending)
-                                    return
-                                remaining_rows -= 1
-                                ts = line.get("ts")
-                                if (
-                                    isinstance(ts, str)
-                                    and (
-                                        frontier_before is None or ts < frontier_before
-                                    )
-                                    and (current := pending[name]) != ts
-                                ):
-                                    pending[name] = min(current, ts) if current else ts
-                                yield line
-                        readers = next_readers
-
-
 @dataclass(frozen=True)
 class ScanPosition:
     day: date
     # Exclusive byte endpoints in SURFACES order. None starts a fresh day.
     offsets: tuple[int, ...] | None = None
+
+
+def context_rows(
+    root: Path | None,
+    start: ScanPosition,
+    accept: Callable[[dict[str, Any]], bool],
+    *,
+    max_bytes: int,
+    max_rows: int,
+    tail: bool = False,
+) -> Iterator[dict[str, Any]]:
+    """Read context near the given position or the end of one day's files."""
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        return
+    with opened:
+        files = [
+            (surface, name)
+            for day, surface, name in reversed(opened.files())
+            if day == start.day
+        ]
+        for surface, name in files:
+            length = max_bytes // len(files)
+            partial_start = False
+            try:
+                fd = opened.read_fd(name)
+                try:
+                    if tail:
+                        offset = max(0, os.fstat(fd).st_size - length)
+                        os.lseek(fd, offset, os.SEEK_SET)
+                        partial_start = offset > 0
+                    elif start.offsets is not None:
+                        os.lseek(
+                            fd, start.offsets[SURFACES.index(surface)], os.SEEK_SET
+                        )
+                    data = os.read(fd, length)
+                finally:
+                    os.close(fd)
+            except OSError:
+                continue
+            rows = data.split(b"\n")[int(partial_start) : -1]
+            for raw in reversed(rows) if tail else rows:
+                if len(raw) > MAX_LINE:
+                    continue
+                try:
+                    line = decode_row(raw)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(line, dict) and accept(line):
+                    yield line
+                    max_rows -= 1
+                    if max_rows == 0:
+                        return
 
 
 @dataclass

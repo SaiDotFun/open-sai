@@ -166,88 +166,25 @@ def _before(value: str | None) -> datetime | None:
 CONTEXT_BYTES = 256 * 1024
 CONTEXT_ROWS = 256
 CONTEXT_FILES = len(log.SURFACES)
-START_EVENTS = {"command.start", "mcp.tool_call"}
 
 
-def _scan(
+def _context(
     root: Path | None,
-    before: str | None,
-    anchor: Callable[[LogLine], bool],
-) -> tuple[list[LogLine], bool, str | None, str | None]:
-    instant = _before(before)
-    cutoff = log.stamp(instant) if instant else None
-    page_day = instant.date() if instant else None
-    scan = log.LogScan(
-        max_bytes=log.MAX_SCAN_BYTES - 2 * CONTEXT_BYTES,
-        max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
-        max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
-    )
-
-    log.flush(1.0)
-    rows = [
-        line
-        for line in scan.rows(
+    position: log.ScanPosition,
+    accept: Callable[[LogLine], bool],
+    *,
+    tail: bool = False,
+) -> list[LogLine]:
+    return list(
+        log.context_rows(
             root,
-            last_day=page_day,
-            accept=lambda line: _in_window(line, cutoff) or anchor(line),
-            frontier_before=cutoff,
-        )
-        if _timestamp(line)
-    ]
-    frontier = (
-        scan.frontier
-        if scan.truncated
-        else min(
-            (line["ts"] for line in rows if _in_window(line, cutoff)),
-            default=None,
+            position,
+            accept,
+            max_bytes=CONTEXT_BYTES,
+            max_rows=CONTEXT_ROWS,
+            tail=tail,
         )
     )
-    truncated = scan.truncated
-    if page_day is not None and page_day < date.max:
-        # A start on this page can belong to an invocation first scoped
-        # just after midnight. The next day's prefix supplies that anchor.
-        following = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
-        rows.extend(
-            following.rows(
-                root,
-                days={page_day + timedelta(days=1)},
-                prefix=True,
-                accept=anchor,
-            )
-        )
-        scan.visited.update(following.visited)
-        truncated |= following.truncated
-
-    starts = {_invocation(line) for line in rows if line.get("event") in START_EVENTS}
-    missing = {
-        invocation: date.fromisoformat(ts[:10]) - timedelta(days=1)
-        for line in rows
-        if anchor(line)
-        and (invocation := _invocation(line)) is not None
-        and invocation not in starts
-        and (ts := _timestamp(line))
-        and ts[:10] != "0001-01-01"
-    }
-    if missing:
-        # Reserve a bounded read near the end of the preceding day's files.
-        # Skip files already scanned by either phase.
-        previous = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
-        rows.extend(
-            previous.rows(
-                root,
-                days=set(missing.values()),
-                skip=scan.visited,
-                accept=lambda line: (
-                    line.get("event") in START_EVENTS and _invocation(line) in missing
-                ),
-            )
-        )
-        truncated |= previous.truncated
-    return sorted(rows, key=log.event_order), truncated, cutoff, frontier
-
-
-def _in_window(line: LogLine, cutoff: str | None) -> bool:
-    return cutoff is None or (ts := _id(line, "ts")) is not None and ts < cutoff
 
 
 NO_CALL_PARENT = "-"
@@ -380,37 +317,6 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     return log.clean(safe, tokens)
 
 
-def _limit(
-    report: LogLine,
-    entries: list[tuple[str, LogLine]],
-    scan_truncated: bool,
-    oldest_scanned: str | None,
-) -> LogLine:
-    page = _PageReport(report)
-    last_returned = None
-    output_limited = False
-    for field, line in reversed(entries):
-        if not page.add(field, line):
-            output_limited = True
-            break
-        if field != "unattributedGaps":
-            last_returned = _timestamp(line)
-    for field in {field for field, _line in entries}:
-        report[field].reverse()
-    if scan_truncated or output_limited:
-        report["truncated"] = True
-        next_before = (
-            (last_returned or oldest_scanned) if output_limited else oldest_scanned
-        )
-        if next_before:
-            report["nextBefore"] = next_before
-        report["more"] = (
-            "Use --before for earlier timestamps in the scan window. "
-            "To read past the scan limit, inspect files from sai logs path."
-        )
-    return report
-
-
 class _PageReport:
     def __init__(self, report: LogLine) -> None:
         self.report = report
@@ -472,41 +378,63 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    rows, scan_truncated, cutoff, frontier = _scan(
-        root, before, lambda row: _has_intent(row, key)
-    )
-    identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
-    anchors = [line for line in rows if _has_intent(line, key)]
-    scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
-    events: list[LogLine] = []
-    if scope is not None:
-        direct = [line for line in anchors if _scope(line) == scope]
-        invocations = {match for line in direct if (match := _invocation(line))}
-        conflicting = {
-            match
-            for line in anchors
-            if _scope(line) not in (None, scope)
-            and (match := _invocation(line)) in invocations
-        }
-        for line in rows:
-            if not _in_window(line, cutoff) or line.get("event") == "log.dropped":
-                continue
-            if _has_intent(line, key) and _scope(line) == scope:
-                events.append(line)
-                continue
-            match = _invocation(line)
-            if (
-                match in invocations
-                and match not in conflicting
-                and line.get("intentKey") in (None, key)
-                and _address(line) in (None, scope[0])
-                and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
-                and line.get("endpointId") in (None, scope[1])
-            ):
-                events.append(line)
-    else:
-        direct = []
+    cursor = _Cursor.parse(before)
+    last_day = cursor.position.day if cursor.position else cursor.last_day
+    log.flush(1.0)
+    anchors: list[LogLine] = []
 
+    def is_anchor(line: LogLine) -> bool:
+        return _has_intent(line, key) and _timestamp(line) is not None
+
+    # Already consumed rows can still scope an invocation on this page.
+    if cursor.position is not None and cursor.position.offsets is not None:
+        anchors.extend(_context(root, cursor.position, is_anchor))
+        # The previous page may have spent its scan budget on unrelated rows
+        # between a newer anchor and this boundary.
+        anchors.extend(_context(root, cursor.position, is_anchor, tail=True))
+    if last_day is not None and last_day < date.max:
+        following = log.ScanPosition(last_day + timedelta(days=1))
+        anchors.extend(_context(root, following, is_anchor))
+
+    def remember_filtered_anchor(line: LogLine) -> None:
+        if (
+            cursor.upper is not None
+            and _has_intent(line, key)
+            and (ts := _timestamp(line)) is not None
+            and ts >= cursor.upper
+        ):
+            anchors.append(line)
+
+    scan = log.PageScan(
+        max_bytes=log.MAX_SCAN_BYTES - 3 * CONTEXT_BYTES,
+        max_rows=log.MAX_SCAN_ROWS - 3 * CONTEXT_ROWS,
+        max_files=log.MAX_SCAN_FILES - 3 * CONTEXT_FILES,
+    )
+    rows = [
+        (position, ts, line)
+        for position, line in scan.rows(
+            root,
+            start=cursor.position,
+            last_day=cursor.last_day,
+            before=cursor.upper,
+            observe=remember_filtered_anchor if cursor.upper else None,
+        )
+        if (ts := _timestamp(line)) is not None
+    ]
+    anchors.extend(line for _, _, line in rows if _has_intent(line, key))
+    identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
+    scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
+    direct = sorted(
+        (line for line in anchors if scope is not None and _scope(line) == scope),
+        key=log.event_order,
+    )
+    invocations = {match for line in direct if (match := _invocation(line))}
+    conflicting = {
+        match
+        for line in anchors
+        if _scope(line) not in (None, scope)
+        and (match := _invocation(line)) in invocations
+    }
     report: LogLine = {
         "intentKey": key if scope else None,
         "events": [],
@@ -559,21 +487,41 @@ def intent(
     )
     report["txHash"] = keeper.request_hash(log.clean(request_hash))[0]
     matched_runs = {_id(line, "runId") for line in direct} - {None}
-    entries = [("events", line) for line in events]
-    unattributed = []
-    for line in rows:
-        if _in_window(line, cutoff) and line.get("event") == "log.dropped":
-            if _id(line, "runId") in matched_runs:
-                entries.append(("gaps", line))
-            else:
-                unattributed.append(line)
-    entries.sort(key=lambda entry: log.event_order(entry[1]))
+    page = _PageReport(report)
+    last = None
+    stop = None
+    unattributed = 0
+    for position, ts, line in rows:
+        if line.get("event") == "log.dropped":
+            field = "gaps" if _id(line, "runId") in matched_runs else "unattributedGaps"
+            if field == "unattributedGaps":
+                if unattributed >= 8:
+                    unattributed += 1
+                    continue
+                report.setdefault(field, [])
+        elif scope is not None and (
+            (_has_intent(line, key) and _scope(line) == scope)
+            or (
+                (match := _invocation(line)) in invocations
+                and match not in conflicting
+                and line.get("intentKey") in (None, key)
+                and _address(line) in (None, scope[0])
+                and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
+                and line.get("endpointId") in (None, scope[1])
+            )
+        ):
+            field = "events"
+        else:
+            continue
+        if not page.add(field, line):
+            stop = position
+            break
+        if field == "unattributedGaps":
+            unattributed += 1
+        last = ts
     if unattributed:
-        report["unattributedGapCount"] = len(unattributed)
-        report["unattributedGaps"] = []
-        entries = [("unattributedGaps", line) for line in unattributed[-8:]] + entries
-        scan_truncated |= len(unattributed) > 8
-    return _limit(report, entries, scan_truncated, frontier)
+        report["unattributedGapCount"] = unattributed
+    return page.finish(scan, cursor, last, stop)
 
 
 def run(
@@ -611,12 +559,9 @@ def run(
         and last_day is not None
         and last_day < date.max
     ):
-        context = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
-        for line in context.rows(
-            root,
-            days={last_day + timedelta(days=1)},
-            prefix=True,
-            accept=lambda line: _id(line, "callId") == identifier,
+        following = log.ScanPosition(last_day + timedelta(days=1))
+        for line in _context(
+            root, following, lambda row: _id(row, "callId") == identifier
         ):
             remember_call_run(line)
 
