@@ -681,12 +681,14 @@ Queries scan up to 128 files, 16 MiB, and 20,000 rows per call. Stats seek by UT
 and skip out-of-window rows before charging the row budget. The scan
 alternates surfaces within a day. Intent reports reserve part of the scan
 budget for finding command starts and anchors across midnight. A report contains
-up to 128 event or gap rows and uses a 96 KiB response budget. When
-`truncated` is true, pass the report's `nextBefore` to `--before`. For
-`logs run` and `logs stats` this is a cursor. For `logs intent` and the
-MCP tool `logs_intent`, it is an exclusive UTC timestamp. Inspect the files
-listed by `sai --json logs path` for older intent events or more events
-that share the cutoff timestamp.
+up to 128 event or gap rows and uses a 96 KiB response budget. When a report
+includes `nextBefore`, pass it to `--before` or the MCP `before` argument.
+For `logs run` and `logs stats`, the value is a cursor. For `logs intent`
+and the MCP tool `logs_intent`, it is an exclusive UTC timestamp. An intent
+report with `truncated: true` can omit `nextBefore` if the scan finds no
+usable cutoff. In that case, inspect the retained files listed by
+`sai --json logs path`. Use those files for events that share the cutoff
+timestamp, too.
 
 Use `sai --json logs ...` for machine-readable output. The `intent` and
 `run` reports return arrays `events` and `gaps`. The intent report also
