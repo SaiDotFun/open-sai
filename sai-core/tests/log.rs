@@ -33,6 +33,52 @@ fn finish(writer: LogWriter) {
 }
 
 #[test]
+fn keeper_identity_reuses_the_python_log_key_and_omits_private_url_parts() {
+    let home = tempdir().unwrap();
+    let directory = home.path().join("logs");
+    fs::create_dir(&directory).unwrap();
+    let key = directory.join(".endpoint-key");
+    let bytes: Vec<u8> = (0..32).collect();
+    fs::write(&key, &bytes).unwrap();
+    fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
+    let logger = writer(home.path()).with_v2_command();
+    for url in [
+        "https://EXAMPLE.com:443/query?route=first#fragment",
+        "https://example.com:443/query?route=first",
+        "https://example.com:443/query?route=second",
+    ] {
+        logger.event(
+            Surface::Cli,
+            "keeper.request",
+            Level::Info,
+            [
+                ("endpoint", Field::Endpoint(url.into())),
+                ("endpointId", Field::endpoint_identity(url)),
+            ],
+        );
+    }
+    finish(logger);
+
+    let events = read(home.path(), "cli");
+    let first = &events[0];
+    assert_eq!(first["schema"], 2);
+    assert_eq!(first["endpoint"], "https://example.com:443");
+    assert_eq!(
+        first["endpointId"],
+        "h1_072362528695781ee0c33c42695e396186efbd794aa2a4a8ac77b28f51b790a3"
+    );
+    assert_eq!(first["endpointId"], events[1]["endpointId"]);
+    assert_ne!(first["endpointId"], events[2]["endpointId"]);
+    assert_eq!(first["commandId"].as_str().unwrap().len(), 32);
+    assert!(
+        events
+            .iter()
+            .all(|row| row["commandId"] == first["commandId"])
+    );
+    assert_eq!(fs::read(key).unwrap(), bytes);
+}
+
+#[test]
 fn redaction_applies_to_nested_text_url_origins_arguments_and_untrusted_errors() {
     let home = tempdir().unwrap();
     let opaque = "opaque-synthetic-token-for-rust-log-tests";

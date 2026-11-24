@@ -31,7 +31,7 @@ _SUBMISSION_TRACE: ContextVar[SubmissionTrace | None] = ContextVar(
 
 @contextmanager
 def track_submission() -> Generator[SubmissionTrace]:
-    """Keep the generated intent key available for the caller's recovery."""
+    """Keep the reserved intent key available for the caller's recovery."""
     trace = SubmissionTrace()
     token = _SUBMISSION_TRACE.set(trace)
     try:
@@ -196,6 +196,24 @@ def _record_submission_status(
     return None
 
 
+def _recover_reservation(
+    key: str, endpoint: str, account: str, cause: Exception | KeyboardInterrupt
+) -> storage.IntentReservationError:
+    """Release a reservation from an attempt that stopped before transport."""
+    try:
+        record = storage.intent_record(endpoint, key)
+        if record is not None and record[0] == account.lower():
+            storage.set_status(key, endpoint, account, "not_sent")
+    except (sqlite3.Error, OSError, ValueError, KeyboardInterrupt):
+        return storage.IntentReservationError(
+            cause,
+            intent_key=key,
+            hint=storage.intent_status_hint(endpoint, account, key),
+            account=account,
+        )
+    return storage.IntentReservationError(cause)
+
+
 def submit(
     endpoint: str,
     session: dict[str, str],
@@ -211,8 +229,6 @@ def submit(
         + f"{instant.microsecond // 1000:03d}Z_"
         + "".join(choice("0123456789ABCDEFGHJKMNPQRSTVWXYZ") for _ in range(16))
     )
-    if trace is not None:
-        trace.identity = (endpoint, account, key)
     stamp = now()
     envelope = {
         "intentKey": key,
@@ -223,18 +239,34 @@ def submit(
             "tsLifecycleStep": stamp,
         },
     }
-    storage.pending(
-        key,
-        endpoint,
-        account,
-        intent["kind"],
-        intent.get("target", {}).get("userTradeId", ""),
-        allow_concurrent_open=allow_concurrent_open,
-    )
+    attempt = keeper.RequestAttempt()
     try:
-        data = keeper.request(
-            endpoint, keeper.SUBMIT, {"input": envelope}, session["token"]
-        )
+        try:
+            storage.pending(
+                key,
+                endpoint,
+                account,
+                intent["kind"],
+                intent.get("target", {}).get("userTradeId", ""),
+                allow_concurrent_open=allow_concurrent_open,
+            )
+            if trace is not None:
+                trace.identity = (endpoint, account, key)
+            data = keeper.request(
+                endpoint,
+                keeper.SUBMIT,
+                {"input": envelope},
+                session["token"],
+                attempt=attempt,
+            )
+        except (Exception, KeyboardInterrupt) as exc:
+            if attempt.transport_started or isinstance(
+                exc, (storage.IntentReservationError, storage.UnresolvedIntent)
+            ):
+                raise
+            if trace is not None:
+                trace.identity = None
+            raise _recover_reservation(key, endpoint, account, exc) from exc
         ack = data["recordUserIntent"]
         if (
             ack["intentKey"] != key
