@@ -12,7 +12,7 @@ use sai_core::{
     trade::{self, OpenTrade, SubmitOptions, TradePreview, Trading, close_preview},
     wait,
 };
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use crate::{load_settings, local};
 
@@ -193,7 +193,7 @@ pub fn run(
                 true,
             ))
         };
-        let (mut receipt, reference_price, recovered) = runtime.block_on(async {
+        let (mut receipt, metadata, recovered) = runtime.block_on(async {
             let waited = async {
                 let submission = trading
                     .submit_with_reference_price(
@@ -203,8 +203,17 @@ pub fn run(
                         std::future::pending(),
                     )
                     .await;
-                let (key, price) = match submission {
-                    Ok((accepted, price)) => (accepted.intent_key, price),
+                let (key, metadata) = match submission {
+                    Ok((accepted, price)) => {
+                        let mut metadata = Map::from_iter([
+                            ("intentKey".into(), json!(accepted.intent_key)),
+                            ("status".into(), json!(accepted.status)),
+                        ]);
+                        if let Some(price) = price {
+                            metadata.insert("referencePrice".into(), json!(price));
+                        }
+                        (accepted.intent_key, Some(metadata))
+                    }
                     Err(error) if error.code == Code::AdmissionRejected => {
                         let Some(key) = reservation.get() else {
                             return Err(error);
@@ -230,7 +239,7 @@ pub fn run(
                     events,
                 )
                 .await?;
-                Ok((receipt, price, false))
+                Ok((receipt, metadata, false))
             };
             tokio::select! {
                 biased;
@@ -240,11 +249,15 @@ pub fn run(
                 result = waited => result.or_else(|error| recover(false, error)),
             }
         })?;
+        if let Some(mut metadata) = metadata {
+            let Value::Object(body) = receipt.body else {
+                return Err(SaiError::internal());
+            };
+            metadata.extend(body);
+            receipt.body = Value::Object(metadata);
+        }
         if !recovered {
             receipt.body["status"] = json!(receipt.outcome);
-        }
-        if let Some(price) = reference_price {
-            receipt.body["referencePrice"] = json!(price);
         }
         return local::emit_wait(receipt, endpoint, env, json, recovered);
     }

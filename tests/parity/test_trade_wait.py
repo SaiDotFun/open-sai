@@ -321,7 +321,12 @@ def test_trade_wait(
                     submission = item["variables"]["input"]
                     stamp = submission["intent"].pop("tsIntentInit")
                     assert submission["lifecycle"].pop("tsLifecycleStep") == stamp
-            documents.append(normalized([document, wire, ledger], key))
+            documents.append(
+                (
+                    result.stdout.replace(key.encode(), b"<intent>"),
+                    normalized([wire, ledger], key),
+                )
+            )
     assert documents[0] == documents[1]
 
 

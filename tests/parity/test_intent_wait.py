@@ -388,7 +388,7 @@ def test_intent_wait(
                     "oraclePrice": "81000.50",
                     "escrowedCollateralBaseUnits": 4_000_000,
                 }
-            observed.append((document, wire, ledger))
+            observed.append((result.stdout, wire, ledger))
     assert observed[0] == observed[1]
 
 
