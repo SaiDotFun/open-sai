@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
@@ -28,22 +29,33 @@ def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
         raise ValueError("Unable to read contract state") from exc
 
 
-def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
+def smart_value(lcd: str, contract: str, message: dict[str, Any]) -> Any:
+    """Read a CosmWasm smart query, including scalar and array responses."""
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
-    data = _get_json(
+    return _get_json(
         f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
     ).get("data")
+
+
+def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
+    data = smart_value(lcd, contract, message)
     if not isinstance(data, dict):
         raise TypeError("Contract returned invalid state")
     return data
 
 
-def snapshot(
-    endpoint: str, lcd: str, addr: str, trade_id: int
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+@dataclass(frozen=True)
+class PositionSnapshot:
+    raw: dict[str, Any]
+    funds: dict[str, Any]
+    market: dict[str, Any]
+    contract: str
+
+
+def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
     node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
     if (
@@ -97,7 +109,7 @@ def snapshot(
         raise ValueError(
             "Indexed position differs from contract state; wait for synchronization and retry"
         )
-    return raw, funds, market
+    return PositionSnapshot(raw, funds, market, contract)
 
 
 def margin_quote(

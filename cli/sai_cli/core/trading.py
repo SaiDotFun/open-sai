@@ -1,11 +1,8 @@
 """Trading actions that preview or submit one intent.
 
-Each action builds its intent once. With `dry_run`, it returns that intent as
-a preview; otherwise it submits the same intent, so a preview is exactly what
-would be submitted. A `before_submit` check sees the preview of the exact
-intent object about to be submitted and can refuse it by raising. Actions take a session loader and call it only when they
-need the session, so validation errors come first and a dry run that needs no
-account never reads the stored session.
+With `dry_run`, an action returns the intent it would submit. The
+`before_submit` check receives the final preview and may refuse submission.
+Actions take a session loader and call it only when they need the session.
 """
 
 from __future__ import annotations
@@ -14,7 +11,7 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
-from . import intents, keeper, margin
+from . import intents, keeper, margin, partial
 
 SessionLoader = Callable[[], dict[str, str]]
 Notify = Callable[[str], None]
@@ -29,6 +26,14 @@ MARGIN_WARNING = (
 MARKET_PRICE_NOTICE = (
     "Market orders use the refreshed Keeper price; --price is a dry-run reference."
 )
+
+
+class PositionChanged(ValueError):
+    """A live recheck found a different position quote."""
+
+    def __init__(self, message: str, preview: dict[str, Any], addr: str) -> None:
+        super().__init__(message)
+        self.preview = {**preview, "addr": addr}
 
 
 def _ignore(_message: str) -> None:
@@ -192,34 +197,32 @@ def change_margin(
     must match the first, or the change is refused for review.
     """
     active = get_session()
-    raw, funds, market = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
-    )
-    quoted = margin.margin_quote(raw, funds, market, direction, amount)
-    payload = intents.leverage_intent(trade_id, quoted["requestedLeverage"])
-    preview = {
-        "dryRun": True,
-        "quote": quoted,
-        "intent": payload,
-        "warning": MARGIN_WARNING,
-    }
+
+    def build_preview() -> dict[str, Any]:
+        state = margin.snapshot(endpoint, lcd_endpoint, active["evmAddress"], trade_id)
+        quote = margin.margin_quote(
+            state.raw, state.funds, state.market, direction, amount
+        )
+        return {
+            "dryRun": True,
+            "quote": quote,
+            "intent": intents.leverage_intent(trade_id, quote["requestedLeverage"]),
+            "warning": MARGIN_WARNING,
+        }
+
+    preview = build_preview()
     if dry_run:
         return preview
-    fresh_raw, fresh_funds, fresh_market = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
-    )
-    fresh_quote = margin.margin_quote(
-        fresh_raw, fresh_funds, fresh_market, direction, amount
-    )
-    if (
-        fresh_raw["collateral_amount"] != raw["collateral_amount"]
-        or fresh_raw["leverage"] != raw["leverage"]
-        or fresh_quote != quoted
-    ):
-        raise ValueError("Position changed; review the margin change again")
-    before_submit(preview)
-    result = intents.submit(endpoint, active, payload)
-    result["quote"] = quoted
+    fresh = build_preview()
+    if fresh != preview:
+        raise PositionChanged(
+            "Position changed; review the margin change again",
+            fresh,
+            active["evmAddress"],
+        )
+    before_submit(fresh)
+    result = intents.submit(endpoint, active, fresh["intent"])
+    result["quote"] = fresh["quote"]
     result["warning"] = MARGIN_WARNING
     return result
 
@@ -240,49 +243,47 @@ def partial_close(
     minimum position size, and re-checked before submitting.
     """
     active = get_session()
-    # The snapshot refuses when Keeper's index differs from the contract,
-    # so the reduction is never sized from a lagging collateral amount.
-    raw, _, borrowing = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
-    )
-    market_id = borrowing["marketId"]
-    markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
-    candidates = [
-        item
-        for item in markets
-        if item["marketId"] == market_id and item["collateralToken"]["symbol"] == "USDC"
-    ]
-    if len(candidates) != 1 or not candidates[0]["isOpen"]:
-        raise ValueError("Open market data not available")
-    position = {
-        "id": trade_id,
-        "collateralAmount": raw["collateral_amount"],
-        "leverage": raw["leverage"],
-    }
-    payload = intents.partial_intent(
-        position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
-    )
-    leverage = str(raw["leverage"])
-    reduction_usd = Decimal(payload["body"]["collateral"]["amountUsd"])
-    preview = {
-        "dryRun": True,
-        "intent": payload,
-        "quote": {
-            "percent": percent,
-            "collateralBefore": str(raw["collateral_amount"]),
-            "leverageBefore": leverage,
-            "closedNotionalUsd": format(reduction_usd * Decimal(leverage), "f"),
-        },
-    }
+
+    def build_preview() -> dict[str, Any]:
+        state = margin.snapshot(endpoint, lcd_endpoint, active["evmAddress"], trade_id)
+        raw = state.raw
+        market_id = state.market["marketId"]
+        markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
+        candidates = [
+            item
+            for item in markets
+            if item["marketId"] == market_id
+            and item["collateralToken"]["symbol"] == "USDC"
+        ]
+        if len(candidates) != 1 or not candidates[0]["isOpen"]:
+            raise ValueError("Open market data not available")
+        position = {
+            "id": trade_id,
+            "collateralAmount": raw["collateral_amount"],
+            "leverage": raw["leverage"],
+        }
+        payload = intents.partial_intent(
+            position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
+        )
+        delta = int(payload["body"]["collateral"]["amountUsdc"])
+        return {
+            "dryRun": True,
+            "intent": payload,
+            "quote": {
+                "percent": percent,
+                "collateralBefore": str(raw["collateral_amount"]),
+                "leverageBefore": str(raw["leverage"]),
+                **partial.notional_quote(lcd_endpoint, state, trade_id, delta),
+            },
+        }
+
+    preview = build_preview()
     if dry_run:
         return preview
-    latest, _, _ = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
-    )
-    if (
-        latest["collateral_amount"] != raw["collateral_amount"]
-        or latest["leverage"] != raw["leverage"]
-    ):
-        raise ValueError("Position changed; review the reduction again")
-    before_submit(preview)
-    return intents.submit(endpoint, active, payload)
+    fresh = build_preview()
+    if fresh != preview:
+        raise PositionChanged(
+            "Position changed; review the reduction again", fresh, active["evmAddress"]
+        )
+    before_submit(fresh)
+    return intents.submit(endpoint, active, fresh["intent"])

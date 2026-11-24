@@ -553,17 +553,15 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
         "smart",
         lambda lcd, contract, message: raw if "get_trade_raw" in message else funds,
     )
-    snapshot, available, market = margin.snapshot(
-        keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7
-    )
-    assert snapshot == raw
-    assert available == funds
-    assert market["marketId"] == 0
+    snapshot = margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7)
+    assert snapshot.raw == raw
+    assert snapshot.funds == funds
+    assert snapshot.market["marketId"] == 0
     # The contract decimal may have more precision than the indexed Float.
     # Matching their binary64 representations must not reject this snapshot.
     raw["leverage"] = "10.00000000000000001"
     assert (
-        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7)[0]
+        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7).raw
         == raw
     )
     raw["leverage"] = "10"
@@ -589,7 +587,11 @@ def test_margin_dry_run_and_recheck(session, monkeypatch):
     funds = {"available_to_trade": "20000000"}
     market = {"minLeverage": 1, "maxLeverage": 100}
     monkeypatch.setattr("sai_cli.sai_cli.session", lambda ctx: session)
-    monkeypatch.setattr(margin, "snapshot", lambda *args: (raw, funds, market))
+    monkeypatch.setattr(
+        margin,
+        "snapshot",
+        lambda *args: margin.PositionSnapshot(raw, funds, market, "test-contract"),
+    )
     result = CliRunner().invoke(
         main,
         [
@@ -611,15 +613,17 @@ def test_margin_dry_run_and_recheck(session, monkeypatch):
 def test_margin_refuses_changed_position(session, monkeypatch):
     items = iter(
         [
-            (
+            margin.PositionSnapshot(
                 {"collateral_amount": "10000000", "leverage": "10"},
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
+                "test-contract",
             ),
-            (
+            margin.PositionSnapshot(
                 {"collateral_amount": "11000000", "leverage": "10"},
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
+                "test-contract",
             ),
         ]
     )

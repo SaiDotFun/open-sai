@@ -526,14 +526,25 @@ def markets(price: float = 100.5) -> dict[str, Any]:
 def snapshots(monkeypatch, *collaterals: str) -> None:
     """Make margin.snapshot return one position state per call, in order."""
     states = iter(
-        (
-            {"collateral_amount": amount, "leverage": "2"},
+        margin.PositionSnapshot(
+            {
+                "collateral_amount": amount,
+                "leverage": "2",
+                "market_index": "MarketIndex(0)",
+                "collateral_index": "TokenIndex(1)",
+            },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
+            "test-contract",
         )
         for amount in collaterals
     )
     monkeypatch.setattr(margin, "snapshot", lambda *args: next(states))
+    monkeypatch.setattr(
+        margin,
+        "smart_value",
+        lambda lcd, contract, query: "1" if "get_collateral_price" in query else False,
+    )
 
 
 def confirm(

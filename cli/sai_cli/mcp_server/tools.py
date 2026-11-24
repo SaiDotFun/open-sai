@@ -144,6 +144,8 @@ def describe(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(str(exc), exc.code, **extra, **exc.extra)
+    if isinstance(exc, trading.PositionChanged):
+        return error(MISMATCH, "PREVIEW_MISMATCH", preview=with_digest(exc.preview))
     if isinstance(exc, SessionUnavailable):
         return error(str(exc), exc.code)
     if isinstance(exc, stream.StreamError):

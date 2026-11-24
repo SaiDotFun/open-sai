@@ -577,8 +577,9 @@ async def preview_partial_close(
 
     Sizes the reduction from contract state, checks the market minimum, and
     quotes the closed notional. Needs a signed-in session to read the
-    position. Show the user the closed notional and collateral reduction.
-    trade_partial_close needs the previewDigest they confirm.
+    position. Show the user the quoted notional and collateral reduction.
+    When quote.closedNotionalIsEstimate is true, say that the notional is
+    an estimate. trade_partial_close needs the previewDigest they confirm.
 
     Args:
         trade_id: Trade id from account_positions.

@@ -168,8 +168,8 @@ longer matches:
 - `trade_margin` also binds the margin quote, including the position's
   starting collateral and leverage.
 - `trade_partial_close` also binds the close percentage, starting collateral
-  and leverage, and quoted closed notional. A leverage-only change requires
-  a new confirmation even when the collateral reduction is the same.
+  and leverage, and the contract inputs used to quote the requested slice,
+  including the applicable after-hours cap and collateral/USD oracle price.
 - `trade_open` for a market order: also the market price, which may move at
   most the slippage from the confirmed `referencePrice`. A new price needs a
   new confirmation.
