@@ -975,6 +975,31 @@ def install_native(args: argparse.Namespace) -> int:
                 ) from error
             pending.unlink()
             sync_dir(root)
+            if old is not None:
+                # Doctor's MCP checks use HOME and the caller's working directory.
+                # Keep its profile checks in the same disposable home as smoke.
+                try:
+                    repair = subprocess.run(
+                        [launcher, "doctor", "--offline"],
+                        env={
+                            **os.environ,
+                            "SAI_HOME": profile,
+                            "SAI_LOG": "false",
+                            "CI": "1",
+                        },
+                        stdin=subprocess.DEVNULL,
+                        capture_output=True,
+                        timeout=VERIFY_TIMEOUT,
+                        check=False,
+                    )
+                    repaired = repair.returncode == 0
+                except (OSError, subprocess.TimeoutExpired):
+                    repaired = False
+                if not repaired:
+                    print(
+                        "Could not finish MCP registration repair. Run `sai doctor`.",
+                        file=sys.stderr,
+                    )
     print(f"Installed sai {version} at {launcher}.")
     return 0
 

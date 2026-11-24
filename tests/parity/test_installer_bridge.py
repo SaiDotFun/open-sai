@@ -521,6 +521,31 @@ runpy.run_path(script, run_name='__main__')
     assert not pending(install).exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_reinstall_repairs_cursor(install: Install, replay: Replay) -> None:
+    native_artifact(replay)
+    result = install.install(replay, "--native")
+    pre_mcp_xfail(result)
+    ok(result)
+    cursor = install.home / ".cursor" / "mcp.json"
+    cursor.parent.mkdir()
+    other = {"url": f"{replay.base}/service"}
+    servers = {
+        "sai": {"command": OLD_MCP_COMMAND, "env": {"SAI_HOME": str(install.profile)}},
+        "other": other,
+    }
+    cursor.write_text(json.dumps({"mcpServers": servers}))
+    ok(install.install(replay, "--native"))
+    repaired = json.loads(cursor.read_text())["mcpServers"]
+    assert repaired["sai"] == {
+        "command": str(install.launcher),
+        "args": ["mcp", "serve"],
+        "env": {"SAI_HOME": str(install.profile)},
+    }
+    assert repaired["other"] == other
+    assert not install.profile.exists()
+
+
 def add_shim(replay: Replay, wheel: Path, binary: Path | None = None) -> str:
     version = wheel_version(wheel)
     files = {wheel.name: wheel.read_bytes()}
