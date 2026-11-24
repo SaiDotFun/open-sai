@@ -774,8 +774,8 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price", "get_trade_raw", "get_perp_prices", "get_liquidation_price",
-    "is_after_hours_market", "get_market", "get_fees",
+    # The fixture has no oracle publication time, so the estimate stops here.
+    "get_collateral_price", "get_trade_raw", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
