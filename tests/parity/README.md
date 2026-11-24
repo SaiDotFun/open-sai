@@ -77,7 +77,8 @@ by an exit before submission.
 ## Comparison Rules
 
 The runner compares exit codes, stderr categories, and stdout. JSON and JSONL
-object keys may appear in any order. Array entries and JSONL events retain
+object keys may appear in any order. Market, account, and watch cases also
+compare stdout and stderr byte for byte. Array entries and JSONL events retain
 their order. For the concurrent-close case, each process's events retain
 their own order, and the two streams are matched by the process outcome.
 For MCP, replies are matched by request ID and entries in `tools/list` by

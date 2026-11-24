@@ -94,6 +94,7 @@ class Observation:
     output: Any
     stderr: tuple[str, ...]
     files: dict[str, Entry]
+    raw: tuple[bytes, bytes] | None = None
 
 
 def invoke(
@@ -108,13 +109,14 @@ def invoke(
         env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
-        encoding="utf-8",
         timeout=20,
         umask=0o022,
         check=False,
     )
     check_sandbox_exit(result.returncode)
-    return result
+    return subprocess.CompletedProcess(
+        result.args, result.returncode, result.stdout.decode(), result.stderr.decode()
+    )
 
 
 def check_sandbox_exit(exit_code: int) -> None:
@@ -359,7 +361,9 @@ def observe(
         stderr += tuple(
             f"contender {category}" for category in stderr_category(contender.stderr)
         )
-    return Observation(result.returncode, output, stderr, files)
+    exact = case.command.split()[0] in {"market", "account", "watch"}
+    raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
+    return Observation(result.returncode, output, stderr, files, raw)
 
 
 def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
@@ -388,6 +392,12 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
         diffs.append(f"stderr {a} to {b}")
     if found := first_difference(reference.output, candidate.output, "stdout"):
         diffs.append(found)
+    if reference.raw is not None and candidate.raw is not None:
+        for stream, expected, actual in zip(
+            ("stdout", "stderr"), reference.raw, candidate.raw, strict=True
+        ):
+            if expected != actual:
+                diffs.append(f"{stream} bytes differ")
     missing = sorted(reference.files.keys() - candidate.files.keys())
     extra = sorted(candidate.files.keys() - reference.files.keys())
     diffs.extend(f"missing {name}" for name in missing)
