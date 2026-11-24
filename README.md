@@ -10,20 +10,26 @@ and trading intents. It uses Sai Keeper's mainnet endpoint by default. Fund the
 Sai account through Sai Web before trading; depositing and bridging funds are
 outside the CLI.
 
-Install [uv](https://docs.astral.sh/uv/), then install the newest release of
-`sai` on your `PATH`:
+On Linux or macOS (x86-64 and ARM64), use Python 3.10 or later to run the
+standalone installer. It verifies the release archive against `SHA256SUMS`,
+checks that Sai and its MCP server start, and installs the launcher at
+`~/.local/bin/sai`. Add `~/.local/bin` to your `PATH` to run the command. The
+installed binary runs on its own. Until a native release is available, use the
+pinned Python installer below.
 
 ```bash
-uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py
+curl -fsSL https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py | python3 - --native
 sai --help
 ```
 
-The [install script](scripts/install.py) finds the newest `sai-cli` release,
-downloads its wheel, checks it against the release's `SHA256SUMS`, and runs
-`uv tool install` on that file. It keeps the wheel in a cache only you can
-write to, and does not defend against other local users who can write to the
-directories above `~/.sai`. Until the first release is published, the script says so and
-installs from `main`.
+If you installed Sai with [uv](https://docs.astral.sh/uv/), run `sai update`
+to switch to the native shim and keep your uv launcher. On Windows, stay on
+the full Python release `sai-cli==0.1.2` until native binaries are available.
+Use the pinned installer to get the verified Python wheel:
+
+```powershell
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version 0.1.2
+```
 
 To build from source instead, install from Git:
 
@@ -146,7 +152,7 @@ and keeps available data when another read fails. See the
 
 `sai mcp serve` runs an MCP server that gives agent clients such as Claude
 Code the same reads, previews, and trades as the CLI. Install `sai` on your
-`PATH` with `uv tool install` first, then register it:
+`PATH`, then register it:
 
 ```bash
 sai mcp install claude          # or codex, cursor, or several at once
