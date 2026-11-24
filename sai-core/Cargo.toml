@@ -8,4 +8,16 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+aes-gcm.workspace = true
+base64.workspace = true
+chrono.workspace = true
+regex.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
 toml_edit.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true

@@ -1,0 +1,221 @@
+use std::{
+    fs::{self, File},
+    io::{self, Write as _},
+    path::Path,
+    time::SystemTime,
+};
+
+use chrono::{DateTime, Datelike, NaiveDate, Utc};
+
+use super::Surface;
+
+const PRUNE_MARKER: &str = ".pruned";
+
+#[cfg(unix)]
+pub(super) struct LogDir(File);
+
+#[cfg(not(unix))]
+pub(super) struct LogDir(std::path::PathBuf);
+
+impl LogDir {
+    pub fn open(root: &Path) -> io::Result<Self> {
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        {
+            use rustix::{
+                fs::{Mode, OFlags, open},
+                process::geteuid,
+            };
+            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+            builder.mode(0o700);
+            builder.create(root)?;
+            let fd = open(
+                root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )?;
+            let dir = File::from(fd);
+            let info = dir.metadata()?;
+            if info.uid() != geteuid().as_raw() {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            restrict(&dir, &info)?;
+            Ok(Self(dir))
+        }
+        #[cfg(not(unix))]
+        {
+            builder.create(root)?;
+            if redirected(&fs::symlink_metadata(root)?) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            Ok(Self(root.into()))
+        }
+    }
+
+    #[cfg(unix)]
+    fn private_file(&self, name: &str, exclusive: bool) -> io::Result<File> {
+        use rustix::{
+            fs::{Mode, OFlags, openat},
+            process::geteuid,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        let mut flags = OFlags::WRONLY
+            | OFlags::APPEND
+            | OFlags::CREATE
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK;
+        flags.set(OFlags::EXCL, exclusive);
+        let file =
+            File::from(openat(&self.0, name, flags, Mode::RUSR | Mode::WUSR)?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.nlink() > 1
+            || metadata.uid() != geteuid().as_raw()
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        restrict(&file, &metadata)?;
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    fn private_file(&self, name: &str, exclusive: bool) -> io::Result<File> {
+        let target = self.0.join(name);
+        if let Ok(info) = fs::symlink_metadata(&target)
+            && (!info.is_file() || redirected(&info))
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        fs::OpenOptions::new()
+            .create(true)
+            .create_new(exclusive)
+            .append(true)
+            .open(target)
+    }
+
+    pub fn append(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        let mut file = self.private_file(name, false)?;
+        // One O_APPEND write keeps each JSONL record together across processes.
+        let written = file.write(data)?;
+        if written == data.len() {
+            Ok(())
+        } else {
+            Err(io::ErrorKind::WriteZero.into())
+        }
+    }
+
+    pub fn prune(&self, keep_days: u64, today: NaiveDate) -> io::Result<()> {
+        let (marker, created) = match self.private_file(PRUNE_MARKER, true) {
+            Ok(marker) => (marker, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                (self.private_file(PRUNE_MARKER, false)?, false)
+            }
+            Err(error) => return Err(error),
+        };
+        let Ok(()) = marker.try_lock() else {
+            return Ok(());
+        };
+        let modified =
+            DateTime::<Utc>::from(marker.metadata()?.modified()?).date_naive();
+        if !created && modified >= today {
+            return Ok(());
+        }
+        self.remove_expired(keep_days, today)?;
+        marker.set_modified(SystemTime::now())
+    }
+
+    #[cfg(unix)]
+    fn remove_expired(
+        &self,
+        keep_days: u64,
+        today: NaiveDate,
+    ) -> io::Result<()> {
+        use rustix::fs::{AtFlags, Dir, FileType, statat, unlinkat};
+
+        for entry in Dir::read_from(&self.0)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if name
+                .to_str()
+                .ok()
+                .is_some_and(|name| expired(name, keep_days, today))
+                && statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(
+                    |stat| {
+                        FileType::from_raw_mode(stat.st_mode)
+                            == FileType::RegularFile
+                    },
+                )
+            {
+                let _ = unlinkat(&self.0, name, AtFlags::empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    fn remove_expired(
+        &self,
+        keep_days: u64,
+        today: NaiveDate,
+    ) -> io::Result<()> {
+        for entry in fs::read_dir(&self.0)? {
+            let entry = entry?;
+            if entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| expired(name, keep_days, today))
+                && entry.file_type()?.is_file()
+            {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(unix)]
+fn restrict(file: &File, metadata: &fs::Metadata) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        file.set_permissions(fs::Permissions::from_mode(mode & 0o7700))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn redirected(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(any(unix, windows)))]
+fn redirected(metadata: &fs::Metadata) -> bool {
+    metadata.is_symlink()
+}
+
+fn expired(name: &str, keep_days: u64, today: NaiveDate) -> bool {
+    let Some((surface, date)) = name
+        .strip_suffix(".jsonl")
+        .and_then(|name| name.split_once('-'))
+    else {
+        return false;
+    };
+    if !Surface::ALL.iter().any(|valid| valid.as_str() == surface)
+        || date.len() != 10
+        || date.as_bytes()[4] != b'-'
+        || date.as_bytes()[7] != b'-'
+    {
+        return false;
+    }
+    NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|date| {
+        date.format("%Y-%m-%d").to_string().len() == 10
+            && date.year_ce().0
+            && (today - date).num_days()
+                >= i64::try_from(keep_days).unwrap_or(i64::MAX)
+    })
+}

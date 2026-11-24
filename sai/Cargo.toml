@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 clap.workspace = true
 sai-core = { path = "../sai-core" }
+serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
