@@ -259,6 +259,10 @@ def close_trade(
                 raise ValueError(
                     "Target is not an open pending order. Preview a market close for a filled position."
                 )
+            if not keeper.same_account(addr, trade.get("user")):
+                raise margin.PositionOwnerMismatch(
+                    "Contract pending order belongs to a different account"
+                )
 
         def cancel_estimate(_preview: dict[str, Any]) -> dict[str, Any]:
             reason = "A pending order can fill before cancellation executes. Perp may close a filled position at market."

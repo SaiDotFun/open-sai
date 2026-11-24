@@ -1321,6 +1321,33 @@ def test_cancel_checks_live_order_type_and_refuses_after_fill(position_service):
     asyncio.run(scenario())
 
 
+def test_cancel_refuses_another_accounts_pending_order(position_service):
+    position, base_url = position_service
+    position.trade_type = "limit"
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            args = {"trade_id": 7, "cancel_order": True}
+            preview = await call(client, "preview_close", args)
+            assert preview["addr"] == ADDR
+            position.contract_owner = OTHER_TRADER
+
+            refused_preview = await call(client, "preview_close", args)
+            refused_trade = await call(
+                client,
+                "trade_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused_preview == refused_trade == {
+                "code": "INVALID_REQUEST",
+                "error": "Contract pending order belongs to a different account",
+            }
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("cap", ["5", None])
 def test_position_mutations_show_no_zero_fee_without_an_inactive_guard(
     position_service, cap
