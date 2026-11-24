@@ -423,6 +423,32 @@ def intent_status_hint(endpoint: str, account: str, key: str) -> str:
     return keeper_command_hint(endpoint, "intent", "status", account, "--key", key)
 
 
+def _check_open_pending(
+    connection: sqlite3.Connection,
+    endpoint: str,
+    account: str,
+    allow_concurrent_open: bool,
+) -> None:
+    # Locally pending opens store 'unknown' in status for older readers.
+    opens = connection.execute(
+        "SELECT id FROM intents WHERE endpoint=? AND account=?"
+        " AND kind='OPEN_TRADE' AND (keeper_status='pending'"
+        " OR (NOT ? AND status IN ('unknown', 'accepted')))"
+        " ORDER BY rowid DESC",
+        (endpoint, account.lower(), allow_concurrent_open),
+    ).fetchall()
+    if opens:
+        raise RecentOpenPending([row[0] for row in opens], endpoint, account)
+
+
+def check_open_pending(
+    endpoint: str, account: str, *, allow_concurrent_open: bool
+) -> None:
+    """Refuse an already blocked open early. Reservation checks again."""
+    with contextlib.closing(db()) as connection:
+        _check_open_pending(connection, endpoint, account, allow_concurrent_open)
+
+
 def pending(
     key: str,
     endpoint: str,
@@ -437,16 +463,7 @@ def pending(
     with db() as connection:
         connection.execute("BEGIN IMMEDIATE")
         if opening:
-            # Known pending fills store 'unknown' in status for older readers.
-            opens = connection.execute(
-                "SELECT id FROM intents WHERE endpoint=? AND account=?"
-                " AND kind='OPEN_TRADE' AND (keeper_status='pending'"
-                " OR (NOT ? AND status IN ('unknown', 'accepted')))"
-                " ORDER BY rowid DESC",
-                (endpoint, account.lower(), concurrent_open),
-            ).fetchall()
-            if opens:
-                raise RecentOpenPending([row[0] for row in opens], endpoint, account)
+            _check_open_pending(connection, endpoint, account, concurrent_open)
         unresolved = connection.execute(
             "SELECT id FROM intents WHERE endpoint=? AND account=?"
             " AND ((status='unknown' AND (NOT ? OR kind<>'OPEN_TRADE'))"

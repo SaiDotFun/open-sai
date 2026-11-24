@@ -344,7 +344,6 @@ def test_unkeyed_cli_status_blocks_a_second_acknowledged_open(
         "reference_price": preview["referencePrice"],
     }
     for allow in (False, True):
-        replies.append(MARKET)
         result = call_mcp(mcp, "trade_open", {**args, "allow_concurrent_open": allow})
         assert result["code"] == "RECENT_OPEN_PENDING"
         assert result["intentKeys"] == [key]
@@ -379,14 +378,27 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     key = first["intentKey"]
     if retry == "mcp":
         mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
-        replies.extend((MARKET, MARKET))
+        replies.append(MARKET)
         preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
         args = {
             **OPEN_ARGS,
             "preview_digest": preview["previewDigest"],
             "reference_price": preview["referencePrice"],
         }
+        # Keeper now quotes 103, outside the 1% slippage of the confirmed 100.
+        moved = {
+            "data": {
+                "perp": {
+                    "borrowings": [
+                        {**MARKET["data"]["perp"]["borrowings"][0], "price": 103}
+                    ]
+                }
+            }
+        }
+        replies.append(moved)
         error = call_mcp(mcp, "trade_open", args)
+        assert error["code"] == "RECENT_OPEN_PENDING"
+        assert replies.pop() == moved
         assert error["intentKeys"] == [key]
         assert f"intent {key}" in error["error"]
         assert "intent_status" in error["error"]

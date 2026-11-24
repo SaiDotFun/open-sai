@@ -553,6 +553,12 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
+    if not dry_run:
+        storage.check_open_pending(
+            settings.endpoint,
+            load()["evmAddress"],
+            allow_concurrent_open=allow_concurrent_open,
+        )
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
