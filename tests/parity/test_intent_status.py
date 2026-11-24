@@ -184,8 +184,7 @@ def test_log_events_detect_wrong_fixture_intent_key(tmp_path: Path) -> None:
 
 def read_state(home: Path) -> tuple[Any, ...]:
     files = {
-        str(path.relative_to(home)): path.stat().st_mode
-        for path in home.rglob("*")
+        str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
     }
     db = home / "trader/intents.sqlite3"
     if not db.exists():
