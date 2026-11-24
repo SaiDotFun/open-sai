@@ -1160,12 +1160,13 @@ def test_json_report_shape_and_exit_code():
     error = json.loads(output)["error"]
     assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
     assert "expired" in error["message"]
-    assert "sai auth login NAME" in error["message"]
+    recovery = f"sai --endpoint {ENDPOINT} auth login NAME"
+    assert recovery in error["message"]
     details = error["details"]
     assert details["schemaVersion"] == 1 and details["overall"] == "fail"
     checks = {check["id"]: check for check in details["checks"]}
     assert checks["session"]["status"] == "fail"
-    assert "sai auth login NAME" in checks["session"]["fix"]
+    assert recovery in checks["session"]["fix"]
     assert checks["keeper"]["status"] == "skipped"
 
 
