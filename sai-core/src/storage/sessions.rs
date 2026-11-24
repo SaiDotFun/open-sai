@@ -90,6 +90,10 @@ impl Session {
             .filter(|name| !name.is_empty())
     }
 
+    pub fn has_named_signer(&self) -> bool {
+        self.key_name().is_some()
+    }
+
     pub fn is_imported(&self) -> bool {
         self.extra
             .get("source")

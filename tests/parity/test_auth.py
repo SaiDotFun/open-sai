@@ -549,6 +549,15 @@ def test_auth_expiry_notice_for_invalid_subject_matches_python(
             assert "renewalCommand" not in report
             assert result[2].splitlines() == [f"{warning} {guidance}"]
             reports.append(result)
+        doctor = env.run(
+            "--json", "--endpoint", endpoint, "doctor", "--offline", "--no-fix"
+        )
+        report = json.loads(doctor.stdout)
+        if "error" in report:
+            report = report["error"]["details"]
+        session = next(check for check in report["checks"] if check["id"] == "session")
+        assert session["summary"] == f"{warning} {guidance}"
+        assert session["fix"] is None
         save_expiry_fixture(
             env,
             monkeypatch,
