@@ -170,7 +170,11 @@ def _record_submission_status(
 
 
 def submit(
-    endpoint: str, session: dict[str, str], intent: dict[str, Any]
+    endpoint: str,
+    session: dict[str, str],
+    intent: dict[str, Any],
+    *,
+    allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
     instant = datetime.now(UTC)
     key = (
@@ -195,6 +199,7 @@ def submit(
         account,
         intent["kind"],
         intent.get("target", {}).get("userTradeId", ""),
+        allow_concurrent_open=allow_concurrent_open,
     )
     try:
         data = keeper.request(

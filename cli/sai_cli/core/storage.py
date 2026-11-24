@@ -38,6 +38,23 @@ class UnresolvedIntent(SaiError, ValueError):
     code = Code.INVALID_REQUEST
 
 
+class RecentOpenPending(UnresolvedIntent):
+    """An earlier open on the same account may still execute."""
+
+    code = Code.RECENT_OPEN_PENDING
+
+    def __init__(self, keys: list[str], endpoint: str, account: str) -> None:
+        key = keys[0]
+        hint = intent_status_hint(endpoint, account, key)
+        super().__init__(
+            f"Earlier open intent {key} may still execute."
+            f" Check its status with `{hint}` before retrying.",
+            intent_key=key,
+            hint=hint,
+        )
+        self.keys = keys
+
+
 def home() -> Path:
     return Path(os.environ.get("SAI_HOME", Path.home() / ".sai")) / "trader"
 
@@ -406,14 +423,53 @@ def intent_status_hint(endpoint: str, account: str, key: str) -> str:
     return keeper_command_hint(endpoint, "intent", "status", account, "--key", key)
 
 
-def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> None:
+def _check_open_pending(
+    connection: sqlite3.Connection,
+    endpoint: str,
+    account: str,
+    allow_concurrent_open: bool,
+) -> None:
+    # Locally pending opens store 'unknown' in status for older readers.
+    opens = connection.execute(
+        "SELECT id FROM intents WHERE endpoint=? AND account=?"
+        " AND kind='OPEN_TRADE' AND (keeper_status='pending'"
+        " OR (NOT ? AND status IN ('unknown', 'accepted')))"
+        " ORDER BY rowid DESC",
+        (endpoint, account.lower(), allow_concurrent_open),
+    ).fetchall()
+    if opens:
+        raise RecentOpenPending([row[0] for row in opens], endpoint, account)
+
+
+def check_open_pending(
+    endpoint: str, account: str, *, allow_concurrent_open: bool
+) -> None:
+    """Refuse an already blocked open early. Reservation checks again."""
+    with contextlib.closing(db()) as connection:
+        _check_open_pending(connection, endpoint, account, allow_concurrent_open)
+
+
+def pending(
+    key: str,
+    endpoint: str,
+    account: str,
+    kind: str,
+    entity: str,
+    *,
+    allow_concurrent_open: bool = False,
+) -> None:
+    opening = kind == "OPEN_TRADE"
+    concurrent_open = opening and allow_concurrent_open
     with db() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        if opening:
+            _check_open_pending(connection, endpoint, account, concurrent_open)
         unresolved = connection.execute(
             "SELECT id FROM intents WHERE endpoint=? AND account=?"
-            " AND (status='unknown' OR keeper_status='pending'"
+            " AND ((status='unknown' AND (NOT ? OR kind<>'OPEN_TRADE'))"
+            " OR keeper_status='pending'"
             " OR (status='accepted' AND entity <> '' AND entity=?)) LIMIT 1",
-            (endpoint, account.lower(), entity),
+            (endpoint, account.lower(), concurrent_open, entity),
         ).fetchone()
         if unresolved:
             blocked_key = unresolved[0]
