@@ -175,7 +175,7 @@ def test_template_lists_every_key_unset_and_explained():
 
 
 def test_set_and_unset_round_trip_from_no_file():
-    text, value = settings.set_value(None, "keeper.endpoint", " https://k.example/q ")
+    text, value = settings.set_value(None, "keeper.endpoint", "https://k.example/q")
     assert value == "https://k.example/q"
     assert tomllib.loads(text)["keeper"] == {"endpoint": "https://k.example/q"}
     # The key takes the place of its commented-out line.

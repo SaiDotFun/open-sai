@@ -143,12 +143,9 @@ def test_config_set_rejects_malformed_ipv6_authority(tmp_path, authority):
     assert not (tmp_path / ".config.lock").exists()
 
 
-@pytest.mark.parametrize("padding", ["", "\xa0"])
-def test_config_set_accepts_ipv6_with_port(padding):
+def test_config_set_accepts_ipv6_with_port():
     endpoint = "https://[::1]:8443/path"
-    result = sai(
-        "--json", "config", "set", "keeper.endpoint", f"{padding}{endpoint}{padding}"
-    )
+    result = sai("--json", "config", "set", "keeper.endpoint", endpoint)
     assert result.exit_code == 0
     assert json.loads(result.stdout)["value"] == endpoint
 
@@ -188,6 +185,38 @@ def test_watch_rejects_a_keeper_fragment_in_config(tmp_path):
     assert error["code"] == "INVALID_REQUEST"
     assert "keeper.endpoint" in error["message"] and "fragment" in error["message"]
     assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("key", "endpoint"),
+    [
+        ("keeper.ws_endpoint", "wss://keeper.example/graphql stream"),
+        ("keeper.ws_endpoint", "wss://keeper.example/graphql?name=one two"),
+        ("keeper.endpoint", " https://keeper.example/graphql"),
+        ("keeper.endpoint", "https://keeper.example/graphql "),
+        ("keeper.endpoint", "\xa0https://[::1]:8443/path\xa0"),
+        ("lcd.endpoint", "https://lcd.example/path\x80"),
+    ],
+)
+def test_config_set_rejects_raw_whitespace_and_controls_in_urls(
+    tmp_path, key, endpoint
+):
+    result = sai("--json", "config", "set", key, endpoint)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+def test_config_set_accepts_percent_encoded_websocket_request_target():
+    endpoint = "wss://keeper.example/graphql%20stream?name=one%20two"
+    result = sai("--json", "config", "set", "keeper.ws_endpoint", endpoint)
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["value"] == endpoint
 
 
 @pytest.mark.parametrize(

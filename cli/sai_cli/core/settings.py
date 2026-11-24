@@ -43,7 +43,7 @@ LENIENT_SECTIONS = frozenset({"logs"})
 _RANK = {"flag": 0, "env": 1, "file": 2, "default": 3}
 _TRUE = ("true", "1", "yes", "on")
 _FALSE = ("false", "0", "no", "off")
-_URL_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
+_URL_WHITESPACE_OR_CONTROL = re.compile(r"[\s\x00-\x1f\x7f-\x9f]")
 
 
 class SettingsError(ValueError):
@@ -217,10 +217,7 @@ def parse_value(key: str, raw: str) -> str | bool | int:
                 f"Invalid value {raw!r} for {key}: expected a whole number, 1 or more"
             )
         return check_value(key, int(text))
-    # Keep raw control characters that stripping surrounding whitespace removed.
-    if text != raw and _URL_CONTROL.search(raw):
-        text = raw
-    return check_value(key, text)
+    return check_value(key, raw)
 
 
 def check_value(key: str, value: Any) -> str | bool | int:
@@ -240,6 +237,10 @@ def check_value(key: str, value: Any) -> str | bool | int:
         raise InvalidEndpoint(f"Invalid value for {key}: expected a URL string")
     if spec.section == "keeper" and "#" in value:
         raise InvalidEndpoint(f"Invalid value for {key}: remove the URL fragment")
+    if _URL_WHITESPACE_OR_CONTROL.search(value):
+        raise InvalidEndpoint(
+            f"Invalid value for {key}: URL contains whitespace or control characters"
+        )
     try:
         parts = urlsplit(value)
         hostname = parts.hostname
@@ -255,21 +256,19 @@ def check_value(key: str, value: Any) -> str | bool | int:
                 or (suffix and not suffix.startswith(":"))
             ):
                 hostname = None
-        scheme, separator, rest = value.partition("://")
+        scheme, separator, _ = value.partition("://")
         if (
             separator
-            and scheme.lstrip().lower() == parts.scheme
+            and scheme.lower() == parts.scheme
             and parts.scheme in spec.schemes
             and hostname
-            and not _URL_CONTROL.search(value)
+            and "\\" not in parts.netloc
         ):
-            authority = re.split(r"[/#?]", rest, maxsplit=1)[0]
-            if not any(char.isspace() or char == "\\" for char in authority):
-                if parts.scheme in ("ws", "wss"):
-                    parse_uri(value)
-                    return value
-                if httpx.URL(value).is_absolute_url:
-                    return value
+            if parts.scheme in ("ws", "wss"):
+                parse_uri(value)
+                return value
+            if httpx.URL(value).is_absolute_url:
+                return value
     except (ValueError, httpx.InvalidURL, InvalidURI):
         pass
     raise InvalidEndpoint(
