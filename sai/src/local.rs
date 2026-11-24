@@ -181,8 +181,31 @@ pub fn intent(
     }
 }
 
-fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
     match event {
+        StorageEvent::IntentReserved {
+            key,
+            kind,
+            addr,
+            entity,
+            endpoint,
+        } => {
+            events.event(
+                "intent.reserved",
+                Level::Info,
+                [
+                    ("intentKey", json!(key).into()),
+                    ("kind", json!(kind).into()),
+                    ("status", json!("unknown").into()),
+                    ("addr", json!(addr).into()),
+                    (
+                        "tradeId",
+                        json!((!entity.is_empty()).then_some(entity)).into(),
+                    ),
+                    ("endpoint", Field::Endpoint(endpoint.into())),
+                ],
+            );
+        }
         StorageEvent::IntentStatus {
             key,
             kind,
@@ -253,7 +276,7 @@ impl Formatter for InlineJson {
     }
 }
 
-fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
+pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     let mut bytes = Vec::new();
     if json {
         value.serialize(&mut serde_json::Serializer::with_formatter(
