@@ -457,10 +457,11 @@ class ReplSkin:
 
     # ── Prompt toolkit session factory ────────────────────────────────
 
-    def create_prompt_session(self, **options):
+    def create_prompt_session(self, *, history_filter=None, **options):
         """Create a prompt_toolkit PromptSession with skin styling.
 
         Args:
+            history_filter: Optional predicate for automatic history entries.
             options: Extra PromptSession arguments, such as input and output.
 
         Returns:
@@ -477,8 +478,16 @@ class ReplSkin:
             history.touch(mode=0o600, exist_ok=True)
             history.chmod(0o600)
 
+            class FilteredHistory(FileHistory):
+                def append_string(self, string):
+                    if history_filter is None or history_filter(string):
+                        self.record(string)
+
+                def record(self, string):
+                    super().append_string(string)
+
             session = PromptSession(
-                history=FileHistory(self.history_file),
+                history=FilteredHistory(self.history_file),
                 auto_suggest=AutoSuggestFromHistory(),
                 style=style,
                 enable_history_search=True,
