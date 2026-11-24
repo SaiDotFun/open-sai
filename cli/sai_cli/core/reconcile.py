@@ -99,7 +99,7 @@ def _matches_account(row: Mapping[str, Any], account: str) -> bool:
     )
 
 
-def _hash(value: str | None) -> str:
+def _hash(value: object) -> str:
     return value.lower().removeprefix("0x") if isinstance(value, str) else ""
 
 
@@ -301,10 +301,10 @@ def poll_steps(
         log.event(
             "intent.keeper",
             intentKey=key,
-            lifecycleStep=None,
             found=False,
-            addr=addr,
+            addr=account,
             endpoint=log.endpoint(endpoint),
+            endpointId=log.endpoint_identity(endpoint),
         )
         with write():
             local = storage.mark_absent(
@@ -320,19 +320,22 @@ def poll_steps(
 
     row = matching[0]
     step = row.get("lifecycleStep")
+    tx_hash, invalid_hash = keeper.request_hash(row.get("txHash"))
+    error_code = keeper.intent_error_code(row)
     outcome = classify_outcome(row)
     log.event(
         "intent.keeper",
         intentKey=key,
-        kind=row.get("kind"),
-        lifecycleStep=step,
-        execActor=row.get("execActor"),
-        errorCode=row.get("errorCode"),
-        errorMsg=log.untrusted(row.get("errorMsg")),
-        txHash=row.get("txHash"),
-        addr=addr,
+        kind=keeper.known_text(row.get("kind"), keeper.INTENT_KINDS),
+        lifecycleStep=keeper.known_text(step, keeper.INTENT_STEPS),
+        execActor=keeper.known_text(row.get("execActor"), keeper.INTENT_ACTORS),
+        errorCode=error_code,
+        txHash=tx_hash,
+        txHashInvalid=invalid_hash,
+        addr=account,
         endpoint=log.endpoint(endpoint),
-        **({"code": Code.KEEPER_ERROR} if outcome == "terminal-failed" else {}),
+        endpointId=log.endpoint_identity(endpoint),
+        code=Code.KEEPER_ERROR if outcome == "terminal-failed" else None,
     )
     if outcome == "unknown":
         return data

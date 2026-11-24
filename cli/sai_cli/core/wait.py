@@ -141,14 +141,22 @@ async def for_intent_async(
         with storage.busy_timeout(0):
             yield
 
-    fields = {"intentKey": key, "addr": addr, "endpoint": log.endpoint(endpoint)}
+    endpoint_label = log.endpoint(endpoint)
+    endpoint_id = log.endpoint_identity(endpoint)
     outcome: Outcome = "unknown"
     request_tx_hash: str | None = None
     request_block: int | None = None
     row: dict[str, Any] = {}
     history: list[dict[str, Any]] = []
     delay = INITIAL_DELAY
-    log.event("intent.wait.start", **fields, timeoutSeconds=timeout)
+    log.event(
+        "intent.wait.start",
+        intentKey=key,
+        addr=addr,
+        endpoint=endpoint_label,
+        endpointId=endpoint_id,
+        timeoutMs=round(timeout * 1000),
+    )
     try:
         try:
             await asyncio.sleep(0)
@@ -217,8 +225,11 @@ async def for_intent_async(
     finally:
         log.event(
             "intent.wait.end",
-            **fields,
-            outcome=outcome,
+            intentKey=key,
+            addr=addr,
+            endpoint=endpoint_label,
+            endpointId=endpoint_id,
+            status=outcome,
             code=OUTCOME_CODES.get(outcome),
             durationMs=round((clock.now() - started) * 1000),
         )

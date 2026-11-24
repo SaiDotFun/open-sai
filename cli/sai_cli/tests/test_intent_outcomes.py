@@ -867,7 +867,7 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert clock.delays == [0.25, 0.25, 0.5]
     assert status(endpoint) == "terminal"
     start, end = log.tail(2, name="intent.wait")
-    assert (start["event"], end["event"], end["outcome"]) == (
+    assert (start["event"], end["event"], end["status"]) == (
         "intent.wait.start",
         "intent.wait.end",
         "filled",
@@ -889,7 +889,7 @@ def test_wait_times_out_with_unknown_and_keeps_pending_ledger(keeper_replay):
     assert result["receipt"]["requestBlock"] == 50109595
     assert clock.delays == [0.25, 0.5]
     assert status(endpoint) == "pending"
-    assert log.tail(1, name="intent.wait.end")[0]["outcome"] == "unknown"
+    assert log.tail(1, name="intent.wait.end")[0]["status"] == "unknown"
 
 
 def test_intent_wait_cli_returns_confirmed_failure(keeper_replay):
@@ -931,8 +931,8 @@ def test_mcp_wait_caps_timeout_and_paginates_history(keeper_replay):
     assert result["outcome"] == "filled"
     assert result["receipt"]["execution"]["historyId"] == 1007
     assert (
-        log.tail(1, name="intent.wait.start")[0]["timeoutSeconds"]
-        == wait.MCP_MAX_TIMEOUT
+        log.tail(1, name="intent.wait.start")[0]["timeoutMs"]
+        == wait.MCP_MAX_TIMEOUT * 1000
     )
 
 

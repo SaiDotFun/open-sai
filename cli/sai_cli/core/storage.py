@@ -490,6 +490,7 @@ def pending(
         addr=account,
         tradeId=entity or None,
         endpoint=log.endpoint(endpoint),
+        endpointId=log.endpoint_identity(endpoint),
     )
 
 
@@ -571,7 +572,8 @@ def _log_status(
         status=status,
         addr=account,
         endpoint=log.endpoint(endpoint),
-        **({"code": code} if code is not None else {}),
+        endpointId=log.endpoint_identity(endpoint),
+        code=code,
     )
 
 
