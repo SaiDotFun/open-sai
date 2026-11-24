@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import gzip
 import hashlib
 import os
@@ -302,6 +303,11 @@ def repair_digest_mode(folder: Path) -> None:
         os.close(fd)
 
 
+def digest_directory_inaccessible(info: os.stat_result) -> bool:
+    required = stat.S_IRUSR | stat.S_IXUSR
+    return info.st_mode & required != required
+
+
 def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
     receipt = cache / "verified"
     try:
@@ -319,6 +325,8 @@ def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
         folder = cache / archive_digest
         info = folder.lstat()
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            return None
+        if digest_directory_inaccessible(info):
             return None
         if stat.S_IMODE(info.st_mode) != 0o700:
             repair_digest_mode(folder)
@@ -341,6 +349,11 @@ def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
                 file.close()
     except (FileNotFoundError, UnicodeError):
         pass
+    except OSError as exc:
+        # O_NOFOLLOW rejected a cache entry. A verified publish replaces
+        # the link itself without reading or writing its destination.
+        if exc.errno != errno.ELOOP:
+            raise
     return None
 
 
@@ -367,6 +380,17 @@ def install_binary(cache: Path, url: str, name: str, base: str) -> None:
             with (staged / "sai").open("wb") as file:
                 binary_digest = unpack(archive, file)
                 folder = cache / digest
+                with suppress(FileNotFoundError):
+                    info = folder.lstat()
+                    if (
+                        stat.S_ISDIR(info.st_mode)
+                        and info.st_uid == os.getuid()
+                        and digest_directory_inaccessible(info)
+                    ):
+                        # Keep the rename in the trusted, locked parent. A
+                        # cross-directory move can need write access to '..'.
+                        with tempfile.TemporaryDirectory(dir=cache) as discarded:
+                            folder.replace(discarded)
                 folder.mkdir(mode=0o700, exist_ok=True)
                 repair_digest_mode(folder)
                 binary = folder / "sai"

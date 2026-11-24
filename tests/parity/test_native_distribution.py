@@ -173,6 +173,47 @@ def test_shim_repairs_digest_directory_permissions_offline(
         assert stat.S_IMODE(binary.parent.stat().st_mode) == 0o700
 
 
+@pytest.mark.parametrize("damage", ["receipt-link", "executable-link", "mode-zero"])
+def test_shim_replaces_malformed_cache_entries(
+    distribution: SimpleNamespace, tmp_path: Path, damage: str
+) -> None:
+    d = distribution
+    d.replay.add_release(d.wheel, d.version, d.archive)
+    requests = [f"{d.release}/SHA256SUMS", f"{d.release}/{d.archive.name}"]
+    missing = tmp_path / "missing"
+    with (
+        d.rehearsal.keeper_server(d.replay.handler()) as base,
+        closing(socket.socket()) as proxy,
+    ):
+        offline_env(d, base, proxy)
+        run(d.tool, "Install the shim wheel", d.tool.uv, "tool", "install", d.wheel)
+        d.tool.verify_version(d.version)
+        assert d.replay.get_requests == requests
+        [binary] = list((d.tool.sai_home / "bin").rglob("sai"))
+        folder = binary.parent
+        receipt = folder.parent / "verified"
+        if damage == "mode-zero":
+            folder.chmod(0)
+        else:
+            entry = receipt if damage == "receipt-link" else binary
+            entry.unlink()
+            entry.symlink_to(missing)
+        try:
+            assert (
+                run(
+                    d.tool, "Replace the malformed cache entry", d.tool.sai, "--version"
+                )
+                == f"sai {d.version}\n"
+            )
+            assert d.replay.get_requests == requests * 2
+            assert stat.S_IMODE(folder.stat().st_mode) == 0o700
+            assert not binary.is_symlink() and not receipt.is_symlink()
+            assert not missing.exists()
+        finally:
+            if folder.is_dir():
+                folder.chmod(0o700)
+
+
 def test_distributable_wheel_ignores_loopback_release_override(
     distribution: SimpleNamespace,
 ) -> None:
