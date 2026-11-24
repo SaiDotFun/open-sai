@@ -1793,8 +1793,9 @@ def logs_intent(
 ) -> None:
     """Show an intent's CLI and MCP trail and its current Keeper record."""
     endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
+    account = addr if addr is not None else ctx.obj["as_addr"]
     report = log_queries.intent(
-        key, endpoint=endpoint, addr=addr, offline=offline, before=before
+        key, endpoint=endpoint, addr=account, offline=offline, before=before
     )
     print_log_trail(ctx, report)
     if ctx.obj["json"]:

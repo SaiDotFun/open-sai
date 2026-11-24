@@ -1758,6 +1758,26 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
     )
 
 
+def test_logs_intent_honors_root_account_selector(keeper_stub):
+    endpoint, state = keeper_stub
+    save_session(endpoint, OTHER)
+    save_session(endpoint, ADDR)
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {"intentKey": key, "evmAddress": OTHER, "lifecycleStep": "exec_req_pass"},
+        {"intentKey": key, "evmAddress": ADDR, "lifecycleStep": "exec_req_pass"},
+    ]
+    args = ("--json", "--endpoint", endpoint, "--as", OTHER, "logs", "intent", key)
+    for flags, account in (((), OTHER), (("--addr", ADDR), ADDR)):
+        code, output = run_cli(*args, *flags)
+        assert code == 0
+        report = json.loads(output)
+        assert report["events"] == []
+        assert report["keeper"]["evmAddress"] == account
+        assert state.requests[-1]["variables"] == {"user": account, "key": key}
+        assert state.authorizations[-1] is None
+
+
 def test_log_queries_report_process_gaps_and_order_legacy_events(home):
     path = log.file_path("mcp", log.now().date(), home / "logs")
     path.parent.mkdir()

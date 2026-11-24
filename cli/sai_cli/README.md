@@ -436,8 +436,9 @@ The `intent` command reads Keeper's current record and returns the request
 transaction hash when available. The configured Keeper endpoint selects the
 trail. The endpoint identity uses a local key to hash the full request URL,
 including its path and query. The printed `endpoint` field shows the origin.
-Use `--addr` to select an account
-or `--offline` to skip Keeper. If the local trail has several endpoint
+Use the root `--as` flag to select an account. The command's `--addr` flag
+takes precedence when both are present. Use `--offline` to skip Keeper.
+If the local trail has several endpoint
 identities, pass a root `--endpoint` flag to select one offline. The report
 warns when the scope is ambiguous or an older line lacks enough information
 to assign it. The read leaves the local intent ledger untouched.
