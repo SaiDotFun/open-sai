@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, fs, io, path::Path};
+use std::{collections::BTreeMap, fs, io, path::Path, time::Duration};
 
 use aes::Aes256;
 use aes_gcm::{
@@ -49,7 +49,7 @@ pub struct Session {
 pub struct SessionSummary<'a> {
     pub addr: &'a str,
     pub expires_at: &'a str,
-    pub endpoint: String,
+    pub endpoint: Option<String>,
 }
 
 impl Session {
@@ -83,15 +83,42 @@ impl Session {
         self.extra.get("endpoint").and_then(Value::as_str)
     }
 
-    pub fn summary(&self) -> Result<SessionSummary<'_>, StorageError> {
-        let endpoint = self
-            .endpoint()
-            .ok_or_else(|| SessionError::new("Stored session is missing its Keeper endpoint"))?;
-        Ok(SessionSummary {
+    pub fn key_name(&self) -> Option<&str> {
+        self.extra
+            .get("keyName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+    }
+
+    pub fn is_imported(&self) -> bool {
+        self.extra
+            .get("source")
+            .is_some_and(|source| source == "imported")
+    }
+
+    pub(crate) fn set_key_name(&mut self, name: &str) {
+        self.extra
+            .insert("keyName".into(), Value::String(name.into()));
+    }
+
+    pub(crate) fn mark_imported(&mut self) {
+        self.extra
+            .insert("source".into(), Value::String("imported".into()));
+    }
+
+    pub fn summary(&self) -> SessionSummary<'_> {
+        SessionSummary {
             addr: self.addr(),
             expires_at: self.expires_at(),
-            endpoint: endpoint_origin(endpoint),
-        })
+            endpoint: self.endpoint().map(endpoint_origin),
+        }
+    }
+
+    fn same_as(&self, previous: &Self) -> bool {
+        self.token() == previous.token()
+            && self.addr == previous.addr
+            && self.expires_at == previous.expires_at
+            && self.extra == previous.extra
     }
 }
 
@@ -209,12 +236,16 @@ fn load_v2(envelope: &Value) -> Result<Accounts, SessionError> {
 
 impl Storage<'_> {
     pub fn load_accounts(&self) -> Result<Accounts, StorageError> {
+        self.read_accounts().map_err(StorageError::SessionData)
+    }
+
+    fn read_accounts(&self) -> Result<Accounts, SessionError> {
         let path = self.trader.join(SESSIONS);
         let fields = match read_envelope(&path)? {
             Some(fields) => fields,
             None => {
                 if let Some(fields) = read_envelope(&self.trader.join(LEGACY_SESSION))? {
-                    return Ok(load_v2(&fields)?);
+                    return load_v2(&fields);
                 }
                 // Another process may have published v3 and removed v2 between our reads.
                 let Some(fields) = read_envelope(&path)? else {
@@ -224,7 +255,7 @@ impl Storage<'_> {
             }
         };
         if fields["version"].as_u64() != Some(VERSION) {
-            return Err(session_error("Unsupported session version").into());
+            return Err(session_error("Unsupported session version"));
         }
         let StoredAccounts(mut accounts) = decrypt(&fields, AAD)?;
         accounts
@@ -261,17 +292,39 @@ impl Storage<'_> {
         Ok(())
     }
 
+    fn session_lock_file(&self) -> io::Result<fs::File> {
+        private_file(&self.directory()?.join("sessions.lock"))
+    }
+
     fn lock_sessions(&self) -> io::Result<fs::File> {
-        let lock = private_file(&self.directory()?.join("sessions.lock"))?;
+        let lock = self.session_lock_file()?;
         lock.lock()?;
         Ok(lock)
     }
 
     pub fn save_session(&self, session: Session) -> Result<(), StorageError> {
-        let lock = self.lock_sessions()?;
+        self.save_session_locked(self.lock_sessions()?, session)
+    }
+
+    /// Wait for the session lock without blocking cancellation in the caller.
+    /// Once acquired, keep the lock through the synchronous commit.
+    pub async fn save_session_async(&self, session: Session) -> Result<(), StorageError> {
+        let lock = self.session_lock_file()?;
+        loop {
+            match lock.try_lock() {
+                Ok(()) => return self.save_session_locked(lock, session),
+                Err(fs::TryLockError::WouldBlock) => {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+
+    fn save_session_locked(&self, lock: fs::File, session: Session) -> Result<(), StorageError> {
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::Session(_)) => Accounts::default(),
+            Err(StorageError::SessionData(_)) => Accounts::default(),
             Err(error) => return Err(error),
         };
         let key = session.addr.to_lowercase();
@@ -281,14 +334,54 @@ impl Storage<'_> {
         accounts.active = Some(key.clone());
         self.save_accounts(&accounts)?;
         drop(lock);
-        let session = &accounts.sessions[&key].0;
+        self.session_saved(&accounts, &key);
+        Ok(())
+    }
+
+    /// Replace the account only if it still contains the session that was renewed.
+    pub fn replace_session(
+        &self,
+        previous: &Session,
+        renewed: Session,
+    ) -> Result<(), StorageError> {
+        let lock = self.lock_sessions()?;
+        let mut accounts = self.load_accounts()?;
+        let key = previous.addr.to_lowercase();
+        if !accounts
+            .sessions
+            .get(&key)
+            .is_some_and(|session| session.0.same_as(previous))
+        {
+            return Err(SessionError(SaiError::new(
+                Code::InvalidRequest,
+                "Stored session changed during renewal. Run sai auth status.",
+            ))
+            .into());
+        }
+        if crate::session::expired(&renewed, chrono::Utc::now())? {
+            return Err(SessionError(SaiError::new(
+                Code::KeeperError,
+                "Keeper returned an already expired session",
+            ))
+            .into());
+        }
+        accounts
+            .sessions
+            .insert(key.clone(), StoredSession(renewed));
+        self.save_accounts(&accounts)?;
+        drop(lock);
+        self.session_saved(&accounts, &key);
+        Ok(())
+    }
+
+    fn session_saved(&self, accounts: &Accounts, key: &str) {
+        let session = &accounts.sessions[key].0;
         self.emit(StorageEvent::SessionSaved {
             addr: session.addr(),
             expires_at: session.expires_at(),
             endpoint: session.endpoint().map(endpoint_origin).as_deref(),
             connected_accounts: accounts.sessions.len(),
         });
-        Ok(())
     }
 
     pub fn load_session(&self, addr: Option<&str>) -> Result<Session, StorageError> {
@@ -318,6 +411,7 @@ impl Storage<'_> {
         let lock = self.lock_sessions()?;
         let mut accounts = self.load_accounts()?;
         let key = accounts.find(addr)?;
+        crate::session::session_expiry(&accounts.sessions[&key].0)?;
         accounts.active = Some(key.clone());
         self.save_accounts(&accounts)?;
         drop(lock);
@@ -347,7 +441,7 @@ impl Storage<'_> {
         }
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::Session(_)) if addr.is_none() => {
+            Err(StorageError::SessionData(_)) if addr.is_none() => {
                 self.remove_session_files()?;
                 drop(lock);
                 self.emit(StorageEvent::UnreadableSessionRemoved);
