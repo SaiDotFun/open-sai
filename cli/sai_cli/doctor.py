@@ -529,7 +529,7 @@ def check_session(ctx: Context) -> Check:
             "session",
             "fail",
             f"Session for {short(addr)} expired at {state['expiresAt']}",
-            SIGN_IN,
+            state.get("renewalCommand", SIGN_IN),
             details,
         )
     if not state["endpointMatches"]:

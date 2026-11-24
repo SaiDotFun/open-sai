@@ -451,20 +451,19 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         if not name:
             if stored.get("source") == "imported":
                 raise ValueError(
-                    "This session was imported. Run sai auth import with a fresh token."
+                    f"This session was imported. Run {sessions.renewal_command(stored)} with a fresh token."
                 )
             raise ValueError(
-                "This session has no saved key name. Run sai auth login NAME once"
-                " for a local key, or sai auth import for a browser session."
+                f"This session has no saved key name. Run {sessions.renewal_command(stored)}."
             )
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
-        flags = forwarded_flags(ctx.find_root().obj)
-        command = shlex.join(["sai", *flags, "auth", "renew", stored["evmAddress"]])
-        raise click.ClickException(f"{exc} Run `{command}` in a terminal.") from exc
+        raise click.ClickException(
+            f"{exc} Run {sessions.renewal_command(stored)} in a terminal."
+        ) from exc
     except (ValueError, keeper.KeeperError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
 

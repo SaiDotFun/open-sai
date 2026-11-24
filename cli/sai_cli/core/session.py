@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import base64
 import json
+import shlex
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import log, storage
+from .settings import public_url
 
 EXPIRY_WARNING = timedelta(days=3)
 
@@ -20,12 +23,28 @@ def expiry_time(result: dict[str, str]) -> datetime:
 
 
 def renewal_command(result: dict[str, str]) -> str:
-    """Return the command appropriate for this stored session's signer."""
+    """Return recovery instructions scoped to the session's Keeper."""
+    endpoint = result.get("endpoint")
+    public = public_url(endpoint)
+    origin = ""
+    prefix = ["sai"]
+    if public:
+        parsed = urlsplit(public)
+        origin = " at " + parsed._replace(path="").geturl()
+        if public == endpoint and parsed.path in ("", "/", "/query", "/graphql"):
+            prefix += ["--endpoint", public]
+    suffix = (
+        f" (reuse the Keeper endpoint{origin} configured when this session was stored)"
+        if len(prefix) == 1
+        else ""
+    )
     if result.get("keyName"):
-        return f"sai auth renew {result['evmAddress']}"
+        return shlex.join([*prefix, "auth", "renew", result["evmAddress"]]) + suffix
+    browser = shlex.join([*prefix, "auth", "import"])
     if result.get("source") == "imported":
-        return "sai auth import"
-    return "sai auth login NAME or sai auth import"
+        return browser + suffix
+    local = shlex.join([*prefix, "auth", "login", "NAME"])
+    return f"{local} or {browser}{suffix}"
 
 
 def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
@@ -64,7 +83,7 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
             addr=result.get("evmAddress"),
             expiresAt=result["expiresAt"],
         )
-        raise ValueError("Trading session expired; sign in again")
+        raise ValueError(f"Trading session expired. Run {renewal_command(result)}.")
     return result
 
 
@@ -107,7 +126,7 @@ def summary(result: dict[str, str]) -> dict[str, str]:
     return {
         "addr": result["evmAddress"],
         "expiresAt": result["expiresAt"],
-        "endpoint": result["endpoint"],
+        "endpoint": public_url(result["endpoint"]) or "",
     }
 
 

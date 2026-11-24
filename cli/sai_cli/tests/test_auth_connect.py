@@ -786,7 +786,7 @@ def test_renew_uses_saved_name_and_preserves_active_account(env: Env, keeper_aut
 
     refused = env.run("--endpoint", endpoint, "auth", "renew")
     assert refused.returncode == 1
-    assert "sai auth import" in refused.stderr
+    assert f"sai --endpoint {endpoint} auth import" in refused.stderr
     assert len(keeper_auth["signatures"]) == 2
 
 
@@ -809,7 +809,7 @@ def test_cli_status_and_list_report_expiry_warnings(env: Env):
     result = env.run("--json", "auth", "list")
     row = json.loads(result.stdout)["accounts"][0]
     assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
-    assert row["renewalCommand"] == "sai auth import"
+    assert row["renewalCommand"] == f"sai --endpoint {keeper.MAINNET_HTTP} auth import"
     assert status.stderr == result.stderr == ""
 
 
@@ -852,7 +852,32 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
         assert error == ""
     else:
         assert len(error.splitlines()) == 1
-        assert "expires in" in error and "sai auth import" in error
+        assert (
+            "expires in" in error
+            and f"sai --endpoint {keeper.MAINNET_HTTP} auth import" in error
+        )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["/query?api_key=synthetic-test-credential", "/synthetic-test-credential/query"],
+)
+def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
+    env: Env, suffix: str
+):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    origin = "http://127.0.0.1:9876"
+    endpoint = origin + suffix
+    args = ("--json", "--endpoint", endpoint, "auth")
+    assert env.run(*args, "import").returncode == 0
+    status = env.run(*args, "status")
+    row = json.loads(status.stdout)
+    assert f"reuse the Keeper endpoint at {origin}" in row["renewalCommand"]
+    refused = env.run(*args, "renew")
+    assert refused.returncode == 1
+    assert "reuse the Keeper endpoint" in refused.stderr
+    assert "synthetic-test-credential" not in row["renewalCommand"] + refused.stderr
 
 
 def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:

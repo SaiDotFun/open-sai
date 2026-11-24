@@ -327,6 +327,7 @@ def session_state(settings: Settings) -> dict[str, Any]:
         "expired": expired,
         "endpoint": public_url(stored.get("endpoint")),
         "endpointMatches": matches,
+        **({"renewalCommand": sessions.renewal_command(stored)} if expired else {}),
         **(sessions.expiry_fields(stored, now) if matches else {}),
     }
 

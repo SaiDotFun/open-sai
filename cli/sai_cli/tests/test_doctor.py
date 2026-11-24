@@ -150,7 +150,7 @@ def test_expired_session_fails():
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
     assert "expired" in check.summary
-    assert check.fix and "sai auth login" in check.fix
+    assert check.fix and f"sai --endpoint {ENDPOINT} auth login" in check.fix
 
 
 def test_session_for_other_endpoint_fails():
