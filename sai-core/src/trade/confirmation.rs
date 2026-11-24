@@ -216,6 +216,9 @@ mod tests {
             preview.reference_price = input["referencePrice"].as_str().map(str::to_owned);
             preview.quote = input.get("quote").cloned();
             preview.estimates = Some(data["estimates"].clone());
+            if kind == "CLOSE_POSITION" {
+                preview.close_owner_verified = Some(true);
+            }
             let account = input["addr"].as_str();
             assert_eq!(
                 digest_bytes(&preview, account),

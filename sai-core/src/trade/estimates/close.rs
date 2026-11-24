@@ -22,7 +22,7 @@ const GUARDED: &str = "The after-hours guard can change or close this position."
 impl Trading<'_> {
     pub(super) async fn close_estimates(
         &self,
-        preview: &TradePreview,
+        preview: &mut TradePreview,
         session: Option<&Session>,
     ) -> Result<Value, SaiError> {
         let mut result = json!({
@@ -34,6 +34,7 @@ impl Trading<'_> {
                 "reason": "This Keeper intent carries no slippage limit.",
             },
         });
+        preview.close_owner_verified = session.map(|_| false);
         let (Some(endpoint), Some(session), Some(target)) =
             (self.lcd_endpoint, session, &preview.intent.target)
         else {
@@ -58,6 +59,8 @@ impl Trading<'_> {
         if !same_account(account, raw.get("user")) {
             return Err(contract_owner_error());
         }
+        // Ownership verification stands even if the estimate inputs are unavailable.
+        preview.close_owner_verified = Some(true);
         let state = match self
             .position_snapshot(&lcd, account, &id, route, indexed, Some(raw))
             .await

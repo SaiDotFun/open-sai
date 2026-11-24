@@ -861,6 +861,9 @@ def loopback(
                         if name == "get_fees" and scenario == "quote-fee-read-error":
                             self.reply({}, 503)
                             return
+                        if owner_read and scenario == "quote-owner-read-error":
+                            self.reply({}, 503)
+                            return
                         if name == "get_trade_raw" and cancel_target is not None:
                             [nonce] = parse_qs(urlsplit(self.path).query).get(
                                 "_sai_query", [""]

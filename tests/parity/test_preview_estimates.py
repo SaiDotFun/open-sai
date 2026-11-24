@@ -286,3 +286,31 @@ def test_close_quote_checks_the_position_owner_and_index(
             assert [request.label for request in endpoints.wire] == wire.split()
             assert not endpoints.errors
             assert not rows(home)
+
+
+def test_close_quote_reports_unverified_owner_when_perp_read_fails(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    reference = str(Path(sys.executable).with_name("sai"))
+    outputs = []
+    for index, cli in enumerate(((reference,), cli_pair[1])):
+        with loopback("quote-owner-read-error") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, output, stderr = run(
+                cli, home, endpoints, (*CLOSE, "--dry-run"), python=index == 0
+            )
+            assert (code, stderr) == (0, "")
+            assert output["positionOwnerVerified"] is False
+            assert output["estimates"]["fees"]["status"] == "unavailable"
+            assert "previewDigest" not in output
+            assert [request.label for request in endpoints.wire] == [
+                "trade",
+                "oneClickTrading",
+                "node_info",
+                "get_trade_raw",
+            ]
+            assert not endpoints.errors
+            assert not rows(home)
+            outputs.append(output)
+    assert outputs[0] == outputs[1]
