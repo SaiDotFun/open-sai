@@ -211,11 +211,7 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool,
     let sai_home = home.join("sai-home");
     fs::create_dir(&sai_home).unwrap();
     let writer = LogWriter::start(Environment::new(sai_home.clone(), |_| None)).unwrap();
-    let events = EventContext {
-        writer: Some(&writer),
-        surface: Surface::Update,
-        command: None,
-    };
+    let events = EventContext::new(Some(&writer), Surface::Update, None);
     let result = repair_after_update(&launcher, background, events);
     let fields = result.json_fields();
     let reports = fields["mcp"].as_array().unwrap();
