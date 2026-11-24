@@ -76,6 +76,8 @@ from types import MappingProxyType
 from typing import Any, Self
 from urllib.parse import urlsplit
 
+import httpx
+
 from . import paths
 from .errors import Code
 from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
@@ -348,13 +350,15 @@ def origin(value: str) -> str:
         host = parts.hostname or ""
         if ":" in host:
             host = f"[{host}]"
+        elif not host.isascii():
+            host = httpx.URL(scheme=parts.scheme, host=host).raw_host.decode("ascii")
         # A host with any other character is not a host: it is text that ran
         # into the URL, and may be the secret.
         if not parts.scheme or not _HOST.fullmatch(host):
             return REDACTED_URL
         port = parts.port
         return f"{parts.scheme}://{host}" + ("" if port is None else f":{port}")
-    except ValueError:
+    except (ValueError, httpx.InvalidURL):
         return REDACTED_URL
 
 

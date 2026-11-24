@@ -90,7 +90,13 @@ def test_non_utf8_home_json(
             ("unset", "update.auto"),
         ):
             result = invoke(cli, home, *args)
-            outputs.append(reply(result, home))
+            data = reply(result, home)
+            if args == ("list",):
+                # The pinned Python reference predates origin-only endpoint output.
+                settings = data["settings"]
+                assert isinstance(settings, dict)
+                data = {"settings": {"update.auto": settings["update.auto"]}}
+            outputs.append(data)
             assert rb"home-\udcff-\udce2\udc82-\u00e9-\"/config.toml" in result.stdout
         assert b"auto = false" not in (home / "config.toml").read_bytes()
         replies.append(outputs)
