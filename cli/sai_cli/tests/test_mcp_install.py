@@ -17,7 +17,7 @@ import tomlkit
 from click.testing import CliRunner
 from sai_cli import mcp_install
 from sai_cli import sai_cli as cli
-from sai_cli.core import log
+from sai_cli.core import log, updater
 from sai_cli.sai_cli import main
 from test_update import GIT, make_prefix
 
@@ -1282,6 +1282,27 @@ def test_claude_local_replacement_targets_git_root(
     projects = env.claude_json()["projects"]
     assert projects[str(env.project)]["mcpServers"]["sai"] == claude_entry(serve(env))
     assert projects[str(nested)]["mcpServers"]["sai"] == nested_entry
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_update_ignores_a_healthy_claude_profile_pin(env: Env, background: bool):
+    config = env.home / ".claude.json"
+    profile = env.root / "pinned profile"
+    original = {
+        "mcpServers": {"sai": claude_entry(serve(env), {"SAI_HOME": str(profile)})}
+    }
+    config.write_text(json.dumps(original))
+
+    updated = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, background
+    )
+
+    assert updated.mcp_results() == []
+    assert "Claude Code" not in updater.mcp_notice(
+        updated.mcp_results(), updated.mcp_notes
+    )
+    assert env.claude_json() == original
+    assert not any(call[1] in ("add", "remove") for call in env.calls())
 
 
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):

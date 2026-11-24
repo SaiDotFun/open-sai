@@ -22,7 +22,7 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, MutableMapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -1495,6 +1495,8 @@ def check_claude_differences(
     stale: list[StaleRegistration],
     target: Target | None,
     legacy_name: bool,
+    *,
+    compare_profile: bool,
 ) -> RegistrationCheck | None:
     stale_by_scope = {(issue.name, issue.registration.scope): issue for issue in stale}
     repairs = []
@@ -1502,12 +1504,18 @@ def check_claude_differences(
     manual = []
     for name, reg in found:
         issue = stale_by_scope.get((name, reg.scope))
+        expected = target
         if name == NAME:
-            if issue is None and (target is None or reg.matches(target)):
+            if expected is not None and not compare_profile:
+                saved_env = (
+                    {"SAI_HOME": reg.sai_home} if reg.sai_home is not None else {}
+                )
+                expected = replace(expected, env=saved_env)
+            if issue is None and (expected is None or reg.matches(expected)):
                 continue
             if reg.disabled:
                 manual.append("Review MCP approvals and settings in Claude Code.")
-            elif target is None:
+            elif expected is None:
                 manual.append("Install a stable Sai launcher on PATH.")
             else:
                 repairs.append(
@@ -1515,7 +1523,7 @@ def check_claude_differences(
                         reg.scope,
                         name,
                         replace_entry=True,
-                        use_profile="SAI_HOME" in target.env,
+                        use_profile="SAI_HOME" in expected.env,
                         directory=client.scope_directory(reg.scope),
                     )
                 )
@@ -1531,7 +1539,7 @@ def check_claude_differences(
             issue.reason
             if issue is not None
             else "Sai registration has a different SAI_HOME setting"
-            if target is not None and not reg.matches_sai_home(target.env)
+            if expected is not None and not reg.matches_sai_home(expected.env)
             else "Sai registration differs from the requested settings"
         )
         differences.append(f"{reg.scope} {name}: {reason}")
@@ -1585,7 +1593,7 @@ def check_registration(
     expected_env = server_env(client.environ) if compare_profile else {}
     if isinstance(client, Claude):
         claude_check = check_claude_differences(
-            client, found, stale, target, legacy_name
+            client, found, stale, target, legacy_name, compare_profile=compare_profile
         )
         if claude_check is not None:
             return claude_check
