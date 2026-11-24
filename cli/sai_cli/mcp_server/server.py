@@ -836,7 +836,7 @@ class SaiMCP(FastMCP):
             if tool is None:
                 return None, len(given)
             names = tool.parameters.get("properties", {})
-            if name == "logs_intent":
+            if name in {"auth_use", "logs_intent"}:
                 return {}, sum(key not in names for key in given)
             known = {key: loggable_value(given[key]) for key in names if key in given}
             return known, len(given) - len(known)
@@ -863,7 +863,12 @@ class SaiMCP(FastMCP):
             return await super().call_tool(name, arguments)
         except ToolError as exc:
             cause = exc.__cause__
-            if name != "logs_intent" or not isinstance(cause, ValidationError):
+            if not isinstance(cause, ValidationError):
+                raise
+            if name == "auth_use":
+                message = "Argument 'addr' must be a string."
+                raise ToolError(message) from SaiError(message, Code.INVALID_REQUEST)
+            if name != "logs_intent":
                 raise
             # SDK validation renders the rejected input in its exception.
             # Use known fields and type names only, including for extra keys.

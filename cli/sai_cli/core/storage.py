@@ -251,11 +251,12 @@ def _remove_files() -> None:
     _v2_path().unlink(missing_ok=True)
 
 
-def _find(accounts: dict[str, Any], addr: str) -> str:
+def _find(accounts: dict[str, Any], addr: str, *, include_addr: bool = True) -> str:
     key = addr.lower()
     if key not in accounts["sessions"]:
         raise ValueError(
-            f"{addr} is not connected; run `sai auth list` to see connected"
+            f"{addr if include_addr else 'Requested account'} is not connected;"
+            " run `sai auth list` to see connected"
             " accounts, or sign in with `sai auth login NAME` or `sai auth import`"
         )
     return key
@@ -331,7 +332,7 @@ def use_session(
 
     with _locked():
         accounts = load_accounts()
-        key = _find(accounts, addr)
+        key = _find(accounts, addr, include_addr=False)
         session = accounts["sessions"][key]
         address = session_address(session, key)
         expiry_time(session)

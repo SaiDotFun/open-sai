@@ -530,6 +530,20 @@ def test_accounts_connect_switch_and_disconnect(env: Env) -> None:
 
 
 @pytest.mark.parametrize("json_output", [False, True])
+def test_auth_use_keeps_unregistered_input_private(env: Env, json_output: bool) -> None:
+    marker = "synthetic-unregistered-account-credential-marker"
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, "auth", "use", marker)
+
+    assert result.returncode == 1
+    assert marker not in result.stdout + result.stderr
+    assert "Requested account is not connected" in result.stdout + result.stderr
+    records = env.stored_bytes()
+    assert marker.encode() not in records
+    assert b"command.end" in records and b"session.active" not in records
+
+
+@pytest.mark.parametrize("json_output", [False, True])
 @pytest.mark.parametrize(
     "expiry", ["synthetic-expiry-credential-marker", "2031-02-03T04:05:06"]
 )

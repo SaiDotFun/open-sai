@@ -19,7 +19,7 @@ from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
-from mcp.types import TextContent
+from mcp.types import CallToolResult, TextContent
 from sai_cli.core import keeper, margin, settings, storage, stream, update
 from sai_cli.core import log as sai_log
 from sai_cli.core import session as sessions
@@ -1475,6 +1475,45 @@ def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
         }
 
 
+def stdio_auth_use(tmp_path: Path, addr: object) -> tuple[CallToolResult, str]:
+    command, *args = sai_command()
+    params = StdioServerParameters(
+        command=command,
+        args=[*args, "mcp", "serve"],
+        env={"SAI_HOME": str(tmp_path), "SAI_LOG": "1"},
+    )
+
+    async def switch(errlog: TextIO) -> CallToolResult:
+        async with (
+            stdio_client(params, errlog=errlog) as (read, write),
+            ClientSession(read, write) as client,
+        ):
+            await client.initialize()
+            return await client.call_tool("auth_use", {"addr": addr})
+
+    stderr = tmp_path / "stderr.log"
+    with stderr.open("w") as errlog:
+        result = asyncio.run(switch(errlog))
+    logs = "".join(
+        file.read_text() for _, _, file in sai_log.log_files(tmp_path / "logs")
+    )
+    return result, logs + stderr.read_text()
+
+
+@pytest.mark.parametrize("as_object", [False, True])
+def test_stdio_auth_use_keeps_unregistered_input_private(
+    tmp_path: Path, as_object: bool
+) -> None:
+    marker = "synthetic-mcp-unregistered-credential-marker"
+    result, logs = stdio_auth_use(tmp_path, {"value": marker} if as_object else marker)
+
+    assert marker not in result.model_dump_json() + logs
+    text = text_of(result.content)
+    assert "must be a string" in text if as_object else "is not connected" in text
+    assert "mcp.tool_result" in logs and "INVALID_REQUEST" in logs
+    assert "session.active" not in logs
+
+
 @pytest.mark.parametrize(
     "corruption",
     ["selected-expiry", "other-expiry", "endpoint", "address", "other-address"],
@@ -1501,35 +1540,15 @@ def test_stdio_auth_use_refuses_malformed_response_before_switching(
     storage._save_accounts({"active": OTHER, "sessions": records})
     path = tmp_path / "trader" / "sessions.json"
     before = path.read_bytes()
-    command, *args = sai_command()
-    params = StdioServerParameters(
-        command=command,
-        args=[*args, "mcp", "serve"],
-        env={"SAI_HOME": str(tmp_path), "SAI_LOG": "1"},
-    )
+    result, logs = stdio_auth_use(tmp_path, ADDR)
 
-    async def switch(errlog: TextIO) -> None:
-        async with (
-            stdio_client(params, errlog=errlog) as (read, write),
-            ClientSession(read, write) as client,
-        ):
-            await client.initialize()
-            result = await client.call_tool("auth_use", {"addr": ADDR})
-            assert secret not in result.model_dump_json()
-            assert json.loads(text_of(result.content)) == {
-                "error": f"Stored session has an invalid {field}; {storage.SIGN_IN_AGAIN}",
-                "code": "SESSION_UNAVAILABLE",
-            }
-
-    stderr = tmp_path / "stderr.log"
-    with stderr.open("w") as errlog:
-        asyncio.run(switch(errlog))
-    logs = "".join(
-        file.read_text() for _, _, file in sai_log.log_files(tmp_path / "logs")
-    )
+    assert json.loads(text_of(result.content)) == {
+        "error": f"Stored session has an invalid {field}; {storage.SIGN_IN_AGAIN}",
+        "code": "SESSION_UNAVAILABLE",
+    }
     assert "mcp.tool_result" in logs and "SESSION_UNAVAILABLE" in logs
     assert "session.active" not in logs
-    assert secret not in logs + stderr.read_text()
+    assert secret not in result.model_dump_json() + logs
     assert path.read_bytes() == before
     assert storage.load_accounts()["active"] == OTHER
 
