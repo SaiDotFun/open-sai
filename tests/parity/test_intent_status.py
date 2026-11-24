@@ -748,17 +748,19 @@ def test_public_intent_status_scrubs_keeper_payload(
             assert public["errorMsg"] == "Keeper reported an intent error."
 
 
+@pytest.mark.parametrize("change", ["synthetic-keeper-text", "position_liquidated"])
 def test_public_history_projects_after_raw_hash_correlation(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    change: str,
 ) -> None:
     opaque = "synthetic-keeper-text"
     intent = RESPONSES["outcome_not_indexed"]["data"]["userIntents"][0]
     history = {
         "intentKey": KEY,
         "id": opaque,
-        "tradeChangeType": opaque,
+        "tradeChangeType": change,
         "txHash": opaque,
         "evmTxHash": "0X" + "CD" * 32,
         "trade": {"id": opaque, "trader": ADDR, "note": opaque},

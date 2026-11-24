@@ -52,7 +52,7 @@ const TRADE_CHANGES: &[&str] = &[
     "order_triggered",
     "position_closed_tp",
     "position_closed_sl",
-    "position_closed_liquidated",
+    "position_liquidated",
     "position_closed_user",
     "order_closed_user",
     "tp_updated",
