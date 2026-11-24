@@ -2023,6 +2023,34 @@ def test_close_previews_withhold_estimates_and_digests_without_oracle_time(
 
 
 @pytest.mark.parametrize(
+    ("action", "options"), [("close", {}), ("partial_close", {"percent": 10})]
+)
+def test_close_digest_is_refused_when_oracle_time_disappears(
+    position_service, action, options
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+
+    async def scenario():
+        args = {"trade_id": 7, **options}
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            digest = preview["previewDigest"]
+            position.oracle_base_age = None
+
+            refusal = await call(
+                client, f"trade_{action}", {**args, "preview_digest": digest}
+            )
+            assert refusal["code"] == "PREVIEW_MISMATCH"
+            assert "publication time is unknown" in refusal["error"]
+            assert refusal["preview"] == await call(client, f"preview_{action}", args)
+            assert "previewDigest" not in refusal["preview"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
     ("indexed_cap", "pair_cap", "status"),
     [
         (0, "0", "estimate"),

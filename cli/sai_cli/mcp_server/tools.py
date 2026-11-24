@@ -147,6 +147,12 @@ def describe(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
             return error(failure.message, Code.PREVIEW_MISMATCH)
+        if estimates.close_oracle_time_unknown(exc.preview.get("estimates", {})):
+            return error(
+                exc.preview["estimates"]["execution"]["reason"],
+                Code.PREVIEW_MISMATCH,
+                preview=confirmation.with_digest(exc.preview),
+            )
         return error(
             "The position, quote, or route changed during confirmation, so nothing was"
             " submitted. Show the user the latest preview, get their confirmation"

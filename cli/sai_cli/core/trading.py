@@ -54,16 +54,31 @@ def _checked(
     before_submit: SubmitCheck,
     preview: dict[str, Any],
     estimate: Estimate | None,
+    *,
+    addr: str | None = None,
 ) -> None:
+    values = None
+    if (
+        addr is not None
+        and before_submit is not _accept
+        and estimate is not None
+        and preview["intent"]["kind"] in {"CLOSE_POSITION", "DECREASE_POSITION_SIZE"}
+    ):
+        values = estimate(preview)
     try:
         before_submit(preview)
     except PreviewRefused as exc:
         if exc.preview is not None and estimate is not None:
-            values = estimate(exc.preview)
-            exc.preview["estimates"] = values
-            if estimates.close_oracle_time_unknown(values):
+            fresh = values if values is not None else estimate(exc.preview)
+            exc.preview["estimates"] = fresh
+            if estimates.close_oracle_time_unknown(fresh):
                 exc.preview.pop("previewDigest", None)
         raise
+    if values is not None and estimates.close_oracle_time_unknown(values):
+        raise PositionChanged(
+            values["execution"]["reason"],
+            {**preview, "addr": addr, "estimates": values},
+        )
 
 
 def _ignore(_message: str) -> None:
@@ -381,7 +396,7 @@ def _position_intent(
         if verified is None:
             preview["positionOwnerVerified"] = False
         return {**preview, "estimates": estimate(preview)}
-    _checked(before_submit, preview, estimate)
+    _checked(before_submit, preview, estimate, addr=addr)
     return intents.submit(endpoint, get_session(), payload)
 
 
@@ -484,7 +499,9 @@ def _position_preview(
         fresh["estimates"] = estimate(state, inputs, fresh)
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
     if before_submit is not None:
-        _checked(before_submit, fresh, lambda _: estimate(state, inputs, fresh))
+        _checked(
+            before_submit, fresh, lambda _: estimate(state, inputs, fresh), addr=addr
+        )
     return fresh
 
 
