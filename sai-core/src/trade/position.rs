@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use tokio::time::{Instant, sleep, timeout_at};
 
 use crate::{
-    errors::SaiError,
+    errors::{Code, SaiError},
     keeper::{MARKET, POSITION, ROUTE, TIMEOUT, canonical_account, truthy},
 };
 
@@ -55,7 +55,11 @@ pub(super) fn contract_owner_error() -> SaiError {
 }
 
 impl Trading<'_> {
-    pub(super) async fn position_route(&self, lcd: &Lcd<'_>) -> Result<PositionRoute, SaiError> {
+    pub(super) async fn position_route(
+        &self,
+        lcd: &Lcd<'_>,
+        confirming: bool,
+    ) -> Result<PositionRoute, SaiError> {
         let route = self
             .keeper
             .request(ROUTE, Map::new(), None, TIMEOUT)
@@ -64,13 +68,25 @@ impl Trading<'_> {
             .get("oneClickTrading")
             .ok_or_else(|| incomplete("KeyError"))?;
         let network = lcd.network().await?;
+        let network = network.as_str().filter(|id| !id.trim().is_empty());
         let chain = text_field(route, "chainId")?;
-        if !truthy(field(route, "enabled")?) || chain.trim().is_empty() || network != chain {
-            return Err(invalid("Keeper trading route and LCD network do not match"));
+        let mismatch = "Keeper trading route and LCD network do not match";
+        if !truthy(field(route, "enabled")?) || chain.trim().is_empty() || network.is_none() {
+            return Err(invalid(mismatch));
         }
         let contract = text_field(route, "contractAddress")?;
         if contract.trim().is_empty() {
             return Err(invalid("Keeper trading route has no Perp contract address"));
+        }
+        if network != Some(chain) {
+            return Err(if confirming {
+                SaiError::new(
+                    Code::PreviewMismatch,
+                    format!("{mismatch}. Use an LCD on Keeper's chain and request a new preview."),
+                )
+            } else {
+                invalid(mismatch)
+            });
         }
         Ok(PositionRoute {
             chain_id: chain.into(),

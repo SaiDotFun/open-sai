@@ -119,9 +119,9 @@ impl Trading<'_> {
         let route = if let Some(endpoint) = self.lcd_endpoint {
             let lcd = Lcd(endpoint);
             if confirmed {
-                Some(self.verify_position_owner(&lcd, addr, &id).await?)
+                Some(self.verify_position_owner(&lcd, addr, &id, false).await?)
             } else {
-                self.position_route(&lcd).await.ok()
+                self.position_route(&lcd, false).await.ok()
             }
         } else {
             None
@@ -143,6 +143,7 @@ impl Trading<'_> {
         &self,
         addr: &str,
         preview: &TradePreview,
+        confirming: bool,
     ) -> Result<PositionUpdate, SaiError> {
         let id = preview.update_id()?;
         let indexed = self.indexed_position(addr, &id, TIMEOUT).await?;
@@ -151,7 +152,10 @@ impl Trading<'_> {
             .map(Lcd)
             .ok_or_else(|| invalid("Cannot verify the position without an LCD"))?;
         let mut preview = preview.clone();
-        preview.position_route = Some(self.verify_position_owner(&lcd, addr, &id).await?);
+        preview.position_route = Some(
+            self.verify_position_owner(&lcd, addr, &id, confirming)
+                .await?,
+        );
         Ok(PositionUpdate { preview, indexed })
     }
 
@@ -160,8 +164,9 @@ impl Trading<'_> {
         lcd: &Lcd<'_>,
         addr: &str,
         id: &Value,
+        confirming: bool,
     ) -> Result<PositionRoute, SaiError> {
-        let route = self.position_route(lcd).await?;
+        let route = self.position_route(lcd, confirming).await?;
         let (raw, _) = lcd
             .position(&route.contract_address, addr, id, Read::Fresh)
             .await?;

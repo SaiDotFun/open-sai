@@ -198,7 +198,10 @@ impl<'a> Trading<'a> {
             self.check_pending_order(session, preview).await?;
         }
         let update = if preview.is_standalone_position_update() {
-            Some(self.preflight_position_update(account, preview).await?)
+            Some(
+                self.preflight_position_update(account, preview, options.confirmation.is_some())
+                    .await?,
+            )
         } else {
             None
         };

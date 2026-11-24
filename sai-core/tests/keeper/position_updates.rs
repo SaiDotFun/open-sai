@@ -291,3 +291,47 @@ async fn confirmed_position_submit_refuses_contract_switch() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn confirmed_position_submit_reports_lcd_only_chain_drift() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = leverage_preview("7", "10.00").unwrap();
+    let digest = confirmed_digest(&trading, &session, &preview).await;
+    server.state.lock().unwrap().lcd_chain = "fixture-chain-2";
+
+    for (confirmation, expected) in [
+        (
+            Some(Confirmation::new(&digest, None).unwrap()),
+            Code::PreviewMismatch,
+        ),
+        (None, Code::InvalidRequest),
+    ] {
+        server.state.lock().unwrap().requests.clear();
+        let error = trading
+            .submit(
+                &session,
+                &preview,
+                SubmitOptions {
+                    confirmation,
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .expect("LCD chain mismatch must be refused");
+        assert_eq!(error.code, expected);
+        if expected == Code::PreviewMismatch {
+            assert_eq!(
+                error.message,
+                "Keeper trading route and LCD network do not match. Use an LCD on Keeper's chain and request a new preview."
+            );
+        }
+        assert_eq!(server.requests(), ["position", "route", "node_info"]);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
+}
