@@ -30,7 +30,7 @@ import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -53,7 +53,6 @@ NETWORK_TIMEOUT = 5.0
 # Wall-clock limit for all network checks together, and separately for
 # reconciling unknown intents.
 NETWORK_DEADLINE = NETWORK_TIMEOUT + 2
-EXPIRY_WARNING = timedelta(hours=24)
 STATUSES = ("pass", "fixed", "warn", "fail", "skipped")
 SIGN_IN = "sai auth login NAME, or sai auth import"
 REINSTALL = update.INSTALL_COMMAND
@@ -543,15 +542,12 @@ def check_session(ctx: Context) -> Check:
             f" sai with --endpoint {state['endpoint']}",
             details,
         )
-    left = datetime.fromisoformat(state["expiresAt"]) - ctx.now
-    if left < EXPIRY_WARNING:
-        minutes = int(left.total_seconds() // 60)
-        when = f"{minutes} min" if minutes < 120 else f"{minutes // 60} h"
+    if warning := state.get("expiryWarning"):
         return Check(
             "session",
             "warn",
-            f"Session for {short(addr)} expires in {when}",
-            SIGN_IN,
+            warning,
+            state["renewalCommand"],
             details,
         )
     return Check(

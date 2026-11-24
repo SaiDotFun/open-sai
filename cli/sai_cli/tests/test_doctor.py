@@ -49,7 +49,7 @@ def isolated_home(tmp_path, monkeypatch) -> Path:
     return tmp_path
 
 
-def save(hours: float = 48, endpoint: str = ENDPOINT, addr: str = ADDR) -> None:
+def save(hours: float = 96, endpoint: str = ENDPOINT, addr: str = ADDR) -> None:
     storage.save_session(
         {
             "token": TOKEN,
@@ -161,11 +161,12 @@ def test_session_for_other_endpoint_fails():
     assert "pw" not in check.summary and "key=abc" not in check.summary
 
 
-def test_session_expiring_within_a_day_warns():
-    save(hours=0.5)
+@pytest.mark.parametrize(("hours", "unit"), [(0.5, "min"), (48, " h")])
+def test_session_expiring_within_three_days_warns(hours, unit):
+    save(hours=hours)
     check = one(doctor.check_session, ctx())
     assert check.status == "warn"
-    assert "expires in" in check.summary and "min" in check.summary
+    assert "expires in" in check.summary and unit in check.summary
 
 
 @pytest.mark.parametrize(

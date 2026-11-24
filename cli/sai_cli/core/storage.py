@@ -223,12 +223,30 @@ def save_session(session: dict[str, str]) -> None:
         accounts["sessions"][addr] = session
         accounts["active"] = addr
         _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def replace_session(previous: dict[str, str], session: dict[str, str]) -> None:
+    """Renew the same stored session without switching the active account."""
+    with _locked():
+        accounts = load_accounts()
+        addr = previous["evmAddress"].lower()
+        if accounts["sessions"].get(addr) != previous:
+            raise ValueError(
+                "Stored session changed during renewal. Run sai auth status."
+            )
+        accounts["sessions"][addr] = session
+        _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def _log_saved(session: dict[str, str], count: int) -> None:
     log.event(
         "session.saved",
         addr=session["evmAddress"],
         expiresAt=session["expiresAt"],
         endpoint=log.endpoint(session.get("endpoint")),
-        connectedAccounts=len(accounts["sessions"]),
+        connectedAccounts=count,
     )
 
 

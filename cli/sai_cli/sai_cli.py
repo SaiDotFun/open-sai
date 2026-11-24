@@ -254,10 +254,42 @@ def main(
     passed = (endpoint, ws_endpoint, lcd_endpoint)
     flags = {key: value for (_, key), value in zip(GLOBAL_FLAGS, passed, strict=True)}
     ctx.obj.update(flags=flags, settings=None, json=json_output, as_addr=as_addr)
+    if ctx.invoked_subcommand not in {
+        "account",
+        "auth",
+        "doctor",
+        "mcp",
+        "logs",
+        "skill",
+    }:
+        session_notice(ctx, as_addr)
     if auto_update_applies(ctx.invoked_subcommand, json_output):
         updater.tick(warn)
     if ctx.invoked_subcommand is None:
         repl(ctx)
+
+
+def session_notice(ctx: click.Context, addr: str | None) -> None:
+    """Warn on a terminal without touching piped output or MCP stdio."""
+    if ctx.obj["json"] or not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return
+    try:
+        stored = storage.load_session(addr)
+        if stored.get("endpoint") == keeper_url(ctx):
+            show_expiry_notice(ctx, sessions.expiry_fields(stored))
+    except (ValueError, click.ClickException):
+        # This notice is optional. The command handles its own settings and session.
+        return
+
+
+def show_expiry_notice(ctx: click.Context, fields: Mapping[str, Any]) -> None:
+    if (
+        fields.get("expiryWarning")
+        and not ctx.obj["json"]
+        and sys.stdin.isatty()
+        and sys.stderr.isatty()
+    ):
+        warn(f"{fields['expiryWarning']} Run {fields['renewalCommand']}.")
 
 
 # Commands that never start or announce an automatic update. `mcp` serves
@@ -387,6 +419,7 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
     try:
         result = signed_login(keeper_url(ctx), name, addr)
         result["endpoint"] = keeper_url(ctx)
+        result["keyName"] = name
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
@@ -396,6 +429,39 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
         command = shlex.join(["sai", *flags, "auth", "login", name, *chosen])
         raise click.ClickException(f"{exc} Run `{command}` in a terminal.") from exc
     except (ValueError, keeper.KeeperError) as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
+@auth.command("renew")
+@click.argument("addr", required=False)
+@click.pass_context
+def renew(ctx: click.Context, addr: str | None) -> None:
+    """Renew ADDR's session with its saved key name, or renew the active account."""
+    chosen = addr or ctx.obj["as_addr"]
+    try:
+        stored = storage.load_session(chosen)
+        endpoint = keeper_url(ctx)
+        if stored.get("endpoint") != endpoint:
+            raise ValueError("Stored session belongs to another Keeper endpoint")
+        name = stored.get("keyName")
+        if not name:
+            if stored.get("source") == "imported":
+                raise ValueError(
+                    "This session was imported. Run sai auth import with a fresh token."
+                )
+            raise ValueError(
+                "This session has no saved key name. Run sai auth login NAME once"
+                " for a local key, or sai auth import for a browser session."
+            )
+        result = signed_login(endpoint, name, stored["evmAddress"])
+        result.update(endpoint=endpoint, keyName=name)
+        storage.replace_session(stored, result)
+        emit(ctx, sessions.summary(result))
+    except NeedsTerminal as exc:
+        flags = forwarded_flags(ctx.find_root().obj)
+        command = shlex.join(["sai", *flags, "auth", "renew", stored["evmAddress"]])
+        raise click.ClickException(f"{exc} Run `{command}` in a terminal.") from exc
+    except (ValueError, keeper.KeeperError, OSError) as exc:
         raise click.ClickException(str(exc)) from exc
 
 
@@ -634,8 +700,9 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
         {
             **sessions.summary(result),
             "active": key == accounts["active"],
-            "expired": datetime.fromisoformat(result["expiresAt"]) <= now,
+            "expired": sessions.expiry_time(result) <= now,
             "endpointMatches": result.get("endpoint") == endpoint,
+            **sessions.expiry_fields(result, now),
         }
         for key, result in sorted(accounts["sessions"].items())
     ]
@@ -646,7 +713,11 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
 def auth_list(ctx: click.Context) -> None:
     """List connected accounts, their expiry, and which one is active."""
     try:
-        emit(ctx, {"accounts": account_rows(keeper_url(ctx))})
+        rows = account_rows(keeper_url(ctx))
+        for row in rows:
+            if row["active"] and row["endpointMatches"]:
+                show_expiry_notice(ctx, row)
+        emit(ctx, {"accounts": rows})
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -673,7 +744,9 @@ def auth_status(ctx: click.Context) -> None:
     showing the token."""
     try:
         result = session(ctx)
-        emit(ctx, sessions.summary(result))
+        fields = sessions.expiry_fields(result)
+        show_expiry_notice(ctx, fields)
+        emit(ctx, {**sessions.summary(result), **fields})
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -698,8 +771,11 @@ def market_prices(ctx: click.Context) -> None:
 
 
 @main.group()
-def account() -> None:
+@click.pass_context
+def account(ctx: click.Context) -> None:
     """Inspect positions and account activity."""
+    if ctx.invoked_subcommand != "overview":
+        session_notice(ctx, ctx.obj["as_addr"])
 
 
 def perform_query(

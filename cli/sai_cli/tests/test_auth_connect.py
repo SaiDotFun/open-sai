@@ -766,6 +766,53 @@ def login(env: Env, keeper_auth, *args: str) -> subprocess.CompletedProcess[str]
     )
 
 
+def test_renew_uses_saved_name_and_preserves_active_account(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, name="saved-key", addr=ADDR)
+    endpoint = keeper_auth["endpoint"]
+    assert login(env, keeper_auth, "saved-key").returncode == 0
+    env.clipboard()
+    env.clip.write_text(make_token(OTHER))
+    assert env.run("--endpoint", endpoint, "auth", "import").returncode == 0
+
+    keeper_auth["token"] = make_token(hours=1440)
+    renewed = env.run("--json", "--endpoint", endpoint, "auth", "renew", ADDR)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["addr"] == ADDR
+    assert keeper_auth["token"] not in renewed.stdout + renewed.stderr
+    assert env.log.read_text().count(" wallet sign --account saved-key ") == 2
+    status = env.run("--json", "--endpoint", endpoint, "auth", "status")
+    assert json.loads(status.stdout)["addr"] == OTHER
+
+    refused = env.run("--endpoint", endpoint, "auth", "renew")
+    assert refused.returncode == 1
+    assert "sai auth import" in refused.stderr
+    assert len(keeper_auth["signatures"]) == 2
+
+
+def test_renew_refuses_a_key_that_changed_address(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    assert login(env, keeper_auth, "dev").returncode == 0
+    keystore(env, addr=OTHER)
+    result = env.run("--endpoint", keeper_auth["endpoint"], "auth", "renew")
+    assert result.returncode == 1
+    assert "does not match the wallet addr" in result.stderr
+    assert len(keeper_auth["signatures"]) == 1
+
+
+def test_cli_status_and_list_report_expiry_warnings(env: Env):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    status = env.run("--json", "auth", "status")
+    result = env.run("--json", "auth", "list")
+    row = json.loads(result.stdout)["accounts"][0]
+    assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
+    assert row["renewalCommand"] == "sai auth import"
+    assert status.stderr == result.stderr == ""
+
+
 def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
     fake_ud(env)
     result = login(env, keeper_auth, "dev")
