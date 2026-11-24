@@ -1,13 +1,68 @@
 """Run with python3 scripts/release-rehearsal.py --self-test."""
 
+import fcntl
 import json
+import os
 import runpy
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 import urllib.request
 from pathlib import Path
 
 REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
+
+
+class ProcessTest(unittest.TestCase):
+    def test_partial_reply_times_out(self) -> None:
+        read, write = os.pipe()
+        with os.fdopen(read, "rb") as source, os.fdopen(write, "wb") as writer:
+            reader = REHEARSAL["ReplyReader"](source)
+            writer.write(b"first\nsecond\npartial")
+            writer.flush()
+            self.assertEqual(reader.line("first"), "first")
+            self.assertEqual(reader.line("second"), "second")
+            with self.assertRaisesRegex(REHEARSAL["RehearsalError"], "complete reply"):
+                reader.line("partial", timeout=0.05)
+
+    def test_timeout_kills_a_descendant_after_the_leader_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            lock = root / "descendant.lock"
+            descendant = (
+                "import fcntl, sys, time; file = open(sys.argv[1], 'w'); "
+                "fcntl.flock(file, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(30)"
+            )
+            leader = "import subprocess, sys; subprocess.Popen(sys.argv[1:])"
+            command = (
+                sys.executable,
+                "-c",
+                leader,
+                sys.executable,
+                "-c",
+                descendant,
+                lock,
+            )
+            with (
+                self.assertRaises(subprocess.TimeoutExpired),
+                REHEARSAL["owned_process"](command, root, {"HOME": temp}) as child,
+            ):
+                self.assertEqual(
+                    REHEARSAL["ReplyReader"](child.stdout).line("lock"), "locked"
+                )
+                child.communicate(timeout=0.1)
+            with lock.open("r") as file:
+                deadline = time.monotonic() + 2
+                while True:
+                    try:
+                        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        if time.monotonic() >= deadline:
+                            self.fail("Descendant still holds the lock")
+                        time.sleep(0.01)
 
 
 class KeeperReplayTest(unittest.TestCase):

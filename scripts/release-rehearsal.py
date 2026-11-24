@@ -9,13 +9,15 @@ import os
 import re
 import select
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from collections.abc import Generator
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any
@@ -95,11 +97,54 @@ def require(condition: bool, message: str) -> None:
         raise RehearsalError(message)
 
 
-def read_line(stream: IO[str], step: str) -> str:
-    ready, _, _ = select.select([stream], [], [], 10)
-    if ready and (line := stream.readline()):
-        return line.strip()
-    raise RehearsalError(f"{step} received no reply")
+class ReplyReader:
+    def __init__(self, stream: IO[bytes]) -> None:
+        self.fd = stream.fileno()
+        self.pending = bytearray()
+        os.set_blocking(self.fd, False)
+
+    def line(self, step: str, *, timeout: float = 10) -> str:
+        deadline = time.monotonic() + timeout
+        while (end := self.pending.find(b"\n")) < 0:
+            left = deadline - time.monotonic()
+            if left <= 0 or not select.select([self.fd], [], [], left)[0]:
+                raise RehearsalError(f"{step} timed out waiting for a complete reply")
+            try:
+                chunk = os.read(self.fd, 8192)
+            except BlockingIOError:
+                continue
+            if not chunk:
+                raise RehearsalError(f"{step} received no complete reply")
+            self.pending.extend(chunk)
+        line = bytes(self.pending[:end])
+        del self.pending[: end + 1]
+        return line.decode("utf-8")
+
+
+@contextmanager
+def owned_process(
+    command: tuple[str | Path, ...],
+    cwd: Path,
+    env: dict[str, str],
+    *,
+    stderr: int | IO[bytes] = subprocess.PIPE,
+) -> Generator[subprocess.Popen[bytes], None, None]:
+    with subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=stderr,
+        start_new_session=True,
+    ) as process:
+        try:
+            yield process
+        finally:
+            # The leader can exit while a descendant still owns a pipe or file.
+            with suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
 
 
 class Replay:
@@ -261,16 +306,14 @@ class Install:
         timeout: float = 300,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            result = subprocess.run(
-                command,
-                cwd=self.home,
-                env=self.env,
-                capture_output=True,
-                text=True,
-                input=input_text,
-                timeout=timeout,
-                check=False,
-            )
+            with owned_process(command, self.home, self.env) as process:
+                out, err = process.communicate(input_text.encode(), timeout=timeout)
+                result = subprocess.CompletedProcess(
+                    command,
+                    process.returncode,
+                    out.decode(errors="replace"),
+                    err.decode(errors="replace"),
+                )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RehearsalError(f"{step} failed ({type(exc).__name__})") from exc
         if check and result.returncode:
@@ -318,10 +361,10 @@ class Install:
         replies = {}
         with self.stdio(*command) as (send, receive):
             for msg in MCP_REQUESTS:
-                send.write(json.dumps({"jsonrpc": "2.0", **msg}) + "\n")
+                send.write((json.dumps({"jsonrpc": "2.0", **msg}) + "\n").encode())
                 send.flush()
                 if "id" in msg:
-                    reply = json.loads(read_line(receive, f"MCP {msg['method']}"))
+                    reply = json.loads(receive.line(f"MCP {msg['method']}"))
                     require(reply.get("id") == msg["id"], "Unexpected MCP reply ID")
                     replies[msg["id"]] = reply
         require("result" in replies[1], f"MCP {version} did not initialize")
@@ -334,30 +377,22 @@ class Install:
     @contextmanager
     def stdio(
         self, *command: str | Path
-    ) -> Generator[tuple[IO[str], IO[str]], None, None]:
-        with subprocess.Popen(
-            command,
-            cwd=self.home,
-            env=self.env,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
+    ) -> Generator[tuple[IO[bytes], ReplyReader], None, None]:
+        with owned_process(
+            command, self.home, self.env, stderr=subprocess.DEVNULL
         ) as process:
             assert process.stdout is not None and process.stdin is not None
+            yield process.stdin, ReplyReader(process.stdout)
+            process.stdin.close()
             try:
-                yield process.stdin, process.stdout
-            finally:
-                process.stdin.close()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
 
     @contextmanager
     def websocket(self) -> Generator[str, None, None]:
         with self.stdio(self.python, "-I", "-c", WEBSOCKET_SERVER) as (_, receive):
-            address = read_line(receive, "Loopback Keeper WebSocket")
+            address = receive.line("Loopback Keeper WebSocket")
             require(
                 address.startswith("ws://127.0.0.1:"), "Expected a loopback WebSocket"
             )
