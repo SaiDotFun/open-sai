@@ -445,14 +445,14 @@ def launcher_owner_error(prefix: Path, launcher: Path) -> str | None:
             target = launcher.parent / launcher.readlink()
             if launcher.resolve(strict=True) == inside.resolve(strict=True):
                 return None
-        elif os.name == "nt" and stat.S_ISREG(info.st_mode):
-            # uv copies the executable on Windows. Compare its exact bytes
-            # before relying on the private executable for startup checks.
-            if (
-                info.st_size == inside.stat().st_size
-                and launcher.read_bytes() == inside.read_bytes()
-            ):
-                return None
+        # uv copies the executable on Windows. Require the same bytes.
+        elif (
+            os.name == "nt"
+            and stat.S_ISREG(info.st_mode)
+            and info.st_size == inside.stat().st_size
+            and launcher.read_bytes() == inside.read_bytes()
+        ):
+            return None
     except (OSError, RuntimeError):
         return f"{launcher} is missing or unreadable. Expected the uv executable at {inside}"
     return f"{launcher} runs another install at {target}. Expected the uv executable at {inside}"

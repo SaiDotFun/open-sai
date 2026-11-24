@@ -1232,7 +1232,9 @@ def test_windows_refuses_a_replaced_uv_launcher(
     prepare_uv(install, python_wheel, replay)
     add_shim(replay, wheel_artifact("SHIM"))
     contents = b"another install occupies this launcher"
-    install.launcher.write_bytes(contents)
+    competitor = install.launcher.with_name("competing-sai.exe")
+    competitor.write_bytes(contents)
+    competitor.replace(install.launcher)
     inside = install.tools / "sai-cli" / "Scripts" / "sai.exe"
     result = install.run(
         inside, "--json", "update", "--api-base", replay.base, "--web-base", replay.base
