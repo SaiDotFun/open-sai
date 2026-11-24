@@ -8,12 +8,19 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
@@ -139,6 +146,11 @@ class FakeKeeper:
                     "evmAddress": ADDR,
                 }
             }
+        if query == keeper.POSITION and query not in self.answers:
+            assert variables is not None
+            return position_data(variables)
+        if query == keeper.ROUTE and query not in self.answers:
+            return POSITION_ROUTE
         return json.loads(json.dumps(self.answers[query]))
 
     def intent(self) -> dict[str, Any]:
@@ -150,8 +162,9 @@ class FakeKeeper:
 
 
 @pytest.fixture
-def mcp() -> FastMCP:
-    return server.create_server()
+def mcp() -> Iterator[FastMCP]:
+    with keeper_server(PositionKeeperHandler) as lcd:
+        yield server.create_server(settings.load(flags={"lcd.endpoint": lcd}))
 
 
 # Schema and listing
@@ -547,7 +560,7 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
         for amount in collaterals
     )
 
-    def snapshot(*args: Any) -> margin.PositionSnapshot:
+    def snapshot(*args: Any, **kwargs: Any) -> margin.PositionSnapshot:
         nonlocal current
         current = next(states)
         return current
@@ -666,7 +679,8 @@ def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     storage.save_session(stored_session())
     fake = FakeKeeper({keeper.MARKETS: markets()})
     monkeypatch.setattr(keeper, "request", fake)
-    snapshots(monkeypatch, "4000000")
+    if name in ("preview_margin", "preview_partial_close"):
+        snapshots(monkeypatch, "4000000")
     preview = invoke(mcp, name, arguments)
     assert preview["dryRun"] is True
     assert len(preview["previewDigest"]) == 64
@@ -1059,10 +1073,12 @@ def test_errors_redact_every_connected_token():
     assert tools.redact(text) == f"failed with {tools.REDACTED} and {tools.REDACTED}"
 
 
-def test_preview_without_a_session_names_no_account(mcp, monkeypatch):
-    monkeypatch.setattr(keeper, "request", FakeKeeper())
+def test_position_preview_requires_a_session(mcp, monkeypatch):
+    fake = FakeKeeper()
+    monkeypatch.setattr(keeper, "request", fake)
     preview = invoke(mcp, "preview_close", {"trade_id": 7})
-    assert preview["addr"] is None
+    assert preview["code"] == "SIGNED_OUT"
+    assert fake.calls == []
 
 
 def test_reference_price_is_only_for_market_orders(mcp, monkeypatch):
@@ -1300,19 +1316,27 @@ def test_logged_and_returned_errors_redact_the_session_token(mcp, monkeypatch, c
 
 def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
     monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s")
-    monkeypatch.setenv("SAI_LCD_ENDPOINT", "https://lcd.example/?apikey=s")
+    monkeypatch.setenv(
+        "SAI_LCD_ENDPOINT", "http://[::1]:9/fixture-lcd-path?key=fixture-lcd-query"
+    )
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")
     assert info["endpoints"] == {
         "keeper": "https://k.example:8443",
         "websocket": "wss://k.example:8443",
-        "lcd": "https://lcd.example/",
+        "lcd": "http://[::1]:9",
     }
     assert info["session"]["endpoint"] == "https://k.example"
     text = json.dumps(info)
-    for secret in ("user:pw", "key=", "apikey", "u:p@", "t=s"):
+    for secret in (
+        "user:pw",
+        "key=",
+        "fixture-lcd-path",
+        "fixture-lcd-query",
+        "u:p@",
+        "t=s",
+    ):
         assert secret not in text
-    assert settings.public_url("http://[::1]:9/q?x=1") == "http://[::1]:9/q"
 
 
 def test_mcp_info_reports_versions_without_network(mcp, monkeypatch):
@@ -1404,6 +1428,8 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
         "serve",
         "--endpoint",
         "http://127.0.0.1:9/query",
+        "--lcd-endpoint",
+        "http://127.0.0.1:8/fixture-lcd-path?key=fixture-lcd-query",
     ]
     with subprocess.Popen(
         command,
@@ -1438,8 +1464,13 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     info = json.loads(called["content"][0]["text"])
     assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
     assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
+    assert info["endpoints"]["lcd"] == "http://127.0.0.1:8"
     assert info["trading"]["reason"] == "signed-out"
     assert "agent client should launch it" not in stderr
+    logs = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.jsonl"))
+    assert '"event":"mcp.server_start"' in logs
+    for secret in ("fixture-lcd-path", "fixture-lcd-query"):
+        assert secret not in json.dumps(called) + stderr + logs
 
 
 def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
