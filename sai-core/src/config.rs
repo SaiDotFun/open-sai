@@ -3,8 +3,6 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
-use toml_edit::Document;
-
 const SETTINGS: [(&str, &str, &str); 6] = [
     ("keeper", "endpoint", "keeper.endpoint"),
     ("keeper", "ws_endpoint", "keeper.ws_endpoint"),
@@ -101,28 +99,19 @@ pub fn list_config() -> io::Result<ConfigListing> {
     };
 
     // TOML parse errors can quote the original line, including credentials.
-    let document = Document::parse(&text).map_err(|_| {
+    let configured_keys = listing::configured_keys(&text).map_err(|_| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             format!("Cannot parse {} as TOML", path.display()),
         )
     })?;
-    let configured_keys = SETTINGS
-        .iter()
-        .filter_map(|&(section, key, name)| {
-            document
-                .get(section)?
-                .as_table_like()?
-                .get(key)
-                .map(|_| name)
-        })
-        .collect();
-
     Ok(ConfigListing {
         path,
         configured_keys,
     })
 }
+
+mod listing;
 
 #[cfg(all(test, unix))]
 mod tests {

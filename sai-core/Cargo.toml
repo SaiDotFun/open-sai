@@ -9,3 +9,4 @@ publish = false
 
 [dependencies]
 toml_edit.workspace = true
+toml_parser.workspace = true

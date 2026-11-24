@@ -92,3 +92,47 @@ fn malformed_config_fails_without_echoing_file_contents() {
     assert!(stderr.contains("config.toml"));
     assert!(!stderr.contains("fixture_secret"));
 }
+
+#[test]
+fn multiline_inline_table_is_invalid_in_toml_1_0() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    fs::write(
+        &path,
+        include_str!("fixtures/config-multiline-inline-table.toml"),
+    )
+    .unwrap();
+    let output = sai()
+        .env("SAI_HOME", root.path())
+        .args(["config", "list", "--json"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert!(
+        String::from_utf8(output.stderr)
+            .unwrap()
+            .contains("config.toml")
+    );
+}
+
+#[test]
+fn oversized_unknown_integers_do_not_hide_known_keys() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("config.toml");
+    let contents = include_str!("fixtures/config-oversized-unknown-integer.toml");
+    fs::write(&path, contents).unwrap();
+    let output = sai()
+        .env("SAI_HOME", root.path())
+        .args(["config", "list", "--json"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&output.stdout).unwrap(),
+        json!({"path": path, "configuredKeys": ["update.auto"]})
+    );
+    assert_eq!(fs::read_to_string(path).unwrap(), contents);
+}
