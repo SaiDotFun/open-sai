@@ -129,14 +129,18 @@ contains the error. In text mode, read stderr.
 | 5 | Outcome unknown | Keep `intentKey` and run `sai --json intent status ADDR --key KEY` against the original Keeper endpoint. Do not resubmit. |
 | 6 | Signed out or session expired | Ask the person to sign in in their terminal. |
 
-`retryable: true` means the request executed nothing. It does not carry
-approval over to a revised trade. For MCP errors, read the top-level `code`
+`retryable: true` means Sai classified the failure as a rejection. Get fresh
+confirmation for a revised trade. An intent wait can return its outcome and
+receipt beside the `error` object. For MCP errors, read the top-level `code`
 and follow the same recovery rules for `NOT_SENT`, `ADMISSION_REJECTED`,
 `OUTCOME_UNKNOWN`, `SIGNED_OUT`, and `SESSION_EXPIRED`.
 
 ## Digest Confirmation in MCP
 
-Each preview returns `previewDigest`. A `trade_*` call must send it back as
+A preview for a connected account returns `previewDigest`. If a signed-out
+`preview_open` returns `addr: null`, preview again for the connected account
+after sign-in, then ask for confirmation. A `trade_*` call must send the
+confirmed preview's digest as
 input `preview_digest`, and a market `trade_open` must also send the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
@@ -195,14 +199,21 @@ decision, refresh the preview and confirm the updated figures.
 
 ## CLI Trade Commands
 
-Each command's `--help` lists its parameters. These examples use `--dry-run`,
-a placeholder account, and an existing trade ID. They send nothing.
+Each command's `--help` lists its parameters. These open previews need no
+session and send no intent. Add `--as ADDR` when previewing for a connected
+account.
 
 ```bash
-sai --as 0xYOUR_ADDR --json trade open --market 0 --side long \
+sai --json trade open --market 0 --side long \
   --type market --amount 2 --leverage 2 --slippage 1 --dry-run
-sai --as 0xYOUR_ADDR --json trade open --market 0 --side long \
+sai --json trade open --market 0 --side long \
   --type limit --amount 2 --leverage 2 --price 60000 --slippage 1 --dry-run
+```
+
+For position previews, substitute the connected account and a trade ID
+from that account. Keep `--dry-run` while reviewing.
+
+```bash
 sai --as 0xYOUR_ADDR --json trade partial-close 42 --percent 50 --dry-run
 sai --as 0xYOUR_ADDR --json trade tpsl 42 --take-profit 70000 --dry-run
 sai --as 0xYOUR_ADDR --json trade leverage 42 --leverage 5 --dry-run
@@ -242,8 +253,10 @@ will send.
   position is at submit. For a quoted slice, show the person the collateral
   reduction and quoted notional and submit with the confirmed digest. If
   `quote.closedNotionalIsEstimate` is true, say the notional is an estimate.
-  If the oracle price is unavailable, show the USDC estimate from
-  `quote.closedNotionalUsdc`. Keeper sends the collateral delta to Perp.
+  If the collateral oracle price is unavailable, show the USDC estimate
+  from `quote.closedNotionalUsdc`. Sai requires a verifiable price to
+  submit the partial close. When the price is available, preview again
+  and ask for confirmation. Keeper sends the collateral delta to Perp.
   Perp applies the position state and oracle price at execution, so the
   executed notional can differ from the confirmed quote. The after-hours
   risk guard can also reduce the position before Perp closes the requested
