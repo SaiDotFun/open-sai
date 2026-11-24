@@ -34,7 +34,7 @@ from pydantic import ConfigDict, ValidationError
 from ..core import log as sai_log
 from ..core import log_queries
 from ..core import settings as sai_settings
-from ..core.errors import Code, McpStdioError, SaiError, describe
+from ..core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
 
@@ -1008,7 +1008,13 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
     try:
         settings = sai_settings.load(flags, warn=log.warning)
     except sai_settings.SettingsError as exc:
-        raise SaiError(f"sai mcp serve: {exc}", Code.INVALID_REQUEST) from exc
+        raise SaiError(
+            f"sai mcp serve: {exc}",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE
+            if isinstance(exc, sai_settings.InvalidEndpoint)
+            else None,
+        ) from exc
     with sai_log.bind(surface="mcp"):
         sai_log.event(
             "mcp.server_start",

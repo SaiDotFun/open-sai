@@ -53,6 +53,13 @@ class ConfigError(SettingsError):
         self.diagnostic = diagnostic
 
 
+class InvalidEndpoint(ConfigError):
+    """An endpoint setting contains a malformed URL."""
+
+    def __init__(self, diagnostic: str, detail: str | None = None) -> None:
+        super().__init__(diagnostic, diagnostic if detail is None else detail)
+
+
 @dataclass(frozen=True)
 class Invalid:
     """A value in the config file that failed its check, kept so `resolve`
@@ -222,7 +229,7 @@ def check_value(key: str, value: Any) -> str | bool | int:
             )
         return value
     if not isinstance(value, str):
-        raise SettingsError(f"Invalid value for {key}: expected a URL string")
+        raise InvalidEndpoint(f"Invalid value for {key}: expected a URL string")
     try:
         parts = urlsplit(value)
         hostname = parts.hostname
@@ -243,7 +250,7 @@ def check_value(key: str, value: Any) -> str | bool | int:
                 hostname = None
         if parts.scheme in spec.schemes and hostname:
             return value
-    raise SettingsError(
+    raise InvalidEndpoint(
         f"Invalid value for {key}: expected a URL starting with"
         f" {' or '.join(s + '://' for s in spec.schemes)}"
     )
@@ -298,6 +305,8 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
                 continue
             try:
                 values[key] = check_value(key, value)
+            except InvalidEndpoint as exc:
+                raise InvalidEndpoint(exc.diagnostic, f"{path}: {exc}") from None
             except SettingsError as exc:
                 if section not in LENIENT_SECTIONS:
                     raise ConfigError(str(exc), f"{path}: {exc}") from None
@@ -375,6 +384,8 @@ def resolve(
                 sources[spec.key] = layer if off else "invalid"
                 continue
             origin = spec.flag or spec.key if raw_flag is not None else spec.env
+            if isinstance(exc, InvalidEndpoint):
+                raise InvalidEndpoint(exc.diagnostic, f"{origin}: {exc}") from None
             raise SettingsError(f"{origin}: {exc}") from None
     logs_valid = "invalid" not in (sources["logs.enabled"], sources["logs.keep_days"])
     ws_key, http_key = "keeper.ws_endpoint", "keeper.endpoint"

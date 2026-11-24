@@ -165,10 +165,72 @@ def test_flag_and_env_override_the_file(monkeypatch):
     assert "SAI_ENDPOINT is set and overrides keeper.endpoint" in result.stderr
 
 
-def test_bad_flag_value_is_an_error():
-    result = sai("--endpoint", "keeper.example", "config", "list")
-    assert result.exit_code == 1
-    assert "--endpoint: Invalid value for keeper.endpoint" in result.stderr
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("source", ["flag", "env", "file"])
+@pytest.mark.parametrize(
+    "endpoint", ["https://[::1]:oops/path", "https://[::1/path", "keeper.example"]
+)
+def test_malformed_endpoint_during_resolution_is_a_usage_error(
+    tmp_path, monkeypatch, json_output, source, endpoint
+):
+    args = ["--json"] if json_output else []
+    if source == "flag":
+        args.extend(("--endpoint", endpoint))
+        origin = "--endpoint"
+    elif source == "env":
+        monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        origin = "SAI_ENDPOINT"
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f"[keeper]\nendpoint = {json.dumps(endpoint)}\n")
+        origin = str(path)
+
+    result = sai(*args, "config", "get", "keeper.endpoint")
+
+    assert result.exit_code == 2
+    message = (
+        f"{origin}: Invalid value for keeper.endpoint:"
+        " expected a URL starting with https:// or http://"
+    )
+    if json_output:
+        assert json.loads(result.stdout) == {
+            "error": {"code": "INVALID_REQUEST", "message": message, "retryable": False}
+        }
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+        assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "key"),
+    [
+        (("mcp", "serve", "--endpoint", "https://[::1]:oops/path"), "keeper.endpoint"),
+        (
+            ("watch", "price", "1", "--ws-endpoint", "wss://[::1]:oops/path"),
+            "keeper.ws_endpoint",
+        ),
+        (
+            (
+                "--endpoint",
+                "https://[::1]:oops/path",
+                "logs",
+                "intent",
+                "key",
+                "--offline",
+            ),
+            "keeper.endpoint",
+        ),
+    ],
+)
+def test_malformed_command_endpoint_is_a_usage_error(args, key):
+    result = sai("--json", *args)
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert result.stderr == ""
 
 
 def test_commands_use_the_configured_endpoint():
