@@ -672,7 +672,7 @@ def test_cast_login_refuses_foreign_typed_data(env: Env, keeper_auth) -> None:
 
 
 def test_login_requires_a_name_and_drops_the_old_flags(env: Env) -> None:
-    missing = env.run("auth", "login")
+    missing = env.run("auth", "login", "--addr", ADDR)
     assert missing.returncode == 2
     assert "Missing argument 'NAME'" in missing.stderr
     for flag in ("--account", "--wallet"):
