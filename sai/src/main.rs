@@ -105,7 +105,7 @@ impl Cli {
         operands: &[String],
         start_log: impl FnOnce(),
         writer: Option<&Arc<LogWriter>>,
-    ) -> Result<(), SaiError> {
+    ) -> Result<ExitCode, SaiError> {
         let flags = Flags {
             endpoint: self.endpoint,
             ws_endpoint: self.ws_endpoint,
@@ -115,7 +115,9 @@ impl Cli {
             Command::Auth { command } => {
                 auth::dispatch(command, self.account.as_deref(), &flags, env, json, events)
             }
-            Command::Intent { command, .. } => local::intent(command, &flags, env, json, events),
+            Command::Intent { command, .. } => {
+                return local::intent(command, self.account.as_deref(), &flags, env, json, events);
+            }
             Command::Config { command } => command.run(&flags, env, json),
             Command::Mcp(args) => args.run(
                 flags,
@@ -129,9 +131,10 @@ impl Cli {
             Command::Account { command } => command.run(&flags, env, json, events),
             Command::Watch { command } => command.run(&flags, env, events),
             Command::Trade { command } => {
-                trade::run(command, self.account.as_deref(), &flags, env, json, events)
+                return trade::run(command, self.account.as_deref(), &flags, env, json, events);
             }
         }
+        .map(|()| ExitCode::Ok)
     }
 }
 
@@ -235,7 +238,15 @@ fn main() -> process::ExitCode {
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
                 .and_then(|env| cli.run(env, json, events, operands, start_log, writer.as_ref()));
-            complete(result, usage_command, json && command != "mcp serve", home)
+            match result {
+                Ok(code) => (code, None),
+                Err(error) => complete(
+                    Err(error),
+                    usage_command,
+                    json && command != "mcp serve",
+                    home,
+                ),
+            }
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
@@ -336,6 +347,7 @@ fn usage(command: &str) -> String {
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
         "watch price" => " TOKEN_ID",
         "trade close" | "trade cancel" => " TRADE_ID",
+        "intent wait" => " KEY",
         "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
@@ -475,7 +487,7 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
             } else {
                 let consumed = match command {
                     "config get" | "config unset" | "intent status" | "intent local"
-                    | "auth use" | "auth logout" | "auth login" | "auth renew"
+                    | "intent wait" | "auth use" | "auth logout" | "auth login" | "auth renew"
                     | "account positions" | "account history" | "account balances"
                     | "watch positions" | "watch balances" | "watch price" => 1,
                     "config set" => 2,
@@ -516,14 +528,22 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
     while let Some(arg) = operands.next() {
         match arg {
             "--" if options => options = false,
-            "--key" if options && command == "intent status" => {
+            "--key" if options && matches!(command, "intent status" | "intent wait") => {
                 operands.next();
             }
-            "--addr" if options && command == "auth login" => {
+            "--addr" if options && matches!(command, "auth login" | "intent wait") => {
                 operands.next();
             }
-            arg if options && command == "intent status" && arg.starts_with("--key=") => {}
-            arg if options && command == "auth login" && arg.starts_with("--addr=") => {}
+            "--timeout" if options && command == "intent wait" => {
+                operands.next();
+            }
+            arg if options
+                && matches!(command, "intent status" | "intent wait")
+                && arg.starts_with("--key=") => {}
+            arg if options
+                && matches!(command, "auth login" | "intent wait")
+                && arg.starts_with("--addr=") => {}
+            arg if options && command == "intent wait" && arg.starts_with("--timeout=") => {}
             "--ws-endpoint" if options && websocket => {
                 operands.next();
             }
@@ -562,9 +582,17 @@ fn print_parse_error(
             return (ExitCode::Ok, None);
         }
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
+            if command == "intent wait" && json {
+                return complete(
+                    Err(SaiError::usage("Missing argument 'KEY'.")),
+                    Some(command),
+                    true,
+                    home,
+                );
+            }
             if matches!(
                 command,
-                "config" | "intent" | "auth" | "market" | "account" | "watch"
+                "config" | "intent" | "intent wait" | "auth" | "market" | "account" | "watch"
             ) && let Some(help) = help()
             {
                 let error = SaiError::usage(help);
