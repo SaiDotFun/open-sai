@@ -6,6 +6,7 @@ import json
 import os
 import queue
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -409,6 +410,42 @@ def test_reconciliation_hints_keep_endpoint_credentials_private(credential_in_pa
     assert error["hint"].endswith(
         f"intent status {TRADE_ADDR} --key {error['intentKey']}"
     )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+def test_sigint_after_keeper_receives_intent_reports_unknown():
+    requests = queue.Queue()
+    release = threading.Event()
+
+    def reply(key: str) -> None:
+        requests.put(key)
+        release.wait(timeout=15)
+
+    with submission_keeper(reply) as endpoint:
+        save_trade_session(endpoint)
+        with subprocess.Popen(
+            close_trade_args(endpoint),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as process:
+            try:
+                key = requests.get(timeout=10)
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                release.set()
+                if process.poll() is None:
+                    process.kill()
+    assert process.returncode == 5 and stderr == ""
+    error = json.loads(stdout)["error"]
+    assert error["code"] == "OUTCOME_UNKNOWN" and error["intentKey"] == key
+    assert (
+        error["hint"]
+        == f"sai --endpoint {endpoint} intent status {TRADE_ADDR} --key {key}"
+    )
+    [entry] = storage.list_pending(endpoint, TRADE_ADDR)
+    assert entry["intentKey"] == key and entry["status"] == "unknown"
 
 
 def test_two_processes_cannot_reserve_same_position(tmp_path, monkeypatch):

@@ -147,6 +147,10 @@ def request(
             error=str(exc), code=Code.OUTCOME_UNKNOWN if query == SUBMIT else exc.code
         )
         raise
+    except KeyboardInterrupt:
+        if query == SUBMIT:
+            outcome["code"] = Code.OUTCOME_UNKNOWN
+        raise
     finally:
         _log_request(endpoint, query, variables, token, started, outcome)
 
