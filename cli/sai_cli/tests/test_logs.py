@@ -2298,6 +2298,42 @@ def test_logs_run_before_attributes_gap_using_later_call_event(home):
     assert report["gaps"] == [gap]
 
 
+@pytest.mark.parametrize("cli_count", [1, log_queries.MAX_REPORT_ROWS + 1])
+def test_logs_run_paging_defers_rows_below_the_scan_frontier(home, cli_count):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+
+    def row(i: int, run_id: str) -> dict[str, Any]:
+        return {
+            "event": "command.start",
+            "runId": run_id,
+            "seq": i,
+            "ts": log.stamp(start + timedelta(milliseconds=i)),
+        }
+
+    early = [row(i, "target") for i in range(cli_count)]
+    buried = row(10_000, "target")
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(log.encode(line) for line in early)
+    )
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(buried)
+        + b"".join(
+            log.encode(row(10_001 + i, "other")) for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+
+    report = log_queries.run("target")
+    assert report["events"] == []
+    pages = []
+    while before := report.get("nextBefore"):
+        report = log_queries.run("target", before=before)
+        pages.append(report["events"])
+        assert len(pages) <= 3
+    assert [line for page in reversed(pages) for line in page] == [*early, buried]
+
+
 def test_earlier_intent_page_keeps_same_day_invocation_anchor(home, keeper_stub):
     endpoint, state = keeper_stub
     state.intents = [

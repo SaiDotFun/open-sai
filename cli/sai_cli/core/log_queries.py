@@ -489,13 +489,19 @@ def run(
         line for line in rows if line.get("event") != "log.dropped" and matches_id(line)
     ]
     runs.update(run_id for line in events if (run_id := _id(line, "runId")))
-    entries = [("events", line) for line in events if _in_window(line, cutoff)]
+
+    def in_page(line: LogLine) -> bool:
+        return _in_window(line, cutoff) and (
+            not scan_truncated or frontier is None or line["ts"] >= frontier
+        )
+
+    entries = [("events", line) for line in events if in_page(line)]
     entries.extend(
         ("gaps", line)
         for line in rows
         if line.get("event") == "log.dropped"
         and _id(line, "runId") in runs
-        and _in_window(line, cutoff)
+        and in_page(line)
     )
     entries.sort(key=lambda entry: log.event_order(entry[1]))
     return _limit(
