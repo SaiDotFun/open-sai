@@ -20,6 +20,10 @@ IntentIdentity = tuple[str, str, str]  # Keeper endpoint, account, key
 TRADE_DECIMAL = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]{1,18})?")
 
 
+def is_trade_integer(value: str) -> bool:
+    return value.isascii() and value.isdecimal()
+
+
 @dataclass
 class SubmissionTrace:
     identity: IntentIdentity | None = None

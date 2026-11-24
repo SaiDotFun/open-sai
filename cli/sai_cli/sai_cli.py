@@ -1207,7 +1207,7 @@ class TradeInt(click.IntRange):
     def convert(
         self, value: Any, param: click.Parameter | None, ctx: click.Context | None
     ) -> int:
-        if isinstance(value, str) and not value.isascii():
+        if isinstance(value, str) and not intents.is_trade_integer(value):
             self.fail(f"{value!r} is not a valid integer.", param, ctx)
         return super().convert(value, param, ctx)
 

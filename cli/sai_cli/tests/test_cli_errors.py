@@ -104,7 +104,7 @@ def test_command_failures_use_one_json_envelope(args, exit_code, code):
         ("partial-close", {"trade_id": "7"}, "--percent"),
     ],
 )
-@pytest.mark.parametrize("malformed", ["3٣", "bad"])
+@pytest.mark.parametrize("malformed", ["3٣", "bad", "3_0", " 7 ", "+7"])
 def test_trade_rejects_malformed_numbers_as_usage_errors(
     command, defaults, field, malformed
 ):
