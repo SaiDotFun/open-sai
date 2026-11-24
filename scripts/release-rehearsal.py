@@ -139,24 +139,25 @@ class Cancellation:
 
     @contextmanager
     def defer(self) -> Generator[None, None, None]:
-        # Register cleanup before delivering a signal received during acquisition.
+        already_received = self.signum
         self.deferred = True
         try:
             yield
         finally:
             self.deferred = False
-            if self.signum is not None:
+            if already_received is None and self.signum is not None:
                 raise RehearsalInterrupted(self.signum)
 
 
 CANCELLATION = Cancellation()
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
 
 
 @contextmanager
 def cancel_on_signal() -> Generator[None, None, None]:
     previous = {}
     try:
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in STOP_SIGNALS:
             previous[sig] = signal.signal(sig, CANCELLATION.receive)
         yield
     finally:
@@ -164,6 +165,31 @@ def cancel_on_signal() -> Generator[None, None, None]:
             if handler is not None:
                 signal.signal(sig, handler)
         CANCELLATION.signum = None
+
+
+@contextmanager
+def cleanup_stack() -> Generator[ExitStack, None, None]:
+    cleanup = ExitStack()
+
+    def close_stack() -> None:
+        # A signal sent to another thread can still invoke Python's handler.
+        with CANCELLATION.defer():
+            previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+            try:
+                cleanup.close()
+            finally:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+    try:
+        try:
+            yield cleanup
+        finally:
+            close_stack()
+    except RehearsalInterrupted:
+        # A first signal can arrive before close_stack() has blocked interruptions.
+        # ExitStack removes callbacks as they run, so closing again is safe.
+        close_stack()
+        raise
 
 
 def require(condition: bool, message: str) -> None:
@@ -207,7 +233,8 @@ def owned_process(
     stdout: int | None = subprocess.PIPE,
     stderr: int | IO[bytes] | None = subprocess.PIPE,
 ) -> Generator[subprocess.Popen[bytes], None, None]:
-    with ExitStack() as cleanup:
+    with cleanup_stack() as cleanup:
+        # Register cleanup before delivering a signal received during acquisition.
         with CANCELLATION.defer():
             process = cleanup.enter_context(
                 subprocess.Popen(
@@ -1084,7 +1111,7 @@ def main() -> int:
             diagnostics = directory / "child-output.log"
             diagnostics.touch(mode=0o600)
             print(f"Child output log: {diagnostics}", file=sys.stderr)
-        with cancel_on_signal(), ExitStack() as cleanup:
+        with cancel_on_signal(), cleanup_stack() as cleanup:
             with CANCELLATION.defer():
                 scratch = cleanup.enter_context(
                     tempfile.TemporaryDirectory(

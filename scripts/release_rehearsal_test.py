@@ -12,6 +12,7 @@ import tempfile
 import time
 import unittest
 import urllib.request
+from contextlib import suppress
 from pathlib import Path
 from unittest.mock import patch
 
@@ -199,51 +200,85 @@ class ProcessTest(unittest.TestCase):
                         self.fail("Descendant still holds the lock")
                     time.sleep(0.01)
 
-    def test_parent_signals_stop_the_group_and_remove_the_home(self) -> None:
+    def assert_interruption_cleans_up(
+        self, sig: signal.Signals, teardown_hook: str = ""
+    ) -> None:
         script = Path(__file__).with_name("release-rehearsal.py").resolve()
         parent = """
-import runpy, sys, tempfile
+import runpy, signal, sys, tempfile
 from pathlib import Path
 entry = runpy.run_path(sys.argv[1])
+hook = sys.argv[3]
+
+def interrupt_at_teardown(frame, event, arg):
+    if event == "call" and frame.f_code.co_name == hook:
+        sys.setprofile(None)
+        signal.raise_signal(signal.SIGTERM)
+
 try:
-    with entry["cancel_on_signal"](), tempfile.TemporaryDirectory(dir=sys.argv[2]) as home:
-        with entry["owned_process"](tuple(sys.argv[3:]), Path(home), {"HOME": home}) as child:
+    with entry["cancel_on_signal"](), entry["cleanup_stack"]() as cleanup:
+        home = cleanup.enter_context(tempfile.TemporaryDirectory(dir=sys.argv[2]))
+        with entry["owned_process"](tuple(sys.argv[4:]), Path(home), {"HOME": home}) as child:
             if entry["ReplyReader"](child.stdout).line("descendant") != "locked":
                 sys.exit(2)
-            print(home, flush=True)
-            child.communicate()
+            print(child.pid, home, flush=True)
+            if hook:
+                sys.setprofile(interrupt_at_teardown)
+            else:
+                child.communicate()
 except entry["RehearsalInterrupted"] as exc:
     sys.exit(128 + exc.signum)
 """
-        with tempfile.TemporaryDirectory() as temp:
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            REHEARSAL["owned_process"](
+                (
+                    sys.executable,
+                    "-c",
+                    parent,
+                    script,
+                    temp,
+                    teardown_hook,
+                    sys.executable,
+                    "-c",
+                    "import subprocess, sys; subprocess.run(sys.argv[1:])",
+                    sys.executable,
+                    "-c",
+                    LOCK_DESCENDANT,
+                    Path(temp) / "descendant.lock",
+                ),
+                Path(temp),
+                {},
+            ) as process,
+        ):
             lock = Path(temp) / "descendant.lock"
-            for sig in (signal.SIGTERM, signal.SIGINT):
-                with (
-                    self.subTest(signal=sig.name),
-                    REHEARSAL["owned_process"](
-                        (
-                            sys.executable,
-                            "-c",
-                            parent,
-                            script,
-                            temp,
-                            sys.executable,
-                            "-c",
-                            LOCK_DESCENDANT,
-                            lock,
-                        ),
-                        Path(temp),
-                        {},
-                    ) as process,
-                ):
-                    home = Path(
-                        REHEARSAL["ReplyReader"](process.stdout).line("parent ready")
-                    )
+            group, home_name = (
+                REHEARSAL["ReplyReader"](process.stdout)
+                .line("parent ready")
+                .split(" ", 1)
+            )
+            home = Path(home_name)
+            try:
+                if not teardown_hook:
                     self.assertTrue(home.is_dir())
                     process.send_signal(sig)
-                    self.assertEqual(process.wait(timeout=5), 128 + sig)
-                    self.assertFalse(home.exists())
-                    self.assert_group_released(lock)
+                self.assertEqual(process.wait(timeout=5), 128 + sig)
+                self.assertFalse(home.exists())
+                self.assert_group_released(lock)
+            except BaseException:
+                with suppress(ProcessLookupError):
+                    os.killpg(int(group), signal.SIGKILL)
+                raise
+
+    def test_parent_signals_stop_the_group_and_remove_the_home(self) -> None:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig.name):
+                self.assert_interruption_cleans_up(sig)
+
+    def test_sigterm_during_teardown_stops_the_group_and_removes_the_home(self) -> None:
+        for hook in ("close_stack", "stop_process_group"):
+            with self.subTest(hook=hook):
+                self.assert_interruption_cleans_up(signal.SIGTERM, hook)
 
     def test_partial_reply_times_out(self) -> None:
         read, write = os.pipe()
