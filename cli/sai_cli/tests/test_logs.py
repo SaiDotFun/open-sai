@@ -20,14 +20,14 @@ import tracemalloc
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from click.testing import CliRunner
-from loopback_keeper import position_data
+from loopback_keeper import POSITION_ROUTE, PositionKeeperHandler, position_data
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
@@ -177,7 +177,7 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
     """A Keeper on loopback answering prices, markets, and intent records."""
     state = Keeper()
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.requests.append(body)
@@ -186,6 +186,8 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
             query = body["query"]
             if query == keeper.POSITION:
                 value: dict[str, Any] = {"data": position_data(body["variables"])}
+            elif query == keeper.ROUTE:
+                value = {"data": POSITION_ROUTE}
             elif state.errors is not None:
                 value = {"errors": state.errors}
             elif "recordUserIntent" in query and state.ack_tx_hash is not None:
@@ -686,7 +688,17 @@ def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper
     save_session(base)
     state.errors = [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]
     result = CliRunner().invoke(
-        main, ["--json", "--endpoint", base, "trade", "close", "7"]
+        main,
+        [
+            "--json",
+            "--endpoint",
+            base,
+            "--lcd-endpoint",
+            base.removesuffix("/query"),
+            "trade",
+            "close",
+            "7",
+        ],
     )
     assert result.exit_code == 4 and result.stderr == ""
     error = json.loads(result.stdout)["error"]
@@ -1930,7 +1942,17 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
     request_hash = "ab" * 32
     state.ack_tx_hash = request_hash.upper()
     submitted = subprocess.run(
-        [*sai_command(), "--json", "--endpoint", endpoint, "trade", "close", "7"],
+        [
+            *sai_command(),
+            "--json",
+            "--endpoint",
+            endpoint,
+            "--lcd-endpoint",
+            endpoint.removesuffix("/query"),
+            "trade",
+            "close",
+            "7",
+        ],
         env={"SAI_HOME": str(home), "PATH": os.defpath},
         capture_output=True,
         text=True,
@@ -1949,7 +1971,7 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
             endpoint.removesuffix("/query"): "http://127.0.0.1:43210",
         },
     )
-    assert state.authorizations == [None, f"Bearer {token}"]
+    assert state.authorizations == [None, None, f"Bearer {token}"]
     record = {
         "intentKey": key,
         "kind": "CLOSE_POSITION",
@@ -2559,7 +2581,16 @@ def test_invalid_hash_and_keeper_text_are_excluded_from_reports(home, keeper_stu
     save_session(endpoint)
     secret = "some-opaque-credential-unrelated-to-the-active-session"
     state.ack_tx_hash = secret
-    code, output = run_cli("--json", "--endpoint", endpoint, "trade", "close", "7")
+    code, output = run_cli(
+        "--json",
+        "--endpoint",
+        endpoint,
+        "--lcd-endpoint",
+        endpoint.removesuffix("/query"),
+        "trade",
+        "close",
+        "7",
+    )
     assert code == 0
     key = json.loads(output)["intentKey"]
     submitted = events(home, "intent.submitted")[0]

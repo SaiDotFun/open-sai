@@ -425,6 +425,24 @@ def trading_contract(endpoint: str, lcd: str) -> str:
     return route["contractAddress"]
 
 
+def verify_position_owner(endpoint: str, lcd: str, addr: str, trade_id: int) -> None:
+    """Verify the live contract target before accepting a position intent."""
+    contract = trading_contract(endpoint, lcd)
+    raw = smart_value(
+        lcd,
+        contract,
+        {"get_trade_raw": {"trader": addr, "index": trade_id}},
+        fresh=True,
+    )
+    if (
+        not isinstance(raw, dict)
+        or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+    ):
+        raise ValueError(f"Unable to verify contract position {trade_id}")
+    if not keeper.same_account(addr, raw.get("user")):
+        raise PositionOwnerMismatch("Contract position belongs to a different account")
+
+
 def snapshot(
     endpoint: str,
     lcd: str,

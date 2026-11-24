@@ -36,13 +36,19 @@ CLI_POSITION_ACTIONS = (
     ("leverage", "7", "--leverage", "3"),
     ("tpsl", "7", "--take-profit", "120"),
 )
+MCP_POSITION_ACTIONS = (
+    ("close", {"trade_id": 7}),
+    ("leverage", {"trade_id": 7, "leverage": "3"}),
+    ("tpsl", {"trade_id": 7, "take_profit": "120"}),
+)
 
 
 @dataclass
 class Position:
     collateral: int = 4_000_000
     trader: str = TRADER
-    contract_owner: str = TRADER
+    contract_owner: str | None = TRADER
+    contract_position_unavailable: bool = False
     position_reads: int = 0
     trade_type: str = "trade"
     keeper_market_open: bool = True
@@ -197,6 +203,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
                 position.position_reads += 1
+                if position.contract_position_unavailable:
+                    self.reply({}, status=503)
+                    return
                 index = message["get_trade_raw"]["index"]
                 if index != 7:
                     self.reply(
@@ -481,9 +490,7 @@ def test_cli_refuses_logout_during_keeper_position_read(position_service, comman
 @pytest.mark.parametrize(
     ("action", "args"),
     [
-        ("close", {"trade_id": 7}),
-        ("leverage", {"trade_id": 7, "leverage": "3"}),
-        ("tpsl", {"trade_id": 7, "take_profit": "120"}),
+        *MCP_POSITION_ACTIONS,
         ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
         ("partial_close", {"trade_id": 7, "percent": 50}),
     ],
@@ -516,6 +523,47 @@ def test_mcp_refuses_another_accounts_position(position_service, action, args):
             assert not (storage.home() / "intents.sqlite3").exists()
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("action", "args"), MCP_POSITION_ACTIONS)
+@pytest.mark.parametrize("scenario", ["foreign-owner", "missing-owner", "unavailable"])
+def test_mcp_rechecks_contract_position_before_admission(
+    position_service, action, args, scenario
+):
+    position, base_url = position_service
+    position.trader = ADDR
+    position.cache_contract_queries = True
+
+    async def run():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            position_reads = position.position_reads
+            if scenario == "unavailable":
+                position.contract_position_unavailable = True
+            else:
+                position.contract_owner = (
+                    OTHER_TRADER if scenario == "foreign-owner" else None
+                )
+
+            result = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            if scenario == "unavailable":
+                assert result["code"] == "PREVIEW_MISMATCH"
+                assert "Unable to verify contract state" in result["error"]
+            else:
+                assert result == {
+                    "code": "INVALID_REQUEST",
+                    "error": "Contract position belongs to a different account",
+                }
+            assert "preview" not in result
+            assert position.position_reads == position_reads + 1
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(run())
 
 
 def test_mcp_refuses_another_account_during_quote_rebuild(position_service):

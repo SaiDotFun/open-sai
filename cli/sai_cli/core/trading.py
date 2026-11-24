@@ -367,6 +367,9 @@ def _position_intent(
 
     if dry_run:
         return {**preview, "estimates": estimate(preview)}
+    if lcd is None:
+        raise ValueError("Cannot verify the position without an LCD")
+    margin.verify_position_owner(endpoint, lcd, addr, trade_id)
     _checked(before_submit, preview, estimate)
     return intents.submit(endpoint, get_session(), payload)
 

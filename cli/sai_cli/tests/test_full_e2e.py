@@ -18,9 +18,10 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
-from loopback_keeper import position_data
+from loopback_keeper import POSITION_ROUTE, PositionKeeperHandler, position_data
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
@@ -43,11 +44,13 @@ def save_trade_session(endpoint: str) -> None:
 
 @contextmanager
 def submission_keeper(reply: Callable[[str], dict | None]) -> Generator[str]:
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             if body["query"] == keeper.POSITION:
                 response = {"data": position_data(body["variables"])}
+            elif body["query"] == keeper.ROUTE:
+                response = {"data": POSITION_ROUTE}
             else:
                 assert body["query"] == keeper.SUBMIT
                 response = reply(body["variables"]["input"]["intentKey"])
@@ -75,7 +78,19 @@ def submission_keeper(reply: Callable[[str], dict | None]) -> Generator[str]:
 
 
 def close_trade_args(endpoint: str) -> list[str]:
-    return [*_resolve_cli(), "--endpoint", endpoint, "--json", "trade", "close", "7"]
+    return [*cli_at(endpoint), "trade", "close", "7"]
+
+
+def cli_at(endpoint: str) -> list[str]:
+    url = urlsplit(endpoint)
+    return [
+        *_resolve_cli(),
+        "--endpoint",
+        endpoint,
+        "--lcd-endpoint",
+        f"{url.scheme}://{url.netloc}",
+        "--json",
+    ]
 
 
 @pytest.fixture
@@ -245,7 +260,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
     recorded = []
     history_visible = False
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             query = request["query"]
@@ -257,6 +272,8 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
                 return
             if query == keeper.POSITION:
                 data = position_data(request["variables"])
+            elif query == keeper.ROUTE:
+                data = POSITION_ROUTE
             elif "userIntents" in query:
                 key = recorded[0]["intentKey"]
                 data = {
@@ -316,7 +333,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
 
     def invoke(*args):
         return subprocess.run(
-            [*_resolve_cli(), "--endpoint", endpoint, "--json", *args],
+            [*cli_at(endpoint), *args],
             capture_output=True,
             check=False,
             text=True,
@@ -777,7 +794,7 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
     recorded = []
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self):
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             query = request["query"]
@@ -789,6 +806,8 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
                 return
             if query == keeper.POSITION:
                 data = position_data(request["variables"])
+            elif query == keeper.ROUTE:
+                data = POSITION_ROUTE
             else:
                 assert "userIntents" in query, query
                 data = {"userIntents": []}
@@ -817,7 +836,7 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
 
     def invoke(*args):
         return subprocess.run(
-            [*_resolve_cli(), "--endpoint", endpoint, "--json", *args],
+            [*cli_at(endpoint), *args],
             capture_output=True,
             check=False,
             text=True,
