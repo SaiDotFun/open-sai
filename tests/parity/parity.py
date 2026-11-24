@@ -88,6 +88,7 @@ class Case:
     retry_expect: int | None = None
     mcp_calls: list[dict[str, Any]] | None = None
     rust: dict[str, Any] | None = None
+    rust_early_position_reads: int = 0
     accepted_difference: str | None = None
     client_seed: str | None = None
     accepted_divergence: str | None = None
@@ -563,6 +564,35 @@ def matches_overview_help_difference(
     return not differences(adjusted_reference, candidate)
 
 
+def matches_early_position_reads(
+    reference: Observation, candidate: Observation, expected_reads: int
+) -> bool:
+    name = "logs/cli.jsonl"
+    entry = candidate.files.get(name)
+    if entry is None:
+        return False
+    remaining = []
+    reads = 0
+    for event in entry.data:
+        sequence = event.get("seq")
+        if type(sequence) is not int:
+            return False
+        if (event.get("event"), event.get("operation"), event.get("status")) == (
+            "keeper.request",
+            "position",
+            "ok",
+        ):
+            if not remaining or sequence != remaining[-1]["seq"] + reads + 1:
+                return False
+            reads += 1
+        else:
+            remaining.append({**event, "seq": sequence - reads})
+    if reads != expected_reads:
+        return False
+    files = {**candidate.files, name: replace(entry, data=remaining)}
+    return not differences(reference, replace(candidate, files=files))
+
+
 def safe_observe(
     case: Case,
     binary: list[str],
@@ -685,6 +715,14 @@ def run_case(
     else:
         diffs = differences(left, right)
     expected = case.accepted_difference if rust else None
+    if (
+        rust
+        and diffs
+        and case.rust_early_position_reads
+        and matches_early_position_reads(left, right, case.rust_early_position_reads)
+    ):
+        diffs = []
+        expected = "Rust checks Keeper ownership before reading the LCD network."
     if (
         diffs
         and case.expected_overview_help

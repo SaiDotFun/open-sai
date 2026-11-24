@@ -105,6 +105,8 @@ submissions.
 The standalone runner projects out Python-only estimates when comparing to
 Rust. It checks Python's estimate reads and Rust's quote reads separately.
 The stale-index case records Python's retries and Rust's immediate refusal.
+The wrong-chain cases account for the indexed reads Rust logs before the LCD
+network check. They still compare the rest of each log.
 
 ```sh
 SAI_PARITY_PYTHON=/path/to/pinned/.venv/bin/sai \

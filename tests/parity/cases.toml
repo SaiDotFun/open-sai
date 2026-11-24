@@ -953,6 +953,7 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.message" = "Keeper trading route and LCD network do not match" }
 rust = { wire = ["oneClickTrading", "trade", "node_info"] }
+rust_early_position_reads = 1
 
 [[case]]
 name = "trade-margin-recheck-height"
@@ -1167,6 +1168,7 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "Keeper trading route and LCD network do not match. Use an LCD on Keeper's chain and request a new preview." }
 rust = { wire = ["oneClickTrading", "trade", "node_info", "oneClickTrading", "trade", "node_info"] }
+rust_early_position_reads = 2
 
 [[case]]
 name = "trade-partial-close-accepted"
