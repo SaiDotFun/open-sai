@@ -182,6 +182,20 @@ pub fn intent(
 }
 
 pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+    storage_event_with_endpoint(events, event, None);
+}
+
+pub(crate) fn storage_event_with_endpoint(
+    events: EventContext<'_>,
+    event: StorageEvent<'_>,
+    trade_endpoint: Option<&str>,
+) {
+    let endpoint_id = || {
+        trade_endpoint.map_or(
+            Field::Scalar(serde_json::Value::Null),
+            Field::endpoint_identity,
+        )
+    };
     match event {
         StorageEvent::IntentReserved {
             key,
@@ -203,6 +217,7 @@ pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
                         json!((!entity.is_empty()).then_some(entity)).into(),
                     ),
                     ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("endpointId", endpoint_id()),
                 ],
             );
         }
@@ -229,6 +244,7 @@ pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
                     ("status", json!(status.as_str()).into()),
                     ("addr", json!(addr).into()),
                     ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("endpointId", endpoint_id()),
                     ("code", json!(code).into()),
                 ],
             );

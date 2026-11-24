@@ -107,7 +107,9 @@ pub fn run(
     events: EventContext<'_>,
 ) -> Result<(), SaiError> {
     let settings = load_settings(flags, env)?;
-    let log_storage = |event: StorageEvent<'_>| local::storage_event(events, event);
+    let log_storage = |event: StorageEvent<'_>| {
+        local::storage_event_with_endpoint(events, event, Some(settings.endpoint()))
+    };
     let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let trading = Trading::new(settings.endpoint(), &storage, events);
     let (preview, dry_run, allow_concurrent_open, supplied_price) = match command {

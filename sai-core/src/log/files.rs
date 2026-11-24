@@ -100,6 +100,71 @@ impl LogDir {
         }
     }
 
+    #[cfg(unix)]
+    pub fn endpoint_key(&self) -> io::Result<[u8; 32]> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        use rustix::fs::{AtFlags, renameat, unlinkat};
+
+        const KEY: &str = ".endpoint-key";
+
+        if let Some(key) = self.read_endpoint_key(KEY)? {
+            return Ok(key);
+        }
+        // Python writers use this same lock and publish the key by rename.
+        let lock = self.private_file(".endpoint-key.lock", false)?;
+        lock.lock()?;
+        if let Some(key) = self.read_endpoint_key(KEY)? {
+            return Ok(key);
+        }
+        let mut key = [0; 32];
+        SystemRandom::new()
+            .fill(&mut key)
+            .map_err(|_| io::Error::other("log endpoint identity key generation failed"))?;
+        let staged = format!(".endpoint-key-{}", uuid::Uuid::new_v4().simple());
+        let mut output = self.private_file(&staged, true)?;
+        let result = output.write_all(&key).and_then(|()| {
+            renameat(&self.0, staged.as_str(), &self.0, KEY).map_err(io::Error::from)
+        });
+        if result.is_err() {
+            let _ = unlinkat(&self.0, staged.as_str(), AtFlags::empty());
+        }
+        result.map(|()| key)
+    }
+
+    #[cfg(unix)]
+    fn read_endpoint_key(&self, name: &str) -> io::Result<Option<[u8; 32]>> {
+        use rustix::{
+            fs::{Mode, OFlags, openat},
+            process::geteuid,
+        };
+        use std::{io::Read, os::unix::fs::MetadataExt};
+
+        let file = match openat(
+            &self.0,
+            name,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        ) {
+            Ok(fd) => File::from(fd),
+            Err(rustix::io::Errno::NOENT) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let info = file.metadata()?;
+        if !info.is_file()
+            || info.nlink() != 1
+            || info.uid() != geteuid().as_raw()
+            || info.mode() & 0o077 != 0
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let mut bytes = Vec::with_capacity(33);
+        file.take(33).read_to_end(&mut bytes)?;
+        bytes
+            .try_into()
+            .map(Some)
+            .map_err(|_| io::ErrorKind::InvalidData.into())
+    }
+
     pub fn prune(&self, keep_days: u64, today: NaiveDate) -> io::Result<()> {
         let (marker, created) = match self.private_file(PRUNE_MARKER, true) {
             Ok(marker) => (marker, true),

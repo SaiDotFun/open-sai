@@ -111,6 +111,34 @@ def test_numeric_keeper_price_rounds_to_even(
             )
 
 
+def test_python_reads_rust_trade_events_offline(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    python, rust = trade_pair
+    with loopback("trade-accepted") as endpoints:
+        home = tmp_path / "shared"
+        seed_home(home, endpoints, "session")
+        code, result, _ = run(rust, home, endpoints, CLOSE, python=False)
+        assert code == 0
+        key = result["intentKey"]
+        code, report, _ = run(
+            python, home, endpoints, ("logs", "intent", key, "--offline"), python=True
+        )
+        assert code == 0
+        assert report["intentKey"] == key
+        assert report["txHash"] == TRADE_REQUEST_HASH.lower()
+        assert len(endpoints.wire) == 1
+        events = {event["event"]: event for event in report["events"]}
+        trade_events = [
+            events[name]
+            for name in ("intent.reserved", "intent.submitted", "intent.status")
+        ]
+        assert len({event["endpointId"] for event in trade_events}) == 1
+        endpoint_key = home / "sai" / "logs" / ".endpoint-key"
+        assert endpoint_key.stat().st_size == 32
+        assert endpoint_key.stat().st_mode & 0o777 == 0o600
+
+
 def trade_events(home: Path, key: str, endpoint: str) -> list[tuple[str, str | None]]:
     events = [
         json.loads(line)

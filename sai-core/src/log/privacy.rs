@@ -2,6 +2,7 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::endpoint::Endpoint;
 
@@ -35,6 +36,7 @@ pub enum Field {
     Untrusted(String),
     Arg(String),
     Endpoint(String),
+    EndpointIdentity([u8; 32]),
     Array(Vec<Field>),
     Object(Vec<(String, Field)>),
     Scalar(Value),
@@ -57,6 +59,20 @@ impl From<Value> for Field {
 }
 
 impl Field {
+    /// Keep only the intermediate digest until the writer keys it.
+    pub fn endpoint_identity(endpoint: &str) -> Self {
+        let site = origin(endpoint);
+        if site != REDACTED_URL
+            && let Some(url) = Endpoint::split(endpoint.trim())
+        {
+            let path = if url.path.is_empty() { "/" } else { &url.path };
+            return Self::EndpointIdentity(
+                Sha256::digest(format!("{site}{path}?{}", url.query)).into(),
+            );
+        }
+        Self::Scalar(Value::Null)
+    }
+
     pub fn argv(args: impl IntoIterator<Item = String>) -> Self {
         Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Arg).collect())
     }
@@ -69,6 +85,7 @@ impl Field {
             Self::Untrusted(text) => Self::Untrusted(copy_text(&text, budget, tokens)),
             Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
             Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
+            Self::EndpointIdentity(_) => self,
             Self::Scalar(Value::Number(number))
                 if number.is_i64()
                     || number.is_u64()
@@ -123,6 +140,7 @@ impl Field {
             Self::Untrusted(text) => Value::String(scrub(&text, tokens, &URL_REST, true)),
             Self::Arg(text) => Value::String(scrub(&text, tokens, &URL_REST, false)),
             Self::Endpoint(text) => Value::String(origin(&text)),
+            Self::EndpointIdentity(_) => Value::Null,
             Self::Array(items) => {
                 Value::Array(items.into_iter().map(|item| item.clean(tokens)).collect())
             }
