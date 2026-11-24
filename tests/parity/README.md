@@ -30,6 +30,16 @@ executable path or a command on `PATH` to compare a port. Arguments belong in
 `cases.toml`. The runner prints a Markdown report to stdout and exits 1 if
 any selected case differs or fails its expectations.
 
+The intent wait replays use Python commit
+`48e38755c5e391057b4a0a9b0a313e96f5964176` from PR #70. Set the reference
+launcher separately from the C4 parity reference.
+
+```sh
+SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \
+SAI_PARITY_BIN=/absolute/path/to/rust/sai \
+uv run pytest tests/parity/test_intent_wait.py
+```
+
 `PASS` means the selected invocation or MCP tool call matched. `LISTED`
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command that needs another fixture.
