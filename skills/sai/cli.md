@@ -87,8 +87,10 @@ token is, tell them:
 
 - It is the same session token Sai Web keeps in the browser.
 - It lasts as long as Keeper issues it, 30 days in production.
-- It authorizes all trading on the funds deposited in their Sai account.
-  Withdrawals still need their wallet.
+- Anyone with the token can trade with their Sai Balance and request
+  one-click withdrawals of idle funds. Those withdrawals can only go to
+  the wallet that owns the session. Keep the token out of clipboard sync,
+  chats, and shared notes.
 - Keeper cannot revoke it. `sai auth logout` deletes only the local copy, and
   signing out of Sai Web does not sign out the CLI.
 
