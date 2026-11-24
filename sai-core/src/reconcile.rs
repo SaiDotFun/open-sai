@@ -1,6 +1,9 @@
 //! Reconcile local intent rows against Keeper's authoritative outcomes.
 
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use serde_json::{Map, Value, json};
 
@@ -14,6 +17,8 @@ use crate::{
 const OUTCOME_NOT_INDEXED: &str = "market_order_outcome_not_indexed";
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(2);
 const HISTORY_RETRY_DELAY: Duration = Duration::from_millis(250);
+const HISTORY_PAGE_SIZE: usize = 25;
+const HISTORY_MAX_PAGES: usize = 4;
 pub(crate) const PENDING_HINT: &str = "Fill pending at the next oracle price. Do not resubmit.";
 pub(crate) const UNINDEXED_HINT: &str =
     "The order may have filled. Check positions and run intent status again. Do not resubmit.";
@@ -131,7 +136,9 @@ pub async fn reconcile(
         (Value::Array(_), None) => {}
         (other, _) if !truthy(&other) => {}
         (Value::String(_) | Value::Object(_), None) => {}
-        (Value::String(_) | Value::Object(_), Some(_)) => return Err(SaiError::internal()),
+        (Value::String(_) | Value::Object(_), Some(_)) => {
+            return Err(SaiError::internal());
+        }
         _ => return Err(incomplete_data("TypeError")),
     }
     let Some(account) = account else {
@@ -238,7 +245,7 @@ async fn reconcile_key(
     if (outcome == Outcome::TerminalFilled && (row["kind"].is_null() || perp_history(&row["kind"])))
         || (outcome == Outcome::Pending && row["lifecycleStep"] != "pending_exec")
     {
-        let matches = read_history(context, row).await?;
+        let matches = read_history(context, row).await;
         let established_fill = !matches.is_empty() && outcome == Outcome::Pending;
         data.insert("matchedTradeHistory".into(), json!(matches));
         if established_fill {
@@ -298,73 +305,96 @@ fn store_outcome(
     )?)
 }
 
-fn normalize_hash(value: &Value) -> Result<String, SaiError> {
-    if !truthy(value) {
-        return Ok(String::new());
-    }
-    let lower = value
-        .as_str()
-        .ok_or_else(SaiError::internal)?
-        .to_lowercase();
-    Ok(lower.strip_prefix("0x").unwrap_or(&lower).into())
+fn normalize_hash(value: &Value) -> String {
+    let hash = value.as_str().unwrap_or_default();
+    hash.strip_prefix("0x")
+        .or_else(|| hash.strip_prefix("0X"))
+        .unwrap_or(hash)
+        .to_lowercase()
 }
 
-async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Result<Vec<Value>, SaiError> {
-    let hash = normalize_hash(&row["txHash"])?;
+async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
+    let hash = normalize_hash(&row["txHash"]);
     if hash.is_empty() {
-        return Ok(Vec::new());
+        return Vec::new();
     }
+
+    let end = Instant::now() + context.timeout.min(HISTORY_TIMEOUT);
+    let remaining = || end.saturating_duration_since(Instant::now());
+    let mut pages_left = HISTORY_MAX_PAGES + 1;
+    let mut found = Vec::new();
     for attempt in 0..2 {
         if attempt > 0 {
+            if remaining() <= HISTORY_RETRY_DELAY {
+                break;
+            }
             tokio::time::sleep(HISTORY_RETRY_DELAY).await;
         }
-        let Ok(data) = context
-            .keeper
-            .request(
-                keeper::HISTORY,
-                Map::from_iter([("trader".into(), json!(context.addr))]),
-                None,
-                context.timeout.min(HISTORY_TIMEOUT),
-            )
-            .await
-        else {
-            break;
-        };
-        let perp = data
-            .get("perp")
-            .ok_or_else(|| incomplete_data("KeyError"))?;
-        let history = perp
-            .as_object()
-            .ok_or_else(|| incomplete_data("TypeError"))?
-            .get("tradeHistory")
-            .ok_or_else(|| incomplete_data("KeyError"))?;
-        let history = match history {
-            Value::Array(items) => items,
-            // Python iterates these containers. An empty one yields no matches.
-            Value::Object(_) | Value::String(_) if !truthy(history) => continue,
-            Value::Object(_) | Value::String(_) => return Err(SaiError::internal()),
-            _ => return Err(incomplete_data("TypeError")),
-        };
-        let mut matches = Vec::new();
-        for item in history {
-            if !item.is_object() {
-                return Err(SaiError::internal());
+        let mut seen = HashSet::new();
+        let mut execution_block = None;
+        if row["lifecycleStep"] == "exec_pass" {
+            execution_block = row["execBlock"].as_i64();
+        }
+        for page in 0..pages_left.min(HISTORY_MAX_PAGES) {
+            let timeout = remaining();
+            if timeout.is_zero() {
+                return found;
             }
-            if item["intentKey"] == context.key
-                && account_matches(&item["trade"]["trader"], context.account)
-            {
-                let tx_hash = normalize_hash(&item["txHash"])?;
-                let evm_tx_hash = normalize_hash(&item["evmTxHash"])?;
-                if hash == tx_hash || hash == evm_tx_hash {
-                    matches.push(item.clone());
+            pages_left -= 1;
+            let Ok(data) = context
+                .keeper
+                .request(
+                    keeper::INTENT_HISTORY,
+                    Map::from_iter([
+                        ("trader".into(), json!(context.addr)),
+                        ("limit".into(), json!(HISTORY_PAGE_SIZE)),
+                        ("offset".into(), json!(page * HISTORY_PAGE_SIZE)),
+                    ]),
+                    None,
+                    timeout,
+                )
+                .await
+            else {
+                return found;
+            };
+            let Some(history) = data
+                .get("perp")
+                .and_then(|perp| perp["tradeHistory"].as_array())
+            else {
+                return found;
+            };
+            for item in history {
+                if item["intentKey"] == context.key
+                    && account_matches(&item["trade"]["trader"], context.account)
+                    && ["txHash", "evmTxHash"]
+                        .iter()
+                        .any(|field| normalize_hash(&item[*field]) == hash)
+                    && item["id"].as_i64().is_none_or(|id| seen.insert(id))
+                {
+                    found.push(item.clone());
+                }
+            }
+            if history.len() < HISTORY_PAGE_SIZE {
+                break;
+            }
+            if let Some(first) = found.first() {
+                execution_block = execution_block.or_else(|| first["block"]["block"].as_i64());
+                let oldest = history
+                    .last()
+                    .and_then(|item| item["block"]["block"].as_i64());
+                if oldest
+                    .zip(execution_block)
+                    .is_some_and(|(oldest, execution)| oldest < execution)
+                {
+                    break;
                 }
             }
         }
-        if !matches.is_empty() {
-            return Ok(matches);
+        if !found.is_empty() {
+            break;
         }
     }
-    Ok(Vec::new())
+    found
 }
 
 fn incomplete_data(kind: &str) -> SaiError {

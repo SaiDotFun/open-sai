@@ -7,6 +7,21 @@ pub const POSITIONS: &str = "query($trader:String!) { perp { trades(where:{trade
 pub const POSITION: &str = "query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }";
 pub const ROUTE: &str = "query { oneClickTrading { enabled chainId contractAddress } }";
 pub const HISTORY: &str = "query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }";
+pub const INTENT_HISTORY: &str = "query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) {
+      id intentKey tradeChangeType txHash evmTxHash block { block block_ts }
+      marketOrder { orderReqBlock orderReqTxHash orderExecBlock sequence execPrice collateralAmount }
+      openingFeeUsd closingFeeUsd borrowingFeeUsd
+      trade {
+        id trader tradeType isOpen isLong collateralAmount openCollateralAmount
+        leverage openPrice closePrice tp sl openBlock { block } closeBlock { block }
+        perpBorrowing { marketId collateralToken { symbol } }
+      }
+    }
+  }
+}";
 pub const INTENTS: &str = "query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
 pub const CHALLENGE: &str = "mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }";
 pub const SESSION: &str = "mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }";
@@ -15,7 +30,7 @@ pub const SUBMIT: &str = "mutation($input:RecordUserIntentInput!) { recordUserIn
 pub(super) fn operation(query: &str) -> &'static str {
     match query {
         CHALLENGE => "challenge",
-        HISTORY => "history",
+        HISTORY | INTENT_HISTORY => "history",
         INTENTS => "intents",
         MARKET => "market",
         MARKETS => "markets",
