@@ -3,6 +3,7 @@
 mod actions;
 mod cancel;
 mod confirmation;
+mod estimates;
 mod position;
 mod update;
 
@@ -22,6 +23,7 @@ use crate::{
 
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
+pub use estimates::PreviewMode;
 pub use update::{leverage_preview, tpsl_preview};
 
 #[derive(Clone, Debug, Serialize)]
@@ -59,6 +61,7 @@ pub struct TradePreview {
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
     position_route: Option<position::PositionRoute>,
+    close_owner_verified: Option<bool>,
     estimates: Option<Value>,
 }
 
@@ -70,6 +73,7 @@ impl TradePreview {
             quote: None,
             warning: None,
             position_route: None,
+            close_owner_verified: None,
             estimates: None,
         }
     }
@@ -83,23 +87,28 @@ impl TradePreview {
             output["quote"] = quote.clone();
         }
         output["intent"] = json!(self.intent);
+        if self.close_owner_verified == Some(false) {
+            output["positionOwnerVerified"] = json!(false);
+        }
+        if let Some(estimates) = &self.estimates {
+            output["estimates"] = estimates.clone();
+        } else if self.intent.kind == "CANCEL_PENDING_TRADE" {
+            output["estimates"] = cancel::estimates();
+        }
         if let Some(price) = &self.reference_price {
             output["referencePrice"] = json!(price);
         }
         if let Some(warning) = self.warning {
             output["warning"] = json!(warning);
         }
-        if self.intent.kind == "CANCEL_PENDING_TRADE" {
-            output["estimates"] = cancel::estimates();
-        }
-        if let Some(estimates) = &self.estimates {
-            output["estimates"] = estimates.clone();
-        }
         output
     }
 
     pub fn confirmed_output(&self, account: Option<&str>) -> Value {
         let mut output = self.output(account);
+        if self.intent.kind == "CLOSE_POSITION" && self.close_owner_verified != Some(true) {
+            return output;
+        }
         if let Some(route) = &self.position_route {
             output["positionRoute"] = json!(route);
         }
@@ -199,6 +208,7 @@ impl<'a> Trading<'a> {
         if cancelling {
             self.check_pending_order(session, preview).await?;
         }
+        let mut market_row = None;
         let update = if preview.is_standalone_position_update() {
             Some(
                 self.preflight_position_update(account, preview, options.confirmation.is_some())
@@ -210,7 +220,7 @@ impl<'a> Trading<'a> {
         let mut prepared;
         let preview = if market {
             prepared = preview.clone();
-            self.refresh_market_open(&mut prepared).await?;
+            market_row = Some(self.refresh_market_quote(&mut prepared).await?);
             let price = prepared
                 .reference_price
                 .as_deref()
@@ -234,12 +244,27 @@ impl<'a> Trading<'a> {
             session
         };
         if let Some(confirmation) = options.confirmation
-            && let Err(error) = confirmation.verify(preview, account)
+            && let Err(mut error) = confirmation.verify(preview, account)
         {
-            return Err(match update {
-                Some(update) => self.update_refusal(account, update, error).await,
-                None => error,
-            });
+            if let Some(update) = update {
+                return Err(self.update_refusal(account, update, error).await);
+            }
+            if let Some(fresh) = error
+                .details
+                .as_deref_mut()
+                .and_then(|details| details.get_mut("preview"))
+            {
+                let mut replacement = preview.clone();
+                self.estimate_preview(
+                    &mut replacement,
+                    Some(session),
+                    PreviewMode::Mcp,
+                    market_row,
+                )
+                .await?;
+                *fresh = replacement.confirmed_output(Some(account));
+            }
+            return Err(error);
         }
 
         let (key, stamp) = intent_identity();
