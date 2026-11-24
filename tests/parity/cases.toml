@@ -447,6 +447,14 @@ expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 
 [[case]]
+name = "doctor-invalid-endpoint-text"
+args = ["doctor", "--offline", "--no-fix"]
+mode = "text"
+seed = "doctor-invalid-endpoint"
+expect = 2
+state = { "trader" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
 name = "doctor-malformed-toml"
 args = ["--json", "doctor", "--offline", "--no-fix"]
 seed = "doctor-malformed-toml"

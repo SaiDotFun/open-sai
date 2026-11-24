@@ -199,11 +199,12 @@ fn main() -> process::ExitCode {
                     &cli.command,
                     Command::Auth { json: true, .. } | Command::Intent { json: true, .. }
                 );
+            let usage_command = (!matches!(&cli.command, Command::Doctor(_))).then_some(command);
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
                 .and_then(|env| cli.run(env, json, events, operands, start_log));
-            complete(result, command, json, home)
+            complete(result, usage_command, json, home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
@@ -242,7 +243,7 @@ fn load_settings(flags: &Flags, env: &Environment) -> Result<Settings, SettingsE
 
 fn complete(
     result: Result<(), SaiError>,
-    command: &str,
+    usage_command: Option<&str>,
     json_output: bool,
     home: Option<&Path>,
 ) -> (ExitCode, Option<SaiError>) {
@@ -271,7 +272,9 @@ fn complete(
     } else if interrupted {
         eprintln!("Aborted!");
     } else {
-        if error.exit_code == ExitCode::Usage && !(command == "doctor" && error.details.is_some()) {
+        if error.exit_code == ExitCode::Usage
+            && let Some(command) = usage_command
+        {
             eprintln!(
                 "{}\nTry '{} --help' for help.\n",
                 usage(command),
@@ -515,7 +518,7 @@ fn print_parse_error(
             {
                 let error = SaiError::usage(help);
                 if json || matches!(command, "market" | "account" | "watch") {
-                    return complete(Err(error), command, json, home);
+                    return complete(Err(error), Some(command), json, home);
                 }
                 eprintln!("{}", error.message);
                 return (ExitCode::Usage, Some(error));
@@ -546,7 +549,7 @@ fn print_parse_error(
                 eprintln!("Error: {}", usage.message);
                 return (ExitCode::Usage, Some(usage));
             }
-            return complete(Err(usage), command, json, home);
+            return complete(Err(usage), Some(command), json, home);
         }
         let choices = choices
             .iter()
@@ -557,7 +560,7 @@ fn print_parse_error(
             "Invalid value for '--scope': {} is not one of {choices}.",
             repr(value)
         ));
-        return complete(Err(usage), command, json, home);
+        return complete(Err(usage), Some(command), json, home);
     }
     let usage_command = match error.get(ContextKind::Usage) {
         Some(ContextValue::StyledStr(usage)) => {
@@ -581,7 +584,7 @@ fn print_parse_error(
             eprintln!("Error: {}", usage.message);
             return (ExitCode::Usage, Some(usage));
         }
-        return complete(Err(usage), usage_command, json, home);
+        return complete(Err(usage), Some(usage_command), json, home);
     }
     if json {
         let message = match error.kind() {
@@ -590,7 +593,12 @@ fn print_parse_error(
             }
             _ => "Invalid command arguments.",
         };
-        return complete(Err(SaiError::usage(message)), usage_command, true, home);
+        return complete(
+            Err(SaiError::usage(message)),
+            Some(usage_command),
+            true,
+            home,
+        );
     }
     let _ = error.print();
     (ExitCode::Usage, None)
