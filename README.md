@@ -192,9 +192,13 @@ Keeper. An expired session returns `SESSION_EXPIRED`. The server reads the
 stored session without a prompt, never asks for the token, and never returns
 it.
 
-Each preview names the signed-in account in `addr`. Pass the confirmed
-preview's `previewDigest` as `preview_digest` in the trade call. Before submitting, the
-server rebuilds the trade and checks the confirmed terms listed below.
+An MCP preview for a connected account names that account in `addr`.
+While signed out, `preview_open` without an `addr` can return `addr: null`
+and a `previewDigest`. Treat that preview as informational. After sign-in,
+preview again for the connected account before asking for confirmation.
+Pass that preview's `previewDigest` as `preview_digest` in the trade call.
+Before submitting, the server rebuilds the trade and checks the confirmed
+terms listed below.
 If the trade returns `PREVIEW_MISMATCH` or `PRICE_MOVED`, it has submitted
 nothing. Use the returned `preview` when present. If it is missing, obtain a
 new preview before asking for confirmation again.
@@ -218,10 +222,9 @@ check, use its error code to diagnose the requested account.
 
 With several accounts connected, `auth_list` shows them, `auth_use` switches
 the active one (for the CLI too), and preview and trade tools take an
-optional `addr` to act as another connected account. A preview names its
-account, and a trade refuses if the account changed after the preview. A
-trade for an account that is not signed in for this server's endpoint is
-refused the same way.
+optional `addr` to act as another connected account. A change of account
+requires a new preview and confirmation. A trade also requires a valid
+session for that account on this server's Keeper endpoint.
 
 The server reads the same settings as the CLI once, when it starts: the
 `--endpoint`, `--ws-endpoint`, and `--lcd-endpoint` flags after `sai mcp

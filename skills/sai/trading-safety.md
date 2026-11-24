@@ -133,7 +133,10 @@ and follow the same recovery rules for `NOT_SENT`, `ADMISSION_REJECTED`,
 
 ## Digest Confirmation in MCP
 
-Each preview returns `previewDigest`. A `trade_*` call must send it back as
+A preview for a connected account returns `previewDigest`. If a signed-out
+`preview_open` returns `addr: null`, preview again for the connected account
+after sign-in, then ask for confirmation. A `trade_*` call must send the
+confirmed preview's digest as
 input `preview_digest`, and a market `trade_open` must also send the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,

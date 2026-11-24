@@ -111,6 +111,11 @@ for the token and never returns it.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
+A signed-out `preview_open` without `addr` can return `addr: null` and a
+`previewDigest`. Use it for estimates only. The digest changes when the
+preview names a connected account. After sign-in, preview again with that
+account's `addr` before asking for confirmation.
+
 Outputs use camelCase and inputs use snake_case:
 
 | Preview output | `trade_*` input | Needed by |
