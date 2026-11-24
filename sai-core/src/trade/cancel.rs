@@ -156,7 +156,7 @@ fn read_object(success: bool, bytes: &[u8]) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-fn lcd_url(raw: &str) -> Result<Url, SaiError> {
+pub(super) fn lcd_url(raw: &str) -> Result<Url, SaiError> {
     let Some(endpoint) = Endpoint::split(raw).filter(|endpoint| {
         endpoint.scheme == "https"
             || (endpoint.scheme == "http"
