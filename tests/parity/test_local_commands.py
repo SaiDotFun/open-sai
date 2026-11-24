@@ -157,6 +157,24 @@ def test_skill_install(
         assert json.loads(repeated.stdout) == {**report, "action": "unchanged"}
 
 
+def test_skill_force_keeps_previous_contents(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    _, rust = local_pair
+    target = tmp_path / "skill"
+    shutil.copytree(SKILL, target)
+    (target / "editor-note.txt").write_bytes(b"unpublished edit")
+
+    report = cli_json(
+        rust, tmp_path, "skill", "install", "--dir", str(target), "--force"
+    )
+    assert report["action"] == "replaced"
+    [previous] = tmp_path.glob(".sai-previous-*/skill")
+    assert (previous / "editor-note.txt").read_bytes() == b"unpublished edit"
+    assert (target / "SKILL.md").read_bytes() == (SKILL / "SKILL.md").read_bytes()
+    assert not (target / "editor-note.txt").exists()
+
+
 RUN = "1a" * 16
 OTHER_RUN = "2b" * 16
 COMMAND = "3c" * 16

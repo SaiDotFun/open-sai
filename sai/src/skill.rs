@@ -217,10 +217,10 @@ fn is_sai_skill(target: &Path) -> io::Result<bool> {
         .starts_with("---\nname: sai\n"))
 }
 
-fn replace_dir(target: &Path) -> Result<(), SaiError> {
+fn replace_dir(target: &Path, force: bool) -> Result<&'static str, SaiError> {
     let parent = target.parent().ok_or_else(SaiError::internal)?;
     let staging = tempfile::Builder::new()
-        .prefix(".sai-new-")
+        .prefix(if force { ".sai-previous-" } else { ".sai-new-" })
         .tempdir_in(parent)
         .map_err(io_error)?;
     let staged = staging.path().join("skill");
@@ -235,25 +235,41 @@ fn replace_dir(target: &Path) -> Result<(), SaiError> {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&staged, fs::Permissions::from_mode(0o755)).map_err(io_error)?;
     }
-    let backup = staging.path().join("previous");
-    let had_target = match fs::rename(target, &backup) {
-        Ok(()) => true,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
-        Err(error) => return Err(io_error(error)),
-    };
-    if let Err(error) = fs::rename(staged, target) {
-        if had_target && fs::rename(&backup, target).is_err() {
-            // Keep the original directory on disk if an external writer races rollback.
-            let saved = staging.keep().join("previous");
-            return Err(skill_error(format!(
-                "Could not restore {}. Previous contents are at {}.",
-                target.display(),
-                saved.display()
-            )));
+    let outcome = action(target, force)?;
+    match outcome {
+        "unchanged" => {}
+        "installed" => {
+            // This succeeds only if the destination is still missing or empty.
+            fs::rename(staged, target).map_err(io_error)?;
         }
-        return Err(io_error(error));
+        _ => exchange_dir(target, staging)?,
     }
-    Ok(())
+    Ok(outcome)
+}
+
+fn exchange_dir(target: &Path, staging: tempfile::TempDir) -> Result<(), SaiError> {
+    #[cfg(any(target_os = "linux", target_vendor = "apple", target_os = "redox"))]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+
+        // Persist staging before the exchange. The old skill takes its place
+        // atomically and can still contain open files that an editor is writing.
+        let backup = staging.keep();
+        let previous = backup.join("skill");
+        if let Err(error) = renameat_with(CWD, &previous, CWD, target, RenameFlags::EXCHANGE) {
+            let _ = fs::remove_dir_all(backup);
+            return Err(io_error(error.into()));
+        }
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "redox")))]
+    {
+        let _ = staging;
+        Err(skill_error(format!(
+            "Atomic replacement is unavailable for {}. Move it aside and retry.",
+            target.display()
+        )))
+    }
 }
 
 fn action(target: &Path, force: bool) -> Result<&'static str, SaiError> {
@@ -347,10 +363,11 @@ fn install(target: &Path, force: bool, json_output: bool) -> Result<(), SaiError
         directory.lock().map_err(io_error)?;
         directory
     };
-    let action = action(&target, force)?;
-    if action != "unchanged" {
-        replace_dir(&target)?;
-    }
+    let action = if action(&target, force)? == "unchanged" {
+        "unchanged"
+    } else {
+        replace_dir(&target, force)?
+    };
     let record = source_record();
     let commit = record["commit"].as_str();
     if json_output {
