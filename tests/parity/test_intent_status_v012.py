@@ -28,8 +28,9 @@ from test_intent_status import (
 def release_pair(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> tuple[CLI, CLI]:
     version = invoke(cli_pair[0], tmp_path / "version-home", "--version")
     assert version.returncode == 0, version.stderr
-    if version.stdout.strip() != b"sai, version 0.1.2":
-        pytest.skip("set SAI_PARITY_PYTHON to the sai-cli/v0.1.2 executable")
+    assert version.stdout.strip() == b"sai, version 0.1.2", (
+        "set SAI_PARITY_PYTHON to the sai-cli/v0.1.2 executable"
+    )
     return cli_pair
 
 
