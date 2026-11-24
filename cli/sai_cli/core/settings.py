@@ -238,6 +238,8 @@ def check_value(key: str, value: Any) -> str | bool | int:
         return value
     if not isinstance(value, str):
         raise InvalidEndpoint(f"Invalid value for {key}: expected a URL string")
+    if spec.section == "keeper" and "#" in value:
+        raise InvalidEndpoint(f"Invalid value for {key}: remove the URL fragment")
     try:
         parts = urlsplit(value)
         hostname = parts.hostname

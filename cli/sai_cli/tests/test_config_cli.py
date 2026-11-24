@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
 import tomllib
 from typing import Any
 
@@ -149,6 +151,43 @@ def test_config_set_accepts_ipv6_with_port(padding):
     )
     assert result.exit_code == 0
     assert json.loads(result.stdout)["value"] == endpoint
+
+
+@pytest.mark.parametrize(
+    ("key", "scheme"), [("keeper.endpoint", "https"), ("keeper.ws_endpoint", "wss")]
+)
+@pytest.mark.parametrize("fragment", ["#client", "#"])
+def test_config_set_rejects_keeper_endpoint_fragments(tmp_path, key, scheme, fragment):
+    result = sai(
+        "--json", "config", "set", key, f"{scheme}://keeper.example/graphql{fragment}"
+    )
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"] and "fragment" in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+def test_watch_rejects_a_keeper_fragment_in_config(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        '[keeper]\nendpoint = "http://127.0.0.1:9/graphql#client"\n'
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "sai_cli", "--json", "watch", "price", "1"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert "keeper.endpoint" in error["message"] and "fragment" in error["message"]
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize(
