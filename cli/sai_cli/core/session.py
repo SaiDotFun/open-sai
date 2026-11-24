@@ -24,11 +24,12 @@ def expiry_time(result: dict[str, str]) -> datetime:
 
 def renewal_fields(result: dict[str, str]) -> dict[str, str]:
     """Return a shell command and any guidance needed to renew the session."""
-    args = (
-        ("auth", "renew", result["evmAddress"])
-        if result.get("keyName")
-        else ("auth", "import")
-    )
+    if result.get("keyName"):
+        args = ("auth", "renew", result["evmAddress"])
+    elif result.get("source") == "imported":
+        args = ("auth", "import")
+    else:
+        args = ("auth", "import", "--addr", result["evmAddress"])
     endpoint = result.get("endpoint")
     try:
         configured_endpoint = settings.load().endpoint

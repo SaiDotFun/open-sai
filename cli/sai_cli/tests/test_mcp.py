@@ -1351,6 +1351,7 @@ def test_session_reports_never_include_the_token(mcp):
     assert info["session"]["addr"] == ADDR
     assert info["session"]["usable"] is True
     assert "expires in" in info["session"]["expiryWarning"]
+    assert status["renewalCommand"] == f"sai auth import --addr {ADDR}"
     assert info["session"]["renewalCommand"] == status["renewalCommand"]
     assert info["session"]["renewalGuidance"] == status["renewalGuidance"]
     assert "expiryWarning" in invoke(mcp, "auth_list")["accounts"][0]

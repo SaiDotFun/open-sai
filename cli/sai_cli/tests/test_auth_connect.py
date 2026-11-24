@@ -26,7 +26,7 @@ from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sai_cli.core import keeper
+from sai_cli.core import keeper, storage
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
@@ -862,6 +862,39 @@ def test_paste_renewal_command_with_the_configured_keeper(
     assert renewed.returncode == 0, renewed.stderr
     assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
     assert env.run("--json", "auth", "status").returncode == 0
+
+
+def test_legacy_renewal_refuses_another_accounts_clipboard_token(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    storage.save_session(
+        {
+            "evmAddress": ADDR,
+            "token": make_token(hours=48),
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+            "endpoint": keeper.MAINNET_HTTP,
+        }
+    )
+    env.clipboard()
+    report = json.loads(env.run("--json", "auth", "status").stdout)
+    command = report["renewalCommand"]
+    assert shlex.split(command) == ["sai", "auth", "import", "--addr", ADDR]
+    before = storage.load_accounts()
+
+    wrong_token = make_token(OTHER)
+    env.clip.write_text(wrong_token)
+    refused = env.run_shell(command)
+    assert refused.returncode == 1
+    assert "different account than --addr" in refused.stderr
+    assert storage.load_accounts() == before
+    assert env.clip.read_text() == wrong_token
+
+    env.clip.write_text(make_token("0x" + ADDR[2:].upper()))
+    renewed = env.run_shell(command)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
+    assert storage.load_accounts()["active"] == ADDR
 
 
 @pytest.mark.parametrize("json_output", [False, True])

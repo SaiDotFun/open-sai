@@ -775,8 +775,11 @@ def read_token() -> str:
 
 
 @auth.command("import")
+@click.option(
+    "--addr", metavar="ADDR", help="Require the token to match this EVM address."
+)
 @click.pass_context
-def import_token(ctx: click.Context) -> None:
+def import_token(ctx: click.Context, addr: str | None) -> None:
     """Connect with a session token copied from Sai Web.
 
     In a terminal, paste the token at the hidden prompt or press Enter to read
@@ -786,6 +789,8 @@ def import_token(ctx: click.Context) -> None:
     """
     token = read_token()
     result = sessions.import_session(token, keeper_url(ctx))
+    if addr is not None and addr.lower() != result["evmAddress"].lower():
+        raise ValueError("The Sai session token is for a different account than --addr")
     storage.save_session(result)
     # Re-read: the person may have copied something else since, and that
     # must survive.
