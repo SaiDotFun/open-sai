@@ -367,11 +367,6 @@ pub fn run(
     account: Option<&str>,
     mut dispatch: impl FnMut(Vec<OsString>),
 ) -> Result<(), SaiError> {
-    let interrupt = Arc::new(AtomicBool::new(false));
-    let _registration = InterruptRegistration(
-        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupt))
-            .map_err(|_| SaiError::internal())?,
-    );
     let directory = history_directory(home).map_err(|_| SaiError::internal())?;
     banner(
         io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
@@ -400,6 +395,13 @@ pub fn run(
     } else {
         None
     };
+    // The terminal installs its own SIGINT handler during editor creation.
+    // Register afterward so command cancellation and terminal signals coexist.
+    let interrupt = Arc::new(AtomicBool::new(false));
+    let _registration = InterruptRegistration(
+        signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&interrupt))
+            .map_err(|_| SaiError::internal())?,
+    );
     let mut forwarded = vec![OsString::from("sai")];
     for (option, value) in [
         ("--endpoint", flags.endpoint.as_deref()),
@@ -432,6 +434,8 @@ pub fn run(
                     line
                 }
                 Err(ReadlineError::Interrupted) => continue,
+                #[cfg(unix)]
+                Err(ReadlineError::Signal(rustyline::error::Signal::Interrupt)) => continue,
                 Err(ReadlineError::Eof) => {
                     println!();
                     break;
