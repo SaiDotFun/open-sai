@@ -467,9 +467,22 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                 "unique": unique,
                 "origin": origin,
                 "partial": partial,
-                "columns": conn.execute(
-                    "SELECT * FROM pragma_index_xinfo(?) ORDER BY seqno", (index,)
-                ).fetchall(),
+                "columns": [
+                    (
+                        seqno,
+                        cid,
+                        index_column,
+                        descending,
+                        "BINARY"
+                        if collation is None
+                        else collation.translate(ASCII_UPPER),
+                        is_key,
+                    )
+                    for seqno, cid, index_column, descending, collation, is_key in conn.execute(
+                        'SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?) ORDER BY seqno',
+                        (index,),
+                    )
+                ],
             }
         tables[name] = {
             "type": kind,

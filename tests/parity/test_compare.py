@@ -210,6 +210,27 @@ def test_ledger_detects_column_collation_changes(tmp_path: Path) -> None:
 
 
 @requires_sqlite_schema
+@pytest.mark.parametrize(
+    ("declared", "equivalent"),
+    [("COLLATE NOCASE", "COLLATE [nocase]"), ("", "COLLATE binary")],
+)
+def test_ledger_ignores_equivalent_index_collations(
+    tmp_path: Path, declared: str, equivalent: str
+) -> None:
+    def read(name: str, collation: str) -> dict:
+        home = tmp_path / name
+        path = home / LEDGER
+        path.parent.mkdir(parents=True)
+        with sqlite3.connect(path) as db:
+            db.execute(f"CREATE TABLE intents (id TEXT {collation} PRIMARY KEY)")
+            db.execute("INSERT INTO intents VALUES ('saved')")
+        return ledger(path, Normalize(home))
+
+    reference = read("declared", declared)
+    assert first_difference(reference, read("equivalent", equivalent), "ledger") is None
+
+
+@requires_sqlite_schema
 def test_ledger_detects_added_or_changed_check_constraints(tmp_path: Path) -> None:
     ddl = """
         CREATE TABLE intents (
