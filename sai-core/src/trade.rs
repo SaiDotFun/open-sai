@@ -237,13 +237,9 @@ impl<'a> Trading<'a> {
         if let Some(confirmation) = confirmation {
             let mut current = preview.clone();
             current.position_route = Some(route.clone());
-            // A replacement contract may not contain the target. Compare the
-            // confirmed route before reading it so drift is reported first.
-            if preview.requires_market_price_refresh() {
-                confirmation.verify_route_digest(&current, account)?;
-            } else {
-                confirmation.verify_digest(&current, account)?;
-            }
+            // A replacement contract may not contain the target or market.
+            // Route checks cannot issue a digest before those reads.
+            confirmation.verify_route_digest(&current, account)?;
         }
         if let Some(id) = close_id {
             Self::verify_contract_owner(&lcd, account, &id, &route).await?;

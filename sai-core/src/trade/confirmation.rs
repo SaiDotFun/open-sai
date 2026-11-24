@@ -33,11 +33,7 @@ impl<'a> Confirmation<'a> {
         })
     }
 
-    pub(super) fn verify_digest(
-        &self,
-        preview: &TradePreview,
-        account: &str,
-    ) -> Result<(), SaiError> {
+    fn verify_digest(&self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
         if !self.digest_matches(preview, account)? {
             return Err(refusal(
                 preview,

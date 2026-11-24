@@ -478,7 +478,7 @@ async fn basic_trade_confirmation_checks_live_chain_and_contract() {
                 .err()
                 .unwrap();
             assert_eq!(error.code, Code::PreviewMismatch);
-            assert_eq!(error.details.is_some(), index != 0);
+            assert!(error.details.is_none());
             let refreshed = trading
                 .confirmed_trade_preview(&session, preview.clone())
                 .await
@@ -648,6 +648,8 @@ async fn cancel_confirmation_checks_route_before_reading_replacement_contract() 
         .err()
         .unwrap();
     assert_eq!(error.code, Code::PreviewMismatch);
+    assert!(error.details.is_none());
+    assert!(error.message.contains("Request a fresh preview"));
     assert_eq!(server.requests(), ["route", "node_info"]);
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
