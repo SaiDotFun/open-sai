@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -1013,6 +1014,79 @@ def test_claude_install_leaves_a_disabled_canonical_project_entry_in_place(
     assert (config.read_bytes(), policy.read_bytes()) == before
     assert not env.calls()
     assert SECRET not in result.output
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Claude uses worktree-local settings on Windows"
+)
+@pytest.mark.parametrize("name", [OLD_COMMAND, "sai"])
+def test_claude_install_honors_settings_from_the_main_checkout(
+    env: Env, monkeypatch: pytest.MonkeyPatch, name: str
+):
+    git = shutil.which("git", path=os.defpath)
+    assert git is not None
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), str(Path(git).parent)]))
+    linked = env.root / "linked worktree"
+    commands = (
+        ["init", "--quiet"],
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Initial commit",
+        ],
+        ["worktree", "add", "--quiet", "--detach", str(linked)],
+    )
+    for args in commands:
+        subprocess.run(
+            [git, "-C", str(env.project), *args], check=True, capture_output=True
+        )
+    policy = env.project / ".claude" / "settings.local.json"
+    policy.parent.mkdir()
+    policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
+    config = linked / ".mcp.json"
+    config.write_text(json.dumps({"mcpServers": {name: claude_entry(serve(env))}}))
+    before = config.read_bytes(), policy.read_bytes()
+    monkeypatch.chdir(linked)
+    scope = "user" if name == OLD_COMMAND else "project"
+
+    result = invoke("mcp", "install", "claude", "--scope", scope)
+
+    message = failure(result)
+    assert "claude (project): failed" in message and "disabled" in message
+    assert name in message and "Review MCP approvals" in message
+    assert (config.read_bytes(), policy.read_bytes()) == before
+    assert not (env.home / ".claude.json").exists()
+    assert not env.calls()
+
+
+def test_claude_install_honors_the_project_toggle_for_a_user_alias(env: Env):
+    config = env.home / ".claude.json"
+    config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    OLD_COMMAND: claude_entry(serve(env), {"CUSTOM": SECRET})
+                },
+                "projects": {str(env.project): {"disabledMcpServers": [OLD_COMMAND]}},
+            }
+        )
+    )
+    before = config.read_bytes()
+
+    result = invoke("mcp", "install", "claude")
+
+    message = failure(result)
+    assert "claude (user): failed" in message
+    assert f"{OLD_COMMAND} registration is disabled in claude" in message
+    assert config.read_bytes() == before
+    assert SECRET not in result.output
+    assert not env.calls()
 
 
 @pytest.mark.parametrize("stale", [False, True])

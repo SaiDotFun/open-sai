@@ -525,17 +525,24 @@ class Claude(Client):
     def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
+        projects = (data or {}).get("projects")
+        project = (
+            projects.get(str(self.cwd))
+            if self.cwd is not None and isinstance(projects, dict)
+            else None
+        )
+        project = project if isinstance(project, dict) else None
+        toggled_off = (project or {}).get("disabledMcpServers")
+        disabled = isinstance(toggled_off, list) and name in toggled_off
         found = []
         user = servers(data).get(name)
         if user is not None:
-            found.append(entry_registration(user, "user"))
+            found.append(entry_registration(user, "user", disabled))
         if self.cwd is None:
             return self.ordered([r for r in found if r is not None])
-        projects = (data or {}).get("projects")
-        project = projects.get(str(self.cwd)) if isinstance(projects, dict) else None
-        local = servers(project if isinstance(project, dict) else None).get(name)
+        local = servers(project).get(name)
         if local is not None:
-            found.append(entry_registration(local, "local"))
+            found.append(entry_registration(local, "local", disabled))
         shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
         if shared is not None:
             found.append(
@@ -545,16 +552,50 @@ class Claude(Client):
 
     def project_disabled(self, name: str) -> bool:
         assert self.cwd is not None
-        settings_paths = (
+        settings_paths = [
             self.home_dir() / "settings.json",
             self.cwd / ".claude" / "settings.json",
             self.cwd / ".claude" / "settings.local.json",
-        )
+        ]
+        main = self.main_checkout()
+        if main is not None and main != self.cwd:
+            settings_paths.append(main / ".claude" / "settings.local.json")
         for path in settings_paths:
             rejected = (load_json(path) or {}).get("disabledMcpjsonServers")
             if isinstance(rejected, list) and name in rejected:
                 return True
         return False
+
+    def main_checkout(self) -> Path | None:
+        """Find the Git checkout Claude uses for project-local settings."""
+        if self.cwd is None or os.name == "nt":
+            return None
+        try:
+            result = subprocess.run(
+                ["git", "worktree", "list", "--porcelain", "-z"],
+                cwd=self.cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            first = result.stdout.partition(b"\0\0")[0].split(b"\0")
+            if (
+                result.returncode
+                or not first[0].startswith(b"worktree ")
+                or b"bare" in first
+            ):
+                return None
+            root = Path(os.fsdecode(first[0].removeprefix(b"worktree ")))
+            if not root.is_absolute() or root == self.home:
+                return None
+            for path in (root, root / ".git", root / ".claude"):
+                if path.exists() and path.stat().st_uid != os.getuid():
+                    return None
+            return root
+        except (OSError, subprocess.TimeoutExpired):
+            return None
 
     def add_steps(
         self, scope: str, target: Target, name: str = NAME
@@ -863,7 +904,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
                 return report_legacy_install(client, legacy, target)
         elif isinstance(client, Claude) and existing.disabled:
             raise ClientError(
-                "Claude Code has disabled the project sai registration. "
+                f"Claude Code has disabled the {existing.scope} sai registration. "
                 "Review MCP approvals and settings in the client."
             )
         winner = client.effective(found)
