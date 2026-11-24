@@ -146,7 +146,9 @@ def describe(exc: Exception) -> dict[str, Any]:
             Code.PREVIEW_MISMATCH,
             preview=with_digest(exc.preview),
         )
-    if failure.code == Code.INTERNAL_ERROR:
+    if failure.code == Code.INTERNAL_ERROR and not isinstance(
+        exc, storage.IntentReservationError
+    ):
         trace = "".join(traceback.format_exception(exc))
         log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
         return error(INTERNAL, failure.code)

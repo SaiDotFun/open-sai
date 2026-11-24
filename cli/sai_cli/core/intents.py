@@ -31,7 +31,7 @@ _SUBMISSION_TRACE: ContextVar[SubmissionTrace | None] = ContextVar(
 
 @contextmanager
 def track_submission() -> Generator[SubmissionTrace]:
-    """Keep the generated intent key available for the caller's recovery."""
+    """Keep the reserved intent key available for the caller's recovery."""
     trace = SubmissionTrace()
     token = _SUBMISSION_TRACE.set(trace)
     try:
@@ -211,8 +211,6 @@ def submit(
         + f"{instant.microsecond // 1000:03d}Z_"
         + "".join(choice("0123456789ABCDEFGHJKMNPQRSTVWXYZ") for _ in range(16))
     )
-    if trace is not None:
-        trace.identity = (endpoint, account, key)
     stamp = now()
     envelope = {
         "intentKey": key,
@@ -231,6 +229,8 @@ def submit(
         intent.get("target", {}).get("userTradeId", ""),
         allow_concurrent_open=allow_concurrent_open,
     )
+    if trace is not None:
+        trace.identity = (endpoint, account, key)
     try:
         data = keeper.request(
             endpoint, keeper.SUBMIT, {"input": envelope}, session["token"]

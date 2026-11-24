@@ -24,7 +24,11 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import log, paths
-from .errors import Code, SaiError, SessionError
+from .errors import Code, SaiError, SessionError, describe
+
+
+class IntentReservationError(SaiError):
+    """A local ledger failure prevented submission to Keeper."""
 
 
 class UnresolvedIntent(SaiError, ValueError):
@@ -457,11 +461,24 @@ def _check_open_pending(
         raise RecentOpenPending([row[0] for row in opens], endpoint, account)
 
 
+@contextmanager
+def _reservation_errors() -> Generator[None]:
+    try:
+        yield
+    except UnresolvedIntent:
+        raise
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        raise IntentReservationError(
+            f"Could not reserve the trade intent. {exc}. Nothing was sent.",
+            describe(exc).code,
+        ) from exc
+
+
 def check_open_pending(
     endpoint: str, account: str, *, allow_concurrent_open: bool
 ) -> None:
     """Refuse an already blocked open early. Reservation checks again."""
-    with contextlib.closing(db()) as connection:
+    with _reservation_errors(), contextlib.closing(db()) as connection:
         _check_open_pending(connection, endpoint, account, allow_concurrent_open)
 
 
@@ -476,7 +493,7 @@ def pending(
 ) -> None:
     opening = kind == "OPEN_TRADE"
     concurrent_open = opening and allow_concurrent_open
-    with db() as connection:
+    with _reservation_errors(), db() as connection:
         connection.execute("BEGIN IMMEDIATE")
         if opening:
             _check_open_pending(connection, endpoint, account, concurrent_open)

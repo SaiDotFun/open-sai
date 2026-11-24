@@ -13,7 +13,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
-from contextlib import suppress
+from contextlib import closing, suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -111,13 +111,13 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                 request = self.read_json()
             except (ConnectionResetError, json.JSONDecodeError):
                 return
+            if request["query"] == keeper.SUBMIT:
+                active_key = request["variables"]["input"]["intentKey"]
+                submitted_keys.append(active_key)
             replay = replies.popleft()
             slow = replay if isinstance(replay, SlowBody) else None
             if isinstance(replay, SlowBody):
                 replay = replay.response
-            if request["query"] == keeper.SUBMIT:
-                active_key = request["variables"]["input"]["intentKey"]
-                submitted_keys.append(active_key)
             if replay == "drop_ack":
                 self.close_connection = True
                 return
@@ -495,6 +495,59 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert allowed["status"] == "accepted"
     assert allowed["intentKey"] != key
     assert submitted_keys == [key, allowed["intentKey"]]
+
+
+@pytest.mark.parametrize(
+    ("surface", "lock"),
+    [
+        ("cli", "IMMEDIATE"),
+        ("cli-wait", "IMMEDIATE"),
+        ("mcp", "IMMEDIATE"),
+        ("mcp", "EXCLUSIVE"),
+    ],
+)
+def test_locked_ledger_reports_open_was_not_sent(
+    connected_replay: tuple[str, deque[Reply]],
+    submitted_keys: list[str],
+    surface: str,
+    lock: str,
+) -> None:
+    endpoint, replies = connected_replay
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    if surface == "mcp":
+        replies.append(MARKET)
+        preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
+        args = {
+            **OPEN_ARGS,
+            "preview_digest": preview["previewDigest"],
+            "reference_price": preview["referencePrice"],
+        }
+
+    # IMMEDIATE lets MCP's precheck read the ledger, then blocks reservation.
+    # EXCLUSIVE also blocks the precheck, before the refreshed quote.
+    if lock == "IMMEDIATE":
+        replies.append(MARKET)
+    with closing(storage.db()) as connection, connection, storage.busy_timeout(0):
+        connection.execute(f"BEGIN {lock}")
+        if surface == "mcp":
+            response = call_mcp(mcp, "trade_open", args)
+            error, message = response, response["error"]
+        else:
+            flags = ["--wait"] if surface == "cli-wait" else []
+            result = CliRunner().invoke(
+                main, ["--endpoint", endpoint, "--json", *CLI_OPEN, *flags]
+            )
+            assert result.exit_code == 1, result.output
+            response = json.loads(result.stdout)
+            error, message = response["error"], response["error"]["message"]
+
+    assert not submitted_keys
+    assert not storage.list_pending(endpoint, ADDR)
+    assert error["code"] == "INTERNAL_ERROR"
+    assert "database is locked" in message
+    assert "Nothing was sent" in message
+    assert "intentKey" not in response and "intentKey" not in error
+    assert "hint" not in error and "next" not in error
 
 
 def _open_with_mcp(
