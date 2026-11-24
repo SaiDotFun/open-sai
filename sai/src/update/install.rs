@@ -142,7 +142,7 @@ impl Install {
             ));
         }
         match self {
-            Self::Standalone(install) => install.active().map(|_| ()),
+            Self::Standalone(install) => install.owner(),
             Self::Uv(install) => install.owner(pending),
             Self::Other(..) => unreachable!(),
         }

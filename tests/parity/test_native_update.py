@@ -322,13 +322,16 @@ def standalone(
     old.parent.mkdir(parents=True, mode=0o700)
     old.parent.parent.chmod(0o700)
     shutil.copy2(binary, old)
-    launcher.symlink_to(old.relative_to(root))
+    selector = old.parent.parent / "current"
+    selector.symlink_to(old.relative_to(selector.parent))
+    launcher.symlink_to(selector.relative_to(root))
     return NativeInstall(launcher, old, home, env, installed)
 
 
-def test_standalone_update_replaces_only_the_launcher(
+def test_standalone_update_keeps_the_public_launcher(
     standalone: NativeInstall,
 ) -> None:
+    public = standalone.launcher.lstat()
     initial = standalone.launcher.readlink()
     asset = assets(NEW, archive_name(), archive())
     ledger = standalone.home / "ledger-fixture"
@@ -344,7 +347,8 @@ def test_standalone_update_replaces_only_the_launcher(
         assert json.loads(result.stdout)["status"] == "updated"
         assert server.reads[2:] == list(reversed(asset))
     assert standalone.launcher.is_symlink()
-    assert standalone.launcher.readlink() != initial
+    assert standalone.launcher.readlink() == initial
+    assert os.path.samestat(standalone.launcher.lstat(), public)
     assert stat.S_IMODE(standalone.launcher.stat().st_mode) == 0o700
     assert standalone.invoke("--version").stdout.strip() == f"sai {NEW}"
     assert standalone.executable.is_file()
@@ -372,9 +376,10 @@ def test_invalid_assets_keep_the_working_launcher(
     assert result.returncode == 1
     assert "is unchanged" in json.loads(result.stdout)["error"]["message"]
     assert standalone.launcher.readlink() == initial
-    assert sorted(
-        path.name for path in standalone.executable.parent.parent.iterdir()
-    ) == [standalone.executable.parent.name]
+    assert {path.name for path in standalone.executable.parent.parent.iterdir()} == {
+        standalone.executable.parent.name,
+        "current",
+    }
 
 
 def test_update_refuses_cross_origin_asset_redirect(standalone: NativeInstall) -> None:
@@ -449,8 +454,9 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
     staged = root / interrupted / "sai"
     staged.parent.mkdir()
     shutil.copy2(standalone.executable, staged)
-    standalone.launcher.unlink()
-    standalone.launcher.symlink_to(staged.relative_to(standalone.launcher.parent))
+    selector = root / "current"
+    selector.unlink()
+    selector.symlink_to(staged.relative_to(root))
     record = root / "pending.json"
     record.write_text(
         json.dumps({"old": standalone.executable.parent.name, "new": interrupted}),
@@ -466,6 +472,40 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
         assert json.loads(changed.stdout)["status"] == "current"
     assert standalone.launcher.resolve() == standalone.executable
     assert not record.exists()
+
+
+@pytest.mark.parametrize("has_previous", [False, True], ids=["first", "upgrade"])
+def test_ordinary_recovery_leaves_legacy_direct_launchers_in_place(
+    standalone: NativeInstall, has_previous: bool
+) -> None:
+    root = standalone.executable.parent.parent
+    candidate = root / f"{NEW}-{'a' * 64}" / "sai"
+    candidate.parent.mkdir()
+    shutil.copy2(standalone.executable, candidate)
+    standalone.launcher.unlink()
+    standalone.launcher.symlink_to(candidate.relative_to(standalone.launcher.parent))
+    public = standalone.launcher.lstat()
+    record = root / "pending.json"
+    record.write_text(
+        json.dumps(
+            {
+                "old": standalone.executable.parent.name if has_previous else None,
+                "new": candidate.parent.name,
+            }
+        ),
+        encoding="utf-8",
+    )
+    with releases({}, tags=(standalone.installed,)) as server:
+        result = standalone.update(server)
+        assert not server.reads
+    assert result.returncode == 3, result.stdout
+    assert (
+        "no longer points to a managed Sai binary"
+        in json.loads(result.stdout)["error"]["message"]
+    )
+    assert os.path.samestat(standalone.launcher.lstat(), public)
+    assert standalone.launcher.resolve() == candidate
+    assert record.exists()
 
 
 @pytest.mark.parametrize("interruption", ["installer-staged", "rust-withdrew"])
@@ -549,8 +589,9 @@ def test_background_optout_keeps_pending_standalone_recovery(
     staged = root / interrupted / "sai"
     staged.parent.mkdir()
     shutil.copy2(standalone.executable, staged)
-    standalone.launcher.unlink()
-    standalone.launcher.symlink_to(staged.relative_to(standalone.launcher.parent))
+    selector = root / "current"
+    selector.unlink()
+    selector.symlink_to(staged.relative_to(root))
     record = root / "pending.json"
     content = json.dumps({"old": standalone.executable.parent.name, "new": interrupted})
     record.write_text(content, encoding="utf-8")

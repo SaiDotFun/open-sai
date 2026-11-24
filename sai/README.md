@@ -128,9 +128,11 @@ Windows stays on Python until native support passes.
 The native updater uses the C10 archive name `sai-<version>-<target>.tar.gz`
 and verifies it against `SHA256SUMS`. A standalone launcher is a symlink
 named `sai` beside a private `.sai-native` directory. Its target is
-`.sai-native/<version>-<archive-sha256>/sai`. The updater holds
-`.sai-update.lock` beside the launcher and keeps the previous target
-until the new binary passes its version, offline CLI, and MCP checks.
+`.sai-native/current`, which selects `<version>-<archive-sha256>/sai`
+inside the private directory. The updater holds `.sai-update.lock`
+beside the launcher and changes only the private selector during
+updates and ordinary rollback. Earlier launchers that link directly to
+a versioned binary need their original installer for updates.
 
 For uv installs, the shim passes its own `sys.prefix` as
 `SAI_NATIVE_UV_PREFIX` when it execs the cached binary. Rust checks that

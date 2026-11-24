@@ -21,6 +21,7 @@ use crate::update::{
 use super::{Change, Result, io as io_error, remove_record};
 
 const ROOT: &str = ".sai-native";
+const SELECTOR: &str = "current";
 const RECORD: &str = "pending.json";
 const LAUNCHER_STAGE: &str = ".launcher-switch/sai";
 const LOCK: &str = ".sai-update.lock";
@@ -127,9 +128,11 @@ impl Standalone {
         let version_dir = exe.parent()?;
         dir_version(version_dir.file_name()?.to_str()?)?;
         let root = version_dir.parent()?;
+        let info = root.symlink_metadata().ok()?;
         if root.file_name()? != ROOT
-            || !fs::metadata(root).ok()?.is_dir()
-            || fs::metadata(root).ok()?.permissions().mode() & 0o022 != 0
+            || !info.is_dir()
+            || info.uid() != rustix::process::geteuid().as_raw()
+            || info.permissions().mode() & 0o022 != 0
         {
             return None;
         }
@@ -159,48 +162,97 @@ impl Standalone {
         (canonical == binary && fs::metadata(&canonical).ok()?.is_file()).then_some(canonical)
     }
 
-    pub(super) fn active(&self) -> Result<String> {
-        let outside = || {
+    fn launcher_identity(&self) -> Result<LauncherEntry> {
+        let link = Path::new(ROOT).join(SELECTOR);
+        launcher_entry(&self.launcher)
+            .map_err(io_error)?
+            .filter(|entry| entry.2.as_deref().map(Path::as_os_str) == Some(link.as_os_str()))
+            .ok_or_else(|| {
+                format!(
+                    "{} no longer points to a managed Sai binary through {}. Update it through its installer.",
+                    self.launcher.display(),
+                    link.display(),
+                )
+            })
+    }
+
+    pub(super) fn owner(&self) -> Result<()> {
+        self.launcher_identity().map(|_| ())
+    }
+
+    fn require_launcher(&self, expected: &LauncherEntry) -> Result<()> {
+        if launcher_entry(&self.launcher).map_err(io_error)?.as_ref() != Some(expected) {
+            return Err("the Sai launcher changed during the update".into());
+        }
+        Ok(())
+    }
+
+    fn selected_directory(&self) -> Result<Option<String>> {
+        let selector = self.root.join(SELECTOR);
+        let link = match fs::read_link(&selector) {
+            Ok(link) => link,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(io_error(error)),
+        };
+        let invalid = || {
             format!(
-                "{} no longer points to a managed Sai binary.",
-                self.launcher.display()
+                "{} does not select a managed Sai binary",
+                selector.display()
             )
         };
-        let link = fs::read_link(&self.launcher).map_err(|_| outside())?;
-        let target = self
-            .launcher
-            .parent()
-            .expect("launcher has a parent")
-            .join(link);
-        let directory = target
+        let directory = link
             .parent()
             .and_then(Path::file_name)
             .and_then(|name| name.to_str())
-            .ok_or_else(outside)?;
-        if self.target(directory).as_deref() != Some(&target) {
-            return Err(outside());
+            .ok_or_else(invalid)?;
+        if link.as_os_str() != Path::new(directory).join("sai").as_os_str()
+            || self.target(directory).is_none()
+        {
+            return Err(invalid());
         }
-        Ok(directory.to_owned())
+        Ok(Some(directory.to_owned()))
     }
 
-    fn switch(&self, from: &str, to: &str) -> Result<()> {
-        let parent = self.launcher.parent().expect("launcher has a parent");
-        if self.target(to).is_none() {
-            return Err("the replacement binary is missing".into());
+    fn switch_selector(
+        &self,
+        launcher: &LauncherEntry,
+        from: &str,
+        to: Option<&str>,
+    ) -> Result<()> {
+        let selector = self.root.join(SELECTOR);
+        let stage = to
+            .map(|to| -> Result<TempDir> {
+                if self.target(to).is_none() {
+                    return Err("the replacement binary is missing".into());
+                }
+                let stage = TempDir::new_in(&self.root).map_err(io_error)?;
+                symlink(Path::new(to).join("sai"), stage.path().join(SELECTOR))
+                    .map_err(io_error)?;
+                Ok(stage)
+            })
+            .transpose()?;
+        if self.selected_directory()?.as_deref() != Some(from) {
+            return Err("the Sai selector changed during the update".into());
         }
-        let stage = TempDir::new_in(parent).map_err(io_error)?;
-        let link = stage.path().join("sai");
-        symlink(Path::new(ROOT).join(to).join("sai"), &link).map_err(io_error)?;
-        if self.active()? != from {
-            return Err("the Sai launcher changed during the update".into());
+        self.require_launcher(launcher)?;
+        // The install lock protects the private selector. A competing installer
+        // may still replace the public link, so leave that path alone.
+        match stage {
+            Some(stage) => fs::rename(stage.path().join(SELECTOR), &selector),
+            None => fs::remove_file(&selector),
         }
-        fs::rename(link, &self.launcher).map_err(io_error)?;
-        state::sync_dir(parent).map_err(io_error)
+        .map_err(io_error)?;
+        state::sync_dir(&self.root).map_err(io_error)?;
+        self.require_launcher(launcher)
     }
 
     pub(super) fn version(&self) -> Result<Version> {
-        self.active()
+        self.owner()?;
+        self.selected_directory()?
             .map(|active| dir_version(&active).expect("validated managed target"))
+            .ok_or_else(|| {
+                "the Sai launcher has no selected binary; run the installer again".into()
+            })
     }
 
     fn settle_launcher_switch(&self, pending: &mut Pending) -> Result<bool> {
@@ -375,32 +427,33 @@ impl Standalone {
             return self.version();
         };
         let record = self.root.join(RECORD);
-        let active = self.active()?;
+        let launcher = self.launcher_identity()?;
+        let active = self.selected_directory()?;
         let invalid =
             || "the pending Sai install record names a missing or invalid binary".to_owned();
         self.target(&pending.new).ok_or_else(invalid)?;
-        let Some(old) = pending.old else {
-            if active != pending.new || self.active()? != pending.new {
-                return Err("the Sai launcher changed during an interrupted install".into());
-            }
-            fs::remove_file(&self.launcher).map_err(io_error)?;
-            state::sync_dir(self.launcher.parent().expect("launcher has a parent"))
-                .map_err(io_error)?;
-            remove_record(&record)?;
-            return Err(
-                "Interrupted first Sai install was rolled back. Run the installer again.".into(),
-            );
-        };
-        let previous = dir_version(&old)
-            .filter(|_| self.target(&old).is_some())
-            .ok_or_else(invalid)?;
-        if active == pending.new {
-            self.switch(&pending.new, &old)?;
-        } else if active != old {
-            return Err("the Sai launcher changed during an interrupted update".into());
+        let previous = pending
+            .old
+            .as_deref()
+            .map(|old| {
+                dir_version(old)
+                    .filter(|_| self.target(old).is_some())
+                    .ok_or_else(invalid)
+            })
+            .transpose()?;
+        if active.as_deref() == Some(pending.new.as_str()) && active != pending.old {
+            self.switch_selector(&launcher, &pending.new, pending.old.as_deref())?;
+        } else if active != pending.old {
+            return Err("the Sai selector changed during an interrupted install".into());
         }
+        if self.selected_directory()? != pending.old {
+            return Err("the Sai selector changed during an interrupted install".into());
+        }
+        self.require_launcher(&launcher)?;
         remove_record(&record)?;
-        Ok(previous)
+        previous.ok_or_else(|| {
+            "Interrupted first Sai install was rolled back. Run the installer again.".into()
+        })
     }
 
     async fn stage(
@@ -450,7 +503,10 @@ impl Standalone {
     ) -> Change {
         let result = async {
             let home = TempDir::new().map_err(io_error)?;
-            let old = self.active()?;
+            let launcher = self.launcher_identity()?;
+            let old = self.selected_directory()?.ok_or_else(|| {
+                "the Sai launcher has no selected binary; run the installer again".to_owned()
+            })?;
             if dir_version(&old).as_ref() != Some(installed) {
                 return Err("the Sai launcher changed during the update".into());
             }
@@ -458,6 +514,7 @@ impl Standalone {
             if !allowed() {
                 return Ok(Change::Available);
             }
+            self.require_launcher(&launcher)?;
             self.publish(stage, &new)?;
             let record = self.root.join(RECORD);
             let pending = Pending {
@@ -467,8 +524,12 @@ impl Standalone {
             };
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let switched = async {
-                self.switch(&old, &pending.new)?;
+                self.switch_selector(&launcher, &old, Some(&pending.new))?;
                 smoke::verify(&self.launcher, home.path(), target, None).await?;
+                self.require_launcher(&launcher)?;
+                if self.selected_directory()?.as_deref() != Some(pending.new.as_str()) {
+                    return Err("the Sai selector changed during the update".into());
+                }
                 remove_record(&record)
             }
             .await;
@@ -476,12 +537,13 @@ impl Standalone {
             match switched {
                 Ok(()) => Ok(Change::Updated),
                 Err(reason) => {
-                    let rollback = self.active().and_then(|active| {
-                        if active == pending.new {
-                            self.switch(&pending.new, &old)?;
+                    let rollback = self.require_launcher(&launcher).and_then(|()| {
+                        let active = self.selected_directory()?;
+                        if active.as_deref() == Some(pending.new.as_str()) {
+                            self.switch_selector(&launcher, &pending.new, Some(&old))?;
                             let _ = remove_record(&record);
                             Ok(true)
-                        } else if active == old {
+                        } else if active.as_deref() == Some(old.as_str()) {
                             let _ = remove_record(&record);
                             Ok(false)
                         } else {

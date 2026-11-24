@@ -19,20 +19,67 @@ fn recovery_rolls_back_a_first_install_without_an_old_target() {
     state::private_dir(binary.parent().unwrap()).unwrap();
     fs::write(&binary, "candidate").unwrap();
     let launcher = directory.join("sai");
-    symlink(&binary, &launcher).unwrap();
+    let selector = root.join(SELECTOR);
+    symlink(Path::new(&new).join("sai"), &selector).unwrap();
+    symlink(Path::new(ROOT).join(SELECTOR), &launcher).unwrap();
+    let original = launcher_entry(&launcher).unwrap();
     let record = root.join(RECORD);
     state::atomic_json(&record, &serde_json::json!({"old": null, "new": new})).unwrap();
 
     let install = Standalone::discover(&binary).unwrap();
+    let _lock = state::try_lock(&install.lock_path()).unwrap().unwrap();
     assert!(
         install
             .recover()
             .unwrap_err()
             .contains("first Sai install was rolled back")
     );
-    assert!(!launcher.is_symlink());
+    assert_eq!(launcher_entry(&launcher).unwrap(), original);
+    assert!(!selector.is_symlink());
     assert!(!record.exists());
     assert!(binary.is_file());
+}
+
+#[test]
+fn rollback_stops_when_a_competitor_takes_the_public_launcher() {
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().canonicalize().unwrap();
+    let root = bin.join(ROOT);
+    let old = format!("0.1.0-{}", "a".repeat(64));
+    let new = format!("0.2.0-{}", "b".repeat(64));
+    for version in [&old, &new] {
+        let directory = root.join(version);
+        state::private_dir(&directory).unwrap();
+        fs::write(directory.join("sai"), "managed binary").unwrap();
+    }
+    let launcher = bin.join("sai");
+    let selector = root.join(SELECTOR);
+    let selected = Path::new(&new).join("sai");
+    symlink(&selected, &selector).unwrap();
+    let public_target = Path::new(ROOT).join(SELECTOR);
+    symlink(&public_target, &launcher).unwrap();
+
+    let install = Standalone::discover(&root.join(&new).join("sai")).unwrap();
+    let _lock = state::try_lock(&install.lock_path()).unwrap().unwrap();
+    let original = install.launcher_identity().unwrap();
+    fs::rename(&launcher, bin.join("saved-launcher")).unwrap();
+    symlink(&public_target, &launcher).unwrap();
+    let competitor = launcher_entry(&launcher).unwrap().unwrap();
+    assert_ne!(original, competitor);
+
+    for previous in [None, Some(old.as_str())] {
+        assert!(
+            install
+                .switch_selector(&original, &new, previous)
+                .unwrap_err()
+                .contains("launcher changed during the update")
+        );
+        assert_eq!(
+            launcher_entry(&launcher).unwrap().as_ref(),
+            Some(&competitor)
+        );
+        assert_eq!(fs::read_link(&selector).unwrap(), selected);
+    }
 }
 
 #[test]
@@ -202,7 +249,9 @@ async fn download_deadline_leaves_the_launcher_untouched() {
     state::private_dir(old.parent().unwrap()).unwrap();
     fs::write(&old, "working installation").unwrap();
     let launcher = directory.join("sai");
-    symlink(&old, &launcher).unwrap();
+    let selector = root.join(SELECTOR);
+    symlink(old.strip_prefix(&root).unwrap(), &selector).unwrap();
+    symlink(Path::new(ROOT).join(SELECTOR), &launcher).unwrap();
     let install = Standalone::discover(&old).unwrap();
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
@@ -263,7 +312,7 @@ async fn download_deadline_leaves_the_launcher_untouched() {
         "{reason}"
     );
     assert!(!rolled_back);
-    assert_eq!(fs::read_link(launcher).unwrap(), old);
+    assert_eq!(fs::canonicalize(launcher).unwrap(), old);
     assert!(!root.join(RECORD).exists());
 }
 
