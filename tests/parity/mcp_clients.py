@@ -170,6 +170,12 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
             '[profiles.demo]\r\nmodel =    "after"\r\n'
         )
     write(home / ".codex/config.toml", config, 0o640)
+    read_only = {
+        "uninstall-codex-read-only": ".codex/config.toml",
+        "uninstall-cursor-read-only": ".cursor/mcp.json",
+    }.get(scenario)
+    if read_only:
+        (home / read_only).chmod(0o444)
     return {
         relative: (home / relative).read_bytes()
         for relative in CLIENT_CONFIGS

@@ -399,6 +399,13 @@ def observe(
             "serve",
         ]
         del state["clients/.codex/config.toml#data.settings.mcp_servers.sai"]
+    if case.accepted_divergence == "uninstall-read-only":
+        filename, entry = read_only_uninstall_path(case)
+        state[f"{filename}#changed"] = not candidate
+        if candidate:
+            state[f"{filename}#{entry}.args"] = ["mcp", "serve"]
+        else:
+            state[f"{filename}#{entry}"] = "<absent>"
     check_state(state, files)
     try:
         output = stdout(result.stdout, case.mode, case.command, normalize)
@@ -418,6 +425,8 @@ def observe(
     if case.mode == "mcp":
         mcp_tools(output)
     stderr = stderr_category(result.stderr)
+    if case.accepted_divergence == "uninstall-read-only":
+        check_read_only_uninstall(case, result.returncode, output, stderr, candidate)
     if contender:
         stderr += tuple(
             f"contender {category}" for category in stderr_category(contender.stderr)
@@ -429,6 +438,37 @@ def observe(
     }
     raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
     return Observation(result.returncode, output, stderr, files, raw)
+
+
+def read_only_uninstall_path(case: Case) -> tuple[str, str]:
+    if case.args[3] == "codex":
+        return "clients/.codex/config.toml", "data.settings.mcp_servers.sai"
+    return "clients/.cursor/mcp.json", "data.mcpServers.sai"
+
+
+def check_read_only_uninstall(
+    case: Case, code: int, output: Any, stderr: tuple[str, ...], candidate: bool
+) -> None:
+    if candidate:
+        error = output["error"]
+        if code != 1 or error["code"] != "INTERNAL_ERROR" or stderr:
+            raise ValueError("Expected the native read-only uninstall error")
+        report = error["details"]
+        (row,) = report["results"]
+        if row["error"] != "The client config is read-only" or row["changed"]:
+            raise ValueError("The read-only error reported a change")
+    else:
+        report = output
+        (row,) = report["results"]
+        if code != 0 or stderr != ("diagnostic",):
+            raise ValueError("Expected Python to remove the read-only entry")
+    if (
+        row["client"] != case.args[3]
+        or row["scope"] != "user"
+        or row["action"] != ("failed" if candidate else "removed")
+        or report["reconnectNeeded"] != (not candidate)
+    ):
+        raise ValueError("Unexpected read-only uninstall result")
 
 
 def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
@@ -613,6 +653,7 @@ def run_case(
             tools,
             None,
         )
+    reference_exit = left.exit_code
     if candidate != reference and case.accepted_divergence == "codex-repair-rollback":
         # Both observations checked their expected change flag. Compare the
         # saved file's existence and mode while allowing its contents to differ.
@@ -641,6 +682,31 @@ def run_case(
         left = replace(
             left, stderr=tuple(item for item in left.stderr if item != "diagnostic")
         )
+    if candidate != reference and case.accepted_divergence == "uninstall-read-only":
+        # Both sides already checked exit, report, mode and changed bytes.
+        # A successful removal also changes the command end record and trace.
+        filename, _ = read_only_uninstall_path(case)
+        left.files[filename] = right.files[filename]
+        log = "logs/cli.jsonl"
+        if log in left.files and log in right.files:
+            left.files[log] = replace(
+                left.files[log],
+                data=left.files[log].data[:-1] + right.files[log].data[-1:],
+            )
+        trace = "clients/argv.jsonl"
+        if trace in left.files and trace in right.files:
+            python_trace = left.files[trace].data
+            rust_trace = right.files[trace].data
+            left.files[trace] = replace(
+                left.files[trace],
+                data={
+                    **python_trace,
+                    "data": python_trace["data"][: len(rust_trace["data"])],
+                },
+            )
+        left = replace(
+            left, exit_code=right.exit_code, output=right.output, stderr=right.stderr
+        )
     diffs = differences(left, right)
     expected = None
     if (
@@ -650,8 +716,8 @@ def run_case(
     ):
         diffs = []
         expected = case.expected_overview_help
-    if left.exit_code != case.expect:
-        diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
+    if reference_exit != case.expect:
+        diffs.insert(0, f"expected reference exit {case.expect}, got {reference_exit}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
         diffs.insert(0, "expected reference JSON output")
     if case.mode == "mcp":

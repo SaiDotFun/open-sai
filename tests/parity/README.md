@@ -158,6 +158,11 @@ query. Rust restores the original configuration bytes and mode, so the
 result reports no change or reconnect. The Python reference leaves the
 entry deleted.
 
+The `mcp-uninstall-*-read-only` cases use mode-0444 Codex and Cursor files
+in writable directories. Python replaces the file with the Sai entry removed
+and preserves its mode. Rust returns `INTERNAL_ERROR` and leaves the bytes and
+mode intact. The cases also check that the unrelated server remains.
+
 The `lcd-origin-only` cases project the LCD endpoint in Python's report to
 its origin before comparing it with Rust. They cover successful probes and
 an unavailable LCD with a private path. Rust output is compared as emitted.
