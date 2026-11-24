@@ -141,8 +141,13 @@ input `preview_digest`, and a market `trade_open` must also send the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
 intent, position quote, or quoted price fails the confirmation check.
-Nothing is submitted on a refusal. Show the fresh preview from the result
-and ask again.
+Nothing is submitted on a refusal. If the result includes a replacement
+`preview`, show it and get confirmation again.
+
+If the result has no `preview`, wait until Sai can verify the quote, then
+call the matching `preview_*` tool again. For a partial close, that includes
+verifying the collateral price. Show the fresh quote and get confirmation
+again. Discard the old digest.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
