@@ -14,10 +14,22 @@ and marks it `absent`. Keeper's acceptance is not trade finality. `intent status
 
 Keeper issues one credential: a session JWT signed after a wallet challenge,
 valid for 30 days in production, with no scopes and no revocation. The CLI
-uses that same token. `auth import` takes it from Sai Web through a hidden
-prompt or the clipboard. `auth login NAME` signs the challenge with the
-Foundry keystore of that name through `cast`. `auth logout` deletes the local
-copy. The CLI
+uses that same token. On Sai Web Mainnet, open the wallet menu and select
+**Connect Sai CLI / MCP** beside **Send to phone** for the selected, connected
+wallet with an active trading session. Review its expiry and click **Copy
+session token**. Run the dialog's `sai auth import` command. Paste the token at
+the hidden prompt or press Enter to read the clipboard. Agents can run the
+command without a terminal to read the clipboard directly.
+
+The dialog pins the Mainnet Keeper endpoint for import only. Check the session
+with `sai --endpoint https://sai-keeper.nibiru.fi/query auth status`. Later CLI
+commands and any MCP server must use that endpoint to access the session. To
+save it as your default, run
+`sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query`.
+Update any endpoint overrides and restart running MCP servers to pick up the change.
+
+`auth login NAME` signs the challenge with the Foundry keystore of that name
+through `cast`. `auth logout` deletes the local copy. The CLI
 stores the session under `$SAI_HOME/trader` at mode 0600, encrypted with a
 fixed built-in key, so no command prompts for a passphrase.
 Per-device credentials are not yet part of this repository.
