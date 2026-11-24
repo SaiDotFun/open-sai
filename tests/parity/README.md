@@ -125,3 +125,41 @@ within a run. An event with the wrong call ID or an output with a different
 intent key can therefore differ even when both IDs have valid shapes.
 `LOG_VOLATILE_FIELDS` in `compare.py` assigns normalization rules to the
 volatile fields listed in `docs/log-events.json` and to generated intent keys.
+
+## Shared-Home Trade Replays
+
+The shared-state cases pin Python to commit
+`973f3f59f38dd89d0c2e03e674157934a00316ae`. This pin includes the
+position-confirmation changes in #150. Use a checkout at that commit with
+its project environment installed. The Rust CI job runs this file separately
+from the Keeper and auth parity files.
+
+```sh
+uv sync --project "$SAI_PYTHON_REFERENCE" --locked
+cargo build --locked -p sai
+cargo test --locked -p sai-core --test storage --no-run
+```
+
+Set `SAI_PYTHON_REFERENCE` to the pinned checkout, `SAI_PARITY_BIN` to the
+absolute path of the compiled Rust CLI, and `SAI_PARITY_RESERVE_BIN` to
+the storage test executable printed by the last Cargo command. Run
+`uv run --locked pytest tests/parity/test_trade_shared_state.py -rs`.
+
+Each case starts with a private `SAI_HOME` and uses fixture credentials
+against loopback Keeper and LCD servers. The crash cases stop the real
+storage writer at a pipe barrier after SQLite commits. The other runtime
+opens the same ledger, attempts a reservation, and reconciles the
+original key. The loopback server must see zero mutations. The grace
+period case advances the fixture row's timestamp to exercise recovery
+without waiting five minutes.
+
+The trade cases count every mutation arrival by intent key, including
+repeated arrivals with the same key. The tests hold or drop the admission
+reply to exercise contention, transport timeouts, and reconciliation. The
+wait cases replay pending and final results and check the receipt against
+the original request and the indexed execution.
+
+Native trade and wait cases report the missing command, flag, or signed-in
+MCP handler in their skip reason. The cases run when their adapters are
+available. The Python subprocess cases also run in a checkout with no Rust
+binary or pinned reference configured.
