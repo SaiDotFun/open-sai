@@ -531,7 +531,7 @@ returns `intentKey`, `keeper`, and `txHash`. A failed Keeper read adds
 `keeperError` alongside the local trail. The `stats` report maps operations
 to `count`, `p50Ms`, and `p95Ms` under `keeper`, with counts by code under
 `errors`. It also returns `gaps` and the UTC cutoff `since`, if set.
-The `tail` command prints stored JSON objects one per line.
+The `tail` command prints one JSON object per line.
 
 A `keeper.request` has `status` `ok`, `error`, `rejected` (Keeper refused
 admission), or `not_sent` (the connection failed first). Its `operation` is

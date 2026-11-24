@@ -2858,6 +2858,76 @@ def test_logs_tail_filters_by_count_surface_and_event(home):
     assert raw_logs(home) == before
 
 
+def test_log_readers_project_retained_keeper_errors(home):
+    path = old_file(home / "logs", "cli", 1)
+    target = f"/{PATH_KEY}/query?api_key={URL_KEY}"
+    row = {
+        "schema": 2,
+        "ts": log.stamp(log.now() - timedelta(days=1)),
+        "level": "warn",
+        "event": "keeper.request",
+        "surface": "cli",
+        "pid": 1,
+        "version": "0.1.0",
+        "runId": "old-run",
+        "seq": 1,
+        "operation": "intents",
+        "endpoint": "https://keeper.example",
+        "endpointId": "h1_" + "a" * 64,
+        "addr": ADDR,
+        "intentKey": "KEY",
+        "authenticated": False,
+        "durationMs": 10,
+        "status": "error",
+        "keeperErrors": [
+            {"code": "GRAPHQL_VALIDATION_FAILED", "message": target},
+            {"code": target, "message": target},
+        ],
+    }
+    current = {
+        **row,
+        "seq": 2,
+        "keeperErrors": [{"code": "FORBIDDEN"}],
+        "keeperErrorCount": 5,
+    }
+    raw = log.encode(row) + log.encode(current)
+    path.write_bytes(raw)
+    expected = [
+        (2, [{"code": "GRAPHQL_VALIDATION_FAILED"}, {"code": "KEEPER_ERROR"}]),
+        (5, [{"code": "FORBIDDEN"}]),
+    ]
+
+    for args in (
+        ("tail", "--event", "keeper.request"),
+        ("run", "old-run"),
+        ("intent", "KEY", "--offline"),
+    ):
+        code, text = run_cli("logs", *args)
+        assert code == 0
+        assert PATH_KEY not in text and URL_KEY not in text
+        assert "GRAPHQL_VALIDATION_FAILED" in text and "KEEPER_ERROR" in text
+        assert "keeperErrorCount=2" in text and "keeperErrorCount=5" in text
+
+        code, output = run_cli("--json", "logs", *args)
+        assert code == 0
+        assert PATH_KEY not in output and URL_KEY not in output
+        rows = (
+            [json.loads(line) for line in output.splitlines()]
+            if args[0] == "tail"
+            else json.loads(output)["events"]
+        )
+        assert [
+            (item["keeperErrorCount"], item["keeperErrors"]) for item in rows
+        ] == expected
+
+    mcp = server.create_server(settings.load())
+    report = call(mcp, "logs_intent", {"key": "KEY", "offline": True})
+    assert [
+        (item["keeperErrorCount"], item["keeperErrors"]) for item in report["events"]
+    ] == expected
+    assert path.read_bytes() == raw
+
+
 def test_logs_tail_reads_from_the_end_of_large_files(home):
     """Tail finds the newest events by reading backwards in chunks, so
     lines split across chunks, bad lines, and a missing final newline all

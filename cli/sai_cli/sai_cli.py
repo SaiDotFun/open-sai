@@ -1800,7 +1800,7 @@ def logs_tail(
     """Show the most recent events, oldest first.
 
     Plain output is one line per event: time (UTC), surface, level, event,
-    then its fields. With --json, each line is the stored JSON object.
+    then its fields. With --json, each line is a JSON object.
 
     \b
     Examples:

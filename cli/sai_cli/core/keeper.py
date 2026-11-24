@@ -125,17 +125,6 @@ INTENT_ERROR_CODES = frozenset(
         "jwt_failed",
     }
 )
-GRAPHQL_ERROR_CODES = frozenset(
-    {
-        "GRAPHQL_PARSE_FAILED",
-        "GRAPHQL_VALIDATION_FAILED",
-        "INTENT_NOT_ACCEPTED",
-        "BAD_USER_INPUT",
-        "FORBIDDEN",
-        "INTERNAL_SERVER_ERROR",
-        "UNAUTHENTICATED",
-    }
-)
 
 
 def request_hash(value: object) -> tuple[str | None, bool | None]:
@@ -455,20 +444,6 @@ def _log_request(
         pass
 
 
-def _graphql_error_codes(errors: Any) -> list[dict[str, str]]:
-    """Keep validated codes from the first three GraphQL errors."""
-    found: list[dict[str, str]] = []
-    for item in errors[:3] if isinstance(errors, list) else []:
-        if not isinstance(item, dict):
-            continue
-        extensions = item.get("extensions")
-        code = extensions.get("code") if isinstance(extensions, dict) else None
-        found.append(
-            {"code": known_text(code, GRAPHQL_ERROR_CODES) or Code.KEEPER_ERROR}
-        )
-    return found
-
-
 def _request(
     endpoint: str,
     query: str,
@@ -501,8 +476,7 @@ def _request(
         raise KeeperError("Keeper returned an invalid response")
     if result.get("errors"):
         errors = result["errors"]
-        outcome["keeperErrors"] = _graphql_error_codes(errors)
-        outcome["keeperErrorCount"] = len(errors) if isinstance(errors, list) else 1
+        outcome.update(log.keeper_error_fields(errors))
         if (
             query == SUBMIT
             and not result.get("data")

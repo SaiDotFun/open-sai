@@ -255,6 +255,9 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
         and field not in FREE_TEXT
         and isinstance(value, (str, int, bool))
     }
+    if name == "keeper.request" and "keeperErrors" in line:
+        # The shared decoder has already projected these error entries.
+        safe["keeperErrors"] = line["keeperErrors"]
     for field, allowed in (
         ("kind", keeper.INTENT_KINDS),
         ("lifecycleStep", keeper.INTENT_STEPS),
