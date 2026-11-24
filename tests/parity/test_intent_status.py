@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from stat import S_IMODE
 from typing import Any
 
 import pytest
@@ -155,6 +156,8 @@ def invoke(
     home: Path,
     *args: str,
     overrides: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    umask: int = -1,
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [*cli, *args],
@@ -167,10 +170,11 @@ def invoke(
             "PYTHONUTF8": "1",
             **(overrides or {}),
         },
-        cwd=home.parent,
+        cwd=cwd or home.parent,
         capture_output=True,
         check=False,
         timeout=30,
+        umask=umask,
     )
 
 
@@ -266,6 +270,77 @@ def test_c11_rejects_endpoints_before_network_io(
             else:
                 assert result.stdout == b""
                 assert result.stderr == f"Error: {message}\n".encode()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and directory modes")
+def test_c11_log_writer_leaves_symlink_target_untouched(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    # A Keeper read would create both the log and its endpoint key in a fresh home.
+    data = {"perp": {"borrowings": []}}
+    for index, cli in enumerate(c11_cli_pair):
+        target = tmp_path / f"target-{index}"
+        target.mkdir(mode=0o750)
+        home = tmp_path / f"home-{index}"
+        home.symlink_to(target, target_is_directory=True)
+        with replay() as (endpoint, replies, requests):
+            replies.append(response({"data": data}))
+            result = invoke(
+                cli, home, "--json", "--endpoint", endpoint, "market", "list"
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert json.loads(result.stdout) == data
+            assert result.stderr == b""
+            assert [request.body for request in requests] == [wire(keeper.MARKETS)]
+        assert home.is_symlink()
+        assert S_IMODE(target.stat().st_mode) == 0o750
+        assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX umask and directory modes")
+@pytest.mark.parametrize("writer", ["logs", "config", "trader", "existing-home"])
+def test_c11_first_write_restores_owner_directory_mode(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path, writer: str
+) -> None:
+    profiles = []
+    for index, cli in enumerate(c11_cli_pair):
+        parent = tmp_path / str(index) / "ancestor"
+        home = parent / "home"
+        inherited_home = writer == "existing-home"
+        if inherited_home:
+            home.mkdir(parents=True, mode=0o750)
+        overrides = {} if writer == "logs" else {"SAI_LOG": "0"}
+        with replay() as (endpoint, replies, requests):
+            flags = ["--json", "--endpoint", endpoint]
+            if writer == "logs":
+                # Reject the key before reading settings while the log thread
+                # creates the profile at first use.
+                args = ["config", "get", "unknown"]
+            elif writer == "trader":
+                args = ["intent", "status", ADDR, "--key", KEY]
+                replies.append(response({"data": {"userIntents": []}}))
+            else:
+                args = ["config", "set", "logs.keep_days", "14"]
+            result = invoke(
+                cli, home, *flags, *args, overrides=overrides, cwd=tmp_path, umask=0o777
+            )
+            assert result.returncode == (2 if writer == "logs" else 0), result.stdout
+            assert result.stderr == b""
+            assert not replies
+            assert len(requests) == (writer == "trader")
+        if not inherited_home:
+            assert S_IMODE(parent.parent.stat().st_mode) == 0o700
+            assert S_IMODE(parent.stat().st_mode) == 0o700
+        assert S_IMODE(home.stat().st_mode) == (0o750 if inherited_home else 0o700)
+        if writer in {"logs", "trader"}:
+            assert S_IMODE((home / writer).stat().st_mode) == 0o700
+        profiles.append(
+            {
+                str(child.relative_to(home)): S_IMODE(child.stat().st_mode)
+                for child in home.rglob("*")
+            }
+        )
+    assert profiles[0] == profiles[1]
 
 
 def read_events(home: Path) -> list[dict[str, Any]]:

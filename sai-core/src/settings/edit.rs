@@ -1,5 +1,5 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::OpenOptions,
     io::{self, Write},
     ops::Range,
     path::Path,
@@ -10,6 +10,7 @@ use toml_edit::{Item, Table};
 
 use super::toml::ParsedDocument;
 use super::{Key, MAINNET_WS, SettingsError, os_message, parse_error, read_raw_text, table_error};
+use crate::paths;
 
 const TEMPLATE: &str = include_str!("../settings-template.toml");
 const LOCK_NAME: &str = ".config.lock";
@@ -42,22 +43,14 @@ fn edit_file(
         ))
     };
 
-    let mut directory = fs::DirBuilder::new();
-    directory.recursive(true);
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        directory.mode(0o700);
+        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    directory.create(parent).map_err(writing)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(writing)?;
-    }
+    paths::profile(parent).map_err(writing)?;
     let lock = options.open(parent.join(LOCK_NAME)).map_err(writing)?;
     lock.lock().map_err(writing)?;
     let text = read_raw_text(path)?;

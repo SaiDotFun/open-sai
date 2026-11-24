@@ -8,6 +8,7 @@ use std::{
 use chrono::{DateTime, Datelike, NaiveDate, Utc};
 
 use super::Surface;
+use crate::paths;
 
 const PRUNE_MARKER: &str = ".pruned";
 const ENDPOINT_KEY: &str = ".endpoint-key";
@@ -21,18 +22,22 @@ pub(super) struct LogDir(std::path::PathBuf);
 
 impl LogDir {
     pub fn open(root: &Path) -> io::Result<Self> {
-        let mut builder = fs::DirBuilder::new();
-        builder.recursive(true);
+        if let Some(parent) = root.parent() {
+            paths::profile(parent)?;
+        }
+        // Existing log directories keep their owner bits. The open descriptor
+        // below clears group and other access.
+        if !root.exists() {
+            paths::managed(root)?;
+        }
         #[cfg(unix)]
         {
             use rustix::{
                 fs::{Mode, OFlags, open},
                 process::geteuid,
             };
-            use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+            use std::os::unix::fs::MetadataExt;
 
-            builder.mode(0o700);
-            builder.create(root)?;
             let fd = open(
                 root,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
@@ -48,7 +53,6 @@ impl LogDir {
         }
         #[cfg(not(unix))]
         {
-            builder.create(root)?;
             if redirected(&fs::symlink_metadata(root)?) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
