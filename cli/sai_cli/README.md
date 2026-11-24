@@ -259,20 +259,46 @@ signs, the CLI checks that the typed data has primary type
 `UserTradingSession`, domain `Sai` version `1`, your addr, and the issued
 challenge nonce.
 
+### Renewing Sessions
+
 Run `sai auth renew [ADDR]` to get a fresh session using the key saved by
 `sai auth login NAME`. An explicit address takes precedence over the global
 `--as` flag. If neither is set, Sai renews the active account. Renewal keeps
-the active selection. A signed-out renewal exits 6 with code `SIGNED_OUT`. If a
-keystore session predates the saved key name, run `sai auth login NAME` once.
-For a session copied from Sai Web, copy a fresh token and run `sai auth
-import`.
+the active selection. A signed-out renewal exits 6 with code `SIGNED_OUT`.
+
+If a keystore session predates the saved key name, run `sai auth login NAME`
+once. To renew a session copied from Sai Web, copy a fresh token for the
+same account. In v0.1.2, run `sai auth import` with the session's original
+Keeper endpoint. On `main`, run the reported `auth import --addr` command.
+It also works for older keystore sessions when you have a Sai Web token for
+that account.
 
 Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
 warning when a session has less than three days left. Interactive commands
-can also print an expiry notice to stderr. JSON output carries the warning
-in the reported session data. Use the session's original Keeper endpoint
-when renewing or importing. The v0.1.2 `renewalCommand` field can include
-explanatory text after the command.
+can also print a notice to stderr. In v0.1.2, the `renewalCommand` field can
+include explanatory text after the command.
+
+On `main`, the notice stays on one line. In `auth status` and `auth list`
+JSON output, the account overview, and MCP session reports, look for
+`expiryWarning`, the shell command `renewalCommand` when available, and
+optional `renewalGuidance`. Share the guidance separately when passing the
+command to someone else. If the stored account address is invalid, the
+report asks you to sign in again.
+
+The command specifies `--endpoint` so the destination shell uses the original
+Keeper. An origin-only URL or the public built-in Keeper URL appears directly
+in the command. A private URL uses the `SAI_RECONCILE_ENDPOINT` variable.
+If the command references `SAI_RECONCILE_ENDPOINT`, supply the full original
+URL privately in the same shell before running it. In Bash, you can enter
+the URL at a hidden prompt to keep it out of shell history.
+
+```bash
+read -rsp 'Original Keeper URL: ' SAI_RECONCILE_ENDPOINT
+printf '\n'
+export SAI_RECONCILE_ENDPOINT
+```
+
+### Choosing a Signing Key
 
 `auth login NAME` picks the key named `NAME`:
 

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..core.session import expiry_notice_text
 from .repl_skin import ReplSkin
 
 UNKNOWN = "unknown"
@@ -280,7 +281,7 @@ def show(result: dict[str, Any]) -> None:
             )
             print(f"  {state.capitalize()} until {session['expiresAt']}")
             print(f"  Issued at {_source(session)}")
-            if warning := session.get("expiryWarning"):
-                print(f"  {warning} Run {session['renewalCommand']}.")
+            if session.get("expiryWarning"):
+                print(f"  {expiry_notice_text(session)}")
         else:
             print("  No local session for this account")
