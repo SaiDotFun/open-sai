@@ -389,11 +389,16 @@ def test_mcp_list_and_uninstall_all_include_repaired_legacy_entries(
     assert repaired.exit_code == 0, repaired.output
     assert invoke("doctor", "--offline").exit_code == 0
     if canonical_exists:
-        assert invoke("mcp", "install", "codex", "cursor").exit_code == 0
-        claude_config = env.home / ".claude.json"
-        data = env.claude_json()
-        data["mcpServers"]["sai"] = claude_entry(serve(env), {})
-        claude_config.write_text(json.dumps(data))
+        entries = doctor_entries(env)
+        canonical = claude_entry(serve(env))
+        for client in entries:
+            entries[client]["sai"] = canonical
+        env.write_codex(entries["codex"])
+        for path, client in (
+            (env.home / ".claude.json", "claude"),
+            (env.cursor_path(), "cursor"),
+        ):
+            path.write_text(json.dumps({"mcpServers": entries[client]}))
 
     listed = invoke("mcp", "list")
     for row in payload(listed)["clients"]:
@@ -842,6 +847,7 @@ def test_install_uses_each_clients_registration_backend(env: Env):
     assert env.calls() == [
         ["mcp", "add", "--scope", "user", "sai", "--", sai, "mcp", "serve"],
         *GETS,
+        *LEGACY_GETS,
         *CHECK,
     ]
     assert env.claude_json()["mcpServers"]["sai"]["command"] == sai
@@ -874,6 +880,58 @@ def test_install_replaces_an_old_entry(env: Env):
         *GETS,
         *CHECK,
     ]
+
+
+@pytest.mark.parametrize("repair_first", [False, True])
+def test_install_preserves_working_codex_and_cursor_aliases(
+    env: Env, repair_first: bool
+):
+    routing = ["--endpoint", f"https://private.example/{SECRET}"]
+    argv = [OLD_COMMAND, *routing] if repair_first else [*serve(env), *routing]
+    write_doctor_entries(env, OLD_COMMAND, claude_entry(argv, {"SAI_HOME": SECRET}))
+    if repair_first:
+        report = invoke("doctor", "--offline")
+        assert mcp_checks(report)["claude"]["status"] == "fail"
+        entries = doctor_entries(env)
+        for client in ("codex", "cursor"):
+            assert entries[client][OLD_COMMAND]["command"] == str(env.sai)
+
+    paths = (env.codex_path(), env.cursor_path())
+    before = [path.read_bytes() for path in paths]
+    env.clear()
+    for flags in ((), ("--dry-run",)):
+        result = invoke("mcp", "install", "codex", "cursor", *flags)
+        assert result.exit_code == 0, result.output
+        summary = payload(result)
+        assert not summary["reconnectNeeded"]
+        assert [
+            (row["client"], row["name"], row["scope"], row["action"])
+            for row in summary["results"]
+        ] == [
+            (client, OLD_COMMAND, "user", "unchanged") for client in ("codex", "cursor")
+        ]
+        assert SECRET not in result.output
+        assert [path.read_bytes() for path in paths] == before
+    assert env.calls() == (GETS + LEGACY_GETS) * 2
+
+
+def test_user_install_reports_the_cursor_project_alias(env: Env):
+    project = env.project / ".cursor" / "mcp.json"
+    project.parent.mkdir()
+    project.write_text(
+        json.dumps({"mcpServers": {OLD_COMMAND: claude_entry(serve(env))}})
+    )
+
+    result = invoke("mcp", "install", "cursor")
+
+    assert result.exit_code == 0, result.output
+    [row] = payload(result)["results"]
+    assert (row["action"], row["name"], row["scope"]) == (
+        "unchanged",
+        OLD_COMMAND,
+        "project",
+    )
+    assert not env.cursor_path().exists()
 
 
 def test_explicit_claude_install_keeps_the_existing_legacy_name(env: Env):
@@ -975,7 +1033,7 @@ def test_dry_run_runs_no_client_and_writes_nothing(env: Env):
     ]
     assert payload(result)["reconnectNeeded"] is False
     # Only Codex's read-only `get`s ran.
-    assert env.calls() == GETS
+    assert env.calls() == GETS + LEGACY_GETS
     assert not (env.home / ".claude.json").exists()
     assert not env.cursor_path().exists()
 

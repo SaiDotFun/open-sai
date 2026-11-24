@@ -794,6 +794,28 @@ def replacement_steps(
     return [*remove, *client.add_steps(scope, target, name)]
 
 
+def report_legacy_install(client: Client, reg: Registration, target: Target) -> Result:
+    result = Result(
+        client.name,
+        "unchanged",
+        scope=reg.scope,
+        name=RETIRED_NAME,
+        **reg.shown(target),
+    )
+    if reg.disabled:
+        result.error = (
+            f"Enable the existing {RETIRED_NAME} registration in {client.name}"
+        )
+    elif stale := stale_registration(client, RETIRED_NAME, reg):
+        result.error = (
+            f"The existing {RETIRED_NAME} registration needs repair. {stale.reason}. "
+            "Run `sai doctor` for repair instructions."
+        )
+    if result.error is not None:
+        result.action = "failed"
+    return result
+
+
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
     result = Result(client.name, "failed", command=target.argv, scope=scope)
     try:
@@ -803,6 +825,10 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
         found = client.registrations()
         existing = next((r for r in found if r.scope == scope), None)
         name = NAME
+        if existing is None and isinstance(client, (Codex, Cursor)):
+            legacy = client.effective(client.registrations(RETIRED_NAME))
+            if legacy is not None:
+                return report_legacy_install(client, legacy, target)
         if existing is None and isinstance(client, Claude):
             existing = client.registration(scope, RETIRED_NAME)
             if existing is not None:
