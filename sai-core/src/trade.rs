@@ -4,6 +4,8 @@ mod actions;
 mod cancel;
 mod confirmation;
 mod estimates;
+mod position;
+mod update;
 
 use std::future::{Future, pending};
 
@@ -22,6 +24,7 @@ use crate::{
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
 pub use estimates::PreviewMode;
+pub use update::{leverage_preview, tpsl_preview};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TradeIntent {
@@ -57,7 +60,8 @@ pub struct TradePreview {
     pub reference_price: Option<String>,
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
-    pub estimates: Option<Value>,
+    position_route: Option<position::PositionRoute>,
+    estimates: Option<Value>,
 }
 
 impl TradePreview {
@@ -67,6 +71,7 @@ impl TradePreview {
             reference_price: None,
             quote: None,
             warning: None,
+            position_route: None,
             estimates: None,
         }
     }
@@ -96,6 +101,9 @@ impl TradePreview {
 
     pub fn confirmed_output(&self, account: Option<&str>) -> Value {
         let mut output = self.output(account);
+        if let Some(route) = &self.position_route {
+            output["positionRoute"] = json!(route);
+        }
         output["previewDigest"] = json!(preview_digest(self, account));
         output
     }
@@ -137,7 +145,7 @@ impl<'a> Trading<'a> {
         }
     }
 
-    /// Select the LCD used to verify a cancellation against the live contract.
+    /// Select the LCD used for live contract checks and preview estimates.
     pub fn with_lcd_endpoint(mut self, endpoint: &'a str) -> Self {
         self.lcd_endpoint = Some(endpoint);
         self
@@ -191,6 +199,14 @@ impl<'a> Trading<'a> {
             self.check_pending_order(session, preview).await?;
         }
         let mut market_row = None;
+        let update = if preview.is_standalone_position_update() {
+            Some(
+                self.preflight_position_update(account, preview, options.confirmation.is_some())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut prepared;
         let preview = if market {
             prepared = preview.clone();
@@ -202,13 +218,16 @@ impl<'a> Trading<'a> {
             positive_decimal(price, "Current price")?;
             prepared.intent.body["intentPrice"] = json!(price);
             &prepared
+        } else if let Some(update) = &update {
+            &update.preview
         } else {
             preview
         };
         // Live reads can outlast the session. Reload the pinned account
         // before confirmation and reserve with its current token.
         let reloaded;
-        let session = if cancelling || market || options.confirmation.is_some() {
+        let session = if cancelling || market || update.is_some() || options.confirmation.is_some()
+        {
             reloaded = self.load_session(Some(account))?;
             &reloaded
         } else {
@@ -217,6 +236,9 @@ impl<'a> Trading<'a> {
         if let Some(confirmation) = options.confirmation
             && let Err(mut error) = confirmation.verify(preview, account)
         {
+            if let Some(update) = update {
+                return Err(self.update_refusal(account, update, error).await);
+            }
             if let Some(fresh) = error
                 .details
                 .as_deref_mut()

@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -14,6 +15,7 @@ import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -76,6 +78,11 @@ class Endpoints:
     errors: list[str] = field(default_factory=list)
     wire: list[WireRequest] = field(default_factory=list)
     admission: Admission = field(default_factory=Admission)
+    near_expiry: str = field(
+        default_factory=lambda: (
+            datetime.now(UTC) + timedelta(hours=50, minutes=30)
+        ).isoformat()
+    )
     interrupt_ready: threading.Event = field(default_factory=threading.Event)
     interrupt_closed: threading.Event = field(default_factory=threading.Event)
     keeper_path: str = "/query"
@@ -126,6 +133,37 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
     sai_home.mkdir(mode=0o700)
     if seed == "empty":
         return
+    if seed == "doctor-malformed-toml":
+        config = sai_home / "config.toml"
+        config.write_text("[keeper\n")
+        config.chmod(0o600)
+        return
+    if seed == "doctor-invalid-endpoint":
+        config = sai_home / "config.toml"
+        config.write_text('[keeper]\nendpoint = "https://fixture.invalid:bad/api"\n')
+        config.chmod(0o600)
+        return
+    if seed == "doctor-ledger-v0":
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o700)
+        with sqlite3.connect(path := trader / "intents.sqlite3") as conn:
+            conn.execute(
+                "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL,"
+                " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+                " entity TEXT NOT NULL)"
+            )
+        path.chmod(0o600)
+        return
+    if seed == "doctor-loose-profile":
+        sai_home.chmod(0o750)
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o755)
+        history = trader / "history"
+        history.touch(mode=0o644)
+        return
     if seed == "legacy":
         shutil.copytree(HERE / "v0.1.0", sai_home, dirs_exist_ok=True)
         sai_home.chmod(0o700)
@@ -139,26 +177,76 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         path.write_text(text, encoding="utf-8")
         path.chmod(0o600)
         return
-    session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
+    if seed == "mcp-info-cache":
+        path = sai_home / "update.json"
+        path.write_text(
+            '{"schema": 1, "latest": "sai-cli/v0.99.0", "checkedAt": "2000-01-01T00:00:00Z"}',
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return
     sessions = []
-    if seed in {"session", "accounts", "history-token"}:
-        sessions.append({**session, "endpoint": endpoints.keeper})
+    if seed in {
+        "session",
+        "accounts",
+        "doctor-near-expiry",
+        "doctor-ledger-session",
+        "history-token",
+    }:
+        sessions.append(session_fixture(endpoints, "session"))
+        if seed == "doctor-near-expiry":
+            sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+    if seed == "doctor-ledger-session":
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
+    write_seed(
+        home,
+        endpoints,
+        sessions,
+        ledger=seed in {"ledger", "doctor-ledger-session"},
+        disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
+    )
+
+
+def session_fixture(endpoints: Endpoints, state: str) -> dict[str, Any]:
+    session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
+    return {
+        **session,
+        "endpoint": endpoints.keeper if state != "other-endpoint" else endpoints.http,
+        "expiresAt": "2000-01-01T00:00:00Z"
+        if state == "expired"
+        else session["expiresAt"],
+    }
+
+
+def write_seed(
+    home: Path,
+    endpoints: Endpoints,
+    sessions: list[dict[str, Any]],
+    *,
+    ledger: bool = False,
+    disable_logs: bool = False,
+) -> None:
+    env = child_env(home, endpoints)
+    if disable_logs:
+        env["SAI_LOG"] = "false"
     subprocess.run(
         [sys.executable, "-c", SEED],
         input=json.dumps(
             {
                 "sessions": sessions,
-                "ledger": seed == "ledger",
+                "ledger": ledger,
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
             }
         ),
-        env=child_env(home, endpoints),
+        env=env,
         cwd=home,
         text=True,
         capture_output=True,
@@ -333,9 +421,11 @@ def loopback(
             "collateral_index": token_index,
         },
         "is_after_hours_market": False,
+        "market_order_config": {"fill_at_next_oracle_price": False},
         "get_collateral_price": "1",
         "get_perp_prices": {"market": {"base_per_quote": "100"}, "collateral": "1"},
         "get_liquidation_price": {"liquidation_price": "60"},
+        "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
         "get_market": {"fee_index": "FeeIndex(0)", "group_index": "GroupIndex(0)"},
         "get_group": {"min_leverage": "1", "max_leverage": "100"},
         "get_pair_custom_max_leverage": "0",
@@ -369,7 +459,8 @@ def loopback(
         "get_trade_raw": {
             "trader": (
                 cancel_trader
-                if scenario == "pending-order" or cancel_target is not None
+                if scenario in {"pending-order", "concurrent-close"}
+                or cancel_target is not None
                 else position["trader"]
             ),
             "index": 7,
@@ -379,6 +470,7 @@ def loopback(
             "collateral_index": token_index,
         },
         "is_after_hours_market": {"market_index": market_index},
+        "market_order_config": {},
         "get_collateral_price": {"collateral_index": token_index},
         "get_market": {"index": market_index},
         "get_group": {"index": "GroupIndex(0)"},
@@ -392,8 +484,17 @@ def loopback(
             "trader": position["trader"],
             "include_borrowing_fees": True,
         },
+        "quote_trade": {
+            "trader": position["trader"],
+            "funds": [],
+            "action": {
+                "update_leverage": {
+                    "trade_index": "UserTradeIndex(7)",
+                    "new_leverage": "1.818181818181818182",
+                }
+            },
+        },
         "get_fees": {"index": "FeeIndex(0)"},
-        "market_order_config": {},
         "get_after_hours_leverage": {},
     }
 
@@ -546,8 +647,20 @@ def loopback(
                         self.reply({"data": {"userIntents": [row]}})
                     return
                 if name in responses:
-                    if not same_variables(request.variables, variables.get(name, {})):
+                    expected = variables.get(name, {})
+                    if (
+                        scenario == "mcp-reads"
+                        and name == "userIntents"
+                        and request.variables.get("key") is None
+                    ):
+                        expected = {**expected, "key": None}
+                    if not same_variables(request.variables, expected):
                         self.reject(f"Wrong Keeper variables for {name}")
+                    elif scenario == "mcp-cancel":
+                        interrupt_ready.set()
+                        self.connection.settimeout(5)
+                        if self.rfile.read(1) == b"":
+                            interrupt_closed.set()
                     elif scenario == "interrupt-http":
                         interrupt_ready.set()
                         interrupt_closed.wait(8)
@@ -580,9 +693,10 @@ def loopback(
                             b'{"priceUsd":18446744073709551616123456},'
                             b'{"priceUsd":"1.2300"}]}}}'
                         )
-                    elif (
-                        scenario == "history-graphql-errors" and name == "tradeHistory"
-                    ):
+                    elif (scenario, name) in {
+                        ("history-graphql-errors", "tradeHistory"),
+                        ("doctor-graphql-errors", "oneClickTrading"),
+                    }:
                         self.reply(
                             {
                                 **responses[name],
@@ -634,6 +748,13 @@ def loopback(
             path = urlsplit(self.path).path
             if path.startswith(scope):
                 path = path.removeprefix(scope)
+                if (
+                    scenario == "doctor-lcd-unreachable"
+                    and path == "/private-fixture-credential" + NODE_INFO
+                ):
+                    wire.append(WireRequest("node_info"))
+                    self.reply({}, 503)
+                    return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
                     self.reply(
@@ -676,7 +797,17 @@ def loopback(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        if not same_variables(query, {name: contract_args[name]}):
+                        expected = {name: contract_args[name]}
+                        # Ownership uses the account address. The next read
+                        # uses Perp's stored owner to pin the quote.
+                        if (
+                            scenario == "concurrent-close"
+                            and name == "get_trade_raw"
+                            and query
+                            == {name: {"trader": position["trader"], "index": 7}}
+                        ):
+                            expected = query
+                        if not same_variables(query, expected):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         if scenario.startswith("quote-"):
@@ -786,6 +917,9 @@ def loopback(
                 errors.append("Expected WebSocket connection_init")
                 return
             wire.append(WireRequest("ws:init"))
+            if scenario == "doctor-ws-timeout":
+                connection.recv(timeout=7)
+                return
             if scenario == "interrupt-handshake":
                 interrupt_ready.set()
                 connection.recv(timeout=8)
@@ -890,7 +1024,7 @@ def loopback(
             errors,
             wire,
             admission,
-            interrupt_ready,
-            interrupt_closed,
+            interrupt_ready=interrupt_ready,
+            interrupt_closed=interrupt_closed,
             keeper_path=keeper_path,
         )

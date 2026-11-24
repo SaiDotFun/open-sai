@@ -14,11 +14,10 @@ use sai_core::{
 };
 use serde_json::{Map, Value, json};
 
-const EVENTS: EventContext<'_> = EventContext {
-    writer: None,
-    surface: Surface::Cli,
-    command: None,
-};
+#[path = "keeper/position_updates.rs"]
+mod position_updates;
+
+const EVENTS: EventContext<'_> = EventContext::new(None, Surface::Cli, None);
 
 fn listener() -> TcpListener {
     TcpListener::bind(("127.0.0.1", 0)).unwrap()
@@ -46,7 +45,7 @@ fn read_request(stream: &mut TcpStream) -> (Vec<String>, Vec<u8>) {
                 .parse()
                 .ok()
         })
-        .unwrap();
+        .unwrap_or(0);
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     (lines, body)

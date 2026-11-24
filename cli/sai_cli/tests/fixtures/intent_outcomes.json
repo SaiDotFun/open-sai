@@ -567,6 +567,7 @@
           {
             "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
             "kind": "OPEN_TRADE",
+            "body": {"orderType": "limit"},
             "lifecycleStep": "exec_pass",
             "execActor": "server",
             "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",

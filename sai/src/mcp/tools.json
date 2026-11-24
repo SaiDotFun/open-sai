@@ -1,0 +1,402 @@
+[
+  {
+    "name": "mcp_info",
+    "description": "Report this server's versions, provenance, endpoints, tools,\n        session state, log directory, and whether trading is available. Call\n        this first.\n\n        `logs.dir` holds JSON-lines logs of every tool call, Keeper request,\n        and intent status change; `sai logs tail` in a terminal reads them.\n\n        `restartNeeded` is true when a newer sai was installed after this\n        server started; restart the MCP client to load it.\n\n        Never read MCP client config files to learn about this server; they\n        can hold secrets. The report never includes the session token.\n        ",
+    "inputSchema": {
+      "properties": {},
+      "title": "mcp_infoArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "mcp_infoOutput", "type": "object"},
+    "annotations": {"title": "MCP Info", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+  },
+  {
+    "name": "auth_status",
+    "description": "Show the active account and its session expiry, never the token.\n\n    Sessions come from `sai auth login NAME` or `sai auth import`, run by the\n    user in a terminal.\n\n    Args:\n        addr: A connected account to check instead of the active one.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "title": "auth_statusArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "auth_statusOutput", "type": "object"},
+    "annotations": {"title": "Auth Status", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+  },
+  {
+    "name": "auth_list",
+    "description": "List connected accounts: addr, expiry, whether each is usable on\n    this server's endpoint, and which one is active. Never shows tokens.",
+    "inputSchema": {
+      "properties": {},
+      "title": "auth_listArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "auth_listOutput", "type": "object"},
+    "annotations": {"title": "Connected Accounts", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+  },
+  {
+    "name": "auth_use",
+    "description": "Make a connected account the active one. Call only when the user\n    asks to switch; the CLI shares the active account. Returns auth_list.\n\n    Args:\n        addr: EVM addr (0x...) of a connected account from auth_list.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"title": "Addr", "type": "string"}
+      },
+      "required": ["addr"],
+      "title": "auth_useArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "auth_useOutput", "type": "object"},
+    "annotations": {"title": "Switch Account", "readOnlyHint": false, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+  },
+  {
+    "name": "market_list",
+    "description": "List Keeper borrowing markets: market id, price, open state, leverage\n    limits, minimum position size, fees, and tokens.",
+    "inputSchema": {
+      "properties": {},
+      "title": "market_listArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "market_listOutput", "type": "object"},
+    "annotations": {"title": "Market List", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "market_prices",
+    "description": "List current indexed USD token prices.",
+    "inputSchema": {
+      "properties": {},
+      "title": "market_pricesArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "market_pricesOutput", "type": "object"},
+    "annotations": {"title": "Market Prices", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "account_positions",
+    "description": "List open positions and pending orders.\n\n    The result names the `addr` read and its `addrSource`.\n\n    Args:\n        addr: EVM addr (0x...). Defaults to the signed-in account,\n            unless its session is for another Keeper endpoint.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "title": "account_positionsArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_positionsOutput", "type": "object"},
+    "annotations": {"title": "Account Positions", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "account_history",
+    "description": "Read the latest 50 trade history rows.\n\n    The result names the `addr` read and its `addrSource`.\n\n    Args:\n        addr: EVM addr (0x...). Defaults to the signed-in account,\n            unless its session is for another Keeper endpoint.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "title": "account_historyArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_historyOutput", "type": "object"},
+    "annotations": {"title": "Account History", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "account_balances",
+    "description": "Read one balance snapshot, including Sai deposits and credits.\n\n    The result names the `addr` read and its `addrSource`.\n\n    Args:\n        addr: EVM addr (0x...). Defaults to the signed-in account,\n            unless its session is for another Keeper endpoint.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "title": "account_balancesArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_balancesOutput", "type": "object"},
+    "annotations": {"title": "Account Balances", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "intent_local",
+    "description": "List intents this machine recorded, with their local status.\n\n    Statuses `unknown` and `pending` block new trades until intent_status\n    reconciles them.\n    The result names the `addr` read and its `addrSource`.\n\n    Args:\n        addr: EVM addr (0x...). Defaults to the signed-in account,\n            unless its session is for another Keeper endpoint.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "title": "intent_localArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "intent_localOutput", "type": "object"},
+    "annotations": {"title": "Local Intents", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": false}
+  },
+  {
+    "name": "intent_status",
+    "description": "Read Keeper's latest intent records; with KEY, reconcile that intent.\n\n    The account list records pending observations in the local ledger.\n    With KEY this also checks for a final outcome. If the result includes\n    outcome `pending`, follow its hint and check the same key again.\n\n    Args:\n        addr: EVM addr (0x...). Defaults to the signed-in account,\n            unless its session is for another Keeper endpoint.\n        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"},
+        "key": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Key"}
+      },
+      "title": "intent_statusArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "intent_statusOutput", "type": "object"},
+    "annotations": {"title": "Intent Status", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "preview_open",
+    "description": "Preview opening a market, limit, or stop trade without submitting.\n\n    Show the user the result and get confirmation; trade_open then needs its\n    previewDigest. A market order preview sets requiresMarketPriceRefresh\n    and reports Keeper's current price as referencePrice: the submit uses\n    the price current at that time, and trade_open needs referencePrice too.\n\n    Args:\n        market_id: Market id from market_list.\n        side: long or short.\n        order_type: market, limit, or stop.\n        amount: Collateral in USD as a decimal string, at most 6 decimals.\n        leverage: Leverage as a decimal string, such as \"5\".\n        slippage: Maximum slippage percentage as a decimal string.\n        price: Trigger price, required for limit and stop. A market order\n            submits Keeper's current price instead.\n        take_profit: Optional take-profit price.\n        stop_loss: Optional stop-loss price.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "market_id": {"title": "Market Id", "type": "integer"},
+        "side": {"enum": ["long", "short"], "title": "Side", "type": "string"},
+        "order_type": {"enum": ["market", "limit", "stop"], "title": "Order Type", "type": "string"},
+        "amount": {"title": "Amount", "type": "string"},
+        "leverage": {"title": "Leverage", "type": "string"},
+        "slippage": {"title": "Slippage", "type": "string"},
+        "price": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Price"},
+        "take_profit": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Take Profit"},
+        "stop_loss": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Stop Loss"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["market_id", "side", "order_type", "amount", "leverage", "slippage"],
+      "title": "preview_openArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_openOutput", "type": "object"},
+    "annotations": {"title": "Preview Open Trade", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "preview_close",
+    "description": "Preview closing a position or cancelling a pending order. Show the\n    user the result; trade_close needs its previewDigest.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        cancel_order: True to cancel a pending order instead of closing.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "cancel_order": {"default": false, "title": "Cancel Order", "type": "boolean"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id"],
+      "title": "preview_closeArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_closeOutput", "type": "object"},
+    "annotations": {"title": "Preview Close Trade", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "preview_tpsl",
+    "description": "Preview setting or clearing take-profit and stop-loss prices. Show the\n    user the result; trade_tpsl needs its previewDigest.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        take_profit: New take-profit price as a decimal string.\n        stop_loss: New stop-loss price as a decimal string.\n        clear_take_profit: True to remove the take-profit.\n        clear_stop_loss: True to remove the stop-loss.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "take_profit": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Take Profit"},
+        "stop_loss": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Stop Loss"},
+        "clear_take_profit": {"default": false, "title": "Clear Take Profit", "type": "boolean"},
+        "clear_stop_loss": {"default": false, "title": "Clear Stop Loss", "type": "boolean"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id"],
+      "title": "preview_tpslArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_tpslOutput", "type": "object"},
+    "annotations": {"title": "Preview TP/SL", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "preview_leverage",
+    "description": "Preview setting target leverage without changing TP or SL. Show the\n    user the result; trade_leverage needs its previewDigest.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        leverage: Target leverage as a decimal string.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "leverage": {"title": "Leverage", "type": "string"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "leverage"],
+      "title": "preview_leverageArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_leverageOutput", "type": "object"},
+    "annotations": {"title": "Preview Leverage", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "preview_margin",
+    "description": "Quote adding or removing margin from exact contract state.\n\n    The change is a target-leverage intent: the amount is a quote, not a\n    cap, and the actual change may differ at execution. Uses effective\n    leverage after any applicable after-hours cap. If\n    quote.marginChangeIsEstimate is true, tell the user that the guard can\n    deduct fees first. A signed-in session is required. trade_margin needs\n    the previewDigest the user confirms.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        direction: add or remove.\n        amount: USDC amount to quote, as a decimal string.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "direction": {"enum": ["add", "remove"], "title": "Direction", "type": "string"},
+        "amount": {"title": "Amount", "type": "string"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "direction", "amount"],
+      "title": "preview_marginArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_marginOutput", "type": "object"},
+    "annotations": {"title": "Preview Margin Change", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "preview_partial_close",
+    "description": "Preview reducing an open USDC position by a whole percentage.\n\n    Sizes the reduction from contract state, checks the market minimum, and\n    quotes the closed notional. Needs a signed-in session to read the\n    position. Show the user the quoted notional and collateral reduction.\n    When quote.closedNotionalIsEstimate is true, say that the notional is\n    an estimate. trade_partial_close needs the previewDigest they confirm.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        percent: Whole percentage to close, 1 to 99.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "percent": {"title": "Percent", "type": "integer"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "percent"],
+      "title": "preview_partial_closeArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "preview_partial_closeOutput", "type": "object"},
+    "annotations": {"title": "Preview Partial Close", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "logs_intent",
+    "description": "Read one intent's local log trail and current Keeper record.\n\n    Args:\n        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.\n        offline: Read local logs only.\n        addr: EVM address to select if the trail has several accounts.\n        before: UTC timestamp from a truncated report's nextBefore field.\n    ",
+    "inputSchema": {
+      "properties": {
+        "key": {"title": "Key", "type": "string"},
+        "offline": {"default": false, "title": "Offline", "type": "boolean"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"},
+        "before": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Before"}
+      },
+      "required": ["key"],
+      "title": "logs_intentArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "logs_intentOutput", "type": "object"},
+    "annotations": {"title": "Intent Log Trail", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "trade_open",
+    "description": "Submit an open-trade intent. Call preview_open with the same\n    arguments, show the user the preview, and get their explicit\n    confirmation first. `accepted` means Keeper admitted the intent, not\n    that it executed.\n\n    Refuses without submitting: PREVIEW_MISMATCH when the intent differs\n    from the confirmed preview, and, for a market order, PRICE_MOVED when\n    Keeper's current price moved from reference_price by more than the\n    slippage percent. Both return a new preview to show the user. Also\n    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or\n    pending. Check its key with intent_status before retrying.\n\n    Args:\n        market_id: Market id from market_list.\n        side: long or short.\n        order_type: market, limit, or stop.\n        amount: Collateral in USD as a decimal string, at most 6 decimals.\n        leverage: Leverage as a decimal string, such as \"5\".\n        slippage: Maximum slippage percentage as a decimal string.\n        price: Trigger price, required for limit and stop. A market order\n            submits Keeper's current price instead.\n        take_profit: Optional take-profit price.\n        stop_loss: Optional stop-loss price.\n        preview_digest: previewDigest from the confirmed preview_open.\n        reference_price: referencePrice from the confirmed preview_open;\n            required for market orders only.\n        allow_concurrent_open: True to submit while an earlier open is unknown\n            or accepted, after checking its status and getting confirmation for\n            another position. Any locally pending open on the same account and\n            Keeper still blocks submission, including a late acknowledgement\n            or an outcome that is still waiting to be indexed.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "market_id": {"title": "Market Id", "type": "integer"},
+        "side": {"enum": ["long", "short"], "title": "Side", "type": "string"},
+        "order_type": {"enum": ["market", "limit", "stop"], "title": "Order Type", "type": "string"},
+        "amount": {"title": "Amount", "type": "string"},
+        "leverage": {"title": "Leverage", "type": "string"},
+        "slippage": {"title": "Slippage", "type": "string"},
+        "preview_digest": {"title": "Preview Digest", "type": "string"},
+        "price": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Price"},
+        "take_profit": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Take Profit"},
+        "stop_loss": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Stop Loss"},
+        "reference_price": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Reference Price"},
+        "allow_concurrent_open": {"default": false, "title": "Allow Concurrent Open", "type": "boolean"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["market_id", "side", "order_type", "amount", "leverage", "slippage", "preview_digest"],
+      "title": "trade_openArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_openOutput", "type": "object"},
+    "annotations": {"title": "Open Trade", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
+  },
+  {
+    "name": "trade_close",
+    "description": "Submit a close or cancel intent. Call preview_close, show the user the\n    preview, and get confirmation first. Refuses with PREVIEW_MISMATCH and a\n    new preview if the intent differs from the confirmed one.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        preview_digest: previewDigest from the confirmed preview_close.\n        cancel_order: True to cancel a pending order instead of closing.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "preview_digest": {"title": "Preview Digest", "type": "string"},
+        "cancel_order": {"default": false, "title": "Cancel Order", "type": "boolean"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "preview_digest"],
+      "title": "trade_closeArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_closeOutput", "type": "object"},
+    "annotations": {"title": "Close Trade", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
+  },
+  {
+    "name": "trade_tpsl",
+    "description": "Submit a take-profit and stop-loss change. Call preview_tpsl, show the\n    user the preview, and get confirmation first. Refuses with\n    PREVIEW_MISMATCH and a new preview if the intent differs.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        preview_digest: previewDigest from the confirmed preview_tpsl.\n        take_profit: New take-profit price as a decimal string.\n        stop_loss: New stop-loss price as a decimal string.\n        clear_take_profit: True to remove the take-profit.\n        clear_stop_loss: True to remove the stop-loss.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "preview_digest": {"title": "Preview Digest", "type": "string"},
+        "take_profit": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Take Profit"},
+        "stop_loss": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Stop Loss"},
+        "clear_take_profit": {"default": false, "title": "Clear Take Profit", "type": "boolean"},
+        "clear_stop_loss": {"default": false, "title": "Clear Stop Loss", "type": "boolean"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "preview_digest"],
+      "title": "trade_tpslArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_tpslOutput", "type": "object"},
+    "annotations": {"title": "Set TP/SL", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
+  },
+  {
+    "name": "trade_leverage",
+    "description": "Submit a target-leverage change. Call preview_leverage, show the user\n    the preview, and get confirmation first. Refuses with PREVIEW_MISMATCH\n    and a new preview if the intent differs.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        leverage: Target leverage as a decimal string.\n        preview_digest: previewDigest from the confirmed preview_leverage.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "leverage": {"title": "Leverage", "type": "string"},
+        "preview_digest": {"title": "Preview Digest", "type": "string"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "leverage", "preview_digest"],
+      "title": "trade_leverageArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_leverageOutput", "type": "object"},
+    "annotations": {"title": "Set Leverage", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
+  },
+  {
+    "name": "trade_margin",
+    "description": "Submit a margin change. Call preview_margin, show the user the quote,\n    and get confirmation first.\n\n    The digest covers the intent and the quote, so it refuses with\n    PREVIEW_MISMATCH and a new preview if the position changed since the\n    confirmed quote. The amount is a quote, not a cap.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        direction: add or remove.\n        amount: USDC amount to quote, as a decimal string.\n        preview_digest: previewDigest from the confirmed preview_margin.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "direction": {"enum": ["add", "remove"], "title": "Direction", "type": "string"},
+        "amount": {"title": "Amount", "type": "string"},
+        "preview_digest": {"title": "Preview Digest", "type": "string"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "direction", "amount", "preview_digest"],
+      "title": "trade_marginArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_marginOutput", "type": "object"},
+    "annotations": {"title": "Change Margin", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
+  },
+  {
+    "name": "trade_partial_close",
+    "description": "Submit a partial close. Call preview_partial_close, show the user the\n    preview, and get confirmation first.\n\n    Refuses with PREVIEW_MISMATCH and a new preview if the position changed\n    since the confirmed reduction was sized.\n\n    Args:\n        trade_id: Trade id from account_positions.\n        percent: Whole percentage to close, 1 to 99.\n        preview_digest: previewDigest from the confirmed preview_partial_close.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "inputSchema": {
+      "properties": {
+        "trade_id": {"title": "Trade Id", "type": "integer"},
+        "percent": {"title": "Percent", "type": "integer"},
+        "preview_digest": {"title": "Preview Digest", "type": "string"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "required": ["trade_id", "percent", "preview_digest"],
+      "title": "trade_partial_closeArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "trade_partial_closeOutput", "type": "object"},
+    "annotations": {"title": "Partial Close", "readOnlyHint": false, "destructiveHint": true, "idempotentHint": false, "openWorldHint": true}
+  }
+]

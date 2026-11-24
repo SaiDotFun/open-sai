@@ -1,11 +1,14 @@
-"""Confirm position quotes through MCP against loopback Keeper and LCD routes."""
+"""Confirm position quotes through CLI and MCP against loopback Keeper and LCD."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import logging
 import threading
+import time
+import traceback
 from collections import deque
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
@@ -21,22 +24,48 @@ from click.testing import CliRunner
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
-from sai_cli.core import keeper, settings, storage
+from sai_cli.core import keeper, margin, settings, storage
+from sai_cli.core.errors import ExitCode
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
+CHECKSUM_ADDR = "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"
 TOKEN = "fake-token"
 CHAIN_ID = "test-1"
-TRADER = "nibi1trader"
+TRADER = "nibi1424242424242424242424242424242422mldj0"
+OTHER_TRADER = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
+CLI_POSITION_ACTIONS = (
+    ("close", "7"),
+    ("leverage", "7", "--leverage", "3"),
+    ("tpsl", "7", "--take-profit", "120"),
+    ("margin", "7", "--direction", "add", "--amount", "1"),
+    ("partial-close", "7", "--percent", "50"),
+)
+MCP_POSITION_ACTIONS = (
+    ("close", {"trade_id": 7}),
+    ("leverage", {"trade_id": 7, "leverage": "3"}),
+    ("tpsl", {"trade_id": 7, "take_profit": "120"}),
+)
 
 
 @dataclass
 class Position:
+    chain_id: str = CHAIN_ID
+    contract_address: str = "nibi1contract"
+    lcd_chain_id: str | None = None
+    lcd_chain_ids: deque[str] = field(default_factory=deque)
     collateral: int = 4_000_000
+    available_balance: int = 10_000_000
+    pinned_balance: int | None = None
+    trader: str = TRADER
+    contract_owner: str | None = TRADER
+    contract_position_unavailable: bool = False
+    position_reads: int = 0
     trade_type: str = "trade"
     keeper_market_open: bool = True
     market_trading_state: str = "open"
+    switch_and_logout_on_keeper_read: str | None = None
     logout_on_position_read: bool = False
     missing_trade_status: int = 400
     leverage: str = "2"
@@ -44,6 +73,8 @@ class Position:
     quoted_max_leverage: int | None = None
     pair_leverage: str | None = "0"
     liquidation_threshold: str = "60"
+    quoted_liquidation_threshold: str | None = None
+    quote_error_height: int | None = None
     block_timestamp: int = 2_000_000_000
     oracle_base_age: int | None = None
     null_market_price: bool = False
@@ -51,10 +82,13 @@ class Position:
     oracle_ttl: int = 300
     fill_at_next_oracle_price: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
+    snapshot_traders: deque[str] = field(default_factory=deque)
+    indexed_collaterals: deque[int] = field(default_factory=deque)
     after_hours: bool = False
     risk_block: int = 90
     cap: str | None = "5"
     caps_on_position_read: deque[str | None] = field(default_factory=deque)
+    collateral_on_position_read: deque[int | None] = field(default_factory=deque)
     reported_height: int | None = 120
     cache_contract_queries: bool = False
     drop_pinned_height: bool = False
@@ -64,6 +98,8 @@ class Position:
     minimum_position_microusd: str = "1"
     preview_inputs: bool = False
     malformed_node_info: bool = False
+    deny_lcd: bool = False
+    denied_lcd_targets: list[str] = field(default_factory=list)
     price: float | str = 100.5
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
@@ -90,8 +126,18 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_POST(self) -> None:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if request["query"] == keeper.POSITION and position.snapshot_leverages:
-                position.leverage = position.snapshot_leverages.popleft()
+            indexed_collateral = position.collateral
+            if request["query"] == keeper.POSITION:
+                if position.switch_and_logout_on_keeper_read is not None:
+                    storage.use_session(position.switch_and_logout_on_keeper_read)
+                    assert storage.delete_session(ADDR) == ADDR
+                    position.switch_and_logout_on_keeper_read = None
+                if position.snapshot_leverages:
+                    position.leverage = position.snapshot_leverages.popleft()
+                if position.snapshot_traders:
+                    position.trader = position.snapshot_traders.popleft()
+                if position.indexed_collaterals:
+                    indexed_collateral = position.indexed_collaterals.popleft()
             if request["query"] == keeper.SUBMIT:
                 assert self.headers["Authorization"] == f"Bearer {TOKEN}"
                 envelope = request["variables"]["input"]
@@ -119,17 +165,18 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     keeper.ROUTE: {
                         "oneClickTrading": {
                             "enabled": True,
-                            "chainId": CHAIN_ID,
-                            "contractAddress": "nibi1contract",
+                            "chainId": position.chain_id,
+                            "contractAddress": position.contract_address,
                         }
                     },
                     keeper.POSITION: {
                         "perp": {
                             "trade": {
-                                "trader": TRADER,
+                                "id": 7,
+                                "trader": position.trader,
                                 "isOpen": True,
                                 "tradeType": "trade",
-                                "collateralAmount": position.collateral,
+                                "collateralAmount": indexed_collateral,
                                 "leverage": float(position.leverage),
                                 "perpBorrowing": market,
                             }
@@ -141,13 +188,20 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.reply({"data": data})
 
         def do_GET(self) -> None:
+            if position.deny_lcd:
+                position.denied_lcd_targets.append(self.path)
+                self.reply({}, status=401)
+                return
             path = urlsplit(self.path).path
             if path == "/cosmos/base/tendermint/v1beta1/node_info":
+                network = position.lcd_chain_id or position.chain_id
+                if position.lcd_chain_ids:
+                    network = position.lcd_chain_ids.popleft()
                 self.reply(
                     {
                         "default_node_info": None
                         if position.malformed_node_info
-                        else {"network": CHAIN_ID}
+                        else {"network": network}
                     }
                 )
                 return
@@ -168,10 +222,14 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     }
                 )
                 return
-            prefix = "/cosmwasm/wasm/v1/contract/nibi1contract/smart/"
+            prefix = f"/cosmwasm/wasm/v1/contract/{position.contract_address}/smart/"
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
+                position.position_reads += 1
+                if position.contract_position_unavailable:
+                    self.reply({}, status=503)
+                    return
                 index = message["get_trade_raw"]["index"]
                 if index != 7:
                     self.reply(
@@ -185,6 +243,10 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 if position.logout_on_position_read:
                     assert storage.delete_session(ADDR) == ADDR
                     position.logout_on_position_read = False
+                if position.collateral_on_position_read:
+                    collateral = position.collateral_on_position_read.popleft()
+                    if collateral is not None:
+                        position.collateral = collateral
                 if position.caps_on_position_read:
                     cap = position.caps_on_position_read.popleft()
                     if cap is not None:
@@ -202,7 +264,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 return
             if "get_trade_raw" in message:
                 data = {
-                    "user": TRADER,
+                    "user": position.contract_owner,
                     "user_trade_index": "UserTradeIndex(7)",
                     "market_index": "MarketIndex(0)",
                     "collateral_index": "TokenIndex(1)",
@@ -257,10 +319,49 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     position.reported_height
                 )
                 data = {"liquidation_price": position.liquidation_threshold}
+            elif "quote_trade" in message:
+                assert not position.fill_at_next_oracle_price
+                assert self.headers.get("x-cosmos-block-height") == str(
+                    position.reported_height
+                )
+                quote = message["quote_trade"]
+                leverage = quote["action"]["update_leverage"]["new_leverage"]
+                assert quote == {
+                    "trader": TRADER,
+                    "funds": [],
+                    "action": {
+                        "update_leverage": {
+                            "trade_index": "UserTradeIndex(7)",
+                            "new_leverage": leverage,
+                        }
+                    },
+                }
+                threshold = position.quoted_liquidation_threshold
+                if threshold is not None:
+                    assert leverage == "20"
+                    if Decimal(str(position.price)) <= Decimal(threshold):
+                        self.reply(
+                            {
+                                "code": 2,
+                                "message": f"Generic error: liquidation price reached. "
+                                f"Liq price {threshold}, current price 1: query wasm contract failed",
+                            },
+                            status=500,
+                            bare_height=position.quote_error_height,
+                        )
+                        return
+                data = {"data": None, "attributes": [], "events": [], "messages": []}
             elif "get_exchange_balance" in message:
+                balance = message["get_exchange_balance"]
+                assert keeper.same_account(TRADER, balance["user"])
+                assert balance["collateral_index"] == "TokenIndex(1)"
+                pinned = self.headers.get("x-cosmos-block-height") is not None
+                available = position.available_balance
+                if pinned and position.pinned_balance is not None:
+                    available = position.pinned_balance
                 data = {
                     "collateral_index": "TokenIndex(1)",
-                    "available_to_trade": "10000000",
+                    "available_to_trade": str(available),
                 }
             elif "is_after_hours_market" in message:
                 assert message["is_after_hours_market"] == {
@@ -342,7 +443,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.reply({"data": data}, height)
 
         def reply(
-            self, value: dict[str, Any], height: int | None = None, *, status: int = 200
+            self,
+            value: dict[str, Any],
+            height: int | None = None,
+            *,
+            status: int = 200,
+            bare_height: int | None = None,
         ) -> None:
             requested_height = self.headers.get("x-cosmos-block-height")
             if requested_height is not None and height is not None:
@@ -353,6 +459,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.send_header("Content-Length", str(len(data)))
             if height is not None:
                 self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
+            if bare_height is not None:
+                self.send_header("x-cosmos-block-height", str(bare_height))
             self.end_headers()
             self.wfile.write(data)
 
@@ -371,9 +479,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
             thread.join()
 
 
-@asynccontextmanager
-async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
-    endpoint = f"{base_url}/query"
+def save_session(endpoint: str) -> None:
     storage.save_session(
         {
             "token": TOKEN,
@@ -382,8 +488,16 @@ async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
             "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
         }
     )
+
+
+@asynccontextmanager
+async def connected_client(
+    base_url: str, *, lcd_endpoint: str | None = None
+) -> AsyncGenerator[ClientSession]:
+    endpoint = f"{base_url}/query"
+    save_session(endpoint)
     config = settings.load(
-        flags={"keeper.endpoint": endpoint, "lcd.endpoint": base_url}
+        flags={"keeper.endpoint": endpoint, "lcd.endpoint": lcd_endpoint or base_url}
     )
     mcp = create_server(config)
     async with create_connected_server_and_client_session(mcp._mcp_server) as client:
@@ -398,6 +512,387 @@ async def call(
     block = result.content[0]
     assert isinstance(block, TextContent)
     return json.loads(block.text)
+
+
+@pytest.mark.parametrize("command", CLI_POSITION_ACTIONS)
+def test_cli_refuses_another_accounts_position(position_service, command):
+    position, base_url = position_service
+    endpoint = f"{base_url}/query"
+    save_session(endpoint)
+    position.trader = OTHER_TRADER
+    position.contract_owner = OTHER_TRADER
+    args = ["--json", "--endpoint", endpoint, "--lcd-endpoint", base_url, "trade"]
+    runner = CliRunner()
+
+    for flags in (["--dry-run"], []):
+        result = runner.invoke(main, [*args, *command, *flags])
+        assert result.exit_code == 1, result.output
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert error["message"] == "Keeper position belongs to a different account"
+
+    assert position.position_reads == 0
+    assert position.submitted == []
+    assert not (storage.home() / "intents.sqlite3").exists()
+
+
+@pytest.mark.parametrize("command", CLI_POSITION_ACTIONS)
+def test_cli_refuses_logout_during_keeper_position_read(position_service, command):
+    position, base_url = position_service
+    endpoint = f"{base_url}/query"
+    save_session(endpoint)
+    other_account = "0x" + "b" * 40
+    storage.save_session({**storage.load_session(), "evmAddress": other_account})
+    storage.use_session(ADDR)
+    position.switch_and_logout_on_keeper_read = other_account
+
+    args = ["--json", "--endpoint", endpoint, "--lcd-endpoint", base_url, "trade"]
+    result = CliRunner().invoke(main, [*args, *command])
+    assert position.switch_and_logout_on_keeper_read is None
+    assert storage.load_session()["evmAddress"] == other_account
+    assert result.exit_code == 6, result.output
+    assert json.loads(result.stdout)["error"]["code"] == "SIGNED_OUT"
+    assert position.submitted == []
+    assert not (storage.home() / "intents.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    ("action", "args"),
+    [
+        *MCP_POSITION_ACTIONS,
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+    ],
+)
+def test_mcp_refuses_another_accounts_position(position_service, action, args):
+    position, base_url = position_service
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            assert preview["addr"] == ADDR
+            position.trader = OTHER_TRADER
+            position.contract_owner = OTHER_TRADER
+            position_reads = position.position_reads
+
+            refused_preview = await call(client, f"preview_{action}", args)
+            refused_trade = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            for result in (refused_preview, refused_trade):
+                assert result == {
+                    "code": "INVALID_REQUEST",
+                    "error": "Keeper position belongs to a different account",
+                }
+
+            assert position.position_reads == position_reads
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("action", "args"), MCP_POSITION_ACTIONS)
+def test_mcp_contract_outage_returns_unverified_preview(position_service, action, args):
+    position, base_url = position_service
+    position.contract_position_unavailable = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            assert preview["dryRun"] is True
+            assert preview["addr"] == ADDR
+            assert preview["positionOwnerVerified"] is False
+            assert "previewDigest" not in preview
+            assert preview["estimates"]["fees"]["status"] == "unavailable"
+
+            position.contract_position_unavailable = False
+            position.preview_inputs = True
+            position.keeper_market_open = False
+            position.null_market_price = True
+            verified = await call(client, f"preview_{action}", args)
+            assert verified["intent"] == preview["intent"]
+            assert len(verified["previewDigest"]) == 64
+            assert verified["estimates"]["fees"]["status"] == "unavailable"
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("action", "args"), MCP_POSITION_ACTIONS)
+@pytest.mark.parametrize("scenario", ["foreign-owner", "missing-owner", "unavailable"])
+def test_mcp_rechecks_contract_position_before_admission(
+    position_service, action, args, scenario
+):
+    position, base_url = position_service
+    position.trader = ADDR
+    position.cache_contract_queries = True
+
+    async def run():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            position_reads = position.position_reads
+            if scenario == "unavailable":
+                position.contract_position_unavailable = True
+            else:
+                position.contract_owner = (
+                    OTHER_TRADER if scenario == "foreign-owner" else None
+                )
+
+            result = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            if scenario == "unavailable":
+                assert result["code"] == "PREVIEW_MISMATCH"
+                assert "Unable to verify contract state" in result["error"]
+            else:
+                assert result == {
+                    "code": "INVALID_REQUEST",
+                    "error": "Contract position belongs to a different account",
+                }
+            assert "preview" not in result
+            assert position.position_reads == position_reads + 1
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(run())
+
+
+def test_mcp_refuses_another_account_during_quote_rebuild(position_service):
+    position, base_url = position_service
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            args = {"trade_id": 7, "direction": "add", "amount": "5"}
+            preview = await call(client, "preview_margin", args)
+            # Both quotes use the initial cap. The final LCD read changes it,
+            # so the third lookup must rebuild the quote from Keeper again.
+            position.caps_on_position_read.extend([None, None, "4"])
+            position.snapshot_traders.extend([TRADER, TRADER, OTHER_TRADER])
+            result = await call(
+                client,
+                "trade_margin",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert result == {
+                "code": "INVALID_REQUEST",
+                "error": "Keeper position belongs to a different account",
+            }
+            assert not position.snapshot_traders
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("action", "args"),
+    [
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+    ],
+)
+def test_mcp_quotes_equivalent_position_addresses_through_index_retry(
+    position_service, action, args
+):
+    position, base_url = position_service
+    position.snapshot_traders.extend([CHECKSUM_ADDR, TRADER])
+    position.indexed_collaterals.append(3_000_000)
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            assert preview["addr"] == ADDR
+            assert preview["quote"]["collateralBefore"] == "4000000"
+            assert not position.snapshot_traders
+
+            position.contract_owner = OTHER_TRADER
+            refused = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused == {
+                "code": "INVALID_REQUEST",
+                "error": "Contract position belongs to a different account",
+            }
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
+position_commands = pytest.mark.parametrize(
+    ("tool", "args", "command"),
+    [
+        (
+            "margin",
+            {"trade_id": 7, "direction": "add", "amount": "1"},
+            ["margin", "7", "--direction", "add", "--amount", "1"],
+        ),
+        (
+            "partial_close",
+            {"trade_id": 7, "percent": 50},
+            ["partial-close", "7", "--percent", "50"],
+        ),
+    ],
+)
+
+
+def position_cli_args(base_url: str, command: list[str]) -> list[str]:
+    return [
+        "--json",
+        "--endpoint",
+        f"{base_url}/query",
+        "--lcd-endpoint",
+        base_url,
+        "trade",
+        *command,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "route_key"),
+    [
+        ("chain_id", "test-2", "chainId"),
+        ("contract_address", "nibi1replacement", "contractAddress"),
+    ],
+)
+@position_commands
+def test_position_confirmation_binds_keeper_route(
+    position_service: tuple[Position, str],
+    field: str,
+    value: str,
+    route_key: str,
+    tool: str,
+    args: dict[str, Any],
+    command: list[str],
+) -> None:
+    position, base_url = position_service
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, command)
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            cli_preview = cli.invoke(main, [*cli_args, "--dry-run"])
+            assert cli_preview.exit_code == 0, cli_preview.output
+            digest = preview["previewDigest"]
+            assert json.loads(cli_preview.stdout)["previewDigest"] == digest
+
+            setattr(position, field, value)
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            assert json.loads(cli_refusal.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
+            mcp_refusal = await call(
+                client, f"trade_{tool}", {**args, "preview_digest": digest}
+            )
+            assert mcp_refusal["code"] == "PREVIEW_MISMATCH", mcp_refusal
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+            fresh = mcp_refusal["preview"]
+            assert fresh["intent"] == preview["intent"]
+            assert fresh["quote"] == preview["quote"]
+            assert fresh["positionRoute"] == {
+                **preview["positionRoute"],
+                route_key: value,
+            }
+            assert fresh["previewDigest"] != digest
+            assert fresh == await call(client, f"preview_{tool}", args)
+
+            accepted = cli.invoke(
+                main, [*cli_args, "--preview-digest", fresh["previewDigest"]]
+            )
+            assert accepted.exit_code == 0, accepted.output
+            assert json.loads(accepted.stdout)["status"] == "accepted"
+            (submitted,) = position.submitted
+            assert {key: submitted[key] for key in fresh["intent"]} == fresh["intent"]
+
+    asyncio.run(scenario())
+
+
+@position_commands
+def test_position_confirmation_refuses_lcd_only_network_switch(
+    position_service: tuple[Position, str],
+    tool: str,
+    args: dict[str, Any],
+    command: list[str],
+) -> None:
+    position, base_url = position_service
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, command)
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            digest = preview["previewDigest"]
+            trade_args = {**args, "preview_digest": digest}
+
+            position.lcd_chain_id = "test-2"
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            mcp_error = await call(client, f"trade_{tool}", trade_args)
+            assert cli_error["code"] == mcp_error["code"] == "PREVIEW_MISMATCH"
+            assert cli_error["message"] == mcp_error["error"]
+            assert "Use an LCD on Keeper's chain" in cli_error["message"]
+            assert "details" not in cli_error and "preview" not in mcp_error
+
+            for flags in ([], ["--dry-run"]):
+                cli_invalid = cli.invoke(main, [*cli_args, *flags])
+                assert (
+                    json.loads(cli_invalid.stdout)["error"]["code"] == "INVALID_REQUEST"
+                )
+            assert (await call(client, f"preview_{tool}", args))[
+                "code"
+            ] == "INVALID_REQUEST"
+
+            position.lcd_chain_id = None
+            position.malformed_node_info = True
+            malformed = await call(client, f"trade_{tool}", trade_args)
+            assert malformed["code"] == "INVALID_REQUEST"
+            position.malformed_node_info = False
+            position.leverage = "2.5"
+            position.lcd_chain_ids.append("test-2")
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            assert cli_error["code"] == "PREVIEW_MISMATCH"
+
+            position.lcd_chain_ids.append("test-2")
+            mcp_error = await call(client, f"trade_{tool}", trade_args)
+            assert mcp_error["code"] == "PREVIEW_MISMATCH"
+            fresh = await call(client, f"preview_{tool}", args)
+            assert cli_error["details"]["preview"] == mcp_error["preview"] == fresh
+            assert fresh["previewDigest"] != digest
+            assert fresh["positionRoute"] == preview["positionRoute"]
+
+            position.lcd_chain_ids.append("test-2")
+            plain_refusal = cli.invoke(
+                main, [*cli_args[1:], "--preview-digest", digest]
+            )
+            assert plain_refusal.exit_code == ExitCode.REJECTED
+            assert "Run with --dry-run" in plain_refusal.stderr
+
+            position.trade_type = "limit"
+            position.lcd_chain_ids.append("test-2")
+            unavailable = await call(client, f"trade_{tool}", trade_args)
+            assert unavailable["code"] == "PREVIEW_MISMATCH"
+            assert "Could not refresh the position preview" in unavailable["error"]
+            assert "preview" not in unavailable
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -545,6 +1040,7 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
         async with connected_client(base_url) as client:
             preview = await call(client, f"preview_{tool}", args)
             assert preview["quote"]["afterHoursLeverageCap"] == "5"
+            position.cap_query_heights.clear()
             # Both rebuilt quotes see 5x. The cap changes as the final
             # contract position read starts, with the stored trade intact.
             position.caps_on_position_read.extend([None, None, "4"])
@@ -555,13 +1051,15 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
             )
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
-            assert position.cap_query_heights == [
-                None,
+            expected_heights = [
                 None,
                 None,
                 "121" if reported_height is not None else None,
                 None,
             ]
+            if tool == "margin" and reported_height is not None:
+                expected_heights.append("121")
+            assert position.cap_query_heights == expected_heights
             fresh = result["preview"]
             assert fresh["previewDigest"] != preview["previewDigest"]
             assert (
@@ -1107,6 +1605,53 @@ def test_malformed_lcd_keeps_the_limit_preview_and_digest_refusal(position_servi
     asyncio.run(scenario())
 
 
+def test_lcd_http_failure_logs_only_the_origin_in_an_embedded_server(
+    position_service, caplog
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.deny_lcd = True
+    path_key, query_key = "fixture-private-lcd-path", "fixture-private-lcd-query"
+    lcd = f"{base_url}/{path_key}?key={query_key}"
+
+    async def preview():
+        async with connected_client(base_url, lcd_endpoint=lcd) as client:
+            return await call(
+                client,
+                "preview_open",
+                {
+                    "market_id": 0,
+                    "side": "long",
+                    "order_type": "limit",
+                    "price": "100",
+                    "amount": "10",
+                    "leverage": "2",
+                    "slippage": "1",
+                },
+            )
+
+    with caplog.at_level(logging.INFO):
+        quote = asyncio.run(preview())
+        with pytest.raises(margin.QueryHeightMismatch) as denied:
+            margin.block_header(lcd, "latest", deadline=time.monotonic() + 5)
+    assert quote["estimates"]["fees"]["status"] == "unavailable"
+    assert position.submitted == []
+    assert any(record.name == "httpx" for record in caplog.records)
+    assert caplog.text.count(f"LCD HTTP response from {base_url} (status 401)") == 2
+    assert position.denied_lcd_targets[0] == (
+        f"/{path_key}{margin.NODE_INFO_PATH}?key={query_key}"
+    )
+    assert position.denied_lcd_targets[1].startswith(
+        f"/{path_key}{margin.BLOCK_PATH}latest?key={query_key}&_sai_query="
+    )
+    log_data = caplog.text + repr([record.args for record in caplog.records])
+    error_trace = "".join(traceback.format_exception(denied.value))
+    for secret in (path_key, query_key):
+        assert secret not in log_data
+        assert secret not in error_trace + json.dumps(quote)
+    assert f"LCD at {base_url} returned HTTP 401" in error_trace
+
+
 def test_mcp_market_refuses_first_step_excess_of_one_price_atom(position_service):
     position, base_url = position_service
     position.preview_inputs = True
@@ -1166,6 +1711,37 @@ def test_cancel_checks_live_order_type_and_refuses_after_fill(position_service):
             position.trade_type = "limit"
             assert (await call(client, "trade_close", trade))["status"] == "accepted"
             assert position.submitted[0]["kind"] == "CANCEL_PENDING_TRADE"
+
+    asyncio.run(scenario())
+
+
+def test_cancel_refuses_another_accounts_pending_order(position_service):
+    position, base_url = position_service
+    position.trade_type = "limit"
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            args = {"trade_id": 7, "cancel_order": True}
+            preview = await call(client, "preview_close", args)
+            assert preview["addr"] == ADDR
+            position.contract_owner = OTHER_TRADER
+
+            refused_preview = await call(client, "preview_close", args)
+            refused_trade = await call(
+                client,
+                "trade_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert (
+                refused_preview
+                == refused_trade
+                == {
+                    "code": "INVALID_REQUEST",
+                    "error": "Contract pending order belongs to a different account",
+                }
+            )
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
 
     asyncio.run(scenario())
 
@@ -1498,13 +2074,14 @@ def test_preview_uses_perp_group_and_pair_leverage_limits(
     asyncio.run(scenario())
 
 
-def test_stale_prices_are_unavailable_for_queued_closes(position_service):
+@pytest.mark.parametrize(("price", "age"), [("95", 900), ("95", 100), ("99", 100)])
+def test_queued_closes_defer_settlement_to_the_next_tick(position_service, price, age):
     position, base_url = position_service
     position.preview_inputs = True
     position.leverage = "20"
-    position.price = "95"
+    position.price = price
     position.liquidation_threshold = "96"
-    position.oracle_base_age = 900
+    position.oracle_base_age = age
     position.fill_at_next_oracle_price = True
 
     async def scenario():
@@ -1518,40 +2095,61 @@ def test_stale_prices_are_unavailable_for_queued_closes(position_service):
                 assert result["execution"]["status"] == "unavailable"
                 assert "fresh oracle update" in result["execution"]["reason"]
                 assert result["fees"]["status"] == "unavailable"
+                assert result["liquidationPrice"]["status"] == "unavailable"
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("order_type", ["limit", "stop"])
-def test_pending_open_estimates_follow_perp_market_state(position_service, order_type):
+@pytest.mark.parametrize("order_type", ["market", "limit", "stop"])
+def test_open_previews_follow_perp_market_state(position_service, order_type):
     position, base_url = position_service
     position.preview_inputs = True
-    position.keeper_market_open = False
-    position.market_trading_state = "closed"
+    position.keeper_market_open = order_type == "market"
+    position.market_trading_state = "open" if order_type == "market" else "closed"
     args = {
         "market_id": 0,
         "side": "long",
         "order_type": order_type,
-        "price": "100",
         "amount": "10",
         "leverage": "2",
         "slippage": "1",
     }
+    if order_type != "market":
+        args["price"] = "100"
 
     async def scenario():
         async with connected_client(base_url) as client:
             quote = await call(client, "preview_open", args)
             assert quote["estimates"]["fees"]["status"] == "estimate"
             assert quote["estimates"]["worstCaseFill"]["status"] == "bound"
-            position.keeper_market_open = True
             position.market_trading_state = "close_only"
-            quote = await call(client, "preview_open", args)
-            for field in ("fees", "liquidationPrice", "worstCaseFill"):
-                item = quote["estimates"][field]
-                assert item["status"] == "unavailable"
-                assert "close-only" in item["reason"]
+            for indexed_open in (True, False):
+                position.keeper_market_open = indexed_open
+                quote = await call(client, "preview_open", args)
+                assert_rejected_preview(quote, "MarketClosed", "close-only")
+
+            if order_type == "market":
+                position.market_trading_state = "closed"
+                quote = await call(client, "preview_open", args)
+                assert_rejected_preview(quote, "MarketClosed", "closed market")
+            assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+def assert_rejected_preview(quote: dict[str, Any], code: str, reason: str) -> None:
+    assert "quote" not in quote
+    assert "previewDigest" not in quote
+    estimates = quote["estimates"]
+    execution = estimates["execution"]
+    assert execution["status"] == "would_be_rejected"
+    assert execution["code"] == code
+    assert reason in execution["reason"]
+    for key in ("fees", "liquidationPrice", "worstCaseFill"):
+        assert estimates[key] == {
+            "status": "unavailable",
+            "reason": execution["reason"],
+        }
 
 
 @pytest.mark.parametrize(
@@ -1560,8 +2158,11 @@ def test_pending_open_estimates_follow_perp_market_state(position_service, order
         ("97", False, 100, "LiquidationReached"),
         ("98.4", False, None, "LiquidationReached"),
         ("97", False, 900, "OraclePriceStale"),
+        ("99", False, 301, "OraclePriceStale"),
+        ("99", False, 300, None),
         ("99", False, None, None),
         ("97", True, None, None),
+        ("97", True, 900, None),
     ],
 )
 def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
@@ -1584,10 +2185,12 @@ def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
             estimates = quote["estimates"]
             liq = estimates["liquidationPrice"]
             if code:
-                assert estimates["execution"]["status"] == "would_be_rejected"
-                assert estimates["execution"]["code"] == code
-                assert liq["status"] == "unavailable"
-                assert "price" not in liq
+                reason = (
+                    "stale oracle"
+                    if code == "OraclePriceStale"
+                    else "prospective liquidation threshold"
+                )
+                assert_rejected_preview(quote, code, reason)
             else:
                 assert liq["status"] == "estimate"
                 assert liq["price"] == "98.4"
@@ -1595,5 +2198,305 @@ def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
                 if queued:
                     assert estimates["execution"]["status"] == "unavailable"
                     assert "fresh oracle update" in estimates["execution"]["reason"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    (
+        "action",
+        "args",
+        "price",
+        "age",
+        "close_only",
+        "code",
+        "reason",
+    ),
+    [
+        (
+            "margin",
+            {"direction": "remove", "amount": "50"},
+            "95",
+            100,
+            False,
+            "LiquidationReached",
+            "prospective liquidation threshold",
+        ),
+        (
+            "leverage",
+            {"leverage": "5"},
+            "99",
+            100,
+            False,
+            "InsufficientDepositBalance",
+            "100.000000 USDC",
+        ),
+        (
+            "margin",
+            {"direction": "add", "amount": "100"},
+            "99",
+            100,
+            False,
+            "InsufficientDepositBalance",
+            "100.000000 USDC",
+        ),
+        (
+            "margin",
+            {"direction": "remove", "amount": "50"},
+            "99",
+            301,
+            False,
+            "OraclePriceStale",
+            "stale oracle",
+        ),
+        (
+            "margin",
+            {"direction": "remove", "amount": "50"},
+            "99",
+            301,
+            True,
+            "MarketClosed",
+            "close-only",
+        ),
+        (
+            "leverage",
+            {"leverage": "5"},
+            "99",
+            301,
+            True,
+            "MarketClosed",
+            "close-only",
+        ),
+    ],
+)
+def test_cli_and_mcp_have_the_same_position_rejection(
+    position_service, action, args, price, age, close_only, code, reason
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.price = price
+    position.available_balance = 100_000_000
+    position.pinned_balance = 0
+    position.oracle_base_age = age
+    if close_only:
+        position.keeper_market_open = False
+        position.market_trading_state = "close_only"
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, f"preview_{action}", {"trade_id": 7, **args})
+            assert_rejected_preview(quote, code, reason)
+
+    asyncio.run(scenario())
+    flags = []
+    for name, value in args.items():
+        flags.extend((f"--{name}", value))
+    result = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            f"{base_url}/query",
+            "--lcd-endpoint",
+            base_url,
+            "trade",
+            action,
+            "7",
+            *flags,
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert_rejected_preview(json.loads(result.stdout), code, reason)
+    assert position.submitted == []
+
+
+def test_margin_refuses_position_drift_during_rejection_check(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            request = {"trade_id": 7, "direction": "add", "amount": "1"}
+            quote = await call(client, "preview_margin", request)
+            # Both rebuilt quotes and the position comparison still match.
+            # The rejection check's own position read sees the resized trade.
+            position.collateral_on_position_read.extend([None, None, None, 3_000_000])
+            result = await call(
+                client,
+                "trade_margin",
+                {**request, "preview_digest": quote["previewDigest"]},
+            )
+            assert result["code"] == "PREVIEW_MISMATCH"
+            assert "final preview check" in result["error"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("target", "required"), [("5", "100"), ("4", "150")])
+def test_leverage_submit_rechecks_balance_after_confirmation(
+    position_service, target, required
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.pinned_balance = 100_000_000
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client, "preview_leverage", {"trade_id": 7, "leverage": "5"}
+            )
+            assert quote["estimates"]["liquidationPrice"]["status"] == "estimate"
+            assert quote["previewDigest"]
+
+            position.pinned_balance = 0
+            refused = await call(
+                client,
+                "trade_leverage",
+                {
+                    "trade_id": 7,
+                    "leverage": target,
+                    "preview_digest": quote["previewDigest"],
+                },
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert_rejected_preview(
+                refused["preview"],
+                "InsufficientDepositBalance",
+                f"{required}.000000 USDC",
+            )
+            assert (
+                refused["error"]
+                == refused["preview"]["estimates"]["execution"]["reason"]
+            )
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("leverage", {"leverage": "5"}),
+        ("margin", {"direction": "add", "amount": "100"}),
+    ],
+)
+def test_queued_leverage_warns_about_funding_at_fill(position_service, tool, args):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.available_balance = 99_000_000
+    position.fill_at_next_oracle_price = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            request = {"trade_id": 7, **args}
+            quote = await call(client, f"preview_{tool}", request)
+            execution = quote["estimates"]["execution"]
+            assert execution["status"] == "unavailable"
+            assert "100.000000 USDC" in execution["warning"]
+            assert "99.000000 USDC" in execution["warning"]
+            assert "Perp checks funding at fill" in execution["warning"]
+            result = await call(
+                client,
+                f"trade_{tool}",
+                {**request, "preview_digest": quote["previewDigest"]},
+            )
+            assert result["status"] == "accepted"
+            assert len(position.submitted) == 1
+            assert position.submitted[0]["body"] == quote["intent"]["body"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("price", "queued", "rejected"),
+    [
+        ("90", False, True),
+        ("92.2", False, True),
+        ("93", False, False),
+        ("90", True, False),
+    ],
+)
+def test_leverage_checks_stored_liquidation_before_after_hours_cap(
+    position_service, price, queued, rejected
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    position.cap = "5"
+    position.price = price
+    position.oracle_base_age = 100
+    position.liquidation_threshold = "92.2"
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client,
+                "preview_margin",
+                {"trade_id": 7, "direction": "remove", "amount": "50"},
+            )
+            if rejected:
+                assert_rejected_preview(quote, "LiquidationReached", "stored leverage")
+            else:
+                assert (
+                    "after-hours guard"
+                    in quote["estimates"]["liquidationPrice"]["reason"]
+                )
+                assert quote["previewDigest"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("price", "queued", "rejected", "quote_error_height"),
+    [
+        ("96.10", False, True, None),
+        ("96.20", False, True, 120),
+        ("96.21", False, False, None),
+        ("96.10", True, False, None),
+        ("96.10", False, False, 121),
+    ],
+)
+def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
+    position_service, price, queued, rejected, quote_error_height
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.price = price
+    position.oracle_base_age = 100
+    # The 20x position has $50 of collateral. With $2 of accrued borrowing,
+    # Perp's liquidation threshold moves from $96 to $96.20.
+    position.quoted_liquidation_threshold = "96.20"
+    position.quote_error_height = quote_error_height
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client,
+                "preview_margin",
+                {"trade_id": 7, "direction": "remove", "amount": "50"},
+            )
+            if rejected:
+                assert_rejected_preview(
+                    quote, "LiquidationReached", "prospective liquidation threshold"
+                )
+            else:
+                assert quote["estimates"]["liquidationPrice"]["price"] == "96"
+                assert quote["previewDigest"]
+            assert position.submitted == []
 
     asyncio.run(scenario())

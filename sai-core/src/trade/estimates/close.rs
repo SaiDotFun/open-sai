@@ -51,7 +51,7 @@ impl Trading<'_> {
     ) -> Option<()> {
         let id = serde_json::from_str(id).ok()?;
         let lcd = QuoteLcd::new(endpoint, self.trading_contract(endpoint).await.ok()?);
-        let raw = self.position_snapshot(&lcd, account, &id).await?;
+        let raw = self.close_snapshot(&lcd, account, &id).await?;
         let long = raw["long"].as_bool()?;
         let trade = raw.get("user")?;
         let read = json!({"get_trade_raw": {"trader": trade, "index": id}});
@@ -175,13 +175,8 @@ impl Trading<'_> {
         Some(())
     }
 
-    async fn position_snapshot(
-        &self,
-        lcd: &QuoteLcd<'_>,
-        account: &str,
-        id: &Value,
-    ) -> Option<Value> {
-        let mut indexed = self.indexed_position(account, id, TIMEOUT).await?;
+    async fn close_snapshot(&self, lcd: &QuoteLcd<'_>, account: &str, id: &Value) -> Option<Value> {
+        let mut indexed = self.indexed_close_position(account, id, TIMEOUT).await?;
         let borrowing = indexed.get("perpBorrowing")?.clone();
         let collateral = borrowing.get("collateralToken")?;
         if collateral["symbol"] != "USDC" {
@@ -233,7 +228,7 @@ impl Trading<'_> {
                 }
                 sleep(delay).await;
                 indexed = self
-                    .indexed_position(
+                    .indexed_close_position(
                         account,
                         id,
                         deadline.saturating_duration_since(Instant::now()),
@@ -261,7 +256,7 @@ impl Trading<'_> {
         (funds["collateral_index"] == token).then_some(raw)
     }
 
-    async fn indexed_position(
+    async fn indexed_close_position(
         &self,
         account: &str,
         id: &Value,

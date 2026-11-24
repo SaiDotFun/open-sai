@@ -1,10 +1,9 @@
 # List uncovered commands explicitly so adding a command requires a decision.
 [deferred]
 "account overview" = "Requires pinned LCD and trade replay fixtures."
-"auth import" = "Requires an isolated clipboard input."
-"auth login" = "Requires an isolated signing program and challenge."
-"auth renew" = "Requires an isolated signing program and challenge."
-"mcp install" = "Requires a client registration fixture."
+"auth import" = "Compared with a fixture clipboard and PTY in test_auth.py."
+"auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
+"auth renew" = "Compared with Python main in test_auth.py."
 "mcp uninstall" = "Requires a client registration fixture."
 "logs intent" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
 "logs run" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
@@ -343,6 +342,7 @@ server = "absent"
 wire = ["userIntents"]
 state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "absent" }
 
+# C9a compares against Python main at 3feb83a1ab3e46b4f618f497a4820d6179d19eba.
 [[case]]
 name = "intent-wait"
 args = ["--json","intent","wait","{intent}","--timeout","5"]
@@ -356,15 +356,206 @@ args = ["--json","doctor","--offline","--no-fix"]
 state = { "trader" = "<absent>" }
 
 [[case]]
+name = "doctor-unknown-option"
+args = ["doctor", "--unknown"]
+mode = "text"
+exact_output = true
+expect = 2
+
+[[case]]
+name = "mcp-install-invalid-scope"
+args = ["mcp", "install", "--scope", "nonsense"]
+mode = "text"
+exact_output = true
+expect = 2
+
+[[case]]
+name = "mcp-install-empty-scope"
+args = ["mcp", "install", "--scope="]
+mode = "text"
+exact_output = true
+expect = 2
+
+[[case]]
+name = "mcp-install-missing-scope"
+args = ["mcp", "install", "--scope"]
+mode = "text"
+exact_output = true
+expect = 2
+state = { "trader" = "<absent>" }
+
+[[case]]
 name = "doctor-network"
 args = ["--json","doctor","--no-fix"]
+accepted_divergence = "lcd-origin-only"
 seed = "session"
 wire = ["oneClickTrading","ws:init","node_info"]
+
+[[case]]
+name = "doctor-ws-no-subprotocol"
+args = ["--json", "doctor", "--no-fix"]
+accepted_divergence = "lcd-origin-only"
+seed = "session"
+server = "ws-no-subprotocol"
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
+name = "doctor-ws-timeout"
+args = ["--json", "doctor", "--no-fix"]
+accepted_divergence = "lcd-origin-only"
+server = "doctor-ws-timeout"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+state = { "logs" = "<absent>" }
 
 [[case]]
 name = "doctor-fix"
 args = ["--json","doctor","--offline"]
 state = { "trader" = "directory" }
+
+[[case]]
+name = "doctor-network-with-logging"
+args = ["--json", "doctor"]
+accepted_divergence = "lcd-origin-only"
+seed = "session"
+wire = ["oneClickTrading", "ws:init", "node_info"]
+state = { "logs/.endpoint-key#@mode" = 384 }
+
+[[case]]
+name = "doctor-keeper-error-codes"
+args = ["--json", "doctor"]
+accepted_divergence = "lcd-origin-only"
+seed = "session"
+server = "doctor-graphql-errors"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+absent_log_text = ["opaque Keeper diagnostic", "unvalidated"]
+state = { "logs/cli.jsonl#2.event" = "keeper.request", "logs/cli.jsonl#2.keeperErrorCount" = 4, "logs/cli.jsonl#2.keeperErrors" = [{ code = "GRAPHQL_VALIDATION_FAILED" }, { code = "KEEPER_ERROR" }, { code = "KEEPER_ERROR" }] }
+
+[[case]]
+name = "doctor-lcd-unreachable"
+args = ["--json", "doctor", "--no-fix", "--lcd-endpoint", "{http}/private-fixture-credential"]
+accepted_divergence = "lcd-origin-only"
+server = "doctor-lcd-unreachable"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
+name = "doctor-invalid-endpoint"
+args = ["--json", "doctor", "--no-fix"]
+seed = "doctor-invalid-endpoint"
+expect = 2
+state = { "trader" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
+name = "doctor-invalid-endpoint-text"
+args = ["doctor", "--offline", "--no-fix"]
+mode = "text"
+seed = "doctor-invalid-endpoint"
+expect = 2
+state = { "trader" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
+name = "doctor-malformed-toml"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+seed = "doctor-malformed-toml"
+expect = 1
+state = { "trader" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
+name = "doctor-near-expiry"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+seed = "doctor-near-expiry"
+state = { "trader/sessions.json" = "file", "logs" = "<absent>" }
+
+[[case]]
+name = "doctor-ledger-v0-inspect"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+seed = "doctor-ledger-v0"
+state = { "trader/intents.sqlite3#user_version" = 0, "trader/intents.sqlite3-journal" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
+name = "doctor-ledger-v0-migrate"
+args = ["--json", "doctor", "--offline"]
+seed = "doctor-ledger-v0"
+state = { "trader/intents.sqlite3#user_version" = 1 }
+
+[[case]]
+name = "doctor-reconcile-absent-intent"
+args = ["--json", "doctor"]
+accepted_divergence = "lcd-origin-only"
+seed = "doctor-ledger-session"
+server = "absent"
+wire = ["userIntents", "oneClickTrading", "ws:init", "node_info"]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "absent" }
+
+[[case]]
+name = "doctor-report-blocking-intent"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+seed = "doctor-ledger-session"
+expect = 1
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "logs" = "<absent>" }
+
+[[case]]
+name = "doctor-tighten-modes"
+args = ["--json", "doctor", "--offline"]
+seed = "doctor-loose-profile"
+state = { ".#@mode" = 448, "trader#@mode" = 448, "trader/history#@mode" = 384 }
+
+[[case]]
+name = "doctor-report-loose-modes"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+seed = "doctor-loose-profile"
+state = { ".#@mode" = 488, "trader#@mode" = 493, "trader/history#@mode" = 420 }
+
+[[case]]
+name = "doctor-mcp-current"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+client_seed = "current"
+state = { "logs" = "<absent>", "clients/.codex/config.toml#changed" = false }
+
+[[case]]
+name = "doctor-mcp-no-fix"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+client_seed = "retired"
+expect = 1
+state = { "logs" = "<absent>", "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false, "clients/.claude.json#changed" = false }
+
+[[case]]
+name = "doctor-mcp-retired"
+args = ["--json", "doctor", "--offline"]
+client_seed = "retired"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
+
+[[case]]
+name = "doctor-mcp-missing"
+args = ["--json", "doctor", "--offline"]
+client_seed = "missing"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
+
+[[case]]
+name = "doctor-mcp-uv-cache"
+args = ["--json", "doctor", "--offline"]
+client_seed = "cache"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
+
+[[case]]
+name = "doctor-mcp-verification-failure"
+args = ["--json", "doctor", "--offline"]
+client_seed = "partial"
+accepted_divergence = "codex-repair-rollback"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
+
+[[case]]
+name = "doctor-mcp-codex-shadow"
+args = ["--json", "doctor", "--offline"]
+client_seed = "shadowed"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = true, "clients/.codex/project.json#changed" = false, "clients/.cursor/mcp.json#changed" = true }
 
 [[case]]
 name = "watch-bare"
@@ -480,12 +671,123 @@ args = ["--json","skill","source"]
 [[case]]
 name = "mcp-list"
 args = ["--json","mcp","list"]
+client_seed = "empty"
+
+[[case]]
+name = "mcp-list-redacted"
+args = ["--json", "mcp", "list"]
+client_seed = "legacy"
+state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
+
+[[case]]
+name = "mcp-install-all"
+args = ["--json", "mcp", "install", "--all"]
+client_seed = "empty"
+state = { "clients/.codex/config.toml#@mode" = 384, "clients/.cursor/mcp.json#@mode" = 384 }
+
+[[case]]
+name = "mcp-install-legacy"
+args = ["--json", "mcp", "install", "--all"]
+client_seed = "legacy"
+state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
+
+[[case]]
+name = "mcp-install-dry-run"
+args = ["--json", "mcp", "install", "cursor", "--scope", "project", "--dry-run", "--", "fixture-wrapper", "sai", "mcp", "serve"]
+client_seed = "empty"
+state = { "clients/.cursor/mcp.json" = "<absent>", "clients/argv.jsonl" = "<absent>" }
+
+[[case]]
+name = "mcp-install-claude-repair"
+args = ["--json", "mcp", "install", "--client", "claude", "--repair-existing", "sai"]
+client_seed = "retired"
+state = { "clients/.claude.json#changed" = true, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false, "clients/argv.jsonl" = "<absent>" }
 
 [[case]]
 name = "mcp-tool-inventory"
 args = ["mcp","serve"]
 mode = "mcp"
+mcp_profile = "inventory"
+mcp_logs = true
 wire = ["borrowings", "tokenPricesUsd"]
+
+[[case]]
+name = "mcp-initialize-legacy"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "initialize"
+mcp_protocol = "2024-11-05"
+
+[[case]]
+name = "mcp-initialize-newer"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "initialize"
+mcp_protocol = "2026-07-28"
+
+[[case]]
+name = "mcp-info-public-endpoints"
+args = ["mcp","serve","--endpoint","{keeper}?fixture=hidden","--ws-endpoint","{ws}?fixture=hidden","--lcd-endpoint","{http}/fixture-lcd-private?fixture=hidden"]
+mode = "mcp"
+mcp_profile = "info"
+seed = "mcp-info-cache"
+
+[[case]]
+name = "mcp-market-number-spelling"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "number-spelling"
+server = "read-number-spelling"
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "mcp-account-intent-reads"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "reads"
+seed = "ledger"
+server = "mcp-reads"
+wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
+# The current Python checkout uses the narrower history query during reconciliation.
+mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
+
+[[case]]
+name = "mcp-argument-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "validation"
+
+[[case]]
+name = "mcp-session-refusals"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "refusals"
+
+[[case]]
+name = "mcp-session-reloads"
+args = ["--endpoint","{http}","mcp","serve","--endpoint","{keeper}"]
+mode = "mcp"
+mcp_profile = "session"
+# Temporary. The native-only trade_open probe expires this when the tool lands.
+mcp_deferred_trade_exception = true
+seed = "session"
+wire = ["trades", "trades", "trades"]
+
+[[case]]
+name = "mcp-keeper-errors"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "keeper-errors"
+server = "keeper-error"
+wire = ["borrowings", "tokenPricesUsd", "trades", "tradeHistory", "userIntents"]
+
+[[case]]
+name = "mcp-stream-error"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "stream-error"
+server = "ws-partial"
+wire = ["ws:init", "ws:userBalances", "ws:pong"]
 
 [[case]]
 name = "logs-path"
@@ -512,6 +814,7 @@ wire = ["borrowings", "oneClickTrading", "node_info", "get_market", "get_group",
 [[case]]
 name = "trade-close"
 args = ["--json","trade","close","7","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-cancel"
@@ -523,10 +826,12 @@ wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 [[case]]
 name = "trade-tpsl"
 args = ["--json","trade","tpsl","7","--take-profit","110","--clear-stop-loss","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-leverage"
 args = ["--json","trade","leverage","7","--leverage","5","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-margin"
@@ -534,8 +839,9 @@ args = ["--json","trade","margin","7","--direction","add","--amount","1","--dry-
 seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market", "get_market", "get_group",
-    "get_pair_custom_max_leverage", "get_fees",
+    "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market",
+    "market_order_config", "get_perp_prices", "is_after_hours_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees", "quote_trade", "get_exchange_balance",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
@@ -546,7 +852,7 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price", "get_trade_raw", "get_perp_prices", "get_liquidation_price",
+    "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
     "is_after_hours_market", "get_market", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
@@ -556,5 +862,13 @@ name = "trade-concurrent-close"
 args = ["--json", "trade", "close", "7"]
 seed = "session"
 server = "concurrent-close"
-wire = ["recordUserIntent"]
+wire = [
+    "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
+    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
+    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "recordUserIntent",
+    "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
+    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
+    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

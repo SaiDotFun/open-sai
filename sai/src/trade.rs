@@ -29,6 +29,31 @@ pub enum TradeCommand {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Set or clear take-profit and stop-loss prices.
+    Tpsl {
+        #[arg(allow_negative_numbers = true)]
+        trade_id: String,
+        #[arg(long, allow_negative_numbers = true)]
+        take_profit: Option<String>,
+        #[arg(long, allow_negative_numbers = true)]
+        stop_loss: Option<String>,
+        #[arg(long)]
+        clear_take_profit: bool,
+        #[arg(long)]
+        clear_stop_loss: bool,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Set target leverage without changing TP or SL.
+    Leverage {
+        #[arg(allow_negative_numbers = true)]
+        trade_id: String,
+        /// Target leverage as a decimal.
+        #[arg(long, allow_negative_numbers = true)]
+        leverage: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -141,6 +166,35 @@ pub fn run(
         TradeCommand::Cancel { trade_id, dry_run } => {
             (close_preview(&trade_id, true)?, dry_run, false, false)
         }
+        TradeCommand::Tpsl {
+            trade_id,
+            take_profit,
+            stop_loss,
+            clear_take_profit,
+            clear_stop_loss,
+            dry_run,
+        } => (
+            trade::tpsl_preview(
+                &trade_id,
+                take_profit.as_deref(),
+                stop_loss.as_deref(),
+                clear_take_profit,
+                clear_stop_loss,
+            )?,
+            dry_run,
+            false,
+            false,
+        ),
+        TradeCommand::Leverage {
+            trade_id,
+            leverage,
+            dry_run,
+        } => (
+            trade::leverage_preview(&trade_id, &leverage)?,
+            dry_run,
+            false,
+            false,
+        ),
     };
     let session = match trading.load_session(account) {
         Ok(session) => Some(session),
@@ -154,6 +208,14 @@ pub fn run(
         .build()
         .map_err(|_| SaiError::internal())?;
     if dry_run {
+        if preview.is_standalone_position_update() {
+            let output = runtime.block_on(trading.position_update_preview(
+                preview,
+                session.as_ref(),
+                false,
+            ))?;
+            return local::emit(&output, json);
+        }
         let preview = runtime.block_on(trading.prepare_preview(
             preview,
             session.as_ref(),

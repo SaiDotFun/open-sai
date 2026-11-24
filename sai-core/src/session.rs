@@ -1,29 +1,91 @@
 //! Endpoint and expiry checks shared by the CLI and other front ends.
 
-use std::sync::LazyLock;
+use std::fmt::Write as _;
 
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
-use regex::Regex;
+use serde::Serialize;
 
 use crate::{
     errors::{Code, SaiError},
-    storage::{Session, SessionError, Storage, StorageError, StorageEvent},
+    keeper::is_evm_address,
+    log,
+    settings::MAINNET_HTTP,
+    storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
 
+const INVALID_RENEWAL_ADDRESS: &str = "Stored session address is invalid. Sign in again.";
 pub(crate) const ORIGINAL_KEEPER_HINT: &str =
     r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#;
 
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
-    let expires_at = parse_expiry(session.expires_at())
-        .ok_or_else(|| SessionError::new(
+    Ok(session_expiry(session)? <= now)
+}
+
+pub fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> {
+    parse_expiry(session.expires_at()).ok_or_else(|| {
+        SessionError::new(
             "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again",
-        ))?;
-    Ok(expires_at <= now)
+        )
+    })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpiryNotice {
+    pub expiry_warning: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_command: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renewal_guidance: Option<String>,
+}
+
+impl ExpiryNotice {
+    pub fn text(&self) -> String {
+        let mut notice = self.expiry_warning.clone();
+        if let Some(guidance) = &self.renewal_guidance {
+            notice.push(' ');
+            notice.push_str(guidance);
+        }
+        if let Some(command) = &self.renewal_command {
+            let _ = write!(notice, " Run {command}");
+        }
+        notice
+    }
+}
+
+fn expiry_warning_time(left: TimeDelta) -> Option<String> {
+    if left <= TimeDelta::zero() || left >= TimeDelta::days(3) {
+        return None;
+    }
+    Some(match left.num_minutes() {
+        0 => "under 1 min".into(),
+        minutes @ 1..120 => format!("{minutes} min"),
+        minutes => format!("{} h", minutes / 60),
+    })
+}
+
+fn escape_warning_text(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            '\n' => escaped.push_str("\\n"),
+            '\r' => escaped.push_str("\\r"),
+            '\t' => escaped.push_str("\\t"),
+            '\u{2028}' | '\u{2029}' => {
+                let _ = write!(escaped, "\\u{:04x}", u32::from(c));
+            }
+            c if c.is_control() => {
+                let _ = write!(escaped, "\\x{:02x}", u32::from(c));
+            }
+            c => escaped.push(c),
+        }
+    }
+    escaped
 }
 
 // Stored Keeper expiries follow Python's datetime.fromisoformat. Convert to
 // UTC for comparisons and retain the original text in the session.
-pub(crate) fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
+pub fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
     let date_end = date_length(text.as_bytes())?;
     let date = text.get(..date_end)?;
     let tail = text.get(date_end..)?;
@@ -196,40 +258,137 @@ impl Storage<'_> {
                 addr: session.addr(),
                 expires_at: session.expires_at(),
             });
+            if !is_evm_address(session.addr()) {
+                let mut error = SaiError::new(Code::SessionExpired, INVALID_RENEWAL_ADDRESS);
+                error.hint = None;
+                return Err(SessionError(error));
+            }
             let mut error = SaiError::new(
                 Code::SessionExpired,
                 "Trading session expired; sign in again",
             );
-            error.hint = Some(hint(Some(session.addr())));
+            error.hint = if session.key_name().is_some() || session.is_imported() {
+                let (command, guidance) = self.renewal_fields(session);
+                if let Some(guidance) = guidance {
+                    error.message.push_str(&format!(". {guidance}"));
+                }
+                command
+            } else {
+                Some(hint(Some(session.addr())))
+            };
             return Err(SessionError(error));
         }
         Ok(())
     }
 
-    fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>, origin_only: bool) -> String {
-        static PLAIN_KEEPER_URL: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"\Ahttps?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query\z")
-                .expect("valid Keeper URL pattern")
-        });
-        let flag = if origin_only {
-            self.keeper_hint_flag(endpoint)
-        } else if PLAIN_KEEPER_URL.is_match(endpoint)
+    fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>, trade: bool) -> String {
+        let mut args = vec!["auth", "login", "NAME"];
+        if let Some(addr) = addr {
+            args.extend(["--addr", addr]);
+        }
+        if trade {
+            format!(
+                "sai --endpoint {} {}",
+                self.keeper_hint_flag(endpoint),
+                shell_join(&args)
+            )
+        } else {
+            self.keeper_command_hint(endpoint, &args)
+        }
+    }
+
+    pub fn keeper_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
+        let origin = keeper_origin(endpoint);
+        let location = keeper_location(origin.as_deref());
+        self.keeper_command(endpoint, origin.as_deref(), &location, args)
+    }
+
+    fn keeper_command(
+        &self,
+        endpoint: &str,
+        origin: Option<&str>,
+        location: &str,
+        args: &[&str],
+    ) -> String {
+        let flag = if origin == Some(endpoint)
             && self
                 .trader
                 .parent()
-                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
+                .is_some_and(|home| log::redact(home, endpoint) == endpoint)
         {
             shell_quote(endpoint)
         } else {
-            ORIGINAL_KEEPER_HINT.into()
+            format!(
+                r#""${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL{location}}}""#
+            )
         };
-        let mut hint = format!("sai --endpoint {flag} auth login NAME");
-        if let Some(addr) = addr {
-            hint.push_str(" --addr ");
-            hint.push_str(&shell_quote(addr));
-        }
-        hint
+        format!("sai --endpoint {flag} {}", shell_join(args))
     }
+
+    pub fn renewal_fields(&self, session: &Session) -> (Option<String>, Option<String>) {
+        if !is_evm_address(session.addr()) {
+            return (None, Some(INVALID_RENEWAL_ADDRESS.into()));
+        }
+        let args: &[&str] = if session.key_name().is_some() {
+            &["auth", "renew", session.addr()]
+        } else {
+            &["auth", "import", "--addr", session.addr()]
+        };
+        let home = self.trader.parent();
+        let endpoint = session.endpoint().unwrap_or_default();
+        let origin = keeper_origin(endpoint)
+            .filter(|origin| home.is_some_and(|home| log::redact(home, origin) == *origin));
+        let public_default = endpoint == MAINNET_HTTP
+            && home.is_some_and(|home| log::redact(home, endpoint) == endpoint);
+        let route = if public_default {
+            Some(endpoint)
+        } else {
+            origin.as_deref()
+        };
+        let mut guidance = Vec::new();
+        if route != Some(endpoint) {
+            let location = keeper_location(origin.as_deref());
+            guidance.push(format!(
+                "Reuse the Keeper endpoint{location} used to sign in."
+            ));
+        }
+        if session.key_name().is_none() && !session.is_imported() {
+            guidance.push("You can also sign in again with your Foundry keystore.".into());
+        }
+        (
+            Some(self.keeper_command(endpoint, route, "", args)),
+            (!guidance.is_empty()).then(|| guidance.join(" ")),
+        )
+    }
+
+    pub fn expiry_notice(&self, session: &Session, left: TimeDelta) -> Option<ExpiryNotice> {
+        let when = expiry_warning_time(left)?;
+        let (renewal_command, renewal_guidance) = self.renewal_fields(session);
+        Some(ExpiryNotice {
+            expiry_warning: format!(
+                "Sai session for {} expires in {when}.",
+                escape_warning_text(session.addr())
+            ),
+            renewal_command,
+            renewal_guidance,
+        })
+    }
+}
+
+fn keeper_origin(endpoint: &str) -> Option<String> {
+    let origin = endpoint_origin(endpoint);
+    (origin != "[redacted url]").then_some(origin)
+}
+
+fn keeper_location(origin: Option<&str>) -> String {
+    origin.map_or_else(String::new, |origin| format!(" at {origin}"))
+}
+
+fn shell_join(args: &[&str]) -> String {
+    args.iter()
+        .map(|text| shell_quote(text))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub(crate) fn shell_quote(text: &str) -> String {
@@ -247,6 +406,27 @@ pub(crate) fn shell_quote(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expiry_warning_window_and_display_thresholds() {
+        for (seconds, expected) in [
+            (-1, None),
+            (0, None),
+            (1, Some("under 1 min")),
+            (59, Some("under 1 min")),
+            (60, Some("1 min")),
+            (120 * 60 - 1, Some("119 min")),
+            (120 * 60, Some("2 h")),
+            (3 * 24 * 3600 - 1, Some("71 h")),
+            (3 * 24 * 3600, None),
+            (3 * 24 * 3600 + 1, None),
+        ] {
+            assert_eq!(
+                expiry_warning_time(TimeDelta::seconds(seconds)).as_deref(),
+                expected
+            );
+        }
+    }
 
     #[test]
     fn python_iso_expiry_variants_compare_as_utc() {
