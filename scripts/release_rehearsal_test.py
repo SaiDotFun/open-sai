@@ -4,6 +4,7 @@ import fcntl
 import json
 import os
 import runpy
+import signal
 import socket
 import subprocess
 import sys
@@ -15,6 +16,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
+LOCK_DESCENDANT = (
+    "import fcntl, sys, time; file = open(sys.argv[1], 'w'); "
+    "fcntl.flock(file, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(30)"
+)
 
 
 class LauncherTest(unittest.TestCase):
@@ -107,6 +112,64 @@ class NetworkTest(unittest.TestCase):
 
 
 class ProcessTest(unittest.TestCase):
+    def assert_group_released(self, lock: Path) -> None:
+        with lock.open("r") as file:
+            deadline = time.monotonic() + 2
+            while True:
+                try:
+                    fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    return
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        self.fail("Descendant still holds the lock")
+                    time.sleep(0.01)
+
+    def test_parent_signals_stop_the_group_and_remove_the_home(self) -> None:
+        script = Path(__file__).with_name("release-rehearsal.py").resolve()
+        parent = """
+import runpy, sys, tempfile
+from pathlib import Path
+entry = runpy.run_path(sys.argv[1])
+try:
+    with entry["cancel_on_signal"](), tempfile.TemporaryDirectory(dir=sys.argv[2]) as home:
+        with entry["owned_process"](tuple(sys.argv[3:]), Path(home), {"HOME": home}) as child:
+            if entry["ReplyReader"](child.stdout).line("descendant") != "locked":
+                sys.exit(2)
+            print(home, flush=True)
+            child.communicate()
+except entry["RehearsalInterrupted"] as exc:
+    sys.exit(128 + exc.signum)
+"""
+        with tempfile.TemporaryDirectory() as temp:
+            lock = Path(temp) / "descendant.lock"
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                with (
+                    self.subTest(signal=sig.name),
+                    REHEARSAL["owned_process"](
+                        (
+                            sys.executable,
+                            "-c",
+                            parent,
+                            script,
+                            temp,
+                            sys.executable,
+                            "-c",
+                            LOCK_DESCENDANT,
+                            lock,
+                        ),
+                        Path(temp),
+                        {},
+                    ) as process,
+                ):
+                    home = Path(
+                        REHEARSAL["ReplyReader"](process.stdout).line("parent ready")
+                    )
+                    self.assertTrue(home.is_dir())
+                    process.send_signal(sig)
+                    self.assertEqual(process.wait(timeout=5), 128 + sig)
+                    self.assertFalse(home.exists())
+                    self.assert_group_released(lock)
+
     def test_partial_reply_times_out(self) -> None:
         read, write = os.pipe()
         with os.fdopen(read, "rb") as source, os.fdopen(write, "wb") as writer:
@@ -122,10 +185,6 @@ class ProcessTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             lock = root / "descendant.lock"
-            descendant = (
-                "import fcntl, sys, time; file = open(sys.argv[1], 'w'); "
-                "fcntl.flock(file, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(30)"
-            )
             leader = "import subprocess, sys; subprocess.Popen(sys.argv[1:])"
             command = (
                 sys.executable,
@@ -133,7 +192,7 @@ class ProcessTest(unittest.TestCase):
                 leader,
                 sys.executable,
                 "-c",
-                descendant,
+                LOCK_DESCENDANT,
                 lock,
             )
             with (
@@ -144,16 +203,7 @@ class ProcessTest(unittest.TestCase):
                     REHEARSAL["ReplyReader"](child.stdout).line("lock"), "locked"
                 )
                 child.communicate(timeout=0.1)
-            with lock.open("r") as file:
-                deadline = time.monotonic() + 2
-                while True:
-                    try:
-                        fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            self.fail("Descendant still holds the lock")
-                        time.sleep(0.01)
+            self.assert_group_released(lock)
 
 
 class KeeperReplayTest(unittest.TestCase):

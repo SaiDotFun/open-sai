@@ -20,7 +20,7 @@ import time
 import unittest
 from collections import deque
 from collections.abc import Generator
-from contextlib import closing, contextmanager, nullcontext, suppress
+from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any, NamedTuple
@@ -113,6 +113,51 @@ class RehearsalError(RuntimeError):
     pass
 
 
+class RehearsalInterrupted(BaseException):
+    def __init__(self, signum: int) -> None:
+        self.signum = signum
+
+
+class Cancellation:
+    def __init__(self) -> None:
+        self.signum: int | None = None
+        self.deferred = False
+
+    def receive(self, signum: int, _frame: object) -> None:
+        if self.signum is None:
+            self.signum = signum
+            if not self.deferred:
+                raise RehearsalInterrupted(signum)
+
+    @contextmanager
+    def defer(self) -> Generator[None, None, None]:
+        # Register cleanup before delivering a signal received during acquisition.
+        self.deferred = True
+        try:
+            yield
+        finally:
+            self.deferred = False
+            if self.signum is not None:
+                raise RehearsalInterrupted(self.signum)
+
+
+CANCELLATION = Cancellation()
+
+
+@contextmanager
+def cancel_on_signal() -> Generator[None, None, None]:
+    previous = {}
+    try:
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            previous[sig] = signal.signal(sig, CANCELLATION.receive)
+        yield
+    finally:
+        for sig, handler in previous.items():
+            if handler is not None:
+                signal.signal(sig, handler)
+        CANCELLATION.signum = None
+
+
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RehearsalError(message)
@@ -153,22 +198,28 @@ def owned_process(
     *,
     stderr: int | IO[bytes] = subprocess.PIPE,
 ) -> Generator[subprocess.Popen[bytes], None, None]:
-    with subprocess.Popen(
-        command,
-        cwd=cwd,
-        env=env,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=stderr,
-        start_new_session=True,
-    ) as process:
-        try:
-            yield process
-        finally:
-            # The leader can exit while a descendant still owns a pipe or file.
-            with suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
+    with ExitStack() as cleanup:
+        with CANCELLATION.defer():
+            process = cleanup.enter_context(
+                subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+            )
+            cleanup.callback(stop_process_group, process)
+        yield process
+
+
+def stop_process_group(process: subprocess.Popen[bytes]) -> None:
+    # The leader can exit while a descendant still owns a pipe or file.
+    with suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
 
 
 def loopback_env(base: str, proxy_port: int) -> dict[str, str]:
@@ -900,11 +951,21 @@ def main() -> int:
             diagnostics = directory / "child-output.log"
             diagnostics.touch(mode=0o600)
             print(f"Child output log: {diagnostics}", file=sys.stderr)
-        with tempfile.TemporaryDirectory(
-            prefix="sai-release-rehearsal-",
-            dir=diagnostics.parent if diagnostics else None,
-        ) as scratch:
+        with cancel_on_signal(), ExitStack() as cleanup:
+            with CANCELLATION.defer():
+                scratch = cleanup.enter_context(
+                    tempfile.TemporaryDirectory(
+                        prefix="sai-release-rehearsal-",
+                        dir=diagnostics.parent if diagnostics else None,
+                    )
+                )
             rehearse(Path(scratch), wheel, match[1], diagnostics)
+    except RehearsalInterrupted as exc:
+        print(
+            f"Release rehearsal interrupted by {signal.Signals(exc.signum).name}",
+            file=sys.stderr,
+        )
+        return 128 + exc.signum
     except RehearsalError as exc:
         print(f"Release rehearsal failed: {exc}", file=sys.stderr)
         return 1
