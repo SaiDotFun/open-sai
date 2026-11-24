@@ -1,5 +1,6 @@
 """Run with python3 scripts/release-rehearsal.py --self-test."""
 
+import ast
 import fcntl
 import json
 import os
@@ -769,6 +770,84 @@ class KeeperReplayTest(unittest.TestCase):
             REHEARSAL["project_fields"](payload, fields),
             {"rows": [{"intentKey": "the-key", "trade": {"owner": "trader-address"}}]},
         )
+
+    def test_intent_wait_projects_body_only_when_requested(self) -> None:
+        # Load the CLI's query without importing third-party CLI dependencies.
+        keeper = SCRIPT.parent.parent / "cli" / "sai_cli" / "core" / "keeper.py"
+        query = next(
+            ast.literal_eval(node.value)
+            for node in ast.parse(keeper.read_text()).body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(name, ast.Name) and name.id == "WAIT_INTENTS"
+                for name in node.targets
+            )
+        )
+        self.replay.lifecycle = "filled"
+        body = {"kind": "OPEN_TRADE"}
+        self.replay.responses["filled"]["data"]["userIntents"][0]["body"] = body
+        variables = {"user": self.replay.addr, "key": self.key}
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for override in ({}, {"includeAction": False}, {"includeAction": True}):
+                with self.subTest(variables=override):
+                    [row] = self.query(base, query, **variables, **override)[
+                        "userIntents"
+                    ]
+                    self.assertEqual(row["intentKey"], self.key)
+                    self.assertEqual(row["lifecycleStep"], "exec_pass")
+                    if override.get("includeAction"):
+                        self.assertEqual(row["body"], body)
+                    else:
+                        self.assertNotIn("body", row)
+
+    def test_skip_directive_uses_its_boolean_binding(self) -> None:
+        query = (
+            "query($skip:Boolean!, $user:String!, $key:String) {"
+            " rows: userIntents(where:{user:$user, intentKey:$key}) @skip(if:$skip) { intentKey } }"
+        )
+        variables = {"user": self.replay.addr, "key": self.key}
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            self.assertEqual(
+                self.query(base, query, skip=False, **variables),
+                {"rows": [{"intentKey": self.key}]},
+            )
+            self.assertEqual(self.query(base, query, skip=True, **variables), {})
+            with self.assertRaises(HTTPError) as error:
+                self.query(base, query, skip="false", **variables)
+            with error.exception as response:
+                self.assertEqual(response.code, 400)
+
+    def test_mutation_uses_the_bound_input_argument(self) -> None:
+        key = "20261124T080000000Z_ABCDEFGHJKMNPQRT"
+        query = (
+            "mutation($payload:RecordUserIntentInput!) {"
+            " submitted: recordUserIntent(input:$payload) { intentKey } }"
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            token = REHEARSAL["SYNTHETIC_TOKEN"]
+            request = urllib.request.Request(
+                f"{base}/query",
+                data=json.dumps(
+                    {
+                        "query": query,
+                        "variables": {
+                            "payload": {
+                                "intentKey": key,
+                                "intent": {"kind": "OPEN_TRADE"},
+                            }
+                        },
+                    }
+                ).encode(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {token}",
+                },
+            )
+            with urllib.request.urlopen(request, timeout=2) as response:
+                self.assertEqual(
+                    json.load(response)["data"], {"submitted": {"intentKey": key}}
+                )
+        self.assertEqual(self.replay.submitted, [self.key, key])
 
     def test_projects_trade_history_with_variable_pagination_and_legacy_limit(
         self,

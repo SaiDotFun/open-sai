@@ -458,7 +458,7 @@ class SelectedField(NamedTuple):
     name: str
     key: str
     arguments: dict[str, Any]
-    children: tuple[SelectedField, ...]
+    children: tuple[SelectedField, ...] | None
 
 
 FILTER_ARGUMENT_TYPES = {
@@ -473,7 +473,9 @@ VARIABLE_SCALARS = {"String": str, "Int": int, "Boolean": bool}
 ENUM_LITERAL = object()
 
 
-def filter_variable_type(path: tuple[str, ...]) -> str | None:
+def expected_variable_type(path: tuple[str, ...]) -> str | None:
+    if path in {("@include", "if"), ("@skip", "if")}:
+        return "Boolean!"
     if len(path) < 2 or path[1] != "where":
         return None
     argument_type = FILTER_ARGUMENT_TYPES.get(path[0])
@@ -582,13 +584,15 @@ def selection_set(
             if name not in bindings:
                 raise ValueError("Undeclared GraphQL variable")
             type_name, default = declared[name]
-            if expected := filter_variable_type(path):
+            if expected := expected_variable_type(path):
                 if type_name.removesuffix("!") != expected.removesuffix("!") or (
                     expected.endswith("!")
                     and not type_name.endswith("!")
                     and default is None
                 ):
-                    raise ValueError(f"Expected a {expected} variable for the filter")
+                    raise ValueError(
+                        f"Expected a {expected} variable at {'.'.join(path)}"
+                    )
                 validate_variable(expected, bindings[name])
             return bindings[name]
         if token == "{":
@@ -606,8 +610,26 @@ def selection_set(
             )
         return json.loads(token)
 
+    def included() -> bool:
+        directives = {}
+        while tokens[0] == "@":
+            tokens.popleft()
+            name = take_name()
+            if name in directives or name not in {"include", "skip"}:
+                raise ValueError("Unsupported or repeated GraphQL field directive")
+            expect("(")
+            arguments = named_values(")", (f"@{name}",))
+            if arguments.keys() != {"if"}:
+                raise ValueError("Expected an 'if' argument for the GraphQL directive")
+            condition = arguments["if"]
+            validate_variable("Boolean!", condition)
+            directives[name] = condition
+        return directives.get("include", True) and not directives.get("skip", False)
+
     def fields() -> tuple[SelectedField, ...]:
         expect("{")
+        if tokens[0] == "}":
+            raise ValueError("Expected a nonempty GraphQL selection")
         result = []
         while tokens[0] != "}":
             key = name = take_name()
@@ -618,8 +640,10 @@ def selection_set(
             if tokens[0] == "(":
                 tokens.popleft()
                 arguments = named_values(")", (name,))
-            children = fields() if tokens[0] == "{" else ()
-            result.append(SelectedField(name, key, arguments, children))
+            include = included()
+            children = fields() if tokens[0] == "{" else None
+            if include:
+                result.append(SelectedField(name, key, arguments, children))
         tokens.popleft()
         return tuple(result)
 
@@ -634,12 +658,14 @@ def selection_set(
         selected = fields()
     except IndexError as exc:
         raise ValueError("Incomplete GraphQL selection") from exc
-    if tokens or not selected:
+    if tokens:
         raise ValueError("Expected a single inline GraphQL operation")
     return selected
 
 
-def project_fields(value: Any, fields: tuple[SelectedField, ...]) -> Any:
+def project_fields(value: Any, fields: tuple[SelectedField, ...] | None) -> Any:
+    if fields is None:
+        return value
     if isinstance(value, list):
         return [project_fields(item, fields) for item in value]
     if isinstance(value, dict):
@@ -734,21 +760,35 @@ class Replay:
                 except ValueError:
                     self.send_error(400)
                     return
-                roots = {field.name: field.children for field in selected}
+                if not selected:
+                    self.reply({"data": {}})
+                    return
+                roots = {field.name for field in selected}
                 perp = {
                     child.name
                     for root in selected
                     if root.name == "perp"
-                    for child in root.children
+                    for child in root.children or ()
                 }
                 if "recordUserIntent" in roots:
                     if self.headers.get("Authorization") != f"Bearer {SYNTHETIC_TOKEN}":
                         self.send_error(403)
                         return
-                    submitted = variables.get("input", {})
-                    key = submitted.get("intentKey")
+                    field = next(
+                        field for field in selected if field.name == "recordUserIntent"
+                    )
+                    submitted = field.arguments.get("input")
+                    key = (
+                        submitted.get("intentKey")
+                        if isinstance(submitted, dict)
+                        else None
+                    )
+                    intent = (
+                        submitted.get("intent") if isinstance(submitted, dict) else None
+                    )
                     if (
-                        submitted.get("intent", {}).get("kind") != "OPEN_TRADE"
+                        not isinstance(intent, dict)
+                        or intent.get("kind") != "OPEN_TRADE"
                         or not isinstance(key, str)
                         or not INTENT_KEY.fullmatch(key)
                     ):
@@ -791,7 +831,7 @@ class Replay:
                                 )
                                 if field.name == "tradeHistory"
                                 else None
-                                for field in root.children
+                                for field in root.children or ()
                             }
                             if root.name == "perp"
                             else None
@@ -823,6 +863,10 @@ class Replay:
                             ]
                         }
                     }
+                elif all(
+                    field.name == "perp" and field.children == () for field in selected
+                ):
+                    data = {"perp": {}}
                 else:
                     self.send_error(400)
                     return
