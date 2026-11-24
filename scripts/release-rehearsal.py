@@ -151,12 +151,14 @@ def cancel_on_signal() -> Generator[None, None, None]:
         for sig in STOP_SIGNALS:
             previous[sig] = signal.signal(sig, CANCELLATION.receive)
         yield
-        CANCELLATION.check()
     finally:
-        for sig, handler in previous.items():
-            if handler is not None:
-                signal.signal(sig, handler)
-        CANCELLATION.signum = None
+        try:
+            for sig, handler in previous.items():
+                if handler is not None:
+                    signal.signal(sig, handler)
+            CANCELLATION.check()
+        finally:
+            CANCELLATION.signum = None
 
 
 @contextmanager

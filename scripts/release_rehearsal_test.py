@@ -355,6 +355,36 @@ except entry["RehearsalInterrupted"] as exc:
             with self.subTest(signal=sig.name):
                 self.assert_interruption_cleans_up(sig, "owned_process.__exit__")
 
+    def test_sigterm_during_handler_restoration_reports_interruption(self) -> None:
+        script = Path(__file__).with_name("release-rehearsal.py").resolve()
+        program = """
+import runpy, signal, sys
+entry = runpy.run_path(sys.argv[1])
+
+def interrupt_at_restore(frame, event, arg):
+    if (event == "call" and frame.f_code is signal.signal.__code__
+            and frame.f_locals["signalnum"] == signal.SIGTERM):
+        sys.setprofile(None)
+        signal.raise_signal(signal.SIGTERM)
+
+def work():
+    with entry["cancel_on_signal"]():
+        sys.setprofile(interrupt_at_restore)
+    return 0
+
+sys.exit(entry["report_result"](work))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", program, script],
+            env={},
+            timeout=5,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 128 + signal.SIGTERM)
+        self.assertIn("interrupted by SIGTERM", result.stderr)
+
     @unittest.skipUnless(sys.platform == "linux", "Linux subreaper coverage")
     def test_sigterm_stops_a_helper_in_a_separate_session(self) -> None:
         self.assert_interruption_cleans_up(signal.SIGTERM, detached=True)
