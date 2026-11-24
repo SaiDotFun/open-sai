@@ -61,7 +61,7 @@ def home() -> Path:
 
 def directory() -> Path:
     path = home()
-    paths.private_directory(path.parent)
+    paths.private_directory(path.parent, profile_root=True)
     return paths.private_directory(path)
 
 

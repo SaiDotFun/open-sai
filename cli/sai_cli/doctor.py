@@ -378,7 +378,9 @@ def loose_modes(paths: Sequence[Path]) -> list[tuple[Path, int, int]]:
     return loose
 
 
-def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
+def tighten(
+    root: Path, names: Sequence[str], *, profile_root: bool = False
+) -> tuple[list[str], list[str]]:
     """Clear group and other bits on ROOT and each of NAMES in it.
 
     Every chmod goes through a descriptor opened with O_NOFOLLOW, and the
@@ -412,6 +414,12 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
                 continue
             try:
                 info_ = os.fstat(fd)
+                if (
+                    profile_root
+                    and name is None
+                    and not paths.home_mode_repairable(root, info_)
+                ):
+                    return changes, [f"Inspect the permissions on {root} by hand"]
                 if (
                     name is None
                     and hasattr(os, "getuid")
@@ -474,7 +482,14 @@ def check_home(ctx: Context) -> Check:
             None,
             details,
         )
-    changes, failed = tighten(sai_home, ()) if home_loose else ([], [])
+    manual_home = bool(home_loose) and not paths.home_mode_repairable(
+        sai_home, sai_home.lstat()
+    )
+    changes, failed = (
+        tighten(sai_home, (), profile_root=True)
+        if home_loose and not manual_home
+        else ([], [])
+    )
     if not failed and not trader_exists:
         home_exists = sai_home.is_dir()
         storage.directory()
@@ -490,6 +505,15 @@ def check_home(ctx: Context) -> Check:
             "fail",
             f"Could not make {plural(len(failed), 'path')} private",
             "; ".join(failed),
+            details,
+            changes=changes,
+        )
+    if manual_home:
+        return Check(
+            "home",
+            "warn",
+            f"{sai_home} is accessible by other users",
+            "Review the directory's permissions by hand",
             details,
             changes=changes,
         )

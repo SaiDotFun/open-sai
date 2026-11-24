@@ -589,7 +589,7 @@ class LogDir:
         remove group and other access from a directory this user owns."""
         try:
             if create:
-                paths.private_directory(root.parent)
+                paths.private_directory(root.parent, profile_root=True)
                 # Preserve owner access on existing log directories. The
                 # descriptor below is used to clear group and other access.
                 if not root.exists():

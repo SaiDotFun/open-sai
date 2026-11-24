@@ -621,7 +621,7 @@ def unset_value(
 
 def write_file(path: Path, text: str) -> None:
     """Write TEXT to PATH atomically, mode 0600 in a 0700 directory."""
-    paths.private_directory(path.parent)
+    paths.private_directory(path.parent, profile_root=True)
     # mkstemp creates the file with mode 0600.
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".config-")
     try:
@@ -636,7 +636,7 @@ def write_file(path: Path, text: str) -> None:
 def _locked(path: Path) -> Generator[None]:
     """Hold an exclusive lock on PATH's sibling `.config.lock` file, so
     concurrent edits run one after another instead of losing changes."""
-    paths.private_directory(path.parent)
+    paths.private_directory(path.parent, profile_root=True)
     fd = os.open(path.parent / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         if sys.platform == "win32":

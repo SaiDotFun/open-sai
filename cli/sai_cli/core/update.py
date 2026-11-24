@@ -672,7 +672,7 @@ def prepare_parent(target: Path) -> None:
         # destinations remain usable even if SAI_HOME was relative.
         in_profile = False
     if in_profile:
-        paths.private_directory(target.parent)
+        paths.private_directory(target.parent, profile_root=True)
     else:
         target.parent.mkdir(mode=paths.PRIVATE_MODE, parents=True, exist_ok=True)
 

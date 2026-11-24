@@ -117,6 +117,31 @@ def test_first_write_creates_private_home(entry: str, tmp_path: Path, monkeypatc
         assert directory.stat().st_mode & 0o777 == 0o700, directory
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize(
+    ("mode", "mixed_use", "expected"),
+    [(0o2770, False, 0o2770), (0o755, False, 0o700), (0o755, True, 0o755)],
+)
+def test_log_write_respects_existing_root_mode(
+    tmp_path: Path, monkeypatch, mode, mixed_use, expected
+):
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    storage.db().close()
+    if mixed_use:
+        (tmp_path / "project.txt").touch()
+    tmp_path.chmod(mode)
+    result = subprocess.run(
+        [sys.executable, "-c", FIRST_WRITE, "logging", "022"],
+        input="start\n",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    assert result.stderr == ""
+    assert tmp_path.stat().st_mode & 0o7777 == expected
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes and pipes")
 def test_concurrent_first_writes_share_private_home(tmp_path: Path, monkeypatch):
     home = tmp_path / "sai"

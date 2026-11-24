@@ -279,9 +279,16 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 @pytest.mark.parametrize("with_trader", [False, True])
-def test_doctor_reports_and_tightens_loose_sai_home(isolated_home, with_trader):
+def test_doctor_reports_and_tightens_loose_sai_home(
+    isolated_home, with_trader, monkeypatch
+):
     if with_trader:
-        (isolated_home / "trader").mkdir(mode=0o700)
+        storage.db().close()
+    else:
+        monkeypatch.setenv("HOME", str(isolated_home))
+        isolated_home = isolated_home / ".sai"
+        monkeypatch.setenv("SAI_HOME", str(isolated_home))
+        isolated_home.mkdir()
     isolated_home.chmod(0o755)
 
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
@@ -299,6 +306,26 @@ def test_doctor_reports_and_tightens_loose_sai_home(isolated_home, with_trader):
     assert check["status"] == "fixed"
     assert f"chmod {isolated_home} 755 -> 700" in check["changes"]
     assert isolated_home.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize("mode", [0o2770, 0o0770, 0o0755])
+def test_doctor_reports_and_preserves_an_existing_shared_or_ambiguous_root(
+    isolated_home, mode
+):
+    if mode != 0o0755:
+        storage.db().close()
+    isolated_home.chmod(mode)
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["details"]["looseModes"][0] == {
+        "path": str(isolated_home),
+        "mode": f"{mode:o}",
+    }
+    assert isolated_home.stat().st_mode & 0o7777 == mode
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")

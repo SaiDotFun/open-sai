@@ -494,7 +494,9 @@ def private_cache() -> Path:
     `cache/wheels` private to the current user."""
     cache = update.wheel_cache()
     try:
-        paths.private_directory(cache.parent.parent)
+        home = paths.private_directory(cache.parent.parent, profile_root=True)
+        if os.name != "nt" and home.stat().st_mode & 0o022:
+            raise OSError(f"{home} is writable by other users")
         paths.private_directory(cache.parent)
         paths.private_directory(cache)
     except OSError as exc:
