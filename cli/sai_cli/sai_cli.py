@@ -191,7 +191,10 @@ def show_failure(exc: Exception, failure: SaiError, json_output: bool) -> None:
     elif isinstance(exc, click.Abort):
         click.echo("Aborted!", err=True)
     else:
-        click.ClickException(log.redact(failure.message)).show()
+        message = failure.message
+        if isinstance(failure, storage.IntentReservationError) and failure.hint:
+            message += f" Check the local reservation with `{failure.hint}`."
+        click.ClickException(log.redact(message)).show()
 
 
 def unlogged(names: list[str], argv: list[str]) -> bool:
