@@ -722,6 +722,29 @@ def standalone_launcher(
     return entry
 
 
+def require_launcher(
+    launcher: Path,
+    expected: tuple[int, int, str | None] | None,
+    binary: Path,
+    proved: os.stat_result | None = None,
+) -> None:
+    observed = launcher_entry(launcher)
+    same_binary = True
+    if proved is not None:
+        try:
+            same_binary = launcher.resolve(strict=True) == binary and os.path.samestat(
+                launcher.stat(), proved
+            )
+        except (OSError, RuntimeError):
+            same_binary = False
+    if observed != expected or not same_binary or launcher_entry(launcher) != expected:
+        raise LauncherChanged(
+            f"The Sai launcher changed at {launcher}."
+            f" It selected {launcher_destination(launcher, observed)}."
+            f" Expected the verified binary at {binary}."
+        )
+
+
 def selected_directory(root: Path) -> str | None:
     selector = root / NATIVE_SELECTOR
     try:
@@ -942,12 +965,12 @@ def native_release(args: argparse.Namespace) -> tuple[str, str, str]:
     return tag, version, native_asset(version)
 
 
-def repair_mcp(launcher: Path, profile: str) -> None:
+def repair_mcp(binary: Path, profile: str) -> None:
     # Doctor reads registrations from HOME and the caller's working directory.
     try:
         result = subprocess.run(
             [
-                launcher,
+                binary,
                 "--json",
                 "doctor",
                 "--offline",
@@ -1027,25 +1050,34 @@ def install_native(args: argparse.Namespace) -> int:
                 staging.rename(published)
                 sync_dir(root)
             binary = native_binary(root, new)
+            proved = binary.stat()
             # Complete startup checks before making this binary public.
             smoke_native(binary, Path(profile), version)
             pending = root / NATIVE_PENDING
             write_native_pending(root, {"old": old, "new": new})
             try:
-                standalone_launcher(launcher, root)
+                require_launcher(launcher, entry, binary)
                 switch_selector(root, new)
                 if entry is None:
-                    publish_launcher(launcher, root)
+                    entry = publish_launcher(launcher, root)
+                require_launcher(launcher, entry, binary, proved)
+                if old is not None:
+                    repair_mcp(binary, profile)
+                require_launcher(launcher, entry, binary, proved)
             except FileExistsError as error:
                 recover_native(root)
+                actual = launcher_destination(launcher, launcher_entry(launcher))
                 raise LookupFailed(
-                    f"{launcher} was created by another installer while selecting {binary}"
+                    f"{launcher} was created by another installer at {actual}"
+                    f" while selecting {binary}"
                 ) from error
+            except LauncherChanged:
+                recover_native(root)
+                raise
             pending.unlink()
             sync_dir(root)
-            if old is not None:
-                repair_mcp(launcher, profile)
-    print(f"Installed sai {version} at {launcher}.")
+            require_launcher(launcher, entry, binary, proved)
+            print(f"Installed sai {version} at {launcher}.")
     return 0
 
 

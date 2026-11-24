@@ -496,6 +496,55 @@ def test_standalone_reinstall_keeps_public_inode_without_link_or_renameat2(
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("boundary", ["selector", "doctor"])
+def test_standalone_refuses_to_commit_a_same_version_replacement(
+    install: Install, replay: Replay, boundary: str
+) -> None:
+    native_artifact(replay)
+    ok(install.install(replay, "--native"))
+    binary = install.launcher.resolve(strict=True)
+    competitor = install.launcher.with_name("competing-sai")
+    competitor.symlink_to(install.launcher.readlink())
+    expected = competitor.lstat()
+    selector = pending(install).parent / "current"
+    probe = """
+import os, runpy, sys
+script, launcher, competitor, selector, boundary, binary, *args = sys.argv[1:]
+def race(event, values):
+    if boundary == 'selector' and event == 'os.rename' and values[1] == selector:
+        os.replace(competitor, launcher)
+    if boundary == 'doctor' and event == 'subprocess.Popen' and 'doctor' in values[1]:
+        os.replace(competitor, launcher)
+        assert os.fsdecode(values[0]) == binary
+sys.addaudithook(race)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        competitor,
+        selector,
+        boundary,
+        binary,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "launcher changed" in result.stderr
+    assert str(install.launcher) in result.stderr and str(binary) in result.stderr
+    assert "Installed sai" not in result.stdout
+    assert os.path.samestat(install.launcher.lstat(), expected)
+    assert install.launcher.resolve(strict=True) == binary
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 def test_standalone_refuses_an_indirect_managed_target(
     install: Install, replay: Replay
 ) -> None:
