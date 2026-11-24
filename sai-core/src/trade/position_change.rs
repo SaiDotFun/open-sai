@@ -2,6 +2,8 @@
 
 mod quote;
 
+use std::future::{Future, pending};
+
 const KEEPER_OWNER_MISMATCH: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER_MISMATCH: &str = "Contract position belongs to a different account";
 const NETWORK_MISMATCH: &str = "Keeper trading route and LCD network do not match";
@@ -127,6 +129,20 @@ impl Trading<'_> {
         action: PositionAction<'_>,
         mode: PositionMode<'_>,
     ) -> Result<Value, SaiError> {
+        self.position_trade_with_interrupt(account, lcd_endpoint, trade_id, action, mode, pending())
+            .await
+    }
+
+    /// Use the shared submit path to report an interruption during dispatch.
+    pub async fn position_trade_with_interrupt(
+        &self,
+        account: Option<&str>,
+        lcd_endpoint: &str,
+        trade_id: &str,
+        action: PositionAction<'_>,
+        mode: PositionMode<'_>,
+        interrupted: impl Future<Output = ()>,
+    ) -> Result<Value, SaiError> {
         let id = id(trade_id, "TRADE_ID")?;
         let id = serde_json::from_str(&id.to_string()).map_err(|_| SaiError::internal())?;
         let session = self.load_session(account)?;
@@ -162,14 +178,15 @@ impl Trading<'_> {
             };
             return Err(position_changed(action, addr, latest, cli));
         }
-        let accepted = self
-            .submit(
+        let (accepted, _) = self
+            .submit_with_reference_price(
                 &session,
                 &current.preview,
                 SubmitOptions {
                     confirmation,
                     ..SubmitOptions::default()
                 },
+                interrupted,
             )
             .await?;
         let mut output = json!({

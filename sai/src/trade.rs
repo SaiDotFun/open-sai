@@ -310,11 +310,7 @@ pub fn run(
             allow_concurrent_open,
             ..SubmitOptions::default()
         },
-        async {
-            if tokio::signal::ctrl_c().await.is_err() {
-                std::future::pending().await
-            }
-        },
+        trade_interrupt(),
     ))?;
     let mut output = json!({
         "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
@@ -366,7 +362,14 @@ impl Position {
             .build()
             .map_err(|_| SaiError::internal())?;
         let result = runtime
-            .block_on(trading.position_trade(account, lcd_endpoint, &self.trade_id, action, mode))
+            .block_on(trading.position_trade_with_interrupt(
+                account,
+                lcd_endpoint,
+                &self.trade_id,
+                action,
+                mode,
+                trade_interrupt(),
+            ))
             .map_err(|mut error| {
                 if !json && error.code == Code::PreviewMismatch && error.details.is_some() {
                     error
@@ -376,6 +379,12 @@ impl Position {
                 error
             })?;
         local::emit(&result, json)
+    }
+}
+
+async fn trade_interrupt() {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending().await
     }
 }
 

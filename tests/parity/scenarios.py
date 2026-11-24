@@ -59,9 +59,11 @@ POSITION_SCENARIOS = {
     "position-wrong-height",
     "partial-preview-changed",
     "margin-accepted",
+    "margin-interrupted",
     "margin-rejected",
     "margin-unknown",
     "partial-accepted",
+    "partial-interrupted",
     "partial-unknown",
 }
 MARGIN_INTENT = {
@@ -526,10 +528,12 @@ def loopback(
     expected_intent = {
         "concurrent-close": close_admission["intent"],
         "margin-accepted": MARGIN_INTENT,
+        "margin-interrupted": MARGIN_INTENT,
         "margin-rejected": MARGIN_INTENT,
         "margin-unknown": MARGIN_INTENT,
         "position-equivalent-owner": MARGIN_INTENT,
         "partial-accepted": PARTIAL_INTENT,
+        "partial-interrupted": PARTIAL_INTENT,
         "partial-unknown": PARTIAL_INTENT,
     }.get(scenario)
 
@@ -592,9 +596,17 @@ def loopback(
                 return
             admission.key = key
             admission.arrived.set()
-            if scenario == "concurrent-close" and not admission.release.wait(15):
-                self.reject("Synthetic admission gate timed out")
-                return
+            if scenario in {
+                "concurrent-close",
+                "margin-interrupted",
+                "partial-interrupted",
+            }:
+                if not admission.release.wait(15):
+                    self.reject("Synthetic admission gate timed out")
+                    return
+                if scenario.endswith("-interrupted"):
+                    self.close_connection = True
+                    return
             if scenario == "margin-rejected":
                 self.reply(
                     {
