@@ -229,13 +229,24 @@ def check_value(key: str, value: Any) -> str | bool | int:
         # urlsplit defers port validation until the property is read.
         _ = parts.port
     except ValueError:
-        raise SettingsError(f"Invalid URL for {key}") from None
-    if parts.scheme not in spec.schemes or not hostname:
-        raise SettingsError(
-            f"Invalid value for {key}: expected a URL starting with"
-            f" {' or '.join(s + '://' for s in spec.schemes)}"
-        )
-    return value
+        pass
+    else:
+        # Older urlsplit versions ignore text around a bracketed host.
+        if "[" in parts.netloc or "]" in parts.netloc:
+            host_port = parts.netloc.rpartition("@")[2]
+            host, bracket, suffix = host_port.partition("]")
+            if (
+                not host.startswith("[")
+                or not bracket
+                or (suffix and not suffix.startswith(":"))
+            ):
+                hostname = None
+        if parts.scheme in spec.schemes and hostname:
+            return value
+    raise SettingsError(
+        f"Invalid value for {key}: expected a URL starting with"
+        f" {' or '.join(s + '://' for s in spec.schemes)}"
+    )
 
 
 def sai_home(env: Mapping[str, str]) -> Path:

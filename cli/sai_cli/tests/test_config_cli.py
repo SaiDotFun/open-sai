@@ -119,6 +119,35 @@ def test_unknown_key_or_bad_value_exits_2_listing_keys(args, tmp_path):
     assert not (tmp_path / "config.toml").exists()
 
 
+@pytest.mark.parametrize("authority", ["[::1]suffix", "prefix[::1]", "[::1"])
+def test_config_set_rejects_malformed_ipv6_authority(tmp_path, authority):
+    result = sai(
+        "--json", "config", "set", "keeper.endpoint", f"https://{authority}/path"
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error": {
+            "code": "INVALID_REQUEST",
+            "message": (
+                "Invalid value for keeper.endpoint: expected a URL starting with "
+                f"https:// or http://. Valid keys: {', '.join(settings.KEYS)}"
+            ),
+            "retryable": False,
+        },
+    }
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+def test_config_set_accepts_ipv6_with_port():
+    endpoint = "https://[::1]:8443/path"
+    result = sai("--json", "config", "set", "keeper.endpoint", endpoint)
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["value"] == endpoint
+
+
 def test_flag_and_env_override_the_file(monkeypatch):
     sai("config", "set", "keeper.endpoint", "https://file.example/q")
     sai("config", "set", "keeper.ws_endpoint", "wss://ws.file.example/q")
