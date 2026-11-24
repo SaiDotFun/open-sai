@@ -78,9 +78,9 @@ class NotSent(KeeperError):
     """The connection failed before the request reached Keeper."""
 
 
-# Keeper fails a recorded intent that waits this long without execution
-# (`expireQueued` in sai-keeper). A key that Keeper has not recorded by then,
-# plus a margin for clock skew and slow requests, was never admitted.
+# Keeper expires queued intents two minutes after admission. On an empty
+# Keeper read the CLI releases an unknown key after that window plus a
+# grace period. A later admission can still restore the block.
 ADMISSION_EXPIRY_SECONDS = 120
 ABSENT_AFTER_SECONDS = ADMISSION_EXPIRY_SECONDS + 180
 

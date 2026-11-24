@@ -487,7 +487,7 @@ def _key_time(key: str) -> float | None:
 def mark_absent(
     key: str, endpoint: str, account: str, older_than: float, now: float | None = None
 ) -> str | None:
-    """Mark an unknown intent `absent` once Keeper can no longer admit it.
+    """Mark an unknown intent `absent` after the admission grace period.
 
     Call this only after Keeper returned no record for the key. Returns the
     local status after the check, or None when the key is not recorded here.

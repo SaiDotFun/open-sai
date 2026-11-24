@@ -202,7 +202,8 @@ async def account_balances(addr: str | None = None) -> str:
 async def intent_local(addr: str | None = None) -> str:
     """List intents this machine recorded, with their local status.
 
-    Status `unknown` blocks new trades until intent_status reconciles it.
+    Statuses `unknown` and `pending` block new trades until intent_status
+    reconciles them.
     The result names the `addr` read and its `addrSource`.
 
     Args:
@@ -215,11 +216,10 @@ async def intent_local(addr: str | None = None) -> str:
 async def intent_status(addr: str | None = None, key: str | None = None) -> str:
     """Read Keeper's latest intent records; with KEY, reconcile that intent.
 
-    With KEY this also writes: it updates this machine's local intent cache,
-    the record intent_local lists and trades check. It never changes
-    anything on Keeper. Reconciling updates only the local record: a server failure or matched
-    trade history is final, a server acceptance is accepted, and a key
-    Keeper never recorded past its admission window stops blocking trades.
+    With KEY this advances the local ledger that intent_local lists and
+    trades check. Keeper lifecycle steps can report admission, a pending
+    fill, or a final outcome. When the result includes outcome `pending`,
+    follow the hint and keep checking the same key before trading again.
 
     Args:
         addr: EVM addr (0x...). Defaults to the signed-in account,
