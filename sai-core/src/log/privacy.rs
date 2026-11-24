@@ -486,10 +486,18 @@ pub(super) fn redact_retained_urls(row: &mut Map<String, Value>) {
     *row = std::mem::take(row)
         .into_iter()
         .map(|(key, value)| {
-            let value = match key.as_str() {
-                "endpoint" => value.as_str().map(origin).into(),
-                "argv" => redact_retained_value(value, &URL_REST),
-                _ => redact_retained_value(value, &URL),
+            let value = match (key.as_str(), value) {
+                ("argv", Value::Array(args)) => safe_argv(args.into_iter().map(|arg| match arg {
+                    Value::String(text) => text,
+                    _ => REDACTED_INPUT.into(),
+                }))
+                .into(),
+                ("argv" | "error" | "errorMsg" | "errorMessage", _) => REDACTED_INPUT.into(),
+                (key, Value::String(endpoint)) if endpoint_field(key) => {
+                    public_endpoint(&endpoint).into()
+                }
+                (key, value) if endpoint_field(key) && !value.is_object() => REDACTED_INPUT.into(),
+                (_, value) => redact_retained_value(value, &URL),
             };
             (redact_url_text(key, &URL), value)
         })

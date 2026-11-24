@@ -145,9 +145,13 @@ an earlier page.
 
 Accepted C9b divergences from the pinned Python reference
 
-- Rust omits rejected URLs from usage and runtime diagnostics, including
-  malformed scheme prefixes. It keeps the valid page list in `skill show`
-  errors. Python v0.1.2 echoes rejected values in usage diagnostics.
+- Rust names the rejected option or argument without echoing its value.
+  `skill show` errors still list the valid pages. Python v0.1.2 quotes
+  rejected values in diagnostics.
+- Rust allowlists command names, flags, and known-safe values in fresh
+  and retained `argv`. It replaces other values and free-form error log
+  text with `[redacted]`. It shows only the origin of a structured endpoint
+  when it parses. Python v0.1.2 retains arbitrary argument and error text.
 - Rust `logs tail` strips credentials, paths, queries, and fragments from
   URLs throughout retained rows, including arguments and nested fields.
   The pinned Python reference prints the retained values. Current Python

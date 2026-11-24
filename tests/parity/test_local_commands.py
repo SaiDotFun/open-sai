@@ -351,26 +351,89 @@ def test_logs_tail_redacts_retained_endpoints(
         for flag in (("--json",), ()):
             result = invoke(cli, root, *flag, "logs", "tail")
             assert result.returncode == 0 and result.stderr == b""
+            endpoint_arg = "[redacted]" if index else expected
+            ws_arg = "[redacted]" if index else expected_ws
+            positional = f"{origin}/private with spaces" if preserves_urls else origin
             if flag:
                 row = json.loads(result.stdout)
                 assert row["endpoint"] == expected
                 assert row["argv"] == [
-                    f"--endpoint={expected}",
+                    f"--endpoint={endpoint_arg}",
                     "--ws-endpoint",
-                    expected_ws,
-                    (f"{origin}/private with spaces" if preserves_urls else origin),
+                    ws_arg,
+                    "[redacted]" if index else positional,
                 ]
                 assert row["detail"] == {
                     expected: [{"probe": f"{expected} or {expected_ws}"}]
                 }
             else:
                 assert f"endpoint={expected}".encode() in result.stdout
-                assert f'"--endpoint={expected}"'.encode() in result.stdout
-                assert f'"{expected_ws}"'.encode() in result.stdout
+                assert f'"--endpoint={endpoint_arg}"'.encode() in result.stdout
+                assert f'"{ws_arg}"'.encode() in result.stdout
             if not preserves_urls:
                 assert b"/private" not in result.stdout
                 assert b"user:fixture" not in result.stdout
                 assert b"with spaces" not in result.stdout
+
+
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_logs_tail_applies_argv_and_error_allowlists_to_retained_rows(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    flags: tuple[str, ...],
+) -> None:
+    _, rust = local_pair
+    key = "rev6-retained-secret"
+    seed_logs(
+        tmp_path,
+        {
+            "cli": [
+                event(
+                    "command.start",
+                    1,
+                    argv=[
+                        f"--endpoint=//127.0.0.1/private?api_key={key}",
+                        "--ws-endpoint",
+                        f"wss:/127.0.0.1/private?api_key={key}",
+                        "trade",
+                        "close",
+                        "42",
+                        "--side=long",
+                        "--price",
+                        "2.5",
+                        f"--key=key={key}",
+                        f"--{key}=1",
+                    ],
+                    endpoint=f"https://127.0.0.1:7331/private?key={key}",
+                    websocket=f"//127.0.0.1/private?key={key}",
+                    error=f'Rejected input: "key={key}"',
+                )
+            ]
+        },
+    )
+    result = invoke(rust, tmp_path, *flags, "logs", "tail")
+    assert result.returncode == 0 and not result.stderr
+    assert key.encode() not in result.stdout
+    if flags:
+        row = json.loads(result.stdout)
+        assert row["argv"] == [
+            "--endpoint=[redacted]",
+            "--ws-endpoint",
+            "[redacted]",
+            "trade",
+            "close",
+            "42",
+            "--side=long",
+            "--price",
+            "2.5",
+            "--key=[redacted]",
+            "[redacted]",
+        ]
+        assert row["endpoint"] == "https://127.0.0.1:7331"
+        assert row["websocket"] == row["error"] == "[redacted]"
+    else:
+        assert b"error=[redacted]" in result.stdout
+        assert b"websocket=[redacted]" in result.stdout
 
 
 def test_logs_run_keeps_events_with_non_utf8_argv(
