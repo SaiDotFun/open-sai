@@ -390,6 +390,15 @@ ACTION_REASONS = {
     "tpsl": "issues/173",
     "leverage": "pull/181",
 }
+WAIT_REASONS = {
+    "open": "pull/122",
+    "close": "pull/122",
+    "cancel": "pull/122",
+    "margin": "issues/174",
+    "partial-close": "issues/174",
+    "tpsl": "issues/173",
+    "leverage": "issues/173",
+}
 REPO_URL = "https://github.com/SaiDotFun/open-sai"
 
 
@@ -525,7 +534,9 @@ def test_trade_wait_replays_pending_then_receipt(
         trade_help(home, writer, action_name)
         if command_help(home, writer, "trade", action.args[0], "--wait") is None:
             assert writer.rust
-            pytest.skip(f"Rust trade --wait awaits {REPO_URL}/pull/122")
+            pytest.skip(
+                f"Rust trade {action_name} --wait awaits {REPO_URL}/{WAIT_REASONS[action_name]}"
+            )
         result = home.json(writer, "trade", *action.args, "--wait")
         key = result["intentKey"]
         assert result["outcome"] == action.outcome
