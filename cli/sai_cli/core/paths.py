@@ -96,6 +96,13 @@ def private_directory(
         if only_new:
             return path
     info = path.lstat()
+    if (
+        profile_root
+        and os.name == "nt"
+        and info.st_reparse_tag == stat.IO_REPARSE_TAG_MOUNT_POINT
+        and path.is_dir()
+    ):
+        return path
     if stat.S_ISLNK(info.st_mode) or (
         getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
     ):

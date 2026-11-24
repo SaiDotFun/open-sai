@@ -67,6 +67,29 @@ with closing(sqlite3.connect(sys.argv[1], timeout=0)) as connection:
                     writer.kill()
 
 
+@pytest.mark.skipif(os.name != "nt", reason="Windows directory junctions")
+def test_existing_ledger_opens_through_sai_home_junction(tmp_path: Path, monkeypatch):
+    target = tmp_path / "relocated"
+    monkeypatch.setenv("SAI_HOME", str(target))
+    with closing(storage.db()) as connection:
+        connection.execute("PRAGMA application_id = 42")
+
+    junction = tmp_path / "sai"
+    subprocess.run(
+        ["cmd.exe", "/d", "/c", "mklink", "/j", str(junction), str(target)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    try:
+        monkeypatch.setenv("SAI_HOME", str(junction))
+        with closing(storage.db()) as connection:
+            assert connection.execute("PRAGMA application_id").fetchone() == (42,)
+    finally:
+        junction.rmdir()
+
+
 FIRST_WRITE = """
 import os
 import sys
