@@ -142,7 +142,7 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         config.write_text('[keeper]\nendpoint = "https://fixture.invalid:bad/api"\n')
         config.chmod(0o600)
         return
-    if seed == "doctor-ledger-v0":
+    if seed in {"doctor-ledger-v0", "doctor-loose-profile"}:
         trader = sai_home / "trader"
         trader.mkdir(mode=0o700)
         with sqlite3.connect(path := trader / "intents.sqlite3") as conn:
@@ -152,16 +152,13 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
                 " entity TEXT NOT NULL)"
             )
         path.chmod(0o600)
-        return
-    if seed == "doctor-loose-profile":
-        sai_home.chmod(0o750)
-        config = sai_home / "config.toml"
-        config.write_text("[logs]\nenabled = false\n")
-        config.chmod(0o600)
-        trader = sai_home / "trader"
-        trader.mkdir(mode=0o755)
-        history = trader / "history"
-        history.touch(mode=0o644)
+        if seed == "doctor-loose-profile":
+            sai_home.chmod(0o750)
+            config = sai_home / "config.toml"
+            config.write_text("[logs]\nenabled = false\n")
+            config.chmod(0o600)
+            trader.chmod(0o755)
+            (trader / "history").touch(mode=0o644)
         return
     if seed == "legacy":
         shutil.copytree(HERE / "v0.1.0", sai_home, dirs_exist_ok=True)
