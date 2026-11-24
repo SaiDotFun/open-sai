@@ -40,6 +40,9 @@ jobs:
 
       - run: uv run pytest
 
+      - name: Check parity fixtures against Python
+        run: uv run python tests/parity/parity.py
+
   check:
     runs-on: ubuntu-latest
     # The suite takes under a minute; a hung test must not hold a required

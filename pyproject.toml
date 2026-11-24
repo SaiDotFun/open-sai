@@ -33,7 +33,7 @@ include = ["sai_cli*"]
 # here would skip hidden directories.
 
 [tool.pytest.ini_options]
-testpaths = ["cli/sai_cli/tests"]
+testpaths = ["cli/sai_cli/tests", "tests/parity"]
 markers = ["slow: runs real uv installs; deselect with -m 'not slow'"]
 
 [tool.ruff]
