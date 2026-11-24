@@ -12,6 +12,7 @@ import socket
 import sqlite3
 import ssl
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -579,18 +580,6 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
         ((Reply(b"malformed"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
-        (
-            (
-                {
-                    "errors": [
-                        {"message": "Keeper failure", "extensions": {"code": "FIXTURE"}}
-                    ]
-                },
-            ),
-            "unknown",
-            "KEEPER_ERROR",
-        ),
-        (({"errors": [{"message": "denied"}], "data": {}},), "unknown", "KEEPER_ERROR"),
         (({"data": {"userIntents": 123}},), "unknown", "INCOMPLETE_DATA"),
         (({"data": {"userIntents": [None]}},), "unknown", "INTERNAL_ERROR"),
         (("outcome_not_indexed", {"data": {}}), "pending", "INCOMPLETE_DATA"),
@@ -612,6 +601,70 @@ def test_request_and_data_failures(
     compare(
         cli_pair, tmp_path, monkeypatch, (Step(replies, local, code=1, error=error),)
     )
+
+
+@pytest.mark.parametrize("operation", ["intents", "history"])
+def test_intent_status_logs_only_public_graphql_codes(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, operation: str
+) -> None:
+    diagnostic = "synthetic Keeper diagnostic"
+    failure = {
+        "data": {"userIntents": [], "perp": {"tradeHistory": []}},
+        "errors": [
+            {"message": diagnostic, "extensions": {"code": "FORBIDDEN"}},
+            {"message": diagnostic, "extensions": {"code": "PRIVATE_CODE"}},
+            {"message": diagnostic},
+            {"message": diagnostic, "extensions": {"code": "BAD_USER_INPUT"}},
+        ],
+    }
+    # The Python checkout has the current logging policy. C4's pinned CLI
+    # predates it and remains the reference for the other reconciliation tests.
+    candidate = cli_pair[1]
+    reference = (sys.executable, "-m", "sai_cli.sai_cli")
+    with replay() as (endpoint, replies, requests):
+        for index, cli in enumerate((reference, candidate)):
+            home = tmp_path / str(index)
+            requests.clear()
+            expected_requests = [wire(keeper.INTENTS, user=ADDR, key=KEY)]
+            if operation == "history":
+                replies.append(response("outcome_not_indexed"))
+                expected_requests.append(wire(keeper.HISTORY, trader=ADDR))
+            replies.append(response(failure))
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "status",
+                ADDR,
+                "--key",
+                KEY,
+            )
+            assert not replies
+            assert [request.body for request in requests] == expected_requests
+            assert result.stderr == b""
+            document = json.loads(result.stdout)
+            if operation == "intents":
+                assert result.returncode == 1
+                assert document["error"]["code"] == "KEEPER_ERROR"
+            else:
+                assert result.returncode == 0
+                assert document["outcome"] == "pending"
+            [event] = [
+                event
+                for event in read_events(home)
+                if event["event"] == "keeper.request"
+                and event["operation"] == operation
+            ]
+            assert event["code"] == "KEEPER_ERROR"
+            assert event["keeperErrors"] == [
+                {"code": "FORBIDDEN"},
+                {"code": "KEEPER_ERROR"},
+                {"code": "KEEPER_ERROR"},
+            ]
+            assert event["keeperErrorCount"] == 4
 
 
 def test_compressed_keeper_response(

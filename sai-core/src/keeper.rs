@@ -53,18 +53,11 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(
-            query,
-            variables,
-            token,
-            timeout,
-            std::future::pending(),
-            false,
-        )
-        .await
+        self.request_with(query, variables, token, timeout, std::future::pending())
+            .await
     }
 
-    /// Make an interruptible public read and protect account-history diagnostics.
+    /// Make an interruptible public read.
     pub async fn read_until(
         &self,
         query: &str,
@@ -72,7 +65,7 @@ impl<'a> Keeper<'a> {
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, None, timeout, interrupt, query == HISTORY)
+        self.request_with(query, variables, None, timeout, interrupt)
             .await
     }
 
@@ -83,7 +76,6 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
-        codes_only: bool,
     ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
@@ -98,7 +90,7 @@ impl<'a> Keeper<'a> {
         let (result, interrupted) = tokio::select! {
             biased;
             error = interrupt => (Err(error), true),
-            result = self.post(query, &variables, token, timeout, &mut response, codes_only) => (result, false),
+            result = self.post(query, &variables, token, timeout, &mut response) => (result, false),
         };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
@@ -150,7 +142,6 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
         log: &mut ResponseLog,
-        codes_only: bool,
     ) -> Result<Map<String, Value>, SaiError> {
         check_url(self.endpoint)?;
         let body = serde_json::to_vec(&json!({"query": query, "variables": variables}))
@@ -165,6 +156,7 @@ impl<'a> Keeper<'a> {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
+            let codes_only = matches!(query, INTENTS | HISTORY);
             log.errors = Some(graphql_errors(errors, codes_only));
             if codes_only {
                 log.error_count = Some(errors.as_array().map_or(1, Vec::len));
