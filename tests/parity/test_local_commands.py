@@ -29,6 +29,11 @@ def local_pair(
     return (reference,), cli_pair[1]
 
 
+@pytest.fixture
+def legacy_logs() -> bool:
+    return bool(os.environ.get("SAI_C9B_PARITY_PYTHON"))
+
+
 def case_env(root: Path, *, logging: str) -> dict[str, str]:
     return {
         "PATH": os.defpath,
@@ -308,7 +313,9 @@ def test_log_path_and_tail(
 
 
 def test_logs_tail_redacts_retained_endpoints(
-    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    legacy_logs: bool,
 ) -> None:
     origin = "https://fixture.invalid:8443"
     endpoint = (
@@ -316,10 +323,10 @@ def test_logs_tail_redacts_retained_endpoints(
     )
     ws_origin = "wss://ws.fixture.invalid"
     ws_endpoint = ws_origin + "/private-ws?session=fixture"
-    # Accepted divergence: Python still exposes the retained URLs verbatim.
-    for index, (cli, expected, expected_ws) in enumerate(
-        zip(local_pair, (endpoint, origin), (ws_endpoint, ws_origin), strict=True)
-    ):
+    for index, cli in enumerate(local_pair):
+        preserves_urls = legacy_logs and index == 0
+        expected = endpoint if preserves_urls else origin
+        expected_ws = ws_endpoint if preserves_urls else ws_origin
         root = tmp_path / str(index)
         seed_logs(
             root,
@@ -350,7 +357,7 @@ def test_logs_tail_redacts_retained_endpoints(
                     f"--endpoint={expected}",
                     "--ws-endpoint",
                     expected_ws,
-                    (f"{origin}/private with spaces" if index == 0 else origin),
+                    (f"{origin}/private with spaces" if preserves_urls else origin),
                 ]
                 assert row["detail"] == {
                     expected: [{"probe": f"{expected} or {expected_ws}"}]
@@ -359,7 +366,7 @@ def test_logs_tail_redacts_retained_endpoints(
                 assert f"endpoint={expected}".encode() in result.stdout
                 assert f'"--endpoint={expected}"'.encode() in result.stdout
                 assert f'"{expected_ws}"'.encode() in result.stdout
-            if index:
+            if not preserves_urls:
                 assert b"/private" not in result.stdout
                 assert b"user:fixture" not in result.stdout
                 assert b"with spaces" not in result.stdout
@@ -514,10 +521,12 @@ def test_logs_intent_scopes_and_projects(
 
 
 def test_logs_intent_cursor_keeps_events_at_the_same_timestamp(
-    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    legacy_logs: bool,
 ) -> None:
-    # Accepted divergence: Python's timestamp cursor drops events tied with it.
     for index, cli in enumerate(local_pair):
+        keeps_ties = index == 1 or not legacy_logs
         root = tmp_path / str(index)
         fields = {"intentKey": INTENT_KEY, "addr": ADDR, "endpointId": ENDPOINT_ID}
         upper = STAMP.replace(".000Z", ".001Z")
@@ -541,7 +550,7 @@ def test_logs_intent_cursor_keeps_events_at_the_same_timestamp(
         args = ("logs", "intent", INTENT_KEY, "--offline")
         first = cli_json(cli, root, *args, "--before", upper)
         assert [row["seq"] for row in first["events"]] == list(range(2, 130))
-        if index:
+        if keeps_ties:
             # A new conflicting anchor must stay outside this continuation.
             conflict = event(
                 "intent.status", 131, **{**fields, "addr": "0x" + "34" * 20}
@@ -549,7 +558,7 @@ def test_logs_intent_cursor_keeps_events_at_the_same_timestamp(
             with (logs / f"cli-{STAMP[:10]}.jsonl").open("a") as stream:
                 stream.write(json.dumps(conflict) + "\n")
         second = cli_json(cli, root, *args, "--before", first["nextBefore"])
-        assert [row["seq"] for row in second["events"]] == ([1] if index else [])
+        assert [row["seq"] for row in second["events"]] == ([1] if keeps_ties else [])
         assert "nextBefore" not in second
         assert cli_json(cli, root, *args, "--before", STAMP)["events"] == []
 
@@ -557,8 +566,6 @@ def test_logs_intent_cursor_keeps_events_at_the_same_timestamp(
 def test_logs_intent_cursor_keeps_cross_day_attribution(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:
-    # Python reads the prior UTC day as side context and includes its start
-    # immediately. A Rust cursor reaches that row on its own physical page.
     for index, cli in enumerate(local_pair):
         root = tmp_path / str(index)
         logs = seed_logs(root, {"cli": [event("command.start", 1, commandId=COMMAND)]})
@@ -579,7 +586,7 @@ def test_logs_intent_cursor_keeps_cross_day_attribution(
         first = cli_json(cli, root, *args)
         assert first["truncated"]
         seen = [row["seq"] for row in first["events"]]
-        if index:
+        if 1 not in seen:
             second = cli_json(cli, root, *args, "--before", first["nextBefore"])
             seen.extend(row["seq"] for row in second["events"])
             assert "nextBefore" not in second

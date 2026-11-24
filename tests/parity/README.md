@@ -149,15 +149,17 @@ Accepted C9b divergences from the pinned Python reference
   generic argument error. Python v0.1.2 still echoes the rejected values.
 - Rust `logs tail` strips credentials, paths, queries, and fragments from
   URLs throughout retained rows, including arguments and nested fields.
-  Python currently prints the retained values.
+  The pinned Python reference prints the retained values. Current Python
+  strips them after PR #157.
 - Rust `logs intent` resumes at the first unread file positions when a
   page ends and retains attribution from both the initial scan and anchors
   discovered in later scans.
-  Python can omit events that share the last displayed timestamp.
+  The pinned Python reference can omit events that share the last displayed
+  timestamp. Current Python keeps the remaining events after PR #157.
   Rust also returns attributed command starts on their retained page when
-  the scan budget ends before that file. Python may include those starts
-  on an earlier page. UTC timestamps passed directly to `--before` remain
-  exclusive.
+  the scan budget ends before that file. The pinned Python reference may
+  include those starts on an earlier page. UTC timestamps passed directly
+  to `--before` remain exclusive.
 
 ## Doctor and MCP Registration Reference
 
