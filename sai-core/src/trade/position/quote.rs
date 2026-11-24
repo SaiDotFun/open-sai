@@ -292,7 +292,10 @@ mod tests {
             raw: json!({"collateral_amount": "10000003", "leverage": "2.123456789012345678"}),
             funds: json!({"available_to_trade": "10000000"}),
             market: json!({"minLeverage": 1, "maxLeverage": 100}),
-            contract: String::new(),
+            route: crate::trade::position::PositionRoute {
+                chain_id: String::new(),
+                contract_address: String::new(),
+            },
         };
         let cap = "1.234567890123456789";
         let effective = ContractDecimal::parse(&json!(cap)).unwrap();

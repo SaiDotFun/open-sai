@@ -54,6 +54,7 @@ pub struct TradePreview {
     pub reference_price: Option<String>,
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
+    position_route: Option<position::PositionRoute>,
 }
 
 impl TradePreview {
@@ -63,6 +64,7 @@ impl TradePreview {
             reference_price: None,
             quote: None,
             warning: None,
+            position_route: None,
         }
     }
 

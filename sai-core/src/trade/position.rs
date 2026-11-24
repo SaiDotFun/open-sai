@@ -3,6 +3,7 @@
 mod lcd;
 mod quote;
 
+use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -41,7 +42,14 @@ struct Snapshot {
     raw: Value,
     funds: Value,
     market: Value,
-    contract: String,
+    route: PositionRoute,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct PositionRoute {
+    chain_id: String,
+    contract_address: String,
 }
 
 struct PositionQuote {
@@ -76,7 +84,10 @@ impl Trading<'_> {
 
         let current = self.quote_position(&lcd, addr, &id, action).await?;
         let changed = !current.unchanged(&lcd, &id).await?;
-        if changed || current.preview.output(None) != first.preview.output(None) {
+        if changed
+            || current.snapshot.route != first.snapshot.route
+            || current.preview.output(None) != first.preview.output(None)
+        {
             let latest = if changed {
                 self.quote_position(&lcd, addr, &id, action).await
             } else {
@@ -140,7 +151,7 @@ impl Trading<'_> {
         };
 
         let (effective, mut inputs) = snapshot.leverage(lcd, trade_id, None).await?;
-        let preview = match action {
+        let mut preview = match action {
             PositionAction::Margin { direction, amount } => {
                 let leverage = effective.as_ref().ok_or_else(|| {
                     invalid("Cannot verify effective leverage for this margin change")
@@ -168,6 +179,7 @@ impl Trading<'_> {
                 )?
             }
         };
+        preview.position_route = Some(snapshot.route.clone());
         Ok(PositionQuote {
             snapshot,
             inputs,
@@ -206,7 +218,8 @@ impl Trading<'_> {
         {
             return Err(invalid("Keeper position belongs to a different account"));
         }
-        if &lcd.network().await? != field(route, "chainId")? {
+        let chain_id = text_field(route, "chainId")?;
+        if lcd.network().await? != chain_id {
             return Err(invalid("Keeper trading route and LCD network do not match"));
         }
         let borrowing = field(position, "perpBorrowing")?;
@@ -272,7 +285,10 @@ impl Trading<'_> {
             raw,
             funds,
             market: market.clone(),
-            contract: contract.into(),
+            route: PositionRoute {
+                chain_id: chain_id.into(),
+                contract_address: contract.into(),
+            },
         })
     }
 
@@ -293,7 +309,12 @@ impl PositionQuote {
         let snapshot = &self.snapshot;
         let trader = text_field(&snapshot.raw, "user")?;
         let (latest, height) = lcd
-            .position(&snapshot.contract, trader, trade_id, Read::Fresh)
+            .position(
+                &snapshot.route.contract_address,
+                trader,
+                trade_id,
+                Read::Fresh,
+            )
             .await?;
         require_object(&latest)?;
         if height.as_deref().is_some_and(|height| {
@@ -345,7 +366,7 @@ impl Snapshot {
     ) -> Result<ContractDecimal, SaiError> {
         let (value, _) = lcd
             .smart(
-                &self.contract,
+                &self.route.contract_address,
                 json!({"get_collateral_price": {
                     "collateral_index": self.raw["collateral_index"],
                 }}),
@@ -390,7 +411,7 @@ impl Snapshot {
     ) -> Result<ContractDecimal, SaiError> {
         let query = |message| async move {
             lcd.smart(
-                &self.contract,
+                &self.route.contract_address,
                 message,
                 height.map_or(Read::Snapshot, Read::At),
             )

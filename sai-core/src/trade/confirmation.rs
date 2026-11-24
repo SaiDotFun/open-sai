@@ -191,6 +191,9 @@ pub fn digest_bytes(preview: &TradePreview, account: Option<&str>) -> Vec<u8> {
     if let Some(quote) = &preview.quote {
         material["quote"] = quote.clone();
     }
+    if let Some(route) = &preview.position_route {
+        material["positionRoute"] = json!(route);
+    }
     material.sort_all_objects();
     let mut canonical = String::new();
     for ch in material.to_string().chars() {

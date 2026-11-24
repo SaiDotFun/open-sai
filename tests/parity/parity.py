@@ -472,7 +472,7 @@ def run_case(
             for side, error in (("reference", left_error), ("candidate", right_error))
             if error
         ], tools
-    if rust and case.accepted_difference:
+    if rust and case.accepted_difference and case.mode != "mcp":
         diffs = []
         if right.exit_code != candidate_case.expect:
             diffs.append(
@@ -481,6 +481,16 @@ def run_case(
         if left.stderr != right.stderr:
             diffs.append("stderr differs")
     else:
+        if rust and case.accepted_difference and case.mode == "mcp":
+            # Both sides already checked the digest fields. Compare the rest,
+            # including the duplicate MCP structured-content representation.
+            reference_output = json.dumps(left.output)
+            for path, expected in (case.output or {}).items():
+                if path.endswith(".previewDigest"):
+                    reference_output = reference_output.replace(
+                        expected, (candidate_case.output or {})[path]
+                    )
+            left = replace(left, output=json.loads(reference_output))
         diffs = differences(left, right)
     if left.exit_code != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
