@@ -420,6 +420,18 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         response.headers["Location"] = location
         return response
 
+    def websocket_response(
+        _connection: ServerConnection, request: Request, response: Response
+    ) -> None:
+        if scenario not in {"ws-no-subprotocol", "ws-wrong-subprotocol"}:
+            return
+        if request.headers.get("Sec-WebSocket-Protocol") != "graphql-transport-ws":
+            errors.append("Expected graphql-transport-ws in the upgrade request")
+        if response.status_code == HTTPStatus.SWITCHING_PROTOCOLS:
+            del response.headers["Sec-WebSocket-Protocol"]
+            if scenario == "ws-wrong-subprotocol":
+                response.headers["Sec-WebSocket-Protocol"] = "wrong-protocol"
+
     class StalledClose(ServerConnection):
         def send_data(self) -> None:
             if self.protocol.close_rcvd is None:
@@ -504,7 +516,12 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     '"payload":{"data":{"userBalances":[{"amount":1E-7}]}}}'
                 )
             connection.send(message)
-            if scenario in {"watch", "watch-number-spelling", "ws-redirect"}:
+            if scenario in {
+                "watch",
+                "watch-number-spelling",
+                "ws-redirect",
+                "ws-no-subprotocol",
+            }:
                 connection.send(json.dumps({"id": request_id, "type": "complete"}))
             if scenario == "watch-reconnect" and count == 1:
                 disconnected_at = time.monotonic()
@@ -532,6 +549,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         graphql_ws(
             websocket,
             process_request=websocket_redirect,
+            process_response=websocket_response,
             create_connection=StalledClose
             if scenario == "interrupt-balance-close"
             else None,

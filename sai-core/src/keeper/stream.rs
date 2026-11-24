@@ -1,17 +1,17 @@
 //! Keeper snapshots over graphql-transport-ws.
 
+mod upgrade;
+
 use std::{env, io, pin::Pin, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Number, Value, json};
 use tokio::time::{self, Instant};
 use tokio_tungstenite::{
-    WebSocketStream, client_async_with_config,
+    WebSocketStream,
     tungstenite::{
         Error as WsError, Message,
-        client::IntoClientRequest,
-        http::header::{LOCATION, SEC_WEBSOCKET_PROTOCOL},
-        protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
+        protocol::{CloseFrame, Role, WebSocketConfig, frame::coding::CloseCode},
     },
 };
 use url::Url;
@@ -21,6 +21,7 @@ use crate::{
     endpoint::Endpoint,
     errors::{Code, SaiError},
 };
+use upgrade::Upgrade;
 
 const DEFAULT_REDIRECT_ATTEMPTS: isize = 10;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -213,11 +214,6 @@ impl Connection {
             .and_then(|value| value.trim().parse::<isize>().ok())
             .unwrap_or(DEFAULT_REDIRECT_ATTEMPTS);
         for _ in 0..attempts {
-            let mut request = url.as_str().into_client_request()?;
-            request.headers_mut().insert(
-                SEC_WEBSOCKET_PROTOCOL,
-                SUBPROTOCOL.parse().expect("valid subprotocol"),
-            );
             let stream = transport::websocket_socket(&url, OPEN_TIMEOUT)
                 .await
                 .map_err(|error| {
@@ -227,29 +223,25 @@ impl Connection {
                     };
                     Failure::Disconnected(reason)
                 })?;
-            let config = WebSocketConfig::default()
-                .max_message_size(Some(1 << 20))
-                .max_frame_size(Some(1 << 20));
-            match client_async_with_config(request, stream, Some(config)).await {
-                Ok((socket, _)) => {
+            match upgrade::connect(&url, stream).await? {
+                Upgrade::Connected(socket) => {
+                    let config = WebSocketConfig::default()
+                        .max_message_size(Some(1 << 20))
+                        .max_frame_size(Some(1 << 20));
                     return Ok(Self {
-                        socket,
+                        socket: WebSocketStream::from_raw_socket(
+                            socket,
+                            Role::Client,
+                            Some(config),
+                        )
+                        .await,
                         field,
                         heartbeat: Instant::now() + PING_INTERVAL,
                         ping: None,
                         ping_count: 0,
                     });
                 }
-                Err(WsError::Http(response))
-                    if matches!(response.status().as_u16(), 300..=303 | 307 | 308)
-                        && response.headers().contains_key(LOCATION) =>
-                {
-                    let location = response.headers()[LOCATION]
-                        .to_str()
-                        .map_err(|_| Failure::Disconnected("InvalidURI"))?;
-                    url = redirect_target(&url, location)?;
-                }
-                Err(error) => return Err(error.into()),
+                Upgrade::Redirect(location) => url = redirect_target(&url, &location)?,
             }
         }
         Err(Failure::Disconnected("SecurityError"))

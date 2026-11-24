@@ -42,6 +42,8 @@ def graphql_ws(
     process_request: Callable[[ServerConnection, Request], Response | None]
     | None = None,
     create_connection: type[ServerConnection] | None = None,
+    process_response: Callable[[ServerConnection, Request, Response], Response | None]
+    | None = None,
 ) -> Generator[str]:
     with serve(
         handler,
@@ -50,6 +52,7 @@ def graphql_ws(
         subprotocols=[Subprotocol("graphql-transport-ws")],
         process_request=process_request,
         create_connection=create_connection,
+        process_response=process_response,
     ) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()

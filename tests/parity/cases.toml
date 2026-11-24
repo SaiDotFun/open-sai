@@ -172,6 +172,18 @@ unset = ["SAI_WS_ENDPOINT"]
 wire = ["ws:init","ws:userBalances"]
 
 [[case]]
+name = "account-balances-no-subprotocol"
+args = ["--json","account","balances","{addr}"]
+server = "ws-no-subprotocol"
+wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "account-balances-wrong-subprotocol"
+args = ["--json","account","balances","{addr}"]
+server = "ws-wrong-subprotocol"
+expect = 1
+
+[[case]]
 name = "account-balances-redirect"
 args = ["--json","account","balances","{addr}"]
 server = "ws-redirect"
@@ -315,6 +327,14 @@ name = "watch-balances"
 args = ["--json","watch","balances","{addr}"]
 mode = "jsonl"
 server = "watch"
+expect = 1
+wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "watch-balances-no-subprotocol"
+args = ["--json","watch","balances","{addr}"]
+mode = "jsonl"
+server = "ws-no-subprotocol"
 expect = 1
 wire = ["ws:init","ws:userBalances"]
 
