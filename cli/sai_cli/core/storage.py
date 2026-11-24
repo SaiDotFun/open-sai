@@ -407,6 +407,7 @@ def set_status(
     status: str,
     *,
     repair_legacy_terminal: bool = False,
+    only_if_absent: bool = False,
 ) -> str | None:
     """Advance a recorded intent and return its current status.
 
@@ -414,6 +415,7 @@ def set_status(
     A late acknowledgement or status response cannot downgrade the ledger.
     Explicit evidence of a pending market order can repair a legacy terminal
     row whose outcome was never tracked by this version.
+    With ONLY_IF_ABSENT, leave every other status alone under the write lock.
     """
     if not (home() / "intents.sqlite3").exists():
         return None
@@ -428,6 +430,8 @@ def set_status(
             return None
         kind, stored, keeper_status = row
         previous = keeper_status or stored
+        if only_if_absent and previous != "absent":
+            return previous
         if previous == "absent" and status == "accepted":
             # A late admission can still execute, even after the expiry check.
             status = "pending"

@@ -47,6 +47,9 @@ def for_intent(
 ) -> dict[str, Any]:
     """Poll the same intent until Keeper confirms it or the wait expires."""
     validate_timeout(timeout)
+    account = keeper.canonical_account(addr)
+    if account is None:
+        raise ValueError("Pass a valid EVM or Nibiru account address")
     started = clock.now()
     deadline = started + timeout
 
@@ -72,7 +75,7 @@ def for_intent(
     try:
         with write():
             local = storage.intent_record(endpoint, key)
-        if local == (addr.lower(), "rejected"):
+        if local == (account, "rejected"):
             outcome = "rejected"
         while outcome == "unknown" and remaining() > 0:
             try:

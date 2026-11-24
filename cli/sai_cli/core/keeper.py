@@ -389,6 +389,45 @@ def is_address(value: object) -> bool:
     return all(c in "0123456789abcdefABCDEF" for c in value[2:])
 
 
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_GENERATORS = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+
+
+def canonical_account(value: object) -> str | None:
+    """Return the lowercase EVM form of a 20-byte EVM or Nibiru account."""
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    value = value.lower()
+    evm = "0x" + value.removeprefix("0x")
+    if is_address(evm):
+        return evm
+    # A Nibiru account has 32 payload symbols and six checksum symbols.
+    if not value.startswith("nibi1") or len(value) != 43:
+        return None
+    try:
+        symbols = [_BECH32_CHARSET.index(char) for char in value[5:]]
+    except ValueError:
+        return None
+
+    # Bech32 checksum (BIP 173), using the Nibiru account prefix.
+    prefix = b"nibi"
+    expanded = [char >> 5 for char in prefix] + [0] + [char & 31 for char in prefix]
+    checksum = 1
+    for symbol in (*expanded, *symbols):
+        top = checksum >> 25
+        checksum = ((checksum & 0x1FFFFFF) << 5) ^ symbol
+        for bit, generator in enumerate(_BECH32_GENERATORS):
+            if top & (1 << bit):
+                checksum ^= generator
+    if checksum != 1:
+        return None
+
+    payload = 0
+    for symbol in symbols[:-6]:
+        payload = (payload << 5) | symbol
+    return "0x" + payload.to_bytes(20, "big").hex()
+
+
 @dataclass(frozen=True)
 class UdWallet:
     """Public details from `ud evm wallet show`.

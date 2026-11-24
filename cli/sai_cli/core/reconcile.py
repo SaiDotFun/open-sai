@@ -79,13 +79,11 @@ def _explicit_market_pending(row: dict[str, Any]) -> bool:
     )
 
 
-def _addresses(row: Mapping[str, Any]) -> set[str]:
-    """Use the EVM and Nibiru address pair Keeper resolved for the intent."""
-    return {
-        addr.lower()
-        for addr in (row.get("evmAddress"), row.get("nibiAddress"))
-        if isinstance(addr, str) and addr
-    }
+def _matches_account(row: Mapping[str, Any], account: str) -> bool:
+    nibi = row.get("nibiAddress")
+    return keeper.canonical_account(row.get("evmAddress")) == account and (
+        nibi is None or keeper.canonical_account(nibi) == account
+    )
 
 
 def _hash(value: str | None) -> str:
@@ -95,6 +93,7 @@ def _hash(value: str | None) -> str:
 def _read_history(
     endpoint: str,
     addr: str,
+    account: str,
     row: dict[str, Any],
     timeout: float,
     clock: Callable[[], float],
@@ -104,7 +103,6 @@ def _read_history(
     request_hash = _hash(row.get("txHash"))
     if not request_hash:
         return []
-    traders = _addresses(row)
     end = clock() + min(timeout, HISTORY_BUDGET)
 
     def left() -> float:
@@ -118,7 +116,7 @@ def _read_history(
             if isinstance(item, dict)
             and item.get("intentKey") == row["intentKey"]
             and isinstance(item.get("trade"), dict)
-            and str(item["trade"].get("trader") or "").lower() in traders
+            and keeper.canonical_account(item["trade"].get("trader")) == account
             and request_hash
             in (_hash(item.get("txHash")), _hash(item.get("evmTxHash")))
         ]
@@ -161,17 +159,24 @@ def _history_page(
 
 
 def _store_outcome(
-    endpoint: str, row: dict[str, Any], outcome: IntentOutcome, write: WriteGate
+    endpoint: str,
+    account: str,
+    row: dict[str, Any],
+    outcome: IntentOutcome,
+    write: WriteGate,
+    *,
+    only_if_absent: bool = False,
 ) -> str | None:
     status = "terminal" if outcome.startswith("terminal-") else outcome
     with write():
         return storage.set_status(
             row["intentKey"],
             endpoint,
-            row["evmAddress"],
+            account,
             status,
             repair_legacy_terminal=outcome == "pending"
             and _explicit_market_pending(row),
+            only_if_absent=only_if_absent,
         )
 
 
@@ -188,10 +193,10 @@ def reconcile(
 ) -> dict[str, Any]:
     """Read Keeper's latest intent records for ADDR.
 
-    An account list records pending observations for local keys. With KEY,
-    advance that intent using the matching Keeper record and bounded
-    history reads. A caller with a deadline supplies its remaining seconds
-    and a context manager for ledger writes.
+    An account list records pending observations and restores blocks on late
+    admissions. With KEY, advance that intent using the matching Keeper
+    record and bounded history reads. A caller with a deadline supplies
+    its remaining seconds and a context manager for ledger writes.
     """
     if remaining is not None:
         timeout = min(timeout, remaining())
@@ -201,25 +206,43 @@ def reconcile(
         endpoint, keeper.INTENTS, {"user": addr, "key": key}, timeout=timeout
     )
     rows = data.get("userIntents")
+    if rows is None:
+        return data
     if not isinstance(rows, list):
         data["userIntents"] = None
         return data
+    account = keeper.canonical_account(addr)
     matching = [
         row
         for row in rows
         if isinstance(row, dict)
-        and row.get("evmAddress")
-        and addr.lower() in _addresses(row)
+        and account is not None
+        and _matches_account(row, account)
         and (key is None or row.get("intentKey") == key)
     ]
     data["userIntents"] = matching
+    if account is None:
+        return data
     if key is None:
         for row in matching:
-            if not row.get("intentKey") or classify_outcome(row) != "pending":
+            outcome = classify_outcome(row)
+            if not row.get("intentKey") or outcome not in ("pending", "accepted"):
                 continue
-            local = _store_outcome(endpoint, row, "pending", write)
-            if local == "pending" or (local is None and _explicit_market_pending(row)):
-                row.update(outcome="pending", hint=_pending_hint(row))
+            local = _store_outcome(
+                endpoint,
+                account,
+                row,
+                outcome,
+                write,
+                only_if_absent=outcome == "accepted",
+            )
+            if local == "pending" or (
+                local is None and outcome == "pending" and _explicit_market_pending(row)
+            ):
+                hint = (
+                    _pending_hint(row) if outcome == "pending" else LOCAL_PENDING_HINT
+                )
+                row.update(outcome="pending", hint=hint)
         return data
 
     if rows == []:
@@ -233,7 +256,7 @@ def reconcile(
         )
         with write():
             local = storage.mark_absent(
-                key, endpoint, addr, keeper.ABSENT_AFTER_SECONDS
+                key, endpoint, account, keeper.ABSENT_AFTER_SECONDS
             )
         if local is not None:
             data["localStatus"] = local
@@ -260,16 +283,18 @@ def reconcile(
     outcome = classify_outcome(row)
     if outcome == "unknown":
         return data
-    local = _store_outcome(endpoint, row, outcome, write)
+    local = _store_outcome(endpoint, account, row, outcome, write)
     kind = row.get("kind")
     if (
         outcome == "terminal-filled" and (kind is None or kind in PERP_HISTORY_KINDS)
     ) or (outcome == "pending" and step != "pending_exec"):
-        matches = _read_history(endpoint, addr, row, timeout, clock, sleep, remaining)
+        matches = _read_history(
+            endpoint, addr, account, row, timeout, clock, sleep, remaining
+        )
         data["matchedTradeHistory"] = matches
         if matches and outcome == "pending":
             outcome = "terminal-filled"
-            local = _store_outcome(endpoint, row, outcome, write)
+            local = _store_outcome(endpoint, account, row, outcome, write)
             data["outcome"] = outcome
             if local is not None:
                 data["localStatus"] = local

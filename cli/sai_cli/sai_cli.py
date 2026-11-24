@@ -770,7 +770,7 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
 
 @intent.command("wait")
 @click.argument("key")
-@click.option("--addr", help="EVM account that submitted the intent.")
+@click.option("--addr", help="EVM or Nibiru address that submitted the intent.")
 @click.option(
     "--timeout",
     type=float,

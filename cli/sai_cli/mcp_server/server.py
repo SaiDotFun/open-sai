@@ -239,7 +239,7 @@ async def intent_wait(
 
     Args:
         key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
-        addr: EVM address. Defaults to the local intent account, then the active account.
+        addr: EVM or Nibiru address. Defaults to the local intent account, then the active account.
         timeout: Wait in seconds, capped at 10.
     """
     return await call(tools.intent_wait, key, addr, timeout)
