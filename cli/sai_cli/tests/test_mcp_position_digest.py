@@ -59,6 +59,7 @@ class Position:
     oracle_ttl: int = 300
     fill_at_next_oracle_price: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
+    position_read_states: deque[bool] = field(default_factory=deque)
     after_hours: bool = False
     risk_block: int = 90
     cap: str | None = "5"
@@ -100,8 +101,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_POST(self) -> None:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if request["query"] == keeper.POSITION and position.snapshot_leverages:
-                position.leverage = position.snapshot_leverages.popleft()
+            position_open = True
+            if request["query"] == keeper.POSITION:
+                if position.snapshot_leverages:
+                    position.leverage = position.snapshot_leverages.popleft()
+                if position.position_read_states:
+                    position_open = position.position_read_states.popleft()
             if request["query"] == keeper.SUBMIT:
                 assert self.headers["Authorization"] == f"Bearer {TOKEN}"
                 envelope = request["variables"]["input"]
@@ -143,6 +148,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                                 "leverage": float(position.leverage),
                                 "perpBorrowing": market,
                             }
+                            if position_open
+                            else None
                         }
                     },
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
@@ -607,6 +614,8 @@ def test_partial_close_requires_confirmation_when_position_changes(
 
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
+            assert result["quoteStatus"] == "available"
+            assert result["recovery"]["action"] == "confirm_preview"
             fresh = result["preview"]
             assert fresh["previewDigest"] != preview["previewDigest"]
             assert fresh["intent"] == preview["intent"]
@@ -625,6 +634,31 @@ def test_partial_close_requires_confirmation_when_position_changes(
             assert {key: submitted[key] for key in preview["intent"]} == preview[
                 "intent"
             ]
+
+    asyncio.run(scenario())
+
+
+def test_position_disappears_during_confirmation(position_service):
+    position, base_url = position_service
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            position.position_read_states.extend([True, False])
+            result = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert result["code"] == "PREVIEW_MISMATCH"
+            assert "Open position not found" in result["error"]
+            assert result["quoteStatus"] == "unavailable"
+            assert result["recovery"]["action"] == "request_preview"
+            assert "confirmation" in result["recovery"]["message"]
+            assert "preview" not in result
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
 
     asyncio.run(scenario())
 
@@ -798,6 +832,9 @@ def test_trade_confirms_through_lcd_cache_and_refuses_unverified_heights(
             rejected = await call(client, f"trade_{tool}", trade)
             assert rejected.get("code") == "PREVIEW_MISMATCH", rejected
             assert "Retry" in rejected["error"]
+            assert rejected["quoteStatus"] == "unavailable"
+            assert rejected["recovery"]["action"] == "request_preview"
+            assert "preview" not in rejected
             assert position.submitted == []
 
             position.drop_pinned_height = False

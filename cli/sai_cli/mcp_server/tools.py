@@ -120,6 +120,36 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
     return {"error": message, "code": code, **extra}
 
 
+def preview_mismatch(
+    message: str, preview: dict[str, Any] | None = None, **extra: Any
+) -> dict[str, Any]:
+    if preview is None:
+        return error(
+            message,
+            Code.PREVIEW_MISMATCH,
+            quoteStatus="unavailable",
+            recovery={
+                "action": "request_preview",
+                "message": (
+                    "If the position is still open and readable, call the matching"
+                    " preview tool and get confirmation before retrying."
+                ),
+            },
+            **extra,
+        )
+    return error(
+        message,
+        Code.PREVIEW_MISMATCH,
+        preview=preview,
+        quoteStatus="available",
+        recovery={
+            "action": "confirm_preview",
+            "message": "Show the replacement preview and get confirmation before retrying.",
+        },
+        **extra,
+    )
+
+
 def describe(exc: Exception) -> dict[str, Any]:
     """Format the shared classification using the MCP response fields."""
     failure = describe_error(exc)
@@ -142,18 +172,21 @@ def describe(exc: Exception) -> dict[str, Any]:
             intentKeys=exc.keys,
         )
     if isinstance(exc, Refused):
+        if failure.code == Code.PREVIEW_MISMATCH:
+            return preview_mismatch(failure.message, exc.preview, **exc.extra)
         extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(failure.message, failure.code, **extra, **exc.extra)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
-            return error(failure.message, Code.PREVIEW_MISMATCH)
-        return error(
+            return preview_mismatch(failure.message)
+        return preview_mismatch(
             "The position, quote, or route changed during confirmation, so nothing was"
             " submitted. Show the user the latest preview, get their confirmation"
             " again, then retry with its previewDigest.",
-            Code.PREVIEW_MISMATCH,
-            preview=confirmation.with_digest(exc.preview),
+            confirmation.with_digest(exc.preview),
         )
+    if failure.code == Code.PREVIEW_MISMATCH:
+        return preview_mismatch(failure.message)
     if isinstance(exc, storage.IntentReservationError):
         if key := failure.intent_key:
             return error(

@@ -163,9 +163,19 @@ the stored trigger after checking that the order can fill. The worst fill is
 A stop can miss its fill when a gap takes the price outside that bound.
 [trading-safety.md](trading-safety.md) rule 3 has the full rule.
 
-On `PREVIEW_MISMATCH` or `PRICE_MOVED` nothing was submitted. The result
-holds a fresh preview. Show it, get confirmation again, and retry with the
-new `preview_digest` and `reference_price`.
+On `PREVIEW_MISMATCH` or `PRICE_MOVED`, the server refused submission.
+For `PREVIEW_MISMATCH`, the `quoteStatus` field tells you which
+`recovery.action` to follow.
+
+- `available` with `confirm_preview`. Show the replacement `preview` and
+  get confirmation before retrying with its `previewDigest` and, for a
+  market open, its `referencePrice`.
+- `unavailable` with `request_preview`. If the position is still open and
+  readable, request a fresh preview and get confirmation before retrying.
+  The result omits the `preview` field.
+
+For `PRICE_MOVED`, show the replacement `preview` and get confirmation before
+retrying with its `previewDigest` and `referencePrice`.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Both check that the order is pending. If it fills after the
