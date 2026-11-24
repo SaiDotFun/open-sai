@@ -101,12 +101,23 @@ def sai_home(tmp_path, monkeypatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def private_updater_path(tmp_path, monkeypatch) -> None:
+    """Keep installed MCP clients out of post-update discovery."""
+    executables = tmp_path / "path"
+    executables.mkdir()
+    if REAL_UV is not None:
+        (executables / "uv").symlink_to(Path(REAL_UV).resolve())
+    monkeypatch.setenv("PATH", str(executables))
+
+
 @pytest.fixture
 def uv_dirs(tmp_path, monkeypatch, sai_home) -> Path:
     """Point uv at temporary tool, bin, and cache directories."""
     monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "tools"))
     monkeypatch.setenv("UV_TOOL_BIN_DIR", str(tmp_path / "bin"))
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("UV_PYTHON", str(Path(sys.executable).resolve()))
     monkeypatch.setenv("UV_PYTHON_DOWNLOADS", "never")
     monkeypatch.setenv("UV_NO_CONFIG", "1")
     monkeypatch.delenv("UV", raising=False)
