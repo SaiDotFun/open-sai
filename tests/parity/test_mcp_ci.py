@@ -23,3 +23,17 @@ def test_rust_ci_runs_pinned_mcp_transcript() -> None:
         step for step in steps if step.startswith("Compare the Rust and Python CLIs")
     )
     assert steps.index(transcript) < steps.index(cli)
+
+
+def test_cutover_ci_uses_one_release_for_focused_and_full_parity() -> None:
+    root = Path(__file__).resolve().parents[2]
+    rust = (root / ".github/workflows/ci.yml").read_text().split("\n  rust:\n", 1)[1]
+    focused = rust.split("name: Compare focused release parity cases", 1)[1]
+    focused, manifest = focused.split(
+        "name: Compare the full Rust manifest against the released Python CLI", 1
+    )
+    assert "env: &release-parity" in focused
+    assert "/.parity-python/.venv/bin/sai" in focused
+    assert "env: *release-parity" in manifest
+    assert 'parity.py --reference "$SAI_PARITY_PYTHON" --cutover' in manifest
+    assert "--case " not in manifest

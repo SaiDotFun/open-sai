@@ -681,7 +681,7 @@ def project_reference_lcd_origin(output: dict[str, Any]) -> None:
 
 
 def run_case(
-    case: Case, reference: list[str], candidate: list[str]
+    case: Case, reference: list[str], candidate: list[str], *, cutover: bool = False
 ) -> tuple[list[str], dict[str, str], str | None]:
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
@@ -736,7 +736,7 @@ def run_case(
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
     expected = None
-    if case.mode == "mcp" and reference != candidate:
+    if case.mode == "mcp" and reference != candidate and not cutover:
         expected = expect_native_mcp_info(
             left.output,
             allow_deferred_trade=case.mcp_deferred_trade_exception,
@@ -787,7 +787,16 @@ def main() -> int:
     parser.add_argument(
         "--reference", help="Use this Python sai executable for every selected case"
     )
+    parser.add_argument(
+        "--cutover", action="store_true", help="Require every CLI and MCP row to pass"
+    )
     args = parser.parse_args()
+    if args.cutover and (
+        args.case or not args.reference or not os.getenv("SAI_PARITY_BIN")
+    ):
+        parser.error(
+            "--cutover needs the full manifest, --reference, and SAI_PARITY_BIN"
+        )
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         parser.error(SQLITE_SCHEMA_REQUIREMENT)
     try:
@@ -872,7 +881,11 @@ def main() -> int:
         ):
             case = replace(case, wire=case.mcp_checkout_wire)
         executable = oracle if candidate is reference else candidate
-        diffs, listed, expected = run_case(case, oracle, executable)
+        if args.cutover:
+            case = replace(case, accepted_divergence=None, expected_overview_help=None)
+        diffs, listed, expected = run_case(
+            case, oracle, executable, cutover=args.cutover
+        )
         for tool, status in listed.items():
             if status != "LISTED" or tool not in tools:
                 tools[tool] = status
@@ -901,6 +914,19 @@ def main() -> int:
     print(f"\n{passed}/{len(selected)} cases passed.")
     if expected_differences:
         print(f"Expected differences: {expected_differences}.")
+    if args.cutover:
+        unverified_tools = sorted(
+            name for name, status in tools.items() if status != "PASS"
+        )
+        if deferred:
+            print(f"Deferred CLI commands: {len(deferred)}.")
+        if unverified_tools or not tools:
+            print(
+                "MCP tools without a passing call: "
+                + (", ".join(unverified_tools) or "no inventory")
+            )
+        if deferred or not tools or unverified_tools:
+            return 1
     return int(bool(mismatches))
 
 
