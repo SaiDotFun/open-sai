@@ -10,6 +10,21 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture
+def v012_reference(
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> bool:
+    version = subprocess.run(
+        [*cli_pair[0], "--version"],
+        env={"HOME": str(tmp_path), "SAI_HOME": str(tmp_path / "version-home")},
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    return version.stdout.strip() == b"sai, version 0.1.2"
+
+
 def invoke(
     cli: tuple[str, ...],
     home: Path,
@@ -76,7 +91,9 @@ def test_explicit_table_with_dotted_assignment(
 
 @pytest.mark.skipif(os.name != "posix", reason="requires Unix filesystem bytes")
 def test_non_utf8_home_json(
-    cli_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    v012_reference: bool,
 ) -> None:
     replies = []
     for index, cli in enumerate(cli_pair):
@@ -91,8 +108,8 @@ def test_non_utf8_home_json(
         ):
             result = invoke(cli, home, *args)
             data = reply(result, home)
-            if args == ("list",):
-                # The pinned Python reference predates origin-only endpoint output.
+            if args == ("list",) and not v012_reference:
+                # The legacy reference predates origin-only endpoint output.
                 settings = data["settings"]
                 assert isinstance(settings, dict)
                 data = {"settings": {"update.auto": settings["update.auto"]}}
