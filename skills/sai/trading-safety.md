@@ -61,8 +61,9 @@ the CLI or the MCP tools. A mistake here spends the person's money.
 4. **Follow the intent to its outcome.** `accepted` means Keeper admitted
    the intent. Use the CLI command `sai intent wait KEY` or MCP tool
    `intent_wait` with the same account. Add `--wait` to a live CLI trade
-   to submit once and follow its key in the same command. A successful
-   limit or stop intent confirms placement. Its fill can happen later.
+   to submit once and follow its key in the same command. A limit or stop
+   intent returns `placed` when Keeper confirms placement. Its fill can
+   happen later.
 5. **Never resubmit blindly.** After a timeout, a transport error, or code
    `OUTCOME_UNKNOWN`, the first request may have gone through. Keep the
    intent key and check it before anything else.
@@ -88,8 +89,8 @@ error after submission leaves the outcome unknown.
   key.
 - The receipt's `requestTxHash` identifies the submission. For a
   next-oracle fill, cite `execution.block` for the fill. The receipt
-  includes the indexed position when available and labels the position's
-  cumulative fee totals.
+  includes `positionNow` and cumulative `positionFeesUsd` when Keeper has
+  indexed them. Use `fill` for execution-time evidence.
 - To see what happened on this machine, read the logs: `sai --json logs tail
   -n 50 --event intent` shows the intent's status changes by `intentKey`,
   and `--event keeper.request` shows whether the `submit` request was sent
@@ -101,10 +102,11 @@ error after submission leaves the outcome unknown.
   admission can still appear.
 - An intent marked `not_sent` failed before the request left the machine. It
   does not block.
-- Tool `trade_open` refuses with `RECENT_OPEN_PENDING` while a recent open is
-  unknown or accepted. Check those intents with `intent_status`. Pass
-  `allow_concurrent_open=true` only when the person confirms they want
-  another open position.
+- A second open returns `RECENT_OPEN_PENDING` while an earlier open is
+  unresolved. Check the existing key with `intent_wait`. After Keeper
+  acknowledges the first open, use CLI flag `--allow-concurrent-open` or
+  MCP argument `allow_concurrent_open=true` only if the person confirms a
+  second open. Unknown and pending outcomes still block new trades.
 - `sai doctor` settles unknown intents it can resolve by reading Keeper. It
   never places or cancels a trade.
 
