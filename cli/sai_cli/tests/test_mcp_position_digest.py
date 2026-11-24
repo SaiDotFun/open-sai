@@ -44,6 +44,7 @@ class Position:
     cap_query_heights: list[str | None] = field(default_factory=list)
     collateral_price: str | None = "1"
     preview_inputs: bool = False
+    malformed_node_info: bool = False
     price: float = 100.5
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
@@ -119,7 +120,13 @@ def position_service() -> Iterator[tuple[Position, str]]:
 
         def do_GET(self) -> None:
             if self.path == "/cosmos/base/tendermint/v1beta1/node_info":
-                self.reply({"default_node_info": {"network": CHAIN_ID}})
+                self.reply(
+                    {
+                        "default_node_info": None
+                        if position.malformed_node_info
+                        else {"network": CHAIN_ID}
+                    }
+                )
                 return
             prefix = "/cosmwasm/wasm/v1/contract/nibi1contract/smart/"
             assert self.path.startswith(prefix)
@@ -822,5 +829,47 @@ def test_mcp_position_estimates_do_not_change_confirmed_terms(
             )
             assert accepted["status"] == "accepted"
             assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+def test_malformed_lcd_keeps_the_limit_preview_and_digest_refusal(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.malformed_node_info = True
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "limit",
+        "price": "100",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, "preview_open", args)
+            assert quote["estimates"]["fees"]["status"] == "unavailable"
+            refusal = await call(
+                client,
+                "trade_open",
+                {
+                    **args,
+                    "amount": "11",
+                    "preview_digest": quote["previewDigest"],
+                },
+            )
+            assert refusal["code"] == "PREVIEW_MISMATCH"
+            fresh = refusal["preview"]
+            assert fresh["estimates"]["fees"]["status"] == "unavailable"
+            assert fresh["previewDigest"] != quote["previewDigest"]
+            assert (
+                fresh["previewDigest"]
+                == (await call(client, "preview_open", {**args, "amount": "11"}))[
+                    "previewDigest"
+                ]
+            )
+            assert position.submitted == []
 
     asyncio.run(scenario())

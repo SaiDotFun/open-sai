@@ -139,9 +139,11 @@ def position_unchanged(
 def trading_contract(endpoint: str, lcd: str) -> str:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
     node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
+    info = node.get("default_node_info")
     if (
         not route["enabled"]
-        or node.get("default_node_info", {}).get("network") != route["chainId"]
+        or not isinstance(info, dict)
+        or info.get("network") != route["chainId"]
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
     return route["contractAddress"]
