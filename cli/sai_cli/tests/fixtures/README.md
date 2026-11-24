@@ -45,3 +45,12 @@ generated intent key. It preserves sequence numbers and ID relationships. Regene
 SAI_REGENERATE_LOG_GOLDENS=1 uv run pytest cli/sai_cli/tests/test_logs.py \
   -k 'joins_cli_and_mcp or serve_logs_tool_calls'
 ```
+
+`intent_outcomes.json` contains selected mainnet `userIntents` and
+`tradeHistory` rows captured on 2026-11-24 under `recorded`. The fixture
+replaces wallet addresses, intent keys, transaction hashes, and trade and
+history IDs. The account's latest history was from November 18, before
+next-oracle activation. The `replays` section adapts the mainnet wire shape
+using Keeper PR #682's lifecycle producers and cancellation codes. Those
+rows include a request, a sweep with a missing outcome, and a later fill.
+The tests serve the responses over loopback HTTP.

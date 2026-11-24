@@ -1174,8 +1174,13 @@ def test_lost_ack_reports_unknown_then_intent_status_reconciles(mcp, monkeypatch
         "lifecycleStep": "exec_pass",
         "execActor": "server",
         "evmAddress": ADDR,
+        "txHash": "0x" + "C" * 64,
     }
-    trade = {"intentKey": key, "trade": {"id": 7}}
+    trade = {
+        "intentKey": key,
+        "evmTxHash": "0x" + "c" * 64,
+        "trade": {"id": 7, "trader": ADDR},
+    }
     fake.answers = {
         keeper.INTENTS: {"userIntents": [row]},
         keeper.HISTORY: {"perp": {"tradeHistory": [trade]}},

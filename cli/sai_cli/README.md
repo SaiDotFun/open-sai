@@ -315,7 +315,7 @@ WebSocket, and LCD endpoints, and fixes what it safely can. It creates
 keeps there (the connected accounts, the ledger and its journals, and the
 shell history) and from the logs directory and its log files, migrates the
 intent ledger, and reconciles
-unknown intents for the signed-in account the way `sai intent status` does
+unknown and pending intents for the signed-in account the way `sai intent status` does
 (a Keeper read; it never places or cancels a trade). It never deletes or
 rewrites the session, never writes through a symlink in `$SAI_HOME/trader`,
 and never prints the session token. Without fixes it reads the ledger from a
@@ -466,6 +466,16 @@ returns `intentKey`, `keeper`, and `txHash`. A failed Keeper read adds
 to `count`, `p50Ms`, and `p95Ms` under `keeper`, with counts by code under
 `errors`. It also returns `gaps` and the UTC cutoff `since`, if set.
 The `tail` command prints stored JSON objects one per line.
+
+A `keeper.request` has `status` `ok`, `error`, `rejected` (Keeper refused
+admission), or `not_sent` (the connection failed first). Its `operation` is
+`markets`, `prices`, `positions`, `history`, `intents`, `submit`, and so on.
+To follow one trade, filter on its `intentKey`: `intent.reserved` (status
+`unknown`), then `keeper.request` with operation `submit`, then
+`intent.status` as it becomes `accepted`, `pending`, `rejected`, `not_sent`,
+`terminal`, or `absent`, with `intent.keeper` lines for each time
+`intent status` asked Keeper. An intent in `pending` blocks new trades for
+the account. [Keeper intent outcome mapping](core/intent-outcomes.md)
 
 See the [log event schema](../../docs/log-events.md) for event names and
 field types. The `run` query and statistics also read older logs.

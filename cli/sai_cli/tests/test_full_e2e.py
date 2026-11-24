@@ -253,7 +253,7 @@ def test_installed_watch_replays_observed_btc_websocket_snapshot():
 
 
 def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
-    """The server accepts once, drops its reply, and later exposes finality."""
+    """Keeper drops the admission reply and later reports a pending fill."""
     addr = "0x" + "a" * 40
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
     recorded = []
@@ -277,7 +277,11 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
                             "intentKey": key,
                             "evmAddress": addr,
                             "execActor": "server",
-                            "lifecycleStep": "exec_pass",
+                            "kind": "CLOSE_POSITION",
+                            "lifecycleStep": "exec_pass"
+                            if history_visible
+                            else "pending_exec",
+                            "txHash": "A" * 64,
                         }
                     ]
                 }
@@ -288,7 +292,8 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
                             [
                                 {
                                     "intentKey": recorded[0]["intentKey"],
-                                    "trade": {"id": 7},
+                                    "txHash": "A" * 64,
+                                    "trade": {"id": 7, "trader": addr},
                                 }
                             ]
                             if history_visible
@@ -358,9 +363,9 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         status = invoke("intent", "status", addr, "--key", key)
         assert status.returncode == 0
         assert (
-            json.loads(invoke("intent", "local", addr).stdout)[0]["status"]
-            == "accepted"
+            json.loads(invoke("intent", "local", addr).stdout)[0]["status"] == "pending"
         )
+        assert json.loads(status.stdout)["outcome"] == "pending"
         assert invoke("trade", "close", "7").returncode != 0
         assert len(recorded) == 1
 
