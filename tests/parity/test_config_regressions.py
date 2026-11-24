@@ -124,7 +124,7 @@ def test_undecodable_environment(
         assert not (home / "logs").exists()
     if setting == "SAI_ENDPOINT":
         assert observed[0] == observed[1]
-        assert observed[0][0] == 1
+        assert observed[0][0] == 2
         assert observed[0][2] == b""
         error = json.loads(observed[0][1])["error"]
         assert error["code"] == "INVALID_REQUEST"
