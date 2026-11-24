@@ -24,3 +24,6 @@ tokio = { workspace = true, features = ["io-util", "process", "signal"] }
 toml_edit.workspace = true
 url.workspace = true
 zmij = "1"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

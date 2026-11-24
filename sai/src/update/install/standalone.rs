@@ -301,3 +301,6 @@ fn unpack(compressed: &[u8], binary: &Path) -> Result<()> {
         .map_err(io_error)?;
     file.sync_all().map_err(io_error)
 }
+
+#[cfg(test)]
+mod tests;
