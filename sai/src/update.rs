@@ -32,6 +32,9 @@ pub(crate) struct UpdateCommand {
     /// Report the latest version only.
     #[arg(long)]
     check: bool,
+    /// Restore a pending uv installation using its verified rollback wheel.
+    #[arg(long)]
+    recover: bool,
     /// Install this release instead of the latest. Allows downgrades and prereleases.
     #[arg(long, value_name = "X.Y.Z")]
     to: Option<String>,
@@ -58,6 +61,9 @@ impl UpdateCommand {
         {
             return Err(SaiError::usage("--check takes no other update option."));
         }
+        if self.recover && (self.check || self.to.is_some() || self.source || self.background) {
+            return Err(SaiError::usage("--recover takes no other update option."));
+        }
         let mut env = env.clone();
         env.home = absolute_home(&env.home).map_err(|err| {
             SaiError::new(
@@ -69,7 +75,16 @@ impl UpdateCommand {
             .enable_all()
             .build()
             .map_err(|_| SaiError::internal())?;
-        let install = Install::discover(&env.home, &self.web_base);
+        let install = if self.recover {
+            runtime
+                .block_on(Install::discover_recovery(&self.web_base))
+                .map_err(|message| SaiError {
+                    exit_code: ExitCode::Unsupported,
+                    ..SaiError::new(Code::InternalError, message)
+                })?
+        } else {
+            Install::discover(&env.home, &self.web_base)
+        };
         let releases = Releases::new(&self.api_base, &self.web_base);
         if self.check {
             return runtime.block_on(check(releases, &install, &env.home, json_output, events));
@@ -158,6 +173,11 @@ impl UpdateCommand {
                 );
             }
         };
+        if self.recover
+            && let Err(reason) = install.require_pending_uv_recovery()
+        {
+            return Outcome::new("unsupported", reason, RUNNING, None);
+        }
         if let Err(reason) = install.owner(true) {
             return Outcome::new("unsupported", reason, RUNNING, None);
         }
@@ -190,6 +210,17 @@ impl UpdateCommand {
             }
         };
         let before = installed.to_string();
+        if self.recover {
+            return Outcome {
+                rolled_back: true,
+                ..Outcome::new(
+                    "recovered",
+                    format!("Restored the uv launcher for sai {installed}."),
+                    &before,
+                    None,
+                )
+            };
+        }
         if self.background {
             let _ = state::save(home, json!({"startedAt": state::now()})).await;
         }

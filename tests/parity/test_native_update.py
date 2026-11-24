@@ -879,6 +879,40 @@ def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("environment_missing", [False, True])
+def test_uv_recovery_entry_point_does_not_need_a_shim_prefix(
+    standalone: NativeInstall, tmp_path: Path, environment_missing: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    assert "SAI_NATIVE_UV_PREFIX" not in install.env
+    record = interrupted_uv_install(install, initial)
+    link = install.launcher.readlink()
+    install.launcher.unlink()
+    if environment_missing:
+        shutil.rmtree(Path(install.env["FIXTURE_STABLE_UV_PREFIX"]))
+
+    with releases({}) as server:
+        recovered = install.invoke(
+            "--json",
+            "update",
+            "--recover",
+            *server.args,
+            exe=standalone.executable,
+        )
+        assert not server.reads
+        assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+        assert json.loads(recovered.stdout)["status"] == "recovered"
+        assert install.launcher.readlink() == link
+        assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+        assert not record.exists()
+        repeated = install.invoke(
+            "--json", "update", "--recover", *server.args, exe=standalone.executable
+        )
+        assert repeated.returncode == 3, repeated.stdout + repeated.stderr
+        assert not server.reads
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
 @pytest.mark.parametrize("different_cwd", [False, True])
 def test_uv_recovery_uses_recorded_cwd_for_relative_bin_directory(
     standalone: NativeInstall, tmp_path: Path, different_cwd: bool

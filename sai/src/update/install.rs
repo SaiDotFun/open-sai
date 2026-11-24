@@ -62,6 +62,17 @@ impl Install {
         )
     }
 
+    pub(super) async fn discover_recovery(web_base: &str) -> Result<Self> {
+        uv::Uv::discover_recovery(web_base).await.map(Self::Uv)
+    }
+
+    pub(super) fn require_pending_uv_recovery(&self) -> Result<()> {
+        match self {
+            Self::Uv(install) => install.require_pending(),
+            _ => Err("No pending uv installation needs recovery.".into()),
+        }
+    }
+
     pub(super) fn report(&self) -> InstallReport<'_> {
         let (kind, prefix) = match self {
             Self::Standalone(install) => ("standalone", install.root()),

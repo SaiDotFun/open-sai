@@ -63,6 +63,23 @@ impl Uv {
             return None;
         }
         let tools = prefix.parent()?.canonicalize().ok()?;
+        Self::in_tools(&tools, web_base)
+    }
+
+    pub(super) async fn discover_recovery(web_base: &str) -> Result<Self> {
+        let uv = find_uv()?;
+        let cwd = env::current_dir().map_err(io_error)?;
+        let (_, tools) = uv_directory(&uv, &cwd, &[]).await?;
+        tools
+            .as_deref()
+            .and_then(|tools| Self::in_tools(tools, web_base))
+            .filter(|install| install.pending_path().is_file())
+            .ok_or_else(|| {
+                "No pending Sai installation was found in the configured uv tool directory.".into()
+            })
+    }
+
+    fn in_tools(tools: &Path, web_base: &str) -> Option<Self> {
         let prefix = tools.join(TOOL);
         if prefix.symlink_metadata().is_ok() && prefix.canonicalize().ok()? != prefix {
             return None;
@@ -101,6 +118,12 @@ impl Uv {
 
     fn pending_path(&self) -> PathBuf {
         self.tools().join(RECORD)
+    }
+
+    pub(super) fn require_pending(&self) -> Result<()> {
+        self.pending()?
+            .map(|_| ())
+            .ok_or_else(|| "No pending Sai installation needs recovery.".into())
     }
 
     fn pending(&self) -> Result<Option<Pending>> {
@@ -209,10 +232,7 @@ impl Uv {
 
     async fn check_destination(&self, uv: &Path, cwd: &Path) -> Result<()> {
         for (extra, expected) in [(&[][..], self.tools()), (&["--bin"][..], self.bin_dir())] {
-            let mut command = Command::new(uv);
-            command.current_dir(cwd).args(["tool", "dir"]).args(extra);
-            let output = smoke::uv_output(command, "`uv tool dir`").await?;
-            let found = cwd.join(output.trim()).canonicalize().ok();
+            let (output, found) = uv_directory(uv, cwd, extra).await?;
             if found.as_deref() != Some(expected) {
                 return Err(format!(
                     "uv selects {}, expected {}.",
@@ -556,6 +576,14 @@ fn registered_launcher(prefix: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+async fn uv_directory(uv: &Path, cwd: &Path, extra: &[&str]) -> Result<(String, Option<PathBuf>)> {
+    let mut command = Command::new(uv);
+    command.current_dir(cwd).args(["tool", "dir"]).args(extra);
+    let output = smoke::uv_output(command, "`uv tool dir`").await?;
+    let found = cwd.join(output.trim()).canonicalize().ok();
+    Ok((output, found))
 }
 
 fn find_uv() -> Result<PathBuf> {
