@@ -318,6 +318,37 @@ def perp_prices(lcd: str, state: margin.PositionSnapshot, height: str) -> Any:
     )
 
 
+def fills_at_next_oracle_price(lcd: str, contract: str, height: str) -> bool:
+    config = margin.smart_value(
+        lcd, contract, {"market_order_config": {}}, height=height
+    )
+    queued = config["fill_at_next_oracle_price"]
+    if type(queued) is not bool:
+        raise TypeError("Invalid Perp market-order config")
+    return queued
+
+
+def oracle_publication_time(oracle: dict[str, Any]) -> int | None:
+    times = [
+        time
+        for key in ("base_last_update_time", "quote_last_update_time")
+        if (time := oracle.get(key)) is not None
+    ]
+    if any(type(time) is not int or time < 0 for time in times):
+        raise ValueError("Invalid Perp oracle publication time")
+    return min(times, default=None)
+
+
+def stale_oracle(
+    lcd: str, contract: str, pair: dict[str, Any], height: str, published_at: int
+) -> bool:
+    group = contract_group(lcd, contract, pair, height=height)
+    ttl = group["stale_price_expiration_secs"]
+    if type(ttl) is not int or ttl < 0:
+        raise ValueError("Invalid Perp oracle TTL")
+    return ttl > 0 and margin.block_timestamp(lcd, height) - published_at > ttl
+
+
 def past_liquidation(price: Decimal, threshold: Decimal, long: bool) -> bool:
     return price <= threshold if long else price >= threshold
 
@@ -353,30 +384,14 @@ def close_estimates(
         oracle = prices["market"]
         if not isinstance(oracle, dict):
             return result
-        update_times = [
-            time
-            for key in ("base_last_update_time", "quote_last_update_time")
-            if (time := oracle.get(key)) is not None
-        ]
+        published_at = oracle_publication_time(oracle)
         pair = None
-        if update_times:
-            if any(type(time) is not int or time < 0 for time in update_times):
-                raise ValueError("Invalid Perp oracle publication time")
+        if published_at is not None:
             pair = contract_market(
                 lcd, state.contract, raw["market_index"], height=height
             )
-            group = contract_group(lcd, state.contract, pair, height=height)
-            ttl = group["stale_price_expiration_secs"]
-            if type(ttl) is not int or ttl < 0:
-                raise ValueError("Invalid Perp oracle TTL")
-            if ttl and margin.block_timestamp(lcd, height) - min(update_times) > ttl:
-                mode = margin.smart_value(
-                    lcd, state.contract, {"market_order_config": {}}, height=height
-                )
-                queued = mode["fill_at_next_oracle_price"]
-                if type(queued) is not bool:
-                    return result
-                if queued:
+            if stale_oracle(lcd, state.contract, pair, height, published_at):
+                if fills_at_next_oracle_price(lcd, state.contract, height):
                     return dict.fromkeys(
                         result,
                         unavailable("Queued closes settle on a fresh oracle update."),
@@ -558,15 +573,28 @@ def position_estimates(
                 )
                 if height is not None:
                     prices = perp_prices(lcd, state, height)
-                    price = margin.contract_decimal(prices["market"]["base_per_quote"])
+                    oracle = prices["market"]
+                    price = margin.contract_decimal(oracle["base_per_quote"])
                     # Borrowing fees can only make this threshold more restrictive.
                     if price > 0 and past_liquidation(
                         price, Decimal(liq["price"]), raw["long"]
                     ):
+                        if fills_at_next_oracle_price(lcd, state.contract, height):
+                            result["execution"] = unavailable(
+                                "Queued leverage changes settle on a fresh oracle update."
+                            )
+                            return result
+                        code = "LiquidationReached"
                         reason = "The observed oracle price is past the prospective liquidation threshold."
+                        published_at = oracle_publication_time(oracle)
+                        if published_at is not None and stale_oracle(
+                            lcd, state.contract, pair, height, published_at
+                        ):
+                            code = "OraclePriceStale"
+                            reason = "Perp rejects the leverage change at the observed stale oracle price."
                         result["execution"] = {
                             "status": "would_be_rejected",
-                            "code": "LiquidationReached",
+                            "code": code,
                             "reason": reason,
                         }
                         result["liquidationPrice"] = unavailable(reason)

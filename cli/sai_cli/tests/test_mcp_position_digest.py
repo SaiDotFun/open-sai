@@ -1555,10 +1555,17 @@ def test_pending_open_estimates_follow_perp_market_state(position_service, order
 
 
 @pytest.mark.parametrize(
-    ("price", "rejected"), [("97", True), ("98.4", True), ("99", False)]
+    ("price", "queued", "age", "code"),
+    [
+        ("97", False, 100, "LiquidationReached"),
+        ("98.4", False, None, "LiquidationReached"),
+        ("97", False, 900, "OraclePriceStale"),
+        ("99", False, None, None),
+        ("97", True, None, None),
+    ],
 )
 def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
-    position_service, price, rejected
+    position_service, price, queued, age, code
 ):
     position, base_url = position_service
     position.preview_inputs = True
@@ -1566,6 +1573,8 @@ def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
     position.leverage = "20"
     position.max_leverage = 50
     position.price = price
+    position.fill_at_next_oracle_price = queued
+    position.oracle_base_age = age
 
     async def scenario():
         async with connected_client(base_url) as client:
@@ -1574,14 +1583,17 @@ def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
             )
             estimates = quote["estimates"]
             liq = estimates["liquidationPrice"]
-            if rejected:
+            if code:
                 assert estimates["execution"]["status"] == "would_be_rejected"
-                assert estimates["execution"]["code"] == "LiquidationReached"
+                assert estimates["execution"]["code"] == code
                 assert liq["status"] == "unavailable"
                 assert "price" not in liq
             else:
                 assert liq["status"] == "estimate"
                 assert liq["price"] == "98.4"
                 assert "borrowing-inclusive" in liq["assumption"]
+                if queued:
+                    assert estimates["execution"]["status"] == "unavailable"
+                    assert "fresh oracle update" in estimates["execution"]["reason"]
 
     asyncio.run(scenario())
