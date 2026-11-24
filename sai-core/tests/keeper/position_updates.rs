@@ -12,7 +12,10 @@ use sai_core::{
     errors::Code,
     keeper::{POSITION, ROUTE, SUBMIT},
     storage::{Session, Storage},
-    trade::{Confirmation, SubmitOptions, Trading, leverage_preview, preview_digest},
+    trade::{
+        Confirmation, SubmitOptions, TradePreview, Trading, leverage_preview, preview_digest,
+        tpsl_preview,
+    },
 };
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -27,6 +30,9 @@ const CONTRACT: &str = "nibi1fixturecontract";
 struct ReplyState {
     keeper_owner: &'static str,
     contract_owner: &'static str,
+    keeper_chain: &'static str,
+    lcd_chain: &'static str,
+    contract: &'static str,
     requests: Vec<String>,
 }
 
@@ -45,6 +51,9 @@ impl PositionServer {
         let state = Arc::new(Mutex::new(ReplyState {
             keeper_owner,
             contract_owner,
+            keeper_chain: NETWORK,
+            lcd_chain: NETWORK,
+            contract: CONTRACT,
             requests: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -110,7 +119,8 @@ impl ReplyState {
                 ROUTE => {
                     self.requests.push("route".into());
                     json!({"oneClickTrading": {
-                        "enabled": true, "chainId": NETWORK, "contractAddress": CONTRACT,
+                        "enabled": true, "chainId": self.keeper_chain,
+                        "contractAddress": self.contract,
                     }})
                 }
                 SUBMIT => {
@@ -126,9 +136,15 @@ impl ReplyState {
         }
         if request.starts_with("GET /cosmos/base/tendermint/v1beta1/node_info ") {
             self.requests.push("node_info".into());
-            return json!({"default_node_info": {"network": NETWORK}});
+            return json!({"default_node_info": {"network": self.lcd_chain}});
         }
-        assert!(request.starts_with(&format!("GET /cosmwasm/wasm/v1/contract/{CONTRACT}/smart/")));
+        assert!(
+            request.starts_with(&format!(
+                "GET /cosmwasm/wasm/v1/contract/{}/smart/",
+                self.contract
+            )),
+            "{request}"
+        );
         self.requests.push("contract_position".into());
         json!({"data": {"user_trade_index": "UserTradeIndex(7)", "user": self.contract_owner}})
     }
@@ -189,4 +205,89 @@ async fn position_update_checks_owners_with_display_quote() {
         assert_eq!(error.message, message);
         assert!(!home.path().join("trader/intents.sqlite3").exists());
     }
+}
+
+async fn confirmed_digest(
+    trading: &Trading<'_>,
+    session: &Session,
+    preview: &TradePreview,
+) -> String {
+    let verified = trading
+        .position_update_preview(preview.clone(), Some(session), true)
+        .await
+        .unwrap();
+    assert_eq!(
+        verified["positionRoute"],
+        json!({"chainId": NETWORK, "contractAddress": CONTRACT})
+    );
+    verified["previewDigest"].as_str().unwrap().to_owned()
+}
+
+async fn assert_fresh_submit_route(
+    chain: &'static str,
+    contract: &'static str,
+    preview: TradePreview,
+) {
+    for display_quote in [None, Some(json!({"display": "position update"}))] {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+        let digest = confirmed_digest(&trading, &session, &preview).await;
+        {
+            let mut state = server.state.lock().unwrap();
+            state.keeper_chain = chain;
+            state.lcd_chain = chain;
+            state.contract = contract;
+            state.requests.clear();
+        }
+        let mut submitted = preview.clone();
+        submitted.quote = display_quote;
+        let error = trading
+            .submit(
+                &session,
+                &submitted,
+                SubmitOptions {
+                    confirmation: Some(Confirmation::new(&digest, None).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .expect("route switch must require a new confirmation");
+        assert_eq!(
+            server.requests(),
+            ["position", "route", "node_info", "contract_position"]
+        );
+        assert_eq!(error.code, Code::PreviewMismatch);
+        let replacement = &error.details.unwrap()["preview"];
+        assert_eq!(
+            replacement["positionRoute"],
+            json!({"chainId": chain, "contractAddress": contract})
+        );
+        assert_ne!(replacement["previewDigest"], digest);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
+}
+
+#[tokio::test]
+async fn confirmed_position_submit_refuses_chain_switch() {
+    assert_fresh_submit_route(
+        "fixture-chain-2",
+        CONTRACT,
+        leverage_preview("7", "10.00").unwrap(),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn confirmed_position_submit_refuses_contract_switch() {
+    assert_fresh_submit_route(
+        NETWORK,
+        "nibi1differentfixturecontract",
+        tpsl_preview("7", Some("110"), None, false, true).unwrap(),
+    )
+    .await;
 }
