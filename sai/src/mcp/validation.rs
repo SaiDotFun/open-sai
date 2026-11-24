@@ -29,6 +29,7 @@ pub(super) fn arguments(
     }
     let required = tool.input_schema.get("required").and_then(Value::as_array);
     let mut issues = Vec::new();
+    let mut converted = Vec::new();
     let input = Value::Object(args.clone());
     for (name, schema) in properties {
         let Some(value) = args.get(name) else {
@@ -54,20 +55,18 @@ pub(super) fn arguments(
             }
             continue;
         }
-        let problem = match schema["type"].as_str() {
-            Some("string") if !value.is_string() => Some(("string", "string_type")),
-            Some("integer") if !is_integer(value) => Some(("integer", "int_type")),
-            Some("boolean") if !value.is_boolean() => Some(("boolean", "bool_type")),
-            _ => None,
+        let conversion = match schema["type"].as_str() {
+            Some("string") if !value.is_string() => {
+                Err(("Input should be a valid string", "string_type"))
+            }
+            Some("integer") => integer(value),
+            Some("boolean") => boolean(value),
+            _ => Ok(None),
         };
-        if let Some((kind, code)) = problem {
-            let article = if kind == "integer" { "an" } else { "a" };
-            issues.push(Issue::new(
-                name,
-                format!("Input should be {article} valid {kind}"),
-                code,
-                value,
-            ));
+        match conversion {
+            Ok(Some(value)) => converted.push((name.clone(), value)),
+            Ok(None) => {}
+            Err((message, code)) => issues.push(Issue::new(name, message, code, value)),
         }
     }
     for (name, value) in &args {
@@ -81,6 +80,7 @@ pub(super) fn arguments(
         }
     }
     let Some(first) = issues.first() else {
+        args.extend(converted);
         return Ok(args);
     };
     if tool.name == "logs_intent" {
@@ -141,6 +141,107 @@ fn is_integer(value: &Value) -> bool {
     value
         .as_number()
         .is_some_and(|number| !number.as_str().contains(['.', 'e', 'E']))
+}
+
+type Conversion = Result<Option<Value>, (&'static str, &'static str)>;
+
+fn integer(value: &Value) -> Conversion {
+    match value {
+        Value::Bool(flag) => Ok(Some(Value::from(u8::from(*flag)))),
+        Value::Number(_) if is_integer(value) => Ok(None),
+        Value::Number(number) => {
+            let float = number
+                .as_f64()
+                .filter(|value| value.is_finite())
+                .ok_or(("Input should be a finite number", "finite_number"))?;
+            if float.fract() != 0.0 {
+                return Err((
+                    "Input should be a valid integer, got a number with a fractional part",
+                    "int_from_float",
+                ));
+            }
+            if float.abs() >= 2_f64.powi(63) {
+                return Err((
+                    "Unable to parse input string as an integer, exceeded maximum size",
+                    "int_parsing_size",
+                ));
+            }
+            let value = if float == 0.0 {
+                Value::from(0)
+            } else {
+                serde_json::from_str(&format!("{float:.0}")).expect("finite integral float")
+            };
+            Ok(Some(value))
+        }
+        Value::String(text)
+            if text.bytes().filter(u8::is_ascii_digit).take(4301).count() > 4300 =>
+        {
+            Err((
+                "Unable to parse input string as an integer, exceeded maximum size",
+                "int_parsing_size",
+            ))
+        }
+        Value::String(text) => integer_string(text).map(Some).ok_or((
+            "Input should be a valid integer, unable to parse string as an integer",
+            "int_parsing",
+        )),
+        _ => Err(("Input should be a valid integer", "int_type")),
+    }
+}
+
+fn integer_string(text: &str) -> Option<Value> {
+    let text = text.trim();
+    let (whole, fraction) = text.split_once('.').unwrap_or((text, "0"));
+    if fraction.is_empty() || !fraction.bytes().all(|byte| byte == b'0') {
+        return None;
+    }
+    let digits = whole.strip_prefix(['+', '-']).unwrap_or(whole);
+    if !digits
+        .split('_')
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    let digits = digits.trim_start_matches(['0', '_']).replace('_', "");
+    if digits.is_empty() {
+        return Some(Value::from(0));
+    }
+    let sign = if whole.starts_with('-') { "-" } else { "" };
+    serde_json::from_str(&format!("{sign}{digits}")).ok()
+}
+
+fn boolean(value: &Value) -> Conversion {
+    const TYPE: (&str, &str) = ("Input should be a valid boolean", "bool_type");
+    const PARSING: (&str, &str) = (
+        "Input should be a valid boolean, unable to interpret input",
+        "bool_parsing",
+    );
+    let flag = match value {
+        Value::Bool(_) => return Ok(None),
+        Value::Number(number) => {
+            let integral = if is_integer(value) {
+                number.as_i64()
+            } else {
+                number
+                    .as_f64()
+                    .filter(|n| n.fract() == 0.0 && n.abs() < 2_f64.powi(63))
+                    .map(|n| n as i64)
+            };
+            match integral {
+                Some(0) => false,
+                Some(1) => true,
+                Some(_) => return Err(PARSING),
+                None => return Err(TYPE),
+            }
+        }
+        Value::String(text) => match text.to_ascii_lowercase().as_str() {
+            "1" | "on" | "t" | "true" | "y" | "yes" => true,
+            "0" | "off" | "f" | "false" | "n" | "no" => false,
+            _ => return Err(PARSING),
+        },
+        _ => return Err(TYPE),
+    };
+    Ok(Some(Value::Bool(flag)))
 }
 
 fn python_type(value: &Value) -> &'static str {

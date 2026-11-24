@@ -210,3 +210,67 @@ def test_invalid_request_frames(native: Path, tmp_path: Path, use_python: bool) 
         assert stdio.proc.stderr.readline()
         stdio.send("ping", id_=4)
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 4, "result": {}}
+
+
+@pytest.mark.parametrize("market_id", ["  -3.00 ", "01_1", "+02", 3.0, True])
+def test_trade_integer_coercion(
+    native: Path, tmp_path: Path, market_id: object
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+    ):
+        result = stdio.call(
+            2,
+            "trade_open",
+            market_id=market_id,
+            side="long",
+            order_type="market",
+            amount="10",
+            leverage="2",
+            slippage="1",
+            preview_digest="fixture",
+        )
+        assert result["isError"] is False
+        assert json.loads(result["content"][0]["text"])["code"] == "NOT_IMPLEMENTED"
+        assert not endpoints.wire
+
+
+@pytest.mark.parametrize(
+    ("market_id", "code"),
+    [(1.5, "int_from_float"), ("3e0", "int_parsing"), ([], "int_type")],
+)
+def test_trade_integer_rejections(
+    native: Path, tmp_path: Path, market_id: object, code: str
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+    ):
+        result = stdio.call(
+            2,
+            "trade_open",
+            market_id=market_id,
+            side="long",
+            order_type="market",
+            amount="10",
+            leverage="2",
+            slippage="1",
+            preview_digest="fixture",
+        )
+        assert result["isError"] is True
+        assert f"type={code}," in result["content"][0]["text"]
+
+
+@pytest.mark.parametrize("offline", ["true", "YES", 1.0])
+def test_audit_boolean_coercion(native: Path, tmp_path: Path, offline: object) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        result = stdio.call(2, "logs_intent", key="fixture", offline=offline)
+        assert result["isError"] is False
+        assert json.loads(result["content"][0]["text"])["code"] == "NOT_IMPLEMENTED"
+        refused = stdio.call(3, "logs_intent", key="fixture", offline=" True ")
+        assert refused["isError"] is True
+        assert refused["content"][0]["text"] == "Argument 'offline' must be a boolean."
