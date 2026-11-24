@@ -13,8 +13,8 @@ pub(super) fn valid_http_host(authority: &str, host: &str) -> bool {
     if authority.starts_with('[') {
         return !authority.starts_with("[v");
     }
-    // HTTPX applies IDNA only to non-ASCII registered names.
-    if host.is_ascii() {
+    // HTTPX chooses its ASCII branch before lowercasing the registered name.
+    if authority.is_ascii() {
         return true;
     }
 
