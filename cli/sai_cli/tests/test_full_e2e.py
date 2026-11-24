@@ -323,13 +323,16 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         key = recorded[0]["intentKey"]
         assert first.returncode == 5 and first.stderr == ""
         error = json.loads(first.stdout)["error"]
+        hint = error.pop("hint")
         assert error == {
             "code": "OUTCOME_UNKNOWN",
             "message": f"Outcome unknown for intent {key}; reconcile before another trade",
             "retryable": False,
             "intentKey": key,
-            "hint": f"sai --endpoint {endpoint} intent status {addr} --key {key}",
         }
+        assert hint.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+        assert hint.endswith(f"intent status {addr} --key {key}")
+        assert endpoint not in hint
         saved = json.loads(invoke("intent", "local", addr).stdout)
         assert saved[0]["intentKey"] == key
         assert saved[0]["status"] == "unknown"
@@ -412,10 +415,8 @@ def test_keeper_result_survives_a_failed_ledger_write(
     )
     assert error["retryable"] is (not acknowledged)
     assert error["intentKey"] == key
-    assert (
-        error["hint"]
-        == f"sai --endpoint {endpoint} intent status {TRADE_ADDR} --key {key}"
-    )
+    assert error["hint"].endswith(f"intent status {TRADE_ADDR} --key {key}")
+    assert endpoint not in error["hint"]
     assert storage.list_pending(endpoint, TRADE_ADDR)[0]["status"] == "unknown"
 
 
@@ -498,10 +499,8 @@ def test_sigint_after_keeper_receives_intent_reports_unknown():
     assert process.returncode == 5 and stderr == ""
     error = json.loads(stdout)["error"]
     assert error["code"] == "OUTCOME_UNKNOWN" and error["intentKey"] == key
-    assert (
-        error["hint"]
-        == f"sai --endpoint {endpoint} intent status {TRADE_ADDR} --key {key}"
-    )
+    assert error["hint"].endswith(f"intent status {TRADE_ADDR} --key {key}")
+    assert endpoint not in error["hint"]
     [entry] = storage.list_pending(endpoint, TRADE_ADDR)
     assert entry["intentKey"] == key and entry["status"] == "unknown"
 

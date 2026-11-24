@@ -220,7 +220,9 @@ def test_session_for_other_endpoint_fails():
     save(endpoint="https://user:pw@other.example/query?key=abc")
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
-    assert "https://other.example/query" in check.summary
+    assert check.details["endpoint"] == "https://other.example"
+    assert "https://other.example" in check.summary
+    assert "/query" not in check.summary
     assert "pw" not in check.summary and "key=abc" not in check.summary
 
 
@@ -449,7 +451,9 @@ def test_unknown_intent_for_signed_in_account_fails():
     check = one(doctor.check_intents, ctx())
     assert check.status == "fail"
     assert check.summary == "1 unknown intent blocks trading for 0x4803…"
-    assert check.fix == (f"sai intent status {ADDR} --key 20261118T000000000000-a")
+    assert check.fix is not None
+    assert check.fix.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert check.fix.endswith(f"intent status {ADDR} --key 20261118T000000000000-a")
     assert check.details["otherAccounts"] == {"unknown": 1, "accounts": 1}
 
 
@@ -749,6 +753,7 @@ class Stub:
         # Called before each userIntents reply.
         self.on_intents: Any = None
         self.queries: list[str] = []
+        self.paths: list[str] = []
 
 
 @pytest.fixture
@@ -784,6 +789,7 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.queries.append(body["query"])
+            state.paths.append(self.path)
             if "userIntents" in body["query"]:
                 if state.on_intents:
                     state.on_intents()
@@ -1072,6 +1078,56 @@ KEY = "20261118T000000000000-r"
 def blocked_on(endpoint: str) -> None:
     save(endpoint=endpoint)
     ledger([(KEY, endpoint, ADDR, "unknown")])
+
+
+@pytest.mark.parametrize(
+    "matches", [False, True], ids=["same-origin-mismatch", "match"]
+)
+def test_doctor_shows_only_keeper_origins_in_reports_and_hints(http_stub, matches):
+    base, state = http_stub
+    path_key, query_key = "fixture-keeper-path", "fixture-keeper-query"
+    stored_path_key = "fixture-stored-path"
+    route = f"/{path_key}/query?key={query_key}"
+    endpoint = base + route
+    if matches:
+        blocked_on(endpoint)
+    else:
+        save(endpoint=f"{base}/{stored_path_key}/query?key={query_key}")
+    ws_origin = base.replace("http:", "ws:", 1)
+    # websockets includes the raw URI in its error for an invalid fragment.
+    ws = ws_origin + route + "#fragment"
+    for flags in ((), ("--json",)):
+        code, output = run_cli(
+            *flags,
+            "--endpoint",
+            endpoint,
+            "doctor",
+            "--no-fix",
+            "--ws-endpoint",
+            ws,
+            "--lcd-endpoint",
+            base,
+        )
+        assert code == 1
+        assert ws_origin in output
+        assert path_key not in output and query_key not in output
+        assert stored_path_key not in output
+        assert "${SAI_RECONCILE_ENDPOINT:?" in output
+        if flags:
+            checks = {
+                check["id"]: check
+                for check in json.loads(output)["error"]["details"]["checks"]
+            }
+            assert checks["keeper"]["details"]["endpoint"] == base
+            session = checks["session"]["details"]
+            assert session["endpoint"] == base and session["endpointMatches"] is matches
+            assert checks["websocket"]["details"]["endpoint"] == ws_origin
+            fix = checks["intents" if matches else "session"]["fix"]
+            command = (
+                f"intent status {ADDR} --key {KEY}" if matches else "auth login NAME"
+            )
+            assert command in fix
+    assert state.paths == [route, route]
 
 
 def ledger_status(key: str) -> str:
