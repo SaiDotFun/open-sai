@@ -1365,7 +1365,9 @@ def test_repl_interrupt_cancels_skill_lock_wait(
 
 @pytest.mark.parametrize("flags", [(), ("--endpoint", "http://127.0.0.1:1/graphql")])
 def test_repl_commands_share_run_but_keep_command_ids(
-    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path, flags: tuple[str, ...]
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    flags: tuple[str, ...],
 ) -> None:
     for index, cli in enumerate(local_pair):
         root = tmp_path / str(index)
