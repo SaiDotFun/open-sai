@@ -218,7 +218,7 @@ pub(super) fn keeper_endpoint(path: &Path, flags: SettingsFlags<'_>) -> Result<S
                     }
                 }
                 "logs.keep_days" => {
-                    if !value.as_integer().is_some_and(|days| days >= 1) {
+                    if value.as_integer().is_none_or(|days| days < 1) {
                         warnings.push(format!(
                             "{path}: Invalid value for {key}: expected a whole number, 1 or more; logging is off until it is fixed"
                         ));
