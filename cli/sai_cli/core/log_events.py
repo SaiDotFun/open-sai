@@ -248,6 +248,11 @@ EVENTS = {
             "error": "string",
         },
     ),
+    "update.mcp_repair": Event(
+        "core.updater.repair_after_update",
+        ("info", "warn"),
+        {"background": "boolean", "clients": "object[]", "notes": "string[]"},
+    ),
     "update.result": Event(
         "sai_cli.log_update",
         ("info", "warn"),

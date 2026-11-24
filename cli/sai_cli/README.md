@@ -85,9 +85,12 @@ before changing anything, when uv's current tool or executable directory is
 not where this `sai` is installed, or when the `sai` on your `PATH` now
 belongs to another install.
 
-The update does not move `~/.local/bin/sai` or change anything else under
-`$SAI_HOME`, so MCP registrations keep working. A running `sai mcp serve`
-keeps the old code until its client restarts; `mcp_info` reports
+The update keeps the path to `~/.local/bin/sai` stable. After verifying the
+install, it checks MCP registrations and can repair stale Codex and Cursor
+launchers. For stale Claude Code registrations, it prints an explicit repair
+command. Background updates include that command in the next update notice
+for any stale user registration they find. A running `sai mcp serve` keeps
+the old code until its client restarts. The `mcp_info` tool reports
 `restartNeeded`.
 
 With `update.auto` on, which is the default, sai also updates by itself. A
@@ -126,23 +129,36 @@ in the browser. Keeper issues it for 30 days in production. It authorizes
 every trade kind on the account's deposited funds, and Keeper cannot revoke it
 yet: signing out of Sai Web clears only the browser copy, not the CLI's.
 
-`auth import` stores a token copied from Sai Web. The **Connect Sai CLI /
-MCP** button that copies it is in review
-(https://github.com/SaiDotFun/sai-web/pull/1591); until it ships, use
-`auth login NAME` below.
+On Sai Web Mainnet, open the wallet menu and select **Connect Sai CLI / MCP**
+beside **Send to phone**. The button appears for the selected, connected
+wallet with an active trading session. Check the expiry, click **Copy session
+token**, and run the `sai auth import` command shown in the dialog. The command
+specifies the Mainnet endpoint.
 
-- With a terminal, it asks for the token at a hidden prompt. Press Enter
+- With a terminal, paste the token at the hidden prompt or press Enter
   without typing to read the clipboard.
 - Without a terminal, as when an agent runs it, it reads the clipboard with the
   first command that works: `pbpaste`, `wl-paste`, `xclip`, or `powershell.exe
   Get-Clipboard` (WSL and Windows). If none works, as over SSH, it exits
-  non-zero and asks for the person to run `sai auth import` in their own
-  terminal.
+  non-zero. Run the dialog's import command in your own terminal.
 - It never reads the token from arguments, environment variables, or piped
   stdin, and never prints it. Like `auth login` and `auth status`, it prints
   only `addr`, `expiresAt`, and `endpoint`.
 - After storing the token, it reads the clipboard again and clears it only if
   it still holds the token. Anything copied in the meantime stays.
+
+The dialog pins Mainnet for import only. Check the session and, if you want
+Mainnet as your saved default, set the Keeper endpoint.
+
+```bash
+sai --endpoint https://sai-keeper.nibiru.fi/query auth status
+sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query
+```
+
+Later CLI commands and any MCP server using the session must target the same
+Keeper endpoint. An explicit `--endpoint` or `SAI_ENDPOINT` overrides the
+saved setting. Update any conflicting overrides and restart running MCP
+servers to pick up the change.
 
 `auth login` signs Keeper's challenge with a local key. Before anything
 signs, the CLI checks that the typed data has primary type
@@ -308,9 +324,9 @@ marks it `absent` and trading resumes. A connection that fails before the
 request is sent marks the intent `not_sent`, which does not block. Keeper
 admission does not establish execution or finality.
 
-`sai doctor` checks the install, the version, `$SAI_HOME/trader`,
-`$SAI_HOME/logs`, the session, the intent ledger, and the Keeper HTTP,
-WebSocket, and LCD endpoints, and fixes what it safely can. It creates
+`sai doctor` checks the install, the version, config, MCP registrations,
+`$SAI_HOME/trader`, `$SAI_HOME/logs`, the session, the intent ledger, and
+the Keeper HTTP, WebSocket, and LCD endpoints. It creates
 `$SAI_HOME/trader`, removes group and other access from it and the files sai
 keeps there (the connected accounts, the ledger and its journals, and the
 shell history) and from the logs directory and its log files, migrates the
@@ -320,6 +336,14 @@ unknown and pending intents for the signed-in account the way `sai intent status
 rewrites the session, never writes through a symlink in `$SAI_HOME/trader`,
 and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
+
+Doctor can repair stale Codex and Cursor launchers. It prints a repair command
+for each stale Claude Code launcher, such as
+`sai mcp install --client claude --scope user --repair-existing sai`.
+Use the name and scope in the command doctor prints. Run project and local
+repairs from the directory doctor checked. The command preserves the
+registration's environment and compatible server arguments. If the command
+includes `--reset-args`, it uses default server arguments.
 
 Each check prints pass, fixed, warn, fail, or skipped, with what changed or
 the command that fixes it. `sai --json doctor` prints a structured report on
