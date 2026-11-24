@@ -93,7 +93,7 @@ def private_directory(
             mkdir_private(path)
         created = True
     except FileExistsError:
-        if only_new:
+        if only_new and not profile_root:
             return path
     info = path.lstat()
     if (
@@ -112,11 +112,14 @@ def private_directory(
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise PermissionError(f"{path} belongs to another user")
     mode = stat.S_IMODE(info.st_mode)
-    if os.name == "nt" or mode == PRIVATE_MODE:
+    if os.name == "nt" or mode == PRIVATE_MODE or (only_new and not created):
         return path
-    if profile_root and not created:
-        if not mode & 0o077 or not home_mode_repairable(path, info):
-            return path
+    if (
+        profile_root
+        and not created
+        and (not mode & 0o077 or not home_mode_repairable(path, info))
+    ):
+        return path
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except PermissionError:

@@ -393,6 +393,37 @@ def test_symlinked_ledger_is_not_migrated(isolated_home, tmp_path_factory):
     assert one(doctor.check_home, ctx(fix=True)).status == "fail"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes and symlinks")
+@pytest.mark.parametrize(("mode", "expected"), [(0o755, 0o700), (0o2770, 0o2770)])
+def test_doctor_checks_root_independently_of_a_symlinked_history(
+    isolated_home, tmp_path_factory, mode, expected
+):
+    storage.db().close()
+    target = tmp_path_factory.mktemp("elsewhere") / "history"
+    target.write_text("outside history")
+    target.chmod(0o644)
+    history = isolated_home / "trader" / "history"
+    history.symlink_to(target)
+    isolated_home.chmod(mode)
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 1
+    checks = json.loads(output)["error"]["details"]["checks"]
+    check = next(c for c in checks if c["id"] == "home")
+    assert check["status"] == "fail"
+    assert check["details"]["symlinks"] == [str(history)]
+    assert check["details"]["looseModes"] == [
+        {"path": str(isolated_home), "mode": f"{mode:o}"}
+    ]
+    changes = (
+        [f"chmod {isolated_home} {mode:o} -> {expected:o}"] if mode != expected else []
+    )
+    assert check["changes"] == changes
+    assert isolated_home.stat().st_mode & 0o7777 == expected
+    assert history.is_symlink()
+    assert target.stat().st_mode & 0o777 == 0o644
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
 def test_tighten_refuses_a_path_swapped_for_a_symlink(isolated_home, tmp_path_factory):
     outside = tmp_path_factory.mktemp("outside")
@@ -558,6 +589,25 @@ def user_version(path: Path) -> int:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     connection.close()
     return version
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_doctor_reports_root_repair_before_ledger_migration(isolated_home):
+    path = old_ledger(isolated_home)
+    path.parent.chmod(0o770)
+    isolated_home.chmod(0o755)
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    checks = {c["id"]: c for c in json.loads(output)["checks"]}
+    assert checks["home"]["status"] == "fixed"
+    assert checks["home"]["changes"] == [
+        f"chmod {path.parent} 770 -> 700",
+        f"chmod {isolated_home} 755 -> 700",
+    ]
+    assert checks["intents"]["status"] == "fixed"
+    assert user_version(path) == storage.SCHEMA_VERSION
+    assert isolated_home.stat().st_mode & 0o777 == 0o700
 
 
 def test_no_fix_warns_about_an_old_ledger(isolated_home):

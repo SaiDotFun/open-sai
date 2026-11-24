@@ -583,13 +583,17 @@ class LogDir:
         self.fd = fd
 
     @classmethod
-    def open(cls, root: Path, *, create: bool = False) -> LogDir | None:
+    def open(
+        cls, root: Path, *, create: bool = False, repair_home: bool = True
+    ) -> LogDir | None:
         """Open ROOT, or return None when it is missing, a symlink, not a
         directory, or owned by someone else. With CREATE, make it first, and
         remove group and other access from a directory this user owns."""
         try:
             if create:
-                paths.private_directory(root.parent, profile_root=True)
+                paths.private_directory(
+                    root.parent, profile_root=True, only_new=not repair_home
+                )
                 # Preserve owner access on existing log directories. The
                 # descriptor below is used to clear group and other access.
                 if not root.exists():
@@ -917,7 +921,11 @@ def _write(item: _Item) -> None:
     if not on:
         _skip[key] = time.monotonic()
         return
-    opened = LogDir.open(root / DIR_NAME, create=True)
+    # Doctor reports root repairs. Its log writes must preserve the mode
+    # when the home check deferred the repair or could not finish it.
+    opened = LogDir.open(
+        root / DIR_NAME, create=True, repair_home=item.line.get("command") != "doctor"
+    )
     if opened is None:
         _skip[key] = time.monotonic()
         return

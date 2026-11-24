@@ -450,22 +450,35 @@ def check_home(ctx: Context) -> Check:
     sai_home = root.parent
     details: dict[str, Any] = {"path": str(root), "saiHome": str(sai_home)}
     links = symlinks()
-    if links:
-        return Check(
-            "home",
-            "fail",
-            f"{', '.join(map(str, links))}: trader path is a symlink; doctor"
-            " changes nothing there",
-            SYMLINK_FIX,
-            {**details, "symlinks": [str(path) for path in links]},
-        )
-    trader_exists = root.is_dir()
-    home_loose = loose_modes([sai_home])
-    trader_loose = loose_modes([root, *(root / name for name in MANAGED)])
+    home_loose = [] if sai_home in links else loose_modes([sai_home])
+    trader_loose = (
+        [] if links else loose_modes([root, *(root / name for name in MANAGED)])
+    )
     loose = home_loose + trader_loose
     details["looseModes"] = [
         {"path": str(path), "mode": f"{mode:o}"} for path, mode, _ in loose
     ]
+    manual_home = bool(home_loose) and not paths.home_mode_repairable(
+        sai_home, sai_home.lstat()
+    )
+    changes, failed = (
+        tighten(sai_home, (), profile_root=True)
+        if ctx.fix and home_loose and not manual_home
+        else ([], [])
+    )
+    if links:
+        fixes = [SYMLINK_FIX, *failed]
+        if home_loose and (manual_home or not ctx.fix):
+            fixes.append(f"Review permissions on {sai_home}")
+        return Check(
+            "home",
+            "fail",
+            f"{', '.join(map(str, links))}: profile path is a symlink",
+            "; ".join(fixes),
+            {**details, "symlinks": [str(path) for path in links]},
+            changes=changes,
+        )
+    trader_exists = root.is_dir()
     if loose and not ctx.fix:
         return Check(
             "home",
@@ -482,14 +495,6 @@ def check_home(ctx: Context) -> Check:
             None,
             details,
         )
-    manual_home = bool(home_loose) and not paths.home_mode_repairable(
-        sai_home, sai_home.lstat()
-    )
-    changes, failed = (
-        tighten(sai_home, (), profile_root=True)
-        if home_loose and not manual_home
-        else ([], [])
-    )
     if not failed and not trader_exists:
         home_exists = sai_home.is_dir()
         storage.directory()
@@ -499,6 +504,17 @@ def check_home(ctx: Context) -> Check:
     elif not failed and trader_loose:
         trader_changes, failed = tighten(root, MANAGED)
         changes.extend(trader_changes)
+        # Tightening trader can make its files safe evidence of a dedicated
+        # profile. Report any resulting root repair before ledger migration.
+        if (
+            manual_home
+            and trader_changes
+            and paths.home_mode_repairable(sai_home, sai_home.lstat())
+        ):
+            manual_home = False
+            home_changes, home_failures = tighten(sai_home, (), profile_root=True)
+            changes.extend(home_changes)
+            failed.extend(home_failures)
     if failed:
         return Check(
             "home",
