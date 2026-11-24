@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import log
+from .errors import Code, SaiError
 
 MAINNET_HTTP = "https://sai-keeper.nibiru.fi/query"
 MAINNET_WS = "wss://sai-keeper.nibiru.fi/query"
@@ -27,7 +28,7 @@ POSITIONS = """query($trader:String!) { perp { trades(where:{trader:$trader,isOp
 POSITION = """query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }"""
 ROUTE = """query { oneClickTrading { enabled chainId contractAddress } }"""
 HISTORY = """query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }"""
-INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
+INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
 SESSION = """mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }"""
 SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }"""
@@ -47,8 +48,10 @@ OPERATIONS = {
 }
 
 
-class KeeperError(Exception):
+class KeeperError(SaiError):
     """Keeper rejected a query or transport failed."""
+
+    code = Code.KEEPER_ERROR
 
 
 class UdUnavailable(KeeperError):
@@ -62,6 +65,8 @@ class SigningFailed(KeeperError):
 class AdmissionRejected(KeeperError):
     """Keeper confirmed that admission was rejected."""
 
+    code = Code.ADMISSION_REJECTED
+
 
 class OutcomeUnknown(KeeperError):
     """The server may have accepted the request.
@@ -69,18 +74,23 @@ class OutcomeUnknown(KeeperError):
     INTENT_KEY names the intent to reconcile, when one was reserved.
     """
 
-    def __init__(self, message: str, intent_key: str | None = None) -> None:
-        super().__init__(message)
-        self.intent_key = intent_key
+    code = Code.OUTCOME_UNKNOWN
+
+    def __init__(
+        self, message: str, intent_key: str | None = None, *, hint: str | None = None
+    ) -> None:
+        super().__init__(message, intent_key=intent_key, hint=hint)
 
 
 class NotSent(KeeperError):
     """The connection failed before the request reached Keeper."""
 
+    code = Code.NOT_SENT
 
-# Keeper fails a recorded intent that waits this long without execution
-# (`expireQueued` in sai-keeper). A key that Keeper has not recorded by then,
-# plus a margin for clock skew and slow requests, was never admitted.
+
+# Keeper expires queued intents two minutes after admission. On an empty
+# Keeper read the CLI releases an unknown key after that window plus a
+# grace period. A later admission can still restore the block.
 ADMISSION_EXPIRY_SECONDS = 120
 ABSENT_AFTER_SECONDS = ADMISSION_EXPIRY_SECONDS + 180
 
@@ -120,19 +130,26 @@ def request(
     and the response data are never logged.
     """
     started = time.monotonic()
-    outcome: dict[str, Any] = {"status": "error"}
+    outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
     try:
         data = _request(endpoint, query, variables, token, timeout, outcome)
         outcome["status"] = "ok"
+        del outcome["code"]
         return data
-    except NotSent:
-        outcome["status"] = "not_sent"
+    except NotSent as exc:
+        outcome.update(status="not_sent", code=exc.code)
         raise
-    except AdmissionRejected:
-        outcome["status"] = "rejected"
+    except AdmissionRejected as exc:
+        outcome.update(status="rejected", code=exc.code)
         raise
     except KeeperError as exc:
-        outcome["error"] = str(exc)
+        outcome.update(
+            error=str(exc), code=Code.OUTCOME_UNKNOWN if query == SUBMIT else exc.code
+        )
+        raise
+    except KeyboardInterrupt:
+        if query == SUBMIT:
+            outcome["code"] = Code.OUTCOME_UNKNOWN
         raise
     finally:
         _log_request(endpoint, query, variables, token, started, outcome)
@@ -367,6 +384,45 @@ def is_address(value: object) -> bool:
     if not isinstance(value, str) or len(value) != 42 or not value.startswith("0x"):
         return False
     return all(c in "0123456789abcdefABCDEF" for c in value[2:])
+
+
+_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+_BECH32_GENERATORS = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+
+
+def canonical_account(value: object) -> str | None:
+    """Return the lowercase EVM form of a 20-byte EVM or Nibiru account."""
+    if not isinstance(value, str) or not value.isascii():
+        return None
+    value = value.lower()
+    evm = "0x" + value.removeprefix("0x")
+    if is_address(evm):
+        return evm
+    # A Nibiru account has 32 payload symbols and six checksum symbols.
+    if not value.startswith("nibi1") or len(value) != 43:
+        return None
+    try:
+        symbols = [_BECH32_CHARSET.index(char) for char in value[5:]]
+    except ValueError:
+        return None
+
+    # Bech32 checksum (BIP 173), using the Nibiru account prefix.
+    prefix = b"nibi"
+    expanded = [char >> 5 for char in prefix] + [0] + [char & 31 for char in prefix]
+    checksum = 1
+    for symbol in (*expanded, *symbols):
+        top = checksum >> 25
+        checksum = ((checksum & 0x1FFFFFF) << 5) ^ symbol
+        for bit, generator in enumerate(_BECH32_GENERATORS):
+            if top & (1 << bit):
+                checksum ^= generator
+    if checksum != 1:
+        return None
+
+    payload = 0
+    for symbol in symbols[:-6]:
+        payload = (payload << 5) | symbol
+    return "0x" + payload.to_bytes(20, "big").hex()
 
 
 @dataclass(frozen=True)

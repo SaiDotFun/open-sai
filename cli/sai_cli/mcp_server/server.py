@@ -22,16 +22,19 @@ from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any, Literal
 
+from anyio import BrokenResourceError
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import ConfigDict
 
 from ..core import log as sai_log
 from ..core import settings as sai_settings
+from ..core.errors import Code, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
 
 log = logging.getLogger("sai_cli.mcp_server")
+BAD_SETTINGS = "BAD_SETTINGS"  # Legacy MCP result code.
 
 INSTRUCTIONS = """\
 Sai perpetuals trading on Nibiru through Sai Keeper.
@@ -55,9 +58,9 @@ executed. Use intent_status with the intent key to follow it.
 - If a trade returns code OUTCOME_UNKNOWN, call intent_status with its \
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
-retrying. trade_open refuses with RECENT_OPEN_PENDING while a recent open \
-is unknown or accepted; check those intents with intent_status, and pass \
-allow_concurrent_open=true only if the user wants another open position.
+retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
+Wait for a final outcome on pending fills. For recent accepted opens, use \
+allow_concurrent_open=true only after the user confirms another position.
 - The user can connect several accounts; one is active. auth_list shows \
 them. Preview and trade tools act on the active account unless given \
 addr, which must be a connected account. Every preview and trade names \
@@ -117,7 +120,7 @@ async def call(action: Callable[..., Any], /, *args: Any, **kwargs: Any) -> str:
     try:
         config = server_settings()
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     return await asyncio.to_thread(tools.run, partial(action, config, *args, **kwargs))
 
 
@@ -202,7 +205,8 @@ async def account_balances(addr: str | None = None) -> str:
 async def intent_local(addr: str | None = None) -> str:
     """List intents this machine recorded, with their local status.
 
-    Status `unknown` blocks new trades until intent_status reconciles it.
+    Statuses `unknown` and `pending` block new trades until intent_status
+    reconciles them.
     The result names the `addr` read and its `addrSource`.
 
     Args:
@@ -215,11 +219,9 @@ async def intent_local(addr: str | None = None) -> str:
 async def intent_status(addr: str | None = None, key: str | None = None) -> str:
     """Read Keeper's latest intent records; with KEY, reconcile that intent.
 
-    With KEY this also writes: it updates this machine's local intent cache,
-    the record intent_local lists and trades check. It never changes
-    anything on Keeper. Reconciling updates only the local record: a server failure or matched
-    trade history is final, a server acceptance is accepted, and a key
-    Keeper never recorded past its admission window stops blocking trades.
+    The account list records pending observations in the local ledger.
+    With KEY this also checks for a final outcome. If the result includes
+    outcome `pending`, follow its hint and check the same key again.
 
     Args:
         addr: EVM addr (0x...). Defaults to the signed-in account,
@@ -305,9 +307,8 @@ async def trade_open(
     from the confirmed preview, and, for a market order, PRICE_MOVED when
     Keeper's current price moved from reference_price by more than the
     slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an open for this account from the last few
-    minutes is still unknown or accepted: call intent_local and
-    intent_status before retrying.
+    RECENT_OPEN_PENDING when an open is pending, or a recent open is still
+    unknown or accepted. Check its key with intent_status before retrying.
 
     Args:
         market_id: Market id from market_list.
@@ -323,10 +324,9 @@ async def trade_open(
         preview_digest: previewDigest from the confirmed preview_open.
         reference_price: referencePrice from the confirmed preview_open;
             required for market orders only.
-        allow_concurrent_open: True to submit despite a recent pending
-            open, only after intent_status shows it and the user confirms
-            they want another position. An intent still `unknown` blocks
-            every trade until intent_status reconciles it.
+        allow_concurrent_open: True to submit with a recent accepted open,
+            after checking its status and getting confirmation for another
+            position. Unknown outcomes and pending fills still block trades.
         addr: Connected account to act as (0x...). Defaults to the
             active account.
     """
@@ -693,11 +693,13 @@ class SaiMCP(FastMCP):
                 # first line is kept, as untrusted text, and nothing for an
                 # unknown tool, whose message is the name the client sent.
                 first = str(exc).partition("\n")[0] if known is not None else None
+                cause = exc.__cause__
+                failure = describe(cause if isinstance(cause, Exception) else exc)
                 sai_log.event(
                     "mcp.tool_result",
                     "error",
                     ok=False,
-                    code="TOOL_ERROR",
+                    code=Code.INVALID_REQUEST if known is None else failure.code,
                     errorType=type(exc).__name__,
                     error=sai_log.untrusted(first),
                     durationMs=round((time.monotonic() - started) * 1000),
@@ -809,6 +811,11 @@ def result_summary(text: str | None) -> dict[str, Any]:
             summary[name] = value[name]
     if isinstance(summary.get("error"), str):
         summary["error"] = sai_log.untrusted(summary["error"])
+    if not summary["ok"]:
+        if summary.get("code") == BAD_SETTINGS:
+            summary["code"] = Code.INVALID_REQUEST
+        elif not summary.get("code"):
+            summary["code"] = Code.INTERNAL_ERROR
     account = value.get("account", value.get("addr"))
     if isinstance(account, str):
         summary["account"] = sai_log.Arg(account)
@@ -821,7 +828,7 @@ def session_refusal(addr: str | None = None) -> str | None:
     try:
         tools.require_session(server_settings(), addr)
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     except tools.SessionUnavailable as exc:
         return json.dumps(tools.describe(exc))
     return None
@@ -916,7 +923,7 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
     try:
         settings = sai_settings.load(flags, warn=log.warning)
     except sai_settings.SettingsError as exc:
-        raise SystemExit(f"sai mcp serve: {exc}") from None
+        raise SaiError(f"sai mcp serve: {exc}", Code.INVALID_REQUEST) from exc
     with sai_log.bind(surface="mcp"):
         sai_log.event(
             "mcp.server_start",
@@ -924,4 +931,10 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             websocket=sai_log.endpoint(settings.ws_endpoint),
             lcd=sai_log.endpoint(settings.lcd_endpoint),
         )
-        create_server(settings).run()
+        server = create_server(settings)
+        try:
+            server.run()
+        except* (KeyboardInterrupt, BrokenPipeError, BrokenResourceError):
+            pass
+        except* Exception as exc:
+            raise McpStdioError("Sai MCP stdio session failed") from exc

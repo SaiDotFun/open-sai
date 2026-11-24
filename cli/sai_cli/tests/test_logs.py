@@ -514,18 +514,38 @@ def test_command_start_and_end_record_argv_exit_code_and_duration(home, keeper_s
 
 def test_a_failed_command_logs_its_exit_code_and_error(home):
     code, _output = run_cli("--endpoint", "http://127.0.0.1:1/query", "market", "list")
-    assert code == 1
+    assert code == 4
     request = events(home, "keeper.request")[0]
     assert request["status"] == "not_sent" and request["level"] == "warn"
+    assert request["code"] == "NOT_SENT"
     assert "httpStatus" not in request
     end = events(home, "command.end")[0]
-    assert end["exitCode"] == 1 and end["level"] == "warn"
+    assert end["exitCode"] == 4 and end["level"] == "warn"
+    assert end["code"] == request["code"]
     assert end["error"] == "Could not connect to Keeper; the request was not sent"
     # A usage error exits 2 before any command runs.
     assert run_cli("market", "nope")[0] == 2
     usage = events(home, "command.end")[1]
     assert usage["exitCode"] == 2 and usage["command"] == "market"
+    assert usage["code"] == "INVALID_REQUEST"
     assert "No such command" in usage["error"]
+
+
+def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper_stub):
+    base, state = keeper_stub
+    save_session(base)
+    state.errors = [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]
+    result = CliRunner().invoke(
+        main, ["--json", "--endpoint", base, "trade", "close", "7"]
+    )
+    assert result.exit_code == 4 and result.stderr == ""
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "ADMISSION_REJECTED" and error["retryable"] is True
+    key = error["intentKey"]
+    assert storage.list_pending(base, ADDR)[0]["status"] == "rejected"
+    assert events(home, "intent.status")[0]["intentKey"] == key
+    for event in ("keeper.request", "intent.status", "command.end"):
+        assert events(home, event)[0]["code"] == error["code"]
 
 
 def test_command_path_skips_options_and_their_values():
@@ -653,6 +673,7 @@ def test_intent_lifecycle_is_logged_from_reservation_to_terminal(home, keeper_st
     assert reserved["kind"] == "CLOSE_POSITION" and reserved["tradeId"] == "7"
     assert (accepted["previous"], accepted["kind"]) == ("unknown", "CLOSE_POSITION")
     assert (failed["errorCode"], failed["errorMsg"]) == ("SLIPPAGE", "price moved")
+    assert failed["code"] == "KEEPER_ERROR"
     assert terminal["previous"] == "accepted"
 
 
@@ -732,7 +753,7 @@ def test_arguments_fastmcp_rejects_are_logged_without_the_input(home):
     started, result = read_logs(home, "mcp")
     assert started["arguments"] == {"trade_id": "seven-secret"}
     assert result["event"] == "mcp.tool_result" and result["level"] == "error"
-    assert result["ok"] is False and result["code"] == "TOOL_ERROR"
+    assert result["ok"] is False and result["code"] == "INVALID_REQUEST"
     assert result["errorType"] == "ToolError" and result["callId"] == started["callId"]
     assert result["error"].startswith("Error executing tool trade_close")
     assert "seven-secret" not in result["error"] and "\n" not in result["error"]
@@ -748,7 +769,7 @@ def test_only_a_tools_own_parameters_are_logged(home, keeper_stub):
     started, result = read_logs(home, "mcp")
     assert started["arguments"] == {"addr": ADDR}
     assert started["unknownArguments"] == 2
-    assert result["code"] == "TOOL_ERROR" and "unknownArguments" not in result
+    assert result["code"] == "INVALID_REQUEST" and "unknownArguments" not in result
     assert "private" not in raw_logs(home) and OPAQUE_TOKEN not in raw_logs(home)
     assert call(mcp, "account_positions", {"addr": ADDR})["addr"] == ADDR
     assert "unknownArguments" not in events(home, "mcp.tool_call")[1]

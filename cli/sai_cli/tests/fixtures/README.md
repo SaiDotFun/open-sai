@@ -24,3 +24,12 @@ stored examples contain no real JWT or private key.
 An autouse fixture blocks external TCP connections in the pytest process.
 It does not affect spawned CLI processes, whose integration tests explicitly
 select loopback endpoints.
+
+`intent_outcomes.json` contains selected mainnet `userIntents` and
+`tradeHistory` rows captured on 2026-11-24 under `recorded`. The fixture
+replaces wallet addresses, intent keys, transaction hashes, and trade and
+history IDs. The account's latest history was from November 18, before
+next-oracle activation. The `replays` section adapts the mainnet wire shape
+using Keeper PR #682's lifecycle producers and cancellation codes. Those
+rows include a request, a sweep with a missing outcome, and a later fill.
+The tests serve the responses over loopback HTTP.
