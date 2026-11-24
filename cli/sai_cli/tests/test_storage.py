@@ -78,6 +78,8 @@ print('ready', flush=True)
 assert sys.stdin.readline() == 'start\\n'
 if entry == 'storage':
     storage.db().close()
+elif entry == 'storage-directory':
+    storage.directory()
 elif entry == 'logging':
     log.event('update.scheduled')
     assert log.flush(5)
@@ -142,16 +144,40 @@ def test_log_write_respects_existing_root_mode(
     assert tmp_path.stat().st_mode & 0o7777 == expected
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_restrictive_umask_keeps_missing_ancestors_traversable(
+    tmp_path: Path, monkeypatch
+):
+    tmp_path.chmod(0o750)
+    parent = tmp_path / "missing-parent"
+    home = parent / "sai"
+    monkeypatch.setenv("SAI_HOME", str(home))
+    subprocess.run(
+        [sys.executable, "-c", FIRST_WRITE, "storage", "777"],
+        input="start\n",
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=True,
+    )
+    for directory in (parent, home, home / "trader"):
+        assert directory.stat().st_mode & 0o777 == 0o700, directory
+    assert tmp_path.stat().st_mode & 0o777 == 0o750
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes and pipes")
-def test_concurrent_first_writes_share_private_home(tmp_path: Path, monkeypatch):
-    home = tmp_path / "sai"
+@pytest.mark.parametrize("umask", ["000", "777"])
+def test_concurrent_first_writes_share_private_home(tmp_path: Path, monkeypatch, umask):
+    parent = tmp_path / "missing-parent"
+    home = parent / "sai"
+    entries = ENTRY_DIRS if umask == "000" else ("storage-directory",) * 5
     monkeypatch.setenv("SAI_HOME", str(home))
     with ExitStack() as stack:
         workers = []
-        for entry in ENTRY_DIRS:
+        for entry in entries:
             worker = stack.enter_context(
                 subprocess.Popen(
-                    [sys.executable, "-c", FIRST_WRITE, entry, "000"],
+                    [sys.executable, "-c", FIRST_WRITE, entry, umask],
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
@@ -173,8 +199,6 @@ def test_concurrent_first_writes_share_private_home(tmp_path: Path, monkeypatch)
             _stdout, stderr = worker.communicate(timeout=10)
             assert worker.returncode == 0, stderr
 
-    for directory in (
-        home,
-        *(home / name for dirs in ENTRY_DIRS.values() for name in dirs),
-    ):
+    dirs = [name for entry in entries for name in ENTRY_DIRS.get(entry, ("trader",))]
+    for directory in (parent, home, *(home / name for name in dirs)):
         assert directory.stat().st_mode & 0o777 == 0o700, directory

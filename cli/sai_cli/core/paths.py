@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -58,18 +59,42 @@ def home_mode_repairable(path: Path, info: os.stat_result) -> bool:
     return False
 
 
-def private_directory(path: Path, *, profile_root: bool = False) -> Path:
+def mkdir_private(path: Path) -> None:
+    """Create a directory while another first run may be repairing a parent."""
+    deadline = time.monotonic() + 0.5
+    while True:
+        try:
+            path.mkdir(mode=PRIVATE_MODE)
+            return
+        except PermissionError:
+            # Under a restrictive umask, a concurrent creator can publish
+            # a directory before it restores the owner's search permission.
+            if os.name == "nt" or time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+
+
+def private_directory(
+    path: Path, *, profile_root: bool = False, only_new: bool = False
+) -> Path:
     """Create PATH with owner-only access and tighten existing Sai paths.
 
-    Call this on SAI_HOME before creating a directory inside it, since
-    pathlib applies the requested mode only to the last component.
+    Repair a newly created ancestor before creating anything below it.
+    Existing ancestors keep their mode.
     """
     created = False
     try:
-        path.mkdir(mode=PRIVATE_MODE, parents=True)
+        try:
+            mkdir_private(path)
+        except FileNotFoundError:
+            if path.parent == path:
+                raise
+            private_directory(path.parent, only_new=True)
+            mkdir_private(path)
         created = True
     except FileExistsError:
-        pass
+        if only_new:
+            return path
     info = path.lstat()
     if stat.S_ISLNK(info.st_mode) or (
         getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
