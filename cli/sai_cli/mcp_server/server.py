@@ -55,6 +55,8 @@ to run `sai auth login NAME` or `sai auth import` in a terminal, then retry.
 preview and the account it names, and get their explicit confirmation. Only then call the trade_* \
 tool with the same arguments plus the preview's previewDigest, and for a \
 market open also its referencePrice.
+- If a position preview reports positionOwnerVerified as false, request a \
+new preview when the contract position can be read.
 - If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was \
 submitted. If the result includes a new preview, show it to the user and get \
 confirmation before using its previewDigest (and referencePrice). Otherwise \
@@ -1000,7 +1002,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 "endpoints": {
                     "keeper": sai_log.origin(config.endpoint),
                     "websocket": sai_log.origin(config.ws_endpoint),
-                    "lcd": sai_settings.public_url(config.lcd_endpoint),
+                    "lcd": sai_log.origin(config.lcd_endpoint),
                 },
                 "configFile": str(sai_settings.config_path(os.environ)),
                 "logs": {

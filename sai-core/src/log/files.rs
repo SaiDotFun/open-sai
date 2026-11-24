@@ -26,18 +26,28 @@ impl LogDir {
         #[cfg(unix)]
         {
             use rustix::{
-                fs::{Mode, OFlags, open},
-                process::geteuid,
+                fs::{Mode, OFlags, mkdirat, open, openat},
+                process::{geteuid, getuid},
             };
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
             builder.mode(0o700);
-            builder.create(root)?;
-            let fd = open(
-                root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
+            let parent = root
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            builder.create(parent)?;
+            let parent = open(parent, flags, Mode::empty())?;
+            if rustix::fs::fstat(&parent)?.st_uid != getuid().as_raw() {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            match mkdirat(&parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let fd = openat(parent, name, flags, Mode::empty())?;
             let dir = File::from(fd);
             let info = dir.metadata()?;
             if info.uid() != geteuid().as_raw() {
