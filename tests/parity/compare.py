@@ -29,6 +29,10 @@ LOG_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
 LEDGER = "trader/intents.sqlite3"
+MIN_SQLITE_SCHEMA = (3, 26, 0)
+SQLITE_SCHEMA_REQUIREMENT = (
+    "Ledger parity requires SQLite 3.26.0 or newer for table_xinfo"
+)
 SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
@@ -395,14 +399,16 @@ def table_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
 
 
 def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
+    if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
+        raise ValueError(SQLITE_SCHEMA_REQUIREMENT)
+    catalog = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
+    ).fetchall()
     tables = {}
-    for name, kind, without_rowid, strict, sql in conn.execute(
-        "SELECT info.name, info.type, info.wr, info.strict, definition.sql"
-        " FROM pragma_table_list AS info JOIN sqlite_master AS definition"
-        " ON info.name = definition.name AND definition.type IN ('table', 'view')"
-        " WHERE info.schema = 'main' ORDER BY info.name"
-    ):
-        checks, _ = table_ddl(sql)
+    for kind, name, _, sql in catalog:
+        if kind not in {"table", "view"}:
+            continue
+        checks, options = table_ddl(sql)
         # The PRAGMA reports parsed defaults, nullability, PK order, and
         # hidden or generated columns, including when the table is empty.
         columns = [
@@ -434,8 +440,8 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
             }
         tables[name] = {
             "type": kind,
-            "without_rowid": without_rowid,
-            "strict": strict,
+            "without_rowid": "ROWID" in options,
+            "strict": "STRICT" in options,
             "columns": columns,
             "checks": checks,
             "indexes": indexes,
@@ -445,9 +451,7 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
         }
     return {
         "tables": tables,
-        "objects": conn.execute(
-            "SELECT type, name, tbl_name FROM sqlite_schema ORDER BY type, name"
-        ).fetchall(),
+        "objects": [(kind, name, table) for kind, name, table, _ in catalog],
     }
 
 

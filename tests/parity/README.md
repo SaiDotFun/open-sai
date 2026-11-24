@@ -17,6 +17,9 @@ sockets that could reach a host service. The driver stops at startup if it canno
 the isolated network or find a native `uv` executable that runs with a
 temporary home.
 
+Ledger comparison requires SQLite 3.26 or later for `table_xinfo`.
+Pytest skips ledger and namespace parity tests below that version.
+
 The default pytest run includes the comparison unit tests. CI selects the
 namespace-dependent candidate tests with
 `uv run pytest -m parity_namespace tests/parity` after provisioning the

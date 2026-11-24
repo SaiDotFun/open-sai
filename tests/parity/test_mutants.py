@@ -5,11 +5,13 @@ from __future__ import annotations
 import os
 import shlex
 import socket
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from compare import MIN_SQLITE_SCHEMA, SQLITE_SCHEMA_REQUIREMENT
 
 HERE = Path(__file__).parent
 ROOT = HERE.parents[1]
@@ -18,6 +20,10 @@ pytestmark = [
     pytest.mark.skipif(
         sys.platform != "linux",
         reason="Parity candidates require Linux network namespaces",
+    ),
+    pytest.mark.skipif(
+        sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA,
+        reason=SQLITE_SCHEMA_REQUIREMENT,
     ),
 ]
 

@@ -25,6 +25,8 @@ from typing import Any
 import click
 from compare import (
     LEDGER,
+    MIN_SQLITE_SCHEMA,
+    SQLITE_SCHEMA_REQUIREMENT,
     Entry,
     InvalidLogTime,
     Normalize,
@@ -459,6 +461,8 @@ def main() -> int:
         "--case", action="append", help="Run matching case IDs (glob, repeatable)"
     )
     args = parser.parse_args()
+    if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
+        parser.error(SQLITE_SCHEMA_REQUIREMENT)
     try:
         enter_loopback()
         uv = resolve_uv()

@@ -5,12 +5,15 @@ from pathlib import Path
 
 import pytest
 from compare import (
+    MIN_SQLITE_SCHEMA,
+    SQLITE_SCHEMA_REQUIREMENT,
     Entry,
     InvalidLogTime,
     Normalize,
     first_difference,
     ledger,
     snapshot,
+    sqlite_schema,
     stdout,
 )
 from parity import Observation, differences
@@ -89,6 +92,12 @@ def test_snapshot_reports_mode_and_semantic_config_changes(tmp_path: Path) -> No
     assert changed.files["config.toml"] == Entry("file", 0o644, {"enabled": False})
 
 
+requires_sqlite_schema = pytest.mark.skipif(
+    sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA, reason=SQLITE_SCHEMA_REQUIREMENT
+)
+
+
+@requires_sqlite_schema
 def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> None:
     compact = (
         "CREATE TABLE account (id INTEGER PRIMARY KEY);"
@@ -143,6 +152,7 @@ def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> 
     )
 
 
+@requires_sqlite_schema
 def test_ledger_detects_added_or_changed_check_constraints(tmp_path: Path) -> None:
     ddl = """
         CREATE TABLE intents (
@@ -208,6 +218,24 @@ def test_ledger_detects_added_or_changed_check_constraints(tmp_path: Path) -> No
     assert difference is not None and difference.startswith(
         "ledger.schema.tables.intents.checks"
     )
+
+
+@requires_sqlite_schema
+def test_ledger_schema_enumerates_without_table_list() -> None:
+    def authorize(action: int, table: str | None, *_: object) -> int:
+        if action == sqlite3.SQLITE_READ and table == "pragma_table_list":
+            return sqlite3.SQLITE_DENY
+        return sqlite3.SQLITE_OK
+
+    with sqlite3.connect(":memory:") as conn:
+        conn.execute(
+            "CREATE TABLE intents (id TEXT PRIMARY KEY) WITHOUT /* note */ ROWID"
+        )
+        conn.set_authorizer(authorize)
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("SELECT * FROM pragma_table_list").fetchall()
+        schema = sqlite_schema(conn)
+    assert schema["tables"]["intents"]["without_rowid"] is True
 
 
 def log_snapshot(
