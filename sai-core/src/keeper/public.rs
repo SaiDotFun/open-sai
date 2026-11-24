@@ -167,12 +167,8 @@ pub fn normalize_market_price_timestamps(data: &mut Map<String, Value>) {
             if timestamp.as_f64() == Some(0.0)
                 || timestamp.as_str().is_some_and(|value| {
                     value == "0"
-                        || chrono::DateTime::parse_from_rfc3339(value).is_ok_and(
-                            |at| {
-                                at.timestamp() == 0
-                                    && at.timestamp_subsec_nanos() == 0
-                            },
-                        )
+                        || chrono::DateTime::parse_from_rfc3339(value)
+                            .is_ok_and(|at| at.timestamp() == 0 && at.timestamp_subsec_nanos() == 0)
                 })
             {
                 *timestamp = Value::Null;
