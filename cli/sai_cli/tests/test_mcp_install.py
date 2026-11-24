@@ -934,6 +934,60 @@ def test_user_install_reports_the_cursor_project_alias(env: Env):
     assert not env.cursor_path().exists()
 
 
+@pytest.mark.parametrize(
+    "settings_path",
+    [
+        "home/.claude/settings.json",
+        "project/.claude/settings.json",
+        "project/.claude/settings.local.json",
+    ],
+)
+def test_claude_install_reports_a_disabled_project_alias(env: Env, settings_path: str):
+    subprocess.run(
+        [
+            str(env.bin / "claude"),
+            "mcp",
+            "add",
+            "--scope",
+            "project",
+            OLD_COMMAND,
+            f"--env=CUSTOM={SECRET}",
+            "--",
+            *serve(env),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    config = env.project / ".mcp.json"
+    original = config.read_bytes()
+    policy = env.root / settings_path
+    policy.parent.mkdir(exist_ok=True)
+    policy.write_text(
+        json.dumps(
+            {
+                "enabledMcpjsonServers": [OLD_COMMAND],
+                "disabledMcpjsonServers": [OLD_COMMAND],
+            }
+        )
+    )
+    policy_before = policy.read_bytes()
+    env.clear()
+
+    result = invoke("mcp", "install", "claude")
+
+    message = failure(result)
+    assert "claude (project): failed" in message
+    assert f"{OLD_COMMAND} registration is disabled in claude" in message
+    assert "Review MCP approvals" in message
+    [row] = payload(result)["error"]["details"]["results"]
+    assert row["name"] == OLD_COMMAND and not row["changed"]
+    assert SECRET not in result.output
+    assert config.read_bytes() == original
+    assert policy.read_bytes() == policy_before
+    assert not (env.home / ".claude.json").exists()
+    assert not env.calls()
+
+
 @pytest.mark.parametrize("stale", [False, True])
 def test_ordinary_claude_install_preserves_the_legacy_entry(env: Env, stale: bool):
     config = env.home / ".claude.json"

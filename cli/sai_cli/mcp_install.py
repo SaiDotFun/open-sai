@@ -537,8 +537,23 @@ class Claude(Client):
             found.append(entry_registration(local, "local"))
         shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
         if shared is not None:
-            found.append(entry_registration(shared, "project"))
+            found.append(
+                entry_registration(shared, "project", self.project_disabled(name))
+            )
         return self.ordered([r for r in found if r is not None])
+
+    def project_disabled(self, name: str) -> bool:
+        assert self.cwd is not None
+        settings_paths = (
+            self.home_dir() / "settings.json",
+            self.cwd / ".claude" / "settings.json",
+            self.cwd / ".claude" / "settings.local.json",
+        )
+        for path in settings_paths:
+            rejected = (load_json(path) or {}).get("disabledMcpjsonServers")
+            if isinstance(rejected, list) and name in rejected:
+                return True
+        return False
 
     def add_steps(
         self, scope: str, target: Target, name: str = NAME
@@ -809,7 +824,8 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
     )
     if reg.disabled:
         result.error = (
-            f"Enable the existing {RETIRED_NAME} registration in {client.name}"
+            f"The existing {RETIRED_NAME} registration is disabled in {client.name}. "
+            "Review MCP approvals and settings in the client."
         )
     elif stale := stale_registration(client, RETIRED_NAME, reg):
         result.error = (
@@ -1227,7 +1243,8 @@ def replace_json_registration(
         entry = config.entries.get(name)
         if (
             not isinstance(entry, MutableMapping)
-            or entry_registration(entry, scope) != stale.registration
+            or entry_registration(entry, scope, stale.registration.disabled)
+            != stale.registration
         ):
             raise ClientError("The Sai registration changed concurrently")
     else:
