@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
@@ -159,7 +159,10 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
 
 @contextmanager
 def loopback(
-    scenario: str, *, market_price: float | None = None
+    scenario: str,
+    *,
+    market_price: float | None = None,
+    cancel_target: str | None = None,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -227,14 +230,16 @@ def loopback(
     }
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
+    cancel_trader = OTHER_ADDRESS if cancel_target == "other-account" else ADDRESS
+    pending_order = scenario == "pending-order" or cancel_target == "pending"
     contracts = {
         "get_trade_raw": {
-            "user": position["trader"],
+            "user": ADDRESS if cancel_target is not None else position["trader"],
             "user_trade_index": "UserTradeIndex(7)",
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
-            "trade_type": "limit" if scenario == "pending-order" else "trade",
+            "trade_type": "limit" if pending_order else "trade",
             "collateral_amount": str(position["collateralAmount"]),
             "leverage": str(position["leverage"]),
             "open_price": str(position["openPrice"]),
@@ -260,7 +265,11 @@ def loopback(
     }
     contract_args = {
         "get_trade_raw": {
-            "trader": ADDRESS if scenario == "pending-order" else position["trader"],
+            "trader": (
+                cancel_trader
+                if scenario == "pending-order" or cancel_target is not None
+                else position["trader"]
+            ),
             "index": 7,
         },
         "get_exchange_balance": {
@@ -461,6 +470,28 @@ def loopback(
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
+                        if name == "get_trade_raw" and cancel_target is not None:
+                            [nonce] = parse_qs(urlsplit(self.path).query).get(
+                                "_sai_query", [""]
+                            )
+                            if len(nonce) != 32 or any(
+                                c not in "0123456789abcdef" for c in nonce
+                            ):
+                                self.reject("Expected a fresh cancellation query")
+                                return
+                            if cancel_target in {"missing", "other-account"}:
+                                self.reply(
+                                    {
+                                        "message": f"Trade not found for trader {cancel_trader} with index 7"
+                                    },
+                                    500,
+                                )
+                                return
+                            if scenario == "trade-cancel-session":
+                                admission.arrived.set()
+                                if not admission.release.wait(5):
+                                    self.reject("Cancellation session gate timed out")
+                                    return
                         self.reply({"data": contracts[name]}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):

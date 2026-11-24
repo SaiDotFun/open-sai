@@ -1,6 +1,7 @@
 //! Trade previews and one reservation and submission path for CLI and MCP.
 
 mod actions;
+mod cancel;
 mod confirmation;
 
 use std::future::{Future, pending};
@@ -112,6 +113,7 @@ pub struct AcceptedTrade {
 /// Use the same Keeper endpoint for session validation, reservation, and submission.
 pub struct Trading<'a> {
     keeper: Keeper<'a>,
+    lcd_endpoint: Option<&'a str>,
     storage: &'a Storage<'a>,
     events: EventContext<'a>,
 }
@@ -120,9 +122,16 @@ impl<'a> Trading<'a> {
     pub fn new(endpoint: &'a str, storage: &'a Storage<'a>, events: EventContext<'a>) -> Self {
         Self {
             keeper: Keeper::new(endpoint, events),
+            lcd_endpoint: None,
             storage,
             events,
         }
+    }
+
+    /// Select the LCD used to verify a cancellation against the live contract.
+    pub fn with_lcd_endpoint(mut self, endpoint: &'a str) -> Self {
+        self.lcd_endpoint = Some(endpoint);
+        self
     }
 
     pub fn load_session(&self, account: Option<&str>) -> Result<Session, SaiError> {
@@ -167,6 +176,10 @@ impl<'a> Trading<'a> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
+        let cancelling = preview.intent.kind == "CANCEL_PENDING_TRADE";
+        if cancelling {
+            self.check_pending_order(session, preview).await?;
+        }
         let mut prepared;
         let preview = if preview.requires_market_price_refresh() {
             prepared = preview.clone();
@@ -187,6 +200,15 @@ impl<'a> Trading<'a> {
             self.load_session(Some(account))?;
             confirmation.verify(preview, account)?;
         }
+        // Cancellation reads can outlive the session. Reload the pinned
+        // account and use its current token for submission.
+        let reloaded;
+        let session = if cancelling {
+            reloaded = self.load_session(Some(account))?;
+            &reloaded
+        } else {
+            session
+        };
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;

@@ -175,11 +175,11 @@ fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
     text.replace('_', "").parse().map_err(|_| invalid())
 }
 
-fn invalid(message: &str) -> SaiError {
+pub(super) fn invalid(message: &str) -> SaiError {
     SaiError::new(Code::InvalidRequest, message)
 }
 
-fn incomplete(kind: &str) -> SaiError {
+pub(super) fn incomplete(kind: &str) -> SaiError {
     SaiError::new(
         Code::IncompleteData,
         format!("Keeper or contract data was missing or malformed ({kind})"),
