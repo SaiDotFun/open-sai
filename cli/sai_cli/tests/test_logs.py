@@ -20,13 +20,14 @@ import tracemalloc
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import POSITION_ROUTE, PositionKeeperHandler, position_data
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
@@ -176,15 +177,19 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
     """A Keeper on loopback answering prices, markets, and intent records."""
     state = Keeper()
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.requests.append(body)
             state.paths.append(self.path)
             state.authorizations.append(self.headers.get("Authorization"))
             query = body["query"]
-            if state.errors is not None:
-                value: dict[str, Any] = {"errors": state.errors}
+            if query == keeper.POSITION:
+                value: dict[str, Any] = {"data": position_data(body["variables"])}
+            elif query == keeper.ROUTE:
+                value = {"data": POSITION_ROUTE}
+            elif state.errors is not None:
+                value = {"errors": state.errors}
             elif "recordUserIntent" in query and state.ack_tx_hash is not None:
                 envelope = body["variables"]["input"]
                 value = {
@@ -683,7 +688,17 @@ def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper
     save_session(base)
     state.errors = [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]
     result = CliRunner().invoke(
-        main, ["--json", "--endpoint", base, "trade", "close", "7"]
+        main,
+        [
+            "--json",
+            "--endpoint",
+            base,
+            "--lcd-endpoint",
+            base.removesuffix("/query"),
+            "trade",
+            "close",
+            "7",
+        ],
     )
     assert result.exit_code == 4 and result.stderr == ""
     error = json.loads(result.stdout)["error"]
@@ -692,7 +707,7 @@ def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper
     assert storage.list_pending(base, ADDR)[0]["status"] == "rejected"
     assert events(home, "intent.status")[0]["intentKey"] == key
     for event in ("keeper.request", "intent.status", "command.end"):
-        assert events(home, event)[0]["code"] == error["code"]
+        assert events(home, event)[-1]["code"] == error["code"]
 
 
 def test_command_path_skips_options_and_their_values():
@@ -1060,8 +1075,14 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home, monkeypatch):
     monkeypatch.setenv("PATH", "")
     assert run_cli("doctor", "--offline", "--no-fix")[0] == 0
     assert list(home.iterdir()) == []
-    assert run_cli("doctor", "--offline")[0] == 0
+    lcd_origin = "http://127.0.0.1:9000"
+    lcd = f"{lcd_origin}/{PATH_KEY}?key={URL_KEY}"
+    assert run_cli("doctor", "--offline", "--lcd-endpoint", lcd)[0] == 0
     result = events(home, "doctor.result")[0]
+    start = events(home, "command.start")[0]
+    assert start["argv"][-2:] == ["--lcd-endpoint", lcd_origin]
+    output = raw_logs(home)
+    assert PATH_KEY not in output and URL_KEY not in output
     assert result["overall"] == "warn" and result["offline"] is True
     by_id = {check["id"]: check for check in result["checks"]}
     assert list(by_id) == [
@@ -1927,7 +1948,17 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
     request_hash = "ab" * 32
     state.ack_tx_hash = request_hash.upper()
     submitted = subprocess.run(
-        [*sai_command(), "--json", "--endpoint", endpoint, "trade", "close", "7"],
+        [
+            *sai_command(),
+            "--json",
+            "--endpoint",
+            endpoint,
+            "--lcd-endpoint",
+            endpoint.removesuffix("/query"),
+            "trade",
+            "close",
+            "7",
+        ],
         env={"SAI_HOME": str(home), "PATH": os.defpath},
         capture_output=True,
         text=True,
@@ -1946,7 +1977,7 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
             endpoint.removesuffix("/query"): "http://127.0.0.1:43210",
         },
     )
-    assert state.authorizations == [f"Bearer {token}"]
+    assert state.authorizations == [None, None, f"Bearer {token}"]
     record = {
         "intentKey": key,
         "kind": "CLOSE_POSITION",
@@ -2556,7 +2587,16 @@ def test_invalid_hash_and_keeper_text_are_excluded_from_reports(home, keeper_stu
     save_session(endpoint)
     secret = "some-opaque-credential-unrelated-to-the-active-session"
     state.ack_tx_hash = secret
-    code, output = run_cli("--json", "--endpoint", endpoint, "trade", "close", "7")
+    code, output = run_cli(
+        "--json",
+        "--endpoint",
+        endpoint,
+        "--lcd-endpoint",
+        endpoint.removesuffix("/query"),
+        "trade",
+        "close",
+        "7",
+    )
     assert code == 0
     key = json.loads(output)["intentKey"]
     submitted = events(home, "intent.submitted")[0]

@@ -13,8 +13,6 @@ prompt, and never returns the token.
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
 import logging
 import sqlite3
@@ -24,7 +22,17 @@ from datetime import UTC, datetime
 from decimal import Decimal, localcontext
 from typing import Any
 
-from ..core import intents, keeper, overview, reconcile, storage, stream, trading, wait
+from ..core import (
+    confirmation,
+    intents,
+    keeper,
+    overview,
+    reconcile,
+    storage,
+    stream,
+    trading,
+    wait,
+)
 from ..core import log as sai_log
 from ..core import preview as estimates
 from ..core import session as sessions
@@ -140,11 +148,11 @@ def describe(exc: Exception) -> dict[str, Any]:
         if exc.preview is None:
             return error(failure.message, Code.PREVIEW_MISMATCH)
         return error(
-            "The position or quote changed during confirmation, so nothing was"
+            "The position, quote, or route changed during confirmation, so nothing was"
             " submitted. Show the user the latest preview, get their confirmation"
             " again, then retry with its previewDigest.",
             Code.PREVIEW_MISMATCH,
-            preview=with_digest(exc.preview),
+            preview=confirmation.with_digest(exc.preview),
         )
     if isinstance(exc, storage.IntentReservationError):
         if key := failure.intent_key:
@@ -463,50 +471,6 @@ async def intent_wait(
 # Preview binding
 
 
-def canonical_price(value: object) -> str:
-    """Write a price so equal amounts give equal text: 100, 100.0 -> 100."""
-    price = format(Decimal(str(value)), "f")
-    return price.rstrip("0").rstrip(".") if "." in price else price
-
-
-def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
-    """Return the parts of PREVIEW the user confirms.
-
-    That is the account the trade would be submitted under, the intent, and
-    the position quote when there is one. A market open leaves out its intent
-    price, which is refreshed at submit, and binds the referencePrice the
-    user confirmed instead.
-    """
-    intent = copy.deepcopy(preview["intent"])
-    body = intent.get("body", {})
-    account = preview.get("addr")
-    material: dict[str, Any] = {
-        "addr": account.lower() if isinstance(account, str) else None,
-        "intent": intent,
-    }
-    if intent.get("kind") == "OPEN_TRADE" and body.get("orderType") == "market":
-        body.pop("intentPrice", None)
-        reference = preview.get("referencePrice")
-        material["referencePrice"] = (
-            canonical_price(reference) if reference is not None else None
-        )
-    if "quote" in preview:
-        material["quote"] = preview["quote"]
-    return material
-
-
-def preview_digest(preview: dict[str, Any]) -> str:
-    """Hash the confirmed parts of PREVIEW as canonical JSON."""
-    canonical = json.dumps(
-        digest_material(preview), sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
-    return {**preview, "previewDigest": preview_digest(preview)}
-
-
 def bound(
     load: AccountSession,
     digest: str | None,
@@ -536,13 +500,13 @@ def bound(
     def check(preview: dict[str, Any]) -> None:
         # Strict: never None, and SessionUnavailable propagates.
         account = load()["evmAddress"]
-        fresh = with_digest({**preview, "addr": account})
+        fresh = confirmation.with_digest({**preview, "addr": account})
         confirmed = (
             fresh
             if reference is None
             else {**fresh, "referencePrice": format(reference, "f")}
         )
-        if preview_digest(confirmed) != digest:
+        if confirmation.preview_digest(confirmed) != digest:
             raise Refused(MISMATCH, Code.PREVIEW_MISMATCH, fresh)
         if reference is None or slippage is None:
             return
@@ -584,10 +548,13 @@ def submit_check(
 def finish(
     load: AccountSession, dry_run: bool, result: dict[str, Any]
 ) -> dict[str, Any]:
-    """Add the account to a result, and the previewDigest to a preview."""
+    """Add the account and issue a digest only for a confirmable preview."""
     if not dry_run:
         return {**result, "addr": load.pinned}
-    return with_digest({**result, "addr": load.account()})
+    preview = {**result, "addr": load.account()}
+    if preview.get("positionOwnerVerified") is False:
+        return preview
+    return confirmation.with_digest(preview)
 
 
 # Trading: each action previews with dry_run and submits without it. A
