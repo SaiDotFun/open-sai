@@ -137,6 +137,7 @@ EVENTS = {
         },
         {
             "addr": "string",
+            "intentKey": "string",
             "code": "string",
             "error": "string",
             "httpStatus": "integer",

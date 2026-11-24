@@ -44,7 +44,7 @@ The wait entries reserve fields for the intent wait implementation.
 | `intent.submitted` | `core.intents.submit` | `info` | `intentKey` (string), `kind` (string), `addr` (string), `endpoint` (string) | `txHash` (string) |
 | `intent.wait.start` | `core intent wait (lane A4)` | `info` | `intentKey` (string) | `addr` (string), `endpoint` (string), `timeoutMs` (integer) |
 | `intent.wait.end` | `core intent wait (lane A4)` | `info`, `warn`, `error` | `intentKey` (string), `status` (string), `durationMs` (integer) | `addr` (string), `endpoint` (string), `txHash` (string), `fillBlock` (integer), `code` (string), `error` (string) |
-| `keeper.request` | `core.keeper._log_request` | `info`, `warn` | `operation` (string), `endpoint` (string), `authenticated` (boolean), `durationMs` (integer), `status` (string) | `addr` (string), `code` (string), `error` (string), `httpStatus` (integer), `keeperErrors` (object[]) |
+| `keeper.request` | `core.keeper._log_request` | `info`, `warn` | `operation` (string), `endpoint` (string), `authenticated` (boolean), `durationMs` (integer), `status` (string) | `addr` (string), `intentKey` (string), `code` (string), `error` (string), `httpStatus` (integer), `keeperErrors` (object[]) |
 | `log.dropped` | `core.log._write` | `warn` | `count` (integer) | None |
 | `mcp.server_start` | `mcp_server.server.serve` | `info` | `keeper` (string), `websocket` (string), `lcd` (string) | None |
 | `mcp.tool_call` | `mcp_server.server.SaiMCP.call_tool` | `info` | `tool` (string), `callId` (string), `arguments` (object) | `unknownArguments` (integer) |

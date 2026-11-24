@@ -1039,6 +1039,39 @@ def _number(value: Any) -> int:
     return value if isinstance(value, int) else 0
 
 
+def event_order(line: Mapping[str, Any]) -> tuple[str, int]:
+    return str(line.get("ts", "")), _number(line.get("seq"))
+
+
+def read_events(
+    root: Path | None = None, *, first_day: date | None = None
+) -> Iterator[dict[str, Any]]:
+    """Stream complete JSON objects from retained log files."""
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        return
+    with opened:
+        for day, _surface, name in opened.files():
+            if first_day is not None and day < first_day:
+                continue
+            try:
+                with os.fdopen(opened.read_fd(name), "rb") as source:
+                    while raw := source.readline(MAX_LINE + 1):
+                        if not raw.endswith(b"\n"):
+                            # Skip a partial last line or the rest of an oversized line.
+                            while raw and not raw.endswith(b"\n"):
+                                raw = source.readline(MAX_LINE + 1)
+                            continue
+                        try:
+                            line = json.loads(raw)
+                        except (ValueError, RecursionError):
+                            continue
+                        if isinstance(line, dict):
+                            yield line
+            except OSError:
+                continue
+
+
 def tail(
     count: int,
     surface: str | None = None,
@@ -1071,7 +1104,7 @@ def tail(
                 lines += _file_tail(opened, file, count + TAIL_SLACK, name, chunk)
             if len(lines) >= count:
                 break
-    lines.sort(key=lambda line: (str(line.get("ts", "")), _number(line.get("seq"))))
+    lines.sort(key=event_order)
     return lines[-count:]
 
 

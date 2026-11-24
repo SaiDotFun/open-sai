@@ -27,6 +27,7 @@ from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import ConfigDict
 
 from ..core import log as sai_log
+from ..core import log_queries
 from ..core import settings as sai_settings
 from ..core.errors import Code, SaiError, describe
 from ..core.settings import Settings
@@ -229,6 +230,22 @@ async def intent_status(addr: str | None = None, key: str | None = None) -> str:
         key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
     """
     return await call(tools.intent_status, addr, key)
+
+
+async def logs_intent(key: str, offline: bool = False, addr: str | None = None) -> str:
+    """Read one intent's local log trail and current Keeper record.
+
+    Args:
+        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
+        offline: Read local logs only.
+        addr: EVM address for Keeper. Defaults to the account in the trail
+            or the active account for this server's endpoint.
+    """
+    if offline:
+        return await asyncio.to_thread(tools.run, partial(log_queries.intent, key))
+    return await call(
+        lambda config: log_queries.intent(key, endpoint=config.endpoint, addr=addr)
+    )
 
 
 # Previews and trades share one implementation per action.
@@ -650,6 +667,7 @@ READ_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
     (preview_leverage, read_only("Preview Leverage")),
     (preview_margin, read_only("Preview Margin Change")),
     (preview_partial_close, read_only("Preview Partial Close")),
+    (logs_intent, read_only("Intent Log Trail")),
 )
 
 TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (

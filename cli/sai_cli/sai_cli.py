@@ -23,6 +23,7 @@ from .core import (
     clipboard,
     keeper,
     log,
+    log_queries,
     reconcile,
     storage,
     stream,
@@ -1695,6 +1696,74 @@ def logs_tail(
             click.echo(json.dumps(line, separators=(",", ":"), default=str))
         else:
             click.echo(log.render(line))
+
+
+def print_log_trail(ctx: click.Context, report: dict[str, Any]) -> None:
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    lines = sorted(report["events"] + report["gaps"], key=log.event_order)
+    if not lines:
+        click.echo("No matching log events.")
+    for line in lines:
+        prefix = "Gap  " if line.get("event") == "log.dropped" else ""
+        click.echo(prefix + log.render(line))
+
+
+@logs_group.command("intent")
+@click.argument("key")
+@click.option("--offline", is_flag=True, help="Read local logs only.")
+@click.option("--addr", help="EVM address to use for the Keeper lookup.")
+@click.pass_context
+def logs_intent(ctx: click.Context, key: str, offline: bool, addr: str | None) -> None:
+    """Show an intent's CLI and MCP trail and its current Keeper record."""
+    endpoint = None if offline else keeper_url(ctx)
+    report = log_queries.intent(key, endpoint=endpoint, addr=addr)
+    print_log_trail(ctx, report)
+    if ctx.obj["json"]:
+        return
+    if report["txHash"]:
+        click.echo(f"Request transaction {report['txHash']}")
+    if record := report["keeper"]:
+        click.echo("Keeper " + json.dumps(record, separators=(",", ":")))
+    elif error := report.get("keeperError"):
+        click.echo(f"Keeper lookup failed ({error['code']}). {error['message']}")
+    elif not offline:
+        click.echo("Keeper has no record for this intent.")
+
+
+@logs_group.command("run")
+@click.argument("id")
+@click.pass_context
+def logs_run(ctx: click.Context, id: str) -> None:
+    """Show one process run or one MCP call by ID."""
+    print_log_trail(ctx, log_queries.run(id))
+
+
+@logs_group.command("stats")
+@click.option(
+    "--since", metavar="DURATION", help="Look back by a duration such as 24h."
+)
+@click.pass_context
+def logs_stats(ctx: click.Context, since: str | None) -> None:
+    """Summarize Keeper latency and error codes in the retained logs."""
+    report = log_queries.stats(since)
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    if report["keeper"]:
+        click.echo("Keeper operation  Requests  p50 (ms)  p95 (ms)")
+        for name, values in report["keeper"].items():
+            click.echo(
+                f"{name:16}  {values['count']:8}  {values['p50Ms']:8}  {values['p95Ms']:8}"
+            )
+    else:
+        click.echo("No timed Keeper requests.")
+    click.echo("Errors by code" if report["errors"] else "No coded errors.")
+    for code, count in report["errors"].items():
+        click.echo(f"{code}  {count}")
+    for line in report["gaps"]:
+        click.echo("Gap  " + log.render(line))
 
 
 # Exit code for an install `sai update` cannot change in place.

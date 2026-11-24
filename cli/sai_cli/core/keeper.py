@@ -126,8 +126,8 @@ def request(
     """Send one GraphQL request; TIMEOUT applies to each phase in seconds.
 
     Logs one `keeper.request` event with the operation, the endpoint's
-    origin, the outcome, and the duration. The variables, the token,
-    and the response data are never logged.
+    origin, the outcome, and the duration. For an intent lookup, it also
+    records the key. It omits the token and the request and response bodies.
     """
     started = time.monotonic()
     outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
@@ -171,12 +171,14 @@ def _log_request(
             ),
             None,
         )
+        intent_key = (variables or {}).get("key") if query == INTENTS else None
         log.event(
             "keeper.request",
             "info" if outcome.get("status") == "ok" else "warn",
             operation=OPERATIONS.get(query, "custom"),
             endpoint=log.endpoint(endpoint),
             addr=account,
+            intentKey=log.Arg(intent_key) if isinstance(intent_key, str) else None,
             authenticated=bool(token),
             durationMs=round((time.monotonic() - started) * 1000),
             status=outcome["status"],

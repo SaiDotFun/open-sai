@@ -406,67 +406,50 @@ day: `cli-YYYY-MM-DD.jsonl`, `mcp-YYYY-MM-DD.jsonl` for `sai mcp serve`, and
 the files 0600.
 
 ```bash
-sai logs path                        # the directory
-sai logs tail                        # the last 20 events, oldest first
-sai logs tail -n 50 --surface mcp    # cli, mcp, or update
-sai logs tail --event keeper.request
-sai logs tail --event intent         # a prefix matches intent.reserved, intent.status, intent.keeper
-sai --json logs tail                 # the stored JSON objects, one per line
+sai logs path
+sai logs tail -n 50 --surface mcp
+sai logs tail --event intent
+sai logs intent KEY
+sai logs intent KEY --offline
+sai logs run ID
+sai logs stats --since 24h
+sai --json logs intent KEY
 ```
 
-Plain `tail` output is one line per event: UTC time, surface, level, event,
-then `key=value` fields. `sai --json logs path` returns `{"dir", "enabled",
-"keepDays", "files"}`.
+The `intent` command joins events with the requested `intentKey` to other
+events in the same CLI runs and MCP calls. The `run` command accepts a
+process `runId` or a single MCP `callId`. Both show events in timestamp and
+sequence order and report `log.dropped` notices for the matching processes.
+A drop notice counts lost events for the process as a whole.
 
-Every line has these fields:
+The `intent` command reads Keeper's current record and reports the request
+transaction hash when it has one. Keeper uses the configured endpoint and
+the address from the intent's log entries or the active account for that
+endpoint. Use `--addr` to specify an address or `--offline` to skip Keeper.
+The MCP tool `logs_intent` returns the same report and accepts `offline`
+and `addr` arguments. The read leaves the local intent ledger unchanged.
 
-| Field     | Meaning                                                        |
-| --------- | -------------------------------------------------------------- |
-| `ts`      | UTC time with milliseconds, such as `2026-11-18T14:03:07.412Z` |
-| `level`   | `info`, `warn`, or `error`                                     |
-| `event`   | The event name, below                                          |
-| `surface` | `cli`, `mcp`, or `update`; also the file the line is in        |
-| `pid`     | Process id                                                     |
-| `version` | The `sai` version that wrote the line                          |
-| `runId`   | One id per process; it ties a command's lines together         |
-| `seq`     | The line's number within the run                               |
+The `stats` command uses all retained logs by default. Pass a positive
+whole number followed by `s`, `m`, `h`, `d`, or `w` to limit the time
+range. The p50 and p95 use the nearest rank across all timed requests for
+each Keeper operation. The error counts count each event with a `code`
+field, so the same failure may count at the request and command levels.
 
-Lines written while a CLI command runs also carry `command`, such as `market
-prices`. Lines written during an MCP tool call carry `tool` and `callId`.
+Use the root flag `sai --json logs ...` for machine-readable output.
+The `intent` and `run` reports return arrays `events` and `gaps`. The
+intent report also returns `intentKey`, `keeper`, and `txHash`. If Keeper
+cannot be read, `keeperError` describes the failure alongside the local
+trail. The `stats` report maps operations to `count`, `p50Ms`, and
+`p95Ms` under `keeper`, with counts by code under `errors`. It also
+returns `gaps` and the UTC cutoff `since`, if set. The `tail` command
+prints the stored JSON objects one per line.
 
-| Event              | When                                    | Fields                                                                                               |
-| ------------------ | --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `command.start`    | A CLI command starts                    | `command`, `argv`                                                                                    |
-| `command.end`      | It ends                                 | `exitCode`, `durationMs`, `error`                                                                    |
-| `mcp.server_start` | `sai mcp serve` starts                  | `keeper`, `websocket`, `lcd`                                                                         |
-| `mcp.tool_call`    | An agent calls a tool                   | `tool`, `callId`, `arguments`, `unknownArguments`                                                    |
-| `mcp.tool_result`  | The tool returns                        | `ok`, `code`, `error`, `errorType`, `account`, `status`, `intentKey`, `previewDigest`, `durationMs`  |
-| `keeper.request`   | Each Keeper GraphQL request             | `operation`, `endpoint`, `status`, `httpStatus`, `keeperErrors`, `error`, `addr`, `authenticated`, `durationMs` |
-| `intent.reserved`  | A trade intent gets its key             | `intentKey`, `kind`, `status`, `addr`, `tradeId`, `endpoint`                                         |
-| `intent.status`    | Its local status changes                | `intentKey`, `kind`, `previous`, `status`, `addr`, `endpoint`                                        |
-| `intent.keeper`    | Keeper reports its record of the intent | `intentKey`, `kind`, `lifecycleStep`, `execActor`, `errorCode`, `errorMsg`, `txHash`, `found`, `addr` |
-| `session.saved`    | Sign-in stores a session                | `addr`, `expiresAt`, `endpoint`, `connectedAccounts`                                                 |
-| `session.active`   | `auth use` switches account             | `addr`                                                                                               |
-| `session.removed`  | `auth logout` removes one               | `addr`, `connectedAccounts`                                                                          |
-| `session.expired`  | A command finds the session expired     | `addr`, `expiresAt`                                                                                  |
-| `doctor.result`    | `sai doctor` finishes                   | `overall`, `fix`, `offline`, `checks`                                                                |
-| `update.check`     | `sai update --check` finishes           | `ok`, `installed`, `latest`, `updateAvailable`, `installKind`, `error`                               |
-| `update.scheduled` | A command starts the daily background update | none                                                                                            |
-| `update.result`    | `sai update` or the background update finishes | `status`, `installed`, `target`, `rolledBack`, `background`, `message`                        |
-| `log.dropped`      | Events were lost because the disk was slow | `count`                                                                                           |
+See the [log event schema](../../docs/log-events.md) for event names and
+field types. Queries accept logs written before the versioned schema.
 
-A `keeper.request` has `status` `ok`, `error`, `rejected` (Keeper refused
-admission), or `not_sent` (the connection failed first). Its `operation` is
-`markets`, `prices`, `positions`, `history`, `intents`, `submit`, and so on.
-To follow one trade, filter on its `intentKey`: `intent.reserved` (status
-`unknown`), then `keeper.request` with operation `submit`, then
-`intent.status` as it becomes `accepted`, `rejected`, `not_sent`, `terminal`,
-or `absent`, with `intent.keeper` lines for each time `intent status` asked
-Keeper.
-
-The logs never hold the session token, a signature, clipboard text, request
-variables, or response data. sai passes none of these to the logger, and the
-logger also treats every string as untrusted:
+Sai logs allowlisted fields such as the account, intent key, and request
+transaction hash. It omits session tokens, signatures, clipboard text, and
+Keeper request and response payloads. The logger also scrubs every string.
 
 - A URL anywhere, including in `argv` and `endpoint`, is cut to its scheme,
   host, and port, so an API key in a path or query is not written. In
