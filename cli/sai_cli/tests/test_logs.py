@@ -2054,6 +2054,42 @@ def test_mcp_audit_omits_invalid_arguments_from_call_log(home):
     assert marker not in raw_logs(home)
 
 
+@pytest.mark.parametrize("logging", [True, False], ids=["logging-on", "logging-off"])
+def test_mcp_audit_validation_names_types_without_rejected_values(
+    home, monkeypatch, logging
+):
+    if not logging:
+        monkeypatch.setenv("SAI_LOG", "0")
+    mcp = server.create_server()
+    secret = "opaque-rejected-audit-argument"
+    cases = [
+        ({"offline": secret}, "Argument 'offline' must be a boolean."),
+        ({"before": [secret]}, "Argument 'before' must be a string or null."),
+        ({"addr": {"value": secret}}, "Argument 'addr' must be a string or null."),
+        ({"key": [secret]}, "Argument 'key' must be a string."),
+        ({secret: secret}, "Expected audit arguments 'key' (a string)"),
+    ]
+
+    async def run():
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            for arguments, message in cases:
+                result = await client.call_tool(
+                    "logs_intent", {"key": "KEY", "offline": True} | arguments
+                )
+                assert result.isError
+                assert isinstance(result.content[0], TextContent)
+                assert message in result.content[0].text
+                assert secret not in result.model_dump_json()
+
+    asyncio.run(run())
+    results = events(home, "mcp.tool_result")
+    assert len(results) == (len(cases) if logging else 0)
+    assert all(line["code"] == "INVALID_REQUEST" for line in results)
+    assert secret not in raw_logs(home)
+
+
 def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keeper_stub):
     endpoint, state = keeper_stub
     save_session(endpoint)

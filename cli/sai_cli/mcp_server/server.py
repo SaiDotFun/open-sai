@@ -27,8 +27,9 @@ from typing import Any, Literal
 
 from anyio import BrokenResourceError
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
-from pydantic import ConfigDict
+from pydantic import ConfigDict, ValidationError
 
 from ..core import log as sai_log
 from ..core import log_queries
@@ -813,7 +814,31 @@ class SaiMCP(FastMCP):
                 ]
                 result = (content, {"result": refusal})
                 return result  # ty: ignore[invalid-explicit-return]
-        return await super().call_tool(name, arguments)
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            cause = exc.__cause__
+            if name != "logs_intent" or not isinstance(cause, ValidationError):
+                raise
+            # SDK validation renders the rejected input in its exception.
+            # Use known fields and type names only, including for extra keys.
+            types = {
+                "key": "a string",
+                "offline": "a boolean",
+                "addr": "a string or null",
+                "before": "a string or null",
+            }
+            detail = cause.errors(
+                include_input=False, include_context=False, include_url=False
+            )[0]
+            field = detail["loc"][0] if detail["loc"] else None
+            expected = types.get(field) if isinstance(field, str) else None
+            if expected is not None:
+                message = f"Argument '{field}' must be {expected}."
+            else:
+                accepted = ", ".join(f"'{key}' ({kind})" for key, kind in types.items())
+                message = f"Expected audit arguments {accepted}."
+            raise ToolError(message) from SaiError(message, Code.INVALID_REQUEST)
 
 
 def loggable_value(value: Any) -> Any:
