@@ -7,7 +7,6 @@ import fnmatch
 import json
 import os
 import queue
-import re
 import select
 import shlex
 import shutil
@@ -70,7 +69,6 @@ class Case:
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
     mcp_deferred_trade_exception: bool = False
-    mcp_checkout_wire: list[str] | None = None
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -231,7 +229,12 @@ def mcp_exchange(
                         )
                     )
                 requests.extend(
-                    (call.request(id_, endpoints), call.session, False)
+                    (
+                        call.request(id_, endpoints),
+                        call.session,
+                        call.switch_active,
+                        False,
+                    )
                     for id_, call in enumerate(calls, 3)
                 )
                 for request, session, probe in requests:
@@ -634,15 +637,6 @@ def expect_native_mcp_info(
         if not isinstance(value, dict) or value.get("name") != "sai":
             continue
         updates = {}
-        lcd = urlsplit(value["endpoints"]["lcd"])
-        # All replay URLs contain a per-run path. The explicit privacy case
-        # appends a synthetic credential to that path.
-        if re.fullmatch(r"/parity/[0-9a-f]{32}(?:/fixture-lcd-private)?", lcd.path):
-            updates["endpoints"] = {
-                **value["endpoints"],
-                "lcd": f"{lcd.scheme}://{lcd.netloc}",
-            }
-            reasons["Native MCP reports the LCD origin without the private path"] = None
         trading = value["trading"]
         if (
             allow_deferred_trade
@@ -848,12 +842,6 @@ def main() -> int:
             oracle = [c9a_python]
         else:
             oracle = reference
-        if (
-            candidate is reference
-            and oracle is reference
-            and case.mcp_checkout_wire is not None
-        ):
-            case = replace(case, wire=case.mcp_checkout_wire)
         executable = oracle if candidate is reference else candidate
         diffs, listed, expected = run_case(case, oracle, executable)
         for tool, status in listed.items():

@@ -60,6 +60,7 @@ pub(super) fn arguments(
                 Err(("Input should be a valid string", "string_type"))
             }
             Some("integer") => integer(value),
+            Some("number") => number(value),
             Some("boolean") => boolean(value),
             _ => Ok(None),
         };
@@ -208,6 +209,35 @@ fn integer_string(text: &str) -> Option<Value> {
     }
     let sign = if whole.starts_with('-') { "-" } else { "" };
     serde_json::from_str(&format!("{sign}{digits}")).ok()
+}
+
+fn number(value: &Value) -> Conversion {
+    const TYPE: (&str, &str) = ("Input should be a valid number", "float_type");
+    const PARSING: (&str, &str) = (
+        "Input should be a valid number, unable to parse string as a number",
+        "float_parsing",
+    );
+    match value {
+        Value::Bool(_) => Ok(None),
+        Value::Number(number) => {
+            if is_integer(value) && number.as_f64().is_none() {
+                return Err(TYPE);
+            }
+            Ok(None)
+        }
+        Value::String(text) => {
+            let text = text.trim();
+            if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
+                return Err(PARSING);
+            }
+            // The deferred wait handler has no use for the converted value yet.
+            text.replace('_', "")
+                .parse::<f64>()
+                .map(|_| None)
+                .map_err(|_| PARSING)
+        }
+        _ => Err(TYPE),
+    }
 }
 
 fn boolean(value: &Value) -> Conversion {

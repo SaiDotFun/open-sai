@@ -1,4 +1,4 @@
-"""Stdio calls for the Python MCP contract at ea09f0d417a53a71079bb8c5e426005fa29051a4."""
+"""Stdio calls for the Python MCP contract at 6a2e3af1edab943f204d4110db97024c9d7b8c63."""
 
 from __future__ import annotations
 
@@ -107,6 +107,22 @@ CALLS = {
         ),
         *(Call(tool, {"addr": False}, "invalid") for tool in ACCOUNT_READS),
         Call("intent_status", {"addr": "{addr}", "key": {}}, "invalid"),
+    ),
+    "overview-validation": (
+        Call("account_overview", {"addr": False}, "invalid"),
+        Call("account_overview", {"address": "{addr}"}, "invalid"),
+    ),
+    "wait-validation": (
+        Call("intent_wait", expected="invalid"),
+        Call("intent_wait", {"key": "{intent}", "timeout": []}, "invalid"),
+        Call("intent_wait", {"key": "{intent}", "timeout": "later"}, "invalid"),
+        Call("intent_wait", {"key": "{intent}", "deadline": 1}, "invalid"),
+    ),
+    "logs-validation": (
+        Call("logs_intent", expected="invalid"),
+        Call("logs_intent", {"key": "{intent}", "offline": "later"}, "invalid"),
+        Call("logs_intent", {"key": "{intent}", "before": []}, "invalid"),
+        Call("logs_intent", {"key": "{intent}", "token": True}, "invalid"),
     ),
     "refusals": (
         *(Call(tool, {"addr": None}, "SESSION_UNAVAILABLE") for tool in ACCOUNT_READS),

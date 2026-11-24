@@ -36,7 +36,7 @@ means the MCP tool's schema and metadata matched in `tools/list`.
 
 ## Compare MCP Stdio
 
-Check out Python commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` in a
+Check out Python commit `6a2e3af1edab943f204d4110db97024c9d7b8c63` in a
 separate directory. Use CPython 3.12, which preserves the tool description
 indentation recorded in the Rust inventory.
 
@@ -51,6 +51,8 @@ The transcript checks server initialization, ordered tool metadata,
 strict argument errors, and the JSON string in each successful response's
 `content` and `structuredContent`. It also replaces a fixture session
 between calls to check the trade refusal before argument validation.
+The inventory and validation cases include overview, wait, and logs while
+their cores are pending.
 
 ## Add a Case
 

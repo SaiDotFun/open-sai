@@ -747,15 +747,31 @@ mode = "mcp"
 mcp_profile = "reads"
 seed = "ledger"
 server = "mcp-reads"
-wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
-# The current Python checkout uses the narrower history query during reconciliation.
-mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
+wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
 
 [[case]]
 name = "mcp-argument-validation"
 args = ["mcp","serve"]
 mode = "mcp"
 mcp_profile = "validation"
+
+[[case]]
+name = "mcp-overview-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "overview-validation"
+
+[[case]]
+name = "mcp-intent-wait-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "wait-validation"
+
+[[case]]
+name = "mcp-logs-intent-validation"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "logs-validation"
 
 [[case]]
 name = "mcp-session-refusals"

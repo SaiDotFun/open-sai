@@ -1,4 +1,4 @@
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use sai_core::{
     errors::{Code, SaiError},
     log, session,
@@ -93,7 +93,8 @@ impl StoredSession {
                 session,
                 expired,
                 matches,
-            } => json!({
+            } => {
+                let mut report = json!({
                 "signedIn": true,
                 "connectedAccounts": storage.load_accounts().map_or(1, |accounts| accounts.iter().count()),
                 "usable": *matches && !expired,
@@ -102,8 +103,38 @@ impl StoredSession {
                 "endpoint": session.endpoint().map(log::origin),
                 "expired": expired,
                 "endpointMatches": matches,
-            }),
+                });
+                if *expired {
+                    let (command, guidance) = storage.renewal_fields(session);
+                    add_renewal(&mut report, command, guidance);
+                } else if *matches && let Ok(expiry) = session::session_expiry(session) {
+                    add_expiry_notice(&mut report, storage, session, expiry, Utc::now());
+                }
+                report
+            }
         }
+    }
+}
+
+fn add_expiry_notice(
+    report: &mut Value,
+    storage: &Storage<'_>,
+    session: &Session,
+    expiry: DateTime<Utc>,
+    now: DateTime<Utc>,
+) {
+    if let Some(notice) = storage.expiry_notice(session, expiry - now) {
+        report["expiryWarning"] = json!(notice.expiry_warning);
+        add_renewal(report, notice.renewal_command, notice.renewal_guidance);
+    }
+}
+
+fn add_renewal(report: &mut Value, command: Option<String>, guidance: Option<String>) {
+    if let Some(command) = command {
+        report["renewalCommand"] = json!(command);
+    }
+    if let Some(guidance) = guidance {
+        report["renewalGuidance"] = json!(guidance);
     }
 }
 

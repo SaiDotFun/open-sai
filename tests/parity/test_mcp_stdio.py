@@ -506,3 +506,27 @@ def test_stdout_failure_ends_session_with_stdin_open(
         stdio.proc.stdout.close()
         stdio.send("ping", id_=2)
         stdio.proc.wait(timeout=3)
+
+
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("account_overview", {"addr": ADDRESS}),
+        ("intent_wait", {"key": INTENT, "timeout": "1e_0"}),
+        ("logs_intent", {"key": INTENT, "offline": True}),
+        ("logs_intent", {"key": INTENT, "offline": False}),
+    ],
+)
+def test_deferred_read_tools_accept_valid_arguments_without_requests(
+    native: Path, tmp_path: Path, tool: str, arguments: dict[str, Any]
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+    ):
+        result = stdio.call(2, tool, **arguments)
+        assert result["isError"] is False
+        text = result["content"][0]["text"]
+        assert result["structuredContent"] == {"result": text}
+        assert json.loads(text)["code"] == "NOT_IMPLEMENTED"
+        assert not endpoints.wire
