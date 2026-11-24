@@ -37,6 +37,7 @@ from compare import (
     stderr_category,
     stdout,
 )
+from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
 from sai_cli.sai_cli import command_path
@@ -80,6 +81,7 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    client_seed: str | None = None
 
     @property
     def command(self) -> str:
@@ -227,6 +229,9 @@ def observe(
     config = home / "sai" / "config.toml"
     before_config = config.read_bytes().decode("utf-8") if config.is_file() else None
     env = child_env(home, endpoints)
+    client_before = (
+        seed_clients(home, env, case.client_seed) if case.client_seed else {}
+    )
     for key in case.unset or ():
         env.pop(key, None)
     if case.setup:
@@ -289,6 +294,10 @@ def observe(
         home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
     )
     files = snapshot(home / "sai", normalize)
+    if case.client_seed:
+        if SECRET in result.stdout or SECRET in result.stderr:
+            raise ValueError("Client config value escaped into CLI output")
+        files.update(client_state(home, client_before, normalize))
     check_state(case.state or {}, files)
     try:
         output = stdout(result.stdout, case.mode, case.command, normalize)
@@ -489,6 +498,9 @@ def main() -> int:
         parser.error("No parity cases matched")
     reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
     candidate = reference
+    c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
+        Path(sys.executable).with_name("sai")
+    )
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -504,7 +516,14 @@ def main() -> int:
     mismatches = 0
     tools: dict[str, str] = {}
     for case in selected:
-        diffs, listed = run_case(case, reference, candidate)
+        # uv run prepends its own bin directory to PATH. Launch the Python
+        # entry point directly so both CLIs inspect the fixture launcher.
+        if case.client_seed or case.command == "doctor":
+            case_reference = [c9a_python]
+        else:
+            case_reference = reference
+        case_candidate = case_reference if candidate is reference else candidate
+        diffs, listed = run_case(case, case_reference, case_candidate)
         tools.update(listed)
         mismatches += bool(diffs)
         row(

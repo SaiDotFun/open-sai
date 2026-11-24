@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -13,6 +14,7 @@ import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -71,6 +73,11 @@ class Endpoints:
     errors: list[str] = field(default_factory=list)
     wire: list[WireRequest] = field(default_factory=list)
     admission: Admission = field(default_factory=Admission)
+    near_expiry: str = field(
+        default_factory=lambda: (
+            datetime.now(UTC) + timedelta(hours=50, minutes=30)
+        ).isoformat()
+    )
 
     @property
     def keeper(self) -> str:
@@ -117,6 +124,32 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
     sai_home.mkdir(mode=0o700)
     if seed == "empty":
         return
+    if seed == "doctor-invalid-endpoint":
+        config = sai_home / "config.toml"
+        config.write_text('[keeper]\nendpoint = "https://fixture.invalid:bad/api"\n')
+        config.chmod(0o600)
+        return
+    if seed == "doctor-ledger-v0":
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o700)
+        with sqlite3.connect(path := trader / "intents.sqlite3") as conn:
+            conn.execute(
+                "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL,"
+                " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+                " entity TEXT NOT NULL)"
+            )
+        path.chmod(0o600)
+        return
+    if seed == "doctor-loose-profile":
+        sai_home.chmod(0o750)
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
+        trader = sai_home / "trader"
+        trader.mkdir(mode=0o755)
+        history = trader / "history"
+        history.touch(mode=0o644)
+        return
     if seed == "legacy":
         shutil.copytree(HERE / "v0.1.0", sai_home, dirs_exist_ok=True)
         sai_home.chmod(0o700)
@@ -132,22 +165,31 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         return
     session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
     sessions = []
-    if seed in {"session", "accounts"}:
+    if seed in {"session", "accounts", "doctor-near-expiry", "doctor-ledger-session"}:
         sessions.append({**session, "endpoint": endpoints.keeper})
+        if seed == "doctor-near-expiry":
+            sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+    env = child_env(home, endpoints)
+    if seed in {"doctor-near-expiry", "doctor-ledger-session"}:
+        env["SAI_LOG"] = "false"
+    if seed == "doctor-ledger-session":
+        config = sai_home / "config.toml"
+        config.write_text("[logs]\nenabled = false\n")
+        config.chmod(0o600)
     subprocess.run(
         [sys.executable, "-c", SEED],
         input=json.dumps(
             {
                 "sessions": sessions,
-                "ledger": seed == "ledger",
+                "ledger": seed in {"ledger", "doctor-ledger-session"},
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
             }
         ),
-        env=child_env(home, endpoints),
+        env=env,
         cwd=home,
         text=True,
         capture_output=True,
@@ -389,6 +431,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 errors.append("Expected WebSocket connection_init")
                 return
             wire.append(WireRequest("ws:init"))
+            if scenario == "doctor-ws-timeout":
+                connection.recv(timeout=7)
+                return
             connection.send(json.dumps({"type": "connection_ack"}))
             subscription = json.loads(connection.recv(timeout=5))
             if subscription["type"] != "subscribe":
