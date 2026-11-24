@@ -1954,6 +1954,11 @@ def mcp_list(ctx: click.Context) -> None:
     is_flag=True,
     help="Use default server arguments when repairing an existing entry.",
 )
+@click.option(
+    "--restore-previous",
+    is_flag=True,
+    help="Restore a missing Claude Code entry saved before a replacement.",
+)
 @click.option("--all", "all_clients", is_flag=True, help="Every detected client.")
 @click.option("--dry-run", is_flag=True, help="Show the changes; make none.")
 @SCOPE_OPTION
@@ -1964,6 +1969,7 @@ def mcp_install_command(
     client_options: tuple[str, ...],
     repair_existing: str | None,
     reset_args: bool,
+    restore_previous: bool,
     all_clients: bool,
     dry_run: bool,
     scope: str,
@@ -1988,6 +1994,21 @@ def mcp_install_command(
             "--repair-existing requires --client claude and the default server command."
         )
     found = mcp_clients()
+    if restore_previous:
+        if (
+            names != ["claude"]
+            or all_clients
+            or repair_existing is not None
+            or ctx.meta.get("server_argv")
+        ):
+            raise click.UsageError(
+                "--restore-previous requires Claude Code as the only client."
+                " It cannot be combined with --repair-existing or a server command."
+            )
+        claude = found["claude"]
+        assert isinstance(claude, mcp_install.Claude)
+        finish(ctx, [mcp_install.restore_claude_previous(claude, scope, dry_run)])
+        return
     target = server_target(ctx)
     if repair_existing is not None:
         claude = found["claude"]
