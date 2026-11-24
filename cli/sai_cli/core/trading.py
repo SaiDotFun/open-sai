@@ -236,10 +236,9 @@ def close_trade(
 
     if cancel_order:
 
-        def pending_order() -> None:
+        def pending_order(addr: str) -> None:
             if lcd_endpoint is None:
                 raise ValueError("Cannot verify the pending order without an LCD")
-            addr = get_session()["evmAddress"]
             contract = margin.trading_contract(endpoint, lcd_endpoint)
             trade = margin.smart_value(
                 lcd_endpoint,
@@ -259,20 +258,18 @@ def close_trade(
 
         def cancel_estimate(_preview: dict[str, Any]) -> dict[str, Any]:
             reason = "A pending order can fill before cancellation executes. Perp may close a filled position at market."
-            if dry_run:
-                pending_order()
             return {
                 key: estimates.unavailable(reason)
                 for key in ("fees", "liquidationPrice", "worstCaseFill")
             }
 
-        def check(preview: dict[str, Any]) -> None:
-            before_submit(preview)
-            pending_order()
-
-        return preview_or_submit(
-            endpoint, get_session, payload, dry_run, check, cancel_estimate
-        )
+        preview = {"dryRun": True, "intent": payload}
+        active = get_session()
+        pending_order(active["evmAddress"])
+        if dry_run:
+            return {**preview, "estimates": cancel_estimate(preview)}
+        _checked(before_submit, preview, cancel_estimate)
+        return intents.submit(endpoint, get_session(), payload)
 
     return preview_or_submit(
         endpoint,

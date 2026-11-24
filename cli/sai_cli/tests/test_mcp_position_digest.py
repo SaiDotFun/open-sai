@@ -35,6 +35,7 @@ TRADER = "nibi1trader"
 class Position:
     collateral: int = 4_000_000
     trade_type: str = "trade"
+    logout_on_position_read: bool = False
     leverage: str = "2"
     max_leverage: int = 100
     liquidation_threshold: str = "60"
@@ -139,6 +140,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
+                if position.logout_on_position_read:
+                    assert storage.delete_session(ADDR) == ADDR
+                    position.logout_on_position_read = False
                 if position.caps_on_position_read:
                     cap = position.caps_on_position_read.popleft()
                     if cap is not None:
@@ -1179,6 +1183,30 @@ def test_close_previews_detect_full_liquidation_and_unknown_partial_settlement(
             assert quote["estimates"]["execution"]["status"] == "unavailable"
             assert quote["estimates"]["fees"]["status"] == "unavailable"
 
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_cancel_refuses_logout_during_the_last_lcd_read(position_service):
+    position, base_url = position_service
+    position.trade_type = "limit"
+    args = {"trade_id": 7, "cancel_order": True}
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, "preview_close", args)
+            position.logout_on_position_read = True
+            refusal = await call(
+                client,
+                "trade_close",
+                {
+                    **args,
+                    "preview_digest": quote["previewDigest"],
+                },
+            )
+            assert not position.logout_on_position_read
+            assert refusal["code"] == "SIGNED_OUT"
             assert position.submitted == []
 
     asyncio.run(scenario())
