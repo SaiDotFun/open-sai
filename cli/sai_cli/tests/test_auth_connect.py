@@ -47,7 +47,8 @@ def make_token(addr: str = ADDR, hours: int = 720) -> str:
 class Env:
     """A temp SAI_HOME, a fake clipboard file, and a PATH of fake tools."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, command: tuple[str, ...] | None = None) -> None:
+        self.command = command or (sys.executable, "-m", "sai_cli")
         self.home = root / "sai-home"
         self.bin = root / "bin"
         self.clip = root / "clipboard.txt"
@@ -82,7 +83,7 @@ class Env:
         self, *args: str, stdin: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, "-m", "sai_cli", *args],
+            [*self.command, *args],
             input=stdin,
             check=False,
             stdin=None if stdin is not None else subprocess.DEVNULL,
@@ -105,7 +106,7 @@ class Env:
         """
         primary, secondary = pty.openpty()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "sai_cli", *args],
+            [*self.command, *args],
             stdin=secondary,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -534,12 +535,15 @@ def keeper_auth():
     state: dict[str, Any] = {
         "typed": typed_data(),
         "token": make_token(),
+        "expires_at": "2026-12-17T00:00:00+00:00",
+        "requests": [],
         "signatures": [],
     }
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            state["requests"].append(body)
             if "createUserIntentAuthChallenge" in body["query"]:
                 data = {
                     "createUserIntentAuthChallenge": {
@@ -556,7 +560,7 @@ def keeper_auth():
                     "createUserIntentSession": {
                         "token": state["token"],
                         "evmAddress": ADDR,
-                        "expiresAt": "2026-12-17T00:00:00+00:00",
+                        "expiresAt": state["expires_at"],
                     }
                 }
             encoded = json.dumps({"data": data}).encode()
@@ -582,11 +586,13 @@ def keeper_auth():
 def fake_cast(env: Env) -> None:
     env.tool(
         "cast",
-        "import json\n"
+        "import json, os, stat\n"
         "args = sys.argv[1:]\n"
         "if args[:2] == ['wallet', 'address']:\n"
         f"    print({ADDR!r})\n"
         "elif args[:2] == ['wallet', 'sign']:\n"
+        "    assert stat.S_IMODE(os.stat(os.path.dirname(args[-1])).st_mode) == 0o700\n"
+        "    assert stat.S_IMODE(os.stat(args[-1]).st_mode) == 0o600\n"
         "    data = json.load(open(args[-1]))\n"
         "    assert data['primaryType'] == 'UserTradingSession'\n"
         f"    print({SIGNATURE!r})\n"

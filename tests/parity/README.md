@@ -63,6 +63,14 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
 
+## Auth Subprocess Cases
+
+Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.
+Set `SAI_PARITY_PYTHON` to the Python `sai` executable from `main`.
+Until PR 61 lands, set `SAI_PARITY_RENEW_PYTHON` to the executable from that
+branch to include renewal and expiry recovery. The test runs use private
+temporary homes, fixture clipboard and signing commands, and loopback Keeper.
+
 The `legacy` seed contains a config file and an encrypted synthetic session
 written by the Python source at tag `sai-cli/v0.1.0`. The concurrent-close
 case overlaps two processes using one ledger. The stub holds the first
