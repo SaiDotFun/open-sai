@@ -62,6 +62,7 @@ class Position:
     position_reads: int = 0
     trade_type: str = "trade"
     keeper_market_open: bool = True
+    keeper_market_visible: bool = True
     market_trading_state: str = "open"
     switch_and_logout_on_keeper_read: str | None = None
     logout_on_position_read: bool = False
@@ -184,7 +185,13 @@ def position_service() -> Iterator[tuple[Position, str]]:
                         }
                     },
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
-                    keeper.MARKETS: {"perp": {"borrowings": [market_row]}},
+                    keeper.MARKETS: {
+                        "perp": {
+                            "borrowings": [market_row]
+                            if position.keeper_market_visible
+                            else []
+                        }
+                    },
                 }[request["query"]]
             self.reply({"data": data})
 
@@ -845,11 +852,13 @@ def test_position_confirmation_refuses_lcd_only_network_switch(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("market_visible", [True, False], ids=["visible", "hidden"])
 def test_partial_close_allows_remainder_below_fee_schedule_minimum(
-    position_service: tuple[Position, str], tmp_path, monkeypatch
+    position_service: tuple[Position, str], tmp_path, monkeypatch, market_visible: bool
 ) -> None:
     position, base_url = position_service
     position.preview_inputs = True
+    position.keeper_market_visible = market_visible
     position.collateral = 100_000_000
     position.leverage = "2"
     position.keeper_minimum_position_microusd = 100_000_000
@@ -872,6 +881,7 @@ def test_partial_close_allows_remainder_below_fee_schedule_minimum(
             assert preview["intent"]["body"]["collateral"]["amountUsdc"] == "60000000"
             assert preview["quote"]["closedNotionalUsd"] == "120"
             assert preview["estimates"]["fees"]["amountUsdc"] == "0.6"
+            assert position.market_reads == 0
             assert position.submitted == []
 
     asyncio.run(scenario())

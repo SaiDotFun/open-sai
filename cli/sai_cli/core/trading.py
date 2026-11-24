@@ -575,16 +575,6 @@ def partial_close(
     def build_preview() -> PositionPreview:
         state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
         raw = state.raw
-        market_id = state.market["marketId"]
-        markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
-        candidates = [
-            item
-            for item in markets
-            if item["marketId"] == market_id
-            and item["collateralToken"]["symbol"] == "USDC"
-        ]
-        if len(candidates) != 1 or not candidates[0]["isOpen"]:
-            raise ValueError("Open market data not available")
         position = {
             "id": trade_id,
             "collateralAmount": raw["collateral_amount"],
