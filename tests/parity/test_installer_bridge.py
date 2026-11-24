@@ -796,33 +796,56 @@ def test_native_updater_recovers_an_interrupted_first_install(
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
-@pytest.mark.parametrize("profile_matches", [True, False])
-def test_standalone_reinstall_repairs_cursor(
-    install: Install, replay: Replay, profile_matches: bool
-) -> None:
+def test_standalone_reinstall_repairs_cursor(install: Install, replay: Replay) -> None:
     native_artifact(replay)
     result = install.install(replay, "--native")
     pre_mcp_xfail(result)
     ok(result)
     cursor = install.home / ".cursor" / "mcp.json"
-    cursor.parent.mkdir(mode=0o700)
+    cursor.parent.mkdir()
     other = {"url": f"{replay.base}/service"}
-    profile = install.profile if profile_matches else install.home / "different-profile"
     servers = {
-        "sai": {"command": OLD_MCP_COMMAND, "env": {"SAI_HOME": str(profile)}},
+        "sai": {"command": OLD_MCP_COMMAND, "env": {"SAI_HOME": str(install.profile)}},
         "other": other,
     }
     cursor.write_text(json.dumps({"mcpServers": servers}))
-    result = install.install(replay, "--native")
-    ok(result)
-    assert ("different SAI_HOME setting" in result.stderr) is not profile_matches
+    ok(install.install(replay, "--native"))
     repaired = json.loads(cursor.read_text())["mcpServers"]
     assert repaired["sai"] == {
         "command": str(install.launcher),
         "args": ["mcp", "serve"],
-        "env": {"SAI_HOME": str(profile)},
+        "env": {"SAI_HOME": str(install.profile)},
     }
     assert repaired["other"] == other
+    assert not install.profile.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("profile_case", ["default", "matching", "different"])
+def test_standalone_reports_only_the_current_profiles_mcp_warnings(
+    install: Install, replay: Replay, profile_case: str
+) -> None:
+    native_artifact(replay)
+    if profile_case == "default":
+        del install.env["SAI_HOME"]
+    ok(install.install(replay, "--native"))
+    cursor = install.home / ".cursor" / "mcp.json"
+    cursor.parent.mkdir(mode=0o700)
+    registration = {"command": str(install.launcher), "args": ["mcp", "serve"]}
+    if profile_case != "default":
+        profile = (
+            install.profile if profile_case == "matching" else install.home / "other"
+        )
+        registration["env"] = {"SAI_HOME": str(profile)}
+    original = json.dumps({"mcpServers": {"sai": registration}})
+    cursor.write_text(original)
+    result = install.install(replay, "--native")
+    ok(result)
+    assert "Could not finish MCP registration repair" not in result.stderr
+    assert ("different SAI_HOME setting" in result.stderr) == (
+        profile_case == "different"
+    )
+    assert cursor.read_text() == original
     assert not install.profile.exists()
 
 
