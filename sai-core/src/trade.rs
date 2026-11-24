@@ -180,14 +180,14 @@ impl<'a> Trading<'a> {
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
         let cancelling = preview.intent.kind == "CANCEL_PENDING_TRADE";
+        let market = preview.requires_market_price_refresh();
         if cancelling {
             self.check_pending_order(session, preview).await?;
         }
         let mut prepared;
-        let preview = if preview.requires_market_price_refresh() {
+        let preview = if market {
             prepared = preview.clone();
             self.refresh_market_open(&mut prepared).await?;
-            self.storage.check_active_trade(session, endpoint)?;
             let price = prepared
                 .reference_price
                 .as_deref()
@@ -198,20 +198,18 @@ impl<'a> Trading<'a> {
         } else {
             preview
         };
-        if let Some(confirmation) = options.confirmation {
-            // A logout or account expiry during a refresh invalidates confirmation.
-            self.load_session(Some(account))?;
-            confirmation.verify(preview, account)?;
-        }
-        // Cancellation reads can outlive the session. Reload the pinned
-        // account and use its current token for submission.
+        // Live reads can outlast the session. Reload the pinned account
+        // before confirmation and reserve with its current token.
         let reloaded;
-        let session = if cancelling {
+        let session = if cancelling || market || options.confirmation.is_some() {
             reloaded = self.load_session(Some(account))?;
             &reloaded
         } else {
             session
         };
+        if let Some(confirmation) = options.confirmation {
+            confirmation.verify(preview, account)?;
+        }
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;

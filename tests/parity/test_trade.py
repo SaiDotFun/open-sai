@@ -130,6 +130,29 @@ def test_numeric_keeper_price_rounds_to_even(
             )
 
 
+def test_market_open_refuses_logout_during_price_refresh(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    _, rust = trade_pair
+    with loopback("trade-market-session") as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result = pool.submit(run, rust, home, endpoints, OPEN, python=False)
+            try:
+                assert endpoints.admission.arrived.wait(5)
+                assert (
+                    run(rust, home, endpoints, ("auth", "logout"), python=False)[0] == 0
+                )
+            finally:
+                endpoints.admission.release.set()
+            code, output, _ = result.result(timeout=10)
+        assert (code, output.get("error", {}).get("code")) == (6, "SIGNED_OUT")
+        assert [request.label for request in endpoints.wire] == ["borrowings"]
+        assert not endpoints.errors
+        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+
 def test_python_reads_rust_trade_events_offline(
     trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:

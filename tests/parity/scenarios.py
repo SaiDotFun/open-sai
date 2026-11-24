@@ -445,6 +445,11 @@ def loopback(
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
                     else:
+                        if scenario == "trade-market-session" and name == "borrowings":
+                            admission.arrived.set()
+                            if not admission.release.wait(5):
+                                self.reject("Market session gate timed out")
+                                return
                         self.reply(responses[name])
                     return
             except (ValueError, KeyError, TypeError):
