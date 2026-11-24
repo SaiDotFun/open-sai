@@ -1067,7 +1067,13 @@ def repair_mcp(launcher: Path, profile: str) -> None:
     # Doctor reads registrations from HOME and the caller's working directory.
     try:
         result = subprocess.run(
-            [launcher, "--json", "doctor", "--offline"],
+            [
+                launcher,
+                "--json",
+                "doctor",
+                "--offline",
+                "--mcp-profile=" + os.environ.get("SAI_HOME", ""),
+            ],
             env={**os.environ, "SAI_HOME": profile, "SAI_LOG": "false", "CI": "1"},
             stdin=subprocess.DEVNULL,
             capture_output=True,
