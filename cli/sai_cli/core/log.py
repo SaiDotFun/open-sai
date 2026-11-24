@@ -200,6 +200,13 @@ def _off(raw: str | None) -> bool:
 _config_cache: dict[tuple[Any, ...], tuple[bool, int]] = {}
 
 
+def invalidate_config() -> None:
+    """Refresh the writer after a successful config edit."""
+    with _io_lock:
+        _config_cache.clear()
+        _skip.clear()
+
+
 def resolve_config(
     root: Path, raw_enabled: str | None, raw_keep: str | None
 ) -> tuple[bool, int]:
@@ -214,7 +221,19 @@ def resolve_config(
     from . import settings
 
     path = root / settings.FILE_NAME
-    key = (str(path), _stat_key(path), raw_enabled, raw_keep)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    except (OSError, UnicodeError):
+        return (False, DEFAULT_KEEP_DAYS)
+    # An external edit can leave the file's size and timestamps unchanged.
+    key = (
+        str(path),
+        hashlib.sha256(text.encode("utf-8")).digest(),
+        raw_enabled,
+        raw_keep,
+    )
     cached = _config_cache.get(key)
     if cached is not None:
         return cached
@@ -229,7 +248,7 @@ def resolve_config(
 
     value = (False, DEFAULT_KEEP_DAYS)
     try:
-        file, _warnings = settings.read_file(path)
+        file, _warnings = settings.parse_file(text, path)
         if pick("logs.enabled", raw_enabled, file) is True:
             # Only now does the other value matter.
             value = (True, int(pick("logs.keep_days", raw_keep, file)))

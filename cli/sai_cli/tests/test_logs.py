@@ -1127,11 +1127,27 @@ def test_disabled_in_the_config_file_writes_nothing(home, keeper_stub):
     assert log.flush(60) and not (home / "logs").exists()
     code, output = run_cli("--json", "logs", "path")
     assert code == 0 and json.loads(output)["enabled"] is False
-    # Turning it back on takes effect in the same process.
-    (home / "config.toml").write_text("[logs]\nenabled = true\n")
-    log.reset()
+    # A config edit also refreshes the writer after it has skipped an event.
+    assert run_cli("config", "unset", "logs.enabled")[0] == 0
     log.event("something")
-    assert [line["event"] for line in read_logs(home)] == ["something"]
+    assert events(home, "something")
+
+
+def test_log_config_refreshes_after_a_same_size_rewrite(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true \n")
+    before = path.stat()
+    assert log.resolve_config(home, None, None)[0] is True
+
+    path.write_text("[logs]\nenabled = false\n")
+    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    after = path.stat()
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    assert log.resolve_config(home, None, None)[0] is False
 
 
 def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):

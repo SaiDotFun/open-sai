@@ -660,6 +660,8 @@ def edit_file(path: Path, edit: Callable[[str | None], str | None]) -> None:
     """Apply EDIT to the text at PATH (None when missing) and save it, holding
     the config lock across the read, the edit, and the replace. EDIT returns
     None to leave the file as it is."""
+    from . import log
+
     with _locked(path):
         try:
             text: str | None = path.read_text(encoding="utf-8")
@@ -670,3 +672,4 @@ def edit_file(path: Path, edit: Callable[[str | None], str | None]) -> None:
         new = edit(text)
         if new is not None:
             write_file(path, new)
+            log.invalidate_config()
