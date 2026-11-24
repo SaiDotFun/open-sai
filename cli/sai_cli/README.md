@@ -397,6 +397,14 @@ Exit 6 covers `SIGNED_OUT` and
 session the command could not use, for example one for another Keeper
 endpoint.
 
+For Keeper withdrawal failures, `intent status` and MCP `intent_status`
+report these values in `userIntents[].errorCode`.
+
+| Keeper Intent Code | Meaning | What to Do |
+| --- | --- | --- |
+| `withdraw_evm_unconfigured` | Keeper lacks the configuration for EVM withdrawals. | Wait for Keeper to be configured before retrying. |
+| `invalid_withdraw` | Keeper rejected the withdrawal request as invalid. | Review and correct the withdrawal request before retrying. |
+
 The CLI, MCP tools, and failure logs share codes. MCP tool errors have
 top-level `error` and `code` fields. The `command.end` event includes the
 CLI process's numeric `exitCode`. The `mcp.tool_result` event carries the

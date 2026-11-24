@@ -2242,6 +2242,37 @@ def test_browser_lifecycle_codes_survive_intent_status(keeper_stub, error_code, 
 
 
 @pytest.mark.parametrize(
+    "error_code", ["withdraw_evm_unconfigured", "invalid_withdraw"]
+)
+def test_withdrawal_codes_survive_cli_and_mcp_intent_status(keeper_stub, error_code):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "WITHDRAW_USD",
+            "execActor": "server",
+            "lifecycleStep": "exec_req_fail",
+            "errorCode": error_code,
+            "errorMsg": "private withdrawal diagnostic",
+        }
+    ]
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    records = [
+        json.loads(output)["userIntents"][0],
+        call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][0],
+    ]
+    for record in records:
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
+@pytest.mark.parametrize(
     "error_code",
     [
         "market_order_expired",

@@ -106,6 +106,8 @@ INTENT_ERROR_CODES = frozenset(
         "market_order_market_closed",
         "market_order_trade_not_open",
         "market_order_outcome_not_indexed",
+        "withdraw_evm_unconfigured",
+        "invalid_withdraw",
         "intent_already_used",
         "below_minimum",
         "insufficient_idle",
