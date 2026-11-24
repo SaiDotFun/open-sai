@@ -81,6 +81,25 @@ for the existing uv-owned launcher. Fresh native installs use a standalone
 launcher. The installer checks ownership and reports PATH shadowing.
 Windows stays on Python until native support passes.
 
+The native updater uses the C10 archive name `sai-<version>-<target>.tar.gz`
+and verifies it against `SHA256SUMS`. A standalone launcher is a symlink
+named `sai` beside a private `.sai-native` directory. Its target is
+`.sai-native/<version>-<archive-sha256>/sai`. The updater holds
+`.sai-update.lock` beside the launcher and keeps the previous target
+until the new binary passes its version, offline CLI, and MCP checks.
+
+For uv installs, the shim passes its own `sys.prefix` as
+`SAI_NATIVE_UV_PREFIX` when it execs the cached binary. Rust checks that
+prefix's uv receipt, the registered launcher, and the current uv tool
+directories before asking uv to install a verified wheel. A pinned
+`uvx` environment has no matching tool receipt, so its version stays pinned.
+
+C9c compares `sai update --check` with Python commit
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. Run the `update-*` cases in
+the parity driver and `tests/parity/test_update.py` with `SAI_PARITY_BIN`
+pointing to the Rust build. The native install tests serve fixture
+archives and wheels on loopback and run real uv tools in temporary homes.
+
 Updates and `sai doctor` keep valid MCP registrations and repair only
 recognized stale Sai entries after the launcher passes its health checks.
 [MCP registration repair #46](https://github.com/SaiDotFun/open-sai/issues/46).
