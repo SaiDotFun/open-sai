@@ -55,6 +55,17 @@ def auth_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
 
 
 @pytest.fixture
+def auth_privacy_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
+    reference = os.environ.get("SAI_PARITY_AUTH_PRIVACY_PYTHON")
+    if reference is None:
+        pytest.skip("set SAI_PARITY_AUTH_PRIVACY_PYTHON to the auth privacy reference")
+    executable = shutil.which(reference)
+    if executable is None:
+        pytest.fail("SAI_PARITY_AUTH_PRIVACY_PYTHON must name an executable")
+    return (executable,), cli_pair[1]
+
+
+@pytest.fixture
 def renewal_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     # Renewal output changes in both implementations, so use the Python checkout.
     return (str(Path(sys.executable).with_name("sai")),), cli_pair[1]
@@ -110,6 +121,19 @@ def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> No
     expected = observed(python.run(*args))
     assert expected[0] == (0 if "--help" in args else 2)
     assert observed(rust.run(*args)) == expected
+
+
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_auth_use_missing(
+    tmp_path: Path, auth_privacy_pair: tuple[CLI, CLI], flags: CLI
+) -> None:
+    marker = "synthetic-unregistered-account-operand"
+    python, rust = homes(tmp_path, auth_privacy_pair)
+    expected = observed(python.run(*flags, "auth", "use", marker))
+    assert expected[0] == 1
+    assert "Requested account is not connected" in expected[1] + expected[2]
+    assert marker not in expected[1] + expected[2]
+    assert observed(rust.run(*flags, "auth", "use", marker)) == expected
 
 
 @pytest.mark.parametrize(

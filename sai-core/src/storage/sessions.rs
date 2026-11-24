@@ -156,7 +156,7 @@ impl Accounts {
             .map(|(addr, session)| (&session.0, Some(addr) == self.active.as_ref()))
     }
 
-    fn find(&self, addr: &str) -> Result<String, SessionError> {
+    fn find(&self, addr: &str, label: &str) -> Result<String, SessionError> {
         let key = addr.to_lowercase();
         if self.sessions.contains_key(&key) {
             Ok(key)
@@ -164,7 +164,7 @@ impl Accounts {
             Err(SessionError(SaiError::new(
                 Code::InvalidRequest,
                 format!(
-                    "{addr} is not connected; run `sai auth list` to see connected \
+                    "{label} is not connected; run `sai auth list` to see connected \
                  accounts, or sign in with `sai auth login NAME` or `sai auth import`"
                 ),
             )))
@@ -392,7 +392,7 @@ impl Storage<'_> {
         let mut accounts = self.load_accounts()?;
         let key = if let Some(addr) = addr {
             accounts
-                .find(addr)
+                .find(addr, addr)
                 .map_err(|error| SessionError(SaiError::new(Code::SignedOut, error.0.message)))?
         } else {
             accounts.active.take().ok_or_else(|| {
@@ -414,7 +414,7 @@ impl Storage<'_> {
     pub fn use_session(&self, addr: &str) -> Result<Session, StorageError> {
         let lock = self.lock_sessions()?;
         let mut accounts = self.load_accounts()?;
-        let key = accounts.find(addr)?;
+        let key = accounts.find(addr, "Requested account")?;
         crate::session::session_expiry(&accounts.sessions[&key].0)?;
         accounts.active = Some(key.clone());
         self.save_accounts(&accounts)?;

@@ -308,6 +308,7 @@ state = { "trader/sessions.json#payload.active" = "0x111111111111111111111111111
 [[case]]
 name = "auth-use-missing"
 args = ["--json","auth","use","{addr}"]
+env = { SAI_LOG = "0" }
 expect = 1
 
 [[case]]
