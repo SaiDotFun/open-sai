@@ -236,12 +236,16 @@ fn load_v2(envelope: &Value) -> Result<Accounts, SessionError> {
 
 impl Storage<'_> {
     pub fn load_accounts(&self) -> Result<Accounts, StorageError> {
+        self.read_accounts().map_err(StorageError::SessionData)
+    }
+
+    fn read_accounts(&self) -> Result<Accounts, SessionError> {
         let path = self.trader.join(SESSIONS);
         let fields = match read_envelope(&path)? {
             Some(fields) => fields,
             None => {
                 if let Some(fields) = read_envelope(&self.trader.join(LEGACY_SESSION))? {
-                    return Ok(load_v2(&fields)?);
+                    return load_v2(&fields);
                 }
                 // Another process may have published v3 and removed v2 between our reads.
                 let Some(fields) = read_envelope(&path)? else {
@@ -251,7 +255,7 @@ impl Storage<'_> {
             }
         };
         if fields["version"].as_u64() != Some(VERSION) {
-            return Err(session_error("Unsupported session version").into());
+            return Err(session_error("Unsupported session version"));
         }
         let StoredAccounts(mut accounts) = decrypt(&fields, AAD)?;
         accounts
@@ -298,7 +302,7 @@ impl Storage<'_> {
         let lock = self.lock_sessions()?;
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::Session(_)) => Accounts::default(),
+            Err(StorageError::SessionData(_)) => Accounts::default(),
             Err(error) => return Err(error),
         };
         let key = session.addr.to_lowercase();
@@ -407,7 +411,7 @@ impl Storage<'_> {
         }
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::Session(_)) if addr.is_none() => {
+            Err(StorageError::SessionData(_)) if addr.is_none() => {
                 self.remove_session_files()?;
                 drop(lock);
                 self.emit(StorageEvent::UnreadableSessionRemoved);

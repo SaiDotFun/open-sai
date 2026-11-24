@@ -13,7 +13,7 @@ use sai_core::{
     log::{self, EventContext},
     session::{expired, renewal_command},
     settings::{Environment, Flags},
-    storage::{RemovedSession, SessionSummary, Storage, StorageEvent},
+    storage::{RemovedSession, SessionSummary, Storage, StorageError, StorageEvent},
 };
 use serde::Serialize;
 use zeroize::Zeroizing;
@@ -110,8 +110,9 @@ pub fn dispatch(
         }
         AuthCommand::Import => runtime()?.block_on(import(&storage, flags, env, json)),
         AuthCommand::Renew { addr } => {
-            let stored =
-                storage.load_session(addr.as_deref().filter(|s| !s.is_empty()).or(as_addr))?;
+            let stored = storage
+                .load_session(addr.as_deref().filter(|s| !s.is_empty()).or(as_addr))
+                .map_err(account_error)?;
             let settings = load_settings(flags, env)?;
             let endpoint = settings.endpoint();
             if stored.endpoint() != Some(endpoint) {
@@ -144,7 +145,9 @@ pub fn dispatch(
                 })?;
             let summary =
                 serde_json::to_value(session.summary()).map_err(|_| SaiError::internal())?;
-            storage.replace_session(&stored, session)?;
+            storage
+                .replace_session(&stored, session)
+                .map_err(account_error)?;
             emit(&summary, json)
         }
         AuthCommand::Status => {
@@ -154,7 +157,7 @@ pub fn dispatch(
         }
         AuthCommand::List => {
             let settings = load_settings(flags, env)?;
-            let accounts = storage.load_accounts()?;
+            let accounts = storage.load_accounts().map_err(account_error)?;
             let now = Utc::now();
             let accounts = accounts
                 .iter()
@@ -170,7 +173,7 @@ pub fn dispatch(
             emit(&AccountList { accounts }, json)
         }
         AuthCommand::Use { addr } => {
-            let session = storage.use_session(&addr)?;
+            let session = storage.use_session(&addr).map_err(account_error)?;
             emit(
                 &AccountRow {
                     summary: session.summary(),
@@ -182,8 +185,9 @@ pub fn dispatch(
             )
         }
         AuthCommand::Logout { addr } => {
-            let removed =
-                storage.delete_session(addr.as_deref().filter(|s| !s.is_empty()).or(as_addr))?;
+            let removed = storage
+                .delete_session(addr.as_deref().filter(|s| !s.is_empty()).or(as_addr))
+                .map_err(account_error)?;
             emit(
                 &Logout {
                     removed: removed.is_some(),
@@ -196,6 +200,14 @@ pub fn dispatch(
                 json,
             )
         }
+    }
+}
+
+// Python exposes account-store decoding failures as ValueError outside status.
+fn account_error(error: StorageError) -> SaiError {
+    match error {
+        StorageError::SessionData(error) => SaiError::new(Code::InvalidRequest, error.0.message),
+        error => error.into(),
     }
 }
 

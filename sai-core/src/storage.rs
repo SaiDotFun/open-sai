@@ -29,6 +29,8 @@ pub enum StorageError {
     UncertainIntent(String),
     #[error("{0}")]
     Session(#[from] SessionError),
+    #[error("{0}")]
+    SessionData(#[source] SessionError),
 }
 
 #[derive(Debug, Error)]
@@ -50,7 +52,7 @@ impl From<SessionError> for SaiError {
 impl From<StorageError> for SaiError {
     fn from(error: StorageError) -> Self {
         match error {
-            StorageError::Session(error) => error.into(),
+            StorageError::Session(error) | StorageError::SessionData(error) => error.into(),
             StorageError::NewerLedger | StorageError::UncertainIntent(_) => {
                 Self::new(Code::InvalidRequest, error.to_string())
             }

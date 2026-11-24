@@ -411,6 +411,54 @@ def renewal_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     return (executable,), cli_pair[1]
 
 
+def assert_truncated_store_parity(
+    tmp_path: Path, pair: tuple[CLI, CLI], commands: list[tuple[CLI, int, str | None]]
+) -> None:
+    observed_results = []
+    for env in homes(tmp_path, pair):
+        path = env.home / "trader" / "sessions.json"
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b'{"version":')
+        results = []
+        for command, code, error_code in commands:
+            result = env.run("--json", "auth", *command)
+            assert result.returncode == code
+            payload = json.loads(result.stdout)
+            if error_code is None:
+                assert payload["removed"] is True
+                assert not path.exists()
+            else:
+                assert payload["error"]["code"] == error_code
+                assert path.read_bytes() == b'{"version":'
+            results.append(observed(result))
+        observed_results.append(results)
+    assert observed_results[0] == observed_results[1]
+
+
+def test_auth_commands_keep_truncated_store_error_codes(
+    tmp_path: Path, auth_pair: tuple[CLI, CLI]
+) -> None:
+    assert_truncated_store_parity(
+        tmp_path,
+        auth_pair,
+        [
+            (("list",), 1, "INVALID_REQUEST"),
+            (("use", ADDR), 1, "INVALID_REQUEST"),
+            (("logout", ADDR), 1, "INVALID_REQUEST"),
+            (("status",), 1, "SESSION_UNAVAILABLE"),
+            (("logout",), 0, None),
+        ],
+    )
+
+
+def test_renew_keeps_truncated_store_error_code(
+    tmp_path: Path, renewal_pair: tuple[CLI, CLI]
+) -> None:
+    assert_truncated_store_parity(
+        tmp_path, renewal_pair, [(("renew",), 1, "INVALID_REQUEST")]
+    )
+
+
 def test_renew_matches_python_without_switching_active_account(
     tmp_path: Path,
     renewal_pair: tuple[CLI, CLI],
