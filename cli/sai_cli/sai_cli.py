@@ -1934,7 +1934,13 @@ def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
                 lines.append("Client registrations changed.")
             details = "\n".join(lines)
         else:
-            details = json.dumps(summary, indent=2)
+            hints = [r.fix for r in results if r.fix]
+            text_results = [r.to_json() for r in results]
+            for row in text_results:
+                row.pop("fix", None)
+            details = json.dumps({**summary, "results": text_results}, indent=2)
+            if hints:
+                details += "\n" + "\n".join(hints)
         report = {
             **summary,
             "results": [{**r.to_json(), "changed": r.changed} for r in results],
@@ -1983,7 +1989,7 @@ def mcp_list(ctx: click.Context) -> None:
 @click.option(
     "--repair-existing",
     type=click.Choice(mcp_install.SERVER_NAMES),
-    help="Repair only this existing Claude Code entry in the selected scope.",
+    help="Report a differing Claude Code entry or repair a legacy alias in this scope.",
 )
 @click.option(
     "--reset-args",
@@ -2010,6 +2016,8 @@ def mcp_install_command(
     normally ~/.local/bin/sai, so updates need no re-registering. For a dev
     checkout, give the server command after `--`, for example
     `sai mcp install claude -- uv run --directory ~/open-sai sai mcp serve`.
+
+    When a Claude Code entry differs, prints the commands for updating it manually.
 
     With no CLIENT and no --all, a terminal asks which clients to register;
     without a terminal, this lists detected clients and changes nothing.

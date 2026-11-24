@@ -580,6 +580,12 @@ class Outcome:
                                 "scope": repair.scope,
                                 "name": repair.name,
                                 **({"resetArgs": True} if repair.reset_args else {}),
+                                **(
+                                    {"replaceEntry": True}
+                                    if repair.replace_entry
+                                    else {}
+                                ),
+                                **({"useProfile": True} if repair.use_profile else {}),
                             }
                             for repair in check.manual_repairs
                         ],
@@ -1104,7 +1110,10 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
         mcp=tuple(
             check
             for check in checks
-            if check.status in ("fixed", "fail") or check.pinned or check.legacy_name
+            if check.status in ("fixed", "fail")
+            or check.pinned
+            or check.legacy_name
+            or check.manual_repairs
         ),
         mcp_notes=tuple(notes),
     )
@@ -1147,7 +1156,11 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         if entry["client"] == "claude" and isinstance(manual, list):
             claude_manual.extend(
                 mcp_install.ClaudeRepair(
-                    repair["scope"], repair["name"], repair.get("resetArgs") is True
+                    repair["scope"],
+                    repair["name"],
+                    repair.get("resetArgs") is True,
+                    replace_entry=repair.get("replaceEntry") is True,
+                    use_profile=repair.get("useProfile") is True,
                 )
                 for repair in manual
                 if isinstance(repair, dict)
@@ -1165,7 +1178,10 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         old_claude_notice |= old_blocked
         # Older update records used warn exclusively for a pinned launcher.
         if entry.get("pinned") is True or (
-            entry.get("status") == "warn" and not keeps_name and not old_blocked
+            entry.get("status") == "warn"
+            and not keeps_name
+            and not old_blocked
+            and not manual
         ):
             pinned.append(entry["client"])
     messages = []

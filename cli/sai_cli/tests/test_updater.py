@@ -280,11 +280,19 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         claude = repair[0]["clients"][0]
         assert claude["client"] == "claude"
         assert claude["status"] == "fail" and claude["changes"] == []
-        assert claude["manualRepairs"] == [{"scope": scope, "name": name}]
-        command = (
-            f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
-        )
-        assert command in claude["fix"]
+        repair_entry = {"scope": scope, "name": name}
+        if legacy:
+            commands = [
+                f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
+            ]
+        else:
+            repair_entry["replaceEntry"] = True
+            commands = [
+                f"claude mcp remove --scope {scope} {name}",
+                f'claude mcp add --scope {scope} {name} -- "$(command -v sai)" mcp serve',
+            ]
+        assert claude["manualRepairs"] == [repair_entry]
+        assert all(command in claude["fix"] for command in commands)
         assert state["result"]["mcp"] == repair[0]["clients"]
         if legacy:
             clients = {client["client"]: client for client in repair[0]["clients"]}
@@ -301,18 +309,18 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             updater.tick(notices.append, prefix=tool.prefix)
             assert len(notices) == 1 and message in notices[0]
             assert "sai doctor" in notices[0]
-            assert command in notices[0]
+            assert all(command in notices[0] for command in commands)
             assert "project registrations" in notices[0]
             assert state["result"]["mcpNotes"] == ["background"]
         elif mode == "deleted-cwd":
             assert "The working directory is gone." in result.stdout
-            assert command in result.stdout
+            assert all(command in result.stdout for command in commands)
             assert state["result"]["mcpNotes"] == ["cwd-missing"]
         elif mode == "json":
             assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
         else:
             assert message in result.stdout
-            assert command in result.stdout
+            assert all(command in result.stdout for command in commands)
         assert "Repaired Sai MCP registrations for claude" not in result.stdout
         if not background:
             assert updater.notice(state, "0.2.0") is None

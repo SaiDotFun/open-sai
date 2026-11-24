@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -149,6 +150,7 @@ class Result:
     path: str | None = None
     would: str | None = None
     error: str | None = None
+    fix: str | None = None
     scope: str | None = None
     shadowed_by: str | None = None
     # A client config was written, even if the check afterwards failed.
@@ -168,6 +170,7 @@ class Result:
             "path",
             "shadowed_by",
             "error",
+            "fix",
         ):
             value = getattr(self, key)
             if value is not None:
@@ -184,6 +187,8 @@ class ClaudeRepair:
     scope: str
     name: str
     reset_args: bool = False
+    replace_entry: bool = False
+    use_profile: bool = False
 
 
 @dataclass(frozen=True)
@@ -198,11 +203,26 @@ class RegistrationCheck:
     manual_repairs: tuple[ClaudeRepair, ...] = ()
 
 
+def claude_replacement_commands(entry: ClaudeRepair) -> list[str]:
+    scope_and_name = shlex.join(["--scope", entry.scope, entry.name])
+    profile = (
+        ' --env="SAI_HOME=${SAI_HOME:?Set SAI_HOME first}"' if entry.use_profile else ""
+    )
+    return [
+        f"claude mcp remove {scope_and_name}",
+        f'claude mcp add {scope_and_name}{profile} -- "$(command -v sai)" mcp serve',
+    ]
+
+
 def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
     commands = [
-        f"`sai mcp install --client claude --scope {entry.scope}"
-        f" --repair-existing {entry.name}"
-        f"{' --reset-args' if entry.reset_args else ''}`"
+        " then ".join(f"`{command}`" for command in claude_replacement_commands(entry))
+        if entry.replace_entry
+        else (
+            f"`sai mcp install --client claude --scope {entry.scope}"
+            f" --repair-existing {entry.name}"
+            f"{' --reset-args' if entry.reset_args else ''}`"
+        )
         for entry in entries
     ]
     hint = "Run " + " and ".join(commands) + "."
@@ -213,6 +233,19 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
             " The --reset-args flag replaces unsupported arguments with the defaults."
         )
     return hint
+
+
+def report_different_claude_entry(result: Result, scope: str, target: Target) -> Result:
+    entry = ClaudeRepair(
+        scope, NAME, replace_entry=True, use_profile="SAI_HOME" in target.env
+    )
+    hint = claude_repair_hint((entry,))
+    if target.explicit_command:
+        hint += " For a custom launcher, substitute your requested command after `--`."
+    result.command = None
+    result.error = f"The existing {scope} Claude Code sai registration differs from the requested settings"
+    result.fix = hint
+    return result
 
 
 def normalize_client(name: str) -> str:
@@ -555,18 +588,34 @@ class Claude(Client):
         found = []
         user = servers(data).get(name)
         if user is not None:
-            found.append(entry_registration(user, "user", disabled))
+            found.append(self.read_entry(user, "user", name, disabled))
         if self.cwd is None:
             return self.ordered([r for r in found if r is not None])
         local = servers(project).get(name)
         if local is not None:
-            found.append(entry_registration(local, "local", disabled))
+            found.append(self.read_entry(local, "local", name, disabled))
         shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
         if shared is not None:
             found.append(
-                entry_registration(shared, "project", self.project_disabled(name))
+                self.read_entry(shared, "project", name, self.project_disabled(name))
             )
         return self.ordered([r for r in found if r is not None])
+
+    @staticmethod
+    def read_entry(
+        entry: Any, scope: str, name: str, disabled: bool
+    ) -> Registration | None:
+        extras = ()
+        if (
+            name == NAME
+            and isinstance(entry, dict)
+            and (
+                entry.keys() - {"type", "command", "args", "env"}
+                or entry.get("type", "stdio") != "stdio"
+            )
+        ):
+            extras = ("custom settings",)
+        return entry_registration(entry, scope, disabled, extra_settings=extras)
 
     def project_disabled(self, name: str) -> bool:
         assert self.cwd is not None
@@ -873,13 +922,6 @@ def list_clients(
     return rows
 
 
-def replacement_steps(
-    client: Client, scope: str, target: Target, exists: bool
-) -> list[list[str]]:
-    remove = client.remove_steps(scope) if exists else []
-    return [*remove, *client.add_steps(scope, target)]
-
-
 def report_legacy_install(client: Client, reg: Registration, target: Target) -> Result:
     result = Result(
         client.name,
@@ -921,6 +963,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             if legacy is not None:
                 return report_legacy_install(client, legacy, target)
         elif isinstance(client, Claude) and existing.disabled:
+            result.command = None
             raise ClientError(
                 f"Claude Code has disabled the {existing.scope} sai registration. "
                 "Review MCP approvals and settings in the client."
@@ -937,12 +980,14 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
         if existing is not None and existing.matches(target):
             result.action = "unchanged"
             return result
+        if isinstance(client, Claude) and existing is not None:
+            return report_different_claude_entry(result, scope, target)
         action = "added" if existing is None else "replaced"
         if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = replacement_steps(client, scope, target, existing is not None)
+            steps = client.add_steps(scope, target)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", action
@@ -952,9 +997,6 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
         else:
             for argv in steps:
                 run(argv)
-                # Set per step: a remove that ran before a failed add still
-                # changed the client.
-                result.changed = True
         result.changed = True
         client.verify(scope, target)
         result.action = action
@@ -1361,6 +1403,16 @@ def repair_claude_existing(
         existing = client.registration(scope, name)
         if existing is None:
             raise ClientError(f"No existing {name} registration in {scope} scope")
+        if name == NAME:
+            if existing.disabled:
+                raise ClientError(
+                    f"Claude Code has disabled the {scope} sai registration. "
+                    "Review MCP approvals and settings in the client."
+                )
+            if not existing.matches(target):
+                return report_different_claude_entry(result, scope, target)
+            result.action = "unchanged"
+            return result
         if not existing.stdio:
             raise ClientError("The existing Claude Code entry uses a remote transport")
         stale = stale_registration(client, name, existing)
@@ -1382,6 +1434,65 @@ def repair_claude_existing(
     except (OSError, ValueError):
         result.error = "Could not edit the Claude Code registration"
     return result
+
+
+def check_claude_differences(
+    found: list[tuple[str, Registration]],
+    stale: list[StaleRegistration],
+    target: Target | None,
+    legacy_name: bool,
+) -> RegistrationCheck | None:
+    stale_by_scope = {(issue.name, issue.registration.scope): issue for issue in stale}
+    repairs = []
+    differences = []
+    manual = []
+    for name, reg in found:
+        issue = stale_by_scope.get((name, reg.scope))
+        if name == NAME:
+            if issue is None and (target is None or reg.matches(target)):
+                continue
+            if reg.disabled:
+                manual.append("Review MCP approvals and settings in Claude Code.")
+            elif target is None:
+                manual.append("Install a stable Sai launcher on PATH.")
+            else:
+                repairs.append(
+                    ClaudeRepair(
+                        reg.scope,
+                        name,
+                        replace_entry=True,
+                        use_profile="SAI_HOME" in target.env,
+                    )
+                )
+        elif issue is None:
+            continue
+        elif reg.stdio:
+            repairs.append(
+                ClaudeRepair(reg.scope, name, claude_repair_args(issue) is None)
+            )
+        else:
+            manual.append("Review the remote Sai registration in Claude Code.")
+        reason = (
+            issue.reason
+            if issue is not None
+            else "Sai registration has a different SAI_HOME setting"
+            if target is not None and not reg.matches_sai_home(target.env)
+            else "Sai registration differs from the requested settings"
+        )
+        differences.append(f"{reg.scope} {name}: {reason}")
+    if not differences:
+        return None
+    entries = tuple(repairs)
+    if entries:
+        manual.insert(0, claude_repair_hint(entries))
+    return RegistrationCheck(
+        "claude",
+        "fail" if stale else "warn",
+        ". ".join(differences),
+        " ".join(dict.fromkeys(manual)),
+        legacy_name=legacy_name,
+        manual_repairs=entries,
+    )
 
 
 def check_registration(
@@ -1416,31 +1527,11 @@ def check_registration(
     stale = [issue for _, issue in inspected if issue is not None]
     legacy_name = any(server == RETIRED_NAME for server, _ in found)
     legacy_warning = f"Sai retains its existing {RETIRED_NAME} registration name"
-    if stale and isinstance(client, Claude):
-        repairs = tuple(
-            ClaudeRepair(
-                issue.registration.scope, issue.name, claude_repair_args(issue) is None
-            )
-            for issue in stale
-            if issue.registration.stdio
-        )
-        hint = claude_repair_hint(repairs) if repairs else ""
-        if len(repairs) < len(stale):
-            hint = (
-                hint + " Review the remote Sai registration in Claude Code."
-            ).strip()
-        return RegistrationCheck(
-            name,
-            "fail",
-            ". ".join(
-                f"{issue.registration.scope} {issue.name}: {issue.reason}"
-                for issue in stale
-            ),
-            hint,
-            legacy_name=legacy_name,
-            manual_repairs=repairs,
-        )
     expected_env = server_env(client.environ) if compare_profile else {}
+    if isinstance(client, Claude):
+        claude_check = check_claude_differences(found, stale, target, legacy_name)
+        if claude_check is not None:
+            return claude_check
     different_profile = compare_profile and any(
         not reg.matches_sai_home(expected_env) for reg, _ in inspected
     )
