@@ -611,6 +611,31 @@ def test_renew_rejects_malformed_expiry_without_replacing_the_session(
     assert observed(rust.run(*args, "status")) == previous_status
 
 
+def test_renew_rejects_expired_replacement_without_replacing_the_session(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    fake_cast(rust)
+    keystore(rust, addr=ADDR)
+    args = ("--json", "--endpoint", keeper_auth["endpoint"], "auth")
+    keeper_auth["expires_at"] = "2099-01-01T00:00:00+00:00"
+    assert rust.run(*args, "login", "dev").returncode == 0
+    path = rust.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+    previous_status = observed(rust.run(*args, "status"))
+    assert previous_status[0] == 0
+
+    keeper_auth.update(token=fixture_token(ADDR, 0), expires_at="2000-01-01T00:00:00Z")
+    result = rust.run(*args, "renew")
+
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"]["message"] == (
+        "Keeper returned an already expired session"
+    )
+    assert path.read_bytes() == before
+    assert observed(rust.run(*args, "status")) == previous_status
+
+
 def test_renew_does_not_restore_a_concurrent_logout(
     tmp_path: Path, renewal_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
 ) -> None:

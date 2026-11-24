@@ -336,6 +336,13 @@ impl Storage<'_> {
             ))
             .into());
         }
+        if crate::session::expired(&renewed, chrono::Utc::now())? {
+            return Err(SessionError(SaiError::new(
+                Code::KeeperError,
+                "Keeper returned an already expired session",
+            ))
+            .into());
+        }
         accounts
             .sessions
             .insert(key.clone(), StoredSession(renewed));
