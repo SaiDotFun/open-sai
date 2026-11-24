@@ -8,7 +8,7 @@ use std::{
     io::{self, IsTerminal},
     path::Path,
     sync::{Arc, LazyLock},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use clap::Subcommand;
@@ -108,7 +108,10 @@ impl McpCommand {
             .enable_all()
             .build()
             .map_err(|_| SaiError::internal())?;
-        tokio::task::LocalSet::new().block_on(&runtime, server.serve_stdio())
+        let outcome = tokio::task::LocalSet::new().block_on(&runtime, server.serve_stdio());
+        // Tokio stdin uses a blocking read that can remain open after Ctrl-C.
+        runtime.shutdown_timeout(Duration::from_millis(100));
+        outcome
     }
 }
 
