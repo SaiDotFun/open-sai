@@ -1,5 +1,6 @@
 mod client;
 mod uninstall;
+pub(crate) mod update_repair;
 
 use std::{
     env,
@@ -378,14 +379,22 @@ pub(crate) fn checkout_root(executable: &Path) -> Option<&Path> {
 
 struct Clients {
     home: PathBuf,
-    cwd: PathBuf,
+    cwd: Option<PathBuf>,
 }
 
 impl Clients {
     fn open() -> ClientResult<Self> {
         let home = env::home_dir().ok_or("Could not determine the home directory")?;
         let cwd = env::current_dir().map_err(|_| "Could not determine the working directory")?;
-        Ok(Self { home, cwd })
+        Ok(Self {
+            home,
+            cwd: Some(cwd),
+        })
+    }
+
+    // Commands opened without a project can write only user registrations.
+    fn cwd(&self) -> &Path {
+        self.cwd.as_deref().unwrap_or(&self.home)
     }
 
     fn registrations(
@@ -394,7 +403,7 @@ impl Clients {
         name: &str,
         deadline: Instant,
     ) -> ClientResult<Vec<Registration>> {
-        client.registrations(&self.home, &self.cwd, name, deadline)
+        client.registrations(&self.home, self.cwd.as_deref(), name, deadline)
     }
 
     fn all(
@@ -476,7 +485,7 @@ impl Clients {
             return Err(format!("{} does not show the new sai entry", client.name()));
         }
         if client == Client::Codex
-            && !client::codex_get(&self.cwd, Scope::Project, name, deadline)?
+            && !client::codex_get(self.cwd(), Scope::Project, name, deadline)?
                 .as_ref()
                 .is_some_and(matches)
         {
@@ -605,6 +614,9 @@ pub(crate) struct RegistrationCheck {
     pub(crate) summary: String,
     pub(crate) fix: Option<String>,
     pub(crate) changes: Vec<String>,
+    pinned: bool,
+    legacy_name: bool,
+    manual_repairs: Vec<Value>,
 }
 
 impl RegistrationCheck {
@@ -620,6 +632,9 @@ impl RegistrationCheck {
             summary: summary.into(),
             fix: fix.into(),
             changes: Vec::new(),
+            pinned: false,
+            legacy_name: false,
+            manual_repairs: Vec::new(),
         }
     }
 }
@@ -630,20 +645,31 @@ pub(crate) fn check_registrations(
 ) -> ClientResult<Vec<RegistrationCheck>> {
     let clients = Clients::open()?;
     let target = doctor_target(&clients.home);
-    let deadline = Instant::now() + timeout;
-    Ok(CLIENTS
-        .into_iter()
-        .filter(|client| client.detected(&clients.home).is_some())
-        .map(|client| clients.check(client, target.as_ref(), fix, deadline))
-        .collect())
+    Ok(clients.check_all(target.as_ref(), fix, true, timeout))
 }
 
 impl Clients {
+    fn check_all(
+        &self,
+        target: Option<&Target>,
+        fix: bool,
+        compare_profile: bool,
+        timeout: Duration,
+    ) -> Vec<RegistrationCheck> {
+        let deadline = Instant::now() + timeout;
+        CLIENTS
+            .into_iter()
+            .filter(|client| client.detected(&self.home).is_some())
+            .map(|client| self.check(client, target, fix, compare_profile, deadline))
+            .collect()
+    }
+
     fn check(
         &self,
         client: Client,
         target: Option<&Target>,
         fix: bool,
+        compare_profile: bool,
         deadline: Instant,
     ) -> RegistrationCheck {
         let install = format!("Run `sai mcp install {}`", client.name());
@@ -682,12 +708,16 @@ impl Clients {
             .filter_map(|(name, entry, issue)| issue.as_ref().map(|issue| (*name, *entry, issue)))
             .collect::<Vec<_>>();
         if client == Client::Claude && !issues.is_empty() {
-            return claude_check(&issues);
+            let mut result = claude_check(&issues);
+            result.legacy_name = legacy;
+            return result;
         }
-        let expected_profile = profile(&self.home);
-        let different_profile = inspected
-            .iter()
-            .any(|(_, entry, _)| !entry.matches_profile(&expected_profile));
+        let different_profile = compare_profile && {
+            let expected_profile = profile(&self.home);
+            inspected
+                .iter()
+                .any(|(_, entry, _)| !entry.matches_profile(&expected_profile))
+        };
         let pinned = target.is_some_and(|target| {
             inspected.iter().any(|(_, entry, issue)| {
                 issue.is_none()
@@ -758,6 +788,8 @@ impl Clients {
         } else {
             check("fixed", "Sai registration repaired", None)
         };
+        result.pinned = result.status == "warn" && pinned;
+        result.legacy_name = legacy;
         result.changes = changes;
         result
     }
@@ -809,12 +841,12 @@ impl Clients {
             )
         };
         if client == Client::Codex {
-            Client::repair_codex(&self.home, &self.cwd, name, &target, entry, deadline)
+            Client::repair_codex(&self.home, self.cwd(), name, &target, entry, deadline)
         } else {
             client.write(
                 entry.scope,
                 &self.home,
-                &self.cwd,
+                self.cwd(),
                 name,
                 &target,
                 Some(entry),
@@ -832,10 +864,16 @@ fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
         .collect::<Vec<_>>()
         .join(". ");
     let mut commands = Vec::new();
+    let mut manual_repairs = Vec::new();
     let mut reset = false;
     let mut project = false;
     for (name, entry, issue) in issues.iter().filter(|(_, entry, _)| entry.stdio) {
         let needs_reset = claude_args(entry, issue).is_none();
+        let mut repair = json!({"scope": entry.scope.name(), "name": name});
+        if needs_reset {
+            repair["resetArgs"] = json!(true);
+        }
+        manual_repairs.push(repair);
         reset |= needs_reset;
         project |= entry.scope != Scope::User;
         let flag = if needs_reset { " --reset-args" } else { "" };
@@ -861,7 +899,9 @@ fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
         }
         hint.push_str("Review the remote Sai registration in Claude Code.");
     }
-    RegistrationCheck::new(Client::Claude, "fail", summary, Some(hint))
+    let mut result = RegistrationCheck::new(Client::Claude, "fail", summary, Some(hint));
+    result.manual_repairs = manual_repairs;
+    result
 }
 
 impl McpArgs {
@@ -1090,7 +1130,7 @@ impl Clients {
                 client.write(
                     scope,
                     &self.home,
-                    &self.cwd,
+                    self.cwd(),
                     name,
                     &replacement,
                     Some(&entry),
@@ -1198,19 +1238,25 @@ impl Clients {
             result.report["argv"] = json!([add]);
             step = Some(add);
         } else {
-            result.report["path"] = json!(client.path(scope, &self.home, &self.cwd));
+            result.report["path"] = json!(client.path(scope, &self.home, self.cwd()));
         }
         if dry {
             result.planned(action);
             return Ok(());
         }
         if let Some(step) = step {
-            client::run_step(&step, &self.cwd, deadline)?;
+            client::run_step(&step, self.cwd(), deadline)?;
         } else if let Some(old) = existing.filter(|_| client == Client::Claude) {
-            client.replace_claude(&self.home, &self.cwd, NAMES[0], target, old, deadline)?;
+            client.replace_claude(&self.home, self.cwd(), NAMES[0], target, old, deadline)?;
         } else {
             client.write(
-                scope, &self.home, &self.cwd, NAMES[0], target, None, deadline,
+                scope,
+                &self.home,
+                self.cwd(),
+                NAMES[0],
+                target,
+                None,
+                deadline,
             )?;
         }
         result.changed = true;

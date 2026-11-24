@@ -144,7 +144,7 @@ impl Clients {
         if client == Client::Codex && scope == Scope::Project {
             return Err(CODEX_PROJECT_ENTRY.into());
         }
-        let path = client.path(scope, &self.home, &self.cwd);
+        let path = client.path(scope, &self.home, self.cwd());
         let step = if client == Client::Claude {
             let executable = client.executable().ok_or("`claude` is not on PATH")?;
             let args = [
@@ -167,7 +167,7 @@ impl Clients {
         }
         if let Some(step) = step {
             client::check_writable(&path)?;
-            client::run_step(&step, &self.cwd, deadline)?;
+            client::run_step(&step, self.cwd(), deadline)?;
             result.changed = true;
         } else {
             result.changed = client.remove(&path, name, entry, deadline)?;
@@ -192,7 +192,7 @@ impl Clients {
             return Err(format!("{} still shows the sai entry", client.name()));
         }
         if client == Client::Codex
-            && client::codex_get(&self.cwd, Scope::Project, name, deadline)?.is_some()
+            && client::codex_get(self.cwd(), Scope::Project, name, deadline)?.is_some()
         {
             return Err(CODEX_STILL_ACTIVE.into());
         }

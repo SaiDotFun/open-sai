@@ -75,23 +75,31 @@ impl Client {
     pub(super) fn registrations(
         self,
         home: &Path,
-        cwd: &Path,
+        cwd: Option<&Path>,
         name: &str,
         deadline: Instant,
     ) -> Result<Vec<Registration>> {
         if self == Self::Codex {
             let neutral = self.codex_neutral(home);
             let user = codex_get(&neutral, Scope::User, name, deadline)?;
-            let project = if resolved(&neutral) == resolved(cwd) {
-                None
-            } else {
+            let project = if let Some(cwd) = cwd.filter(|cwd| resolved(&neutral) != resolved(cwd)) {
                 codex_get(cwd, Scope::Project, name, deadline)?
                     .filter(|entry| user.as_ref().is_none_or(|user| user.raw != entry.raw))
+            } else {
+                None
             };
             return Ok(project.into_iter().chain(user).collect());
         }
 
-        let user = read_json(&self.path(Scope::User, home, cwd), deadline)?;
+        let user = read_json(&self.path(Scope::User, home, home), deadline)?;
+        let Some(cwd) = cwd else {
+            let entry = &user["mcpServers"][name];
+            return Ok(
+                Registration::new(entry.clone(), entry, Scope::User, false, Vec::new())
+                    .into_iter()
+                    .collect(),
+            );
+        };
         let project = read_json(&self.path(Scope::Project, home, cwd), deadline)?;
         let local = &user["projects"][cwd.to_string_lossy().as_ref()];
         let disabled = self == Self::Claude && has_name(&local["disabledMcpServers"], name);
