@@ -45,7 +45,20 @@ uv run pytest tests/parity/test_intent_wait.py tests/parity/test_trade_wait.py
 
 `PASS` means the selected invocation or MCP tool call matched. `LISTED`
 means the MCP tool's schema and metadata matched in `tools/list`.
-`DEFERRED` marks a CLI command that needs another fixture.
+`DEFERRED` marks a CLI command awaiting a fixture or a native implementation.
+
+## Auth Security Parity
+
+The namespace matrix compares rejected import operands and malformed stored
+expiry in text and JSON against the native auth implementation from
+[PR #106](https://github.com/SaiDotFun/open-sai/pull/106). Those four cases
+disable logging. The auth regression tests check output and log redaction
+directly, including Python MCP stdio responses.
+
+The matrix omits `auth-use-missing` while the native diagnostic quotes the
+unregistered operand. Python returns a fixed diagnostic and omits argument
+values from auth command logs. Native auth logging also differs from Python
+when the command includes an argument value.
 
 ## Compare MCP Stdio
 
