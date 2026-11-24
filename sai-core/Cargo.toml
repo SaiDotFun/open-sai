@@ -8,5 +8,16 @@ repository.workspace = true
 publish = false
 
 [dependencies]
+aes = { version = "0.8", features = ["zeroize"] }
+aes-gcm = { version = "0.10", features = ["zeroize"] }
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["now", "std"] }
+rusqlite = { version = "0.38", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json.workspace = true
+sha2 = "0.10"
+tempfile.workspace = true
+thiserror = "2"
 toml_edit.workspace = true
 toml_parser.workspace = true
+zeroize = "1"
