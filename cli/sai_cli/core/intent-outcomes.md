@@ -1,9 +1,15 @@
 # Keeper Intent Outcomes
 
-Use the latest `userIntents` record for the requested key and account. Match
-the account against Keeper's `evmAddress` or `nibiAddress`, ignoring case.
-An unkeyed account list records pending results for local intents. It leaves
-history checks and terminal updates to keyed reconciliation.
+Use the latest `userIntents` record for the requested key and account. Decode
+the request to a canonical EVM account. Keeper's `evmAddress` and any supplied
+`nibiAddress` must decode to that same account. Verify the Bech32 checksum
+when decoding a Nibiru address. Use the requested account for ledger writes.
+[Bech32 checksum specification](https://bips.dev/173/#checksum)
+
+An unkeyed account list records pending results for local intents and
+restores the block on an `absent` row when Keeper reports late admission.
+It leaves ordinary admissions, history checks, and terminal updates to
+keyed reconciliation.
 
 Python callers can import `classify_outcome(row)` and its return type
 `IntentOutcome` from `sai_cli.core.reconcile`. The classifier uses only the
@@ -68,7 +74,7 @@ first read has no match, it tries once more after 250 ms with a two-second
 request timeout cap per read. It stops on a history request error. Later
 status checks can pick up history that arrives after both reads.
 
-A history row must have the same `intentKey`, a `trade.trader` matching one
-of the lifecycle record's addresses, and a request hash matching that
+A history row must have the same `intentKey`, a `trade.trader` that decodes
+to the requested account, and a request hash matching the lifecycle
 record's `txHash`. Compare history's `txHash` and `evmTxHash` ignoring case
 and any `0x` prefix.

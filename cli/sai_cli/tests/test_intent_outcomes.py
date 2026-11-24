@@ -29,6 +29,9 @@ FIXTURE = json.loads(
 ADDR = FIXTURE["address"]
 KEY = FIXTURE["key"]
 RESPONSES = {**FIXTURE["recorded"], **FIXTURE["replays"]}
+NIBI_ADDR = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
+OTHER_ADDR = "0x" + "b" * 40
+OTHER_NIBI_ADDR = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 Reply = str | dict[str, Any]
 
 
@@ -59,7 +62,7 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
                 reply = RESPONSES[queued] if isinstance(queued, str) else queued
             if "userIntents" in reply["data"]:
                 assert request["query"] == keeper.INTENTS
-                assert request["variables"]["user"] == ADDR
+                assert request["variables"]["user"].lower() in (ADDR, NIBI_ADDR)
                 assert request["variables"]["key"] in (KEY, None)
             elif "tradeHistory" in reply["data"].get("perp", {}):
                 assert request["query"] == keeper.HISTORY
@@ -390,15 +393,65 @@ def test_terminal_ledger_ignores_late_admission_and_provisional_results():
     assert storage.mark_absent(KEY, endpoint, ADDR, 0) == "terminal"
 
 
-def test_late_admission_restores_block_after_an_empty_keeper_read(keeper_replay):
+@pytest.mark.parametrize("lookup_key", [KEY, None])
+def test_late_admission_restores_block_after_an_empty_keeper_read(
+    keeper_replay, lookup_key
+):
     endpoint, replies = keeper_replay
     reserve(endpoint, expired=True)
     replies.extend(("absent", "accepted", "pending_exec"))
     assert reconcile.reconcile(endpoint, ADDR, KEY)["localStatus"] == "absent"
-    assert reconcile.reconcile(endpoint, ADDR, KEY)["localStatus"] == "pending"
+    recovered = reconcile.reconcile(endpoint, ADDR, lookup_key)
+    outcome = recovered if lookup_key else recovered["userIntents"][0]
+    assert outcome["outcome"] == "pending"
+    assert status(endpoint) == "pending"
     with pytest.raises(ValueError, match=KEY):
         storage.pending("another-open", endpoint, ADDR, "OPEN_TRADE", "")
     assert reconcile.reconcile(endpoint, ADDR, KEY)["localStatus"] == "pending"
+
+
+def test_unkeyed_admission_preserves_an_unknown_block(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    replies.append("accepted")
+    reconcile.reconcile(endpoint, ADDR)
+    assert status(endpoint) == "unknown"
+    with pytest.raises(ValueError, match=KEY):
+        storage.pending("another-open", endpoint, ADDR, "OPEN_TRADE", "")
+
+
+@pytest.mark.parametrize(
+    ("lookup_addr", "evm", "nibi"),
+    [
+        (NIBI_ADDR, OTHER_ADDR, NIBI_ADDR),
+        (ADDR, ADDR, OTHER_NIBI_ADDR),
+        (ADDR, ADDR, NIBI_ADDR[:-1] + "q"),
+    ],
+)
+def test_conflicting_or_invalid_account_alias_cannot_clear_a_block(
+    keeper_replay, lookup_addr, evm, nibi
+):
+    endpoint, replies = keeper_replay
+    storage.pending(KEY, endpoint, evm, "OPEN_TRADE", "")
+    storage.set_status(KEY, endpoint, evm, "pending")
+    failure = RESPONSES["market_order_expired"]["data"]["userIntents"][0]
+    replies.append(
+        {"data": {"userIntents": [{**failure, "evmAddress": evm, "nibiAddress": nibi}]}}
+    )
+
+    assert reconcile.reconcile(endpoint, lookup_addr, KEY)["userIntents"] == []
+    assert storage.list_pending(endpoint, evm)[0]["status"] == "pending"
+    with pytest.raises(ValueError, match=KEY):
+        storage.pending("another-open", endpoint, evm, "OPEN_TRADE", "")
+
+
+def test_nibiru_lookup_updates_the_canonical_evm_ledger(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    replies.append("market_order_expired")
+    data = reconcile.reconcile(endpoint, NIBI_ADDR.upper(), KEY)
+    assert data["userIntents"][0]["lifecycleStep"] == "exec_fail"
+    assert status(endpoint) == "terminal"
 
 
 @pytest.mark.parametrize("provisional", ["pending_exec", "outcome_not_indexed"])
