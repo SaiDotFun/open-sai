@@ -357,7 +357,11 @@ Sai omits null, unrecognized, and invalid row fields and lowercases valid
 transaction hashes. A malformed hash or timestamp adds the corresponding
 flag with value `true`. The flags are `txHashInvalid`,
 `evmTxHashInvalid`, `execBlockTsInvalid`, and `block.block_tsInvalid`.
-Use `outcome` and `localStatus` to check the intent's progress.
+
+Use `outcome` and `localStatus` when present. If both are absent, read the
+latest row's `lifecycleStep` and `execActor` together. A server `exec_pass`
+confirms the intent succeeded. Matching trade history can arrive later.
+[Keeper lifecycle and actor mapping](https://github.com/SaiDotFun/open-sai/blob/main/cli/sai_cli/core/intent-outcomes.md#keeper-intent-outcomes)
 
 On an intent error, `errorCode` keeps recognized codes such as
 `wallet_rejected` and `rpc_submission_failed`. Sai uses `KEEPER_ERROR`
