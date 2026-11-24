@@ -284,6 +284,8 @@ def loopback(
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
+    if scenario == "mcp-reads":
+        status = {**status, "txHash": TRADE_REQUEST_HASH}
     history = {
         "id": 7,
         "intentKey": INTENT,
