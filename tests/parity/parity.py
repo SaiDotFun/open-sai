@@ -69,6 +69,7 @@ class Case:
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
     mcp_deferred_trade_exception: bool = False
+    mcp_native_wire: list[str] | None = None
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -428,7 +429,12 @@ def observe(
     ended_at = time.time()
     if endpoints.errors:
         raise ValueError(endpoints.errors[0])
-    actual, expected = [request.label for request in endpoints.wire], case.wire or []
+    wire = (
+        case.mcp_native_wire
+        if candidate and case.mcp_native_wire is not None
+        else case.wire
+    )
+    actual, expected = [request.label for request in endpoints.wire], wire or []
     if case.command == "doctor":
         actual, expected = sorted(actual), sorted(expected)
     if actual != expected:

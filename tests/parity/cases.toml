@@ -748,6 +748,8 @@ mcp_profile = "reads"
 seed = "ledger"
 server = "mcp-reads"
 wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
+# Rust still reconciles with the older history query. The response must match.
+mcp_native_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
 
 [[case]]
 name = "mcp-argument-validation"
