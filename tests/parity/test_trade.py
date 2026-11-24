@@ -324,6 +324,37 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
             assert not rows(home)
 
 
+def test_non_ascii_market_id_is_an_accepted_parity_divergence(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("trade-accepted") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "empty")
+            code, result, stderr = run(
+                cli,
+                home,
+                endpoints,
+                (*OPEN, "--market", "٣", "--dry-run"),
+                python=index == 0,
+            )
+            assert stderr == ""
+            if index == 0:
+                assert code == 0
+                assert (
+                    result["intent"]["body"]["market"]["marketIndex"]
+                    == "MarketIndex(3)"
+                )
+            else:
+                assert code == 2
+                assert (
+                    result["error"]["message"]
+                    == "Invalid value for '--market': '٣' is not a valid integer."
+                )
+            assert not endpoints.wire
+            assert not rows(home)
+
+
 @pytest.mark.parametrize(
     ("args", "intent"),
     [
