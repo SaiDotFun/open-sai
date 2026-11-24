@@ -150,15 +150,22 @@ def test_ping_during_exclusive_ledger_lock(native: Path, tmp_path: Path) -> None
         assert json.loads(response["result"]["content"][0]["text"])["intents"]
 
 
-def test_cancelling_market_read_closes_keeper_connection(
-    native: Path, tmp_path: Path
+@pytest.mark.parametrize(
+    ("tool", "arguments"),
+    [
+        ("market_list", {}),
+        ("intent_wait", {"key": INTENT, "addr": ADDRESS}),
+    ],
+)
+def test_cancelling_read_closes_keeper_connection(
+    native: Path, tmp_path: Path, tool: str, arguments: dict[str, Any]
 ) -> None:
     with (
         loopback("mcp-cancel") as endpoints,
         server(native, tmp_path / "home", endpoints) as stdio,
     ):
-        stdio.send("tools/call", id_=2, name="market_list", arguments={})
-        assert endpoints.interrupt_ready.wait(3), "Keeper did not receive market_list"
+        stdio.send("tools/call", id_=2, name=tool, arguments=arguments)
+        assert endpoints.interrupt_ready.wait(3), f"Keeper did not receive {tool}"
         stdio.send("notifications/cancelled", requestId=2, reason="fixture")
         assert stdio.receive() == {
             "jsonrpc": "2.0",
@@ -512,7 +519,6 @@ def test_stdout_failure_ends_session_with_stdin_open(
     ("tool", "arguments"),
     [
         ("account_overview", {"addr": ADDRESS}),
-        ("intent_wait", {"key": INTENT, "timeout": "1e_0"}),
         ("logs_intent", {"key": INTENT, "offline": True}),
         ("logs_intent", {"key": INTENT, "offline": False}),
     ],
@@ -587,3 +593,22 @@ def test_auth_switch_succeeds_after_legacy_cleanup_failure(
             b"Could not remove legacy session file trader/session.json"
             in stdio.proc.stderr.readline()
         )
+
+
+def test_intent_wait_reports_unknown_when_account_lookup_is_locked(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="ledger") as stdio,
+        closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as database,
+    ):
+        database.execute("BEGIN EXCLUSIVE")
+        result = stdio.call(2, "intent_wait", key=INTENT)
+        report = json.loads(result["content"][0]["text"])
+        assert report["outcome"] == "unknown"
+        assert report["code"] == "OUTCOME_UNKNOWN"
+        assert report["addr"] is None
+        assert "addrSource" not in report
+        assert not endpoints.wire

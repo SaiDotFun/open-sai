@@ -538,6 +538,8 @@ def check_mcp_calls(output: Any, profile: str) -> None:
             None if call.expected == "ok" else call.expected
         ):
             raise ValueError(f"{call.tool} expected MCP result {call.expected}")
+        if call.outcome is not None and text.get("outcome") != call.outcome:
+            raise ValueError(f"{call.tool} expected intent outcome {call.outcome}")
 
 
 def differences(reference: Observation, candidate: Observation) -> list[str]:

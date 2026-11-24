@@ -48,6 +48,7 @@ class Call:
     expected: str = "ok"
     session: str | None = None
     switch_active: str | None = None
+    outcome: str | None = None
 
     def request(self, id_: int, endpoints: Endpoints) -> dict[str, Any]:
         return {
@@ -149,6 +150,18 @@ CALLS = {
         Call("intent_wait", {"key": "{intent}", "timeout": []}, "invalid"),
         Call("intent_wait", {"key": "{intent}", "timeout": "later"}, "invalid"),
         Call("intent_wait", {"key": "{intent}", "deadline": 1}, "invalid"),
+        Call("intent_wait", {"key": "{intent}", "timeout": 0}, "INVALID_REQUEST"),
+        Call("intent_wait", {"key": "{intent}", "addr": "invalid"}, "INVALID_REQUEST"),
+        Call("intent_wait", {"key": "{intent}"}, "SESSION_UNAVAILABLE"),
+    ),
+    "wait-final": (Call("intent_wait", {"key": "{intent}"}, outcome="filled"),),
+    "wait-pending": (
+        Call(
+            "intent_wait",
+            {"key": "{intent}", "addr": "{addr}", "timeout": "7e-1"},
+            "OUTCOME_UNKNOWN",
+            outcome="unknown",
+        ),
     ),
     "logs-validation": (
         Call("logs_intent", expected="invalid"),

@@ -215,31 +215,31 @@ fn integer_string(text: &str) -> Option<Value> {
 }
 
 fn number(value: &Value) -> Conversion {
-    const TYPE: (&str, &str) = ("Input should be a valid number", "float_type");
-    const PARSING: (&str, &str) = (
-        "Input should be a valid number, unable to parse string as a number",
-        "float_parsing",
-    );
+    if float_value(value).is_some() {
+        return Ok(None);
+    }
+    if value.is_string() {
+        return Err((
+            "Input should be a valid number, unable to parse string as a number",
+            "float_parsing",
+        ));
+    }
+    Err(("Input should be a valid number", "float_type"))
+}
+
+pub(super) fn float_value(value: &Value) -> Option<f64> {
     match value {
-        Value::Bool(_) => Ok(None),
-        Value::Number(number) => {
-            if is_integer(value) && number.as_f64().is_none() {
-                return Err(TYPE);
-            }
-            Ok(None)
-        }
+        Value::Bool(flag) => Some(f64::from(u8::from(*flag))),
+        Value::Number(number) if is_integer(value) => number.as_f64(),
+        Value::Number(number) => number.as_str().parse().ok(),
         Value::String(text) => {
             let text = text.trim();
             if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
-                return Err(PARSING);
+                return None;
             }
-            // The deferred wait handler has no use for the converted value yet.
-            text.replace('_', "")
-                .parse::<f64>()
-                .map(|_| None)
-                .map_err(|_| PARSING)
+            text.replace('_', "").parse().ok()
         }
-        _ => Err(TYPE),
+        _ => None,
     }
 }
 

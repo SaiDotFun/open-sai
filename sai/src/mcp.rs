@@ -30,6 +30,7 @@ use sai_core::{
     reconcile,
     settings::{Environment, Flags, Settings},
     storage::{Storage, StorageEvent},
+    wait,
 };
 use serde_json::{Map, Value, json};
 use tokio::sync::Semaphore;
@@ -37,6 +38,7 @@ use uuid::Uuid;
 
 use crate::reads::output;
 
+const MCP_WAIT_LIMIT: Duration = Duration::from_secs(10);
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
 // Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.
 static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
@@ -162,6 +164,7 @@ impl SaiMcp {
             "market_list" => keeper::MARKETS,
             "market_prices" => keeper::PRICES,
             "mcp_info" => return self.info(&storage).await,
+            "intent_wait" => return self.wait_for_intent(args, call_id).await,
             "auth_list" | "auth_status" | "auth_use" => {
                 return self
                     .auth(name, args.get("addr").and_then(Value::as_str), call_id)
@@ -299,6 +302,73 @@ impl SaiMcp {
                 }
             })?;
             Ok(keeper::public_intent_status(&home, &data))
+        })
+        .await
+    }
+
+    async fn wait_for_intent(
+        &self,
+        args: &Map<String, Value>,
+        call_id: &str,
+    ) -> Result<Value, SaiError> {
+        let started = Instant::now();
+        let seconds = args
+            .get("timeout")
+            .and_then(validation::float_value)
+            .unwrap_or(MCP_WAIT_LIMIT.as_secs_f64());
+        let timeout = wait::validate_timeout(seconds)?.min(MCP_WAIT_LIMIT);
+        let key = args["key"]
+            .as_str()
+            .ok_or_else(SaiError::internal)?
+            .to_owned();
+        let addr = args.get("addr").and_then(Value::as_str).map(str::to_owned);
+        let home = self.env.home.clone();
+        let endpoint = self.settings.endpoint().to_owned();
+        let writer = self.writer.clone();
+        let call_id = call_id.to_owned();
+        let runtime = tokio::runtime::Handle::current();
+        let (_cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
+        Self::blocking_work(&self.reconcile_slots, move || {
+            let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
+                .with_tool("intent_wait", &call_id);
+            let log_storage = |event: StorageEvent<'_>| {
+                crate::local::storage_event_with_endpoint(events, event, Some(&endpoint))
+            };
+            let storage = Storage::new(&home)
+                .with_busy_timeout(Duration::ZERO)
+                .with_event_sink(&log_storage);
+            runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    _ = cancel => Err(SaiError::internal()),
+                    result = async {
+                        let local = if addr.is_none() {
+                            storage.intent_record(&endpoint, &key)
+                        } else {
+                            Ok(None)
+                        };
+                        let account = match local {
+                            Ok(Some((owner, _))) => Map::from_iter([
+                                ("addr".into(), json!(owner)),
+                                ("addrSource".into(), json!("ledger")),
+                            ]),
+                            Ok(None) => session::resolve_addr(
+                                &storage, &endpoint, addr.as_deref().filter(|addr| !addr.is_empty()),
+                            )?,
+                            Err(error) if wait::ledger_busy(&error) => {
+                                return Ok(wait_result(Map::new(), wait::unknown_result(&key)));
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        let addr = account["addr"].as_str().expect("resolved account address");
+                        let receipt = wait::for_intent(
+                            &endpoint, addr, &key, timeout, started, &storage, events,
+                        )
+                        .await?;
+                        Ok(wait_result(account, receipt))
+                    } => result,
+                }
+            })
         })
         .await
     }
@@ -545,6 +615,19 @@ fn log_call(events: EventContext<'_>, tool: Option<&Tool>, args: &Map<String, Va
             ),
         ],
     );
+}
+
+fn wait_result(mut account: Map<String, Value>, receipt: wait::ResultReceipt) -> Value {
+    let wait::ResultReceipt { outcome, mut body } = receipt;
+    if outcome == wait::Outcome::Unknown {
+        body["hint"] =
+            json!("Call intent_wait again with the same key and address. Do not resubmit.");
+    }
+    let Value::Object(body) = body else {
+        unreachable!("wait returns a receipt object");
+    };
+    account.extend(body);
+    Value::Object(account)
 }
 
 fn tool_result(value: Value) -> CallToolResult {

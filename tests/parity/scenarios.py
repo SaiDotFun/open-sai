@@ -401,6 +401,18 @@ def loopback(
 
     responses["intentTradeHistory"] = responses["tradeHistory"]
     responses["waitUserIntents"] = responses["userIntents"]
+    if scenario == "mcp-wait-final":
+        history.update(
+            tradeChangeType="position_closed_user", block={"block": status["execBlock"]}
+        )
+    elif scenario == "mcp-wait-pending":
+        responses["waitUserIntents"] = {
+            "data": {
+                "userIntents": [
+                    {**status, "intentKey": INTENT, "lifecycleStep": "pending_exec"}
+                ]
+            }
+        }
     variables = {
         "tradeHistory": {"trader": ADDRESS},
         "intentTradeHistory": {"trader": ADDRESS, "limit": 25, "offset": 0},
