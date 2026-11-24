@@ -94,12 +94,13 @@ def test_skill_source(
         assert result.returncode == 0 and result.stderr == b""
         report = json.loads(result.stdout)
         location = Path(report.pop("path"))
-        if index == 0:
-            assert (location / "SKILL.md").read_bytes() == (
-                SKILL / "SKILL.md"
-            ).read_bytes()
-        else:
-            assert location.samefile(cli[0])
+        assert location.is_absolute() and location.is_dir()
+        for page in SKILL.rglob("*.md"):
+            assert (
+                location / page.relative_to(SKILL)
+            ).read_bytes() == page.read_bytes()
+        repeated = cli_json(cli, root, "skill", "source")
+        assert Path(repeated["path"]) == location
         assert report.pop("cliVersion")
         assert Path(report["install"].pop("defaultDir")) == root / ".agents/skills/sai"
         reports.append(report)

@@ -12,6 +12,7 @@ use sai_core::{
     settings::repr,
 };
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::local;
 
@@ -139,16 +140,34 @@ fn source_record() -> Value {
         .unwrap_or(Value::Null)
 }
 
+fn source_dir() -> Result<PathBuf, SaiError> {
+    let cache = env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+        .map_or_else(|| user_home().map(|home| home.join(".cache")), Ok)?;
+    let mut digest = Sha256::new();
+    for &(name, data) in FILES {
+        for bytes in [name.as_bytes(), data] {
+            digest.update((bytes.len() as u64).to_be_bytes());
+            digest.update(bytes);
+        }
+    }
+    let target =
+        absolute(&cache.join(format!("sai/skills/{:x}", digest.finalize()))).map_err(io_error)?;
+    install_dir(&target, false)?;
+    Ok(target)
+}
+
 fn source(json_output: bool) -> Result<(), SaiError> {
     let record = source_record();
     let directory = default_dir()?;
-    let executable = env::current_exe().map_err(io_error)?;
+    let source = source_dir()?;
     let version = env!("CARGO_PKG_VERSION");
     let pages = pages();
     if json_output {
         return local::emit(
             &json!({
-                "name": "sai", "cliVersion": version, "path": executable,
+                "name": "sai", "cliVersion": version, "path": source,
                 "pages": pages, "repositories": {"cli": CLI_REPOSITORY, "skill": SKILL_REPOSITORY},
                 "source": {
                     "repository": record["repository"].as_str().unwrap_or(SKILL_REPOSITORY),
@@ -161,7 +180,7 @@ fn source(json_output: bool) -> Result<(), SaiError> {
     }
     println!(
         "Skill:      sai (packaged with sai {version})\nPath:       {}\nPages:      {}\nCLI repo:   {CLI_REPOSITORY}\nSkill repo: {SKILL_REPOSITORY}\nSynced at:  {}\nInstall:\n  sai skill install    (copies it to {})\n  {NPX_INSTALL}",
-        executable.display(),
+        source.display(),
         pages.join(", "),
         record["commit"].as_str().unwrap_or("not recorded"),
         directory.display()
@@ -353,8 +372,7 @@ fn action(target: &Path, force: bool) -> Result<&'static str, SaiError> {
     Ok(outcome)
 }
 
-fn install(target: &Path, force: bool, json_output: bool) -> Result<(), SaiError> {
-    let target = absolute(target).map_err(io_error)?;
+fn install_dir(target: &Path, force: bool) -> Result<&'static str, SaiError> {
     let parent = target.parent().ok_or_else(SaiError::internal)?;
     fs::create_dir_all(parent).map_err(io_error)?;
     #[cfg(unix)]
@@ -363,11 +381,16 @@ fn install(target: &Path, force: bool, json_output: bool) -> Result<(), SaiError
         directory.lock().map_err(io_error)?;
         directory
     };
-    let action = if action(&target, force)? == "unchanged" {
-        "unchanged"
+    if action(target, force)? == "unchanged" {
+        Ok("unchanged")
     } else {
-        replace_dir(&target, force)?
-    };
+        replace_dir(target, force)
+    }
+}
+
+fn install(target: &Path, force: bool, json_output: bool) -> Result<(), SaiError> {
+    let target = absolute(target).map_err(io_error)?;
+    let action = install_dir(&target, force)?;
     let record = source_record();
     let commit = record["commit"].as_str();
     if json_output {

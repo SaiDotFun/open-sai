@@ -100,7 +100,7 @@ checked on both sides.
 | --- | --- |
 | Text and structured output | The run's absolute temporary home path |
 | Stdout from `--version`, `skill source`, `update --check`, `doctor`, and MCP initialization | Running or installed CLI versions at the documented fields |
-| `skill source` | Absolute package location. Python reports a directory, and Rust reports the binary that embeds the files. |
+| `skill source` | Absolute package directory containing the bundled skill files. |
 | Doctor checks | `generatedAt` and check durations, including durations embedded in network-check summaries |
 | `update.json` | `checkedAt` |
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
