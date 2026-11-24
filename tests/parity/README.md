@@ -65,6 +65,12 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
 
+## Python References in Rust CI
+
+The Rust CI job sets `SAI_PARITY_PYTHON` to the `sai` executable built from
+the Python tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
+Use that executable to reproduce the release comparison locally.
+
 ## Auth Subprocess Cases
 
 Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.

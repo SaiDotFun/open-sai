@@ -12,20 +12,19 @@ import socket
 import sqlite3
 import ssl
 import subprocess
-import sys
 import threading
 import time
 from collections import deque
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sai_cli.core import keeper, log, reconcile, storage
+from compare import Normalize
+from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
 from websockets.http11 import Request as UpgradeRequest
 from websockets.http11 import Response as UpgradeResponse
@@ -44,25 +43,6 @@ NIBI = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
 OTHER = "0x" + "b" * 40
 OTHER_NIBI = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 CLI = tuple[str, ...]
-# Rust C4 targets the public error codes from the pinned Python contract.
-C4_INTENT_ERROR_CODES = frozenset(
-    {
-        "SLIPPAGE",
-        "simulation_failed",
-        "admission_expired",
-        "broadcast_rejected",
-        "chain_execution_failed",
-        "market_order_expired",
-        "market_order_fill_failed",
-        "market_order_trading_paused",
-        "market_order_market_closed",
-        "market_order_trade_not_open",
-        "market_order_outcome_not_indexed",
-        "intent_already_used",
-        "below_minimum",
-        "insufficient_idle",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -173,16 +153,9 @@ def read_events(home: Path) -> list[dict[str, Any]]:
     ]
     groups: dict[str, list[int]] = {}
     for event in events:
-        run = event["runId"]
-        event["runId"] = list(groups).index(run) if run in groups else len(groups)
-        seq = groups.setdefault(run, [])
-        seq.append(event["seq"])
-        for dynamic in ("ts", "pid", "durationMs"):
-            if dynamic in event:
-                assert isinstance(event[dynamic], str if dynamic == "ts" else int)
-                event[dynamic] = "<dynamic>"
+        groups.setdefault(event["runId"], []).append(event["seq"])
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
-    return events
+    return Normalize(home).log_records(events)
 
 
 def read_state(home: Path) -> tuple[Any, ...]:
@@ -246,75 +219,6 @@ class Step:
     json_output: bool = True
 
 
-def c4_timestamp_field(
-    projected: dict[str, Any], source: dict[str, Any], field: str
-) -> dict[str, Any]:
-    """Use the original C4 timezone-aware ISO parser on the pinned CLI value."""
-    value = source.get(field)
-    timestamp = None
-    if isinstance(value, str) and len(value) <= 40:
-        with suppress(ValueError):
-            if datetime.fromisoformat(value).tzinfo is not None:
-                timestamp = value
-
-    # A timestamp and its invalid flag occupy the same slot in the projection.
-    invalid = field + "Invalid"
-    return {
-        (field if name == invalid else name): (
-            timestamp if name in (field, invalid) else value
-        )
-        for name, value in projected.items()
-        if name not in (field, invalid) or timestamp is not None
-    }
-
-
-def public_intent_output(output: bytes, *, compact: bool) -> bytes:
-    """Project pinned CLI stdout to the Rust C4 field contract."""
-    document = json.loads(output)
-    public = reconcile.status_report(document)
-    for name in ("userIntents", "matchedTradeHistory"):
-        if name not in public:
-            continue
-        rows = (row for row in document[name] if isinstance(row, dict))
-        for index, source in enumerate(rows):
-            row = public[name][index]
-            if name == "userIntents":
-                row = c4_timestamp_field(row, source, "execBlockTs")
-                if "errorCode" in row and row["errorCode"] not in C4_INTENT_ERROR_CODES:
-                    row["errorCode"] = "KEEPER_ERROR"
-                public[name][index] = row
-            elif isinstance(block := source.get("block"), dict):
-                row["block"] = c4_timestamp_field(row["block"], block, "block_ts")
-    return (
-        json.dumps(log.clean(public), indent=None if compact else 2) + "\n"
-    ).encode()
-
-
-def test_pinned_projection_preserves_c4_timestamps():
-    c4_time = "2026-11-20 15:43:31.1234567890123456Z"
-    document = {
-        "userIntents": [
-            {"execBlockTs": c4_time, "txHash": "a" * 64},
-            {"execBlockTs": "2026-11-20T15:43:31"},
-        ],
-        "matchedTradeHistory": [
-            {"block": {"block": 123, "block_ts": c4_time}},
-            {"block": {"block_ts": "invalid"}},
-        ],
-    }
-    expected = {
-        "userIntents": [{"execBlockTs": c4_time, "txHash": "a" * 64}, {}],
-        "matchedTradeHistory": [
-            {"block": {"block": 123, "block_ts": c4_time}},
-            {"block": {}},
-        ],
-    }
-    assert (
-        public_intent_output(json.dumps(document).encode(), compact=True)
-        == (json.dumps(expected) + "\n").encode()
-    )
-
-
 def compare(
     cli_pair: tuple[CLI, CLI],
     root: Path,
@@ -346,7 +250,8 @@ def compare(
                 assert not replies
                 assert [request.body for request in requests] == [
                     wire(keeper.INTENTS, user=step.addr, key=step.key),
-                    *[wire(keeper.HISTORY, trader=step.addr)] * (len(step.replies) - 1),
+                    *[wire(keeper.INTENT_HISTORY, trader=step.addr, limit=25, offset=0)]
+                    * (len(step.replies) - 1),
                 ]
                 if step.json_output:
                     assert not result.stderr
@@ -365,10 +270,7 @@ def compare(
                     assert (
                         next(row for row in rows if row[0] == "foreign")[4] == "unknown"
                     )
-                stdout = result.stdout
-                if index == 0 and step.code == 0:
-                    stdout = public_intent_output(stdout, compact=step.json_output)
-                runs.append((stdout, result.stderr, list(requests), state))
+                runs.append((result.stdout, result.stderr, list(requests), state))
             observed.append((runs, read_events(home)))
         assert observed[0] == observed[1]
 
@@ -454,7 +356,7 @@ def test_split_history_headers_keep_the_inactivity_timer_alive(
     )
 
 
-def test_empty_history_object_retries(
+def test_malformed_history_page_stays_pending_without_retry(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -464,7 +366,7 @@ def test_empty_history_object_retries(
         cli_pair,
         tmp_path,
         monkeypatch,
-        (Step(("outcome_not_indexed", empty, "filled_history"), "terminal"),),
+        (Step(("outcome_not_indexed", empty), "pending"),),
     )
 
 
@@ -584,13 +486,13 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
         ((Reply(b"malformed"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
-        (({"data": {"userIntents": 123}},), "unknown", "INCOMPLETE_DATA"),
-        (({"data": {"userIntents": [None]}},), "unknown", "INTERNAL_ERROR"),
-        (("outcome_not_indexed", {"data": {}}), "pending", "INCOMPLETE_DATA"),
+        (({"data": {"userIntents": 123}},), "unknown", None),
+        (({"data": {"userIntents": [None]}},), "unknown", None),
+        (("outcome_not_indexed", {"data": {}}), "pending", None),
         (
             ("outcome_not_indexed", {"data": {"perp": {"tradeHistory": None}}}),
             "pending",
-            "INCOMPLETE_DATA",
+            None,
         ),
     ],
 )
@@ -600,11 +502,10 @@ def test_request_and_data_failures(
     monkeypatch: pytest.MonkeyPatch,
     replies: tuple[str | dict[str, Any] | Reply, ...],
     local: str,
-    error: str,
+    error: str | None,
 ) -> None:
-    compare(
-        cli_pair, tmp_path, monkeypatch, (Step(replies, local, code=1, error=error),)
-    )
+    step = Step(replies, local, code=1 if error else 0, error=error)
+    compare(cli_pair, tmp_path, monkeypatch, (step,))
 
 
 @pytest.mark.parametrize("operation", ["intents", "history"])
@@ -621,12 +522,8 @@ def test_intent_status_logs_only_public_graphql_codes(
             {"message": diagnostic, "extensions": {"code": "BAD_USER_INPUT"}},
         ],
     }
-    # The Python checkout has the current logging policy. C4's pinned CLI
-    # predates it and remains the reference for the other reconciliation tests.
-    candidate = cli_pair[1]
-    reference = (sys.executable, "-m", "sai_cli.sai_cli")
     with replay() as (endpoint, replies, requests):
-        for index, cli in enumerate((reference, candidate)):
+        for index, cli in enumerate(cli_pair):
             home = tmp_path / str(index)
             requests.clear()
             expected_requests = [wire(keeper.INTENTS, user=ADDR, key=KEY)]
@@ -761,12 +658,8 @@ def test_cli_errors_share_one_envelope(
         payload = json.loads(result.stdout)
         assert payload["error"]["code"] == code
         if code == "SIGNED_OUT":
-            endpoint = keeper.MAINNET_HTTP
-            expected_hint = (
-                f"sai --endpoint {endpoint} auth login NAME"
-                if index == 0
-                else origin_login_hint(endpoint.removesuffix("/query"))
-            )
+            origin = None if index == 0 else keeper.MAINNET_HTTP.removesuffix("/query")
+            expected_hint = origin_login_hint(origin)
             assert payload["error"].pop("hint") == expected_hint
             outputs.append(payload)
         else:
@@ -789,10 +682,11 @@ def test_intent_help(
     assert outputs[0] == outputs[1]
 
 
-def origin_login_hint(origin: str) -> str:
+def origin_login_hint(origin: str | None) -> str:
+    suffix = f" at {origin}" if origin else ""
     return (
         'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
+        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL{suffix}}}"'
         " auth login NAME"
     )
 
@@ -826,15 +720,7 @@ def test_expired_auth_status(
         assert result.stderr == b""
         payload = json.loads(result.stdout)
         assert payload["error"]["code"] == "SESSION_EXPIRED"
-        if index == 1:
-            login = origin_login_hint(origin)
-        elif path == "/query":
-            login = f"sai --endpoint {endpoint} auth login NAME"
-        else:
-            login = (
-                'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-                'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
-            )
+        login = origin_login_hint(origin if index == 1 else None)
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
         observed.append((payload, read_events(home)))
     assert observed[0] == observed[1]
@@ -891,10 +777,6 @@ def test_public_intent_status_scrubs_keeper_payload(
                 wire(keeper.INTENTS, user=ADDR, key=KEY)
             ]
             output = result.stdout
-            if index == 0:
-                # The pinned CLI returns raw rows. Compare the public
-                # projection and always check Rust stdout as emitted.
-                output = public_intent_output(output, compact=json_output)
             assert token.encode() not in output
             assert private.encode() not in output
             envelope = json.loads(output)
@@ -1261,12 +1143,7 @@ def test_keeper_tls_trust_matches_httpx(
             )
             if not trusted:
                 assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
-            stdout = (
-                public_intent_output(result.stdout, compact=True)
-                if index == 0 and trusted
-                else result.stdout
-            )
-            observed.append((stdout, list(requests)))
+            observed.append((result.stdout, list(requests)))
         assert observed[0] == observed[1]
 
 

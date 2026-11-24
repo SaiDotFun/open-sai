@@ -150,12 +150,12 @@ jobs:
       - run: cargo test --locked --workspace
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
 
-      # Use the C4 Python reference in sai/README.md on both PR and push runs.
+      # Use the published Python reference on both PR and push runs.
       - name: Check out the Python parity reference
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf
+          ref: refs/tags/sai-cli/v0.1.2
           path: .parity-python
           persist-credentials: false
 

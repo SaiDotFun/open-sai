@@ -21,12 +21,11 @@ balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 
 ## Port Order
 
-C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
-uses Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf` for
-Keeper requests, reconciliation, structured errors, and emitted events.
-Every Keeper query logs only public GraphQL error codes and an error count,
-following the current Python reference below.
-Logging v2 and intent wait have their own port work. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
+C2 and C3 started against Python tag `sai-cli/v0.1.1`. C4 started against
+Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf`. Rust CI checks C4
+against the published Python tag `sai-cli/v0.1.2` at commit
+`8557a7e13dceab0accc369191182c8e01423c91b`. That release shipped logging
+schema v2 and intent wait. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
 C5 compares read and watch commands against Python on `main` at
 `ea09f0d417a53a71079bb8c5e426005fa29051a4`. These commands emit schema v2
 events, including keyed endpoint IDs for Keeper HTTP reads.
