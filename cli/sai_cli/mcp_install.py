@@ -62,6 +62,7 @@ class Target:
 
     argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
+    explicit_command: bool = False
 
 
 @dataclass(frozen=True)
@@ -259,7 +260,7 @@ def server_target(
     `~/.local/bin/sai` link that `uv tool` keeps across updates.
     """
     if override:
-        return Target(list(override), server_env(environ)), []
+        return Target(list(override), server_env(environ), explicit_command=True), []
     found = shutil.which("sai", path=environ.get("PATH"))
     if found is None:
         raise InstallError(
@@ -832,6 +833,11 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
         result.error = (
             f"The existing {RETIRED_NAME} registration needs repair. {stale.reason}. "
             "Run `sai doctor` for repair instructions."
+        )
+    elif target.explicit_command and reg.argv != target.argv:
+        result.error = (
+            f"Kept the existing {RETIRED_NAME} registration and skipped the requested "
+            "server command. Edit the existing registration in the client to change it."
         )
     if result.error is not None:
         result.action = "failed"

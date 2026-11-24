@@ -1033,6 +1033,47 @@ def test_ordinary_claude_install_preserves_the_legacy_entry(env: Env, stale: boo
         assert env.calls() == []
 
 
+@pytest.mark.parametrize("different", [True, False])
+def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
+    env: Env, different: bool
+):
+    config = env.home / ".claude.json"
+    config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    OLD_COMMAND: claude_entry(serve(env), {"CUSTOM": SECRET})
+                },
+            }
+        )
+    )
+    before = config.read_bytes()
+    command = ["uv", "run", "--directory", f"/src/{SECRET}", "sai", "mcp", "serve"]
+    if not different:
+        command = serve(env)
+
+    result = invoke("mcp", "install", "claude", "--", *command)
+
+    if different:
+        error = failure(result)
+        assert f"Kept the existing {OLD_COMMAND} registration" in error
+        assert "skipped the requested server command" in error
+        summary = payload(result)["error"]["details"]
+    else:
+        assert result.exit_code == 0, result.output
+        summary = payload(result)
+    [row] = summary["results"]
+    assert (row["name"], row["scope"], row["action"]) == (
+        OLD_COMMAND,
+        "user",
+        "failed" if different else "unchanged",
+    )
+    assert not summary["reconnectNeeded"]
+    assert SECRET not in result.output
+    assert config.read_bytes() == before
+    assert not env.calls()
+
+
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):
     args = ("mcp", "install", "--client", "claude", "--repair-existing", OLD_COMMAND)
     config = env.home / ".claude.json"
