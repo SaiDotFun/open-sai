@@ -674,9 +674,14 @@ def run_case(
         report = error["details"]
         report["results"][0]["changed"] = False
         report["reconnectNeeded"] = False
-        error["message"] = error["message"].removesuffix(
-            "\nClient registrations changed."
-        )
+        reconnect = "\nClient registrations changed."
+        error["message"] = error["message"].removesuffix(reconnect)
+        if log := left.files.get("logs/cli.jsonl"):
+            for record in log.data:
+                if record["event"] == "command.end" and isinstance(
+                    record.get("error"), str
+                ):
+                    record["error"] = record["error"].removesuffix(reconnect)
         filename = "clients/.codex/config.toml"
         left.files[filename] = right.files[filename]
         left = replace(
