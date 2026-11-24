@@ -33,7 +33,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
-from sai_cli.core import keeper, storage
+from sai_cli.core import keeper, log, storage
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
@@ -303,6 +303,75 @@ def test_agent_import_without_clipboard_asks_for_a_terminal(env: Env) -> None:
     assert not (env.home / "trader" / "sessions.json").exists()
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize(
+    "form", ["operand", "escaped", "unknown-option", "option-value"]
+)
+def test_import_usage_omits_rejected_operands(env: Env, json_output: bool, form: str):
+    secret = "synthetic-import-credential-marker"
+    operands = {
+        "operand": (secret, make_token()),
+        "escaped": ("--", f"--{secret}"),
+        "unknown-option": (f"--{secret}",),
+        "option-value": (f"--help={secret}",),
+    }[form]
+    flags = ("--json",) if json_output else ()
+    env.clipboard()
+    result = env.run(*flags, "auth", "import", *operands)
+
+    assert result.returncode == 2
+    assert all(
+        operand not in result.stdout + result.stderr
+        for operand in operands
+        if operand != "--"
+    )
+    stored = env.stored_bytes()
+    assert secret.encode() not in stored
+    assert b"command.start" in stored and b"command.end" in stored
+    assert env.log.read_text() == ""
+    assert not (env.home / "trader" / "sessions.json").exists()
+    message = "Unexpected arguments to auth import."
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": message,
+            "retryable": False,
+        }
+    else:
+        assert result.stdout == ""
+        assert f"Error: {message}" in result.stderr
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("form", ["root", "group", "root-value", "leaf", "subcommand"])
+def test_auth_usage_and_logs_omit_values(
+    env: Env, json_output: bool, form: str
+) -> None:
+    marker = "synthetic-auth-parser-credential-marker"
+    args = {
+        "root": (f"--{marker}", "auth", "import"),
+        "group": ("auth", f"--{marker}", "import"),
+        "root-value": ("--as", marker, "auth", "import", "extra"),
+        "leaf": ("auth", "login", f"--{marker}"),
+        "subcommand": ("auth", marker),
+    }[form]
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, *args)
+
+    assert result.returncode == 2
+    assert marker not in result.stdout + result.stderr
+    records = env.stored_bytes()
+    assert marker.encode() not in records
+    assert b"command.start" in records and b"command.end" in records
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"]["code"] == "INVALID_REQUEST"
+    else:
+        assert not result.stdout
+        assert "Usage:" in result.stderr and "Error:" in result.stderr
+
+
 def test_invalid_clipboard_is_not_echoed_or_cleared(env: Env) -> None:
     secret = "not-a-jwt-but-maybe-a-password"
     expired = make_token(hours=-1)
@@ -500,6 +569,186 @@ def test_accounts_connect_switch_and_disconnect(env: Env) -> None:
     status = env.run("auth", "status")
     assert status.returncode != 0
     assert "No active Sai account" in status.stderr
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_auth_use_keeps_unregistered_input_private(env: Env, json_output: bool) -> None:
+    marker = "synthetic-unregistered-account-credential-marker"
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, "auth", "use", marker)
+
+    assert result.returncode == 1
+    assert marker not in result.stdout + result.stderr
+    assert "Requested account is not connected" in result.stdout + result.stderr
+    records = env.stored_bytes()
+    assert marker.encode() not in records
+    assert b"command.end" in records and b"session.active" not in records
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize(
+    "expiry", ["synthetic-expiry-credential-marker", "2031-02-03T04:05:06"]
+)
+def test_use_rejects_malformed_expiry_before_switching(
+    env: Env, monkeypatch: pytest.MonkeyPatch, json_output: bool, expiry: str
+) -> None:
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    token = make_token()
+    with log.silenced():
+        storage.save_session({**session_for(token), "expiresAt": expiry})
+        storage.save_session({**session_for(make_token(OTHER)), "evmAddress": OTHER})
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    output = result.stdout + result.stderr
+    stored = env.stored_bytes()
+    for secret in (token, expiry):
+        assert secret not in output
+        assert secret.encode() not in stored
+    assert b"command.end" in stored and b"session.active" not in stored
+    assert path.read_bytes() == before
+    assert storage.load_accounts()["active"] == OTHER
+    message = f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"] == {
+            "code": "SESSION_UNAVAILABLE",
+            "message": message,
+            "retryable": False,
+        }
+    else:
+        assert result.stdout == ""
+        assert result.stderr == f"Error: {message}\n"
+
+
+def test_use_reports_success_when_legacy_cleanup_fails(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = "synthetic-cli-legacy-cleanup-credential"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    other = {**session_for(make_token(OTHER)), "evmAddress": OTHER}
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: session_for(marker), OTHER: other}}
+    )
+    legacy = env.home / "trader" / "session.json"
+    legacy.mkdir()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 0
+    response = json.loads(result.stdout)
+    assert response["addr"] == ADDR and response["active"] is True
+    assert "Could not remove legacy session file trader/session.json" in result.stderr
+    assert marker not in result.stdout + result.stderr
+    assert marker.encode() not in env.stored_bytes()
+    events = [
+        json.loads(line)
+        for _, _, path in log.log_files(env.home / "logs")
+        for line in path.read_text().splitlines()
+    ]
+    assert [
+        event["addr"] for event in events if event["event"] == "session.active"
+    ] == [ADDR]
+    assert storage.load_accounts()["active"] == ADDR
+    assert legacy.is_dir()
+
+
+@pytest.mark.parametrize("same_account", [True, False])
+def test_use_redacts_known_credentials_in_endpoint(
+    env: Env, monkeypatch: pytest.MonkeyPatch, same_account: bool
+) -> None:
+    marker = "Synthetic-Cli-Origin-Credential"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    selected = session_for(marker if same_account else make_token())
+    selected["endpoint"] = f"https://{marker}.example.invalid/query"
+    other = session_for(make_token(OTHER) if same_account else marker)
+    other["evmAddress"] = OTHER
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: selected, OTHER: other}}
+    )
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 0 and result.stderr == ""
+    assert json.loads(result.stdout)["endpoint"] == log.REDACTED
+    assert marker.lower() not in result.stdout.lower()
+    assert marker.lower().encode() not in env.stored_bytes().lower()
+    assert storage.load_accounts()["active"] == ADDR
+
+
+@pytest.mark.parametrize("corruption", ["endpoint", "address", "address-mismatch"])
+def test_use_refuses_malformed_session_before_switching(
+    env: Env, monkeypatch: pytest.MonkeyPatch, corruption: str
+) -> None:
+    marker = "synthetic-cli-switch-credential-marker"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    selected: dict[str, Any] = session_for(marker)
+    if corruption == "endpoint":
+        selected["endpoint"] = {"value": marker}
+    else:
+        selected["evmAddress"] = marker if corruption == "address" else OTHER
+    storage._save_accounts(
+        {
+            "active": OTHER,
+            "sessions": {
+                ADDR: selected,
+                OTHER: {**session_for(make_token(OTHER)), "evmAddress": OTHER},
+            },
+        }
+    )
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    assert marker not in result.stdout + result.stderr
+    assert json.loads(result.stdout)["error"]["code"] == "SESSION_UNAVAILABLE"
+    assert f"invalid {corruption.split('-')[0]}" in result.stdout
+    assert marker.encode() not in env.stored_bytes()
+    assert b"session.active" not in env.stored_bytes()
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("without_expiry", [False, True])
+@pytest.mark.parametrize("version", [2, 3])
+def test_use_classifies_non_string_or_missing_expiry_as_unavailable(
+    env: Env, monkeypatch: pytest.MonkeyPatch, version: int, without_expiry: bool
+) -> None:
+    marker = "synthetic-expiry-type-credential-marker"
+    numeric_marker = 5427086319284057731
+    selected: dict[str, Any] = session_for(marker)
+    if without_expiry:
+        del selected["expiresAt"]
+    else:
+        selected["expiresAt"] = numeric_marker
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    if version == 2:
+        write_v2_session(env.home, selected)
+        path = env.home / "trader" / "session.json"
+    else:
+        storage._save_accounts({"active": None, "sessions": {ADDR: selected}})
+        path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    stored = env.stored_bytes()
+    assert b"command.end" in stored and b"session.active" not in stored
+    for value in (marker, str(numeric_marker)):
+        assert value not in result.stdout + result.stderr
+        assert value.encode() not in stored
+    assert json.loads(result.stdout)["error"] == {
+        "code": "SESSION_UNAVAILABLE",
+        "message": storage.INVALID_EXPIRY,
+        "retryable": False,
+    }
+    assert path.read_bytes() == before
 
 
 def test_tampered_session_cannot_be_unlocked(env: Env) -> None:
@@ -962,6 +1211,45 @@ def test_renew_uses_saved_name_and_preserves_active_account(env: Env, keeper_aut
     assert "auth import" in refused.stderr
     assert endpoint not in refused.stderr
     assert len(keeper_auth["signatures"]) == 2
+
+
+@pytest.mark.parametrize("command", [("login", "dev"), ("renew", ADDR)])
+@pytest.mark.parametrize("numeric_expiry", [True, False])
+def test_auth_refuses_malformed_issued_expiry_before_saving(
+    env: Env,
+    keeper_auth: dict[str, Any],
+    command: tuple[str, str],
+    numeric_expiry: bool,
+) -> None:
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    args = ("--json", "--endpoint", keeper_auth["endpoint"], "auth")
+    assert env.run(*args, "login", "dev").returncode == 0
+    env.clipboard()
+    env.clip.write_text(make_token(OTHER))
+    assert env.run(*args, "import").returncode == 0
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    marker = "synthetic-issued-session-credential-marker"
+    expiry = 6754981276043819275 if numeric_expiry else marker
+    keeper_auth.update(token=marker, expires_at=expiry)
+    result = env.run(*args, *command)
+
+    assert result.returncode == 1 and result.stderr == ""
+    assert json.loads(result.stdout)["error"] == {
+        "code": "KEEPER_ERROR",
+        "message": "Keeper returned an invalid session expiry",
+        "retryable": False,
+    }
+    for value in (marker, str(expiry)):
+        assert value not in result.stdout
+        assert value.encode() not in env.stored_bytes()
+    assert len(keeper_auth["signatures"]) == 2
+    assert path.read_bytes() == before
+    status = env.run(*args, "status")
+    assert status.returncode == 0
+    assert json.loads(status.stdout)["addr"] == OTHER
 
 
 def test_renew_refuses_a_key_that_changed_address(env: Env, keeper_auth):
