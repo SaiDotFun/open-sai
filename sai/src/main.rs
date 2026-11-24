@@ -144,7 +144,7 @@ fn main() -> process::ExitCode {
                             local::auth(command, cli.account.as_deref(), &flags, env, json, events)
                         }
                         Command::Intent { command, .. } => {
-                            local::intent(command, &flags, env, json)
+                            local::intent(command, &flags, env, json, events)
                         }
                         Command::Config { command } => command.run(&flags, env, json),
                     }
@@ -222,7 +222,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" => "",
-        "intent local" | "auth use" => " ADDR",
+        "intent status" | "intent local" | "auth use" => " ADDR",
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
@@ -322,6 +322,7 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("auth", "use") => "auth use",
                     ("auth", "logout") => "auth logout",
                     ("intent", "local") => "intent local",
+                    ("intent", "status") => "intent status",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);
@@ -354,9 +355,8 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
                 format!("No such option {}.", repr(argument))
             } else {
                 let consumed = match command {
-                    "config get" | "config unset" | "intent local" | "auth use" | "auth logout" => {
-                        1
-                    }
+                    "config get" | "config unset" | "intent status" | "intent local"
+                    | "auth use" | "auth logout" => 1,
                     "config set" => 2,
                     _ => 0,
                 };
@@ -394,6 +394,10 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
     while let Some(arg) = operands.next() {
         match arg {
             "--" if options => options = false,
+            "--key" if options && command == "intent status" => {
+                operands.next();
+            }
+            arg if options && command == "intent status" && arg.starts_with("--key=") => {}
             "--json"
                 if options && (command.starts_with("intent ") || command.starts_with("auth ")) => {}
             _ => positional.push(arg),
@@ -409,7 +413,7 @@ fn print_parse_error(
     json: bool,
     home: Option<&Path>,
 ) -> (ExitCode, Option<SaiError>) {
-    let help = || config::help(command);
+    let help = || config::help(command).or_else(|| local::intent_help(command));
     match error.kind() {
         ErrorKind::DisplayHelp => {
             if let Some(help) = help() {
@@ -424,7 +428,7 @@ fn print_parse_error(
             return (ExitCode::Ok, None);
         }
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
-            if command == "config"
+            if matches!(command, "config" | "intent")
                 && let Some(help) = help()
             {
                 let error = SaiError::usage(help);

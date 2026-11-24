@@ -7,16 +7,18 @@ use chrono::Utc;
 use clap::Subcommand;
 use sai_core::{
     errors::{Code, SaiError},
-    log::{EventContext, Level},
+    keeper,
+    log::{EventContext, Field, Level},
+    reconcile,
     session::expired,
     settings::{Environment, Flags},
-    storage::{RemovedSession, SessionSummary, Storage, StorageEvent},
+    storage::{IntentStatus, RemovedSession, SessionSummary, Storage, StorageEvent},
 };
 use serde::Serialize;
 use serde_json::json;
 use serde_json::ser::{Formatter, PrettyFormatter};
 
-use crate::load_settings;
+use crate::{load_settings, usage};
 
 #[derive(Subcommand)]
 pub enum AuthCommand {
@@ -32,8 +34,32 @@ pub enum AuthCommand {
 
 #[derive(Subcommand)]
 pub enum IntentCommand {
+    /// Read Keeper's latest intent records and record local pending fills.
+    #[command(args_override_self = true)]
+    Status {
+        addr: String,
+        /// Specific intent key.
+        #[arg(long)]
+        key: Option<String>,
+    },
     /// List locally recorded intents for an account.
     Local { addr: String },
+}
+
+pub fn intent_help(command: &str) -> Option<String> {
+    let help = match command {
+        "intent" => {
+            "  Inspect and reconcile trading request outcomes.\n\nOptions:\n  --help  Show this message and exit.\n\nCommands:\n  local   List locally recorded intent identities for ADDR.\n  status  Read Keeper's latest intent records and record local pending..."
+        }
+        "intent status" => {
+            "  Read Keeper's latest intent records and record local pending fills.\n\n  Use --key to check one intent for a final outcome.\n\nOptions:\n  --key TEXT  Specific intent key.\n  --help      Show this message and exit."
+        }
+        "intent local" => {
+            "  List locally recorded intent identities for ADDR.\n\nOptions:\n  --help  Show this message and exit."
+        }
+        _ => return None,
+    };
+    Some(format!("{}\n\n{help}", usage(command)))
 }
 
 #[derive(Serialize)]
@@ -128,10 +154,27 @@ pub fn intent(
     flags: &Flags,
     env: &Environment,
     json: bool,
+    events: EventContext<'_>,
 ) -> Result<(), SaiError> {
-    let storage = Storage::new(&env.home);
+    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
+    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let settings = load_settings(flags, env)?;
     match command {
+        IntentCommand::Status { addr, key } => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| SaiError::internal())?;
+            let data = runtime.block_on(reconcile::reconcile(
+                settings.endpoint(),
+                &addr,
+                key.as_deref(),
+                keeper::TIMEOUT,
+                &storage,
+                events,
+            ))?;
+            emit(&data, json)
+        }
         IntentCommand::Local { addr } => {
             emit(&storage.list_pending(settings.endpoint(), &addr)?, json)
         }
@@ -139,16 +182,46 @@ pub fn intent(
 }
 
 fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
-    if let StorageEvent::SessionExpired { addr, expires_at } = event {
-        events.event(
-            "session.expired",
-            Level::Warn,
-            [
-                ("code", json!(Code::SessionExpired).into()),
-                ("addr", json!(addr).into()),
-                ("expiresAt", json!(expires_at).into()),
-            ],
-        );
+    match event {
+        StorageEvent::IntentStatus {
+            key,
+            kind,
+            previous,
+            status,
+            addr,
+            endpoint,
+        } => {
+            let code = match status {
+                IntentStatus::Rejected => Some(Code::AdmissionRejected),
+                IntentStatus::NotSent => Some(Code::NotSent),
+                _ => None,
+            };
+            events.event(
+                "intent.status",
+                Level::Info,
+                [
+                    ("intentKey", json!(key).into()),
+                    ("kind", json!(kind).into()),
+                    ("previous", json!(previous).into()),
+                    ("status", json!(status.as_str()).into()),
+                    ("addr", json!(addr).into()),
+                    ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("code", json!(code).into()),
+                ],
+            );
+        }
+        StorageEvent::SessionExpired { addr, expires_at } => {
+            events.event(
+                "session.expired",
+                Level::Warn,
+                [
+                    ("code", json!(Code::SessionExpired).into()),
+                    ("addr", json!(addr).into()),
+                    ("expiresAt", json!(expires_at).into()),
+                ],
+            );
+        }
+        _ => {}
     }
 }
 
