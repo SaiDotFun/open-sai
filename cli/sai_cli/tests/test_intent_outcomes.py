@@ -471,10 +471,8 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
         assert exit_code == 1
         error = blocked["error"]
         assert error["intentKey"] == key and error["retryable"] is False
-        assert (
-            error["hint"]
-            == f"sai --endpoint {endpoint} intent status {ADDR} --key {key}"
-        )
+        assert error["hint"].endswith(f"intent status {ADDR} --key {key}")
+        assert endpoint not in error["hint"]
     assert error["code"] == "RECENT_OPEN_PENDING"
     assert submitted_keys == [key]
 
@@ -1239,8 +1237,9 @@ def test_wait_unknown_returns_call_again_hint(keeper_replay, surface):
         )
         assert command.exit_code == 5, command.output
         result = json.loads(command.output)
-        assert f"intent wait {KEY}" in result["hint"]
-        assert endpoint in result["hint"]
+        assert result["hint"].endswith(f"intent wait {KEY} --addr {ADDR}")
+        assert "SAI_RECONCILE_ENDPOINT" in result["hint"]
+        assert endpoint not in result["hint"]
         assert result["error"]["intentKey"] == KEY
     else:
         result = mcp_wait(endpoint, timeout=0.2)
@@ -1329,7 +1328,10 @@ def test_cli_wait_budgets_initial_locked_ledger_lookup(keeper_replay):
     result = json.loads(command.stdout)
     assert result["error"]["code"] == "OUTCOME_UNKNOWN"
     assert result["error"]["intentKey"] == KEY
-    assert result["error"]["hint"] == f"sai --endpoint {endpoint} intent wait {KEY}"
+    hint = result["error"]["hint"]
+    assert hint.endswith(f"intent wait {KEY}")
+    assert "SAI_RECONCILE_ENDPOINT" in hint
+    assert endpoint not in hint
     assert status(endpoint) == "unknown"
 
 
