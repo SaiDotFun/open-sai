@@ -128,7 +128,7 @@ impl<'a> Trading<'a> {
     pub fn load_session(&self, account: Option<&str>) -> Result<Session, SaiError> {
         Ok(self
             .storage
-            .load_active_session(self.keeper.endpoint(), account)?)
+            .load_active_trade_session(self.keeper.endpoint(), account)?)
     }
 
     pub fn check_open_pending(
@@ -166,12 +166,12 @@ impl<'a> Trading<'a> {
     ) -> Result<(AcceptedTrade, Option<String>), SaiError> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
-        self.storage.check_active(session, endpoint)?;
+        self.storage.check_active_trade(session, endpoint)?;
         let mut prepared;
         let preview = if preview.requires_market_price_refresh() {
             prepared = preview.clone();
             self.refresh_market_open(&mut prepared).await?;
-            self.storage.check_active(session, endpoint)?;
+            self.storage.check_active_trade(session, endpoint)?;
             let price = prepared
                 .reference_price
                 .as_deref()
