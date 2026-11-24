@@ -87,7 +87,7 @@ def change_config() -> None:
     path.write_text(text, encoding="utf-8")
 
 
-def rollover() -> None:
+def stamp_logs_in_past() -> None:
     assert log.flush()
     logs = SAI_HOME / "logs"
     events = []
@@ -96,19 +96,13 @@ def rollover() -> None:
             json.loads(line) for line in source.read_text(encoding="utf-8").splitlines()
         )
         source.unlink()
-    assert len(events) >= 2
-    if MUTATION == "midnight-order":
-        events[0], events[1] = events[1], events[0]
-    for index, event in enumerate(events):
-        early = index == 0
-        day = "2026-11-24" if early else "2026-11-25"
-        event["ts"] = f"{day}T23:59:59Z" if early else f"{day}T00:00:{index:02d}Z"
-        if MUTATION == "midnight-wrong-file":
-            day = "2026-11-25"
-        target = logs / f"cli-{day}.jsonl"
-        with target.open("a", encoding="utf-8") as file:
+    assert events
+    target = logs / "cli-2000-01-01.jsonl"
+    with target.open("w", encoding="utf-8") as file:
+        for event in events:
+            event["ts"] = "2000-01-01" + event["ts"][10:]
             file.write(json.dumps(event) + "\n")
-        target.chmod(0o600)
+    target.chmod(0o600)
 
 
 if MUTATION.startswith("history-"):
@@ -149,5 +143,5 @@ finally:
         change_schema()
     elif MUTATION.startswith("config-"):
         change_config()
-    elif MUTATION.startswith("midnight-"):
-        rollover()
+    elif MUTATION == "stale-log":
+        stamp_logs_in_past()

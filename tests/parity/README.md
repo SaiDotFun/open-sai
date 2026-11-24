@@ -17,6 +17,11 @@ sockets that could reach a host service. The driver stops at startup if it canno
 the isolated network or find a native `uv` executable that runs with a
 temporary home.
 
+The default pytest run includes the comparison unit tests. CI selects the
+namespace-dependent candidate tests with
+`uv run pytest -m parity_namespace tests/parity` after provisioning the
+loopback prerequisites.
+
 The default run compares Python with Python. Set `SAI_PARITY_BIN` to an
 executable path or a command on `PATH` to compare a port. Arguments belong in
 `cases.toml`. The runner prints a Markdown report to stdout and exits 1 if
@@ -78,7 +83,9 @@ contents. It parses TOML values and checks that edits preserve the existing
 config text outside the edited value, including its inline comment. It
 authenticates and decrypts session envelopes. It reads SQLite schema SQL,
 indexes, user version, columns, and typed rows from a copy with its journal
-files. SQLite row order and physical page layout may vary.
+files. SQL whitespace, comments, and unquoted ASCII case may vary. Column
+types, constraints, literal values, and table options such as `WITHOUT ROWID`
+are compared. SQLite row order and physical page layout may vary.
 The runner parses `update.json` as JSON and compares other files byte for
 byte. The report names differing paths and fields.
 
@@ -93,7 +100,7 @@ checked on both sides.
 | `update.json` | `checkedAt` |
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
 | Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps. The latter must be stored as REAL Unix seconds within the invocation window. |
-| Log file grouping | Dated files for each surface are merged in UTC date order. Each event must belong to the date in the file name. |
+| Log file grouping | Dated files for each surface are merged in UTC date order. Each event must belong to the file's date and fall within that run's invocation window at millisecond precision. |
 | Log events | `ts`, `durationMs`, `pid`, `runId`, `callId`, generated `intentKey`, and CLI version. The `doctor.result` and `update.check` events use the same rules as their stdout reports. |
 
 Generated IDs use the same placeholder wherever the original ID reappears

@@ -171,7 +171,12 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
-    history = {"id": 7, "intentKey": INTENT, "trade": {"id": 7}}
+    history = {
+        "id": 7,
+        "intentKey": INTENT,
+        "txHash": status["txHash"],
+        "trade": {"id": 7, "trader": ADDRESS},
+    }
     responses = {
         "oneClickTrading": {
             "data": {
@@ -191,7 +196,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "userIntents": {
             "data": {
                 "userIntents": (
-                    [] if scenario == "absent" else [{**status, "intentKey": INTENT}]
+                    []
+                    if scenario == "absent"
+                    else [{**status, "intentKey": INTENT, "nibiAddress": None}]
                 )
             }
         },

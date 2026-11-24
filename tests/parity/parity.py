@@ -26,6 +26,7 @@ import click
 from compare import (
     LEDGER,
     Entry,
+    InvalidLogTime,
     Normalize,
     config_text,
     first_difference,
@@ -264,6 +265,7 @@ def observe(
             result = first.result()
     else:
         result = run(binary, args, home, env)
+    ended_at = time.time()
     if endpoints.errors:
         raise ValueError(endpoints.errors[0])
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
@@ -281,7 +283,9 @@ def observe(
             after_config = config_text(after_config, key)
         if before_config != after_config:
             raise ValueError("config.toml changed text outside the edited value")
-    normalize = Normalize(home, concurrent=concurrent, started_at=started_at)
+    normalize = Normalize(
+        home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
+    )
     files = snapshot(home / "sai", normalize)
     check_state(case.state or {}, files)
     try:
@@ -293,6 +297,8 @@ def observe(
                     contender.stdout, case.mode, case.command, normalize
                 ),
             }
+    except InvalidLogTime:
+        raise
     except (ValueError, AttributeError, KeyError, TypeError):
         raise ValueError(
             f"Invalid {case.mode} stdout (exit {result.returncode})"

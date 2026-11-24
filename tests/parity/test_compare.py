@@ -1,6 +1,10 @@
+import json
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 
-from compare import Entry, Normalize, first_difference, snapshot
+import pytest
+from compare import Entry, InvalidLogTime, Normalize, first_difference, ledger, snapshot
 from parity import Observation, differences
 
 
@@ -71,3 +75,136 @@ def test_snapshot_reports_mode_and_semantic_config_changes(tmp_path: Path) -> No
         "config.toml.enabled",
     ]
     assert changed.files["config.toml"] == Entry("file", 0o644, {"enabled": False})
+
+
+def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> None:
+    compact = (
+        "CREATE TABLE intents (id TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'waiting now');"
+        "CREATE INDEX by_status ON intents(status) WHERE status != 'waiting  now';"
+    )
+    formatted = """
+        CREATE TABLE intents (
+            id text PRIMARY KEY,
+            status text NOT NULL DEFAULT 'waiting now' /* keep the default */
+        );
+        CREATE INDEX by_status
+            ON intents (status)
+            WHERE status != 'waiting  now';
+    """
+
+    def read(name: str, schema: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.executescript(schema)
+            db.execute("PRAGMA user_version = 1")
+            db.execute("INSERT INTO intents (id) VALUES ('saved')")
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read("reference.sqlite3", compact)
+    assert (
+        first_difference(reference, read("format.sqlite3", formatted), "ledger") is None
+    )
+    mutations = {
+        "literal": compact.replace("waiting  now", "waiting now"),
+        "type": compact.replace("status TEXT", "status NUMERIC"),
+        "constraint": compact.replace("NOT NULL ", ""),
+        "rowid": compact.replace(");CREATE INDEX", ") WITHOUT ROWID;CREATE INDEX"),
+        "index": compact.replace("CREATE INDEX", "CREATE UNIQUE INDEX"),
+    }
+    for name, schema in mutations.items():
+        difference = first_difference(
+            reference, read(f"{name}.sqlite3", schema), "ledger"
+        )
+        assert difference is not None and difference.startswith("ledger.schema"), name
+
+
+def log_snapshot(
+    home: Path,
+    files: dict[str, list[tuple[int, str]]],
+    start: str,
+    end: str,
+) -> dict[str, Entry]:
+    root = home / "logs"
+    root.mkdir(parents=True)
+    for day, events in files.items():
+        path = root / f"cli-{day}.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps({"ts": time, "seq": seq, "event": "fixture.event"}) + "\n"
+                for seq, time in events
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+    return snapshot(
+        home,
+        Normalize(
+            home,
+            started_at=datetime.fromisoformat(start).timestamp(),
+            ended_at=datetime.fromisoformat(end).timestamp(),
+        ),
+    )
+
+
+def test_adjacent_utc_rollover_keeps_the_same_sequence(tmp_path: Path) -> None:
+    split = log_snapshot(
+        tmp_path / "split",
+        {
+            "2026-01-01": [(1, "2026-01-01T23:59:59.999Z")],
+            "2026-01-02": [(2, "2026-01-02T00:00:00.001Z")],
+        },
+        "2026-01-01T23:59:59.999500Z",
+        "2026-01-02T00:00:00.002Z",
+    )
+    compact = log_snapshot(
+        tmp_path / "compact",
+        {
+            "2026-01-02": [
+                (1, "2026-01-02T00:00:00.001Z"),
+                (2, "2026-01-02T00:00:00.002Z"),
+            ]
+        },
+        "2026-01-02T00:00:00Z",
+        "2026-01-02T00:00:00.003Z",
+    )
+    assert split == compact
+    reordered = log_snapshot(
+        tmp_path / "reordered",
+        {
+            "2026-01-02": [
+                (2, "2026-01-02T00:00:00.001Z"),
+                (1, "2026-01-02T00:00:00.002Z"),
+            ]
+        },
+        "2026-01-02T00:00:00Z",
+        "2026-01-02T00:00:00.003Z",
+    )
+    assert (
+        first_difference(
+            split["logs/cli.jsonl"].data, reordered["logs/cli.jsonl"].data, "logs"
+        )
+        == "logs[0].seq"
+    )
+
+
+def test_logs_reject_a_correctly_named_stale_shard(tmp_path: Path) -> None:
+    with pytest.raises(InvalidLogTime, match="outside the invocation window"):
+        log_snapshot(
+            tmp_path,
+            {
+                "2025-02-01": [(1, "2025-02-01T23:59:59.999Z")],
+                "2026-01-02": [(2, "2026-01-02T00:00:00.001Z")],
+            },
+            "2026-01-01T23:59:59.999500Z",
+            "2026-01-02T00:00:00.002Z",
+        )
+
+
+def test_logs_reject_a_valid_time_in_the_wrong_shard(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match=r"Cannot decode logs/cli-2026-01-01"):
+        log_snapshot(
+            tmp_path,
+            {"2026-01-01": [(1, "2026-01-02T00:00:00.001Z")]},
+            "2026-01-01T23:59:59.999500Z",
+            "2026-01-02T00:00:00.002Z",
+        )

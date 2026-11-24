@@ -28,10 +28,36 @@ SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
+SQL_TOKEN = re.compile(
+    r"(?P<trivia>\s+|--[^\r\n]*|/\*[\s\S]*?\*/)"
+    r"""|(?P<quoted>[xX]?'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\])"""
+    r"|(?P<number>0[xX][0-9A-Fa-f]+|(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?)"
+    r"|(?P<word>[^\W\d][\w$]*)"
+    r"|->>|->|<=|>=|<>|!=|==|\|\||<<|>>|.",
+    re.DOTALL,
+)
 
 
 class InvalidReservationTime(ValueError):
     """The ledger clock cannot be normalized."""
+
+
+class InvalidLogTime(ValueError):
+    """An event timestamp is outside the observation window."""
+
+
+def schema_tokens(sql: str | None) -> list[str] | None:
+    if sql is None:
+        return None
+    # SQLite stores source DDL. Ignore trivia and ASCII identifier casing,
+    # retaining literal and quoted token contents, operators, and clause order.
+    return [
+        match[0].upper()
+        if match.lastgroup == "word" and match[0].isascii()
+        else match[0]
+        for match in SQL_TOKEN.finditer(sql)
+        if match.lastgroup != "trivia"
+    ]
 
 
 def config_text(text: str, edited_key: str) -> str:
@@ -97,12 +123,14 @@ class Normalize:
         *,
         concurrent: bool = False,
         started_at: float | None = None,
+        ended_at: float | None = None,
     ):
         self.home = str(home)
         self.log_fields = log_fields
         self.concurrent = concurrent
         self.ids: dict[str, dict[int | str, str]] = {}
         self.started_at = started_at
+        self.ended_at = ended_at
 
     def identity(self, kind: str, value: int | str) -> str:
         existing = self.ids.setdefault(kind, {})
@@ -133,6 +161,20 @@ class Normalize:
     def log_event(self, value: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(value, dict):
             raise TypeError("Expected a JSON log event object")
+        if self.started_at is not None and self.ended_at is not None:
+            stamp = value.get("ts")
+            # Sai truncates its event clock to milliseconds.
+            first_ms = int(self.started_at * 1000) / 1000
+            if (
+                not isinstance(stamp, str)
+                or not timestamp(stamp)
+                or not (
+                    first_ms
+                    <= datetime.fromisoformat(stamp).timestamp()
+                    <= self.ended_at
+                )
+            ):
+                raise InvalidLogTime("Log timestamp is outside the invocation window")
         result = self.paths(value)
         predicates = {
             "timestamp": timestamp,
@@ -333,7 +375,12 @@ def ledger(path: Path, normalize: Normalize) -> dict[str, Any]:
             result: dict[str, Any] = {
                 "user_version": version,
                 "schema": [
-                    {"type": kind, "name": name, "table": table, "sql": sql}
+                    {
+                        "type": kind,
+                        "name": name,
+                        "table": table,
+                        "sql": schema_tokens(sql),
+                    }
                     for kind, name, table, sql in schema
                 ],
                 "tables": {},

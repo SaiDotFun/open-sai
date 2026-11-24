@@ -13,9 +13,13 @@ import pytest
 
 HERE = Path(__file__).parent
 ROOT = HERE.parents[1]
-pytestmark = pytest.mark.skipif(
-    sys.platform != "linux", reason="Parity candidates require Linux network namespaces"
-)
+pytestmark = [
+    pytest.mark.parity_namespace,
+    pytest.mark.skipif(
+        sys.platform != "linux",
+        reason="Parity candidates require Linux network namespaces",
+    ),
+]
 
 
 def run_driver(case: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -80,8 +84,11 @@ def run_mutant(
         ),
         ("network-ipv4", "config-list", "attempted a non-loopback network connection"),
         ("network-ipv6", "config-list", "attempted a non-loopback network connection"),
-        ("midnight-order", "market-prices", "logs/cli.jsonl[0]"),
-        ("midnight-wrong-file", "market-prices", "Cannot decode logs/cli"),
+        (
+            "stale-log",
+            "market-prices",
+            "Log timestamp is outside the invocation window",
+        ),
     ],
 )
 def test_wrong_candidate_fails(
@@ -93,12 +100,8 @@ def test_wrong_candidate_fails(
     assert message in run.stdout
 
 
-@pytest.mark.parametrize(
-    ("mutant", "case"),
-    [("history-format", "account-history"), ("midnight-split", "market-prices")],
-)
-def test_equivalent_candidate_passes(tmp_path: Path, mutant: str, case: str) -> None:
-    run = run_mutant(tmp_path, mutant, case)
+def test_equivalent_candidate_passes(tmp_path: Path) -> None:
+    run = run_mutant(tmp_path, "history-format", "account-history")
     assert run.returncode == 0, run.stdout + run.stderr
     assert "| PASS |" in run.stdout
 

@@ -38,6 +38,7 @@ jobs:
           filters: |
             python:
               - 'cli/**'
+              - 'tests/parity/**'
               - 'skills/**'
               - 'scripts/**'
               - 'pyproject.toml'
@@ -79,7 +80,11 @@ jobs:
         if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         run: uv sync --locked --all-groups
 
-      - name: Allow the parity runner to create a loopback namespace
+      - run: uv run pytest
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
+
+      - name: Check parity in a loopback network namespace
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         run: |
           if ! unshare -Urn ip link set lo up; then
             sudo apparmor_parser -r <<'PROFILE'
@@ -92,12 +97,8 @@ jobs:
           PROFILE
           fi
           unshare -Urn ip link set lo up
-
-      - run: uv run pytest
-        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
-
-      - name: Check parity fixtures against Python
-        run: uv run python tests/parity/parity.py
+          uv run pytest -m parity_namespace tests/parity
+          uv run python tests/parity/parity.py
 
   check:
     needs: changes

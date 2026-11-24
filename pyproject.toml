@@ -39,7 +39,11 @@ include = ["sai_cli*"]
 
 [tool.pytest.ini_options]
 testpaths = ["cli/sai_cli/tests", "tests/parity"]
-markers = ["slow: runs real uv installs; deselect with -m 'not slow'"]
+addopts = '-m "not parity_namespace"'
+markers = [
+    "slow: runs real uv installs; deselect with -m 'not slow and not parity_namespace'",
+    "parity_namespace: needs the Linux loopback namespace and libseccomp",
+]
 
 [tool.ruff]
 target-version = "py311"
