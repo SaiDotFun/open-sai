@@ -54,6 +54,7 @@ logs tail --surface mcp` in a terminal reads them ([cli.md](cli.md#logs)).
 | `auth_status`, `auth_list` | The active account, and every connected account |
 | `auth_use` | Switch the active account. Also switches it for the CLI. |
 | `market_list`, `market_prices` | Markets and current indexed prices |
+| `account_overview` | Sai funds, position risk, pending and queued orders, local trade blockers, and session expiry |
 | `account_positions`, `account_balances`, `account_history` | Reads for one account |
 | `intent_local`, `intent_status` | Locally recorded intents, and Keeper's record of them |
 | `preview_open`, `preview_close`, `preview_partial_close`, `preview_tpsl`, `preview_leverage`, `preview_margin` | What a trade would do. Submits nothing. |
@@ -63,10 +64,17 @@ Account reads take an optional `addr`. Without one they read the active
 account and report `addrSource` as `session`. Say so to the person, and pass
 `addr` to read any other account.
 
+Use `account_overview` for a portfolio check. Report any failed section
+that matters to the user's question and check the source age separately
+from the fetch time.
+
 ## Sign-In
 
 The server lists every tool whether or not anyone is signed in. Each
 `trade_*` call checks the session of the account it acts as.
+
+If `mcp_info.session.expiryWarning` is present, tell the person when the
+session expires and pass along the `renewalCommand` it reports.
 
 | `mcp_info.trading.reason` | A `trade_*` call returns | Meaning |
 | --- | --- | --- |
