@@ -436,6 +436,59 @@ def test_logs_tail_applies_argv_and_error_allowlists_to_retained_rows(
         assert b"websocket=[redacted]" in result.stdout
 
 
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_logs_tail_masks_retained_mcp_arguments(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    flags: tuple[str, ...],
+) -> None:
+    _, rust = local_pair
+    secret = "fixture-retained-mcp-key"
+    private = f"//127.0.0.1/private?key={secret}"
+    logs = seed_logs(
+        tmp_path,
+        {
+            "mcp": [
+                event(
+                    "mcp.tool_call",
+                    1,
+                    surface="mcp",
+                    tool="account_positions",
+                    arguments={"addr": private},
+                ),
+                event(
+                    "mcp.tool_call",
+                    2,
+                    surface="mcp",
+                    tool="intent_wait",
+                    arguments={
+                        "key": {"nested": [private]},
+                        "timeout": 5,
+                        "rich": True,
+                    },
+                ),
+            ],
+        },
+    )
+    path = logs / f"mcp-{STAMP[:10]}.jsonl"
+    before = path.read_bytes()
+    result = invoke(rust, tmp_path, *flags, "logs", "tail", "--surface", "mcp")
+    assert result.returncode == 0 and not result.stderr
+    assert secret.encode() not in result.stdout
+    assert path.read_bytes() == before
+    if flags:
+        assert [
+            json.loads(line)["arguments"] for line in result.stdout.splitlines()
+        ] == [
+            {"addr": "[redacted]"},
+            {"key": "[redacted]", "timeout": 5, "rich": True},
+        ]
+    else:
+        assert b'arguments={"addr":"[redacted]"}' in result.stdout
+        assert b'"timeout":5' in result.stdout
+        assert b'"rich":true' in result.stdout
+
+
 def test_logs_run_keeps_events_with_non_utf8_argv(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:

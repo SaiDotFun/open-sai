@@ -487,10 +487,23 @@ fn redact_retained_value(value: Value, url: &Regex) -> Value {
 }
 
 pub(super) fn redact_retained_urls(row: &mut Map<String, Value>) {
+    let mcp_call = row.get("event").and_then(Value::as_str) == Some("mcp.tool_call");
     *row = std::mem::take(row)
         .into_iter()
         .map(|(key, value)| {
             let value = match (key.as_str(), value) {
+                ("arguments", Value::Object(args)) if mcp_call => Value::Object(
+                    args.into_iter()
+                        .map(|(key, value)| {
+                            let value = match value {
+                                Value::Null | Value::Bool(_) | Value::Number(_) => value,
+                                _ => REDACTED_INPUT.into(),
+                            };
+                            (key, value)
+                        })
+                        .collect(),
+                ),
+                ("arguments", _) if mcp_call => REDACTED_INPUT.into(),
                 ("argv", Value::Array(args)) => safe_argv(args.into_iter().map(|arg| match arg {
                     Value::String(text) => text,
                     _ => REDACTED_INPUT.into(),
