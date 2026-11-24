@@ -1520,6 +1520,30 @@ def stdio_auth_use(
     return result, logs + stderr.read_text()
 
 
+def test_stdio_auth_use_reports_success_when_legacy_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    marker = "synthetic-mcp-legacy-cleanup-credential"
+    records = {
+        ADDR: {**stored_session(), "token": marker},
+        OTHER: {**stored_session(), "evmAddress": OTHER, "token": OTHER_TOKEN},
+    }
+    storage._save_accounts({"active": OTHER, "sessions": records})
+    legacy = tmp_path / "trader" / "session.json"
+    legacy.mkdir()
+
+    result, logs = stdio_auth_use(tmp_path, ADDR)
+
+    assert not result.isError
+    response = json.loads(text_of(result.content))
+    assert [row["addr"] for row in response["accounts"] if row["active"]] == [ADDR]
+    assert "Could not remove legacy session file trader/session.json" in logs
+    assert "session.active" in logs
+    assert marker not in result.model_dump_json() + logs
+    assert storage.load_accounts()["active"] == ADDR
+    assert legacy.is_dir()
+
+
 @pytest.mark.parametrize("same_account", [True, False])
 def test_stdio_auth_use_redacts_known_credentials_in_session_fields(
     tmp_path: Path, same_account: bool

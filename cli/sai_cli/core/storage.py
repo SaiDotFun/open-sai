@@ -7,6 +7,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import shlex
 import sqlite3
@@ -225,7 +226,12 @@ def _save_accounts(accounts: dict[str, Any]) -> None:
         os.replace(temp, root / "sessions.json")
     finally:
         Path(temp).unlink(missing_ok=True)
-    _v2_path().unlink(missing_ok=True)
+    try:
+        _v2_path().unlink(missing_ok=True)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Could not remove legacy session file trader/session.json after saving accounts."
+        )
 
 
 @contextlib.contextmanager

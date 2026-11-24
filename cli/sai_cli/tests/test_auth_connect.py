@@ -603,6 +603,38 @@ def test_use_rejects_malformed_expiry_before_switching(
         assert result.stderr == f"Error: {message}\n"
 
 
+def test_use_reports_success_when_legacy_cleanup_fails(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = "synthetic-cli-legacy-cleanup-credential"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    other = {**session_for(make_token(OTHER)), "evmAddress": OTHER}
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: session_for(marker), OTHER: other}}
+    )
+    legacy = env.home / "trader" / "session.json"
+    legacy.mkdir()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 0
+    response = json.loads(result.stdout)
+    assert response["addr"] == ADDR and response["active"] is True
+    assert "Could not remove legacy session file trader/session.json" in result.stderr
+    assert marker not in result.stdout + result.stderr
+    assert marker.encode() not in env.stored_bytes()
+    events = [
+        json.loads(line)
+        for _, _, path in log.log_files(env.home / "logs")
+        for line in path.read_text().splitlines()
+    ]
+    assert [
+        event["addr"] for event in events if event["event"] == "session.active"
+    ] == [ADDR]
+    assert storage.load_accounts()["active"] == ADDR
+    assert legacy.is_dir()
+
+
 @pytest.mark.parametrize("same_account", [True, False])
 def test_use_redacts_known_credentials_in_endpoint(
     env: Env, monkeypatch: pytest.MonkeyPatch, same_account: bool
