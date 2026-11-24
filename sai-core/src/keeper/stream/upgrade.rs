@@ -19,12 +19,16 @@ use url::Url;
 
 use super::{Failure, SUBPROTOCOL, transport::SocketBox};
 
-pub(super) enum Upgrade {
+pub(in crate::keeper) enum Upgrade {
     Connected(SocketBox),
-    Redirect(String),
+    Redirect {
+        status: StatusCode,
+        location: String,
+    },
+    Rejected(StatusCode),
 }
 
-pub(super) async fn connect(url: &Url, socket: SocketBox) -> Result<Upgrade, Failure> {
+pub(in crate::keeper) async fn connect(url: &Url, socket: SocketBox) -> Result<Upgrade, Failure> {
     let mut request = url.as_str().into_client_request()?;
     let path = request
         .uri()
@@ -53,11 +57,14 @@ pub(super) async fn connect(url: &Url, socket: SocketBox) -> Result<Upgrade, Fai
         {
             return location
                 .to_str()
-                .map(|value| Upgrade::Redirect(value.into()))
+                .map(|value| Upgrade::Redirect {
+                    status: reply.status(),
+                    location: value.into(),
+                })
                 .map_err(|_| Failure::Disconnected("InvalidURI"));
         }
         if reply.status() != StatusCode::SWITCHING_PROTOCOLS {
-            return Err(Failure::Disconnected("InvalidStatus"));
+            return Ok(Upgrade::Rejected(reply.status()));
         }
 
         validate_headers(reply.headers(), &accept)?;
