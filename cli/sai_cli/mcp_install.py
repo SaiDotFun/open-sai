@@ -1,8 +1,8 @@
 """Register `sai mcp serve` with agent clients: Claude Code, Codex, Cursor.
 
 Ordinary Claude Code installs and uninstalls use its `mcp add` and
-`mcp remove` commands. Explicit Claude Code repairs edit the existing
-entry in its config file. Codex and Cursor writes also edit config files.
+`mcp remove` commands. Failed replacements restore the previous entry.
+Explicit Claude Code repairs and Codex and Cursor writes edit config files.
 
 Registration inspection keeps only Sai's command, args, and selected
 metadata. Repair retains the full entry in memory to preserve settings
@@ -20,7 +20,8 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Generator, Mapping, MutableMapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -838,6 +839,16 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
 
 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
+    if not isinstance(client, Claude) or dry_run:
+        return _install_one(client, scope, target, dry_run)
+    try:
+        with claude_install_lock(client):
+            return _install_one(client, scope, target, dry_run)
+    except (ClientError, OSError) as exc:
+        return Result(client.name, "failed", scope=scope, error=str(exc))
+
+
+def _install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
     result = Result(client.name, "failed", command=target.argv, scope=scope)
     try:
         if isinstance(client, Codex):
@@ -871,16 +882,20 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
         if dry_run:
             result.action, result.would = "planned", action
             return result
-        if isinstance(client, (Codex, Cursor)):
-            client.write(scope, target)
-        else:
-            for argv in steps:
-                run(argv)
-                # Set per step: a remove that ran before a failed add still
-                # changed the client.
-                result.changed = True
-        result.changed = True
-        client.verify(scope, target)
+        rollback = (
+            claude_install_rollback(client, existing, target, result)
+            if isinstance(client, Claude) and existing is not None
+            else nullcontext()
+        )
+        with rollback:
+            if isinstance(client, (Codex, Cursor)):
+                client.write(scope, target)
+            else:
+                for argv in steps:
+                    run(argv)
+                    result.changed = True
+            result.changed = True
+            client.verify(scope, target)
         result.action = action
     except (ClientError, OSError) as exc:
         result.action, result.error = "failed", str(exc)
@@ -1178,7 +1193,7 @@ class ClientConfig:
 
 
 def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
-    """Read an editable scope. Keep the full entry local to the repair."""
+    """Read an editable scope, keeping the full entry for repair or rollback."""
     destination = path.resolve()
     seen = read_bytes(destination)
     raw = seen.decode() if seen is not None else ""
@@ -1187,8 +1202,12 @@ def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
         raise ClientError("Expected an MCP config object")
     holder = data
     if scope == "local":
-        projects = data.get("projects", {})
-        holder = projects.get(str(client.cwd)) if isinstance(projects, dict) else None
+        projects = data.setdefault("projects", {})
+        holder = (
+            projects.setdefault(str(client.cwd), {})
+            if isinstance(projects, dict)
+            else None
+        )
         if not isinstance(holder, dict):
             raise ClientError("Could not find the local MCP config")
     entries = holder.setdefault("mcpServers", {})
@@ -1211,6 +1230,104 @@ def repair_path(client: Client, scope: str) -> Path:
         return client.config_path()
     assert isinstance(client, Cursor)
     return client.config_path(scope)
+
+
+@contextmanager
+def claude_install_lock(client: Claude) -> Generator[None]:
+    """Serialize Sai installs from the same home through discovery and rollback."""
+    path = client.home / ".sai-claude-install.lock"
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise ClientError(
+                "Could not lock the Claude Code install. Retry after any other install finishes."
+            ) from None
+        yield
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def claude_install_rollback(
+    client: Claude, existing: Registration, target: Target, result: Result
+) -> Generator[None]:
+    """Keep the complete entry until Claude's replacement is verified."""
+    scope = existing.scope
+    path = repair_path(client, scope)
+    try:
+        before = read_client_config(client, scope, path)
+    except (OSError, ValueError):
+        raise ClientError("Could not read the Claude Code entry for rollback") from None
+    original = before.entries.get(NAME)
+    if (
+        not isinstance(original, dict)
+        or entry_registration(original, scope, existing.disabled) != existing
+    ):
+        raise ClientError("The Sai registration changed before install")
+
+    try:
+        yield
+    except (ClientError, OSError, KeyboardInterrupt) as exc:
+        try:
+            restored = restore_claude_entry(
+                client, scope, path, before.destination, original, target
+            )
+        except (ClientError, OSError, ValueError):
+            raise ClientError(
+                f"{exc} Could not restore the previous Claude Code registration. "
+                "Review the client config before trying again."
+            ) from None
+        if restored:
+            result.changed = True
+            if not isinstance(exc, KeyboardInterrupt):
+                raise ClientError(
+                    f"{exc} Restored the previous Claude Code registration."
+                ) from None
+        raise
+
+
+def restore_claude_entry(
+    client: Claude,
+    scope: str,
+    path: Path,
+    destination: Path,
+    original: dict[str, Any],
+    target: Target,
+) -> bool:
+    """Restore just Sai's entry and keep concurrent edits to other settings."""
+    for _ in range(2):
+        current = read_client_config(client, scope, path)
+        if current.destination != destination:
+            break
+        if current.entries.get(NAME) == original:
+            return False
+        if NAME in current.entries:
+            entry = current.entries[NAME]
+            registration = entry_registration(entry, scope)
+            # A rejected add may have written the target before exiting.
+            # Keep any other entry that appeared during the replacement.
+            if (
+                not isinstance(entry, dict)
+                or entry.keys() - {"type", "command", "args", "env"}
+                or registration is None
+                or not registration.matches(target)
+            ):
+                break
+        current.entries[NAME] = original
+        if replace_bytes(
+            path, current.render().encode(), current.seen, destination=destination
+        ):
+            return True
+    raise ClientError("The Claude Code config changed during install")
 
 
 def replace_registration(

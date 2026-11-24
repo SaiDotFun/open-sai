@@ -1792,20 +1792,113 @@ def test_codex_project_tool_filter_is_an_override(env: Env):
     assert "Client registrations changed." not in message
 
 
-def test_reconnect_is_needed_when_a_remove_ran_before_a_failed_add(env: Env):
-    (env.home / ".claude.json").write_text(
-        json.dumps({"mcpServers": {"sai": claude_entry([OLD_COMMAND])}})
+@pytest.mark.parametrize(
+    ("scope", "add_result"),
+    [
+        ("user", "rejected"),
+        ("project", "rejected"),
+        ("local", "rejected"),
+        ("user", "written-before-rejection"),
+        ("user", "unverified"),
+        ("user", "conflicting-edit"),
+    ],
+)
+def test_claude_install_rolls_back_a_failed_replacement(
+    env: Env, scope: str, add_result: str
+):
+    path = (
+        env.project / ".mcp.json" if scope == "project" else env.home / ".claude.json"
     )
-    fails_add = FAKE_CLAUDE.replace(
-        "args = sys.argv[1:]\n",
-        "args = sys.argv[1:]\nif args[1] == 'add':\n    sys.exit(3)\n",
+    original = claude_entry(
+        [*serve(env), "--endpoint", f"https://private.example/{SECRET}"],
+        {"SAI_HOME": str(env.root / "profile"), "CUSTOM": SECRET},
     )
+    original["customField"] = {"keep": True}
+    other = claude_entry(["other-command"])
+    holder = {"mcpServers": {"sai": original, OTHER: other}}
+    data = {"projects": {str(env.project): holder}} if scope == "local" else holder
+    path.write_text(json.dumps(data))
+    path.chmod(0o640)
+    concurrent = claude_entry(["another-launcher"])
+    if add_result == "written-before-rejection":
+        fails_add = FAKE_CLAUDE + "if args[1] == 'add':\n    sys.exit(3)\n"
+    else:
+        on_add = {
+            "rejected": "data['concurrentSetting'] = True\n    sys.exit(3)",
+            "unverified": "sys.exit(0)",
+            "conflicting-edit": f"servers[name] = {concurrent!r}\n    sys.exit(3)",
+        }[add_result]
+        marker = 'if args[1] == "remove":\n'
+        # Make any simulated unrelated edit visible before the add returns.
+        on_add = on_add.replace(
+            "sys.exit", "path.write_text(json.dumps(data))\n    sys.exit"
+        )
+        fails_add = FAKE_CLAUDE.replace(
+            marker, f"if args[1] == 'add':\n    {on_add}\n" + marker
+        )
     write_exe(env.bin / "claude", fails_add)
-    result = invoke("mcp", "install", "claude")
+
+    result = invoke("mcp", "install", "claude", "--scope", scope)
+
     message = failure(result)
-    assert "claude (user): failed" in message
+    assert f"claude ({scope}): failed" in message
+    if add_result == "unverified":
+        assert "does not show the new sai entry" in message
+    else:
+        assert "`claude mcp add` exited 3" in message
+    if add_result == "conflicting-edit":
+        assert "Could not restore the previous Claude Code registration" in message
+    else:
+        assert "Restored the previous Claude Code registration" in message
     assert "Client registrations changed." in message
     details = payload(result)["error"]["details"]
     assert details["reconnectNeeded"] is True
     [row] = details["results"]
     assert row["action"] == "failed" and row["changed"] is True
+    assert env.calls() == [
+        ["mcp", "remove", "--scope", scope, "sai"],
+        ["mcp", "add", "--scope", scope, "sai", "--", *serve(env)],
+    ]
+    actual = json.loads(path.read_text())
+    if add_result == "rejected":
+        assert actual["concurrentSetting"] is True
+    config = actual["projects"][str(env.project)] if scope == "local" else actual
+    expected = concurrent if add_result == "conflicting-edit" else original
+    assert config["mcpServers"] == {"sai": expected, OTHER: other}
+    assert stat.S_IMODE(path.stat().st_mode) == 0o640
+    assert SECRET not in result.output and OTHER not in result.output
+
+
+def test_claude_rollback_excludes_another_install_of_the_same_target(env: Env):
+    path = env.home / ".claude.json"
+    original = claude_entry([*serve(env), "--endpoint", "https://test.example"])
+    path.write_text(json.dumps({"mcpServers": {"sai": original}}))
+    nested = env.root / "nested-install.json"
+    marker = 'if args[1] == "remove":\n'
+    write_exe(
+        env.bin / "claude",
+        FAKE_CLAUDE.replace(
+            marker,
+            f"nested = Path({str(nested)!r})\n"
+            "if args[1] == 'add' and not nested.exists():\n"
+            "    import subprocess\n"
+            "    nested.touch()\n"
+            "    install = subprocess.run(\n"
+            "        [sys.executable, '-m', 'sai_cli', '--json', 'mcp', 'install', 'claude'],\n"
+            "        capture_output=True, text=True, timeout=10,\n"
+            "    )\n"
+            "    nested.write_text(install.stdout)\n"
+            "    sys.exit(3)\n" + marker,
+        ),
+    )
+
+    result = invoke("mcp", "install", "claude")
+
+    assert "Restored the previous Claude Code registration" in failure(result)
+    inner = json.loads(nested.read_text())
+    assert "Could not lock the Claude Code install" in inner["error"]["message"]
+    assert env.claude_json()["mcpServers"] == {"sai": original}
+    assert env.calls() == [
+        ["mcp", "remove", "--scope", "user", "sai"],
+        ["mcp", "add", "--scope", "user", "sai", "--", *serve(env)],
+    ]
