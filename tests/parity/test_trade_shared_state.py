@@ -579,12 +579,16 @@ def test_wait_deadline_then_restart(
     reader = runtime(waiter, request, python_reference)
     action = ACTIONS["close"]
     replay = action.replay(phase="pending")
+    poll_arrived = threading.Event()
     release_wait = threading.Event()
 
     def hold_wait(request: WireRequest, auth: str | None) -> dict[str, Any] | None:
-        if request.label == "waitUserIntents" and not release_wait.wait(10):
-            raise ValueError("Test did not release the outcome reply")
-        return replay(request, auth)
+        response = replay(request, auth)
+        if request.label == "waitUserIntents":
+            poll_arrived.set()
+            if not release_wait.wait(10):
+                raise ValueError("Test did not release the outcome reply")
+        return response
 
     with loopback(action.server, trade_replay=hold_wait) as endpoints:
         home = Home(tmp_path / "home", endpoints)
@@ -600,6 +604,9 @@ def test_wait_deadline_then_restart(
         try:
             timed_out = home.json(
                 reader, "intent", "wait", key, "--timeout", "1", code=5
+            )
+            assert poll_arrived.wait(2), (
+                "The short wait returned without polling Keeper"
             )
         finally:
             release_wait.set()
