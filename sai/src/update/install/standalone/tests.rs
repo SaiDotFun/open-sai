@@ -21,8 +21,7 @@ fn recovery_rolls_back_a_first_install_without_an_old_target() {
     let launcher = directory.join("sai");
     symlink(&binary, &launcher).unwrap();
     let record = root.join(RECORD);
-    state::atomic_json(&record, &serde_json::json!({"old": null, "new": new}))
-        .unwrap();
+    state::atomic_json(&record, &serde_json::json!({"old": null, "new": new})).unwrap();
 
     let install = Standalone::discover(&binary).unwrap();
     assert!(

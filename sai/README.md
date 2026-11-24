@@ -19,6 +19,12 @@ GraphQL envelope and projects each row to validated public fields. The `account 
 command reads one WebSocket snapshot. Use `watch price TOKEN_ID`, `watch
 balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 
+`sai trade open`, `sai trade close`, and `sai trade cancel` support
+`--dry-run`. Python spells cancellation `sai trade close ID --cancel-order`,
+which the Rust CLI also accepts. A live submission reserves the intent
+before it contacts Keeper. If the send outcome is unknown, use the intent
+key to reconcile it before trading again.
+
 ## Port Order
 
 C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
@@ -82,6 +88,16 @@ Run `SAI_PARITY_BIN="$PWD/target/debug/sai" uv run pytest tests/parity`
 after `just rust-build` to compare `sai intent status` against the Python
 package in this checkout. The tests reuse the recorded Keeper outcomes
 and compare request bytes and counts, ledger rows, and log events.
+
+The C7a open and close cases and digest fixtures use Python commit
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. Set `SAI_PARITY_C7_PYTHON` to
+the absolute path of a `sai` binary installed from that checkout when
+running `pytest tests/parity/test_trade.py` with `SAI_PARITY_BIN`.
+Without that override the open and close tests use Python from the current
+workspace. The cancellation cases use Python commit
+`bdc11da6c9938aa0371835d921f27d45daa77c36`. Set `SAI_PARITY_WAIT_PYTHON` to
+the absolute path of its `sai` launcher. Cancellation and wait tests share
+this checkout in CI.
 
 Compare the read and watch commands with the Python package in this
 checkout using the loopback replay cases:

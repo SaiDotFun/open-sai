@@ -9,6 +9,9 @@ use crate::{
     storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
 
+pub(crate) const ORIGINAL_KEEPER_HINT: &str =
+    r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#;
+
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
     Ok(session_expiry(session)? <= now)
 }
@@ -41,7 +44,7 @@ fn expiry_warning_time(left: TimeDelta) -> Option<String> {
 
 // Stored Keeper expiries follow Python's datetime.fromisoformat. Convert to
 // UTC for comparisons and retain the original text in the session.
-pub(crate) fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
+pub fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
     let date_end = date_length(text.as_bytes())?;
     let date = text.get(..date_end)?;
     let tail = text.get(date_end..)?;
@@ -149,19 +152,61 @@ impl Storage<'_> {
         endpoint: &str,
         addr: Option<&str>,
     ) -> Result<Session, StorageError> {
+        self.load_active_session_with_hint(endpoint, addr, |addr| {
+            self.sign_in_hint(endpoint, addr, false)
+        })
+    }
+
+    pub(crate) fn load_active_trade_session(
+        &self,
+        endpoint: &str,
+        addr: Option<&str>,
+    ) -> Result<Session, StorageError> {
+        self.load_active_session_with_hint(endpoint, addr, |addr| {
+            self.sign_in_hint(endpoint, addr, true)
+        })
+    }
+
+    fn load_active_session_with_hint(
+        &self,
+        endpoint: &str,
+        addr: Option<&str>,
+        hint: impl Fn(Option<&str>) -> String,
+    ) -> Result<Session, StorageError> {
         let session = self.load_session(addr).map_err(|mut error| {
             if let StorageError::Session(SessionError(failure)) = &mut error
                 && failure.code == Code::SignedOut
             {
-                failure.hint = Some(self.sign_in_hint(endpoint, addr));
+                failure.hint = Some(hint(addr));
             }
             error
         })?;
-        self.check_active(&session, endpoint)?;
+        self.check_active_with_hint(&session, endpoint, hint)?;
         Ok(session)
     }
 
     pub fn check_active(&self, session: &Session, endpoint: &str) -> Result<(), SessionError> {
+        self.check_active_with_hint(session, endpoint, |addr| {
+            self.sign_in_hint(endpoint, addr, false)
+        })
+    }
+
+    pub(crate) fn check_active_trade(
+        &self,
+        session: &Session,
+        endpoint: &str,
+    ) -> Result<(), SessionError> {
+        self.check_active_with_hint(session, endpoint, |addr| {
+            self.sign_in_hint(endpoint, addr, true)
+        })
+    }
+
+    fn check_active_with_hint(
+        &self,
+        session: &Session,
+        endpoint: &str,
+        hint: impl FnOnce(Option<&str>) -> String,
+    ) -> Result<(), SessionError> {
         if session.endpoint() != Some(endpoint) {
             return Err(SessionError::new(
                 "Stored session belongs to another Keeper endpoint",
@@ -179,19 +224,27 @@ impl Storage<'_> {
             error.hint = Some(if session.key_name().is_some() || session.is_imported() {
                 self.renewal_command(session)
             } else {
-                self.sign_in_hint(endpoint, Some(session.addr()))
+                hint(Some(session.addr()))
             });
             return Err(SessionError(error));
         }
         Ok(())
     }
 
-    fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>) -> String {
+    fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>, trade: bool) -> String {
         let mut args = vec!["auth", "login", "NAME"];
         if let Some(addr) = addr {
             args.extend(["--addr", addr]);
         }
-        self.keeper_command_hint(endpoint, &args)
+        if trade {
+            format!(
+                "sai --endpoint {} {}",
+                self.keeper_hint_flag(endpoint),
+                shell_join(&args)
+            )
+        } else {
+            self.keeper_command_hint(endpoint, &args)
+        }
     }
 
     pub fn keeper_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
@@ -299,7 +352,7 @@ fn shell_join(args: &[&str]) -> String {
         .join(" ")
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     if !text.is_empty()
         && text
             .bytes()

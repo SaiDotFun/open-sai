@@ -134,34 +134,26 @@ impl Standalone {
         let bytes = match fs::read(&record) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(
-                    dir_version(&active).expect("validated managed target")
-                );
+                return Ok(dir_version(&active).expect("validated managed target"));
             }
             Err(err) => return Err(io_error(err)),
         };
-        let pending: Pending = serde_json::from_slice(&bytes).map_err(|_| {
-            "could not read the pending Sai install record".to_owned()
-        })?;
-        let invalid = || {
-            "the pending Sai install record names a missing or invalid binary"
-                .to_owned()
-        };
+        let pending: Pending = serde_json::from_slice(&bytes)
+            .map_err(|_| "could not read the pending Sai install record".to_owned())?;
+        let invalid =
+            || "the pending Sai install record names a missing or invalid binary".to_owned();
         self.target(&pending.new).ok_or_else(invalid)?;
         let Some(old) = pending.old else {
             if active != pending.new || self.active()? != pending.new {
-                return Err(
-                    "the Sai launcher changed during an interrupted install"
-                        .into(),
-                );
+                return Err("the Sai launcher changed during an interrupted install".into());
             }
             fs::remove_file(&self.launcher).map_err(io_error)?;
-            state::sync_dir(
-                self.launcher.parent().expect("launcher has a parent"),
-            )
-            .map_err(io_error)?;
+            state::sync_dir(self.launcher.parent().expect("launcher has a parent"))
+                .map_err(io_error)?;
             remove_record(&record)?;
-            return Err("Interrupted first Sai install was rolled back. Run the installer again.".into());
+            return Err(
+                "Interrupted first Sai install was rolled back. Run the installer again.".into(),
+            );
         };
         let previous = dir_version(&old)
             .filter(|_| self.target(&old).is_some())
@@ -169,9 +161,7 @@ impl Standalone {
         if active == pending.new {
             self.switch(&pending.new, &old)?;
         } else if active != old {
-            return Err(
-                "the Sai launcher changed during an interrupted update".into()
-            );
+            return Err("the Sai launcher changed during an interrupted update".into());
         }
         remove_record(&record)?;
         Ok(previous)
