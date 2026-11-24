@@ -106,6 +106,17 @@ INTENT_ERROR_CODES = frozenset(
         "insufficient_idle",
     }
 )
+GRAPHQL_ERROR_CODES = frozenset(
+    {
+        "GRAPHQL_PARSE_FAILED",
+        "GRAPHQL_VALIDATION_FAILED",
+        "INTENT_NOT_ACCEPTED",
+        "BAD_USER_INPUT",
+        "FORBIDDEN",
+        "INTERNAL_SERVER_ERROR",
+        "UNAUTHENTICATED",
+    }
+)
 
 
 def request_hash(value: object) -> tuple[str | None, bool | None]:
@@ -342,8 +353,8 @@ def request(
 
     Logs one `keeper.request` event with the operation, the endpoint's
     origin, the outcome, and the duration. For an intent lookup, it also
-    records the key. Audit calls disable `trace_intent` so a pasted key
-    or echoed GraphQL diagnostic stays out of the log.
+    records the key unless an audit call disables `trace_intent`.
+    Intent and history reads log only known GraphQL codes and an error count.
     """
     started = time.monotonic()
     outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
@@ -411,14 +422,17 @@ def _log_request(
             code=outcome.get("code"),
             error=outcome.get("error") if trace_intent else None,
             httpStatus=outcome.get("httpStatus"),
-            keeperErrors=outcome.get("keeperErrors") if trace_intent else None,
+            keeperErrors=outcome.get("keeperErrors")
+            if trace_intent or query in (INTENTS, HISTORY)
+            else None,
+            keeperErrorCount=outcome.get("keeperErrorCount"),
         )
     except Exception:  # noqa: BLE001, S110 - logging must not change the outcome
         pass
 
 
-def _graphql_errors(errors: Any) -> list[dict[str, Any]]:
-    """The code and message of the first few GraphQL errors, for the log.
+def _graphql_errors(errors: Any, *, codes_only: bool) -> list[dict[str, Any]]:
+    """Keep at most three GraphQL errors for the log.
 
     Keeper's message can echo input, such as the signature sent to the
     session mutation, so it is marked untrusted: the log writer cuts it
@@ -430,6 +444,11 @@ def _graphql_errors(errors: Any) -> list[dict[str, Any]]:
             continue
         extensions = item.get("extensions")
         code = extensions.get("code") if isinstance(extensions, dict) else None
+        if codes_only:
+            found.append(
+                {"code": known_text(code, GRAPHQL_ERROR_CODES) or Code.KEEPER_ERROR}
+            )
+            continue
         found.append(
             {
                 "code": log.untrusted(str(code)) if code is not None else None,
@@ -471,7 +490,10 @@ def _request(
         raise KeeperError("Keeper returned an invalid response")
     if result.get("errors"):
         errors = result["errors"]
-        outcome["keeperErrors"] = _graphql_errors(errors)
+        codes_only = query in (INTENTS, HISTORY)
+        outcome["keeperErrors"] = _graphql_errors(errors, codes_only=codes_only)
+        if codes_only:
+            outcome["keeperErrorCount"] = len(errors) if isinstance(errors, list) else 1
         if (
             query == SUBMIT
             and not result.get("data")

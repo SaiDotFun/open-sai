@@ -160,6 +160,7 @@ class Keeper:
         self.intents: list[dict[str, Any]] = []
         self.history: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] | None = None
+        self.history_errors: list[dict[str, Any]] | None = None
         self.status = 200
         self.ack_tx_hash: Any = None
         self.intents_block: threading.Event | None = None
@@ -203,7 +204,11 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
             elif "tokenPricesUsd" in query:
                 value = {"data": {"oracle": {"tokenPricesUsd": []}}}
             elif "tradeHistory" in query:
-                value = {"data": {"perp": {"tradeHistory": state.history}}}
+                value = (
+                    {"errors": state.history_errors}
+                    if state.history_errors is not None
+                    else {"data": {"perp": {"tradeHistory": state.history}}}
+                )
             else:
                 value = {"data": {"perp": {"borrowings": [], "trades": []}}}
             data = json.dumps(value).encode()
@@ -690,6 +695,64 @@ def test_keeper_errors_record_what_keeper_answered(home, keeper_stub):
     ]
     assert rejected["error"] == "Keeper rejected the request; check inputs and session"
     assert unavailable["operation"] == "custom" and unavailable["httpStatus"] == 503
+
+
+def test_intent_and_history_reads_log_graphql_codes_and_count(home, keeper_stub):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    secret = "OpaqueGraphqlUpstreamCredential"
+    errors = [
+        {"message": secret, "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}},
+        {"message": secret, "extensions": {"code": secret}},
+        {"message": secret},
+        {"message": secret},
+    ]
+    prefix = ("--json", "--endpoint", endpoint)
+    status = ("intent", "status", ADDR, "--key", key)
+    state.errors = errors
+    reads = [
+        run_cli(*prefix, *status),
+        run_cli(*prefix, "account", "history", ADDR),
+        run_cli(*prefix, "logs", "intent", key, "--addr", ADDR),
+    ]
+    assert [code for code, _ in reads] == [1, 1, 0]
+    assert json.loads(reads[2][1])["keeperError"]["code"] == "KEEPER_ERROR"
+
+    state.errors = None
+    state.history_errors = errors
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "txHash": "a" * 64,
+        }
+    ]
+    code, output = run_cli(*prefix, *status)
+    assert code == 0 and json.loads(output)["matchedTradeHistory"] == []
+    assert all(secret not in text for _, text in reads)
+    assert all(secret not in text for text in (output, raw_logs(home)))
+
+    requests = [row for row in events(home, "keeper.request") if "keeperErrors" in row]
+    assert [row["operation"] for row in requests] == [
+        "intents",
+        "history",
+        "history",
+    ]
+    assert requests[0]["intentKey"] == key
+    for row in requests:
+        assert row["keeperErrorCount"] == 4
+        assert row["keeperErrors"] == [
+            {"code": "GRAPHQL_VALIDATION_FAILED"},
+            {"code": "KEEPER_ERROR"},
+            {"code": "KEEPER_ERROR"},
+        ]
+    for flags in ((), ("--json",)):
+        code, tail = run_cli(*flags, "logs", "tail", "--event", "keeper.request")
+        assert code == 0
+        assert secret not in tail and "GRAPHQL_VALIDATION_FAILED" in tail
 
 
 def test_a_keeper_error_that_echoes_the_signature_is_scrubbed(home, keeper_stub):
