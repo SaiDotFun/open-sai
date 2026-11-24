@@ -38,6 +38,32 @@ impl<'a> Confirmation<'a> {
         preview: &TradePreview,
         account: &str,
     ) -> Result<(), SaiError> {
+        if !self.digest_matches(preview, account)? {
+            return Err(refusal(
+                preview,
+                account,
+                Code::PreviewMismatch,
+                MISMATCH.into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_route_digest(
+        &self,
+        preview: &TradePreview,
+        account: &str,
+    ) -> Result<(), SaiError> {
+        if self.digest_matches(preview, account)? {
+            return Ok(());
+        }
+        Err(SaiError::new(
+            Code::PreviewMismatch,
+            "The trade no longer matches the preview the user confirmed. Request a fresh preview before submitting.",
+        ))
+    }
+
+    fn digest_matches(&self, preview: &TradePreview, account: &str) -> Result<bool, SaiError> {
         match (
             preview.requires_market_price_refresh(),
             self.reference_price.as_ref(),
@@ -60,15 +86,7 @@ impl<'a> Confirmation<'a> {
         if let Some((reference, _)) = &self.reference_price {
             confirmed.reference_price = Some((*reference).into());
         }
-        if preview_digest(&confirmed, Some(account)) != self.digest {
-            return Err(refusal(
-                preview,
-                account,
-                Code::PreviewMismatch,
-                MISMATCH.into(),
-            ));
-        }
-        Ok(())
+        Ok(preview_digest(&confirmed, Some(account)) == self.digest)
     }
 
     pub(super) fn verify(self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {

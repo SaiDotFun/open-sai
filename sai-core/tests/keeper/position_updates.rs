@@ -35,6 +35,7 @@ struct ReplyState {
     contract: &'static str,
     requests: Vec<String>,
     price: &'static str,
+    market_available: bool,
     trade_type: &'static str,
     target_missing: bool,
 }
@@ -59,6 +60,7 @@ impl PositionServer {
             contract: CONTRACT,
             requests: Vec::new(),
             price: "100",
+            market_available: true,
             trade_type: "trade",
             target_missing: false,
         }));
@@ -124,9 +126,12 @@ impl ReplyState {
                 }
                 MARKETS => {
                     self.requests.push("markets".into());
-                    json!({"perp": {"borrowings": [
-                        {"marketId": 3, "price": self.price, "isOpen": true, "collateralToken": {"symbol": "USDC"}}
-                    ]}})
+                    let borrowings = if self.market_available {
+                        json!([{"marketId": 3, "price": self.price, "isOpen": true, "collateralToken": {"symbol": "USDC"}}])
+                    } else {
+                        json!([])
+                    };
+                    json!({"perp": {"borrowings": borrowings}})
                 }
                 ROUTE => {
                     self.requests.push("route".into());
@@ -473,8 +478,11 @@ async fn basic_trade_confirmation_checks_live_chain_and_contract() {
                 .err()
                 .unwrap();
             assert_eq!(error.code, Code::PreviewMismatch);
-            let details = error.details.unwrap();
-            let refreshed = &details["preview"];
+            assert_eq!(error.details.is_some(), index != 0);
+            let refreshed = trading
+                .confirmed_trade_preview(&session, preview.clone())
+                .await
+                .unwrap();
             assert_eq!(
                 refreshed["positionRoute"],
                 json!({"chainId": chain, "contractAddress": contract})
@@ -563,6 +571,47 @@ async fn basic_confirmation_reports_keeper_only_chain_drift() {
         assert_eq!(server.requests(), preflight);
         assert!(!home.path().join("trader/intents.sqlite3").exists());
     }
+}
+
+#[tokio::test]
+async fn market_confirmation_reports_contract_drift_before_reading_missing_market() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = market_open();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    let digest = issued["previewDigest"].as_str().unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.contract = "nibi1differentcontract";
+        state.market_available = false;
+        state.requests.clear();
+    }
+
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(digest, Some("100")).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert!(error.details.is_none());
+    assert!(error.message.contains("Request a fresh preview"));
+    assert_eq!(server.requests(), ["route", "node_info"]);
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
 
 #[tokio::test]

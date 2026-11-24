@@ -234,14 +234,16 @@ impl<'a> Trading<'a> {
             .map(position::Lcd)
             .ok_or_else(|| actions::invalid(no_lcd))?;
         let route = self.position_route(&lcd, confirmation.is_some()).await?;
-        if let Some(confirmation) = confirmation
-            && !preview.requires_market_price_refresh()
-        {
+        if let Some(confirmation) = confirmation {
             let mut current = preview.clone();
             current.position_route = Some(route.clone());
             // A replacement contract may not contain the target. Compare the
             // confirmed route before reading it so drift is reported first.
-            confirmation.verify_digest(&current, account)?;
+            if preview.requires_market_price_refresh() {
+                confirmation.verify_route_digest(&current, account)?;
+            } else {
+                confirmation.verify_digest(&current, account)?;
+            }
         }
         if let Some(id) = close_id {
             Self::verify_contract_owner(&lcd, account, &id, &route).await?;
