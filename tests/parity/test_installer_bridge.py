@@ -324,7 +324,9 @@ def prepare_uv(
     )
     version = wheel_version(wheel)
     replay.add(version, {wheel.name: wheel.read_bytes()})
-    ok(install.install(replay, "--version", version, script=script))
+    # The pinned pre-bridge installer predates the version option.
+    pin = ("--version", version) if script == INSTALLER else ()
+    ok(install.install(replay, *pin, script=script))
     install.pin(version)
 
 
@@ -932,14 +934,15 @@ def test_python_bridge_preserves_uv_and_rolls_back(
     wheel = wheel_artifact("SHIM")
     python_wheel = wheel_artifact("BRIDGE")
     binary = artifact("MUTANT" if failure else "RUST")
+    bridge_version = wheel_version(python_wheel)
+    if not failure:
+        baseline, script = pre_bridge_files()
+        prepare_uv(install, baseline, replay, script)
     # The native tag is already published when the bridge becomes available.
     version = add_shim(replay, wheel, binary)
-    bridge_version = wheel_version(python_wheel)
     if failure:
         prepare_uv(install, python_wheel, replay)
     else:
-        baseline, script = pre_bridge_files()
-        prepare_uv(install, baseline, replay, script)
         replay.add(bridge_version, {python_wheel.name: python_wheel.read_bytes()})
         chosen = json.loads(ok(install.update(replay, "--to", bridge_version)))
         assert (chosen["status"], chosen["target"]) == ("updated", bridge_version)
