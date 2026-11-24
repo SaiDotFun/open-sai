@@ -492,26 +492,18 @@ def test_logs_tail_masks_retained_mcp_arguments(
 def test_logs_run_keeps_events_with_non_utf8_argv(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:
-    python, _ = local_pair
-    result = invoke(
-        python,
+    # Older Python versions logged surrogate-escaped command arguments.
+    seed_logs(
         tmp_path,
-        "config",
-        "get",
-        "invalid-" + os.fsdecode(b"\xff"),
-        logging="1",
+        {
+            "cli": [
+                event("command.start", 1, argv=["config", "get", "invalid-\udcff"]),
+                event("command.end", 2),
+            ],
+        },
     )
-    assert result.returncode == 2
-    rows = [
-        row
-        for path in (tmp_path / "sai-home/logs").glob("cli-*.jsonl")
-        for row in path.read_bytes().splitlines()
-    ]
-    start = next(row for row in rows if json.loads(row)["event"] == "command.start")
-    assert b"\\udcff" in start
-    run_id = json.loads(start)["runId"]
     for cli in local_pair:
-        report = cli_json(cli, tmp_path, "logs", "run", run_id)
+        report = cli_json(cli, tmp_path, "logs", "run", RUN)
         events = report["events"]
         assert [row["event"] for row in events] == ["command.start", "command.end"]
         assert "argv" not in events[0]
