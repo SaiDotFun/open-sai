@@ -131,7 +131,9 @@ fn short(addr: &str) -> String {
 }
 
 pub(crate) fn safe_log_path(env: &Environment) -> bool {
-    !env.home.is_symlink() && !env.home.join("logs").is_symlink()
+    !env.home.is_symlink()
+        && !env.home.join("logs").is_symlink()
+        && files::verify_profile_owner(&env.home).is_ok()
 }
 
 impl DoctorArgs {
@@ -149,6 +151,7 @@ impl DoctorArgs {
             ..flags
         };
         let fix = !self.no_fix;
+        let fix_profile = fix && files::verify_profile_owner(&env.home).is_ok();
         let config_env = env.clone();
         let (config, settings, invalid_endpoint, log_settings) =
             sai_core::files::read_before(Instant::now() + DEADLINE, move || {
@@ -185,7 +188,7 @@ impl DoctorArgs {
         if let Some(writer) = events.writer {
             writer.flush(Duration::from_secs(1));
         }
-        checks.push(timed(|| files::logs_check(env, fix, log_settings)));
+        checks.push(timed(|| files::logs_check(env, fix_profile, log_settings)));
 
         let started = Instant::now();
         match mcp::check_registrations(fix, DEADLINE) {
@@ -214,7 +217,7 @@ impl DoctorArgs {
                     &env.home,
                     settings,
                     session.as_ref(),
-                    fix,
+                    fix_profile,
                     self.offline,
                     events,
                 )

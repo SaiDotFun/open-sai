@@ -171,6 +171,7 @@ impl Ledger<'_> {
     fn unchanged(&self) -> bool {
         self.identity.is_some()
             && identity(&self.path) == self.identity
+            && files::verify_profile_owner(self.home).is_ok()
             && files::trader_links(self.home, &FILES).is_empty()
             && hard_links(&self.root).is_empty()
     }

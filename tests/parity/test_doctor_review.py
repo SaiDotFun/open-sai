@@ -230,3 +230,55 @@ def test_doctor_refuses_named_pipes(
     result = invoke(candidate, tmp_path, fixture_env, *args)
     assert checks(result)[check]["status"] == "fail"
     assert stat.S_ISFIFO(path.stat().st_mode)
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="needs a private procfs mount")
+def test_doctor_checks_foreign_profile_before_creating_children(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    unshare = shutil.which("unshare")
+    if unshare is None:
+        pytest.skip("unshare is unavailable")
+    mount = tmp_path / "sai"
+    fixture_env["SAI_LOG"] = "true"
+    script = """
+from pathlib import Path
+import os
+import subprocess
+import sys
+
+root, binary = sys.argv[1:]
+root = Path(root)
+if root.stat().st_uid == os.getuid():
+    sys.exit(77)
+run = subprocess.run([binary, '--json', 'doctor', '--offline'], capture_output=True)
+assert not (root / 'trader').exists() and not (root / 'logs').exists()
+sys.stdout.buffer.write(run.stdout)
+sys.stderr.buffer.write(run.stderr)
+sys.exit(run.returncode)
+"""
+    result = subprocess.run(
+        [
+            unshare,
+            "--user",
+            "--map-root-user",
+            "--fork",
+            "--pid",
+            f"--mount-proc={mount}",
+            sys.executable,
+            "-c",
+            script,
+            str(mount),
+            candidate,
+        ],
+        cwd=tmp_path,
+        env=fixture_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    if result.returncode == 77 or result.stderr.startswith("unshare:"):
+        pytest.skip("a private mount with a foreign profile owner is unavailable")
+    home = checks(result)["home"]
+    assert home["status"] == "fail" and "belongs to another user" in home["summary"]

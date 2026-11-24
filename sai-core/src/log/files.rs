@@ -85,7 +85,7 @@ impl LogDir {
         {
             use rustix::{
                 fs::{Mode, OFlags, mkdirat, open, openat},
-                process::geteuid,
+                process::{geteuid, getuid},
             };
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
@@ -98,6 +98,9 @@ impl LogDir {
             let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
             builder.create(parent)?;
             let parent = open(parent, flags, Mode::empty())?;
+            if rustix::fs::fstat(&parent)?.st_uid != getuid().as_raw() {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
             match mkdirat(&parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
                 Ok(()) | Err(rustix::io::Errno::EXIST) => {}
                 Err(error) => return Err(error.into()),

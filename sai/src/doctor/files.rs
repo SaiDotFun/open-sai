@@ -93,6 +93,24 @@ fn open_directory(path: &Path) -> io::Result<File> {
     Ok(File::from(unix::open(path, DIR_FLAGS, Mode::empty())?))
 }
 
+fn require_owner(dir: &File, path: &Path) -> io::Result<()> {
+    if dir.metadata()?.uid() != getuid().as_raw() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} belongs to another user", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_profile_owner(home: &Path) -> io::Result<()> {
+    match open_directory(home) {
+        Ok(dir) => require_owner(&dir, home),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 fn chmod(path: &Path, file: &File, info: &Metadata) -> io::Result<Option<String>> {
     let mode = info.mode() & 0o7777;
     let new = mode & !GROUP_OR_OTHER;
@@ -110,7 +128,19 @@ fn tighten(root: &Path, names: &[&str]) -> (Vec<String>, Vec<String>) {
     let mut changes = Vec::new();
     let mut failed = Vec::new();
     let fix = |path: &Path| format!("chmod go-rwx {}", path.display());
-    let Ok(dir) = open_directory(root) else {
+    let open = || -> io::Result<File> {
+        let home = root.parent().ok_or(io::ErrorKind::InvalidInput)?;
+        let name = root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+        let parent = open_directory(home)?;
+        require_owner(&parent, home)?;
+        Ok(File::from(unix::openat(
+            parent,
+            name,
+            DIR_FLAGS,
+            Mode::empty(),
+        )?))
+    };
+    let Ok(dir) = open() else {
         return (changes, vec![fix(root)]);
     };
     let Ok(info) = dir.metadata() else {
@@ -284,6 +314,11 @@ pub(super) fn home_check(home: &Path, fix: bool) -> Check {
         .fix(fix)
         .details(details);
     }
+    if fix && let Err(error) = verify_profile_owner(home) {
+        return Check::new("home", "fail", error.to_string())
+            .fix(SHARED_HOME_FIX)
+            .details(details);
+    }
     let exists = root.is_dir();
     if !fix {
         if !all_loose.is_empty() {
@@ -377,6 +412,7 @@ pub(super) fn home_check(home: &Path, fix: bool) -> Check {
 fn create_trader(home: &Path) -> io::Result<()> {
     DirBuilder::new().mode(0o700).recursive(true).create(home)?;
     let dir = open_directory(home)?;
+    require_owner(&dir, home)?;
     let mode = Mode::RUSR | Mode::WUSR | Mode::XUSR;
     match unix::mkdirat(&dir, "trader", mode) {
         Ok(()) | Err(rustix::io::Errno::EXIST) => {}
