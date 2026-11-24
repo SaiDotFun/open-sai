@@ -341,6 +341,29 @@ otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 `--lcd-endpoint` override them for one run.
 
+### Intent and History JSON
+
+`intent status` returns Keeper intent rows in `userIntents` and any matching
+trade history in `matchedTradeHistory`. Sai can add `outcome`,
+`localStatus`, and `hint`. `account history` returns trade-history rows in
+`perp.tradeHistory`. The CLI and MCP use the same Keeper fields.
+
+| Rows | Keeper Fields |
+| --- | --- |
+| Intent | `intentKey`, `kind`, `lifecycleStep`, `execActor`, `evmAddress`, `nibiAddress`, `txHash`, `execBlock`, `execBlockTs`, `errorCode`, `errorMsg` |
+| Trade history | `id`, `intentKey`, `tradeChangeType`, `txHash`, `evmTxHash`, `block.block`, `block.block_ts`, `trade.id`, `trade.trader` |
+
+Sai omits null, unrecognized, and invalid row fields and lowercases valid
+transaction hashes. A malformed hash or timestamp adds the corresponding
+flag with value `true`. The flags are `txHashInvalid`,
+`evmTxHashInvalid`, `execBlockTsInvalid`, and `block.block_tsInvalid`.
+Use `outcome` and `localStatus` to check the intent's progress.
+
+On an intent error, `errorCode` keeps recognized codes such as
+`wallet_rejected` and `rpc_submission_failed`. Sai uses `KEEPER_ERROR`
+when the code is missing or unrecognized. The `errorMsg` field says
+`Keeper reported an intent error.`.
+
 ## Errors and Exit Codes
 
 Put `--json` before the command to read errors on stdout. A failed command
