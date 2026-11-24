@@ -21,7 +21,7 @@ use x509_cert::{
     time::Validity,
 };
 
-use super::ca_pem::{CaCertificate, ServerTrust, can_issue};
+use super::ca_pem::{CaCertificate, ServerTrust, anchor_path_len, can_issue, same_name};
 
 pub(super) struct CaStore {
     pub roots: RootCertStore,
@@ -29,7 +29,7 @@ pub(super) struct CaStore {
     rejected: HashSet<CertificateDer<'static>>,
     rejected_anchors: RootCertStore,
     intermediates: Vec<LocalIntermediate>,
-    dated_anchors: Vec<(usize, Validity)>,
+    anchor_constraints: Vec<(usize, AnchorConstraints)>,
 }
 
 impl CaStore {
@@ -40,7 +40,7 @@ impl CaStore {
             rejected: HashSet::new(),
             rejected_anchors: RootCertStore::empty(),
             intermediates: Vec::new(),
-            dated_anchors: Vec::new(),
+            anchor_constraints: Vec::new(),
         }
     }
 
@@ -52,9 +52,17 @@ impl CaStore {
         match cert.trust {
             ServerTrust::Anchor => {
                 let index = self.roots.len();
+                let path_len =
+                    anchor_path_len(&cert.tbs).map_err(|_| CertificateError::BadEncoding)?;
                 self.roots.add(cert.der.clone())?;
-                if let Some(validity) = cert.trusted_pem_validity {
-                    self.dated_anchors.push((index, validity));
+                if path_len.is_some() || cert.trusted_pem_validity.is_some() {
+                    self.anchor_constraints.push((
+                        index,
+                        AnchorConstraints {
+                            validity: cert.trusted_pem_validity,
+                            path_len,
+                        },
+                    ));
                 }
             }
             ServerTrust::Rejected => {
@@ -86,7 +94,7 @@ impl CaStore {
             .expect("valid Rustls protocol versions");
         let builder = if (self.rejected.is_empty()
             && self.intermediates.is_empty()
-            && self.dated_anchors.is_empty())
+            && self.anchor_constraints.is_empty())
             || self.roots.is_empty()
         {
             builder.with_root_certificates(self.roots)
@@ -98,12 +106,46 @@ impl CaStore {
                     intermediates: self.intermediates,
                     roots: self.roots,
                     provider,
-                    dated_anchors: self.dated_anchors,
+                    anchor_constraints: self.anchor_constraints,
                 }))
         };
         let mut config = builder.with_no_client_auth();
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         config
+    }
+}
+
+// WebPKI omits these fields when converting a certificate to a trust anchor.
+#[derive(Debug)]
+struct AnchorConstraints {
+    validity: Option<Validity>,
+    path_len: Option<usize>,
+}
+
+impl AnchorConstraints {
+    fn verify(&self, path: &VerifiedPath<'_>, now: UnixTime) -> Result<(), webpki::Error> {
+        if let Some(validity) = self.validity {
+            let start = validity.not_before.to_unix_duration().as_secs();
+            let end = validity.not_after.to_unix_duration().as_secs();
+            if !(start..end).contains(&now.as_secs()) {
+                return Err(webpki::Error::UnknownIssuer);
+            }
+        }
+        if let Some(limit) = self.path_len {
+            let mut count = 0;
+            for intermediate in path.intermediate_certificates() {
+                let tbs = Certificate::from_der(&intermediate.der())
+                    .map_err(|_| webpki::Error::BadDer)?
+                    .tbs_certificate;
+                if !same_name(&tbs.subject, &tbs.issuer) {
+                    count += 1;
+                }
+            }
+            if count > limit {
+                return Err(webpki::Error::PathLenConstraintViolated);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -119,19 +161,19 @@ struct StoreVerifier {
     intermediates: Vec<LocalIntermediate>,
     roots: RootCertStore,
     provider: Arc<CryptoProvider>,
-    dated_anchors: Vec<(usize, Validity)>,
+    anchor_constraints: Vec<(usize, AnchorConstraints)>,
 }
 
 impl StoreVerifier {
     fn verify_path(&self, path: &VerifiedPath<'_>, now: UnixTime) -> Result<(), webpki::Error> {
-        for (index, validity) in &self.dated_anchors {
-            if std::ptr::eq(path.anchor(), &self.roots.roots[*index]) {
-                let start = validity.not_before.to_unix_duration().as_secs();
-                let end = validity.not_after.to_unix_duration().as_secs();
-                if !(start..end).contains(&now.as_secs()) {
-                    return Err(webpki::Error::UnknownIssuer);
-                }
-            }
+        // Match the selected anchor by position. Two certificates can have the
+        // same name and key with different validity or path length.
+        if let Some((_, constraints)) = self
+            .anchor_constraints
+            .iter()
+            .find(|(index, _)| std::ptr::eq(path.anchor(), &self.roots.roots[*index]))
+        {
+            constraints.verify(path, now)?;
         }
         if self.intermediates.is_empty() {
             return Ok(());

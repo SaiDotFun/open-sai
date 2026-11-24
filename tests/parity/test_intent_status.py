@@ -1295,6 +1295,64 @@ def test_chain_uses_only_local_issuers_after_entering_store(
     )
 
 
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("anchor_kind", ["plain-root", "trusted-intermediate"])
+@pytest.mark.parametrize("path_limit", [0, 2, 256])
+def test_configured_anchor_keeps_path_length_limit(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_three_ca_chain: tuple[Path, Path],
+    store: str,
+    anchor_kind: str,
+    path_limit: int,
+) -> None:
+    certs, chain = keeper_three_ca_chain
+    explicit_trust = anchor_kind == "trusted-intermediate"
+    anchor_name = "upper" if explicit_trust else "root"
+    anchor = x509.load_pem_x509_certificate((chain / f"{anchor_name}.pem").read_bytes())
+    signer = serialization.load_pem_private_key((chain / "root.key").read_bytes(), None)
+    assert isinstance(signer, ec.EllipticCurvePrivateKey)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(anchor.subject)
+        .issuer_name(anchor.issuer)
+        .public_key(anchor.public_key())
+        .serial_number(anchor.serial_number)
+        .not_valid_before(anchor.not_valid_before_utc)
+        .not_valid_after(anchor.not_valid_after_utc)
+    )
+    for extension in anchor.extensions:
+        value = extension.value
+        if isinstance(value, x509.BasicConstraints):
+            value = x509.BasicConstraints(ca=True, path_length=path_limit)
+        builder = builder.add_extension(value, extension.critical)
+    limited_anchor = tmp_path / "limited.pem"
+    limited_anchor.write_bytes(
+        builder.sign(signer, hashes.SHA256()).public_bytes(serialization.Encoding.PEM)
+    )
+    peer = [certs / "server.pem", certs / "cross-signed.pem"]
+    if explicit_trust:
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-in",
+            "limited.pem",
+            "-addtrust",
+            "serverAuth",
+            "-out",
+            "trusted.pem",
+        )
+        limited_anchor = tmp_path / "trusted.pem"
+    else:
+        peer.append(chain / "upper.pem")
+    certificate_chain = tmp_path / "peer.pem"
+    certificate_chain.write_bytes(b"".join(cert.read_bytes() for cert in peer))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate_chain, certs / "server.key")
+    trust = ca_store_overrides(tmp_path, store, limited_anchor)
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, path_limit > 0)
+
+
 def write_trusted_pem(path: Path, certificate: Path, aux: bytes) -> None:
     der = ssl.PEM_cert_to_DER_cert(certificate.read_text(encoding="ascii"))
     path.write_bytes(

@@ -10,15 +10,20 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use der::{
     Reader, Sequence, SliceReader,
-    asn1::{ObjectIdentifier, OctetString},
-    oid::db::rfc5912::{
-        DSA_WITH_SHA_1, ID_DSA, ID_EC_PUBLIC_KEY, ID_RSASSA_PSS, PKCS_1, RSA_ENCRYPTION,
+    asn1::{ObjectIdentifier, OctetString, Uint},
+    oid::{
+        AssociatedOid,
+        db::rfc5912::{
+            DSA_WITH_SHA_1, ID_DSA, ID_EC_PUBLIC_KEY, ID_RSASSA_PSS, PKCS_1, RSA_ENCRYPTION,
+        },
     },
 };
 use rustls::pki_types::CertificateDer;
 use x509_cert::{
     Certificate, TbsCertificate,
-    ext::pkix::{AuthorityKeyIdentifier, KeyUsage, SubjectKeyIdentifier, name::GeneralName},
+    ext::pkix::{
+        AuthorityKeyIdentifier, BasicConstraints, KeyUsage, SubjectKeyIdentifier, name::GeneralName,
+    },
     name::Name,
     spki::AlgorithmIdentifierOwned,
     time::Validity,
@@ -193,7 +198,30 @@ fn likely_issuer(issuer: &TbsCertificate, child: &TbsCertificate) -> der::Result
     )
 }
 
-fn same_name(left: &Name, right: &Name) -> bool {
+// The x509-cert BasicConstraints type stores the limit in a u8.
+#[derive(Sequence)]
+struct AnchorBasicConstraints {
+    #[asn1(default = "Default::default")]
+    ca: bool,
+    path_len_constraint: Option<Uint>,
+}
+
+impl AssociatedOid for AnchorBasicConstraints {
+    const OID: ObjectIdentifier = BasicConstraints::OID;
+}
+
+pub(super) fn anchor_path_len(tbs: &TbsCertificate) -> der::Result<Option<usize>> {
+    Ok(tbs
+        .get::<AnchorBasicConstraints>()?
+        .and_then(|(_, constraints)| constraints.path_len_constraint)
+        .map(|limit| {
+            limit.as_bytes().iter().fold(0usize, |value, &byte| {
+                value.saturating_mul(256).saturating_add(usize::from(byte))
+            })
+        }))
+}
+
+pub(super) fn same_name(left: &Name, right: &Name) -> bool {
     left == right
         || canonical_name(left)
             .zip(canonical_name(right))
