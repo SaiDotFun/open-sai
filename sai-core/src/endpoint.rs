@@ -85,13 +85,9 @@ impl Endpoint {
                 .split_once(':')
                 .map_or((host_port, None), |(host, port)| (host, Some(port))),
         };
-        let (host, zone) = host.split_once('%').unwrap_or((host, ""));
-        let host = if zone.is_empty() && !host_port.contains('%') {
-            host.to_lowercase()
-        } else if host_port.starts_with('[') || !zone.is_empty() {
-            format!("{}%{zone}", host.to_lowercase())
-        } else {
-            host.to_lowercase()
+        let host = match host.split_once('%') {
+            Some((host, zone)) => format!("{}%{zone}", host.to_lowercase()),
+            None => host.to_lowercase(),
         };
         let host = if host.contains(':') {
             format!("[{host}]")

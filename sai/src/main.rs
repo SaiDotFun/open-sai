@@ -13,7 +13,12 @@ use serde_json::{Value, json};
 use config::{ConfigCommand, Error};
 
 #[derive(Parser)]
-#[command(version, about, disable_help_subcommand = true)]
+#[command(
+    version,
+    about,
+    disable_help_subcommand = true,
+    args_override_self = true
+)]
 struct Cli {
     /// Print compact machine-readable JSON.
     #[arg(long)]
@@ -113,7 +118,7 @@ fn main() -> ExitCode {
                 writer,
                 command_field(),
                 started,
-                print_parse_error(&error, context),
+                print_parse_error(&error, context, &argv),
             );
         }
     };
@@ -195,7 +200,11 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
     }
 }
 
-fn usage_error(error: &clap::Error) -> Option<Error> {
+fn usage_error(
+    error: &clap::Error,
+    command: &str,
+    argv: &[String],
+) -> Option<Error> {
     let arg = context_text(error, ContextKind::InvalidArg);
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
@@ -207,7 +216,21 @@ fn usage_error(error: &clap::Error) -> Option<Error> {
             if argument.starts_with('-') {
                 format!("No such option {}.", repr(argument))
             } else {
-                format!("Got unexpected extra argument ({argument})")
+                let leaf = command.split_whitespace().last();
+                let extra = argv
+                    .iter()
+                    .skip_while(|arg| leaf.is_some_and(|leaf| *arg != leaf))
+                    .skip_while(|arg| *arg != argument)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if extra.len() > 1 {
+                    format!(
+                        "Got unexpected extra arguments ({})",
+                        extra.join(" ")
+                    )
+                } else {
+                    format!("Got unexpected extra argument ({argument})")
+                }
             }
         }
         ErrorKind::MissingRequiredArgument => {
@@ -231,6 +254,7 @@ fn usage_error(error: &clap::Error) -> Option<Error> {
 fn print_parse_error(
     error: &clap::Error,
     command: &str,
+    argv: &[String],
 ) -> (u8, Option<String>) {
     match error.kind() {
         ErrorKind::DisplayHelp if config::print_help(command, false) => {
@@ -244,8 +268,30 @@ fn print_parse_error(
             (2, None)
         }
         _ => {
-            if let Some(error) = usage_error(error) {
-                return complete(Err(error), command);
+            let usage_command = match error.get(ContextKind::Usage) {
+                Some(ContextValue::StyledStr(usage)) => {
+                    let usage = usage.to_string();
+                    let path = usage.trim_start_matches("Usage: sai");
+                    if path.starts_with(" config ") {
+                        if path.starts_with(&format!(" {command} ")) {
+                            command
+                        } else {
+                            "config"
+                        }
+                    } else {
+                        ""
+                    }
+                }
+                _ => command,
+            };
+            if let Some(usage) = usage_error(error, usage_command, argv) {
+                if error.kind() == ErrorKind::InvalidValue
+                    && usage_command.is_empty()
+                {
+                    eprintln!("Error: {}", usage.message);
+                    return (usage.code, None);
+                }
+                return complete(Err(usage), usage_command);
             }
             let _ = error.print();
             (error.exit_code() as u8, None)

@@ -266,3 +266,21 @@ fn oversized_retention_values_keep_json_precision_and_can_be_edited() {
         "[logs]\n# keep_days = 14\n"
     );
 }
+
+#[test]
+fn adding_to_an_explicit_table_keeps_its_subtable_separate() {
+    let home = tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    for gap in ["", "\n"] {
+        let input = format!(
+            "[keeper]\n# note\n{gap}[keeper.future]\nfield = 'unchanged'\n"
+        );
+        fs::write(&path, input).unwrap();
+        settings::set(&path, Key::KeeperEndpoint, &json!("https://new.example"))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "[keeper]\n# note\nendpoint = \"https://new.example\"\n\n[keeper.future]\nfield = 'unchanged'\n"
+        );
+    }
+}

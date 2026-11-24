@@ -167,14 +167,9 @@ impl LogWriter {
         )
         .snapshot(&mut budget, known.as_deref().unwrap_or_default(), 0);
         let chars = budget.used().min(EVENT_CHARS);
-        if self
-            .queue
-            .chars
-            .fetch_update(Relaxed, Relaxed, |queued| {
-                (queued + chars <= QUEUE_CHARS).then_some(queued + chars)
-            })
-            .is_err()
-        {
+        let queued = self.queue.chars.fetch_add(chars, Relaxed);
+        if queued + chars > QUEUE_CHARS {
+            self.queue.chars.fetch_sub(chars, Relaxed);
             self.queue.dropped.fetch_add(1, Relaxed);
             return;
         }

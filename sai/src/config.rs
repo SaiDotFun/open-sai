@@ -181,6 +181,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" => "",
+        "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
     };
     format!("Usage: {} [OPTIONS]{args}", command_line(command))

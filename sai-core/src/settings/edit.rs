@@ -116,30 +116,30 @@ fn edit(
         }
     };
     let header = table.span().expect("explicit parsed table has a span");
-    let mut headers = Vec::new();
-    table_headers(document.as_table(), &mut headers);
-    if table
-        .iter()
-        .filter_map(|(_, item)| item.as_table())
-        .any(|child| {
-            let mut children = Vec::new();
-            table_headers(child, &mut children);
-            child
-                .span()
-                .into_iter()
-                .map(|span| span.start)
-                .chain(children)
-                .any(|offset| offset < header.start)
-        })
-    {
+    let mut children = Vec::new();
+    table_headers(table, &mut children);
+    if children.iter().any(|&offset| offset < header.start) {
         return Err(uneditable(section, path));
     }
+    let mut headers = Vec::new();
+    table_headers(document.as_table(), &mut headers);
     let body_start = line_end(text, header.start);
-    let body_end = headers
+    let next_header = headers
         .into_iter()
         .filter(|&offset| offset > header.start)
-        .min()
-        .map_or(text.len(), |offset| line_start(text, offset));
+        .min();
+    let body_end =
+        next_header.map_or(text.len(), |offset| line_start(text, offset));
+    let body = &text[body_start..body_end];
+    let content = body.trim_end();
+    let append_at = if content.is_empty() {
+        body_start
+    } else {
+        line_end(&text[..body_end], body_start + content.len())
+    };
+    let insert_gap = next_header
+        .is_some_and(|offset| children.contains(&offset))
+        && append_at == body_end;
     let placeholder = format!("# {name} = {}", placeholder_value(key));
 
     if let Some((key, item)) = table.get_key_value(name) {
@@ -179,10 +179,12 @@ fn edit(
             .unwrap_or_default();
         let assignment = new.map_or_else(|| placeholder.clone(), new_line);
         let mut updated = text.to_owned();
+        let mut offset = append_at;
         for range in invalid.into_iter().rev() {
+            offset -= offset.saturating_sub(range.start).min(range.len());
             updated.replace_range(range, "");
         }
-        return Ok(Some(insert_line(&updated, body_start, &assignment)));
+        return Ok(Some(insert_line(&updated, offset, &assignment)));
     }
 
     let Some(new) = new else { return Ok(None) };
@@ -194,8 +196,7 @@ fn edit(
         .filter_map(|(_, value)| value.span())
         .collect::<Vec<_>>();
     let mut offset = body_start;
-    let mut append_at = body_start;
-    for line in text[body_start..body_end].split_inclusive('\n') {
+    for line in body.split_inclusive('\n') {
         let next = offset + line.len();
         let trimmed = line.trim();
         if trimmed.starts_with(&prefix)
@@ -213,11 +214,13 @@ fn edit(
                 &format!("{assignment}{suffix}\n"),
             )));
         }
-        if !trimmed.is_empty() {
-            append_at = next;
-        }
         offset = next;
     }
+    let assignment = if insert_gap {
+        format!("{assignment}\n")
+    } else {
+        assignment
+    };
     Ok(Some(insert_line(text, append_at, &assignment)))
 }
 

@@ -278,7 +278,7 @@ fn parse_bool(raw: &str) -> Option<bool> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct SettingsError {
     message: String,
     uneditable: bool,
@@ -554,11 +554,7 @@ fn pick(
     } else if let Some(raw) = env.value(key) {
         (key.parse_value(raw), Source::Env)
     } else if let Some(value) = file {
-        let entry = value
-            .as_ref()
-            .map(Clone::clone)
-            .map_err(|error| SettingsError::invalid(error.message.clone()));
-        (entry, Source::File)
+        (value.clone(), Source::File)
     } else {
         (Ok(key.default_value()), Source::Default)
     }
@@ -615,43 +611,75 @@ fn parse_error(
     error: &TomlError,
     editing: bool,
 ) -> SettingsError {
-    let offset = error.span().map_or(input.len(), |span| span.start);
+    let span = error.span().unwrap_or(input.len()..input.len());
+    let message = error.message();
+    let duplicate = message == "duplicate key";
+    let mut offset = span.start;
+    if duplicate
+        && !editing
+        && let Some(line) =
+            input.get(offset..).and_then(|rest| rest.lines().next())
+        && let Ok(document) = ParsedDocument::parse(line)
+        && let Some(end) = document
+            .document
+            .iter()
+            .next()
+            .and_then(|(_, item)| item.span())
+    {
+        offset += end.end;
+    }
     let before = input.get(..offset).unwrap_or(input);
     let line = before.bytes().filter(|&c| c == b'\n').count() + 1;
     let column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
-    let message = error.message();
+    let character = input.get(offset..).and_then(|tail| tail.chars().next());
+    let string_error = message.starts_with("invalid basic string")
+        || message.starts_with("invalid literal string");
     let location = if offset >= input.len() {
         "at end of document".into()
     } else {
         format!("at line {line}, column {column}")
     };
     let detail = if editing {
-        if offset >= input.len() {
-            "Unexpected end of file".into()
+        if character.is_none() {
+            format!("Unexpected end of file at line {line} col 0")
+        } else if duplicate && let Some(key) = input.get(span) {
+            format!(
+                "Key {} already exists.",
+                json!(key.trim_matches(['"', '\'']))
+            )
+        } else if string_error
+            && let Some(c) = character.filter(|c| c.is_ascii_control())
+        {
+            format!(
+                "Control characters (codes less than 0x1f and 0x7f) are not allowed in strings, use \\u{:04x} instead at line {line} col {}",
+                u32::from(c),
+                column - 1
+            )
         } else {
-            let character = input
-                .get(offset..)
-                .and_then(|tail| tail.chars().next())
-                .unwrap_or('\n');
             format!(
                 "Unexpected character: {} at line {line} col {}",
-                repr(&character.to_string()),
+                repr(&character.unwrap_or('\n').to_string()),
                 column - 1
             )
         }
     } else {
-        let description =
-            if message.contains("table") && message.contains("\x60]\x60") {
-                "Expected ']' at the end of a table declaration"
-            } else if message.contains("duplicate") {
-                "Cannot overwrite a value"
-            } else if message.contains("invalid key")
-                || message.contains("key/value pair")
-            {
-                "Expected '=' after a key in a key/value pair"
-            } else {
-                "Invalid value"
-            };
+        let description = if string_error && character.is_none() {
+            "Unterminated string".into()
+        } else if string_error
+            && let Some(c) = character.filter(|c| c.is_ascii_control())
+        {
+            format!("Illegal character {}", repr(&c.to_string()))
+        } else if message.starts_with("unclosed table") {
+            "Expected ']' at the end of a table declaration".into()
+        } else if message.starts_with("unclosed array table") {
+            "Expected ']]' at the end of an array declaration".into()
+        } else if duplicate {
+            "Cannot overwrite a value".into()
+        } else if message.contains("expected `=`") {
+            "Expected '=' after a key in a key/value pair".into()
+        } else {
+            "Invalid value".into()
+        };
         format!("{description} ({location})")
     };
     SettingsError::invalid(format!("Cannot parse {}: {detail}", path.display()))

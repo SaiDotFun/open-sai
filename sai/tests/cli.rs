@@ -309,3 +309,34 @@ fn oversized_unknown_integers_do_not_hide_known_keys() {
     );
     assert_eq!(fs::read_to_string(path).unwrap(), contents);
 }
+
+#[test]
+fn config_accepts_the_last_root_flag_value() {
+    let home = tempdir().unwrap();
+    let output = sai(home.path())
+        .args([
+            "--endpoint",
+            "https://first.example",
+            "--endpoint=https://last.example",
+            "config",
+            "get",
+            "keeper.endpoint",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"https://last.example\n");
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn nested_cli_usage_stays_on_stderr() {
+    let home = tempdir().unwrap();
+    let output = sai(home.path())
+        .args(["config", "list", "extra", "second"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"Usage: sai config list [OPTIONS]\nTry 'sai config list --help' for help.\n\nError: Got unexpected extra arguments (extra second)\n");
+}
