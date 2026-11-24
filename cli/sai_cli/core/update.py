@@ -665,7 +665,13 @@ def read_cache(path: Path | None = None) -> Cache | None:
 
 def prepare_parent(target: Path) -> None:
     """Create the parent for profile state or for uv tool metadata."""
-    if target.parent.absolute() == sai_home():
+    try:
+        in_profile = target.parent.absolute() == sai_home()
+    except FileNotFoundError:
+        # The update can remove the starting directory. Already resolved
+        # destinations remain usable even if SAI_HOME was relative.
+        in_profile = False
+    if in_profile:
         paths.private_directory(target.parent)
     else:
         target.parent.mkdir(mode=paths.PRIVATE_MODE, parents=True, exist_ok=True)
