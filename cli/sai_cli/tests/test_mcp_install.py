@@ -2407,3 +2407,51 @@ def test_claude_install_reports_scoped_commands_without_credentials(
     assert SECRET not in output and OTHER not in output
     assert config.read_bytes() == before
     assert not env.calls()
+
+
+def test_claude_custom_advice_uses_the_invoked_sai_without_sai_on_path(env: Env):
+    env.sai.unlink()
+    invoked = write_exe(
+        env.root / "invoked sai", "from sai_cli.sai_cli import main\nmain()"
+    )
+    custom = write_exe(env.root / f"custom-{SECRET}", "raise SystemExit(9)")
+    config = env.home / ".claude.json"
+    config.write_text(json.dumps({"mcpServers": {"sai": claude_entry(["old"])}}))
+    before = config.read_bytes()
+
+    result = subprocess.run(
+        [
+            str(invoked),
+            "--json",
+            "mcp",
+            "install",
+            "claude",
+            "--",
+            str(custom),
+            "--credential",
+            SECRET,
+        ],
+        cwd=env.project,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    [row] = json.loads(result.stdout)["error"]["details"]["results"]
+    [command] = row["fix"].split("`")[1::2]
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "sai",
+        "--",
+        str(invoked),
+        "mcp",
+        "serve",
+    ]
+    assert "substitute your requested command after --" in row["fix"]
+    assert SECRET not in result.stdout + result.stderr
+    assert config.read_bytes() == before and not env.calls()

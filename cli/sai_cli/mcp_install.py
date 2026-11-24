@@ -273,11 +273,11 @@ def claude_differing_fields(existing: Registration, target: Target) -> tuple[str
 def report_different_claude_entry(
     client: Claude, result: Result, existing: Registration, target: Target
 ) -> Result:
-    launcher: str | None = target.argv[0]
+    launcher = target.argv[0]
     if target.explicit_command:
         # An explicit override can contain private arguments or paths.
         default_launcher = shutil.which("sai", path=client.environ.get("PATH"))
-        launcher = os.path.abspath(default_launcher) if default_launcher else None
+        launcher = os.path.abspath(default_launcher or sys.argv[0])
     scope = existing.scope
     path = client.registration_path(scope)
     entry = ClaudeRepair(
