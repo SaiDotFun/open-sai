@@ -11,6 +11,7 @@ use super::Surface;
 
 const PRUNE_MARKER: &str = ".pruned";
 const ENDPOINT_KEY: &str = ".endpoint-key";
+const ENDPOINT_KEY_LOCK: &str = ".endpoint-key.lock";
 
 #[cfg(unix)]
 pub(super) struct LogDir(File);
@@ -179,12 +180,53 @@ impl LogDir {
         }
     }
 
-    fn read_key(&self) -> io::Result<Option<[u8; 32]>> {
-        let file = match self.read_file(ENDPOINT_KEY) {
-            Ok(file) => file,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
-        };
+    pub fn endpoint_key(&self) -> io::Result<[u8; 32]> {
+        match self.read_endpoint_key() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => return result,
+        }
+        let lock = self.private_file(ENDPOINT_KEY_LOCK, false)?;
+        lock.lock()?;
+        match self.read_endpoint_key() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => return result,
+        }
+        let mut key = [0; 32];
+        use ring::rand::SecureRandom;
+        ring::rand::SystemRandom::new()
+            .fill(&mut key)
+            .map_err(|_| io::Error::other("could not generate log identity key"))?;
+        let staged = format!(".endpoint-key-{}", uuid::Uuid::new_v4().simple());
+        let mut file = self.private_file(&staged, true)?;
+        let result = file.write_all(&key);
+        drop(file);
+        self.publish_endpoint_key(&staged, result)?;
+        Ok(key)
+    }
+
+    #[cfg(unix)]
+    fn publish_endpoint_key(&self, staged: &str, written: io::Result<()>) -> io::Result<()> {
+        use rustix::fs::{AtFlags, renameat, unlinkat};
+        let result = written
+            .and_then(|()| renameat(&self.0, staged, &self.0, ENDPOINT_KEY).map_err(Into::into));
+        if result.is_err() {
+            let _ = unlinkat(&self.0, staged, AtFlags::empty());
+        }
+        result
+    }
+
+    #[cfg(not(unix))]
+    fn publish_endpoint_key(&self, staged: &str, written: io::Result<()>) -> io::Result<()> {
+        let staged = self.0.join(staged);
+        let result = written.and_then(|()| fs::rename(&staged, self.0.join(ENDPOINT_KEY)));
+        if result.is_err() {
+            let _ = fs::remove_file(staged);
+        }
+        result
+    }
+
+    pub(super) fn read_endpoint_key(&self) -> io::Result<[u8; 32]> {
+        let file = self.read_file(ENDPOINT_KEY)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -192,54 +234,11 @@ impl LogDir {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
         }
-        let mut key = Vec::new();
-        file.take(33).read_to_end(&mut key)?;
-        key.try_into()
-            .map(Some)
+        let mut bytes = Vec::with_capacity(33);
+        file.take(33).read_to_end(&mut bytes)?;
+        bytes
+            .try_into()
             .map_err(|_| io::ErrorKind::InvalidData.into())
-    }
-
-    pub fn key(&self, create: bool) -> Option<[u8; 32]> {
-        let key = self.read_key().ok()?;
-        if key.is_some() || !create {
-            return key;
-        }
-        let lock = self.private_file(".endpoint-key.lock", false).ok()?;
-        lock.lock().ok()?;
-        if let Some(key) = self.read_key().ok()? {
-            return Some(key);
-        }
-        let mut key = [0; 32];
-        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key).ok()?;
-        let name = format!(".endpoint-key-{}", uuid::Uuid::new_v4().simple());
-        let mut staged = self.private_file(&name, true).ok()?;
-        let saved = staged.write_all(&key);
-        drop(staged);
-        let result = saved.and_then(|()| self.publish_key(&name));
-        if result.is_err() {
-            self.remove_key_stage(&name);
-        }
-        result.ok().map(|()| key)
-    }
-
-    #[cfg(unix)]
-    fn publish_key(&self, name: &str) -> io::Result<()> {
-        Ok(rustix::fs::renameat(&self.0, name, &self.0, ENDPOINT_KEY)?)
-    }
-
-    #[cfg(not(unix))]
-    fn publish_key(&self, name: &str) -> io::Result<()> {
-        fs::rename(self.0.join(name), self.0.join(ENDPOINT_KEY))
-    }
-
-    #[cfg(unix)]
-    fn remove_key_stage(&self, name: &str) {
-        let _ = rustix::fs::unlinkat(&self.0, name, rustix::fs::AtFlags::empty());
-    }
-
-    #[cfg(not(unix))]
-    fn remove_key_stage(&self, name: &str) {
-        let _ = fs::remove_file(self.0.join(name));
     }
 
     pub fn prune(&self, keep_days: u64, today: NaiveDate) -> io::Result<()> {

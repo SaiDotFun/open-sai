@@ -19,14 +19,13 @@ use std::{
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::settings::{self, Environment};
 
 use files::LogDir;
 pub use privacy::Field;
-use privacy::{Budget, EVENT_CHARS, prefix};
+use privacy::{Budget, EVENT_CHARS, endpoint_digest, prefix};
 use session_tokens::{FileStamp, Tokens, stamp};
 
 const QUEUE_SIZE: usize = 2048;
@@ -127,6 +126,7 @@ pub struct LogWriter {
     events: SyncSender<Work>,
     done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
+    command_id: Option<String>,
 }
 
 enum Work {
@@ -146,20 +146,6 @@ pub(crate) fn valid_identifier(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
 }
 
-fn endpoint_digest(endpoint: &str) -> Option<[u8; 32]> {
-    let origin = privacy::origin(endpoint);
-    if origin == "[redacted url]" {
-        return None;
-    }
-    let parsed = crate::endpoint::Endpoint::split(endpoint.trim())?;
-    let path = if parsed.path.is_empty() {
-        "/"
-    } else {
-        &parsed.path
-    };
-    Some(Sha256::digest(format!("{origin}{path}?{}", parsed.query)).into())
-}
-
 fn keyed_endpoint(digest: &[u8; 32], key: &[u8; 32]) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
     let tag = ring::hmac::sign(&key, digest);
@@ -172,7 +158,7 @@ fn keyed_endpoint(digest: &[u8; 32], key: &[u8; 32]) -> String {
 
 fn endpoint_id(root: &std::path::Path, endpoint: &str) -> Option<String> {
     let digest = endpoint_digest(endpoint)?;
-    let key = LogDir::read_only(root).ok()?.key(false)?;
+    let key = LogDir::read_only(root).ok()?.read_endpoint_key().ok()?;
     Some(keyed_endpoint(&digest, &key))
 }
 
@@ -238,7 +224,14 @@ impl LogWriter {
             events,
             done: Mutex::new(done),
             queue,
+            command_id: None,
         })
+    }
+
+    /// Enable Python's v2 event metadata for a ported CLI command.
+    pub fn with_v2_command(mut self) -> Self {
+        self.command_id = Some(Uuid::new_v4().simple().to_string());
+        self
     }
 
     /// Queue an event without waiting for disk, queue space, or the writer.
@@ -254,14 +247,25 @@ impl LogWriter {
         let known = KNOWN.try_lock().ok().map(|value| Arc::clone(&value));
         let mut budget = Budget::new();
         let mut endpoint = None;
+        let command = self
+            .command_id
+            .as_ref()
+            .map(|id| ("commandId", Field::Text(id.clone())));
         let fields = Field::Object(
             fields
                 .into_iter()
+                .chain(command)
                 .filter_map(|(key, field)| {
+                    if key == "endpointId"
+                        && let Field::EndpointIdentity(digest) = field
+                    {
+                        endpoint = Some(digest);
+                        return None;
+                    }
                     if key == "endpoint"
                         && let Field::Endpoint(ref url) = field
                     {
-                        endpoint = endpoint_digest(url);
+                        endpoint = endpoint.or_else(|| endpoint_digest(url));
                     }
                     if COMMON.contains(&key) || matches!(&field, Field::Scalar(Value::Null)) {
                         None
@@ -379,7 +383,7 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
         }
     }
     if let Some(digest) = event.endpoint
-        && let Some(key) = directory.key(true)
+        && let Ok(key) = directory.endpoint_key()
     {
         line.insert("endpointId".into(), json!(keyed_endpoint(&digest, &key)));
     }

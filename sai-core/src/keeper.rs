@@ -4,6 +4,7 @@ mod ca_dir;
 mod proxy;
 mod public;
 mod queries;
+pub mod stream;
 mod transport;
 
 use std::time::{Duration, Instant};
@@ -17,10 +18,10 @@ use crate::{
     log::{self, EventContext, Field, Level},
 };
 
-pub use public::public_intent_status;
 pub(crate) use public::{
     known_intent_field, log_intent_error_code, log_intent_record, request_hash,
 };
+pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
@@ -54,6 +55,30 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(query, variables, token, timeout, std::future::pending())
+            .await
+    }
+
+    /// Make an interruptible public read.
+    pub async fn read_until(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        timeout: Duration,
+        interrupt: impl Future<Output = SaiError>,
+    ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(query, variables, None, timeout, interrupt)
+            .await
+    }
+
+    async fn request_with(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        token: Option<&str>,
+        timeout: Duration,
+        interrupt: impl Future<Output = SaiError>,
+    ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
         if let Some(token) = token {
@@ -72,11 +97,14 @@ impl<'a> Keeper<'a> {
             None
         };
         let mut response = ResponseLog::default();
-        let result = self
-            .post(query, &variables, token, timeout, &mut response)
-            .await;
+        let (result, interrupted) = tokio::select! {
+            biased;
+            error = interrupt => (Err(error), true),
+            result = self.post(query, &variables, token, timeout, &mut response) => (result, false),
+        };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
+            Err(_) if interrupted => ("error", Level::Warn, Some(Code::InternalError), None),
             Ok(_) => ("ok", Level::Info, None, None),
             Err(error) => match error.code {
                 Code::NotSent => ("not_sent", Level::Warn, Some(error.code), None),

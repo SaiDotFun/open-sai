@@ -56,7 +56,8 @@ def test_tpsl_has_keeper_field_patch():
 
 
 def test_admission_ack_and_key(session, monkeypatch):
-    def fake(endpoint, query, variables, token):
+    def fake(endpoint, query, variables, token, *, attempt):
+        attempt.transport_started = True
         assert token == session["token"]
         submitted = variables["input"]
         assert re.fullmatch(
@@ -84,7 +85,8 @@ def test_admission_ack_and_key(session, monkeypatch):
 
 
 def test_uncertain_submission_blocks_retry(session, monkeypatch):
-    def fail(*args, **kwargs):
+    def fail(*args, attempt):
+        attempt.transport_started = True
         raise keeper.KeeperError("network")
 
     monkeypatch.setattr(keeper, "request", fail)
