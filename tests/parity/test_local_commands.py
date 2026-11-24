@@ -645,6 +645,8 @@ def test_local_usage_matches_click(
         ("--json", "config", "set", "keeper.endpoint", "https://fixture.invalid:abc"),
         ("--json", "config", "set", "keeper.endpoint", "https://fixture.invalid:65536"),
         ("--json", "config", "set", "keeper.endpoint", "https://host space.invalid"),
+        ("--json", "config", "set", "keeper.endpoint", "https://999.1.1.1"),
+        ("--json", "config", "set", "keeper.ws_endpoint", "wss://fixture@localhost"),
         ("--json", "--endpoint", "https://fixture.invalid:abc", "config", "list"),
         ("--endpoint", "https://fixture.invalid/#fragment", "config", "list"),
     ],

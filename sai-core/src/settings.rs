@@ -8,6 +8,7 @@ use std::{
     env,
     ffi::{OsStr, OsString},
     fmt, fs, io,
+    net::Ipv4Addr,
     path::{Path, PathBuf},
 };
 
@@ -217,6 +218,19 @@ impl Key {
                 && !host.is_empty()
                 && port.is_ok()
                 && !url.authority.contains('\\')
+                && match self {
+                    Self::KeeperWsEndpoint => url
+                        .authority
+                        .rsplit_once('@')
+                        .is_none_or(|(userinfo, _)| userinfo.contains(':')),
+                    _ => {
+                        let ipv4_style = host.split('.').count() == 4
+                            && host.split('.').all(|part| {
+                                !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())
+                            });
+                        !ipv4_style || host.parse::<Ipv4Addr>().is_ok()
+                    }
+                }
         }) {
             return Ok(json!(value));
         }
