@@ -226,6 +226,10 @@ impl SaiMcp {
 
     fn info(&self, storage: &Storage<'_>) -> Value {
         let exe = env::current_exe().ok();
+        let install_dir = exe
+            .as_deref()
+            .and_then(Path::parent)
+            .map(Path::to_string_lossy);
         let home = &self.env.home;
         let version = env!("CARGO_PKG_VERSION");
         let mut names: Vec<_> = TOOLS.iter().map(|tool| tool.name.as_ref()).collect();
@@ -239,15 +243,15 @@ impl SaiMcp {
             "restartNeeded": false,
             "latestVersion": latest_version(home),
             "mcpVersion": Implementation::from_build_env().version,
-            "provenance": {"kind": "installed", "path": exe.as_deref().and_then(Path::parent)},
+            "provenance": {"kind": "installed", "path": install_dir},
             "endpoints": {
                 "keeper": log::endpoint_origin(self.settings.endpoint()),
                 "websocket": log::endpoint_origin(self.settings.ws_endpoint()),
                 "lcd": Key::LcdEndpoint.public_value(self.settings.value(Key::LcdEndpoint)),
             },
-            "configFile": self.env.path(),
+            "configFile": self.env.path().to_string_lossy(),
             "logs": {
-                "dir": home.join("logs"),
+                "dir": home.join("logs").to_string_lossy(),
                 "enabled": log::enabled(&self.env),
             },
             "tools": names,
