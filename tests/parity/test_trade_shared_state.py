@@ -20,7 +20,7 @@ from typing import Any
 
 import pytest
 from scenarios import ADDRESS, Endpoints, child_env, loopback, seed_home
-from trade_replay import SESSION, TradeReplay
+from trade_replay import REQUEST_HASH, SESSION, TradeReplay
 
 REFERENCE = "973f3f59f38dd89d0c2e03e674157934a00316ae"
 KEY = "20261124T120000000Z_0123456789ABCDEF"
@@ -270,3 +270,297 @@ def test_restart_after_reservation(
         with reservation(home, reader, RETRY, rust_helper=rust_helper) as proc:
             _, err = proc.communicate(timeout=8)
             assert proc.returncode == 0 and err == b"reserved\n"
+
+
+@dataclass(frozen=True)
+class Action:
+    args: tuple[str, ...]
+    kind: str
+    change: str
+    entity: str = "7"
+    server: str = "default"
+    outcome: str = "succeeded"
+
+    def replay(self, **options: Any) -> TradeReplay:
+        return TradeReplay(self.kind, self.entity, self.change, **options)
+
+
+ACTIONS = {
+    "open": Action(
+        (
+            "open",
+            "--market",
+            "3",
+            "--side",
+            "long",
+            "--type",
+            "market",
+            "--amount",
+            "20",
+            "--leverage",
+            "2",
+            "--slippage",
+            "1",
+        ),
+        "OPEN_TRADE",
+        "position_opened",
+        entity="",
+        outcome="filled",
+    ),
+    "close": Action(
+        ("close", "7"), "CLOSE_POSITION", "position_closed_user", outcome="filled"
+    ),
+    "cancel": Action(
+        ("close", "7", "--cancel-order"),
+        "CANCEL_PENDING_TRADE",
+        "order_closed_user",
+        server="pending-order",
+    ),
+    "margin": Action(
+        ("margin", "7", "--direction", "add", "--amount", "1"),
+        "UPDATE_TRADE",
+        "leverage_updated",
+    ),
+    "partial-close": Action(
+        ("partial-close", "7", "--percent", "50"),
+        "DECREASE_POSITION_SIZE",
+        "trade_size_decrease",
+        outcome="filled",
+    ),
+    "tpsl": Action(
+        ("tpsl", "7", "--take-profit", "110", "--clear-stop-loss"),
+        "UPDATE_TRADE",
+        "tpsl_updated",
+    ),
+    "leverage": Action(
+        ("leverage", "7", "--leverage", "5"),
+        "UPDATE_TRADE",
+        "leverage_updated",
+    ),
+}
+ACTION_REASONS = {
+    "open": "#117",
+    "close": "#117",
+    "cancel": "#117",
+    "margin": "#118",
+    "partial-close": "#118",
+    "tpsl": "R1-03",
+    "leverage": "R1-03",
+}
+
+
+def command_help(home: Home, runner: Runtime, group: str, command: str) -> str | None:
+    result = home.invoke(runner, group, command, "--help")
+    if (
+        runner.rust
+        and result.returncode == 2
+        and any(
+            f"unrecognized subcommand '{name}'" in result.stderr
+            or f"Error: No such command '{name}'." in result.stderr.splitlines()
+            for name in (group, command)
+        )
+    ):
+        return None
+    assert result.returncode == 0 and result.stdout, (result.stdout, result.stderr)
+    return result.stdout
+
+
+def trade_help(home: Home, runner: Runtime, action_name: str) -> str:
+    action = ACTIONS[action_name]
+    help_text = command_help(home, runner, "trade", action.args[0])
+    if help_text is None or (
+        action_name == "cancel" and "--cancel-order" not in help_text
+    ):
+        assert runner.rust
+        pytest.skip(f"Rust trade {action_name} awaits {ACTION_REASONS[action_name]}")
+    return help_text
+
+
+def assert_blocked(result: subprocess.CompletedProcess[str], key: str) -> None:
+    assert result.returncode == 1 and not result.stderr, result
+    failure = json.loads(result.stdout)["error"]
+    assert failure["retryable"] is False
+    assert key in failure.get("intentKeys", [failure.get("intentKey")])
+
+
+def assert_trade_events(
+    home: Home, key: str, statuses: list[str], *, acked: bool
+) -> None:
+    events = home.events(key)
+    names = [event["event"] for event in events]
+    assert names.count("intent.reserved") == 1
+    assert names.count("intent.submitted") == int(acked)
+    assert [
+        event["status"] for event in events if event["event"] == "intent.status"
+    ] == statuses
+
+
+@pytest.mark.parametrize("action_name", ACTIONS)
+@pytest.mark.parametrize(
+    ("submitter", "reconciler"),
+    [("python", "python"), ("python", "rust"), ("rust", "python")],
+)
+def test_lost_admission_blocks_until_reconciliation(
+    action_name: str,
+    submitter: str,
+    reconciler: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    writer = runtime(submitter, request, python_reference)
+    reader = runtime(reconciler, request, python_reference)
+    action = ACTIONS[action_name]
+    replay = action.replay(lose_reply=True)
+    with loopback(action.server, trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "session")
+        trade_help(home, writer, action_name)
+        args = ("trade", *action.args)
+        error = home.json(writer, *args, code=5)["error"]
+        key = error["intentKey"]
+        assert error["code"] == "OUTCOME_UNKNOWN" and error["retryable"] is False
+        home.local(reader, key, action.kind, "unknown")
+        home.row(key, action.kind, action.entity, "unknown")
+        assert_blocked(home.invoke(writer, "--json", *args), key)
+
+        replay.phase = "pending"
+        status = home.json(reader, "intent", "status", ADDRESS, "--key", key)
+        assert status["outcome"] == "pending"
+        home.local(writer, key, action.kind, "pending")
+        home.row(key, action.kind, action.entity, "pending")
+        assert_blocked(home.invoke(writer, "--json", *args), key)
+
+        replay.phase = "filled"
+        status = home.json(reader, "intent", "status", ADDRESS, "--key", key)
+        assert status["matchedTradeHistory"][0]["intentKey"] == key
+        assert status["matchedTradeHistory"][0]["tradeChangeType"] == action.change
+        home.local(writer, key, action.kind, "terminal")
+        home.row(key, action.kind, action.entity, "terminal")
+        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert_trade_events(home, key, ["pending", "terminal"], acked=False)
+
+
+@pytest.mark.parametrize("action_name", ACTIONS)
+@pytest.mark.parametrize("submitter", ["python", "rust"])
+def test_trade_wait_replays_pending_then_receipt(
+    action_name: str,
+    submitter: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    writer = runtime(submitter, request, python_reference)
+    action = ACTIONS[action_name]
+    replay = action.replay(phase="pending", fill_on_second_poll=True)
+    with loopback(action.server, trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "session")
+        if "--wait" not in trade_help(home, writer, action_name):
+            assert writer.rust
+            pytest.skip("Rust trade --wait awaits #122")
+        result = home.json(writer, "trade", *action.args, "--wait")
+        key = result["intentKey"]
+        assert result["outcome"] == action.outcome
+        assert result["addr"] == ADDRESS
+        receipt = result["receipt"]
+        assert receipt["requestTxHash"] == REQUEST_HASH
+        assert receipt["requestBlock"] == 121
+        assert receipt["action"]["kind"] == action.kind
+        assert receipt["execution"]["source"] == "trade_history"
+        assert receipt["execution"]["block"] == 122
+        assert receipt["execution"]["tradeChangeType"] == action.change
+        assert receipt["execution"]["marketOrderSequence"] == 49
+        if action.outcome == "filled":
+            assert receipt["fill"] == {
+                "price": None,
+                "sizeCollateralBaseUnits": None,
+                "oraclePrice": "100.25",
+                "escrowedCollateralBaseUnits": "4000000",
+            }
+        else:
+            assert receipt["fill"] is None
+        home.row(key, action.kind, action.entity, "terminal")
+        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert [
+            item.label
+            for item in endpoints.wire
+            if item.label
+            in {"recordUserIntent", "waitUserIntents", "intentTradeHistory"}
+        ] == [
+            "recordUserIntent",
+            "waitUserIntents",
+            "waitUserIntents",
+            "intentTradeHistory",
+        ]
+        assert_trade_events(home, key, ["accepted", "pending", "terminal"], acked=True)
+
+
+@pytest.mark.parametrize(
+    ("submitter", "waiter"),
+    [("python", "python"), ("python", "rust"), ("rust", "python")],
+)
+def test_wait_deadline_then_restart(
+    submitter: str,
+    waiter: str,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    writer = runtime(submitter, request, python_reference)
+    reader = runtime(waiter, request, python_reference)
+    action = ACTIONS["close"]
+    replay = action.replay(phase="pending")
+    with loopback(action.server, trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "session")
+        trade_help(home, writer, "close")
+        if command_help(home, reader, "intent", "wait") is None:
+            pytest.skip("Rust intent wait awaits #122")
+        first = home.json(writer, "trade", *action.args)
+        key = first["intentKey"]
+        wait = ("intent", "wait", key, "--timeout", "1")
+        timed_out = home.json(reader, *wait, code=5)
+        assert timed_out["intentKey"] == key and timed_out["outcome"] == "unknown"
+        assert timed_out["receipt"]["execution"] is None
+        home.local(writer, key, action.kind, "pending")
+        assert_blocked(home.invoke(writer, "--json", "trade", *action.args), key)
+
+        replay.phase = "filled"
+        receipt = home.json(reader, "intent", "wait", key, "--timeout", "5")
+        assert receipt["intentKey"] == key and receipt["outcome"] == "filled"
+        assert receipt["receipt"]["execution"]["tradeChangeType"] == action.change
+        home.row(key, action.kind, action.entity, "terminal")
+        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert_trade_events(home, key, ["accepted", "pending", "terminal"], acked=True)
+
+
+def test_submission_times_out_after_keeper_receives_mutation(
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    python_reference: Path | None,
+) -> None:
+    # Exercise the real transport deadline in the pinned mixed-runtime run.
+    reader = runtime("rust", request, python_reference)
+    writer = runtime("python", request, python_reference)
+    replay = TradeReplay(hold_admission=True)
+    with loopback("default", trade_replay=replay) as endpoints:
+        home = Home(tmp_path / "home", endpoints)
+        seed_home(home.path, endpoints, "session")
+        started = time.monotonic()
+        try:
+            error = home.json(writer, "trade", "close", "7", code=5)["error"]
+            assert replay.arrived.is_set() and time.monotonic() - started >= 15
+            assert error["code"] == "OUTCOME_UNKNOWN" and error["retryable"] is False
+            key = error["intentKey"]
+            home.row(key, replay.kind, replay.entity, "unknown")
+            home.local(reader, key, replay.kind, "unknown")
+            assert_blocked(home.invoke(writer, "--json", "trade", "close", "7"), key)
+        finally:
+            replay.release.set()
+        replay.phase = "pending"
+        status = home.json(reader, "intent", "status", ADDRESS, "--key", key)
+        assert status["localStatus"] == "pending"
+        home.row(key, replay.kind, replay.entity, "pending")
+        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert_trade_events(home, key, ["pending"], acked=False)

@@ -425,6 +425,7 @@ def loopback(
                     "recordUserIntent",
                     "userIntents",
                     "waitUserIntents",
+                    "tradeHistory",
                     "intentTradeHistory",
                 }:
                     try:

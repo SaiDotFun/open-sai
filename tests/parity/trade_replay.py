@@ -12,8 +12,7 @@ from keeper_wire import WireRequest, same_variables
 from scenarios import ADDRESS, PROTOCOL
 
 SESSION = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
-REQUEST_HASH = "A" * 64
-EXECUTION_HASH = "B" * 64
+REQUEST_HASH = "a" * 64
 Phase = Literal["absent", "pending", "filled"]
 
 
@@ -59,12 +58,17 @@ class TradeReplay:
 
         if key is None or authorization is not None:
             raise ValueError("Outcome replay requires a known key and a public read")
-        if request.label == "intentTradeHistory":
-            if not same_variables(
-                request.variables, {"trader": ADDRESS, "limit": 25, "offset": 0}
-            ):
+        if request.label in {"tradeHistory", "intentTradeHistory"}:
+            history_args: dict[str, Any] = {"trader": ADDRESS}
+            history = self._history(key)
+            if request.label == "intentTradeHistory":
+                history_args.update(limit=25, offset=0)
+            else:
+                # The C4 Rust CLI still uses the public, single-page query.
+                del history["marketOrder"]
+            if not same_variables(request.variables, history_args):
                 raise ValueError("Unexpected trade history variables")
-            return {"data": {"perp": {"tradeHistory": [self._history(key)]}}}
+            return {"data": {"perp": {"tradeHistory": [history]}}}
 
         variables: dict[str, Any] = {"user": ADDRESS, "key": key}
         if request.label == "waitUserIntents":
@@ -124,7 +128,7 @@ class TradeReplay:
             "execActor": "server",
             "evmAddress": ADDRESS,
             "nibiAddress": None,
-            "txHash": EXECUTION_HASH if step == "exec_pass" else REQUEST_HASH,
+            "txHash": REQUEST_HASH.upper(),
             "execBlock": 122 if step == "exec_pass" else 121,
             "execBlockTs": "2026-11-24T12:00:00Z",
             "errorCode": None,
@@ -135,9 +139,16 @@ class TradeReplay:
         return {
             "id": 7,
             "intentKey": key,
-            "txHash": EXECUTION_HASH,
+            "txHash": REQUEST_HASH.upper(),
             "tradeChangeType": self.change,
             "block": {"block": 122, "block_ts": "2026-11-24T12:00:00Z"},
-            "marketOrder": {"orderReqBlock": 121, "orderReqTxHash": REQUEST_HASH},
+            "marketOrder": {
+                "orderReqBlock": 121,
+                "orderReqTxHash": REQUEST_HASH.upper(),
+                "orderExecBlock": 122,
+                "sequence": 49,
+                "execPrice": "100.25",
+                "collateralAmount": "4000000",
+            },
             "trade": {"id": 7, "trader": ADDRESS},
         }
