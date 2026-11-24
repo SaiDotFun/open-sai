@@ -125,12 +125,12 @@ async fn mcp(path: &Path, home: &Path, shim_base: Option<&str>) -> Result<()> {
     if line.last() != Some(&b'\n')
         || reply["id"] != 1
         || reply["jsonrpc"] != "2.0"
-        || !reply["result"]["protocolVersion"]
+        || reply["result"]["protocolVersion"]
             .as_str()
-            .is_some_and(|text| !text.is_empty())
-        || !reply["result"]["serverInfo"]["name"]
+            .is_none_or(str::is_empty)
+        || reply["result"]["serverInfo"]["name"]
             .as_str()
-            .is_some_and(|text| !text.is_empty())
+            .is_none_or(str::is_empty)
         || !reply["result"]["capabilities"].is_object()
     {
         return Err(invalid());

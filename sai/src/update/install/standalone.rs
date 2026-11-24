@@ -172,7 +172,7 @@ impl Standalone {
         let published = self.root.join(directory);
         if published.symlink_metadata().is_ok() {
             let existing = self
-                .target(&directory)
+                .target(directory)
                 .ok_or_else(|| "the existing version directory is invalid".to_owned())?;
             if file_hash(&existing)? != file_hash(&stage.path().join("sai"))? {
                 return Err("the existing version directory contains different bytes".into());
