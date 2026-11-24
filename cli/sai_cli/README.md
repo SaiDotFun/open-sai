@@ -485,14 +485,6 @@ repairs from the directory doctor checked. The command preserves the
 registration's environment and compatible server arguments. If the command
 includes `--reset-args`, it uses default server arguments.
 
-Before replacing a Claude Code entry, Sai saves the prior entry in
-`$SAI_HOME/mcp-recovery`. If the replacement is interrupted and the entry
-is missing, install and doctor print a command such as
-`sai mcp install claude --scope user --restore-previous`. Restore from
-the same `SAI_HOME` used for the replacement. Run project and local restores
-from the original project directory. To discard the saved entry, run
-`sai mcp uninstall claude` with the same scope.
-
 Each check prints pass, fixed, warn, fail, or skipped, with what changed or
 the command that fixes it. `sai --json doctor` prints a structured report on
 success. If a check fails, doctor exits 1 and the JSON error message lists the
