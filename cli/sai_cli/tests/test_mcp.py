@@ -26,8 +26,9 @@ from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
-from mcp.types import TextContent
+from mcp.types import CallToolResult, TextContent
 from sai_cli.core import confirmation, keeper, margin, settings, storage, stream, update
+from sai_cli.core import log as sai_log
 from sai_cli.core import session as sessions
 from sai_cli.mcp_server import info as sai_info
 from sai_cli.mcp_server import server, tools
@@ -1509,6 +1510,149 @@ def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
             "reason": "signed-in",
             "addr": ADDR,
         }
+
+
+def stdio_auth_use(
+    tmp_path: Path, addr: object, *, endpoint: str | None = None
+) -> tuple[CallToolResult, str]:
+    command, *args = sai_command()
+    env = {"SAI_HOME": str(tmp_path), "SAI_LOG": "1"}
+    if endpoint is not None:
+        env["SAI_ENDPOINT"] = endpoint
+    params = StdioServerParameters(
+        command=command,
+        args=[*args, "mcp", "serve"],
+        env=env,
+    )
+
+    async def switch(errlog: TextIO) -> CallToolResult:
+        async with (
+            stdio_client(params, errlog=errlog) as (read, write),
+            ClientSession(read, write) as client,
+        ):
+            await client.initialize()
+            return await client.call_tool("auth_use", {"addr": addr})
+
+    stderr = tmp_path / "stderr.log"
+    with stderr.open("w") as errlog:
+        result = asyncio.run(switch(errlog))
+    logs = "".join(
+        file.read_text() for _, _, file in sai_log.log_files(tmp_path / "logs")
+    )
+    return result, logs + stderr.read_text()
+
+
+def test_stdio_auth_use_reports_success_when_legacy_cleanup_fails(
+    tmp_path: Path,
+) -> None:
+    marker = "synthetic-mcp-legacy-cleanup-credential"
+    records = {
+        ADDR: {**stored_session(), "token": marker},
+        OTHER: {**stored_session(), "evmAddress": OTHER, "token": OTHER_TOKEN},
+    }
+    storage._save_accounts({"active": OTHER, "sessions": records})
+    legacy = tmp_path / "trader" / "session.json"
+    legacy.mkdir()
+
+    result, logs = stdio_auth_use(tmp_path, ADDR)
+
+    assert not result.isError
+    response = json.loads(text_of(result.content))
+    assert [row["addr"] for row in response["accounts"] if row["active"]] == [ADDR]
+    assert "Could not remove legacy session file trader/session.json" in logs
+    assert "session.active" in logs
+    assert marker not in result.model_dump_json() + logs
+    assert storage.load_accounts()["active"] == ADDR
+    assert legacy.is_dir()
+
+
+@pytest.mark.parametrize("same_account", [True, False])
+def test_stdio_auth_use_redacts_known_credentials_in_session_fields(
+    tmp_path: Path, same_account: bool
+) -> None:
+    marker = "synthetic-mcp-origin-credential"
+    endpoint = f"https://{marker}.example.invalid"
+    selected = {
+        **stored_session(endpoint=endpoint),
+        "token": marker if same_account else TOKEN,
+    }
+    other = {
+        **stored_session(),
+        "evmAddress": OTHER,
+        "token": selected["expiresAt"] if same_account else marker,
+    }
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: selected, OTHER: other}}
+    )
+
+    result, logs = stdio_auth_use(tmp_path, ADDR, endpoint=endpoint)
+
+    assert not result.isError
+    response = json.loads(text_of(result.content))
+    active = next(row for row in response["accounts"] if row["active"])
+    assert active["addr"] == ADDR
+    assert active["endpoint"] == sai_log.REDACTED
+    assert active["expiresAt"] == (
+        sai_log.REDACTED if same_account else selected["expiresAt"]
+    )
+    assert "SAI_RECONCILE_ENDPOINT" in active["renewalCommand"]
+    assert marker not in result.model_dump_json() + logs
+    if same_account:
+        assert selected["expiresAt"] not in result.model_dump_json()
+    assert storage.load_accounts()["active"] == ADDR
+
+
+@pytest.mark.parametrize("as_object", [False, True])
+def test_stdio_auth_use_keeps_unregistered_input_private(
+    tmp_path: Path, as_object: bool
+) -> None:
+    marker = "synthetic-mcp-unregistered-credential-marker"
+    result, logs = stdio_auth_use(tmp_path, {"value": marker} if as_object else marker)
+
+    assert marker not in result.model_dump_json() + logs
+    text = text_of(result.content)
+    assert "must be a string" in text if as_object else "is not connected" in text
+    assert "mcp.tool_result" in logs and "INVALID_REQUEST" in logs
+    assert "session.active" not in logs
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    ["selected-expiry", "other-expiry", "endpoint", "address", "other-address"],
+)
+def test_stdio_auth_use_refuses_malformed_response_before_switching(
+    tmp_path: Path, corruption: str
+) -> None:
+    secret = "synthetic-mcp-switch-credential-marker"
+    third = "0x" + "d" * 40
+    records: dict[str, dict[str, Any]] = {
+        ADDR: stored_session(),
+        OTHER: {**stored_session(), "evmAddress": OTHER, "token": OTHER_TOKEN},
+        third: {**stored_session(), "evmAddress": third},
+    }
+    if corruption == "endpoint":
+        records[ADDR]["endpoint"] = {"value": secret}
+        field = "endpoint"
+    elif corruption in {"address", "other-address"}:
+        records[third if corruption == "other-address" else ADDR]["evmAddress"] = secret
+        field = "address"
+    else:
+        records[third if corruption == "other-expiry" else ADDR]["expiresAt"] = secret
+        field = "expiry"
+    storage._save_accounts({"active": OTHER, "sessions": records})
+    path = tmp_path / "trader" / "sessions.json"
+    before = path.read_bytes()
+    result, logs = stdio_auth_use(tmp_path, ADDR)
+
+    assert json.loads(text_of(result.content)) == {
+        "error": f"Stored session has an invalid {field}; {storage.SIGN_IN_AGAIN}",
+        "code": "SESSION_UNAVAILABLE",
+    }
+    assert "mcp.tool_result" in logs and "SESSION_UNAVAILABLE" in logs
+    assert "session.active" not in logs
+    assert secret not in result.model_dump_json() + logs
+    assert path.read_bytes() == before
+    assert storage.load_accounts()["active"] == OTHER
 
 
 def test_bare_sai_mcp_prints_help():
