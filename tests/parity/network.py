@@ -85,3 +85,15 @@ def unroutable_packets() -> tuple[int, int]:
         return ipv4, int(ipv6["Ip6OutNoRoutes"]) if ipv6 else 0
     except (KeyError, OSError, ValueError):
         raise ValueError("Parity could not read network namespace counters") from None
+
+
+def require_loopback() -> None:
+    if sys.platform != "linux" or [name for _, name in socket.if_nameindex()] != ["lo"]:
+        raise ValueError("Run these tests through tests/parity/network.py")
+
+
+if __name__ == "__main__":
+    import pytest
+
+    enter_loopback()
+    sys.exit(pytest.main(sys.argv[1:]))
