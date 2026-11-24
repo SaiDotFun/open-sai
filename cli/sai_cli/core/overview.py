@@ -920,17 +920,14 @@ def _queued_orders(
 
 
 def _blocking_intents(endpoint: str, addr: str) -> list[dict[str, Any]]:
-    now = datetime.now(UTC).timestamp()
     blocking = []
     for row in storage.unresolved_intents(endpoint, addr):
         if row["status"] in ("unknown", "pending"):
             scope = "allTrades"
         elif row["entity"]:
             scope = "sameTrade"
-        elif row["kind"] == "OPEN_TRADE" and storage.intent_is_recent(
-            row["intentKey"], row["createdAt"], now, keeper.ABSENT_AFTER_SECONDS
-        ):
-            scope = "mcpOpen"
+        elif row["kind"] == "OPEN_TRADE":
+            scope = "openTrades"
         else:
             continue
         blocking.append(

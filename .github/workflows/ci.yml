@@ -38,6 +38,7 @@ jobs:
           filters: |
             python:
               - 'cli/**'
+              - 'tests/parity/**'
               - 'skills/**'
               - 'scripts/**'
               - 'pyproject.toml'
@@ -82,6 +83,23 @@ jobs:
       - run: uv run pytest
         if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
 
+      - name: Check parity in a loopback network namespace
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
+        run: |
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          unshare -Urn ip link set lo up
+          uv run pytest -m parity_namespace tests/parity
+          uv run python tests/parity/parity.py
+
   check:
     needs: changes
     if: ${{ !cancelled() }}
@@ -120,13 +138,41 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         with:
           persist-credentials: false
 
       - run: cargo fmt --all --check
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo test --locked --workspace
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+
+      # Use the C4 Python reference in sai/README.md on both PR and push runs.
+      - name: Check out the Python parity reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf
+          path: .parity-python
+          persist-credentials: false
+
+      - name: Install uv and Python for parity
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+
+      - run: |
+          uv sync --locked --all-groups
+          uv sync --project .parity-python --locked --all-groups
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+      - run: cargo build --locked --bin sai
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+      - name: Compare the Rust and Python CLIs
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
+        run: uv run --locked pytest tests/parity

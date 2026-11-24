@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import json
 import os
 import shlex
 import sys
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -23,6 +23,7 @@ from .core import (
     clipboard,
     keeper,
     log,
+    log_queries,
     overview,
     reconcile,
     storage,
@@ -132,6 +133,8 @@ def json_requested(argv: Sequence[str]) -> bool:
 
 
 def cli_failure(exc: Exception) -> SaiError:
+    if isinstance(exc, sai_settings.InvalidEndpoint):
+        return SaiError(str(exc), Code.INVALID_REQUEST, exit_code=ExitCode.USAGE)
     if isinstance(exc, click.ClickException):
         return SaiError(
             exc.format_message(),
@@ -233,9 +236,28 @@ class LoggedGroup(SaiGroup):
         started = time.monotonic()
         exit_code: int = ExitCode.OK
         failure: SaiError | None = None
-        with log.silenced() if quiet else log.bind(surface=surface, command=command):
-            if not quiet:
+        start_logged = False
+
+        def log_start() -> None:
+            nonlocal start_logged
+            if not quiet and not start_logged:
                 log.event("command.start", argv=log.argv(argv[:64]))
+                start_logged = True
+
+        with (
+            log.silenced()
+            if quiet
+            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
+        ):
+            if command == "doctor" and not quiet:
+                # Let doctor report directory creation before logging creates
+                # the profile to record its first event.
+                extra["obj"] = {
+                    **(extra.get("obj") or {}),
+                    "doctor_log_start": log_start,
+                }
+            else:
+                log_start()
             try:
                 result = super().main(
                     args,
@@ -259,19 +281,17 @@ class LoggedGroup(SaiGroup):
                     return result
             finally:
                 if not quiet:
-                    fields: dict[str, Any] = {}
-                    if failure is not None:
-                        fields.update(
-                            code=failure.code, error=log.untrusted(failure.message)
-                        )
-                        if failure.intent_key is not None:
-                            fields["intentKey"] = failure.intent_key
+                    log_start()
                     log.event(
                         "command.end",
                         "info" if exit_code == ExitCode.OK else "warn",
                         durationMs=round((time.monotonic() - started) * 1000),
                         exitCode=exit_code,
-                        **fields,
+                        code=failure.code if failure is not None else None,
+                        error=log.untrusted(failure.message)
+                        if failure is not None
+                        else None,
+                        intentKey=failure.intent_key if failure is not None else None,
                     )
         raise SystemExit(exit_code)
 
@@ -891,7 +911,8 @@ def positions(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def history(ctx: click.Context, addr: str) -> None:
     """Read trade history for ADDR."""
-    perform_query(ctx, keeper.HISTORY, {"trader": addr})
+    data = keeper.request(keeper_url(ctx), keeper.HISTORY, {"trader": addr})
+    emit(ctx, keeper.safe_history_response(data))
 
 
 @account.command("balances")
@@ -925,7 +946,8 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
 
     Use --key to check one intent for a final outcome.
     """
-    emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
+    data = reconcile.reconcile(keeper_url(ctx), addr, key)
+    emit(ctx, reconcile.status_report(data))
 
 
 @intent.command("local")
@@ -1007,6 +1029,13 @@ def warn(message: str) -> None:
 @click.option("--slippage", required=True, help="Maximum slippage percentage.")
 @click.option("--take-profit")
 @click.option("--stop-loss")
+@click.option(
+    "--allow-concurrent-open",
+    is_flag=True,
+    help="Allow another open while an earlier open is unknown or accepted."
+    " Any locally pending open on the same account and Keeper still blocks,"
+    " including a late acknowledgement.",
+)
 @click.option("--dry-run", is_flag=True)
 @click.pass_context
 def trade_open(
@@ -1020,6 +1049,7 @@ def trade_open(
     slippage: str,
     take_profit: str | None,
     stop_loss: str | None,
+    allow_concurrent_open: bool,
     dry_run: bool,
 ) -> None:
     """Open a market, limit, or stop trade."""
@@ -1037,6 +1067,7 @@ def trade_open(
             slippage=slippage,
             take_profit=take_profit,
             stop_loss=stop_loss,
+            allow_concurrent_open=allow_concurrent_open,
             dry_run=dry_run,
             notify=warn,
         ),
@@ -1215,25 +1246,39 @@ def doctor_command(
     ws_endpoint: str | None,
     lcd_endpoint: str | None,
 ) -> None:
-    """Check the install, session, intent ledger, and endpoints, and fix what
-    is safe to fix.
+    """Check the install, config, MCP registrations, session, intent ledger,
+    and endpoints.
 
-    Fixes: create $SAI_HOME/trader, make it, $SAI_HOME/logs, and their files
-    private, migrate the intent ledger, and reconcile unknown intents for the signed-in
-    account with Keeper (a read; no trade is placed or cancelled). It never
-    deletes or rewrites the session, and never prints its token. Each check
-    prints pass, fixed, warn, fail, or skipped, with a fix for the rest. Exits
-    1 if any check still fails.
+    With fixes enabled, doctor creates private Sai directories, tightens
+    permissions on managed files, repairs
+    stale Codex and Cursor MCP registrations, migrates the intent ledger,
+    and reconciles unknown intents for the signed-in account with Keeper.
+    It reports stale Claude Code registrations with a command to repair
+    each existing entry. It never deletes or rewrites the session, and
+    never prints its token. Each check prints pass, fixed, warn, fail, or
+    skipped. Doctor exits 1 if any check still fails.
     """
     from . import doctor
 
-    config = dataclasses.replace(
-        settings(ctx),
-        ws_endpoint=ws_url(ctx, ws_endpoint),
-        lcd_endpoint=lcd_url(ctx, lcd_endpoint),
-    )
-    checks = doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline))
+    flags = dict(ctx.find_root().obj["flags"])
+    for key, value in (
+        ("keeper.ws_endpoint", ws_endpoint),
+        ("lcd.endpoint", lcd_endpoint),
+    ):
+        if value is not None:
+            flags[key] = value
+    config_check, config = doctor.check_config(flags)
+    checks = [
+        config_check,
+        *doctor.run_checks(
+            doctor.context(config, fix=not no_fix, offline=offline),
+            after_home=ctx.obj.get("doctor_log_start"),
+        ),
+    ]
     overall = doctor.overall(checks)
+    code = (
+        Code.INVALID_REQUEST if config_check.status == "fail" else Code.INTERNAL_ERROR
+    )
     log.event(
         "doctor.result",
         "info" if overall == "pass" else "warn",
@@ -1241,7 +1286,7 @@ def doctor_command(
         fix=not no_fix,
         offline=offline,
         checks=[doctor.log_entry(check) for check in checks],
-        **({"code": Code.INTERNAL_ERROR} if overall == "fail" else {}),
+        code=code if overall == "fail" else None,
     )
     if overall == "fail":
         if not ctx.obj["json"]:
@@ -1254,7 +1299,10 @@ def doctor_command(
                 if check.status == "fail"
             )
         raise SaiError(
-            report, details=doctor.report(checks) if ctx.obj["json"] else None
+            report,
+            code,
+            details=doctor.report(checks) if ctx.obj["json"] else None,
+            exit_code=ExitCode.USAGE if config_check.invalid_endpoint else None,
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
@@ -1308,12 +1356,18 @@ def watch_price(ctx: click.Context, token_id: int, ws_endpoint: str | None) -> N
 
 def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
     """The command's --ws-endpoint, else the resolved WebSocket setting."""
-    return ws_endpoint or settings(ctx).ws_endpoint
+    if ws_endpoint is not None:
+        sai_settings.check_value("keeper.ws_endpoint", ws_endpoint)
+        return ws_endpoint
+    return settings(ctx).ws_endpoint
 
 
 def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
     """The command's --lcd-endpoint, else the resolved LCD setting."""
-    return lcd_endpoint or settings(ctx).lcd_endpoint
+    if lcd_endpoint is not None:
+        sai_settings.check_value("lcd.endpoint", lcd_endpoint)
+        return lcd_endpoint
+    return settings(ctx).lcd_endpoint
 
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
@@ -1637,11 +1691,12 @@ def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
 
 SCOPE_OPTION = click.option(
     "--scope",
-    type=click.Choice(mcp_install.SCOPES),
+    type=click.Choice(mcp_install.UNINSTALL_SCOPES),
     default="user",
     show_default=True,
     help="user: every project. project: this directory's shared config"
-    " (Claude Code .mcp.json, Cursor .cursor/mcp.json). Codex is user only.",
+    " (Claude Code .mcp.json, Cursor .cursor/mcp.json)."
+    " local: this directory's Claude Code local config. Codex is user only.",
 )
 
 
@@ -1670,6 +1725,17 @@ def mcp_list(ctx: click.Context) -> None:
 
 @mcp_group.command("install", cls=ArgvAfterDash)
 @click.argument("clients", nargs=-1)
+@click.option("--client", "client_options", multiple=True, help="Name a client.")
+@click.option(
+    "--repair-existing",
+    type=click.Choice(mcp_install.SERVER_NAMES),
+    help="Repair only this existing Claude Code entry in the selected scope.",
+)
+@click.option(
+    "--reset-args",
+    is_flag=True,
+    help="Use default server arguments when repairing an existing entry.",
+)
 @click.option("--all", "all_clients", is_flag=True, help="Every detected client.")
 @click.option("--dry-run", is_flag=True, help="Show the changes; make none.")
 @SCOPE_OPTION
@@ -1677,6 +1743,9 @@ def mcp_list(ctx: click.Context) -> None:
 def mcp_install_command(
     ctx: click.Context,
     clients: tuple[str, ...],
+    client_options: tuple[str, ...],
+    repair_existing: str | None,
+    reset_args: bool,
     all_clients: bool,
     dry_run: bool,
     scope: str,
@@ -1691,9 +1760,34 @@ def mcp_install_command(
     With no CLIENT and no --all, a terminal asks which clients to register;
     without a terminal, this lists detected clients and changes nothing.
     """
+    names = chosen_clients((*clients, *client_options))
+    if reset_args and repair_existing is None:
+        raise click.UsageError("--reset-args requires --repair-existing.")
+    if repair_existing is not None and (
+        names != ["claude"] or all_clients or ctx.meta.get("server_argv")
+    ):
+        raise click.UsageError(
+            "--repair-existing requires --client claude and the default server command."
+        )
     found = mcp_clients()
     target = server_target(ctx)
-    names = chosen_clients(clients)
+    if repair_existing is not None:
+        claude = found["claude"]
+        assert isinstance(claude, mcp_install.Claude)
+        finish(
+            ctx,
+            [
+                mcp_install.repair_claude_existing(
+                    claude,
+                    scope,
+                    repair_existing,
+                    target,
+                    dry_run,
+                    reset_args=reset_args,
+                )
+            ],
+        )
+        return
     detected = [n for n, c in found.items() if c.detected()[0]]
     if all_clients:
         names = list(dict.fromkeys([*names, *detected]))
@@ -1714,6 +1808,8 @@ def mcp_install_command(
         if not detected:
             raise click.UsageError("No agent clients found; name one to register.")
         names = pick("Register Sai with (numbers, names, or all)", detected)
+    if scope == "local" and names != ["claude"]:
+        raise click.UsageError("Install scope local requires the Claude Code client.")
     results = [mcp_install.install_one(found[n], scope, target, dry_run) for n in names]
     finish(ctx, results)
 
@@ -1738,7 +1834,7 @@ def mcp_uninstall(
 ) -> None:
     """Remove Sai from Claude Code, Codex, or Cursor.
 
-    Removes sai from every scope it is registered in for each client, unless
+    Removes canonical and legacy Sai entries from every scope for each client, unless
     --scope names one. With no CLIENT and no --all, a terminal asks which to
     remove; without a terminal this is a usage error that names where Sai is
     registered.
@@ -1849,6 +1945,101 @@ def logs_tail(
             click.echo(json.dumps(line, separators=(",", ":"), default=str))
         else:
             click.echo(log.render(line))
+
+
+def print_log_trail(ctx: click.Context, report: dict[str, Any]) -> None:
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    lines = sorted(report["events"] + report["gaps"], key=log.event_order)
+    if not lines:
+        click.echo("No matching log events.")
+    for line in lines:
+        prefix = "Gap  " if line.get("event") == "log.dropped" else ""
+        click.echo(prefix + log.render(line))
+    if warning := report.get("scopeWarning"):
+        click.echo(warning)
+    for line in report.get("unattributedGaps", ()):
+        click.echo("Unattributed gap  " + log.render(line))
+    if (count := report.get("unattributedGapCount", 0)) > len(
+        report.get("unattributedGaps", ())
+    ):
+        click.echo(f"Unattributed drop notices in scan  {count}")
+    print_log_limit(report)
+
+
+def print_log_limit(report: dict[str, Any]) -> None:
+    if report.get("truncated"):
+        click.echo("Report truncated. " + report["more"])
+        if before := report.get("nextBefore"):
+            click.echo(f"Continue with --before {before}")
+
+
+@logs_group.command("intent")
+@click.argument("key")
+@click.option("--offline", is_flag=True, help="Read local logs only.")
+@click.option("--addr", help="EVM address to use for the Keeper lookup.")
+@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.pass_context
+def logs_intent(
+    ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None
+) -> None:
+    """Show an intent's CLI and MCP trail and its current Keeper record."""
+    endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
+    if offline and endpoint is not None:
+        sai_settings.check_value("keeper.endpoint", endpoint)
+    account = addr if addr is not None else ctx.obj["as_addr"]
+    report = log_queries.intent(
+        key, endpoint=endpoint, addr=account, offline=offline, before=before
+    )
+    print_log_trail(ctx, report)
+    if ctx.obj["json"]:
+        return
+    if report["txHash"]:
+        click.echo(f"Request transaction {report['txHash']}")
+    if record := report["keeper"]:
+        click.echo("Keeper " + json.dumps(record, separators=(",", ":")))
+    elif error := report.get("keeperError"):
+        click.echo(f"Keeper lookup failed ({error['code']}). {error['message']}")
+    elif not offline:
+        click.echo("Keeper has no record for this intent.")
+
+
+@logs_group.command("run")
+@click.argument("id")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
+@click.pass_context
+def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
+    """Show one process run or one MCP call by ID."""
+    print_log_trail(ctx, log_queries.run(id, before=before))
+
+
+@logs_group.command("stats")
+@click.option(
+    "--since", metavar="DURATION", help="Look back by a duration such as 24h."
+)
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
+@click.pass_context
+def logs_stats(ctx: click.Context, since: str | None, before: str | None) -> None:
+    """Summarize Keeper latency and error codes in the retained logs."""
+    report = log_queries.stats(since, before=before)
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    if report["keeper"]:
+        click.echo("Keeper operation  Requests  p50 (ms)  p95 (ms)")
+        for name, values in report["keeper"].items():
+            click.echo(
+                f"{name:16}  {values['count']:8}  {values['p50Ms']:8}  {values['p95Ms']:8}"
+            )
+    else:
+        click.echo("No timed Keeper requests.")
+    click.echo("Errors by code" if report["errors"] else "No coded errors.")
+    for code, count in report["errors"].items():
+        click.echo(f"{code}  {count}")
+    for line in report["gaps"]:
+        click.echo("Gap  " + log.render(line))
+    print_log_limit(report)
 
 
 # Exit code for an install `sai update` cannot change in place.
@@ -1984,7 +2175,7 @@ def log_update(outcome: updater.Outcome, *, background: bool) -> None:
         rolledBack=outcome.rolled_back,
         background=background,
         message=log.untrusted(outcome.message),
-        **({"code": Code.INTERNAL_ERROR} if outcome.exit_code else {}),
+        code=Code.INTERNAL_ERROR if outcome.exit_code else None,
     )
 
 
@@ -2054,8 +2245,8 @@ def update_command(
     Downloads the release wheel, checks it against the release's SHA256SUMS,
     installs it with `uv tool install`, and then runs the new version. If any
     step fails, the previous version stays or is put back. The `sai` path and
-    everything under $SAI_HOME stay as they are, so registered MCP clients
-    keep working; restart them to load the new version.
+    your Sai data stay in place. The update repairs stale MCP registrations.
+    Restart agent clients to load the new version.
 
     Only a `uv tool install` of a release or of the official Git source is
     updated; a checkout, uvx, or other install gets a note and exit code 3.
@@ -2109,6 +2300,8 @@ def update_command(
         emit(ctx, outcome.to_json())
     else:
         click.echo(outcome.message)
+        if notice := updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes):
+            click.echo(notice)
 
 
 if __name__ == "__main__":

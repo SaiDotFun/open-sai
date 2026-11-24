@@ -59,6 +59,35 @@ def test_mark_absent_waits_for_admission_expiry():
     storage.pending("K2", endpoint, ADDR, "CLOSE_POSITION", "7")
 
 
+def test_open_guard_scopes_aged_acknowledgement_to_account_and_keeper():
+    endpoint = "http://127.0.0.1:1/query"
+    storage.pending("accepted-open", endpoint, ADDR, "OPEN_TRADE", "")
+    storage.set_status("accepted-open", endpoint, ADDR, "accepted")
+    with storage.db() as connection:
+        connection.execute("UPDATE intents SET created_at=0 WHERE id='accepted-open'")
+
+    with pytest.raises(storage.RecentOpenPending, match="accepted-open"):
+        storage.pending("retry", endpoint, ADDR.upper(), "OPEN_TRADE", "")
+    storage.pending("other-keeper", "http://127.0.0.1:2/query", ADDR, "OPEN_TRADE", "")
+    storage.pending("other-account", endpoint, "0x" + "b" * 40, "OPEN_TRADE", "")
+    storage.pending("close", endpoint, ADDR, "CLOSE_POSITION", "7")
+
+
+def test_concurrent_open_override_applies_only_to_unknown_or_accepted_opens():
+    endpoint = "http://127.0.0.1:1/query"
+    storage.pending("unknown-open", endpoint, ADDR, "OPEN_TRADE", "")
+    with pytest.raises(storage.RecentOpenPending, match="unknown-open"):
+        storage.pending("retry", endpoint, ADDR, "OPEN_TRADE", "")
+    storage.pending(
+        "override", endpoint, ADDR, "OPEN_TRADE", "", allow_concurrent_open=True
+    )
+    storage.set_status("unknown-open", endpoint, ADDR, "pending")
+    with pytest.raises(storage.RecentOpenPending, match="unknown-open"):
+        storage.pending(
+            "retry", endpoint, ADDR, "OPEN_TRADE", "", allow_concurrent_open=True
+        )
+
+
 def test_v010_trade_guard_sees_pending_intent_after_downgrade():
     endpoint = closed_endpoint()
     storage.pending("K1", endpoint, ADDR, "OPEN_TRADE", "")

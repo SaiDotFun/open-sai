@@ -385,13 +385,17 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
     endpoint = replay["config"].endpoint
     storage.pending("accepted-close", endpoint, ADDR, "CLOSE_POSITION", "1")
     storage.set_status("accepted-close", endpoint, ADDR, "accepted")
-    storage.pending("recent-open", endpoint, ADDR, "OPEN_TRADE", "")
-    storage.set_status("recent-open", endpoint, ADDR, "accepted")
+    storage.pending("accepted-open", endpoint, ADDR, "OPEN_TRADE", "")
+    storage.set_status("accepted-open", endpoint, ADDR, "accepted")
+    with storage.db() as connection:
+        connection.execute(
+            "UPDATE intents SET created_at = 1 WHERE id = ?", ("accepted-open",)
+        )
     storage.pending("unknown-close", endpoint, ADDR, "CLOSE_POSITION", "0")
     storage.pending("other-account", endpoint, OTHER, "CLOSE_POSITION", "0")
     save_session(replay, OTHER)
 
-    expected_scopes = ["allTrades", "mcpOpen", "sameTrade"]
+    expected_scopes = ["allTrades", "openTrades", "sameTrade"]
     result = cli(replay, "--json", "--as", ADDR, "account", "overview")
     assert result.exit_code == 0, result.output
     decoded = json.loads(result.stdout)
@@ -868,21 +872,23 @@ def test_slow_lcd_stops_enrichment_and_keeps_completed_sections(replay):
     assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
 
 
-def test_invalid_lcd_port_does_not_abort_other_reads(replay):
-    populate_trades(replay)
-    config = replay["config"]
-    replay["config"] = settings.load(
-        {
-            "keeper.endpoint": config.endpoint,
-            "keeper.ws_endpoint": config.ws_endpoint,
-            "lcd.endpoint": "https://lcd.example.invalid:bad",
-        }
+def test_overview_rejects_an_invalid_lcd_port():
+    result = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--lcd-endpoint",
+            "https://lcd.example.invalid:bad",
+            "account",
+            "overview",
+            "--as",
+            ADDR,
+        ],
     )
-    result = mcp(replay, addr=ADDR)
-    assert result["balances"]["data"]["balance"]["usd"] == 150.813685
-    assert result["positions"]["error"]["code"] == "INCOMPLETE_DATA"
-    assert result["positions"]["data"]["items"][0]["riskStatus"] == "unavailable"
-    assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
+    assert result.exit_code == 2, result.output
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert "--lcd-endpoint: Invalid value for lcd.endpoint" in error["message"]
 
 
 def test_balance_source_label_warns_about_an_independent_websocket(replay):

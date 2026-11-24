@@ -8,7 +8,9 @@ import shutil
 import subprocess
 import tempfile
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -56,6 +58,254 @@ INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, 
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
 SESSION = """mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }"""
 SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }"""
+
+INTENT_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}")
+GENERATED_INTENT_KEY = re.compile(r"[0-9]{8}T[0-9]{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
+REQUEST_HASH = re.compile(r"(?:0[xX])?[0-9a-fA-F]{64}")
+# gqlgen's Time scalar emits RFC3339Nano for block and execution timestamps.
+BLOCK_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
+INTENT_KINDS = frozenset(
+    {
+        "OPEN_TRADE",
+        "CLOSE_POSITION",
+        "CANCEL_PENDING_TRADE",
+        "UPDATE_TRADE",
+        "BRIDGE_USD",
+        "DEPOSIT_USD",
+        "WITHDRAW_USD",
+        "UPDATE_OPEN_ORDER",
+        "DECREASE_POSITION_SIZE",
+        "INCREASE_POSITION_SIZE",
+    }
+)
+INTENT_STEPS = frozenset(
+    {
+        "jwt_pass",
+        "jwt_failed",
+        "intent_start",
+        "sign_reject",
+        "sign_failed",
+        "exec_req_pass",
+        "exec_req_fail",
+        "pending_exec",
+        "exec_pass",
+        "exec_fail",
+        "exec_finality_observed",
+    }
+)
+TRADE_CHANGES = frozenset(
+    {
+        "position_opened",
+        "limit_order_created",
+        "stop_order_created",
+        "order_triggered",
+        "position_closed_tp",
+        "position_closed_sl",
+        "position_liquidated",
+        "position_closed_user",
+        "order_closed_user",
+        "tp_updated",
+        "sl_updated",
+        "tpsl_updated",
+        "trade_size_increase",
+        "trade_size_decrease",
+        "leverage_updated",
+        "after_hours_risk_trigger",
+    }
+)
+INTENT_ACTORS = frozenset({"server", "client", "user"})
+INTENT_ERROR_CODES = frozenset(
+    {
+        "SLIPPAGE",
+        "simulation_failed",
+        "admission_expired",
+        "broadcast_rejected",
+        "chain_execution_failed",
+        "market_order_expired",
+        "market_order_fill_failed",
+        "market_order_trading_paused",
+        "market_order_market_closed",
+        "market_order_trade_not_open",
+        "market_order_outcome_not_indexed",
+        "withdraw_evm_unconfigured",
+        "invalid_withdraw",
+        "intent_already_used",
+        "below_minimum",
+        "insufficient_idle",
+        # Browser intent lifecycle and authentication diagnostics.
+        "intent_validation_failed",
+        "chain_switch_failed",
+        "gas_estimation_failed",
+        "wallet_rejected",
+        "wallet_sign_failed",
+        "chain_mismatch",
+        "request_pending",
+        "rpc_submission_failed",
+        "sign_failed_unknown",
+        "intent_auth_rejected",
+        "jwt_failed",
+    }
+)
+GRAPHQL_ERROR_CODES = frozenset(
+    {
+        "GRAPHQL_PARSE_FAILED",
+        "GRAPHQL_VALIDATION_FAILED",
+        "INTENT_NOT_ACCEPTED",
+        "BAD_USER_INPUT",
+        "FORBIDDEN",
+        "INTERNAL_SERVER_ERROR",
+        "UNAUTHENTICATED",
+    }
+)
+
+
+def request_hash(value: object) -> tuple[str | None, bool | None]:
+    """Return a validated request transaction hash and an invalid-value flag."""
+    if value is None:
+        return None, None
+    if isinstance(value, str) and REQUEST_HASH.fullmatch(value):
+        return value.lower(), None
+    return None, True
+
+
+def known_text(value: object, allowed: frozenset[str]) -> str | None:
+    return value if isinstance(value, str) and value in allowed else None
+
+
+def intent_error_code(row: Mapping[str, Any]) -> str | None:
+    code = row.get("errorCode")
+    if (
+        code
+        or row.get("errorMsg")
+        or row.get("lifecycleStep")
+        in ("jwt_failed", "sign_reject", "sign_failed", "exec_req_fail", "exec_fail")
+    ):
+        return known_text(code, INTENT_ERROR_CODES) or Code.KEEPER_ERROR
+    return None
+
+
+def _block_time(value: object) -> str | None:
+    if isinstance(value, str) and BLOCK_TIMESTAMP.fullmatch(value):
+        try:
+            datetime.fromisoformat(value)
+        except ValueError:
+            pass
+        else:
+            return value
+    return None
+
+
+def _row_id(value: object) -> str | int | None:
+    if type(value) is int and 0 <= value < 2**63:
+        return value
+    if isinstance(value, str) and re.fullmatch(
+        r"[0-9]{1,24}(?:[-_:][0-9]{1,24}){0,3}", value
+    ):
+        return value
+    return None
+
+
+def safe_intent_record(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Select scalars whose meaning and format are known to Sai."""
+    record: dict[str, Any] = {}
+    key, address = row.get("intentKey"), row.get("evmAddress")
+    if isinstance(key, str) and GENERATED_INTENT_KEY.fullmatch(key):
+        record["intentKey"] = key
+    if isinstance(address, str) and is_address(address):
+        record["evmAddress"] = address
+        nibi = row.get("nibiAddress")
+        if (
+            isinstance(nibi, str)
+            and nibi.startswith("nibi1")
+            and canonical_account(nibi) == address.lower()
+        ):
+            record["nibiAddress"] = nibi
+    for field, allowed in (
+        ("kind", INTENT_KINDS),
+        ("lifecycleStep", INTENT_STEPS),
+        ("execActor", INTENT_ACTORS),
+    ):
+        if value := known_text(row.get(field), allowed):
+            record[field] = value
+    block = row.get("execBlock")
+    if type(block) is int and 0 <= block < 2**63:
+        record["execBlock"] = block
+    timestamp = row.get("execBlockTs")
+    if valid := _block_time(timestamp):
+        record["execBlockTs"] = valid
+    elif timestamp is not None:
+        record["execBlockTsInvalid"] = True
+    tx_hash, invalid = request_hash(row.get("txHash"))
+    if tx_hash:
+        record["txHash"] = tx_hash
+    if invalid:
+        record["txHashInvalid"] = True
+    if code := intent_error_code(row):
+        record["errorCode"] = code
+        record["errorMsg"] = log.untrusted("Keeper reported an intent error.")
+    return log.clean(record)
+
+
+def safe_intent_history(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Return the validated identifiers in a matched trade-history row."""
+    history: dict[str, Any] = {}
+    if isinstance(key := row.get("intentKey"), str) and GENERATED_INTENT_KEY.fullmatch(
+        key
+    ):
+        history["intentKey"] = key
+    if (identifier := _row_id(row.get("id"))) is not None:
+        history["id"] = identifier
+    if change := known_text(row.get("tradeChangeType"), TRADE_CHANGES):
+        history["tradeChangeType"] = change
+    for field in ("txHash", "evmTxHash"):
+        value, invalid = request_hash(row.get(field))
+        if value:
+            history[field] = value
+        if invalid:
+            history[field + "Invalid"] = True
+    if isinstance(trade := row.get("trade"), dict):
+        history["trade"] = {}
+        if (trade_id := _row_id(trade.get("id"))) is not None:
+            history["trade"]["id"] = trade_id
+        trader = trade.get("trader")
+        if canonical_account(trader) is not None:
+            history["trade"]["trader"] = trader
+    if isinstance(block := row.get("block"), dict):
+        history["block"] = {}
+        if (height := _row_id(block.get("block"))) is not None:
+            history["block"]["block"] = height
+        timestamp = block.get("block_ts")
+        if valid := _block_time(timestamp):
+            history["block"]["block_ts"] = valid
+        elif timestamp is not None:
+            history["block"]["block_tsInvalid"] = True
+    return log.clean(history)
+
+
+def safe_history_response(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the account-history response while keeping its GraphQL envelope."""
+    perp = data.get("perp")
+    if not isinstance(perp, dict):
+        return {"perp": None} if perp is None and "perp" in data else {}
+    rows = perp.get("tradeHistory")
+    if isinstance(rows, list):
+        return {
+            "perp": {
+                "tradeHistory": [
+                    safe_intent_history(row) for row in rows if isinstance(row, dict)
+                ]
+            }
+        }
+    return {
+        "perp": {"tradeHistory": None}
+        if rows is None and "tradeHistory" in perp
+        else {}
+    }
+
+
 # Names for the log; a query not listed here is logged as `custom`.
 OPERATIONS = {
     MARKETS: "markets",
@@ -148,12 +398,15 @@ def request(
     variables: dict[str, Any] | None = None,
     token: str | None = None,
     timeout: float = 20,
+    *,
+    trace_intent: bool = True,
 ) -> dict[str, Any]:
     """Send one GraphQL request; TIMEOUT applies to each phase in seconds.
 
     Logs one `keeper.request` event with the operation, the endpoint's
-    origin, the outcome, and the duration. The variables, the token,
-    and the response data are never logged.
+    origin, the outcome, and the duration. For an intent lookup, it also
+    records the key unless an audit call disables `trace_intent`.
+    Intent and history reads log only known GraphQL codes and an error count.
     """
     started = time.monotonic()
     outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
@@ -178,7 +431,7 @@ def request(
             outcome["code"] = Code.OUTCOME_UNKNOWN
         raise
     finally:
-        _log_request(endpoint, query, variables, token, started, outcome)
+        _log_request(endpoint, query, variables, token, started, outcome, trace_intent)
 
 
 def _log_request(
@@ -188,6 +441,7 @@ def _log_request(
     token: str | None,
     started: float,
     outcome: dict[str, Any],
+    trace_intent: bool,
 ) -> None:
     """Log one request. Never raises, so it cannot replace the request's
     own error, and parses nothing: the log writer reduces the endpoint to
@@ -201,22 +455,36 @@ def _log_request(
             ),
             None,
         )
+        intent_key = (
+            (variables or {}).get("key") if query == INTENTS and trace_intent else None
+        )
         log.event(
             "keeper.request",
             "info" if outcome.get("status") == "ok" else "warn",
             operation=OPERATIONS.get(query, "custom"),
             endpoint=log.endpoint(endpoint),
+            endpointId=log.endpoint_identity(endpoint),
             addr=account,
+            intentKey=intent_key
+            if isinstance(intent_key, str) and INTENT_KEY.fullmatch(intent_key)
+            else None,
             authenticated=bool(token),
             durationMs=round((time.monotonic() - started) * 1000),
-            **outcome,
+            status=outcome["status"],
+            code=outcome.get("code"),
+            error=outcome.get("error") if trace_intent else None,
+            httpStatus=outcome.get("httpStatus"),
+            keeperErrors=outcome.get("keeperErrors")
+            if trace_intent or query in (INTENTS, HISTORY)
+            else None,
+            keeperErrorCount=outcome.get("keeperErrorCount"),
         )
     except Exception:  # noqa: BLE001, S110 - logging must not change the outcome
         pass
 
 
-def _graphql_errors(errors: Any) -> list[dict[str, Any]]:
-    """The code and message of the first few GraphQL errors, for the log.
+def _graphql_errors(errors: Any, *, codes_only: bool) -> list[dict[str, Any]]:
+    """Keep at most three GraphQL errors for the log.
 
     Keeper's message can echo input, such as the signature sent to the
     session mutation, so it is marked untrusted: the log writer cuts it
@@ -228,6 +496,11 @@ def _graphql_errors(errors: Any) -> list[dict[str, Any]]:
             continue
         extensions = item.get("extensions")
         code = extensions.get("code") if isinstance(extensions, dict) else None
+        if codes_only:
+            found.append(
+                {"code": known_text(code, GRAPHQL_ERROR_CODES) or Code.KEEPER_ERROR}
+            )
+            continue
         found.append(
             {
                 "code": log.untrusted(str(code)) if code is not None else None,
@@ -269,7 +542,10 @@ def _request(
         raise KeeperError("Keeper returned an invalid response")
     if result.get("errors"):
         errors = result["errors"]
-        outcome["keeperErrors"] = _graphql_errors(errors)
+        codes_only = query in (INTENTS, HISTORY)
+        outcome["keeperErrors"] = _graphql_errors(errors, codes_only=codes_only)
+        if codes_only:
+            outcome["keeperErrorCount"] = len(errors) if isinstance(errors, list) else 1
         if (
             query == SUBMIT
             and not result.get("data")

@@ -16,7 +16,9 @@ import subprocess
 import sys
 import threading
 import time
+import tracemalloc
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -29,14 +31,16 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 from sai_cli import doctor
-from sai_cli.core import keeper, log, reconcile, settings, storage
+from sai_cli.core import keeper, log, log_queries, reconcile, settings, storage
 from sai_cli.core import session as sessions
+from sai_cli.core.log_events import SCHEMA_VERSION, VOLATILE_FIELDS, valid_event
 from sai_cli.mcp_server import server
 from sai_cli.sai_cli import command_path, main
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
 COMMON = set(log.COMMON)
+GOLDENS = Path(__file__).parent / "fixtures" / "logs"
 # Secrets planted in URLs; none may reach a log line.
 URL_PASSWORD = "hunter2-url-password"
 URL_KEY = "url-api-key-0123456789"
@@ -91,13 +95,78 @@ def run_cli(*args: str) -> tuple[int, str]:
     return result.exit_code, result.output
 
 
+def sai_command() -> list[str]:
+    script = Path(sys.executable).with_name("sai.exe" if os.name == "nt" else "sai")
+    return [str(script)] if script.exists() else [sys.executable, "-m", "sai_cli"]
+
+
+def assert_log_golden(
+    name: str, lines: list[dict[str, Any]], replacements: dict[str, str]
+) -> None:
+    """Keep the shape, sequence, and ID relationships of captured lines."""
+    runs: dict[str, str] = {}
+    calls: dict[str, str] = {}
+    commands: dict[str, str] = {}
+    endpoints: dict[str, str] = {}
+    pids: dict[int, int] = {}
+    rows = []
+    for index, line in enumerate(lines, 1):
+        assert line["schema"] == SCHEMA_VERSION
+        assert valid_event(line), line
+        values = dict(line)
+        for field in VOLATILE_FIELDS:
+            if field not in line:
+                continue
+            value = line[field]
+            match field:
+                case "ts":
+                    values[field] = f"2026-01-01T00:00:00.{index:03d}Z"
+                case "pid":
+                    values[field] = pids.setdefault(value, 1000 + len(pids))
+                case "runId":
+                    values[field] = runs.setdefault(value, f"{len(runs) + 1:032x}")
+                case "callId":
+                    values[field] = calls.setdefault(value, f"{len(calls) + 1:012x}")
+                case "commandId":
+                    values[field] = commands.setdefault(
+                        value, f"{len(commands) + 1:032x}"
+                    )
+                case "endpointId":
+                    assert log_queries.ENDPOINT_ID.fullmatch(value)
+                    values[field] = endpoints.setdefault(
+                        value, f"h1_{len(endpoints) + 1:064x}"
+                    )
+                case "durationMs":
+                    values[field] = 0
+                case "version":
+                    values[field] = "0.0.0"
+                case _:
+                    raise AssertionError(f"No golden normalization for {field}")
+        rows.append(json.dumps(values, separators=(",", ":"), sort_keys=True))
+    captured = "\n".join(rows) + "\n"
+    for actual, stable in replacements.items():
+        captured = captured.replace(actual, stable)
+    path = GOLDENS / f"{name}.jsonl"
+    if os.environ.get("SAI_REGENERATE_LOG_GOLDENS") == "1":
+        path.parent.mkdir(exist_ok=True)
+        path.write_text(captured, encoding="utf-8", newline="\n")
+    assert [json.loads(row) for row in captured.splitlines()] == [
+        json.loads(row) for row in path.read_text(encoding="utf-8").splitlines()
+    ]
+
+
 class Keeper:
     """What the stub Keeper answers, and the requests it received."""
 
     def __init__(self) -> None:
         self.intents: list[dict[str, Any]] = []
+        self.history: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] | None = None
+        self.history_errors: list[dict[str, Any]] | None = None
         self.status = 200
+        self.ack_tx_hash: Any = None
+        self.intents_block: threading.Event | None = None
+        self.requests: list[dict[str, Any]] = []
         self.paths: list[str] = []
         self.authorizations: list[str | None] = []
 
@@ -110,17 +179,38 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            state.requests.append(body)
             state.paths.append(self.path)
             state.authorizations.append(self.headers.get("Authorization"))
             query = body["query"]
             if state.errors is not None:
                 value: dict[str, Any] = {"errors": state.errors}
+            elif "recordUserIntent" in query and state.ack_tx_hash is not None:
+                envelope = body["variables"]["input"]
+                value = {
+                    "data": {
+                        "recordUserIntent": {
+                            "intentKey": envelope["intentKey"],
+                            "kind": envelope["intent"]["kind"],
+                            "evmAddress": ADDR,
+                            "lifecycleStep": "jwt_pass",
+                            "execActor": "server",
+                            "txHash": state.ack_tx_hash,
+                        }
+                    }
+                }
             elif "userIntents" in query:
+                if state.intents_block is not None:
+                    assert state.intents_block.wait(15)
                 value = {"data": {"userIntents": state.intents}}
             elif "tokenPricesUsd" in query:
                 value = {"data": {"oracle": {"tokenPricesUsd": []}}}
             elif "tradeHistory" in query:
-                value = {"data": {"perp": {"tradeHistory": []}}}
+                value = (
+                    {"errors": state.history_errors}
+                    if state.history_errors is not None
+                    else {"data": {"perp": {"tradeHistory": state.history}}}
+                )
             else:
                 value = {"data": {"perp": {"borrowings": [], "trades": []}}}
             data = json.dumps(value).encode()
@@ -175,15 +265,36 @@ def call(mcp: Any, name: str, arguments: dict[str, Any] | None = None) -> Any:
 # Line format
 
 
+def sample_request(
+    operation: str, level: str = "info", *, duration: int = 12, status: str = "ok"
+) -> None:
+    log.event(
+        "keeper.request",
+        level,
+        operation=operation,
+        durationMs=duration,
+        endpoint="https://example.test",
+        authenticated=False,
+        status=status,
+    )
+
+
 def test_event_writes_one_json_line_with_the_common_fields(home):
-    log.event("keeper.request", operation="prices", durationMs=12, skipped=None)
+    sample_request("prices")
     assert log.flush(60)
     path = log.file_path("cli", datetime.now(UTC).date(), home / "logs")
     raw = path.read_text()
     assert raw.endswith("\n") and raw.count("\n") == 1
     line = json.loads(raw)
-    assert set(line) == COMMON | {"operation", "durationMs"}
+    assert set(line) == COMMON | {
+        "operation",
+        "durationMs",
+        "endpoint",
+        "authenticated",
+        "status",
+    }
     assert line["event"] == "keeper.request" and line["level"] == "info"
+    assert line["schema"] == SCHEMA_VERSION
     assert line["surface"] == "cli" and line["pid"] == os.getpid()
     assert line["runId"] == log.RUN_ID and len(log.RUN_ID) == 32
     assert line["version"] == log.VERSION
@@ -195,7 +306,7 @@ def test_event_writes_one_json_line_with_the_common_fields(home):
 @posix_only
 def test_directory_and_files_are_private(home):
     with log.bind(surface="mcp"):
-        log.event("mcp.tool_call", tool="market_prices")
+        log.event("mcp.tool_call", tool="market_prices", callId="test", arguments={})
     assert log.flush(60)
     root = home / "logs"
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
@@ -207,10 +318,10 @@ def test_directory_and_files_are_private(home):
 
 def test_bound_fields_reach_every_event_and_pick_the_surface(home):
     with log.bind(surface="mcp", tool="trade_open", callId="abc"):
-        log.event("keeper.request", operation="submit")
+        sample_request("submit")
         with log.bind(surface="update"):
             log.event("update.check", ok=True)
-    log.event("command.start")
+    log.event("command.start", argv=[])
     assert [(line["surface"], line["event"]) for line in read_logs(home)] == [
         ("cli", "command.start"),
         ("mcp", "keeper.request"),
@@ -588,6 +699,64 @@ def test_keeper_errors_record_what_keeper_answered(home, keeper_stub):
     assert unavailable["operation"] == "custom" and unavailable["httpStatus"] == 503
 
 
+def test_intent_and_history_reads_log_graphql_codes_and_count(home, keeper_stub):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    secret = "OpaqueGraphqlUpstreamCredential"
+    errors = [
+        {"message": secret, "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}},
+        {"message": secret, "extensions": {"code": secret}},
+        {"message": secret},
+        {"message": secret},
+    ]
+    prefix = ("--json", "--endpoint", endpoint)
+    status = ("intent", "status", ADDR, "--key", key)
+    state.errors = errors
+    reads = [
+        run_cli(*prefix, *status),
+        run_cli(*prefix, "account", "history", ADDR),
+        run_cli(*prefix, "logs", "intent", key, "--addr", ADDR),
+    ]
+    assert [code for code, _ in reads] == [1, 1, 0]
+    assert json.loads(reads[2][1])["keeperError"]["code"] == "KEEPER_ERROR"
+
+    state.errors = None
+    state.history_errors = errors
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "txHash": "a" * 64,
+        }
+    ]
+    code, output = run_cli(*prefix, *status)
+    assert code == 0 and json.loads(output)["matchedTradeHistory"] == []
+    assert all(secret not in text for _, text in reads)
+    assert all(secret not in text for text in (output, raw_logs(home)))
+
+    requests = [row for row in events(home, "keeper.request") if "keeperErrors" in row]
+    assert [row["operation"] for row in requests] == [
+        "intents",
+        "history",
+        "history",
+    ]
+    assert requests[0]["intentKey"] == key
+    for row in requests:
+        assert row["keeperErrorCount"] == 4
+        assert row["keeperErrors"] == [
+            {"code": "GRAPHQL_VALIDATION_FAILED"},
+            {"code": "KEEPER_ERROR"},
+            {"code": "KEEPER_ERROR"},
+        ]
+    for flags in ((), ("--json",)):
+        code, tail = run_cli(*flags, "logs", "tail", "--event", "keeper.request")
+        assert code == 0
+        assert secret not in tail and "GRAPHQL_VALIDATION_FAILED" in tail
+
+
 def test_a_keeper_error_that_echoes_the_signature_is_scrubbed(home, keeper_stub):
     """Keeper's message for a bad session mutation can quote its input."""
     base, state = keeper_stub
@@ -672,7 +841,7 @@ def test_intent_lifecycle_is_logged_from_reservation_to_terminal(home, keeper_st
     reserved, _, accepted, _, failed, terminal = trail
     assert reserved["kind"] == "CLOSE_POSITION" and reserved["tradeId"] == "7"
     assert (accepted["previous"], accepted["kind"]) == ("unknown", "CLOSE_POSITION")
-    assert (failed["errorCode"], failed["errorMsg"]) == ("SLIPPAGE", "price moved")
+    assert failed["errorCode"] == "SLIPPAGE" and "errorMsg" not in failed
     assert failed["code"] == "KEEPER_ERROR"
     assert terminal["previous"] == "accepted"
 
@@ -826,7 +995,8 @@ def test_logs_commands_never_start_an_update():
     assert auto_update_applies("market", False, {}, True) is True
 
 
-def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home):
+def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home, monkeypatch):
+    monkeypatch.setenv("PATH", "")
     assert run_cli("doctor", "--offline", "--no-fix")[0] == 0
     assert list(home.iterdir()) == []
     assert run_cli("doctor", "--offline")[0] == 0
@@ -834,6 +1004,7 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home):
     assert result["overall"] == "warn" and result["offline"] is True
     by_id = {check["id"]: check for check in result["checks"]}
     assert list(by_id) == [
+        "config",
         "install",
         "version",
         "home",
@@ -844,10 +1015,25 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home):
         "websocket",
         "lcd",
     ]
+    assert by_id["config"]["status"] == "pass"
     assert by_id["home"]["status"] == "fixed" and by_id["home"]["changes"]
     assert set(by_id["logs"]) == {"id", "status", "durationMs"}
     assert by_id["logs"]["status"] == "pass"
     assert "Signed out" in by_id["session"]["summary"]
+
+
+def test_doctor_logs_the_invalid_request_code_for_a_failed_config_check(
+    home, monkeypatch
+):
+    monkeypatch.setenv("PATH", "")
+    code, _ = run_cli("--endpoint", "invalid-value", "doctor", "--offline")
+    assert code == 2
+    result = events(home, "doctor.result")[0]
+    assert result["code"] == "INVALID_REQUEST"
+    assert any(
+        check["id"] == "config" and check["status"] == "fail"
+        for check in result["checks"]
+    )
 
 
 # Retention
@@ -1006,11 +1192,142 @@ def test_disabled_in_the_config_file_writes_nothing(home, keeper_stub):
     assert log.flush(60) and not (home / "logs").exists()
     code, output = run_cli("--json", "logs", "path")
     assert code == 0 and json.loads(output)["enabled"] is False
-    # Turning it back on takes effect in the same process.
-    (home / "config.toml").write_text("[logs]\nenabled = true\n")
-    log.reset()
+    # A config edit also refreshes the writer after it has skipped an event.
+    assert run_cli("config", "unset", "logs.enabled")[0] == 0
     log.event("something")
-    assert [line["event"] for line in read_logs(home)] == ["something"]
+    assert events(home, "something")
+
+
+def rewrite_with_same_mtime(path: Path, replacement: str) -> None:
+    before = path.stat()
+    path.write_text(replacement)
+    deadline = time.monotonic() + 3
+    while True:
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = path.stat()
+        if after.st_ctime_ns != before.st_ctime_ns:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("Filesystem did not update ctime after the rewrite")
+        time.sleep(0.01)
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+@posix_only
+def test_log_config_refreshes_after_a_same_size_rewrite(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true \n")
+    assert log.resolve_config(home, None, None)[0] is True
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
+    assert log.resolve_config(home, None, None)[0] is False
+
+
+@posix_only
+def test_log_writer_honors_external_disable_and_reenable(home):
+    path = home / "config.toml"
+    enabled = "[logs]\nenabled = true \n"
+    path.write_text(enabled)
+    log.event("test.before")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, enabled)
+    log.event("test.resumed")
+    assert [line["event"] for line in read_logs(home)] == [
+        "test.before",
+        "test.resumed",
+    ]
+
+
+def test_log_retry_only_stats_config_on_the_caller_thread(home, monkeypatch):
+    monkeypatch.delenv("SAI_LOG", raising=False)
+    (home / "config.toml").write_text("[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    operations = []
+
+    def record(frame, event, arg):
+        if event == "c_call" and arg.__name__ in {"stat", "open", "read", "acquire"}:
+            operations.append(arg.__name__)
+        if event == "call" and frame.f_code.co_name in {"read_file", "parse_file"}:
+            operations.append(frame.f_code.co_name)
+
+    previous = sys.getprofile()
+    sys.setprofile(record)
+    try:
+        active = log.active()
+        log.event("test.still.disabled")
+    finally:
+        sys.setprofile(previous)
+
+    assert not active
+    assert operations == ["stat", "stat"]
+    assert not (home / "logs").exists()
+
+
+def test_log_writer_reads_unchanged_config_once(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true\n")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """\
+import sys
+from sai_cli.core import log
+
+reads = 0
+
+def count_config_reads(event, args):
+    global reads
+    if event == "open" and args[0] == sys.argv[1]:
+        reads += 1
+
+sys.addaudithook(count_config_reads)
+for index in range(20):
+    log.event("test.config", index=index)
+assert log.flush(10)
+print(reads)
+""",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "SAI_LOG": "1", "SAI_LOG_KEEP_DAYS": "14"},
+    )
+    assert len(events(home, "test.config")) == 20
+    assert int(result.stdout) == 1
+
+
+def test_config_edits_finish_while_log_writer_is_stalled(home):
+    path = home / "config.toml"
+    with ThreadPoolExecutor(max_workers=1) as pool, log._io_lock:
+        log.event("test.config")
+        for key, value in (("logs.enabled", "false"), ("logs.keep_days", "3")):
+            edit = pool.submit(
+                settings.edit_file,
+                path,
+                lambda text, key=key, value=value: settings.set_value(
+                    text, key, value, path
+                )[0],
+            )
+            edit.result(timeout=5)
+
+    assert settings.read_file(path)[0] == {
+        "logs.enabled": False,
+        "logs.keep_days": 3,
+    }
+    assert log.flush(10)
 
 
 def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):
@@ -1321,7 +1638,7 @@ def test_making_an_event_never_reads_the_session_store(home, monkeypatch, keeper
     with log._io_lock:
         for index in range(50):
             log.event("probe", index=index, error="text with nothing in it")
-        with log.bind(surface="mcp", tool="market_prices"):
+        with log.bind(surface="mcp", tool="market_prices", callId="test"):
             log.event("mcp.tool_call", arguments={"addr": ADDR})
         assert keeper.request(base, keeper.PRICES) == {"oracle": {"tokenPricesUsd": []}}
         assert readers == []
@@ -1461,8 +1778,6 @@ def test_a_stuck_writer_delays_exit_only_briefly_and_bounds_the_queue(home):
 def test_sai_mcp_serve_logs_tool_calls_and_keeps_stdout_protocol_only(home):
     """Drive a real `sai mcp serve` over stdio: every stdout line is the
     JSON-RPC reply to a request, and the calls land in the mcp log file."""
-    script = Path(sys.executable).with_name("sai.exe" if os.name == "nt" else "sai")
-    command = [str(script)] if script.exists() else [sys.executable, "-m", "sai_cli"]
     endpoint = f"http://127.0.0.1:9/query?api_key={URL_KEY}"
 
     def rpc(message_id: int | None, method: str, params: dict[str, Any]) -> str:
@@ -1472,7 +1787,7 @@ def test_sai_mcp_serve_logs_tool_calls_and_keeps_stdout_protocol_only(home):
         return json.dumps(message) + "\n"
 
     with subprocess.Popen(
-        [*command, "mcp", "serve", "--endpoint", endpoint],
+        [*sai_command(), "mcp", "serve", "--endpoint", endpoint],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -1535,9 +1850,1504 @@ def test_sai_mcp_serve_logs_tool_calls_and_keeps_stdout_protocol_only(home):
     assert lines[5]["status"] == "not_sent" and lines[6]["code"] == "NOT_SENT"
     assert len({line["runId"] for line in lines}) == 1
     assert URL_KEY not in raw_logs(home)
+    assert_log_golden(
+        "mcp-prices-failure",
+        [line for line in lines if line.get("tool") == "market_prices"],
+        {},
+    )
 
 
 # sai logs
+
+
+def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
+    endpoint, state = keeper_stub
+    token = save_session(endpoint)
+    request_hash = "ab" * 32
+    state.ack_tx_hash = request_hash.upper()
+    submitted = subprocess.run(
+        [*sai_command(), "--json", "--endpoint", endpoint, "trade", "close", "7"],
+        env={"SAI_HOME": str(home), "PATH": os.defpath},
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    key = json.loads(submitted.stdout)["intentKey"]
+    submitted_lines = [
+        line for line in read_logs(home, "cli") if line.get("command") == "trade close"
+    ]
+    assert_log_golden(
+        "cli-trade-close",
+        submitted_lines,
+        {
+            key: "20260101T000000000Z_0123456789ABCDEF",
+            endpoint.removesuffix("/query"): "http://127.0.0.1:43210",
+        },
+    )
+    assert state.authorizations == [f"Bearer {token}"]
+    record = {
+        "intentKey": key,
+        "kind": "CLOSE_POSITION",
+        "lifecycleStep": "exec_req_pass",
+        "execActor": "server",
+        "evmAddress": ADDR,
+        "txHash": request_hash,
+        "execBlock": 123,
+    }
+    state.intents = [record]
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    assert call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"] == [
+        record
+    ]
+    call(mcp, "market_prices")  # Same server process, a different call.
+    calls_before = len(state.requests)
+    before = raw_logs(home)
+    exit_code, output = run_cli("--json", "logs", "intent", key, "--offline")
+    assert exit_code == 0 and len(state.requests) == calls_before
+    assert raw_logs(home) == before
+    trail = json.loads(output)
+    assert trail["keeper"] is None and trail["gaps"] == []
+    assert trail["txHash"] == request_hash
+    safe_submission = [
+        {key: value for key, value in line.items() if key != "argv"}
+        for line in submitted_lines
+    ]
+    assert trail["events"][: len(submitted_lines)] == safe_submission
+    mcp_lines = trail["events"][len(submitted_lines) :]
+    assert {line["tool"] for line in mcp_lines} == {"intent_status"}
+    assert [line["event"] for line in mcp_lines] == [
+        "mcp.tool_call",
+        "keeper.request",
+        "intent.keeper",
+        "mcp.tool_result",
+    ]
+    assert len({line["runId"] for line in trail["events"]}) == 2
+
+    for identifier, expected in (
+        (submitted_lines[0]["runId"], safe_submission),
+        (mcp_lines[0]["callId"], mcp_lines),
+    ):
+        code, output = run_cli("--json", "logs", "run", identifier)
+        assert code == 0
+        assert json.loads(output) == {"id": identifier, "events": expected, "gaps": []}
+    assert "intent.submitted" in run_cli("logs", "run", submitted_lines[0]["runId"])[1]
+
+    # The read sees a later record but must leave the accepted ledger row alone.
+    state.intents = [
+        {**record, "evmAddress": OTHER},
+        {
+            **record,
+            "lifecycleStep": "exec_fail",
+            "errorMsg": f"echo {token} {SIGNATURE} opaque-credential-from-upstream",
+            "extra": token,
+        },
+    ]
+    cli_args = ("--json", "--endpoint", endpoint, "logs", "intent", key)
+    code, output = run_cli(*cli_args)
+    assert code == 0 and token not in output and SIGNATURE not in output
+    assert "opaque-credential-from-upstream" not in output
+    current = json.loads(output)
+    assert current["keeper"]["lifecycleStep"] == "exec_fail"
+    assert current["keeper"]["evmAddress"] == ADDR
+    assert "extra" not in current["keeper"]
+    assert current["events"] == trail["events"]
+    assert state.requests[-1]["variables"] == {"user": ADDR, "key": key}
+    assert state.authorizations[-1] is None
+    assert call(mcp, "logs_intent", {"key": key}) == current
+    assert call(mcp, "logs_intent", {"key": key, "offline": True}) == trail
+    assert json.loads(run_cli(*cli_args)[1]) == current
+    assert storage.list_pending(endpoint, ADDR)[0]["status"] == "accepted"
+
+    state.status = 503
+    failed_lookup = json.loads(run_cli(*cli_args)[1])
+    assert failed_lookup["keeperError"]["code"] == "KEEPER_ERROR"
+    assert (
+        failed_lookup["keeper"] is None and failed_lookup["events"] == trail["events"]
+    )
+    assert (
+        f"Request transaction {request_hash}"
+        in run_cli("logs", "intent", key, "--offline")[1]
+    )
+
+
+def test_logs_intent_honors_root_account_selector(keeper_stub):
+    endpoint, state = keeper_stub
+    save_session(endpoint, OTHER)
+    save_session(endpoint, ADDR)
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {"intentKey": key, "evmAddress": OTHER, "lifecycleStep": "exec_req_pass"},
+        {"intentKey": key, "evmAddress": ADDR, "lifecycleStep": "exec_req_pass"},
+    ]
+    args = ("--json", "--endpoint", endpoint, "--as", OTHER, "logs", "intent", key)
+    for flags, account in (((), OTHER), (("--addr", ADDR), ADDR)):
+        code, output = run_cli(*args, *flags)
+        assert code == 0
+        report = json.loads(output)
+        assert report["events"] == []
+        assert report["keeper"]["evmAddress"] == account
+        assert state.requests[-1]["variables"] == {"user": account, "key": key}
+        assert state.authorizations[-1] is None
+
+
+def test_log_queries_report_process_gaps_and_order_legacy_events(home):
+    path = log.file_path("mcp", log.now().date(), home / "logs")
+    path.parent.mkdir()
+    identity = {"ts": log.stamp(log.now()), "runId": "server", "surface": "mcp"}
+    first = {**identity, "event": "mcp.tool_call", "callId": "first", "seq": 1}
+    anchor = {
+        **identity,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "1" * 64,
+        "callId": "first",
+        "seq": 2,
+    }
+    gap = {**identity, "event": "log.dropped", "seq": 2, "count": 3}
+    sibling = {**identity, "event": "mcp.tool_call", "callId": "other", "seq": 3}
+    path.write_bytes(
+        log.encode(sibling)
+        + log.encode(gap)
+        + b"invalid\n"
+        + b" " * (log.MAX_LINE + 10)
+        + b"\n"
+        + log.encode(anchor)
+        + log.encode(first)
+        + b'{"incomplete":'
+    )
+    queries = [
+        (("intent", "KEY", "--offline"), [first, anchor]),
+        (("run", "first"), [first, anchor]),
+        (("run", "server"), [first, anchor, sibling]),
+    ]
+    for args, expected in queries:
+        code, output = run_cli("--json", "logs", *args)
+        assert code == 0
+        result = json.loads(output)
+        assert result["events"] == expected and result["gaps"] == [gap]
+    assert "Gap  " in run_cli("logs", "run", "first")[1]
+    assert "count=3" in run_cli("logs", "intent", "KEY", "--offline")[1]
+
+
+def test_logs_intent_keeps_failed_status_calls_in_the_trail(keeper_stub):
+    endpoint, state = keeper_stub
+    state.status = 503
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    response = call(mcp, "intent_status", {"addr": ADDR, "key": "KEY"})
+    assert response["code"] == "KEEPER_ERROR"
+    trail = call(mcp, "logs_intent", {"key": "KEY", "offline": True})
+    assert [line["event"] for line in trail["events"]] == [
+        "mcp.tool_call",
+        "keeper.request",
+        "mcp.tool_result",
+    ]
+    assert trail["events"][1]["intentKey"] == "KEY"
+
+
+def test_intent_scope_separates_accounts_paths_and_repl_invocations(home, keeper_stub):
+    endpoint, state = keeper_stub
+    key = "KEY"
+    hash_a, hash_b, hash_path = ("0x" + char * 64 for char in ("a", "b", "c"))
+    base = {
+        "intentKey": key,
+        "evmAddress": ADDR,
+        "kind": "CLOSE_POSITION",
+        "lifecycleStep": "exec_req_pass",
+        "execActor": "server",
+    }
+
+    def status(url, addr, key):
+        return run_cli(
+            "--json", "--endpoint", url, "intent", "status", addr, "--key", key
+        )
+
+    state.intents = [
+        {**base, "evmAddress": OTHER, "txHash": hash_b},
+        {**base, "txHash": hash_a},
+    ]
+    assert status(endpoint, ADDR, key)[0] == 0
+    state.intents = []
+    assert status(endpoint, OTHER, key)[0] == 0
+    assert status(endpoint, ADDR, "UNRELATED")[0] == 0
+
+    trail = json.loads(run_cli("--json", "logs", "intent", key, "--offline")[1])
+    assert trail["txHash"] == hash_a
+    assert len({line["commandId"] for line in trail["events"]}) == 1
+    assert {line.get("addr") for line in trail["events"]} == {None, ADDR}
+    assert not any(line.get("intentKey") == "UNRELATED" for line in trail["events"])
+    assert [
+        line["txHash"] for line in events(home, "intent.keeper") if "txHash" in line
+    ] == [hash_a]
+
+    state.intents = [{**base, "evmAddress": OTHER, "txHash": hash_b}]
+    other = json.loads(
+        run_cli(
+            "--json", "--endpoint", endpoint, "logs", "intent", key, "--addr", OTHER
+        )[1]
+    )
+    assert other["keeper"]["evmAddress"] == OTHER and other["txHash"] == hash_b
+    assert all(line.get("addr") != ADDR for line in other["events"])
+
+    other_endpoint = endpoint + "/opaque-path-secret?secret=opaque-query-secret"
+    state.intents = [{**base, "txHash": hash_path}]
+    assert status(other_endpoint, ADDR, key)[0] == 0
+    assert log.origin(other_endpoint) == log.origin(endpoint)
+    assert log.endpoint_id(other_endpoint) != log.endpoint_id(endpoint)
+    assert log.endpoint_id(other_endpoint) != log.endpoint_id(
+        other_endpoint.partition("?")[0]
+    )
+    result = json.loads(run_cli("--json", "logs", "intent", key, "--offline")[1])
+    assert (
+        result["events"] == [] and result["txHash"] is None and "scopeWarning" in result
+    )
+    result = json.loads(
+        run_cli(
+            "--json", "--endpoint", other_endpoint, "logs", "intent", key, "--offline"
+        )[1]
+    )
+    assert result["txHash"] == hash_path
+    assert "opaque-path-secret" not in raw_logs(home)
+    assert "opaque-query-secret" not in raw_logs(home)
+
+    state.intents = [{**base, "evmAddress": OTHER, "txHash": hash_b}]
+    assert status(endpoint, OTHER, key)[0] == 0
+    request_count = len(state.requests)
+    code, output = run_cli("--endpoint", endpoint, "logs", "intent", key)
+    assert code == 0 and "Several accounts match this key" in output
+    assert "Keeper has no record" not in output
+    assert len(state.requests) == request_count
+
+
+def test_query_routed_keepers_and_homes_have_distinct_endpoint_ids(home, keeper_stub):
+    base, state = keeper_stub
+    route_a = base + "?route=opaque-route-a"
+    route_b = base + "?route=opaque-route-b"
+    key = "KEY"
+    record = {
+        "intentKey": key,
+        "evmAddress": ADDR,
+        "execActor": "server",
+        "kind": "CLOSE_POSITION",
+        "lifecycleStep": "exec_req_pass",
+    }
+    state.intents = [{**record, "txHash": "A" * 64}]
+    assert (
+        run_cli("--endpoint", route_a, "intent", "status", ADDR, "--key", key)[0] == 0
+    )
+    state.intents = [{**record, "txHash": "B" * 64}]
+    report = json.loads(
+        run_cli("--json", "--endpoint", route_b, "logs", "intent", key, "--addr", ADDR)[
+            1
+        ]
+    )
+    assert report["keeper"]["txHash"] == report["txHash"] == "b" * 64
+    assert report["events"] == []
+
+    assert (
+        run_cli("--endpoint", route_b, "intent", "status", ADDR, "--key", key)[0] == 0
+    )
+    identity_a, identity_b = log.endpoint_id(route_a), log.endpoint_id(route_b)
+    assert identity_a and identity_b and identity_a != identity_b
+    entries = events(home, "intent.keeper")
+    assert [line["endpointId"] for line in entries] == [identity_a, identity_b]
+    assert {line["endpoint"] for line in entries} == {log.origin(base)}
+    assert "opaque-route-" not in raw_logs(home)
+    keyfile = home / "logs" / log.ENDPOINT_KEY
+    assert keyfile.stat().st_size == 32
+    if os.name != "nt":
+        assert stat.S_IMODE(keyfile.stat().st_mode) == 0o600
+
+    second_home = home / "second-home"
+    assert log.endpoint_id(route_a, second_home / "logs") is None
+    assert not second_home.exists()
+    subprocess.run(
+        [*sai_command(), "--endpoint", route_a, "market", "prices"],
+        env={"SAI_HOME": str(second_home), "PATH": os.defpath},
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    second_identity = log.endpoint_id(route_a, second_home / "logs")
+    assert second_identity and second_identity != identity_a
+
+
+def test_keeper_lifecycle_codes_and_user_actor_survive_mcp_and_audit(home, keeper_stub):
+    endpoint, state = keeper_stub
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    nibi = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
+    for code, actor, step, value, normalized in (
+        ("simulation_failed", "server", "exec_req_fail", "AB" * 32, "ab" * 32),
+        (
+            "chain_execution_failed",
+            "user",
+            "exec_fail",
+            "0x" + "CD" * 32,
+            "0x" + "cd" * 32,
+        ),
+    ):
+        state.intents = [
+            {
+                "intentKey": key,
+                "evmAddress": ADDR,
+                "nibiAddress": nibi,
+                "execActor": actor,
+                "lifecycleStep": step,
+                "errorCode": code,
+                "errorMsg": "opaque-upstream-error",
+                "txHash": value,
+            }
+        ]
+        status = call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][
+            0
+        ]
+        assert (status["errorCode"], status["execActor"], status["txHash"]) == (
+            code,
+            actor,
+            normalized,
+        )
+        assert status["errorMsg"] == "Keeper reported an intent error."
+        assert status["nibiAddress"] == nibi
+        assert "txHashInvalid" not in status
+        report = call(mcp, "logs_intent", {"key": key, "addr": ADDR})
+        assert report["keeper"]["errorCode"] == code
+        assert report["keeper"]["execActor"] == actor
+        assert report["txHash"] == normalized
+    assert "opaque-upstream-error" not in raw_logs(home)
+
+
+def test_cli_intent_status_keeps_keeper_code_without_echoing_session(home, keeper_stub):
+    endpoint, state = keeper_stub
+    token = save_session(endpoint, token=OPAQUE_TOKEN)
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "OPEN_TRADE",
+            "execActor": "server",
+            "lifecycleStep": "exec_req_fail",
+            "errorCode": "simulation_failed",
+            "errorMsg": f"upstream diagnostic with credential {token}",
+            "txHash": None,
+        }
+    ]
+    result = subprocess.run(
+        [
+            *sai_command(),
+            "--json",
+            "--endpoint",
+            endpoint,
+            "intent",
+            "status",
+            ADDR,
+            "--key",
+            key,
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10,
+    )
+    assert all(
+        token not in output for output in (result.stdout, result.stderr, raw_logs(home))
+    )
+    cli = json.loads(result.stdout)
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
+    assert cli == {
+        name: value
+        for name, value in status.items()
+        if name not in ("addr", "addrSource")
+    }
+    row = cli["userIntents"][0]
+    assert row["errorCode"] == "simulation_failed"
+    assert row["errorMsg"] == "Keeper reported an intent error."
+    assert "txHash" not in row
+    assert events(home, "intent.keeper")[0]["errorCode"] == "simulation_failed"
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "valid"),
+    [
+        ("2026-11-20T15:43:31Z", True),
+        ("2026-11-20T15:43:31.082Z", True),
+        ("2026-11-20T15:43:31.123456789+05:30", True),
+        ("2026-11-20T15:43:31.1234567890123456Z", False),
+        ("2026-11-20x15:43:31Z", False),
+        ("2026-11-20T15:43:31+00:60", False),
+        ("2026-02-30T15:43:31Z", False),
+        (123, False),
+        (None, False),
+    ],
+)
+def test_keeper_read_timestamps_match_the_wire_format(keeper_stub, timestamp, valid):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "txHash": "a" * 64,
+            "execBlockTs": timestamp,
+        }
+    ]
+    state.history = [
+        {
+            "intentKey": key,
+            "trade": {"id": 7, "trader": ADDR},
+            "txHash": "a" * 64,
+            "block": {"block": 123, "block_ts": timestamp},
+        }
+    ]
+    prefix = ("--json", "--endpoint", endpoint)
+    code, output = run_cli(*prefix, "intent", "status", ADDR, "--key", key)
+    assert code == 0
+    report = json.loads(output)
+    code, output = run_cli(*prefix, "account", "history", ADDR)
+    assert code == 0
+    history = json.loads(output)["perp"]["tradeHistory"]
+    code, output = run_cli(*prefix, "logs", "intent", key, "--addr", ADDR)
+    assert code == 0
+    audit_row = json.loads(output)["keeper"]
+    for row, field in (
+        (report["userIntents"][0], "execBlockTs"),
+        (report["matchedTradeHistory"][0]["block"], "block_ts"),
+        (history[0]["block"], "block_ts"),
+        (audit_row, "execBlockTs"),
+    ):
+        assert row.get(field) == (timestamp if valid else None)
+        assert row.get(field + "Invalid") == (
+            True if timestamp is not None and not valid else None
+        )
+        if not valid:
+            assert field not in row
+
+
+@pytest.mark.parametrize(
+    ("error_code", "step"),
+    [
+        ("intent_validation_failed", "sign_failed"),
+        ("chain_switch_failed", "sign_failed"),
+        ("gas_estimation_failed", "sign_failed"),
+        ("wallet_rejected", "sign_reject"),
+        ("wallet_sign_failed", "sign_failed"),
+        ("chain_mismatch", "sign_failed"),
+        ("request_pending", "sign_failed"),
+        ("rpc_submission_failed", "exec_req_fail"),
+        ("sign_failed_unknown", "sign_failed"),
+        ("intent_auth_rejected", "jwt_failed"),
+        ("jwt_failed", "jwt_failed"),
+    ],
+)
+def test_browser_lifecycle_codes_survive_intent_status(keeper_stub, error_code, step):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "OPEN_TRADE",
+            "execActor": "user",
+            "lifecycleStep": step,
+            "errorCode": error_code,
+            "errorMsg": "provider-specific browser diagnostic",
+        }
+    ]
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    records = [
+        json.loads(output)["userIntents"][0],
+        call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][0],
+    ]
+    for record in records:
+        assert record["execActor"] == "user" and record["lifecycleStep"] == step
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
+@pytest.mark.parametrize(
+    "error_code", ["withdraw_evm_unconfigured", "invalid_withdraw"]
+)
+def test_withdrawal_codes_survive_cli_and_mcp_intent_status(keeper_stub, error_code):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "WITHDRAW_USD",
+            "execActor": "server",
+            "lifecycleStep": "exec_req_fail",
+            "errorCode": error_code,
+            "errorMsg": "private withdrawal diagnostic",
+        }
+    ]
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    records = [
+        json.loads(output)["userIntents"][0],
+        call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][0],
+    ]
+    for record in records:
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
+@pytest.mark.parametrize(
+    "error_code",
+    [
+        "market_order_expired",
+        "market_order_fill_failed",
+        "market_order_trading_paused",
+        "market_order_market_closed",
+        "market_order_trade_not_open",
+    ],
+)
+def test_keeper_cancellation_codes_survive_intent_status_and_audit(
+    keeper_stub, error_code
+):
+    endpoint, state = keeper_stub
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "execActor": "server",
+            "lifecycleStep": "exec_fail",
+            "errorCode": error_code,
+            "errorMsg": "opaque-keeper-diagnostic",
+        }
+    ]
+    args = {"key": key, "addr": ADDR}
+    records = [
+        call(mcp, "intent_status", args)["userIntents"][0],
+        call(mcp, "logs_intent", args)["keeper"],
+    ]
+    for record in records:
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
+def test_mcp_audit_omits_invalid_arguments_from_call_log(home):
+    mcp = server.create_server()
+    marker = "opaque-audit-argument-secret"
+    result = call(
+        mcp,
+        "logs_intent",
+        {"key": "KEY", "offline": True, "before": marker, "addr": ADDR},
+    )
+    assert result["code"] == "INVALID_REQUEST"
+    assert events(home, "mcp.tool_call")[0]["arguments"] == {}
+    assert marker not in raw_logs(home)
+
+
+@pytest.mark.parametrize("logging", [True, False], ids=["logging-on", "logging-off"])
+def test_mcp_audit_validation_names_types_without_rejected_values(
+    home, monkeypatch, logging
+):
+    if not logging:
+        monkeypatch.setenv("SAI_LOG", "0")
+    mcp = server.create_server()
+    secret = "opaque-rejected-audit-argument"
+    cases = [
+        ({"offline": secret}, "Argument 'offline' must be a boolean."),
+        ({"before": [secret]}, "Argument 'before' must be a string or null."),
+        ({"addr": {"value": secret}}, "Argument 'addr' must be a string or null."),
+        ({"key": [secret]}, "Argument 'key' must be a string."),
+        ({secret: secret}, "Expected audit arguments 'key' (a string)"),
+    ]
+
+    async def run():
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            for arguments, message in cases:
+                result = await client.call_tool(
+                    "logs_intent", {"key": "KEY", "offline": True} | arguments
+                )
+                assert result.isError
+                assert isinstance(result.content[0], TextContent)
+                assert message in result.content[0].text
+                assert secret not in result.model_dump_json()
+
+    asyncio.run(run())
+    results = events(home, "mcp.tool_result")
+    assert len(results) == (len(cases) if logging else 0)
+    assert all(line["code"] == "INVALID_REQUEST" for line in results)
+    assert secret not in raw_logs(home)
+
+
+def test_invalid_hash_and_keeper_text_are_excluded_from_reports(home, keeper_stub):
+    endpoint, state = keeper_stub
+    save_session(endpoint)
+    secret = "some-opaque-credential-unrelated-to-the-active-session"
+    state.ack_tx_hash = secret
+    code, output = run_cli("--json", "--endpoint", endpoint, "trade", "close", "7")
+    assert code == 0
+    key = json.loads(output)["intentKey"]
+    submitted = events(home, "intent.submitted")[0]
+    assert submitted["txHashInvalid"] is True and "txHash" not in submitted
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "txHash": 123,
+            "kind": secret,
+            "execActor": secret,
+            "lifecycleStep": "exec_fail",
+            "errorCode": secret,
+            "errorMsg": secret,
+        }
+    ]
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
+    assert status["userIntents"][0]["txHashInvalid"] is True
+    assert status["userIntents"][0]["errorCode"] == "KEEPER_ERROR"
+    assert secret not in json.dumps(status)
+    assert events(home, "intent.keeper")[0]["txHashInvalid"] is True
+    trail = call(mcp, "logs_intent", {"addr": ADDR, "key": key})
+    assert secret not in json.dumps(trail) and trail["txHash"] is None
+    assert trail["keeper"]["errorMsg"] == "Keeper reported an intent error."
+    assert secret not in raw_logs(home)
+    state.errors = [{"message": secret, "extensions": {"code": secret}}]
+    missing = call(mcp, "logs_intent", {"key": secret, "addr": ADDR})
+    assert missing["intentKey"] is None and secret not in json.dumps(missing)
+    assert secret not in raw_logs(home)
+    assert missing["keeperError"]["code"] == "KEEPER_ERROR"
+    state.errors = None
+    invalid = call(mcp, "logs_intent", {"key": "https://host/?token=" + secret})
+    assert invalid["code"] == "INVALID_REQUEST" and secret not in json.dumps(invalid)
+    state.intents = [
+        {
+            **state.intents[0],
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "kind": "CLOSE_POSITION",
+            "txHash": "a" * 64,
+        }
+    ]
+    state.history = [
+        {
+            "intentKey": key,
+            "trade": {"id": 7, "trader": ADDR, "extra": secret},
+            "evmTxHash": "0x" + "a" * 64,
+            "txHash": secret,
+            "tradeChangeType": secret,
+        }
+    ]
+    status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
+    expected = [
+        {
+            "intentKey": key,
+            "trade": {"id": 7, "trader": ADDR},
+            "txHashInvalid": True,
+            "evmTxHash": "0x" + "a" * 64,
+        }
+    ]
+    assert status["matchedTradeHistory"] == expected
+    assert secret not in json.dumps(status)
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    assert json.loads(output)["matchedTradeHistory"] == expected
+    assert all(secret not in value for value in (output, raw_logs(home)))
+
+    code, output = run_cli("--json", "--endpoint", endpoint, "account", "history", ADDR)
+    assert code == 0
+    assert json.loads(output) == {"perp": {"tradeHistory": expected}}
+    history = call(mcp, "account_history", {"addr": ADDR})
+    assert history == {
+        "addr": ADDR,
+        "addrSource": "argument",
+        "perp": {"tradeHistory": expected},
+    }
+    assert secret not in raw_logs(home)
+
+
+def test_intent_reports_unattributed_gaps_and_skips_nonfinite_rows(home):
+    root = home / "logs"
+    root.mkdir()
+    path = log.file_path("cli", log.now().date(), root)
+    scope = {"addr": ADDR, "endpointId": "h1_" + "1" * 64}
+    row = {
+        **scope,
+        "ts": log.stamp(log.now()),
+        "runId": "process",
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "seq": 1,
+    }
+    gap = {
+        "event": "log.dropped",
+        "count": 5,
+        "ts": row["ts"],
+        "runId": "process",
+        "seq": 2,
+    }
+    prefix = json.dumps(row).encode()[:-1]
+    path.write_bytes(
+        b"".join(
+            prefix + b', "durationMs": ' + value + b"}\n"
+            for value in (b"NaN", b"Infinity", b"-Infinity", b"1e999")
+        )
+        + log.encode(gap)
+    )
+    result = json.loads(run_cli("--json", "logs", "intent", "KEY", "--offline")[1])
+    assert result["events"] == []
+    assert result["unattributedGaps"] == [gap]
+    assert "Unattributed gap" in run_cli("logs", "intent", "KEY", "--offline")[1]
+    assert json.loads(run_cli("--json", "logs", "run", "process")[1])["events"] == []
+
+
+def test_log_reports_cap_rows_and_bytes_and_offer_earlier_timestamps(home):
+    root = home / "logs"
+    root.mkdir()
+    day = log.now()
+    rows = [
+        {
+            "event": "command.start",
+            "runId": "process",
+            "seq": i,
+            "ts": log.stamp(day.replace(microsecond=0) + timedelta(milliseconds=i)),
+            "command": "z" * 1900,
+        }
+        for i in range(log_queries.MAX_REPORT_ROWS + 30)
+    ]
+    log.file_path("cli", day.date(), root).write_bytes(
+        b"".join(log.encode(row) for row in rows)
+    )
+    code, output = run_cli("--json", "logs", "run", "process")
+    assert code == 0 and len(output.encode()) < log_queries.MAX_REPORT_BYTES
+    first = json.loads(output)
+    assert first["truncated"] and len(first["events"]) < log_queries.MAX_REPORT_ROWS
+    code, output = run_cli(
+        "--json", "logs", "run", "process", "--before", first["nextBefore"]
+    )
+    assert code == 0
+    earlier = json.loads(output)
+    assert earlier["events"][-1]["seq"] + 1 == first["events"][0]["seq"]
+    for row in rows:
+        row.pop("command")
+    log.file_path("cli", day.date(), root).write_bytes(
+        b"".join(log.encode(row) for row in rows)
+    )
+    assert len(log_queries.run("process")["events"]) == log_queries.MAX_REPORT_ROWS
+
+
+def test_logs_run_before_skips_newer_rows_in_long_run(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    rows = [
+        {
+            "event": "command.start",
+            "runId": "process",
+            "seq": i,
+            "ts": log.stamp(start + timedelta(milliseconds=i)),
+        }
+        for i in range(21_000)
+    ]
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(log.encode(row) for row in rows)
+    )
+
+    before = log.stamp(start + timedelta(milliseconds=10))
+    code, output = run_cli("--json", "logs", "run", "process", "--before", before)
+    assert code == 0
+    report = json.loads(output)
+    assert report["events"] == rows[:10]
+    assert "truncated" not in report
+
+
+def test_logs_run_before_attributes_gap_using_later_call_event(home):
+    root = home / "logs"
+    root.mkdir()
+    gap = {
+        "event": "log.dropped",
+        "count": 2,
+        "runId": "process",
+        "ts": "2026-11-24T00:00:00.000Z",
+    }
+    result = {
+        "event": "mcp.tool_result",
+        "callId": "call",
+        "runId": "process",
+        "ts": "2026-11-24T00:00:01.000Z",
+    }
+    log.file_path("mcp", date(2026, 11, 24), root).write_bytes(
+        log.encode(gap) + log.encode(result)
+    )
+
+    code, output = run_cli("--json", "logs", "run", "call", "--before", result["ts"])
+    assert code == 0
+    report = json.loads(output)
+    assert report["events"] == []
+    assert report["gaps"] == [gap]
+
+
+def test_logs_run_continuation_keeps_call_gap_attribution(home):
+    root = home / "logs"
+    root.mkdir()
+    stamp = "2026-11-24T11:00:00.000Z"
+    total = log_queries.MAX_REPORT_ROWS
+    gap = {"event": "log.dropped", "runId": "parent", "ts": stamp}
+    call = {**gap, "event": "mcp.tool_result", "callId": "call", "seq": total}
+    # JSON can decode escaped surrogates even though the writer cannot emit
+    # such a run ID. A malformed unrelated gap must not break this query.
+    malformed = json.dumps({**gap, "runId": "\ud800"}).encode() + b"\n"
+    log.file_path("mcp", date(2026, 11, 24), root).write_bytes(
+        malformed
+        + b"".join(log.encode({**gap, "seq": i}) for i in range(total))
+        + log.encode(call)
+    )
+
+    first = log_queries.run("call")
+    assert first["events"] == [call]
+    assert len(first["gaps"]) == total - 1
+    second = log_queries.run("call", before=first["nextBefore"])
+    assert second["events"] == []
+    assert second["gaps"] == [{**gap, "seq": 0}]
+    assert "nextBefore" not in second
+
+
+def test_logs_run_attributes_gap_before_consuming_the_call_file(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    call = {
+        "event": "mcp.tool_call",
+        "callId": "call",
+        "runId": "parent",
+        "ts": log.stamp(start),
+    }
+    noise = {"event": "command.start", "runId": "other"}
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(call)
+        + log.encode({**noise, "ts": log.stamp(start + timedelta(milliseconds=1))})
+    )
+    gap = {
+        "event": "log.dropped",
+        "runId": "parent",
+        "ts": log.stamp(start + timedelta(minutes=1)),
+    }
+    log.file_path("mcp", start.date(), root).write_bytes(
+        b"".join(
+            log.encode(
+                {**noise, "ts": log.stamp(start + timedelta(milliseconds=i + 2))}
+            )
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+        + log.encode(gap)
+    )
+
+    first = log_queries.run("call")
+    assert first["events"] == []
+    assert first["gaps"] == [gap]
+    second = log_queries.run("call", before=first["nextBefore"])
+    assert second["events"] == [call]
+    assert second["gaps"] == []
+    assert "nextBefore" not in second
+
+
+@pytest.mark.parametrize("parent_found", [True, False])
+def test_logs_run_defers_gap_until_call_parent_is_found(home, parent_found):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    call = {
+        "event": "mcp.tool_call",
+        "callId": "call" if parent_found else "some-other-call",
+        "runId": "parent",
+        "ts": log.stamp(start),
+    }
+    padding = {
+        "event": "mcp.tool_result",
+        "runId": "other",
+        "ts": log.stamp(start + timedelta(milliseconds=1)),
+        "extra": "x" * 8_192,
+    }
+    gap = {
+        "event": "log.dropped",
+        "runId": "parent",
+        "count": 2,
+        "ts": log.stamp(start + timedelta(minutes=1)),
+    }
+    unrelated = {**gap, "runId": "other"}
+    middle = log.encode(padding) * 10
+    assert len(middle) > log.TAIL_CHUNK
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(call) + middle + log.encode(gap) + log.encode(unrelated)
+    )
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(
+            log.encode(
+                {
+                    "event": "command.start",
+                    "runId": "other",
+                    "ts": log.stamp(start + timedelta(milliseconds=i + 2)),
+                }
+            )
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+
+    before = None
+    seen = set()
+    events, gaps = [], []
+    while True:
+        args = ("--before", before) if before is not None else ()
+        code, output = run_cli("--json", "logs", "run", "call", *args)
+        assert code == 0
+        page = json.loads(output)
+        events.extend(page["events"])
+        gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in seen and len(seen) < 5
+        seen.add(before)
+
+    assert events == ([call] if parent_found else [])
+    assert gaps == ([gap] if parent_found else [])
+
+
+def test_logs_run_returns_process_events_before_resolving_unrelated_gaps(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    run_id = "12345678123443218123456789012345"
+    older = 50_000
+    end = older + 2 * log_queries.MAX_REPORT_ROWS
+    with log.file_path("cli", start.date(), root).open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {
+                    "event": "command.start",
+                    "runId": "other" if i < older else run_id,
+                    "seq": i,
+                    "ts": log.stamp(start + timedelta(milliseconds=i)),
+                }
+            )
+            for i in range(end)
+        )
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(
+            {
+                "event": "log.dropped",
+                "runId": "other",
+                "count": 1,
+                "ts": log.stamp(start + timedelta(minutes=1)),
+            }
+        )
+    )
+
+    args = ("--json", "logs", "run", run_id)
+    code, output = run_cli(*args)
+    assert code == 0
+    first = json.loads(output)
+    halfway = older + log_queries.MAX_REPORT_ROWS
+    assert [row["seq"] for row in first["events"]] == list(range(halfway, end))
+    assert first["gaps"] == []
+
+    code, output = run_cli(*args, "--before", first["nextBefore"])
+    assert code == 0
+    second = json.loads(output)
+    assert [row["seq"] for row in second["events"]] == list(range(older, halfway))
+    assert second["gaps"] == []
+
+
+@pytest.mark.parametrize("cli_count", [1, log_queries.MAX_REPORT_ROWS + 1])
+def test_logs_run_paging_defers_rows_below_the_scan_frontier(home, cli_count):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+
+    def row(i: int, run_id: str) -> dict[str, Any]:
+        return {
+            "event": "command.start",
+            "runId": run_id,
+            "seq": i,
+            "ts": log.stamp(start + timedelta(milliseconds=i)),
+        }
+
+    early = [row(i, "target") for i in range(cli_count)]
+    buried = row(10_000, "target")
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(log.encode(line) for line in early)
+    )
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(buried)
+        + b"".join(
+            log.encode(row(10_001 + i, "other")) for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+
+    report = log_queries.run("target")
+    assert report["events"] == []
+    pages = []
+    while before := report.get("nextBefore"):
+        report = log_queries.run("target", before=before)
+        pages.append(report["events"])
+        assert len(pages) <= 3
+    assert [line for page in reversed(pages) for line in page] == [*early, buried]
+
+
+def test_earlier_intent_page_keeps_same_day_invocation_anchor(home, keeper_stub):
+    endpoint, state = keeper_stub
+    state.intents = [
+        {
+            "intentKey": "KEY",
+            "evmAddress": ADDR,
+            "lifecycleStep": "exec_req_pass",
+            "execActor": "server",
+        }
+    ]
+    assert (
+        run_cli("--endpoint", endpoint, "intent", "status", ADDR, "--key", "KEY")[0]
+        == 0
+    )
+    status = events(home, "intent.keeper")[0]
+    path = log.file_path("cli", log.now().date(), home / "logs")
+    earlier = {
+        "event": "command.start",
+        "runId": status["runId"],
+        "commandId": status["commandId"],
+        "ts": "2000-01-01T00:00:00.000Z",
+        "seq": 0,
+    }
+    with path.open("ab") as stream:
+        stream.write(log.encode(earlier))
+    report = log_queries.intent("KEY", before=status["ts"])
+    assert earlier in report["events"]
+
+
+def test_intent_page_finds_start_and_anchor_in_two_utc_days(home):
+    root = home / "logs"
+    root.mkdir()
+    start = {
+        "event": "command.start",
+        "runId": "process",
+        "commandId": "command",
+        "seq": 1,
+        "ts": "2026-11-23T23:59:59.900Z",
+        "surface": "cli",
+    }
+    anchor = {
+        **start,
+        "event": "intent.reserved",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "1" * 64,
+        "seq": 2,
+        "ts": "2026-11-24T00:00:00.100Z",
+    }
+    previous = log.file_path("cli", date(2026, 11, 23), root)
+    following = log.file_path("cli", date(2026, 11, 24), root)
+    previous.write_bytes(log.encode(start))
+    following.write_bytes(log.encode(anchor))
+    assert log_queries.intent("KEY", before="2026-11-23T23:59:59.999Z")["events"] == [
+        start
+    ]
+    assert log_queries.intent("KEY")["events"] == [start, anchor]
+
+    noise = {
+        **anchor,
+        "event": "command.start",
+        "intentKey": "OTHER",
+        "commandId": "other",
+    }
+    following.write_bytes(log.encode(noise) * log.MAX_SCAN_ROWS + log.encode(anchor))
+    assert log_queries.intent("KEY", before=anchor["ts"])["events"] == [start]
+    report = log_queries.intent("KEY")
+    assert report["truncated"] and report["events"] == [start, anchor]
+    assert report["nextBefore"] == anchor["ts"]
+
+
+def test_stats_does_not_spend_row_budget_on_stale_other_surface(home):
+    root = home / "logs"
+    root.mkdir()
+    now = log.now()
+    fresh = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "ts": log.stamp(now),
+    }
+    stale = {**fresh, "ts": log.stamp(now - timedelta(hours=4))}
+    log.file_path("cli", now.date(), root).write_bytes(log.encode(fresh))
+    log.file_path("mcp", now.date(), root).write_bytes(
+        log.encode({**fresh, "operation": "markets"})
+        + log.encode(stale) * (log.MAX_SCAN_ROWS + 1)
+    )
+    report = log_queries.stats("2h")
+    assert report["keeper"] == {
+        "markets": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+        "prices": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+    }
+    assert "truncated" not in report
+
+
+def test_stats_caps_the_number_of_scanned_rows(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    row = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("mcp", start.date(), root).write_bytes(
+        b"".join(
+            log.encode({**row, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(
+            {
+                **row,
+                "operation": "markets",
+                "ts": log.stamp(start - timedelta(hours=10)),
+            }
+        )
+    )
+    report = log_queries.stats()
+    assert (
+        report["truncated"] and report["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    )
+    assert "markets" not in report["keeper"]
+    assert report["errors"] == {"KEEPER_ERROR": log.MAX_SCAN_ROWS}
+    assert report["nextBefore"].startswith(log.stamp(start + timedelta(milliseconds=1)))
+
+    earlier = log_queries.stats(before=report["nextBefore"])
+    assert earlier["keeper"] == {
+        "markets": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+        "prices": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+    }
+    assert earlier["errors"] == {"KEEPER_ERROR": 2}
+    assert "truncated" not in earlier
+
+
+def test_logs_stats_does_not_retain_decoded_request_payloads(home):
+    root = home / "logs"
+    root.mkdir()
+    row = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "ts": "2026-11-24T11:00:00.000Z",
+        "extra": "x" * 4096,
+    }
+    log.file_path("cli", date(2026, 11, 24), root).write_bytes(log.encode(row) * 2_000)
+
+    tracemalloc.start()
+    try:
+        report = log_queries.stats()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert report["keeper"]["prices"]["count"] == 2_000
+    assert peak < 4 * 1024 * 1024
+
+
+def test_logs_stats_counts_older_rows_once_when_gap_output_is_capped(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    gap = {"event": "log.dropped", "count": 1, "runId": "process"}
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode({**sample, "ts": log.stamp(start)})
+        + b"".join(
+            log.encode({**gap, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(1, log_queries.MAX_REPORT_ROWS + 2)
+        )
+        + log.encode({**sample, "ts": log.stamp(start + timedelta(seconds=1))})
+    )
+
+    code, output = run_cli("--json", "logs", "stats")
+    assert code == 0
+    report = json.loads(output)
+    assert report["keeper"] == {"prices": {"count": 1, "p50Ms": 7, "p95Ms": 7}}
+    assert report["errors"] == {"KEEPER_ERROR": 1}
+    assert len(report["gaps"]) == log_queries.MAX_REPORT_ROWS
+    assert report["nextBefore"].startswith(log.stamp(start + timedelta(milliseconds=2)))
+
+    code, output = run_cli("--json", "logs", "stats", "--before", report["nextBefore"])
+    assert code == 0
+    earlier = json.loads(output)
+    assert earlier["keeper"] == report["keeper"]
+    assert earlier["errors"] == report["errors"]
+    assert earlier["gaps"] == [
+        {**gap, "ts": log.stamp(start + timedelta(milliseconds=1))}
+    ]
+    assert "truncated" not in earlier
+
+
+@pytest.mark.parametrize("query", ["run", "stats"])
+def test_log_reports_resume_inside_one_millisecond(home, query):
+    root = home / "logs"
+    root.mkdir()
+    stamp = "2026-11-24T11:00:00.000Z"
+    name = "command.start" if query == "run" else "log.dropped"
+    row = {"event": name, "runId": "process", "ts": stamp}
+    # Split the timestamp across files and leave one row on the second page.
+    total = log_queries.MAX_REPORT_ROWS + 1
+    for parity, surface in enumerate(("cli", "mcp")):
+        log.file_path(surface, date(2026, 11, 24), root).write_bytes(
+            b"".join(log.encode({**row, "seq": i}) for i in range(parity, total, 2))
+        )
+    args = ("--json", "logs", query, *(("process",) if query == "run" else ()))
+    field = "events" if query == "run" else "gaps"
+    code, output = run_cli(*args)
+    assert code == 0
+    first = json.loads(output)
+    assert len(first[field]) == log_queries.MAX_REPORT_ROWS
+    assert first["nextBefore"].startswith(stamp + "~")
+
+    code, output = run_cli(*args, "--before", first["nextBefore"])
+    assert code == 0
+    second = json.loads(output)
+    assert "nextBefore" not in second
+    assert [line["seq"] for line in second[field] + first[field]] == list(range(total))
+
+    code, output = run_cli(*args, "--before", stamp)
+    assert code == 0
+    assert json.loads(output)[field] == []
+
+
+def test_log_stats_scan_continues_inside_one_millisecond(home):
+    root = home / "logs"
+    root.mkdir()
+    row = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+        "ts": "2026-11-24T11:00:00.000Z",
+    }
+    total = log.MAX_SCAN_ROWS + 1
+    log.file_path("cli", date(2026, 11, 24), root).write_bytes(log.encode(row) * total)
+
+    first = log_queries.stats()
+    assert first["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    second = log_queries.stats(before=first["nextBefore"])
+    assert second["keeper"]["prices"]["count"] == 1
+    assert first["errors"]["KEEPER_ERROR"] + second["errors"]["KEEPER_ERROR"] == total
+    assert "nextBefore" not in second
+
+
+def test_logs_stats_continuation_keeps_out_of_order_appends(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    buried_at = 101
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(
+            {
+                **sample,
+                "operation": "markets",
+                "ts": log.stamp(start + timedelta(milliseconds=buried_at)),
+            }
+        )
+        + b"".join(
+            log.encode({**sample, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(log.MAX_SCAN_ROWS + 1)
+            if i != buried_at
+        )
+    )
+
+    first = log_queries.stats()
+    assert first["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    assert first["errors"] == {"KEEPER_ERROR": log.MAX_SCAN_ROWS}
+    earlier = log_queries.stats(before=first["nextBefore"])
+    assert earlier["keeper"] == {"markets": {"count": 1, "p50Ms": 7, "p95Ms": 7}}
+    assert earlier["errors"] == {"KEEPER_ERROR": 1}
+    assert "nextBefore" not in earlier
+
+
+@pytest.mark.parametrize("query", ["run", "stats"])
+def test_log_cursor_reaches_early_rows_past_the_byte_cap(home, query):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    retained = 300
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+        "runId": "process",
+        "extra": "x" * 1_800,
+    }
+    path = log.file_path("cli", start.date(), root)
+    with path.open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {**sample, "seq": i, "ts": log.stamp(start + timedelta(milliseconds=i))}
+            )
+            for i in range(10_000)
+        )
+    assert path.stat().st_size > log.MAX_SCAN_BYTES
+
+    args = ("--json", "logs", query, *(("process",) if query == "run" else ()))
+    before = log.stamp(start + timedelta(milliseconds=retained))
+    code, output = run_cli(*args, "--before", before)
+    assert code == 0
+    first = json.loads(output)
+    assert first["truncated"]
+    assert first["events" if query == "run" else "keeper"] == (
+        [] if query == "run" else {}
+    )
+    pages = []
+    while next_before := (pages[-1] if pages else first).get("nextBefore"):
+        code, output = run_cli(*args, "--before", next_before)
+        assert code == 0
+        pages.append(json.loads(output))
+        assert len(pages) <= 3
+
+    if query == "run":
+        assert [
+            line["seq"] for page in reversed(pages) for line in page["events"]
+        ] == list(range(retained))
+    else:
+        assert len(pages) == 1
+        assert pages[0]["keeper"]["prices"]["count"] == retained
+        assert pages[0]["errors"] == {"KEEPER_ERROR": retained}
+
+
+def test_mcp_log_concurrency_leaves_normal_tools_available(keeper_stub):
+    endpoint, state = keeper_stub
+    state.intents_block = threading.Event()
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+
+    async def run():
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            args = {"key": "KEY", "addr": ADDR}
+            running = [
+                asyncio.create_task(client.call_tool("logs_intent", args))
+                for _ in range(server.LOG_WORKERS)
+            ]
+            try:
+                async with asyncio.timeout(5):
+                    while len(state.requests) < server.LOG_WORKERS:
+                        await asyncio.sleep(0.01)
+                    busy = await client.call_tool("logs_intent", args)
+                    assert isinstance(busy.content[0], TextContent)
+                    assert "busy" in busy.content[0].text
+                    other = await client.call_tool("market_prices", {})
+                    assert isinstance(other.content[0], TextContent)
+                    assert json.loads(other.content[0].text) == {
+                        "oracle": {"tokenPricesUsd": []}
+                    }
+            finally:
+                state.intents_block.set()
+                await asyncio.gather(*running)
+
+    asyncio.run(run())
+
+
+def test_invalid_emitted_type_is_dropped_and_writer_gap_matches_schema(home):
+    log.event(
+        "keeper.request",
+        operation="prices",
+        durationMs="12",
+        endpoint="https://example.test",
+        authenticated=False,
+        status="ok",
+    )
+    sample_request("prices")
+    lines = read_logs(home)
+    assert [line["event"] for line in lines] == ["keeper.request", "log.dropped"]
+    assert all(valid_event(line) for line in lines)
+    assert lines[1]["count"] == 1
+
+
+def test_logs_stats_counts_errors_and_nearest_rank_percentiles(home):
+    now = log.now()
+    root = home / "logs"
+    root.mkdir()
+    ts = log.stamp(now)
+    recent = [
+        {
+            "ts": ts,
+            "seq": i,
+            "event": "keeper.request",
+            "operation": "intents",
+            "durationMs": i,
+        }
+        for i in range(1, 21)
+    ]
+    gap = {"ts": ts, "seq": 22, "event": "log.dropped", "count": 5}
+    recent += [
+        {
+            "ts": ts,
+            "seq": 21,
+            "event": "keeper.request",
+            "operation": "positions",
+            "durationMs": 3,
+            "code": "KEEPER_ERROR",
+        },
+        {"ts": ts, "seq": 23, "event": "command.end", "code": "KEEPER_ERROR"},
+        gap,
+    ]
+    log.file_path("cli", now.date(), root).write_bytes(
+        b"".join(log.encode(line) for line in recent)
+    )
+    old = now - timedelta(days=2)
+    log.file_path("mcp", old.date(), root).write_bytes(
+        log.encode(
+            {
+                "ts": log.stamp(old),
+                "event": "mcp.tool_result",
+                "code": "SIGNED_OUT",
+            }
+        )
+    )
+    code, output = run_cli("--json", "logs", "stats", "--since", "24h")
+    assert code == 0
+    report = json.loads(output)
+    assert report["keeper"] == {
+        "intents": {"count": 20, "p50Ms": 10, "p95Ms": 19},
+        "positions": {"count": 1, "p50Ms": 3, "p95Ms": 3},
+    }
+    assert report["errors"] == {"KEEPER_ERROR": 2}
+    assert report["gaps"] == [gap]
+    all_retained = json.loads(run_cli("--json", "logs", "stats")[1])
+    assert all_retained["errors"] == {"KEEPER_ERROR": 2, "SIGNED_OUT": 1}
+    plain = run_cli("logs", "stats", "--since", "24h")[1]
+    assert "p95 (ms)" in plain and "KEEPER_ERROR  2" in plain and "count=5" in plain
+    code, output = run_cli("--json", "logs", "stats", "--since", "0h")
+    assert code == 2 and json.loads(output)["error"]["code"] == "INVALID_REQUEST"
 
 
 def test_logs_path_prints_the_directory(home):
@@ -1563,11 +3373,11 @@ def test_logs_tail_filters_by_count_surface_and_event(home):
         '"surface":"cli","pid":1,"version":"0","runId":"r"}\nnot json\n'
     )
     log.event("command.start", command="market prices", argv=["market", "prices"])
-    with log.bind(surface="mcp", tool="market_prices"):
+    with log.bind(surface="mcp", tool="market_prices", callId="test"):
         log.event("mcp.tool_call", arguments={"addr": ADDR})
-        log.event("keeper.request", "warn", operation="prices", status="not_sent")
-    log.event("intent.reserved", intentKey="KEY1")
-    log.event("intent.status", intentKey="KEY1", status="accepted")
+        sample_request("prices", "warn", status="not_sent")
+    storage.pending("KEY1", "https://example.test", ADDR, "CLOSE_POSITION", "7")
+    storage.set_status("KEY1", "https://example.test", ADDR, "accepted")
     before = raw_logs(home)
 
     def names(*args: str) -> list[str]:
@@ -1709,23 +3519,29 @@ def test_logs_tail_reads_only_the_end_of_a_file(home, monkeypatch):
 
 
 def test_logs_tail_plain_output_is_one_line_per_event(home):
-    with log.bind(surface="mcp", tool="market_prices"):
+    with log.bind(surface="mcp", tool="market_prices", callId="test"):
         log.event("mcp.tool_call", arguments={"addr": ADDR})
-    log.event("keeper.request", "warn", operation="prices", ok=False, durationMs=7)
+    sample_request("prices", "warn", duration=7, status="not_sent")
     code, output = run_cli("logs", "tail")
     assert code == 0
     first, second = output.splitlines()
     stamp, surface, level, name, *fields = first.split(" ")
     assert datetime.fromisoformat(stamp) and (surface, level) == ("mcp", "info")
     assert name == "mcp.tool_call"
-    assert fields == ["tool=market_prices", f'arguments={{"addr":"{ADDR}"}}']
+    assert fields == [
+        "tool=market_prices",
+        "callId=test",
+        f'arguments={{"addr":"{ADDR}"}}',
+    ]
     assert second.split(" ")[1:] == [
         "cli",
         "warn",
         "keeper.request",
         "operation=prices",
-        "ok=false",
         "durationMs=7",
+        "endpoint=https://example.test",
+        "authenticated=false",
+        "status=not_sent",
     ]
 
 

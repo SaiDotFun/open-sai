@@ -17,7 +17,6 @@ import copy
 import hashlib
 import json
 import logging
-import time
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -69,17 +68,6 @@ MISMATCH = (
     "The trade no longer matches the preview the user confirmed, so nothing"
     " was submitted. Show the user this new preview, get their confirmation"
     " again, then retry with its previewDigest."
-)
-RECENT_OPEN = (
-    "An open-trade intent for this account from the last {minutes} minutes"
-    " is still {statuses}, so this open was not submitted: after a timeout or"
-    " error the first request may have gone through. Call intent_local, then"
-    " intent_status with each key in intentKeys."
-)
-PENDING_OPEN = (
-    "An open for this account is pending at the next oracle price or waiting"
-    " for Keeper to index its outcome. Call intent_status with each key in"
-    " intentKeys and wait for a final outcome before submitting another trade."
 )
 PRICE_MOVED = (
     "The market price moved {moved}% from the confirmed referencePrice, more"
@@ -136,9 +124,26 @@ def describe(exc: Exception) -> dict[str, Any]:
                 " resubmit until it reports a final outcome."
             ),
         )
+    if isinstance(exc, storage.RecentOpenPending):
+        return error(
+            f"Earlier open intent {failure.intent_key} may still execute. Call"
+            " intent_status with each key in intentKeys before retrying.",
+            failure.code,
+            intentKeys=exc.keys,
+        )
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.PositionChanged):
+        if exc.preview is None:
+            return error(failure.message, Code.PREVIEW_MISMATCH)
+        return error(
+            "The position or quote changed during confirmation, so nothing was"
+            " submitted. Show the user the latest preview, get their confirmation"
+            " again, then retry with its previewDigest.",
+            Code.PREVIEW_MISMATCH,
+            preview=with_digest(exc.preview),
+        )
     if failure.code == Code.INTERNAL_ERROR:
         trace = "".join(traceback.format_exception(exc))
         log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
@@ -380,7 +385,8 @@ def account_positions(settings: Settings, addr: str | None) -> dict[str, Any]:
 def account_history(settings: Settings, addr: str | None) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
     variables = {"trader": account["addr"]}
-    return {**account, **keeper.request(settings.endpoint, keeper.HISTORY, variables)}
+    data = keeper.request(settings.endpoint, keeper.HISTORY, variables)
+    return {**account, **keeper.safe_history_response(data)}
 
 
 def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
@@ -409,10 +415,8 @@ def intent_status(
     settings: Settings, addr: str | None, key: str | None
 ) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
-    return {
-        **account,
-        **reconcile.reconcile(settings.endpoint, account["addr"], key),
-    }
+    data = reconcile.reconcile(settings.endpoint, account["addr"], key)
+    return {**account, **reconcile.status_report(data)}
 
 
 # Preview binding
@@ -427,7 +431,7 @@ def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
     """Return the parts of PREVIEW the user confirms.
 
     That is the account the trade would be submitted under, the intent, and
-    the margin quote when there is one. A market open leaves out its intent
+    the position quote when there is one. A market open leaves out its intent
     price, which is refreshed at submit, and binds the referencePrice the
     user confirmed instead.
     """
@@ -530,71 +534,6 @@ def submit_check(
     return bound(load, digest, reference_price, slippage)
 
 
-# The admission window bounds the recent-open check. A pending fill keeps
-# blocking until Keeper provides a final outcome.
-RECENT_OPEN_SECONDS = keeper.ABSENT_AFTER_SECONDS
-
-
-def recent_opens(
-    endpoint: str, account: str, now: float | None = None
-) -> list[dict[str, str]]:
-    """Return this account's OPEN_TRADE intents that may still fill.
-
-    Recent unknown or accepted opens count, and a known pending open counts
-    at any age.
-    """
-    current = time.time() if now is None else now
-    with storage.db() as connection:
-        rows = connection.execute(
-            "SELECT id, COALESCE(keeper_status,status), created_at FROM intents"
-            " WHERE endpoint=? AND account=? AND kind='OPEN_TRADE'"
-            " AND COALESCE(keeper_status,status) IN ('unknown', 'accepted', 'pending')"
-            " ORDER BY rowid DESC",
-            (endpoint, account.lower()),
-        ).fetchall()
-    recent: list[dict[str, str]] = []
-    for key, status, created in rows:
-        if status == "pending" or storage.intent_is_recent(
-            key, created, current, RECENT_OPEN_SECONDS
-        ):
-            recent.append({"intentKey": key, "status": status})
-    return recent
-
-
-def no_recent_open(
-    settings: Settings, load: AccountSession, *, allow_concurrent_open: bool
-) -> trading.SubmitCheck:
-    """Return a check for pending and recent opens."""
-
-    def check(_preview: dict[str, Any]) -> None:
-        account = load()["evmAddress"]
-        opens = recent_opens(settings.endpoint, account)
-        pending = [row["intentKey"] for row in opens if row["status"] == "pending"]
-        if pending:
-            raise Refused(PENDING_OPEN, Code.RECENT_OPEN_PENDING, intentKeys=pending)
-        if opens and not allow_concurrent_open:
-            statuses = " or ".join(sorted({row["status"] for row in opens}))
-            raise Refused(
-                RECENT_OPEN.format(
-                    minutes=RECENT_OPEN_SECONDS // 60, statuses=statuses
-                ),
-                Code.RECENT_OPEN_PENDING,
-                intentKeys=[row["intentKey"] for row in opens],
-            )
-
-    return check
-
-
-def both(
-    first: trading.SubmitCheck, second: trading.SubmitCheck
-) -> trading.SubmitCheck:
-    def check(preview: dict[str, Any]) -> None:
-        first(preview)
-        second(preview)
-
-    return check
-
-
 def finish(
     load: AccountSession, dry_run: bool, result: dict[str, Any]
 ) -> dict[str, Any]:
@@ -640,9 +579,10 @@ def open_trade(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
     if not dry_run:
-        check = both(
-            no_recent_open(settings, load, allow_concurrent_open=allow_concurrent_open),
-            check,
+        storage.check_open_pending(
+            settings.endpoint,
+            load()["evmAddress"],
+            allow_concurrent_open=allow_concurrent_open,
         )
     notices: list[str] = []
     result = trading.open_trade(
@@ -660,6 +600,7 @@ def open_trade(
         dry_run=dry_run,
         notify=notices.append,
         before_submit=check,
+        allow_concurrent_open=allow_concurrent_open,
     )
     if dry_run and market:
         # Read-only: the price a live submit would refresh to now.

@@ -24,7 +24,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import log
+from . import log, paths
 from .errors import Code, SaiError, SessionError
 
 PLAIN_KEEPER_URL = re.compile(
@@ -38,15 +38,31 @@ class UnresolvedIntent(SaiError, ValueError):
     code = Code.INVALID_REQUEST
 
 
+class RecentOpenPending(UnresolvedIntent):
+    """An earlier open on the same account may still execute."""
+
+    code = Code.RECENT_OPEN_PENDING
+
+    def __init__(self, keys: list[str], endpoint: str, account: str) -> None:
+        key = keys[0]
+        hint = intent_status_hint(endpoint, account, key)
+        super().__init__(
+            f"Earlier open intent {key} may still execute."
+            f" Check its status with `{hint}` before retrying.",
+            intent_key=key,
+            hint=hint,
+        )
+        self.keys = keys
+
+
 def home() -> Path:
-    return Path(os.environ.get("SAI_HOME", Path.home() / ".sai")) / "trader"
+    return paths.sai_home() / "trader"
 
 
 def directory() -> Path:
     path = home()
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.chmod(0o700)
-    return path
+    paths.private_directory(path.parent, profile_root=True)
+    return paths.private_directory(path)
 
 
 # Sessions are encrypted with this fixed key, which ships in the source, like
@@ -396,11 +412,15 @@ def busy_timeout(seconds: float) -> Generator[None]:
 
 def db() -> sqlite3.Connection:
     path = directory() / "intents.sqlite3"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    os.close(fd)
-    path.chmod(0o600)
     connection = sqlite3.connect(path, timeout=_BUSY_TIMEOUT.get())
-    _migrate(connection)
+    try:
+        # Closing a separate file descriptor would release any POSIX locks
+        # that another connection in this process holds on the ledger.
+        path.chmod(0o600)
+        _migrate(connection)
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 
@@ -424,14 +444,53 @@ def intent_status_hint(endpoint: str, account: str, key: str) -> str:
     return keeper_command_hint(endpoint, "intent", "status", account, "--key", key)
 
 
-def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> None:
+def _check_open_pending(
+    connection: sqlite3.Connection,
+    endpoint: str,
+    account: str,
+    allow_concurrent_open: bool,
+) -> None:
+    # Locally pending opens store 'unknown' in status for older readers.
+    opens = connection.execute(
+        "SELECT id FROM intents WHERE endpoint=? AND account=?"
+        " AND kind='OPEN_TRADE' AND (keeper_status='pending'"
+        " OR (NOT ? AND status IN ('unknown', 'accepted')))"
+        " ORDER BY rowid DESC",
+        (endpoint, account.lower(), allow_concurrent_open),
+    ).fetchall()
+    if opens:
+        raise RecentOpenPending([row[0] for row in opens], endpoint, account)
+
+
+def check_open_pending(
+    endpoint: str, account: str, *, allow_concurrent_open: bool
+) -> None:
+    """Refuse an already blocked open early. Reservation checks again."""
+    with contextlib.closing(db()) as connection:
+        _check_open_pending(connection, endpoint, account, allow_concurrent_open)
+
+
+def pending(
+    key: str,
+    endpoint: str,
+    account: str,
+    kind: str,
+    entity: str,
+    *,
+    allow_concurrent_open: bool = False,
+) -> None:
+    opening = kind == "OPEN_TRADE"
+    concurrent_open = opening and allow_concurrent_open
     with db() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        if opening:
+            _check_open_pending(connection, endpoint, account, concurrent_open)
         unresolved = connection.execute(
             "SELECT id FROM intents WHERE endpoint=? AND account=?"
-            " AND (status='unknown' OR keeper_status='pending'"
+            " AND ((status='unknown' AND (NOT ? OR kind<>'OPEN_TRADE'))"
+            " OR keeper_status='pending'"
             " OR (status='accepted' AND entity <> '' AND entity=?)) LIMIT 1",
-            (endpoint, account.lower(), entity),
+            (endpoint, account.lower(), concurrent_open, entity),
         ).fetchone()
         if unresolved:
             blocked_key = unresolved[0]
@@ -452,6 +511,7 @@ def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> No
         addr=account,
         tradeId=entity or None,
         endpoint=log.endpoint(endpoint),
+        endpointId=log.endpoint_identity(endpoint),
     )
 
 
@@ -533,7 +593,8 @@ def _log_status(
         status=status,
         addr=account,
         endpoint=log.endpoint(endpoint),
-        **({"code": code} if code is not None else {}),
+        endpointId=log.endpoint_identity(endpoint),
+        code=code,
     )
 
 
@@ -554,11 +615,6 @@ def _key_time(key: str) -> float | None:
     except ValueError:
         return None
     return stamp.replace(tzinfo=UTC).timestamp()
-
-
-def intent_is_recent(key: str, created: float | None, now: float, window: int) -> bool:
-    stamp = created if created is not None else _key_time(key)
-    return stamp is None or now - stamp <= window
 
 
 def unresolved_intents(endpoint: str, account: str) -> list[dict[str, Any]]:

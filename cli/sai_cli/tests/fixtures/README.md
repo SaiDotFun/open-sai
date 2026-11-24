@@ -32,6 +32,27 @@ An autouse fixture blocks external TCP connections in the pytest process.
 It does not affect spawned CLI processes, whose integration tests explicitly
 select loopback endpoints.
 
+## Log Event Goldens
+
+The JSONL files in `logs/` come from real subprocesses with temporary
+`SAI_HOME` directories. Each line follows the [log event schema](../../../../docs/log-events.md).
+
+- `cli-trade-close.jsonl` records `sai --json --endpoint URL trade close 7`
+  when the loopback Keeper acknowledges the request and returns a synthetic
+  transaction hash.
+- `mcp-prices-failure.jsonl` records the `market_prices` call after
+  `mcp_info` in one stdio server session. The Keeper URL has no listener,
+  so the request and tool result carry `NOT_SENT`.
+
+The capture checks field types against the registry before replacing
+volatile values, the loopback port and its endpoint identity, and the
+generated intent key. It preserves sequence numbers and ID relationships. Regenerate both files with this command.
+
+```sh
+SAI_REGENERATE_LOG_GOLDENS=1 uv run pytest cli/sai_cli/tests/test_logs.py \
+  -k 'joins_cli_and_mcp or serve_logs_tool_calls'
+```
+
 `intent_outcomes.json` contains selected mainnet `userIntents` and
 `tradeHistory` rows captured on 2026-11-24 under `recorded`. The fixture
 replaces wallet addresses, intent keys, transaction hashes, and trade and

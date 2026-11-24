@@ -36,6 +36,54 @@ HISTORY_HINT = "Waiting for matching trade history. Do not resubmit."
 LOCAL_PENDING_HINT = "This intent is still pending locally. Do not resubmit."
 
 
+def _reconcile_fields(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the outcome and guidance Sai derives while reconciling."""
+    result = {}
+    if data.get("outcome") in (
+        "accepted",
+        "pending",
+        "terminal-filled",
+        "terminal-failed",
+        "unknown",
+    ):
+        result["outcome"] = data["outcome"]
+    if data.get("localStatus") in (
+        "unknown",
+        "accepted",
+        "pending",
+        "terminal",
+        "rejected",
+        "not_sent",
+        "absent",
+    ):
+        result["localStatus"] = data["localStatus"]
+    if data.get("hint") in (
+        PENDING_HINT,
+        UNINDEXED_HINT,
+        HISTORY_HINT,
+        LOCAL_PENDING_HINT,
+    ):
+        result["hint"] = data["hint"]
+    return result
+
+
+def status_report(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a reconciliation result for CLI and MCP output."""
+    report = _reconcile_fields(data)
+    for name, sanitize in (
+        ("userIntents", keeper.safe_intent_record),
+        ("matchedTradeHistory", keeper.safe_intent_history),
+    ):
+        if isinstance(rows := data.get(name), list):
+            report[name] = [
+                sanitize(row)
+                | (_reconcile_fields(row) if name == "userIntents" else {})
+                for row in rows
+                if isinstance(row, dict)
+            ]
+    return report
+
+
 def classify_outcome(row: Mapping[str, Any]) -> IntentOutcome:
     """Classify one Keeper row using the contract in intent-outcomes.md.
 
@@ -86,8 +134,8 @@ def _matches_account(row: Mapping[str, Any], account: str) -> bool:
     )
 
 
-def _hash(value: str | None) -> str:
-    return (value or "").lower().removeprefix("0x")
+def _hash(value: object) -> str:
+    return value.lower().removeprefix("0x") if isinstance(value, str) else ""
 
 
 def _read_history(
@@ -165,7 +213,8 @@ def reconcile(
     matching = [
         row
         for row in rows or []
-        if account is not None
+        if isinstance(row, dict)
+        and account is not None
         and _matches_account(row, account)
         and (key is None or row.get("intentKey") == key)
     ]
@@ -199,10 +248,10 @@ def reconcile(
         log.event(
             "intent.keeper",
             intentKey=key,
-            lifecycleStep=None,
             found=False,
-            addr=addr,
+            addr=account,
             endpoint=log.endpoint(endpoint),
+            endpointId=log.endpoint_identity(endpoint),
         )
         with write():
             local = storage.mark_absent(
@@ -218,19 +267,22 @@ def reconcile(
 
     row = matching[0]
     step = row.get("lifecycleStep")
+    tx_hash, invalid_hash = keeper.request_hash(row.get("txHash"))
+    error_code = keeper.intent_error_code(row)
     outcome = classify_outcome(row)
     log.event(
         "intent.keeper",
         intentKey=key,
-        kind=row.get("kind"),
-        lifecycleStep=step,
-        execActor=row.get("execActor"),
-        errorCode=row.get("errorCode"),
-        errorMsg=log.untrusted(row.get("errorMsg")),
-        txHash=row.get("txHash"),
-        addr=addr,
+        kind=keeper.known_text(row.get("kind"), keeper.INTENT_KINDS),
+        lifecycleStep=keeper.known_text(step, keeper.INTENT_STEPS),
+        execActor=keeper.known_text(row.get("execActor"), keeper.INTENT_ACTORS),
+        errorCode=error_code,
+        txHash=tx_hash,
+        txHashInvalid=invalid_hash,
+        addr=account,
         endpoint=log.endpoint(endpoint),
-        **({"code": Code.KEEPER_ERROR} if outcome == "terminal-failed" else {}),
+        endpointId=log.endpoint_identity(endpoint),
+        code=Code.KEEPER_ERROR if outcome == "terminal-failed" else None,
     )
     if outcome == "unknown":
         return data
