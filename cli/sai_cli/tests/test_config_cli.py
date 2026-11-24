@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
+import sys
 import tomllib
 from typing import Any
 
@@ -119,6 +121,183 @@ def test_unknown_key_or_bad_value_exits_2_listing_keys(args, tmp_path):
     assert not (tmp_path / "config.toml").exists()
 
 
+@pytest.mark.parametrize("authority", ["[::1]suffix", "prefix[::1]", "[::1"])
+def test_config_set_rejects_malformed_ipv6_authority(tmp_path, authority):
+    result = sai(
+        "--json", "config", "set", "keeper.endpoint", f"https://{authority}/path"
+    )
+
+    assert result.exit_code == 2
+    assert json.loads(result.stdout) == {
+        "error": {
+            "code": "INVALID_REQUEST",
+            "message": (
+                "Invalid value for keeper.endpoint: expected a URL starting with "
+                f"https:// or http://. Valid keys: {', '.join(settings.KEYS)}"
+            ),
+            "retryable": False,
+        },
+    }
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+def test_config_set_accepts_ipv6_with_port():
+    endpoint = "https://[::1]:8443/path"
+    result = sai("--json", "config", "set", "keeper.endpoint", endpoint)
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["value"] == endpoint
+
+
+@pytest.mark.parametrize(
+    ("key", "scheme"), [("keeper.endpoint", "https"), ("keeper.ws_endpoint", "wss")]
+)
+@pytest.mark.parametrize("fragment", ["#client", "#"])
+def test_config_set_rejects_keeper_endpoint_fragments(tmp_path, key, scheme, fragment):
+    result = sai(
+        "--json", "config", "set", key, f"{scheme}://keeper.example/graphql{fragment}"
+    )
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"] and "fragment" in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+def test_watch_rejects_a_keeper_fragment_in_config(tmp_path):
+    (tmp_path / "config.toml").write_text(
+        '[keeper]\nendpoint = "http://127.0.0.1:9/graphql#client"\n'
+    )
+    result = subprocess.run(
+        [sys.executable, "-m", "sai_cli", "--json", "watch", "price", "1"],
+        capture_output=True,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert "keeper.endpoint" in error["message"] and "fragment" in error["message"]
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("key", "endpoint"),
+    [
+        ("keeper.ws_endpoint", "wss://keeper.example/graphql stream"),
+        ("keeper.ws_endpoint", "wss://keeper.example/graphql?name=one two"),
+        ("keeper.endpoint", " https://keeper.example/graphql"),
+        ("keeper.endpoint", "https://keeper.example/graphql "),
+        ("keeper.endpoint", "\xa0https://[::1]:8443/path\xa0"),
+        ("lcd.endpoint", "https://lcd.example/path\x80"),
+    ],
+)
+def test_config_set_rejects_raw_whitespace_and_controls_in_urls(
+    tmp_path, key, endpoint
+):
+    result = sai("--json", "config", "set", key, endpoint)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+def test_config_set_accepts_percent_encoded_websocket_request_target():
+    endpoint = "wss://keeper.example/graphql%20stream?name=one%20two"
+    result = sai("--json", "config", "set", "keeper.ws_endpoint", endpoint)
+    assert result.exit_code == 0
+    assert json.loads(result.stdout)["value"] == endpoint
+
+
+@pytest.mark.parametrize(
+    ("key", "endpoint"),
+    [
+        ("keeper.endpoint", "https://127.0.0.999/query"),
+        ("keeper.endpoint", "https://keeper.example/que\try"),
+        ("keeper.endpoint", "https://keeper.example/query\t"),
+        ("lcd.endpoint", "https://127.0.0.999/query"),
+        ("keeper.ws_endpoint", "wss://keeper.example/query#fragment"),
+    ],
+)
+def test_config_set_rejects_endpoints_the_transport_cannot_parse(
+    tmp_path, key, endpoint
+):
+    result = sai("--json", "config", "set", key, endpoint)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert endpoint not in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["https://127.0.0.999/query", "https://127.0.0.1:9/que\try"]
+)
+def test_market_list_rejects_an_unparseable_endpoint_from_config(tmp_path, endpoint):
+    path = tmp_path / "config.toml"
+    path.write_text(f"[keeper]\nendpoint = {json.dumps(endpoint)}\n")
+
+    result = sai("--json", "market", "list")
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert "keeper.endpoint" in error["message"]
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize("source", ["set", "flag", "env", "file"])
+@pytest.mark.parametrize(
+    "endpoint",
+    [
+        "https://bad host/path",
+        "https://bad\thost/path",
+        "https://user:password@bad host/path",
+        "https://bad\\host/path",
+        "https:\t//bad host/path",
+        "https:/\t/host/path",
+    ],
+)
+def test_rejects_malformed_endpoint_authority(tmp_path, monkeypatch, source, endpoint):
+    path = tmp_path / "config.toml"
+    if source == "set":
+        args = ["config", "set", "keeper.endpoint", endpoint]
+    else:
+        args = ["config", "get", "keeper.endpoint"]
+        if source == "flag":
+            args[:0] = ["--endpoint", endpoint]
+        elif source == "env":
+            monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        else:
+            path.write_text(f"[keeper]\nendpoint = {json.dumps(endpoint)}\n")
+
+    result = sai("--json", *args)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert "keeper.endpoint" in error["message"]
+    assert endpoint not in error["message"]
+    assert "password" not in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / ".config.lock").exists()
+    assert path.exists() == (source == "file")
+
+
 def test_flag_and_env_override_the_file(monkeypatch):
     sai("config", "set", "keeper.endpoint", "https://file.example/q")
     sai("config", "set", "keeper.ws_endpoint", "wss://ws.file.example/q")
@@ -136,10 +315,108 @@ def test_flag_and_env_override_the_file(monkeypatch):
     assert "SAI_ENDPOINT is set and overrides keeper.endpoint" in result.stderr
 
 
-def test_bad_flag_value_is_an_error():
-    result = sai("--endpoint", "keeper.example", "config", "list")
-    assert result.exit_code == 1
-    assert "--endpoint: Invalid value for keeper.endpoint" in result.stderr
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize("source", ["flag", "env", "file"])
+@pytest.mark.parametrize(
+    "endpoint", ["https://[::1]:oops/path", "https://[::1/path", "keeper.example"]
+)
+def test_malformed_endpoint_during_resolution_is_a_usage_error(
+    tmp_path, monkeypatch, json_output, source, endpoint
+):
+    args = ["--json"] if json_output else []
+    if source == "flag":
+        args.extend(("--endpoint", endpoint))
+        origin = "--endpoint"
+    elif source == "env":
+        monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        origin = "SAI_ENDPOINT"
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f"[keeper]\nendpoint = {json.dumps(endpoint)}\n")
+        origin = str(path)
+
+    result = sai(*args, "config", "get", "keeper.endpoint")
+
+    assert result.exit_code == 2
+    message = (
+        f"{origin}: Invalid value for keeper.endpoint:"
+        " expected a URL starting with https:// or http://"
+    )
+    if json_output:
+        assert json.loads(result.stdout) == {
+            "error": {"code": "INVALID_REQUEST", "message": message, "retryable": False}
+        }
+        assert result.stderr == ""
+    else:
+        assert result.stdout == ""
+        assert message in result.stderr
+        assert "Traceback" not in result.stderr
+
+
+@pytest.mark.parametrize(
+    ("args", "key"),
+    [
+        (("mcp", "serve", "--endpoint", "https://[::1]:oops/path"), "keeper.endpoint"),
+        (
+            ("watch", "price", "1", "--ws-endpoint", "wss://[::1]:oops/path"),
+            "keeper.ws_endpoint",
+        ),
+        (
+            (
+                "--endpoint",
+                "https://[::1]:oops/path",
+                "logs",
+                "intent",
+                "key",
+                "--offline",
+            ),
+            "keeper.endpoint",
+        ),
+    ],
+)
+def test_malformed_command_endpoint_is_a_usage_error(args, key):
+    result = sai("--json", *args)
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert result.stderr == ""
+
+
+@pytest.mark.parametrize(
+    ("args", "key"),
+    [
+        (("watch", "price", "1", "--ws-endpoint", ""), "keeper.ws_endpoint"),
+        (
+            (
+                "trade",
+                "partial-close",
+                "7",
+                "--percent",
+                "10",
+                "--dry-run",
+                "--lcd-endpoint",
+                "",
+            ),
+            "lcd.endpoint",
+        ),
+        (
+            ("doctor", "--offline", "--no-fix", "--ws-endpoint", ""),
+            "keeper.ws_endpoint",
+        ),
+        (("doctor", "--offline", "--no-fix", "--lcd-endpoint", ""), "lcd.endpoint"),
+    ],
+)
+def test_explicitly_empty_subcommand_endpoint_is_a_usage_error(monkeypatch, args, key):
+    # A fallback to the configured WebSocket is refused before it connects.
+    monkeypatch.setenv("SAI_WS_ENDPOINT", "ws://keeper.example/query")
+    result = sai("--json", *args)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert result.stderr == ""
 
 
 def test_commands_use_the_configured_endpoint():

@@ -129,23 +129,36 @@ in the browser. Keeper issues it for 30 days in production. It authorizes
 every trade kind on the account's deposited funds, and Keeper cannot revoke it
 yet: signing out of Sai Web clears only the browser copy, not the CLI's.
 
-`auth import` stores a token copied from Sai Web. The **Connect Sai CLI /
-MCP** button that copies it is in review
-(https://github.com/SaiDotFun/sai-web/pull/1591); until it ships, use
-`auth login NAME` below.
+On Sai Web Mainnet, open the wallet menu and select **Connect Sai CLI / MCP**
+beside **Send to phone**. The button appears for the selected, connected
+wallet with an active trading session. Check the expiry, click **Copy session
+token**, and run the `sai auth import` command shown in the dialog. The command
+specifies the Mainnet endpoint.
 
-- With a terminal, it asks for the token at a hidden prompt. Press Enter
+- With a terminal, paste the token at the hidden prompt or press Enter
   without typing to read the clipboard.
 - Without a terminal, as when an agent runs it, it reads the clipboard with the
   first command that works: `pbpaste`, `wl-paste`, `xclip`, or `powershell.exe
   Get-Clipboard` (WSL and Windows). If none works, as over SSH, it exits
-  non-zero and asks for the person to run `sai auth import` in their own
-  terminal.
+  non-zero. Run the dialog's import command in your own terminal.
 - It never reads the token from arguments, environment variables, or piped
   stdin, and never prints it. Like `auth login` and `auth status`, it prints
   only `addr`, `expiresAt`, and `endpoint`.
 - After storing the token, it reads the clipboard again and clears it only if
   it still holds the token. Anything copied in the meantime stays.
+
+The dialog pins Mainnet for import only. Check the session and, if you want
+Mainnet as your saved default, set the Keeper endpoint.
+
+```bash
+sai --endpoint https://sai-keeper.nibiru.fi/query auth status
+sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query
+```
+
+Later CLI commands and any MCP server using the session must target the same
+Keeper endpoint. An explicit `--endpoint` or `SAI_ENDPOINT` overrides the
+saved setting. Update any conflicting overrides and restart running MCP
+servers to pick up the change.
 
 `auth login` signs Keeper's challenge with a local key. Before anything
 signs, the CLI checks that the typed data has primary type
@@ -361,6 +374,33 @@ otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 `--lcd-endpoint` override them for one run.
 
+### Intent and History JSON
+
+`intent status` returns Keeper intent rows in `userIntents` and any matching
+trade history in `matchedTradeHistory`. Sai can add `outcome`,
+`localStatus`, and `hint`. `account history` returns trade-history rows in
+`perp.tradeHistory`. The CLI and MCP use the same Keeper fields.
+
+| Rows | Keeper Fields |
+| --- | --- |
+| Intent | `intentKey`, `kind`, `lifecycleStep`, `execActor`, `evmAddress`, `nibiAddress`, `txHash`, `execBlock`, `execBlockTs`, `errorCode`, `errorMsg` |
+| Trade history | `id`, `intentKey`, `tradeChangeType`, `txHash`, `evmTxHash`, `block.block`, `block.block_ts`, `trade.id`, `trade.trader` |
+
+Sai omits null, unrecognized, and invalid row fields and lowercases valid
+transaction hashes. A malformed hash or timestamp adds the corresponding
+flag with value `true`. The flags are `txHashInvalid`,
+`evmTxHashInvalid`, `execBlockTsInvalid`, and `block.block_tsInvalid`.
+
+Use `outcome` and `localStatus` when present. If both are absent, read the
+latest row's `lifecycleStep` and `execActor` together. A server `exec_pass`
+confirms the intent succeeded. Matching trade history can arrive later.
+[Keeper lifecycle and actor mapping](https://github.com/SaiDotFun/open-sai/blob/main/cli/sai_cli/core/intent-outcomes.md#keeper-intent-outcomes)
+
+On an intent error, `errorCode` keeps recognized codes such as
+`wallet_rejected` and `rpc_submission_failed`. Sai uses `KEEPER_ERROR`
+when the code is missing or unrecognized. The `errorMsg` field says
+`Keeper reported an intent error.`.
+
 ## Errors and Exit Codes
 
 Put `--json` before the command to read errors on stdout. A failed command
@@ -393,6 +433,14 @@ Exit 6 covers `SIGNED_OUT` and
 `SESSION_EXPIRED`. `SESSION_UNAVAILABLE` has exit 1 and describes a local
 session the command could not use, for example one for another Keeper
 endpoint.
+
+For Keeper withdrawal failures, `intent status` and MCP `intent_status`
+report these values in `userIntents[].errorCode`.
+
+| Keeper Intent Code | Meaning | What to Do |
+| --- | --- | --- |
+| `withdraw_evm_unconfigured` | Keeper lacks the configuration for EVM withdrawals. | Wait for Keeper to be configured before retrying. |
+| `invalid_withdraw` | Keeper rejected the withdrawal request as invalid. | Review and correct the withdrawal request before retrying. |
 
 The CLI, MCP tools, and failure logs share codes. MCP tool errors have
 top-level `error` and `code` fields. The `command.end` event includes the

@@ -79,20 +79,28 @@ trade request without submitting it.
 
 Trading needs a Sai session. There are two ways to get one:
 
-- **From Sai Web.** A **Connect Sai CLI / MCP** button that copies your
-  session token is coming to Sai Web
-  ([sai-web#1591](https://github.com/SaiDotFun/sai-web/pull/1591)). Once it
-  ships, copy the token and run `sai auth import`. In a terminal, paste the
-  token at the hidden prompt or press Enter to read the clipboard. You can
-  also tell your agent "connect Sai"; it runs `sai auth import`, which reads
-  the clipboard when there is no terminal.
-- **With a Foundry keystore.** This works today. Run `sai auth login NAME`,
+- **From Sai Web.** On Mainnet, open the wallet menu and select
+  **Connect Sai CLI / MCP** beside **Send to phone**. The button appears for
+  the selected, connected wallet with an active trading session. Check the
+  session expiry shown in local time and click **Copy session token**. Run the
+  `sai auth import` command shown there, which specifies the Mainnet endpoint.
+  Paste the token at the hidden prompt or press Enter to read the clipboard.
+  You can also tell your agent to run the command without a terminal so it
+  reads the clipboard directly.
+- **With a Foundry keystore.** Run `sai auth login NAME`,
   where `NAME` is a keystore in `~/.foundry/keystores`. The CLI fetches
   Keeper's sign-in challenge, checks that it is a Sai trading-session
   request for that account, and only then has the key sign it. Keeper
   returns a session that lets `sai` trade for the account. `cast wallet
   sign` asks for the keystore password, unless the `ud` tool is on your
   `PATH` with a wallet of the same name, which signs without a prompt.
+
+The Sai Web dialog pins Mainnet for the import command only. Check the
+imported session with `sai --endpoint https://sai-keeper.nibiru.fi/query auth status`.
+Later CLI commands and any MCP server using the session must target the same
+Keeper endpoint. To save Mainnet as your CLI default, run
+`sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query`.
+Update any endpoint overrides and restart running MCP servers to pick up the change.
 
 You can connect several accounts. Each sign-in adds an account and makes it
 active. `sai auth list` shows them, `sai auth use ADDR` switches the active
@@ -104,8 +112,10 @@ what the token is:
 
 - It is the same session token Sai Web uses in your browser.
 - It lasts as long as Keeper issues it: 30 days in production.
-- It authorizes all trading on the funds deposited in your Sai account.
-  Withdrawals still need your wallet.
+- Anyone with the token can trade with your Sai Balance and request
+  one-click withdrawals of idle funds. Those withdrawals can only go to
+  the wallet that owns the session. Keep the token out of clipboard sync,
+  chats, and shared notes.
 - It cannot be revoked yet. Signing out of Sai Web does not sign out the CLI,
   and `sai auth logout` only deletes the local copy.
 
@@ -248,7 +258,9 @@ Each component of this repository releases under its own tag prefix. The CLI
 uses `sai-cli/vX.Y.Z`, where `X.Y.Z` is the version in `pyproject.toml`, and
 `sai-cli/vX.Y.Z-rc.N` for a pre-release.
 
-To release, merge the version bump, then run `just release X.Y.Z` on `main`.
+To release, merge the version bump and complete the
+[upgrade and downgrade rehearsal](#rehearse-an-upgrade-and-downgrade), then
+run `just release X.Y.Z` on `main`.
 It is a dry run that checks the tree and prints the Git commands; add `--run`
 to create and push the tag. The tag starts the
 [Release workflow](.github/workflows/release.yml), which runs the tests,
@@ -258,21 +270,24 @@ GitHub Release. The install script and `sai update` look for the highest
 
 ### Rehearse an Upgrade and Downgrade
 
-After the version bump lands on `main`, build the candidate and rehearse it
-before tagging. The script needs Python 3.11 or later, `uv`, `claude`, and
-`codex` on `PATH`, and network access to GitHub and the Python package index.
-Use executables that can run with a fresh home directory.
+After the version bump lands on `main`, build the candidate and run the
+rehearsal with `--strict` before tagging. The release gate requires a Linux
+host that can create a loopback-only network namespace with `unshare` and
+`ip`. The script also needs Python 3.11 or later, `uv`, `claude`, and
+`codex` on `PATH`, and network access to GitHub and the Python package
+index. Use executables that can run with a fresh home directory.
 
 ```bash
 uv build --wheel --out-dir dist
-python3 scripts/release-rehearsal.py dist/sai_cli-0.1.1-py3-none-any.whl
+python3 scripts/release-rehearsal.py --strict dist/sai_cli-0.1.1-py3-none-any.whl
 ```
 
 The script installs the published v0.1.0 wheel through the release installer
 in a temporary home and caches the candidate's dependencies. For the
-rehearsal, it sets uv offline and pins the endpoints to loopback. On Linux,
-it uses a loopback-only network namespace when available. Otherwise it
-reports that it is using a dead proxy for proxy-aware traffic. A synthetic
+rehearsal, it sets uv offline and pins the endpoints to loopback. The
+`--strict` flag stops the run before installing anything if the namespace
+is unavailable. For a local practice run, omit `--strict` to allow the
+dead-proxy fallback, which only covers proxy-aware traffic. A synthetic
 session and loopback Keeper leave an open unresolved. The script serves both wheels
 and their checksums to `sai update`. It checks that the session, config,
 and Claude and Codex MCP registrations work through the same launcher,
@@ -281,6 +296,9 @@ Keeper reports a terminal outcome.
 It restores the pending ledger checkpoint before running
 `sai update --to 0.1.0` and reports whether v0.1.0 still blocks the open
 before and after reconciling it.
+
+The script stops its command process groups during teardown. On Linux, it
+also adopts and stops orphaned helpers that started a separate session.
 
 Run `python3 scripts/release-rehearsal.py --self-test` for the local script
 checks. Add `--verbose` to a rehearsal to keep child output in a private

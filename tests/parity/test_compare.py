@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 from compare import (
+    LEDGER,
     MIN_SQLITE_SCHEMA,
     SQLITE_SCHEMA_REQUIREMENT,
     Entry,
@@ -178,6 +179,55 @@ def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> 
     assert first_difference(reference, nullable, "ledger") == (
         "ledger.schema.tables.intents.columns[1].notnull"
     )
+
+
+@requires_sqlite_schema
+def test_ledger_detects_column_collation_changes(tmp_path: Path) -> None:
+    def read(name: str, collation: str) -> dict:
+        home = tmp_path / name
+        path = home / LEDGER
+        path.parent.mkdir(parents=True)
+        with sqlite3.connect(path) as db:
+            db.execute(f"""
+                CREATE TABLE intents (
+                    id TEXT PRIMARY KEY,
+                    "endpoint" TEXT NOT NULL {collation} /* COLLATE RTRIM */
+                        CHECK ("endpoint" COLLATE BINARY <> 'COLLATE NOCASE')
+                )
+            """)
+            db.execute("INSERT INTO intents VALUES ('saved', '/query')")
+        return ledger(path, Normalize(home))
+
+    reference = read("reference", "")
+    changed = read("changed", "COLLATE NOCASE")
+    assert reference["tables"] == changed["tables"]
+    assert first_difference(reference, changed, "ledger") == (
+        "ledger.schema.tables.intents.columns[1].collation"
+    )
+    assert reference == read("explicit-default", "COLLATE BINARY")
+    assert changed == read("formatted", "collate /* same name */ [nocase]")
+    assert changed == read("repeated", 'COLLATE RTRIM COLLATE "nocase"')
+
+
+@requires_sqlite_schema
+@pytest.mark.parametrize(
+    ("declared", "equivalent"),
+    [("COLLATE NOCASE", "COLLATE [nocase]"), ("", "COLLATE binary")],
+)
+def test_ledger_ignores_equivalent_index_collations(
+    tmp_path: Path, declared: str, equivalent: str
+) -> None:
+    def read(name: str, collation: str) -> dict:
+        home = tmp_path / name
+        path = home / LEDGER
+        path.parent.mkdir(parents=True)
+        with sqlite3.connect(path) as db:
+            db.execute(f"CREATE TABLE intents (id TEXT {collation} PRIMARY KEY)")
+            db.execute("INSERT INTO intents VALUES ('saved')")
+        return ledger(path, Normalize(home))
+
+    reference = read("declared", declared)
+    assert first_difference(reference, read("equivalent", equivalent), "ledger") is None
 
 
 @requires_sqlite_schema

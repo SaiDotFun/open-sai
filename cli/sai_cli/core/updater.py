@@ -45,7 +45,7 @@ from typing import Any
 import httpx
 
 from .. import mcp_install
-from . import log, update
+from . import log, paths, update
 from .errors import ExitCode
 
 EXIT_OK = ExitCode.OK
@@ -181,7 +181,7 @@ def locked(path: Path | None = None, wait: float = 0.0) -> Generator[bool]:
     """Hold the lock file at PATH (default: the state lock). Yields False
     when another process still holds it after WAIT seconds."""
     path = path or state_lock_path()
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    update.prepare_parent(path)
     fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         deadline = time.monotonic() + wait
@@ -489,45 +489,19 @@ def write_record(prefix: Path, tag: str, digest: str, wheel: Path) -> None:
     update.write_json(update.release_record_path(prefix), record.to_json())
 
 
-def private_dir(path: Path, exact: bool) -> None:
-    """Make sure directory PATH is the current user's and that no one else
-    can write to it, creating it if needed.
-
-    A directory another user can write to would let them swap a verified
-    wheel before uv opens it. One of ours with loose modes is tightened to
-    0700; EXACT makes it 0700 in any case. One that is a symlink, belongs to
-    someone else, or cannot be tightened is refused.
-    """
-    if path.is_symlink():
-        raise UpdateFailed(f"{path} is a symlink; sai keeps no wheels under it")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    status = path.stat()
-    if hasattr(os, "getuid") and status.st_uid != os.getuid():
-        raise UpdateFailed(f"{path} belongs to another user; sai keeps no wheels there")
-    if os.name == "nt":
-        return
-    mode = status.st_mode & 0o777
-    if mode & 0o022 or (exact and mode != 0o700):
-        try:
-            path.chmod(0o700)
-        except OSError as exc:
-            raise UpdateFailed(
-                f"{path} is writable by other users and could not be made private"
-            ) from exc
-
-
 def private_cache() -> Path:
-    """Return the absolute wheel cache after making $SAI_HOME, `cache`, and
-    `cache/wheels` private to the current user."""
+    """Return the private wheel cache beneath user-owned, non-writable parents."""
     cache = update.wheel_cache()
     try:
-        private_dir(cache.parent.parent, exact=False)
-        private_dir(cache.parent, exact=True)
-        private_dir(cache, exact=True)
+        home = paths.private_directory(cache.parent.parent, profile_root=True)
+        if os.name != "nt" and home.stat().st_mode & 0o022:
+            raise OSError(f"{home} is writable by other users")
+        parent = paths.private_directory(cache.parent, preserve_mode=True)
+        if os.name != "nt" and parent.stat().st_mode & 0o022:
+            raise OSError(f"{parent} is writable by other users")
+        paths.private_directory(cache)
     except OSError as exc:
-        raise UpdateFailed(
-            f"the wheel cache is unusable: {type(exc).__name__}"
-        ) from exc
+        raise UpdateFailed(f"the wheel cache is unusable: {exc}") from exc
     return cache
 
 
@@ -1081,7 +1055,13 @@ def update_now(options: Options | None = None) -> Outcome:
         # Capture the absolute state path while a relative SAI_HOME can
         # still be resolved, even if the working directory goes away.
         state_path = update.cache_path()
-        with locked(cache_lock_path(), wait) as cache_held:
+        with contextlib.ExitStack() as stack:
+            try:
+                cache_held = stack.enter_context(locked(cache_lock_path(), wait))
+            except OSError as exc:
+                return Outcome(
+                    FAILED, f"Could not lock the wheel cache: {exc}", installed, target
+                )
             if not cache_held:
                 message = (
                     "Another sai update is using this SAI_HOME's wheel cache;"

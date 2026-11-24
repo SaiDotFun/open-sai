@@ -70,6 +70,13 @@ expect = 2
 state = { "config.toml" = "<absent>" }
 
 [[case]]
+name = "config-invalid-endpoint"
+args = ["--json","config","set","keeper.endpoint","https://[::1]suffix/path"]
+expect = 2
+seed = "config-logs-disabled"
+state = { "config.toml#keeper.endpoint" = "<absent>", "config.toml#logs.enabled" = false, ".config.lock" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
 name = "config-unknown-key"
 args = ["config","get","fixture.unknown"]
 mode = "text"
