@@ -1336,46 +1336,35 @@ class ScanPosition:
     offsets: tuple[int, ...] | None = None
 
 
-def context_rows(
+def read_prefix(
     root: Path | None,
-    start: ScanPosition,
+    day: date,
     accept: Callable[[dict[str, Any]], bool],
     *,
     max_bytes: int,
     max_rows: int,
-    tail: bool = False,
-) -> Iterator[dict[str, Any]]:
-    """Read context near the given position or the end of one day's files."""
+) -> tuple[list[dict[str, Any]], bool]:
+    """Read bounded attribution context from the start of one day's files."""
+    rows: list[dict[str, Any]] = []
+    truncated = False
     opened = LogDir.open(root or directory())
     if opened is None:
-        return
+        return rows, truncated
     with opened:
-        files = [
-            (surface, name)
-            for day, surface, name in reversed(opened.files())
-            if day == start.day
-        ]
-        for surface, name in files:
-            length = max_bytes // len(files)
-            partial_start = False
+        files = [name for found, _, name in reversed(opened.files()) if found == day]
+        for name in files:
             try:
                 fd = opened.read_fd(name)
                 try:
-                    if tail:
-                        offset = max(0, os.fstat(fd).st_size - length)
-                        os.lseek(fd, offset, os.SEEK_SET)
-                        partial_start = offset > 0
-                    elif start.offsets is not None:
-                        os.lseek(
-                            fd, start.offsets[SURFACES.index(surface)], os.SEEK_SET
-                        )
-                    data = os.read(fd, length)
+                    size = os.fstat(fd).st_size
+                    data = os.read(fd, min(size, max_bytes // len(files)))
+                    truncated |= len(data) < size
                 finally:
                     os.close(fd)
             except OSError:
+                truncated = True
                 continue
-            rows = data.split(b"\n")[int(partial_start) : -1]
-            for raw in reversed(rows) if tail else rows:
+            for raw in data.split(b"\n")[:-1]:
                 if len(raw) > MAX_LINE:
                     continue
                 try:
@@ -1383,10 +1372,10 @@ def context_rows(
                 except (ValueError, RecursionError):
                     continue
                 if isinstance(line, dict) and accept(line):
-                    yield line
-                    max_rows -= 1
-                    if max_rows == 0:
-                        return
+                    if len(rows) == max_rows:
+                        return rows, True
+                    rows.append(line)
+    return rows, truncated
 
 
 @dataclass
@@ -1396,6 +1385,7 @@ class PageScan:
     max_files: int = MAX_SCAN_FILES
     truncated: bool = False
     resume: ScanPosition | None = None
+    start: ScanPosition | None = None
 
     def rows(
         self,
@@ -1529,6 +1519,9 @@ class PageScan:
                                 readers[slot] = read_rows(slot, fd, end, offsets)
                         except OSError:
                             self.truncated = True
+
+                    if self.start is None:
+                        self.start = ScanPosition(day, tuple(offsets))
 
                     heads: dict[int, tuple[int, dict[str, Any]]] = {}
 

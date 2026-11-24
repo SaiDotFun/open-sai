@@ -3216,7 +3216,7 @@ def test_intent_cursor_keeps_invocation_attribution_from_prior_page(home):
         "runId": "process",
         "commandId": "command",
     }
-    total = log_queries.MAX_REPORT_ROWS + 1
+    total = 2 * log_queries.MAX_REPORT_ROWS + 1
     expected = [{**row, "seq": seq} for seq in range(total)]
     expected[-1].update(
         event="intent.keeper",
@@ -3224,20 +3224,25 @@ def test_intent_cursor_keeps_invocation_attribution_from_prior_page(home):
         addr=ADDR,
         endpointId="h1_" + "a" * 64,
     )
-    log.file_path("cli", date(2026, 11, 24), root).write_bytes(
-        b"".join(map(log.encode, expected))
-    )
+    path = log.file_path("cli", date(2026, 11, 24), root)
+    path.write_bytes(b"".join(map(log.encode, expected)))
 
     args = ("--json", "logs", "intent", "KEY", "--offline")
     code, output = run_cli(*args)
     assert code == 0
     first = json.loads(output)
-    assert first["events"] == expected[1:]
+    assert first["events"] == expected[-log_queries.MAX_REPORT_ROWS :]
+    with path.open("ab") as stream:
+        stream.write(log.encode({**expected[-1], "seq": total, "addr": OTHER}))
     code, output = run_cli(*args, "--before", first["nextBefore"])
     assert code == 0
     second = json.loads(output)
-    assert second["events"] == expected[:1]
-    assert "nextBefore" not in second
+    assert second["events"] == expected[1 : log_queries.MAX_REPORT_ROWS + 1]
+    code, output = run_cli(*args, "--before", second["nextBefore"])
+    assert code == 0
+    third = json.loads(output)
+    assert third["events"] == expected[:1]
+    assert "nextBefore" not in third
 
 
 def test_log_stats_scan_continues_inside_one_millisecond(home):

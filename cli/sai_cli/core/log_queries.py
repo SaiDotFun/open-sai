@@ -168,22 +168,19 @@ CONTEXT_ROWS = 256
 CONTEXT_FILES = len(log.SURFACES)
 
 
-def _context(
-    root: Path | None,
-    position: log.ScanPosition,
-    accept: Callable[[LogLine], bool],
-    *,
-    tail: bool = False,
-) -> list[LogLine]:
-    return list(
-        log.context_rows(
-            root,
-            position,
-            accept,
-            max_bytes=CONTEXT_BYTES,
-            max_rows=CONTEXT_ROWS,
-            tail=tail,
-        )
+def _prefix(
+    root: Path | None, day: date, accept: Callable[[LogLine], bool]
+) -> tuple[list[LogLine], bool]:
+    return log.read_prefix(
+        root, day, accept, max_bytes=CONTEXT_BYTES, max_rows=CONTEXT_ROWS
+    )
+
+
+def _trail_scan() -> log.PageScan:
+    return log.PageScan(
+        max_bytes=log.MAX_SCAN_BYTES - 2 * CONTEXT_BYTES,
+        max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
+        max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
     )
 
 
@@ -379,37 +376,17 @@ def intent(
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
     cursor = _Cursor.parse(before)
-    last_day = cursor.position.day if cursor.position else cursor.last_day
     log.flush(1.0)
     anchors: list[LogLine] = []
 
     def is_anchor(line: LogLine) -> bool:
         return _has_intent(line, key) and _timestamp(line) is not None
 
-    # Already consumed rows can still scope an invocation on this page.
-    if cursor.position is not None and cursor.position.offsets is not None:
-        anchors.extend(_context(root, cursor.position, is_anchor))
-        # The previous page may have spent its scan budget on unrelated rows
-        # between a newer anchor and this boundary.
-        anchors.extend(_context(root, cursor.position, is_anchor, tail=True))
-    if last_day is not None and last_day < date.max:
-        following = log.ScanPosition(last_day + timedelta(days=1))
-        anchors.extend(_context(root, following, is_anchor))
-
-    def remember_filtered_anchor(line: LogLine) -> None:
-        if (
-            cursor.upper is not None
-            and _has_intent(line, key)
-            and (ts := _timestamp(line)) is not None
-            and ts >= cursor.upper
-        ):
+    def remember_anchor(line: LogLine) -> None:
+        if is_anchor(line):
             anchors.append(line)
 
-    scan = log.PageScan(
-        max_bytes=log.MAX_SCAN_BYTES - 3 * CONTEXT_BYTES,
-        max_rows=log.MAX_SCAN_ROWS - 3 * CONTEXT_ROWS,
-        max_files=log.MAX_SCAN_FILES - 3 * CONTEXT_FILES,
-    )
+    scan = _trail_scan()
     rows = [
         (position, ts, line)
         for position, line in scan.rows(
@@ -417,17 +394,36 @@ def intent(
             start=cursor.position,
             last_day=cursor.last_day,
             before=cursor.upper,
-            observe=remember_filtered_anchor if cursor.upper else None,
+            observe=remember_anchor,
         )
         if (ts := _timestamp(line)) is not None
     ]
-    anchors.extend(line for _, _, line in rows if _has_intent(line, key))
+    replay = scan.start
+    if cursor.replay is not None:
+        # Preserve the snapshot that supplies attribution across pages.
+        # Its starting offsets exclude rows appended to that day's files.
+        anchor_count = len(anchors)
+        for _ in _trail_scan().rows(
+            root,
+            start=cursor.replay,
+            last_day=cursor.last_day,
+            before=cursor.upper,
+            observe=remember_anchor,
+        ):
+            pass
+        if len(anchors) > anchor_count:
+            replay = cursor.replay
+    boundary_days = {cursor.last_day, cursor.position.day if cursor.position else None}
+    for day in sorted(
+        day for day in boundary_days if day is not None and day < date.max
+    ):
+        following, truncated = _prefix(root, day + timedelta(days=1), is_anchor)
+        anchors.extend(following)
+        scan.truncated |= truncated
+    anchors.sort(key=log.event_order)
     identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
     scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
-    direct = sorted(
-        (line for line in anchors if scope is not None and _scope(line) == scope),
-        key=log.event_order,
-    )
+    direct = [line for line in anchors if scope is not None and _scope(line) == scope]
     invocations = {match for line in direct if (match := _invocation(line))}
     conflicting = {
         match
@@ -490,15 +486,13 @@ def intent(
     page = _PageReport(report)
     last = None
     stop = None
-    unattributed = 0
+    unattributed = []
     for position, ts, line in rows:
         if line.get("event") == "log.dropped":
-            field = "gaps" if _id(line, "runId") in matched_runs else "unattributedGaps"
-            if field == "unattributedGaps":
-                if unattributed >= 8:
-                    unattributed += 1
-                    continue
-                report.setdefault(field, [])
+            if _id(line, "runId") not in matched_runs:
+                unattributed.append(line)
+                continue
+            field = "gaps"
         elif scope is not None and (
             (_has_intent(line, key) and _scope(line) == scope)
             or (
@@ -516,12 +510,18 @@ def intent(
         if not page.add(field, line):
             stop = position
             break
-        if field == "unattributedGaps":
-            unattributed += 1
         last = ts
     if unattributed:
-        report["unattributedGapCount"] = unattributed
-    return page.finish(scan, cursor, last, stop)
+        report["unattributedGapCount"] = len(unattributed)
+        report["unattributedGaps"] = []
+        scan.truncated |= len(unattributed) > 8
+        scan.truncated |= any(
+            not page.add("unattributedGaps", line) for line in unattributed[:8]
+        )
+    page.finish(scan, cursor, last, stop, replay=replay)
+    if report.get("truncated") and "nextBefore" not in report:
+        report["more"] = "Inspect the retained files from sai logs path."
+    return report
 
 
 def run(
@@ -559,17 +559,15 @@ def run(
         and last_day is not None
         and last_day < date.max
     ):
-        following = log.ScanPosition(last_day + timedelta(days=1))
-        for line in _context(
-            root, following, lambda row: _id(row, "callId") == identifier
-        ):
+        following, _ = _prefix(
+            root,
+            last_day + timedelta(days=1),
+            lambda row: _id(row, "callId") == identifier,
+        )
+        for line in following:
             remember_call_run(line)
 
-    scan = log.PageScan(
-        max_bytes=log.MAX_SCAN_BYTES - 2 * CONTEXT_BYTES,
-        max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
-        max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
-    )
+    scan = _trail_scan()
     entries = []
     last = None
     for position, line in scan.rows(
