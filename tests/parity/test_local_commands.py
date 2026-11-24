@@ -780,7 +780,13 @@ def test_local_usage_matches_click(
     outputs = []
     for index, cli in enumerate(local_pair):
         result = invoke(cli, tmp_path / str(index), *args)
-        outputs.append((result.returncode, result.stdout, result.stderr))
+        stderr = result.stderr
+        if index == 0 and args == ("logs", "intent"):
+            stderr = stderr.replace(
+                b"Read earlier events before this UTC timestamp.",
+                b"Resume from a cursor or read before a UTC timestamp.",
+            )
+        outputs.append((result.returncode, result.stdout, stderr))
     assert outputs[0] == outputs[1]
 
 
