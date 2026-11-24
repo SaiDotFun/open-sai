@@ -418,6 +418,7 @@ fn log_keeper(
         ("intentKey", json!(key).into()),
         ("addr", json!(addr).into()),
         ("endpoint", Field::Endpoint(endpoint.into())),
+        ("endpointId", Field::endpoint_identity(endpoint)),
     ];
     let mut fields = Map::new();
     if let Some((row, outcome)) = observed {

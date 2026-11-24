@@ -32,7 +32,7 @@ pub async fn lcd_network(
     const UNREADABLE: &str = "Unable to read contract state";
     check_transport(endpoint, ProbeEndpoint::Lcd)?;
     let url = format!("{}{NODE_INFO}", endpoint.trim_end_matches('/'));
-    let (status, bytes) = transport::get(&url, timeout)
+    let (status, _, bytes) = transport::get(&url, hyper::HeaderMap::new(), timeout)
         .await
         .map_err(|_| UNREADABLE)?;
     if !status.is_success() {

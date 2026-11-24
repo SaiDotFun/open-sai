@@ -180,8 +180,18 @@ fn row_id(value: &Value) -> bool {
 }
 
 fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
+    let (hash, invalid) = request_hash(value);
+    if let Some(hash) = hash {
+        out.insert(key.into(), json!(hash));
+    }
+    if invalid {
+        out.insert(format!("{key}Invalid"), json!(true));
+    }
+}
+
+pub(crate) fn request_hash(value: &Value) -> (Option<String>, bool) {
     if value.is_null() {
-        return;
+        return (None, false);
     }
     if let Some(hash) = value.as_str() {
         let digits = hash
@@ -189,11 +199,10 @@ fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
             .or_else(|| hash.strip_prefix("0X"))
             .unwrap_or(hash);
         if digits.len() == 64 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            out.insert(key.into(), json!(hash.to_ascii_lowercase()));
-            return;
+            return (Some(hash.to_ascii_lowercase()), false);
         }
     }
-    out.insert(format!("{key}Invalid"), json!(true));
+    (None, true)
 }
 
 fn reconcile_fields(out: &mut Map<String, Value>, source: &Map<String, Value>) {

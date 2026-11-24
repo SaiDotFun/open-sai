@@ -20,9 +20,10 @@ use crate::{
 };
 
 pub use diagnostics::{lcd_network, websocket_handshake};
-pub(crate) use public::intent_log_fields;
+pub(crate) use public::{intent_log_fields, request_hash};
 pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
+pub(crate) use transport::get as lcd_get;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 pub const ABSENT_AFTER_SECONDS: f64 = 300.0;

@@ -158,6 +158,14 @@ jobs:
           path: .parity-python
           persist-credentials: false
 
+      - name: Check out the C7 Python parity reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ea09f0d417a53a71079bb8c5e426005fa29051a4
+          path: .parity-python-c7
+          persist-credentials: false
+
       - name: Check out Python main for auth parity
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -180,20 +188,57 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Check out the Python wait parity reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: bdc11da6c9938aa0371835d921f27d45daa77c36
+          path: .parity-python-wait
+          persist-credentials: false
+
+      - name: Check out Python v0.1.2 for position dry runs
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 8557a7e13dceab0accc369191182c8e01423c91b
+          path: .parity-position-v012
+          persist-credentials: false
+
+      - name: Check out Python PR 148 for position ownership parity
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: c6d85c210a441f3729d091151a114a8edeb0afa3
+          path: .parity-position-owner
+          persist-credentials: false
+
       - run: |
           uv sync --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
+          uv sync --project .parity-python-c7 --locked --all-groups
+          uv sync --project .parity-python-wait --locked --all-groups
           uv sync --project .parity-auth-python --locked --all-groups
           uv sync --project .parity-intent-python --locked --all-groups
+          uv sync --project .parity-position-v012 --locked --all-groups
+          uv sync --project .parity-position-owner --locked --all-groups
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+      - name: Race the Rust and Python intent reservations
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-python-c7
+        run: cargo test --locked -p sai --test storage_parity -- --ignored python_and_rust_can_only_reserve_one_intent_at_a_time opening_a_second_rust_connection_keeps_the_reservation_locked
       - name: Compare the Rust and Python CLIs
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
+          SAI_PARITY_C7_PYTHON: ${{ github.workspace }}/.parity-python-c7/.venv/bin/sai
+          SAI_PARITY_WAIT_PYTHON: ${{ github.workspace }}/.parity-python-wait/.venv/bin/sai
           SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
+          SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
+          SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
         run: uv run --locked pytest tests/parity --ignore=tests/parity/test_intent_status_v012.py
       - name: Replay intent status against Python v0.1.2
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'

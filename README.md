@@ -18,12 +18,10 @@ uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install
 sai --help
 ```
 
-The [install script](scripts/install.py) finds the newest `sai-cli` release,
-downloads its wheel, checks it against the release's `SHA256SUMS`, and runs
-`uv tool install` on that file. It keeps the wheel in a cache only you can
-write to, and does not defend against other local users who can write to the
-directories above `~/.sai`. Until the first release is published, the script says so and
-installs from `main`.
+The [install script](scripts/install.py) downloads the latest stable
+`sai-cli` release wheel, checks it against the release's `SHA256SUMS`,
+and installs it with `uv tool install`. It caches the wheel under
+`$SAI_HOME/cache/wheels`.
 
 To build from source instead, install from Git:
 
@@ -34,19 +32,16 @@ uv tool install git+https://github.com/SaiDotFun/open-sai
 To try the CLI without installing it:
 
 ```bash
-uvx --from git+https://github.com/SaiDotFun/open-sai sai --json market prices
+uvx --from https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v0.1.2/sai_cli-0.1.2-py3-none-any.whl sai --json market prices
 ```
 
-Both Git commands build `main`. `sai --version` prints the installed version.
+The Git install builds `main`. Run `sai --version` to check your installed version.
 
-`sai` keeps itself current. About once a day, a command you run in a terminal
-starts an update in the background, and a later command tells you once that
-it happened. `sai update` does the same right away, and `sai update --check`
-only reports. The `sai` path and everything under `~/.sai` stay the same, so
-registered agent clients keep working; restart them to load the new version.
-To be told about updates without installing them, run
-`sai config set update.auto false`. See
-[Updates](cli/sai_cli/README.md#updates).
+On supported installs, an interactive command can start a background update
+once a day. Run `sai update` to update now or `sai update --check` to see
+the installed and latest versions. To get notices without installing updates,
+run `sai config set update.auto false`. Restart agent clients to load the new
+version. See the [update guide](cli/sai_cli/README.md#updates).
 
 The package is `sai-cli` and is not on PyPI yet, so `uv tool install sai`
 installs an unrelated PyPI package.
@@ -62,10 +57,9 @@ sai skill install --dir ~/.claude/skills/sai    # another agent's directory
 npx skills add SaiDotFun/open-sai --skill sai   # without the CLI installed
 ```
 
-`sai skill install` refuses to replace a symlink or a copy that differs
-unless you pass `--force`, and never replaces a directory that is not a `sai`
-skill. `sai skill source` prints where the packaged skill
-lives and which commit it came from.
+`sai skill install` requires `--force` to replace a symlink or a modified
+copy of the skill. When replacing a symlink, it leaves the target intact.
+`sai skill source` prints the packaged path and source commit.
 
 To work from a checkout, run `uv sync`, then `uv run sai --help`.
 
@@ -109,9 +103,17 @@ one, `sai --as ADDR ...` runs one command as another, and `sai auth logout
 
 Run `sai auth renew [ADDR]` to sign a fresh session with the key saved by
 `sai auth login NAME`. Renewal keeps the active account selected. For a
-browser session, copy a fresh Sai Web token and run `sai auth import`.
+browser session, copy a fresh Sai Web token for the same account. In v0.1.2,
+run `sai auth import` with the original Keeper endpoint.
 `sai auth status`, `sai auth list`, `sai doctor`, and the MCP tool
 `mcp_info` warn when a session has less than three days left.
+
+On `main`, run `renewalCommand` when the session report includes it. Browser
+renewal uses `auth import --addr` to check the account. Read any
+`renewalGuidance` separately. If the command references
+`SAI_RECONCILE_ENDPOINT`, supply the original Keeper URL privately in the
+same shell.
+See [Renewing Sessions](cli/sai_cli/README.md#renewing-sessions).
 
 After connecting, commands run without prompts until the session expires. Know
 what the token is:
@@ -132,14 +134,16 @@ your files can decrypt it. There is no session passphrase.
 
 ### Read an Account Overview
 
-Run `sai account overview` for your active account or `sai account overview
---as ADDR --json` for any EVM account. The MCP tool `account_overview` takes
-the same optional address as `addr`.
+Run `sai account overview` for your active account. To read a public EVM
+address without a session, pass `--as ADDR`, for example
+`sai --json account overview --as 0x0000000000000000000000000000000000000001`.
+The MCP tool `account_overview` takes the same address as `addr`.
 
 The overview shows Sai funds and credits, position risk, limit and stop
 orders, market orders waiting for the next oracle price, local trade
 blockers, and session expiry. Each section reports when it was fetched
-and keeps available data when another read fails. See the
+and keeps available data when another read fails. Check the section's
+`error` even when the command exits successfully. See the
 [CLI guide](cli/sai_cli/README.md#account-overview) for units and source age.
 
 ## Use Sai From Your Agent (MCP)
@@ -196,10 +200,16 @@ Keeper. An expired session returns `SESSION_EXPIRED`. The server reads the
 stored session without a prompt, never asks for the token, and never returns
 it.
 
-Each preview names the signed-in account in `addr`, and each trade must carry the
-`previewDigest` from a preview the user confirmed. Before submitting, the
-server rebuilds the trade and refuses it with a fresh preview when it no
-longer matches:
+An MCP preview for a connected account names that account in `addr`.
+While signed out, `preview_open` without an `addr` can return `addr: null`
+and a `previewDigest`. Treat that preview as informational. After sign-in,
+preview again for the connected account before asking for confirmation.
+Pass that preview's `previewDigest` as `preview_digest` in the trade call.
+Before submitting, the server rebuilds the trade and checks the confirmed
+terms listed below.
+If the trade returns `PREVIEW_MISMATCH` or `PRICE_MOVED`, it has submitted
+nothing. Use the returned `preview` when present. If it is missing, obtain a
+new preview before asking for confirmation again.
 
 - Every trade: the signed-in account and the trade's arguments.
 - `trade_margin` also binds the margin quote, including the position's
@@ -207,22 +217,26 @@ longer matches:
 - `trade_partial_close` also binds the close percentage, starting collateral
   and leverage, and the contract inputs used to quote the requested slice,
   including the applicable after-hours cap and collateral/USD oracle price.
-- `trade_open` for a market order: also the market price, which may move at
-  most the slippage from the confirmed `referencePrice`. A new price needs a
-  new confirmation.
+- `trade_open` for a market order also takes the preview's `referencePrice`
+  as `reference_price`. A move beyond the allowed slippage requires a fresh
+  preview and confirmation.
 - `trade_close`, `trade_tpsl`, and `trade_leverage`: nothing beyond the
   account and arguments.
 
-Ask the agent to call `mcp_info` to see the version, endpoints, active
-account, and `trading`, which reports whether trades can submit and why not
-(`signed-out`, `expired`, or `other-endpoint`).
+On `main`, Sai refuses trades on positions owned by a different account.
+A preview with `positionOwnerVerified: false` has no confirmation digest.
+Margin and partial-close digests also bind the chain ID and Perp contract.
+
+Ask the agent to call `mcp_info` to see the version, endpoints, and active
+account. Its `trading` field reports the active account's session readiness.
+Each trade checks the account it targets. If that trade fails a session
+check, use its error code to diagnose the requested account.
 
 With several accounts connected, `auth_list` shows them, `auth_use` switches
 the active one (for the CLI too), and preview and trade tools take an
-optional `addr` to act as another connected account. A preview names its
-account, and a trade refuses if the account changed after the preview. A
-trade for an account that is not signed in for this server's endpoint is
-refused the same way.
+optional `addr` to act as another connected account. A change of account
+requires a new preview and confirmation. A trade also requires a valid
+session for that account on this server's Keeper endpoint.
 
 The server reads the same settings as the CLI once, when it starts: the
 `--endpoint`, `--ws-endpoint`, and `--lcd-endpoint` flags after `sai mcp
@@ -232,20 +246,19 @@ serve`, then `SAI_ENDPOINT`, `SAI_WS_ENDPOINT`, and `SAI_LCD_ENDPOINT`, then
 
 ## Logs
 
-`sai` and `sai mcp serve` record what they do in `~/.sai/logs`, one JSON
-object per line: each command and MCP tool call with its arguments and
-duration, each Keeper request and its outcome, and each status change of a
-trade intent. The session token is never written.
+`sai` and `sai mcp serve` write JSON lines to `$SAI_HOME/logs`, which
+defaults to `~/.sai/logs`. Logs record commands, MCP calls, Keeper requests,
+and intent status changes. Sai redacts session tokens and sensitive values.
 
 ```bash
 sai logs intent KEY              # follow one intent across CLI and MCP
-sai logs run ID                   # read a command run or one MCP call
+sai logs run ID                   # read a process run or one MCP call
 sai logs stats --since 24h        # Keeper latency and error counts
 sai logs tail -n 50 --surface mcp
 sai logs path
 ```
 
-Files older than 14 days are deleted. `sai config set logs.enabled false`
+Sai keeps 14 UTC days of logs by default, counting today. `sai config set logs.enabled false`
 turns logging off. See the [log query guide](cli/sai_cli/README.md#logs)
 and the [event schema](docs/log-events.md).
 

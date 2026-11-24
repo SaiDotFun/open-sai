@@ -145,7 +145,7 @@ def invoke(
     )
 
 
-def read_events(home: Path) -> list[dict[str, Any]]:
+def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
@@ -153,6 +153,10 @@ def read_events(home: Path) -> list[dict[str, Any]]:
     ]
     groups: dict[str, list[int]] = {}
     for event in events:
+        if c4_reference:
+            # The C4 pin predates the v2 envelope and keyed endpoint identity.
+            for field in ("schema", "commandId", "endpointId"):
+                event.pop(field, None)
         run = event["runId"]
         event["runId"] = list(groups).index(run) if run in groups else len(groups)
         seq = groups.setdefault(run, [])
@@ -167,7 +171,10 @@ def read_events(home: Path) -> list[dict[str, Any]]:
 
 def read_state(home: Path) -> tuple[Any, ...]:
     files = {
-        str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
+        str(path.relative_to(home)): path.stat().st_mode
+        for path in home.rglob("*")
+        if path.relative_to(home).as_posix()
+        not in {"logs/.endpoint-key", "logs/.endpoint-key.lock"}
     }
     db = home / "trader/intents.sqlite3"
     if not db.exists():
@@ -236,7 +243,7 @@ def public_intent_output(output: bytes, *, compact: bool) -> bytes:
 
 def legacy_status_events(home: Path, *, reference: bool) -> list[dict[str, Any]]:
     """Compare event payloads across the two reference versions."""
-    events = read_events(home)
+    events = read_events(home, c4_reference=True)
     for event in events:
         if event["event"] == "keeper.request":
             event.pop("intentKey", None)
