@@ -15,7 +15,7 @@ use sai_core::{
 };
 use serde_json::{Value, json};
 
-use client::{Result as ClientResult, absolute, basename, resolved, which};
+use client::{CodexLookup, Result as ClientResult, absolute, basename, resolved, which};
 
 const RETIRED_NAME: &str = "sai-mcp";
 const NAMES: [&str; 2] = ["sai", RETIRED_NAME];
@@ -403,7 +403,13 @@ impl Clients {
         name: &str,
         deadline: Instant,
     ) -> ClientResult<Vec<Registration>> {
-        client.registrations(&self.home, self.cwd.as_deref(), name, deadline)
+        client.registrations(
+            &self.home,
+            self.cwd.as_deref(),
+            name,
+            CodexLookup::Discover,
+            deadline,
+        )
     }
 
     fn all(
@@ -476,7 +482,13 @@ impl Clients {
         target: &Target,
         deadline: Instant,
     ) -> ClientResult<()> {
-        let entries = self.registrations(client, name, deadline)?;
+        let entries = client.registrations(
+            &self.home,
+            self.cwd.as_deref(),
+            name,
+            CodexLookup::Verify,
+            deadline,
+        )?;
         let matches = |entry: &Registration| entry.matches(target);
         if !entries
             .iter()
@@ -485,9 +497,15 @@ impl Clients {
             return Err(format!("{} does not show the new sai entry", client.name()));
         }
         if client == Client::Codex
-            && !client::codex_get(self.cwd(), Scope::Project, name, deadline)?
-                .as_ref()
-                .is_some_and(matches)
+            && !client::codex_get(
+                self.cwd(),
+                Scope::Project,
+                name,
+                CodexLookup::Verify,
+                deadline,
+            )?
+            .as_ref()
+            .is_some_and(matches)
         {
             return Err(CODEX_STILL_ACTIVE.into());
         }

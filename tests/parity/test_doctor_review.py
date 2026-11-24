@@ -329,6 +329,37 @@ def test_uninstall_does_not_replace_read_only_client_config(
     assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444
 
 
+def test_uninstall_restores_codex_config_when_verifier_disappears(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    seed_clients(tmp_path, fixture_env, "current")
+    (tmp_path / "drop-codex-after-discovery").touch()
+    config = tmp_path / ".codex/config.toml"
+    before = config.read_bytes()
+    result = invoke(candidate, tmp_path, fixture_env, "mcp", "uninstall", "codex")
+
+    assert not (tmp_path / "bin/codex").exists()
+    assert result.returncode == 1
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INTERNAL_ERROR"
+    report = error["details"]
+    (row,) = report["results"]
+    assert row["action"] == "failed"
+    assert row["error"] == "`codex` is not on PATH"
+    assert row["changed"] is False and report["reconnectNeeded"] is False
+    assert (
+        config.read_bytes() == before and stat.S_IMODE(config.stat().st_mode) == 0o640
+    )
+
+    # A new uninstall can still report absence when Codex is missing at discovery.
+    next_result = invoke(candidate, tmp_path, fixture_env, "mcp", "uninstall", "codex")
+    assert next_result.returncode == 0
+    assert json.loads(next_result.stdout)["results"] == [
+        {"client": "codex", "action": "absent"}
+    ]
+    assert config.read_bytes() == before
+
+
 def test_uninstall_keeps_removal_after_confirmed_codex_override(
     candidate: str, tmp_path: Path, fixture_env: dict[str, str]
 ) -> None:

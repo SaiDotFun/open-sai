@@ -4,6 +4,7 @@ use clap::Args;
 use sai_core::errors::SaiError;
 use serde_json::json;
 
+use super::client::CodexLookup;
 use super::{
     CLIENT_TIMEOUT, CLIENTS, CODEX_PROJECT_ENTRY, CODEX_STILL_ACTIVE, Client, ClientResult,
     Clients, NAMES, Registration, RegistrationResult, Scope, Target, chosen, client, finish,
@@ -203,14 +204,26 @@ impl Clients {
         scope: Scope,
         deadline: Instant,
     ) -> ClientResult<bool> {
-        let entries = self.registrations(client, name, deadline)?;
+        let entries = client.registrations(
+            &self.home,
+            self.cwd.as_deref(),
+            name,
+            CodexLookup::Verify,
+            deadline,
+        )?;
         if entries.iter().any(|entry| entry.scope == scope) {
             return Err(format!("{} still shows the sai entry", client.name()));
         }
         if client == Client::Codex {
             // A confirmed project override remains active even though the
             // user entry was removed successfully.
-            return match client::codex_get(self.cwd(), Scope::Project, name, deadline) {
+            return match client::codex_get(
+                self.cwd(),
+                Scope::Project,
+                name,
+                CodexLookup::Verify,
+                deadline,
+            ) {
                 Ok(entry) => Ok(entry.is_some()),
                 Err(_) if entries.iter().any(|entry| entry.scope == Scope::Project) => Ok(true),
                 Err(error) => Err(error),

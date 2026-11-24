@@ -19,6 +19,12 @@ mod tests;
 pub(super) type Result<T> = std::result::Result<T, String>;
 pub(super) const READ_ONLY_CONFIG: &str = "The client config is read-only";
 
+#[derive(Clone, Copy)]
+pub(super) enum CodexLookup {
+    Discover,
+    Verify,
+}
+
 enum JsonUpdate<'a> {
     Install(Option<&'a Registration>),
     Repair(&'a Registration),
@@ -80,13 +86,14 @@ impl Client {
         home: &Path,
         cwd: Option<&Path>,
         name: &str,
+        lookup: CodexLookup,
         deadline: Instant,
     ) -> Result<Vec<Registration>> {
         if self == Self::Codex {
             let neutral = self.codex_neutral(home);
-            let user = codex_get(&neutral, Scope::User, name, deadline)?;
+            let user = codex_get(&neutral, Scope::User, name, lookup, deadline)?;
             let project = if let Some(cwd) = cwd.filter(|cwd| resolved(&neutral) != resolved(cwd)) {
-                codex_get(cwd, Scope::Project, name, deadline)?
+                codex_get(cwd, Scope::Project, name, lookup, deadline)?
                     .filter(|entry| user.as_ref().is_none_or(|user| user.raw != entry.raw))
             } else {
                 None
@@ -209,14 +216,20 @@ impl Client {
         let published = edit(&path, true, deadline, |source| {
             edit_codex(source, name, target, Some(old))
         })?;
-        let verification = codex_get(&client.codex_neutral(home), Scope::User, name, deadline)
-            .and_then(|entry| {
-                if entry.is_some_and(|entry| entry.matches_command(target)) {
-                    Ok(())
-                } else {
-                    Err("Codex did not load the repaired Sai registration".into())
-                }
-            });
+        let verification = codex_get(
+            &client.codex_neutral(home),
+            Scope::User,
+            name,
+            CodexLookup::Verify,
+            deadline,
+        )
+        .and_then(|entry| {
+            if entry.is_some_and(|entry| entry.matches_command(target)) {
+                Ok(())
+            } else {
+                Err("Codex did not load the repaired Sai registration".into())
+            }
+        });
         if verification.is_err()
             && let Some(published) = published
         {
@@ -418,10 +431,14 @@ pub(super) fn codex_get(
     cwd: &Path,
     scope: Scope,
     name: &str,
+    lookup: CodexLookup,
     deadline: Instant,
 ) -> Result<Option<Registration>> {
     let Some(exe) = Client::Codex.executable() else {
-        return Ok(None);
+        return match lookup {
+            CodexLookup::Discover => Ok(None),
+            CodexLookup::Verify => Err("`codex` is not on PATH".into()),
+        };
     };
     let label = format!("codex mcp get {name} --json");
     let args = [

@@ -50,6 +50,9 @@ if program == "codex":
             observed.touch()
         entry = json.loads(project.read_text())
     if entry is None:
+        if (name == "sai" + "-mcp" and Path.cwd() != config.parent
+                and (home / "drop-codex-after-discovery").exists()):
+            Path(sys.argv[0]).unlink()
         if name == "sai" and (home / "fail-uninstall-verification").exists():
             sys.exit(9)
         sys.exit(f"Error: No MCP server named '{name}' found.")
