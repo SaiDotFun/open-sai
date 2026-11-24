@@ -59,33 +59,131 @@ impl std::fmt::Display for Line {
     }
 }
 
-pub(super) fn read_lines(root: &Path, lines: &[Line]) -> Vec<(Line, Row)> {
+#[derive(Clone, Copy)]
+pub(super) struct AnchorRange {
+    first: Line,
+    last: u64,
+}
+
+impl AnchorRange {
+    pub fn parse(value: &str) -> Option<Self> {
+        let (line, last) = value.rsplit_once(':')?;
+        if let Some(first) = Line::parse(line) {
+            let last = last.parse().ok()?;
+            (first.offset <= last).then_some(Self { first, last })
+        } else {
+            Some(Line::parse(value)?.into())
+        }
+    }
+
+    pub fn cover(mut lines: Vec<Line>) -> Vec<Self> {
+        lines.sort_unstable();
+        let mut ranges = Vec::<Self>::new();
+        for line in lines {
+            // Seek past sparse gaps. A merged range costs no more to read
+            // than the worst-case size of the individual lines.
+            if let Some(range) = ranges.last_mut()
+                && line.day == range.first.day
+                && line.surface == range.first.surface
+                && line.offset - range.last <= (MAX_LINE + 1) as u64
+            {
+                range.last = line.offset;
+            } else {
+                ranges.push(line.into());
+            }
+        }
+        ranges
+    }
+
+    fn read_size(self) -> u64 {
+        (self.last - self.first.offset).saturating_add((MAX_LINE + 1) as u64)
+    }
+
+    pub fn fits_replay_budget(ranges: &[Self]) -> bool {
+        ranges
+            .iter()
+            .map(|range| range.read_size())
+            .fold(0, u64::saturating_add)
+            <= 64 * 1024 * 1024
+    }
+}
+
+impl From<Line> for AnchorRange {
+    fn from(first: Line) -> Self {
+        Self {
+            first,
+            last: first.offset,
+        }
+    }
+}
+
+impl std::fmt::Display for AnchorRange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.first)?;
+        if self.first.offset != self.last {
+            write!(f, ":{}", self.last)?;
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn read_anchors(
+    root: &Path,
+    ranges: &[AnchorRange],
+    accept: impl Fn(&Row) -> bool,
+) -> Vec<(Line, Row)> {
     let Ok(directory) = LogDir::read_only(root) else {
         return Vec::new();
     };
-    lines
-        .iter()
-        .filter_map(|&line| {
-            let surface = Surface::ALL[line.surface].as_str();
-            let mut file = directory
-                .read_file(&format!("{surface}-{}.jsonl", line.day))
-                .ok()?;
-            if line.offset != 0 {
-                file.seek(SeekFrom::Start(line.offset - 1)).ok()?;
-                let mut preceding = [0];
-                file.read_exact(&mut preceding).ok()?;
-                if preceding != *b"\n" {
-                    return None;
-                }
+    let mut rows = Vec::new();
+    for &range in ranges {
+        let _ = read_anchor_range(&directory, range, &accept, &mut rows);
+    }
+    rows
+}
+
+fn read_anchor_range(
+    directory: &LogDir,
+    range: AnchorRange,
+    accept: &impl Fn(&Row) -> bool,
+    rows: &mut Vec<(Line, Row)>,
+) -> io::Result<()> {
+    let mut line = range.first;
+    let surface = Surface::ALL[line.surface].as_str();
+    let mut file = directory.read_file(&format!("{surface}-{}.jsonl", line.day))?;
+    if line.offset != 0 {
+        file.seek(SeekFrom::Start(line.offset - 1))?;
+        let mut preceding = [0];
+        file.read_exact(&mut preceding)?;
+        if preceding != *b"\n" {
+            return Ok(());
+        }
+    }
+
+    // Last is the byte offset of the last remembered line, not the current EOF.
+    let line_limit = (MAX_LINE + 1) as u64;
+    let mut reader = BufReader::new(file).take(range.read_size());
+    let mut raw = Vec::new();
+    while line.offset <= range.last {
+        raw.clear();
+        let size = reader
+            .by_ref()
+            .take(line_limit)
+            .read_until(b'\n', &mut raw)?;
+        if size == 0 {
+            break;
+        }
+        let skipped = if let Some(bytes) = raw.strip_suffix(b"\n") {
+            if let Some(row) = decode_row(bytes).filter(accept) {
+                rows.push((line, row));
             }
-            let mut raw = Vec::new();
-            BufReader::new(file)
-                .take((MAX_LINE + 1) as u64)
-                .read_until(b'\n', &mut raw)
-                .ok()?;
-            decode_row(raw.strip_suffix(b"\n")?).map(|row| (line, row))
-        })
-        .collect()
+            0
+        } else {
+            reader.skip_until(b'\n')?
+        };
+        line.offset += size as u64 + skipped as u64;
+    }
+    Ok(())
 }
 
 pub(super) struct Budget {

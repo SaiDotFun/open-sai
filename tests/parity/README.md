@@ -137,6 +137,11 @@ To reproduce the pinned comparison, install Python from that commit and set
 `SAI_C9B_PARITY_PYTHON` to its `sai` launcher. The C4 tests still use
 `SAI_PARITY_PYTHON` for the older Keeper baseline.
 
+The dense intent attribution test also matches Python `sai-cli/v0.1.2`
+at commit `8557a7e`. With 1,025 distinct anchors, Rust carries a compact
+file range in its cursor and still returns a row linked to an anchor on
+an earlier page.
+
 Accepted C9b divergences from the pinned Python reference
 
 - Rust `logs tail` strips credentials, paths, queries, and fragments from

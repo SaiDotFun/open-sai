@@ -61,11 +61,14 @@ fn has_intent(row: &Row, key: &str) -> bool {
 }
 
 const ATTRIBUTION_SEPARATOR: &str = "~intent~";
-// Each extra anchor can require reopening one file and reading one log line.
-const MAX_EXTRA_ANCHORS: usize = 1024;
-const MAX_ANCHOR_CURSOR_BYTES: usize = MAX_EXTRA_ANCHORS * 34;
+// Sparse contexts can seek directly to each anchor. Dense contexts replay
+// neighboring anchors in bounded spans without growing with their count.
+const MAX_INLINE_ANCHORS: usize = 1024;
+const MAX_ANCHOR_CURSOR_BYTES: usize = 64 * 1024;
 
-fn parse_cursor(bound: Option<&str>) -> Result<(Cursor<'_>, Option<Vec<scan::Line>>), SaiError> {
+fn parse_cursor(
+    bound: Option<&str>,
+) -> Result<(Cursor<'_>, Option<Vec<scan::AnchorRange>>), SaiError> {
     let Some((bound, positions)) = bound.and_then(|bound| bound.split_once(ATTRIBUTION_SEPARATOR))
     else {
         return Ok((Cursor::parse(bound)?, None));
@@ -80,12 +83,11 @@ fn parse_cursor(bound: Option<&str>) -> Result<(Cursor<'_>, Option<Vec<scan::Lin
     } else {
         positions
             .split(',')
-            .take(MAX_EXTRA_ANCHORS + 1)
-            .map(scan::Line::parse)
+            .map(scan::AnchorRange::parse)
             .collect::<Option<Vec<_>>>()
             .ok_or_else(bad_cursor)?
     };
-    if positions.len() > MAX_EXTRA_ANCHORS {
+    if !scan::AnchorRange::fits_replay_budget(&positions) {
         return Err(bad_cursor());
     }
     Ok((cursor, Some(positions)))
@@ -137,7 +139,7 @@ fn read_context(
     root: &Path,
     key: &str,
     cursor: &Cursor<'_>,
-    remembered: Option<&[scan::Line]>,
+    remembered: Option<&[scan::AnchorRange]>,
 ) -> IntentContext {
     let window = cursor.window();
     let anchor = |row: &Row| has_intent(row, key) && timestamp(row).is_some();
@@ -184,11 +186,7 @@ fn read_context(
         scan.start
     };
     if let Some(remembered) = remembered {
-        anchors.extend(
-            scan::read_lines(root, remembered)
-                .into_iter()
-                .filter(|(_, row)| anchor(row)),
-        );
+        anchors.extend(scan::read_anchors(root, remembered, anchor));
     } else {
         // Bare timestamps (and old cursors) may need evidence from the next UTC
         // day. For new cursors, remember those records at their exact offsets.
@@ -457,18 +455,35 @@ pub async fn intent(
     }
     let mut value = report.finish(scan, &cursor, last, stop, "", attribution_start);
     if let Some(Value::String(next)) = value.get_mut("nextBefore") {
-        if extra_anchors.len() > MAX_EXTRA_ANCHORS {
-            return Err(usage(
-                "Too many intent attribution records to continue. Inspect files from sai logs path.",
-            ));
-        }
-        next.push_str(ATTRIBUTION_SEPARATOR);
-        for (index, line) in extra_anchors.iter().enumerate() {
-            if index != 0 {
-                next.push(',');
+        let ranges = if extra_anchors.len() <= MAX_INLINE_ANCHORS {
+            extra_anchors
+                .into_iter()
+                .map(scan::AnchorRange::from)
+                .collect()
+        } else {
+            scan::AnchorRange::cover(extra_anchors)
+        };
+        let mut positions = String::new();
+        if scan::AnchorRange::fits_replay_budget(&ranges) {
+            for (index, range) in ranges.into_iter().enumerate() {
+                if index != 0 {
+                    positions.push(',');
+                }
+                let _ = write!(positions, "{range}");
+                if positions.len() > MAX_ANCHOR_CURSOR_BYTES {
+                    break;
+                }
             }
-            let _ = write!(next, "{line}");
+            if positions.len() <= MAX_ANCHOR_CURSOR_BYTES {
+                next.push_str(ATTRIBUTION_SEPARATOR);
+                next.push_str(&positions);
+                return Ok(value);
+            }
         }
+        value.as_object_mut().unwrap().remove("nextBefore");
+        value["more"] = json!(
+            "Attribution exceeds the cursor replay limits. Inspect files from sai logs path."
+        );
     } else if value["truncated"] == true {
         value["more"] = json!("Inspect the retained files from sai logs path.");
     }

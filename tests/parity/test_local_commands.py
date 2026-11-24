@@ -684,6 +684,70 @@ def test_logs_intent_cursor_keeps_anchors_discovered_after_scan_limit(
     assert sorted(seen) == expected
 
 
+@pytest.mark.parametrize("count", [1024, 1025])
+def test_logs_intent_cursor_keeps_dense_attribution_after_scan_limit(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path, count: int
+) -> None:
+    from datetime import datetime, timedelta
+
+    start = datetime.fromisoformat(STAMP)
+
+    def stamp(seq: int) -> str:
+        return (
+            (start + timedelta(milliseconds=seq))
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    anchors = [
+        event(
+            "intent.status",
+            seq,
+            ts=stamp(seq),
+            commandId=f"{seq:032x}",
+            intentKey=INTENT_KEY,
+            addr=ADDR,
+            endpointId=ENDPOINT_ID,
+        )
+        for seq in range(2, count + 2)
+    ]
+    linked = event("keeper.request", 1, ts=stamp(1), commandId=f"{count + 1:032x}")
+    filler = event("command.start", count + 2, ts=stamp(10_000), run=OTHER_RUN)
+    args = ("logs", "intent", INTENT_KEY, "--offline")
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        logs = seed_logs(root, {"cli": [linked, *anchors]})
+        with (logs / f"cli-{STAMP[:10]}.jsonl").open("a") as stream:
+            stream.write((json.dumps(filler) + "\n") * 20_500)
+
+        page = cli_json(cli, root, *args)
+        assert page["events"] == []
+        seen = []
+        for step in range(count // 128 + 3):
+            page = cli_json(cli, root, *args, "--before", page["nextBefore"])
+            if index and count == 1025 and step == 0:
+                assert len(page["nextBefore"]) < 512
+                prefix = page["nextBefore"].split("~intent~", 1)[0]
+                oversized = f"{prefix}~intent~{STAMP[:10]}:0:0:{2**64 - 1}"
+                rejected = invoke(cli, root, "--json", *args, "--before", oversized)
+                assert rejected.returncode == 2
+                conflict = event(
+                    "intent.status",
+                    count + 3,
+                    ts=stamp(10_001),
+                    intentKey=INTENT_KEY,
+                    addr="0x" + "34" * 20,
+                    endpointId=ENDPOINT_ID,
+                )
+                with (logs / f"cli-{STAMP[:10]}.jsonl").open("a") as stream:
+                    stream.write(json.dumps(conflict) + "\n")
+            seen.extend(row["seq"] for row in page["events"])
+            if "nextBefore" not in page:
+                break
+        assert "nextBefore" not in page
+        assert sorted(seen) == list(range(1, count + 2))
+
+
 def test_logs_intent_reads_keeper_once(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:
