@@ -468,6 +468,7 @@ wire = ["oneClickTrading", "ws:init", "node_info"]
 name = "doctor-invalid-endpoint"
 args = ["--json", "doctor", "--no-fix"]
 seed = "doctor-invalid-endpoint"
+unset = ["SAI_ENDPOINT"]
 expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 
@@ -476,6 +477,7 @@ name = "doctor-invalid-endpoint-text"
 args = ["doctor", "--offline", "--no-fix"]
 mode = "text"
 seed = "doctor-invalid-endpoint"
+unset = ["SAI_ENDPOINT"]
 expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 
@@ -771,7 +773,7 @@ mcp_profile = "reads"
 seed = "ledger"
 server = "mcp-reads"
 wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
-# The current Python checkout uses the narrower history query during reconciliation.
+# Python v0.1.2 and Rust use paginated history during reconciliation.
 mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
 
 [[case]]
