@@ -984,7 +984,7 @@ def test_cli_status_and_list_report_expiry_warnings(env: Env):
     row = json.loads(result.stdout)["accounts"][0]
     assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
     renewal = row["renewalCommand"]
-    assert renewal == "sai auth import"
+    assert renewal == f"sai --endpoint {keeper.MAINNET_HTTP} auth import"
     assert status.stderr == result.stderr == ""
 
 
@@ -992,18 +992,25 @@ def test_cli_status_and_list_report_expiry_warnings(env: Env):
 def test_paste_renewal_command_with_the_configured_keeper(
     env: Env, keeper_auth, configured: bool
 ):
+    endpoint = keeper.MAINNET_HTTP
+    shell = {"SAI_ENDPOINT": keeper_auth["endpoint"]}
     if configured:
         endpoint = f"{keeper_auth['endpoint']}/private-path"
         assert env.run("config", "set", "keeper.endpoint", endpoint).returncode == 0
+        shell["SAI_RECONCILE_ENDPOINT"] = endpoint
     env.clipboard()
     env.clip.write_text(make_token(hours=48))
     assert env.run("auth", "import").returncode == 0
     report = json.loads(env.run("--json", "auth", "status").stdout)
-    assert report["renewalCommand"] == "sai auth import"
-    assert "renewalGuidance" not in report
+    command = report["renewalCommand"]
+    if configured:
+        assert "SAI_RECONCILE_ENDPOINT" in command
+        assert endpoint not in command
+    else:
+        assert command == f"sai --endpoint {endpoint} auth import"
 
     env.clip.write_text(make_token())
-    renewed = env.run_shell(report["renewalCommand"])
+    renewed = env.run_shell(command, **shell)
     assert renewed.returncode == 0, renewed.stderr
     assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
     assert env.run("--json", "auth", "status").returncode == 0
@@ -1070,7 +1077,15 @@ def test_legacy_renewal_refuses_another_accounts_clipboard_token(
     env.clipboard()
     report = json.loads(env.run("--json", "auth", "status").stdout)
     command = report["renewalCommand"]
-    assert shlex.split(command) == ["sai", "auth", "import", "--addr", ADDR]
+    assert shlex.split(command) == [
+        "sai",
+        "--endpoint",
+        keeper.MAINNET_HTTP,
+        "auth",
+        "import",
+        "--addr",
+        ADDR,
+    ]
     before = storage.load_accounts()
 
     wrong_token = make_token(OTHER)
@@ -1103,7 +1118,9 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     else:
         assert len(error.splitlines()) == 1
         assert "expires in" in error
-        assert error.splitlines()[0].endswith("Run sai auth import")
+        assert error.splitlines()[0].endswith(
+            f"Run sai --endpoint {keeper.MAINNET_HTTP} auth import"
+        )
 
 
 def run_expiry_notice_on_terminal(

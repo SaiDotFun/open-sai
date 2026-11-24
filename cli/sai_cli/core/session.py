@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from . import log, paths, settings, storage
+from . import keeper, log, storage
 from .errors import Code, SessionError
 
 EXPIRY_WARNING = timedelta(days=3)
@@ -30,23 +30,21 @@ def renewal_fields(result: dict[str, str]) -> dict[str, str]:
         args = ("auth", "import")
     else:
         args = ("auth", "import", "--addr", result["evmAddress"])
-    endpoint = result.get("endpoint")
-    try:
-        # A pasted command may run outside this process's Keeper overrides.
-        saved_endpoint = settings.load(env={"SAI_HOME": str(paths.sai_home())}).endpoint
-    except settings.SettingsError:
-        saved_endpoint = None
-    command = shlex.join(("sai", *args))
+    endpoint = result.get("endpoint") or ""
+    origin = log.origin(endpoint)
+    show_origin = origin != log.REDACTED_URL and log.redact(origin) == origin
+    public_default = (
+        endpoint == keeper.MAINNET_HTTP and log.redact(endpoint) == endpoint
+    )
+    command = (
+        shlex.join(("sai", "--endpoint", endpoint, *args))
+        if public_default
+        else storage.keeper_command_hint(endpoint, *args)
+    )
     guidance = []
-    if endpoint and endpoint != saved_endpoint:
-        command = storage.keeper_command_hint(endpoint, *args)
-        origin = log.origin(endpoint)
-        show_origin = origin != log.REDACTED_URL and log.redact(origin) == origin
-        if endpoint != origin or not show_origin:
-            where = f" at {origin}" if show_origin else ""
-            guidance.append(f"Reuse the Keeper endpoint{where} used to sign in.")
-    elif not endpoint:
-        guidance.append("Reuse the Keeper endpoint used to sign in.")
+    if not public_default and (endpoint != origin or not show_origin):
+        where = f" at {origin}" if show_origin else ""
+        guidance.append(f"Reuse the Keeper endpoint{where} used to sign in.")
     if not result.get("keyName") and result.get("source") != "imported":
         guidance.append("You can also sign in again with your Foundry keystore.")
     fields = {"renewalCommand": command}

@@ -8,7 +8,7 @@ use serde::Serialize;
 use crate::{
     errors::{Code, SaiError},
     log,
-    settings::{Environment, Flags, Settings},
+    settings::MAINNET_HTTP,
     storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
 
@@ -271,38 +271,30 @@ impl Storage<'_> {
             &["auth", "import", "--addr", session.addr()]
         };
         let home = self.trader.parent();
-        // Pasting the command can change which Keeper overrides are in effect.
-        let saved_settings = home.and_then(|home| {
-            Settings::load(
-                &Flags::default(),
-                &Environment::new(home.to_path_buf(), |_| None),
-            )
-            .ok()
-        });
-        let saved_endpoint = saved_settings.as_ref().map(Settings::endpoint);
-        let endpoint = session.endpoint().filter(|value| !value.is_empty());
-        let mut guidance = Vec::new();
-        let command = match endpoint.filter(|value| Some(*value) != saved_endpoint) {
-            Some(endpoint) => {
-                let origin = keeper_origin(endpoint)
-                    .filter(|origin| home.is_some_and(|home| log::redact(home, origin) == *origin));
-                if origin.as_deref() != Some(endpoint) {
-                    let location = keeper_location(origin.as_deref());
-                    guidance.push(format!(
-                        "Reuse the Keeper endpoint{location} used to sign in."
-                    ));
-                }
-                self.keeper_command(endpoint, origin.as_deref(), "", args)
-            }
-            None => format!("sai {}", shell_join(args)),
+        let endpoint = session.endpoint().unwrap_or_default();
+        let origin = keeper_origin(endpoint)
+            .filter(|origin| home.is_some_and(|home| log::redact(home, origin) == *origin));
+        let public_default = endpoint == MAINNET_HTTP
+            && home.is_some_and(|home| log::redact(home, endpoint) == endpoint);
+        let route = if public_default {
+            Some(endpoint)
+        } else {
+            origin.as_deref()
         };
-        if endpoint.is_none() {
-            guidance.push("Reuse the Keeper endpoint used to sign in.".into());
+        let mut guidance = Vec::new();
+        if route != Some(endpoint) {
+            let location = keeper_location(origin.as_deref());
+            guidance.push(format!(
+                "Reuse the Keeper endpoint{location} used to sign in."
+            ));
         }
         if session.key_name().is_none() && !session.is_imported() {
             guidance.push("You can also sign in again with your Foundry keystore.".into());
         }
-        (command, (!guidance.is_empty()).then(|| guidance.join(" ")))
+        (
+            self.keeper_command(endpoint, route, "", args),
+            (!guidance.is_empty()).then(|| guidance.join(" ")),
+        )
     }
 
     pub fn expiry_notice(&self, session: &Session, left: TimeDelta) -> Option<ExpiryNotice> {

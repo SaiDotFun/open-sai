@@ -227,9 +227,8 @@ def test_expired_session_fails():
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
     assert "expired" in check.summary
-    assert check.fix == f"sai auth import --addr {ADDR}"
+    assert check.fix == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
     assert "Foundry keystore" in check.summary
-    assert ENDPOINT not in check.fix
 
 
 def test_session_for_other_endpoint_fails():
@@ -1669,8 +1668,7 @@ def test_json_report_shape_and_exit_code():
     checks = {check["id"]: check for check in details["checks"]}
     assert checks["session"]["status"] == "fail"
     recovery = checks["session"]["fix"]
-    assert recovery == f"sai auth import --addr {ADDR}"
-    assert ENDPOINT not in recovery
+    assert recovery == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
     assert checks["keeper"]["status"] == "skipped"
 
 

@@ -321,16 +321,15 @@ def test_auth_expiry_warning_matches_python(
         endpoint = keeper.MAINNET_HTTP
         origin = endpoint.removesuffix("/query")
     expiry = datetime.now(UTC) + timedelta(seconds=seconds_left)
-    option = original_keeper_argument() if custom_endpoint else origin
-    same_keeper = keeper_source in {"default", "file"}
-    prefix = "sai auth" if same_keeper else f"sai --endpoint {option} auth"
+    option = original_keeper_argument() if custom_endpoint else endpoint
+    prefix = f"sai --endpoint {option} auth"
     command = {
         "imported": f"{prefix} import",
         "keystore": f"{prefix} renew {ADDR}",
         "legacy": f"{prefix} import --addr {ADDR}",
     }[source]
     guidance = []
-    if custom_endpoint and not same_keeper:
+    if custom_endpoint:
         guidance.append(reuse_keeper_guidance(origin))
     if source == "legacy":
         guidance.append("You can also sign in again with your Foundry keystore.")
@@ -396,6 +395,13 @@ def test_auth_expiry_warning_matches_python(
             assert "different account than --addr" in refused.stderr
             assert session_state(env) == before
             assert env.clip.read_text() == token
+        if keeper_source == "default":
+            env.clipboard()
+            env.clip.write_text(fixture_token(ADDR))
+            (env.bin / "sai").symlink_to(env.command[0])
+            renewed = env.run_shell(command, SAI_ENDPOINT="http://127.0.0.1:9")
+            assert renewed.returncode == 0, renewed.stderr
+            assert session_state(env)["sessions"][ADDR]["endpoint"] == endpoint
         results.append(runs)
     assert results[0] == results[1]
 

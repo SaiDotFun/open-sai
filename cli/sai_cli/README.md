@@ -245,10 +245,9 @@ list` JSON output, the account overview, and MCP session reports, look for
 `renewalGuidance`. Share the guidance separately when passing the command to
 someone else.
 
-The command omits `--endpoint` when the saved `keeper.endpoint` or built-in
-default matches the stored session. Run a command without `--endpoint` in a
-shell that uses that same Keeper. The command includes explicit routing for
-other URLs, including a Keeper set only through `SAI_ENDPOINT` in MCP.
+The command specifies `--endpoint` so the destination shell uses the original
+Keeper. An origin-only URL or the public built-in Keeper URL appears directly
+in the command. A private URL uses the `SAI_RECONCILE_ENDPOINT` variable.
 If the command references `SAI_RECONCILE_ENDPOINT`, supply the full original
 URL privately in the same shell before running it. In Bash, you can enter
 the URL at a hidden prompt to keep it out of shell history.
