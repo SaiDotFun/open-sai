@@ -28,9 +28,11 @@ pytestmark = [
 ]
 
 
-def run_driver(case: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_driver(
+    case: str, env: dict[str, str], *options: str
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(HERE / "parity.py"), "--case", case],
+        [sys.executable, str(HERE / "parity.py"), "--case", case, *options],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -104,6 +106,19 @@ def test_wrong_candidate_fails(
     assert run.returncode == 1, run.stdout + run.stderr
     assert "| DIFF |" in run.stdout
     assert message in run.stdout
+
+
+def test_driver_invokes_the_explicit_python_reference(tmp_path: Path) -> None:
+    reference = tmp_path / "python-sai"
+    reference.write_text(
+        f"#!{sys.executable}\nraise SystemExit(37)\n", encoding="utf-8"
+    )
+    reference.chmod(0o700)
+    env = dict(os.environ)
+    env.pop("SAI_PARITY_BIN", None)
+    run = run_driver("version", env, "--python-reference", str(reference))
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "expected reference exit 0, got 37" in run.stdout
 
 
 def test_equivalent_candidate_passes(tmp_path: Path) -> None:

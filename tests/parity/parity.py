@@ -460,6 +460,12 @@ def main() -> int:
     parser.add_argument(
         "--case", action="append", help="Run matching case IDs (glob, repeatable)"
     )
+    parser.add_argument(
+        "--python-reference",
+        type=Path,
+        metavar="SAI",
+        help="Use the sai entry point of an installed Python reference",
+    )
     args = parser.parse_args()
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         parser.error(SQLITE_SCHEMA_REQUIREMENT)
@@ -488,6 +494,11 @@ def main() -> int:
     if not selected:
         parser.error("No parity cases matched")
     reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
+    if args.python_reference is not None:
+        executable = shutil.which(str(args.python_reference.absolute()))
+        if executable is None:
+            parser.error("--python-reference must name an executable file")
+        reference = [executable]
     candidate = reference
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
