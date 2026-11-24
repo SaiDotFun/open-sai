@@ -361,9 +361,10 @@ PROFILE_DIRS = {"": ("trader", "logs", "cache"), "cache": ("wheels",)}
 PROFILE_SHARED_MODE = stat.S_ISGID | stat.S_ISVTX | 0o022
 SYMLINK_FIX = "Replace the symlink with a real file or directory by hand"
 SAI_HOME_MODE_FIX = (
-    "Sai preserves the permissions of existing directories because they may be shared."
-    " Use a dedicated directory for SAI_HOME and keep the existing trader data,"
-    " including the intent ledger, when moving the profile."
+    "This Sai home may be shared. Stop all Sai CLI and MCP processes before moving"
+    " the profile to a dedicated directory. Keep the trader data, including the intent"
+    " ledger. Set SAI_HOME to the new directory for the CLI and in every MCP client"
+    " configuration before restarting clients or resuming trading."
 )
 
 

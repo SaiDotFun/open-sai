@@ -365,9 +365,10 @@ def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
     history.chmod(0o644)
     isolated_home.chmod(0o2770)
     root_advice = (
-        "Sai preserves the permissions of existing directories because they may be shared."
-        " Use a dedicated directory for SAI_HOME and keep the existing trader data,"
-        " including the intent ledger, when moving the profile."
+        "This Sai home may be shared. Stop all Sai CLI and MCP processes before moving"
+        " the profile to a dedicated directory. Keep the trader data, including the intent"
+        " ledger. Set SAI_HOME to the new directory for the CLI and in every MCP client"
+        " configuration before restarting clients or resuming trading."
     )
 
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
