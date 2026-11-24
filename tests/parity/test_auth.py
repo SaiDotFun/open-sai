@@ -762,10 +762,10 @@ def test_import_usage_keeps_rejected_token_private(
     ],
 )
 def test_import_rejects_nonroot_json_before_reading_clipboard(
-    tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI, alias: bool
+    tmp_path: Path, auth_privacy_pair: tuple[CLI, CLI], args: CLI, alias: bool
 ) -> None:
     results = []
-    python, rust = homes(tmp_path, auth_pair)
+    python, rust = homes(tmp_path, auth_privacy_pair)
     if alias:
         launcher = tmp_path / "sai-under-review"
         launcher.symlink_to(Path(rust.command[0]))
