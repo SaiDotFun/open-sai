@@ -7,6 +7,7 @@ import os
 import select
 import shutil
 import signal
+import sqlite3
 import subprocess
 import time
 from collections.abc import Iterator
@@ -15,7 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from scenarios import Endpoints, child_env, loopback, seed_home
+from scenarios import ADDRESS, Endpoints, child_env, loopback, seed_home
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
 
@@ -72,10 +73,15 @@ class Stdio:
 
 @contextmanager
 def server(
-    executable: Path, home: Path, endpoints: Endpoints, *, seed: str = "empty"
+    executable: Path,
+    home: Path,
+    endpoints: Endpoints,
+    *,
+    seed: str = "empty",
+    logs: bool = False,
 ) -> Iterator[Stdio]:
     seed_home(home, endpoints, seed)
-    env = {**child_env(home, endpoints), "SAI_LOG": "0"}
+    env = {**child_env(home, endpoints), "SAI_LOG": "1" if logs else "0"}
     with subprocess.Popen(
         [executable, "mcp", "serve"],
         cwd=home,
@@ -113,3 +119,33 @@ def test_sigint_exits_with_stdin_open(native: Path, tmp_path: Path) -> None:
         assert stdio.proc.wait(timeout=3) == 0
         assert stdio.proc.stdout is not None
         assert stdio.proc.stdout.read() == b""
+
+
+def test_ping_during_exclusive_ledger_lock(native: Path, tmp_path: Path) -> None:
+    from contextlib import closing
+
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="ledger", logs=True) as stdio,
+        closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as database,
+    ):
+        database.execute("BEGIN EXCLUSIVE")
+        try:
+            stdio.send(
+                "tools/call", id_=2, name="intent_local", arguments={"addr": ADDRESS}
+            )
+            deadline = time.monotonic() + 3
+            while not any(
+                '"event":"mcp.tool_call"' in file.read_text()
+                for file in (home / "sai/logs").glob("mcp-*.jsonl")
+            ):
+                assert time.monotonic() < deadline, "intent_local did not start"
+                time.sleep(0.01)
+            stdio.send("ping", id_=3)
+            assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+        finally:
+            database.rollback()
+        response = stdio.receive()
+        assert response["id"] == 2
+        assert json.loads(response["result"]["content"][0]["text"])["intents"]

@@ -31,6 +31,7 @@ use sai_core::{
     storage::{Storage, StorageEvent},
 };
 use serde_json::{Map, Value, json};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::reads::output;
@@ -88,6 +89,7 @@ impl McpCommand {
             settings,
             env: env.clone(),
             writer,
+            ledger_slots: Arc::new(Semaphore::new(8)),
         };
         server.events().event(
             "mcp.server_start",
@@ -119,6 +121,7 @@ struct SaiMcp {
     settings: Settings,
     env: Environment,
     writer: Option<Arc<LogWriter>>,
+    ledger_slots: Arc<Semaphore>,
 }
 
 impl SaiMcp {
@@ -148,7 +151,7 @@ impl SaiMcp {
         &self,
         name: &str,
         args: &Map<String, Value>,
-        events: EventContext<'_>,
+        call_id: &str,
     ) -> Result<Value, SaiError> {
         let addr = args
             .get("addr")
@@ -156,6 +159,7 @@ impl SaiMcp {
             .filter(|addr| !addr.is_empty());
         let storage = Storage::new(&self.env.home);
         let endpoint = self.settings.endpoint();
+        let events = self.events().with_tool(name, call_id);
         let keeper = Keeper::new(endpoint, events);
         let query = match name {
             "market_list" => keeper::MARKETS,
@@ -194,23 +198,18 @@ impl SaiMcp {
                         .await?
                     }
                     AccountRead::LocalIntents => {
-                        json!({"intents": storage.list_pending(endpoint, addr)?})
+                        let home = self.env.home.clone();
+                        let endpoint = endpoint.to_owned();
+                        let addr = addr.to_owned();
+                        self.ledger_work(move || {
+                            let intents = Storage::new(home).list_pending(&endpoint, &addr)?;
+                            Ok(json!({"intents": intents}))
+                        })
+                        .await?
                     }
                     AccountRead::IntentStatus => {
-                        let key = args.get("key").and_then(Value::as_str);
-                        let log_storage =
-                            |event: StorageEvent<'_>| crate::local::storage_event(events, event);
-                        let storage = storage.with_event_sink(&log_storage);
-                        let data = reconcile::reconcile(
-                            endpoint,
-                            addr,
-                            key,
-                            keeper::TIMEOUT,
-                            &storage,
-                            events,
-                        )
-                        .await?;
-                        keeper::public_intent_status(&self.env.home, &data)
+                        self.intent_status(addr, args.get("key").and_then(Value::as_str), call_id)
+                            .await?
                     }
                 };
                 if let Value::Object(data) = data {
@@ -225,6 +224,54 @@ impl SaiMcp {
                 .request(query, Map::new(), None, keeper::TIMEOUT)
                 .await?,
         ))
+    }
+
+    async fn ledger_work<T: Send + 'static>(
+        &self,
+        work: impl FnOnce() -> Result<T, SaiError> + Send + 'static,
+    ) -> Result<T, SaiError> {
+        // Leave room in Tokio's blocking pool for stdio even if every query
+        // is waiting on the same SQLite lock.
+        let slot = Arc::clone(&self.ledger_slots)
+            .acquire_owned()
+            .await
+            .map_err(|_| SaiError::internal())?;
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
+            work()
+        })
+        .await
+        .map_err(|_| SaiError::internal())?
+    }
+
+    async fn intent_status(
+        &self,
+        addr: &str,
+        key: Option<&str>,
+        call_id: &str,
+    ) -> Result<Value, SaiError> {
+        let home = self.env.home.clone();
+        let endpoint = self.settings.endpoint().to_owned();
+        let writer = self.writer.clone();
+        let (addr, key, call_id) = (addr.to_owned(), key.map(str::to_owned), call_id.to_owned());
+        let runtime = tokio::runtime::Handle::current();
+        // Reconciliation combines Keeper requests with synchronous SQLite operations.
+        self.ledger_work(move || {
+            let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
+                .with_tool("intent_status", &call_id);
+            let log_storage = |event: StorageEvent<'_>| crate::local::storage_event(events, event);
+            let storage = Storage::new(&home).with_event_sink(&log_storage);
+            let data = runtime.block_on(reconcile::reconcile(
+                &endpoint,
+                &addr,
+                key.as_deref(),
+                keeper::TIMEOUT,
+                &storage,
+                events,
+            ))?;
+            Ok(keeper::public_intent_status(&home, &data))
+        })
+        .await
     }
 
     fn info(&self, storage: &Storage<'_>) -> Value {
@@ -279,7 +326,7 @@ impl SaiMcp {
         name: &str,
         tool: Option<&Tool>,
         args: Map<String, Value>,
-        events: EventContext<'_>,
+        call_id: &str,
     ) -> Result<Value, String> {
         let tool = tool.ok_or_else(|| format!("Unknown tool: {name}"))?;
         // FastMCP checks the session even for missing or malformed trade arguments.
@@ -296,7 +343,7 @@ impl SaiMcp {
         }
         let args = validation::arguments(tool, args)?;
         Ok(self
-            .run_tool(name, &args, events)
+            .run_tool(name, &args, call_id)
             .await
             .unwrap_or_else(|error| self.error(error)))
     }
@@ -371,7 +418,7 @@ impl ServerHandler for SaiMcp {
         }
         let duration =
             || json!((started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64).into();
-        let result = match self.checked_call(name, tool, args, events).await {
+        let result = match self.checked_call(name, tool, args, &call_id[..12]).await {
             Ok(value) => {
                 let error = value.get("error").and_then(Value::as_str);
                 let level = if error.is_some() {
