@@ -815,6 +815,34 @@ class KeeperReplayTest(unittest.TestCase):
             with error.exception as response:
                 self.assertEqual(response.code, 400)
 
+    def test_selected_objects_with_all_children_skipped_keep_their_aliases(
+        self,
+    ) -> None:
+        query = """
+query($user:String!, $key:String) {
+  p: perp { tradeHistory @skip(if:true) { id } }
+  route: oneClickTrading { enabled @include(if:false) }
+  matched: userIntents(where:{user:$user, intentKey:$key}) { intentKey }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            data = self.query(base, query, user=self.replay.addr, key=self.key)
+        self.assertEqual(
+            data, {"p": {}, "route": {}, "matched": [{"intentKey": self.key}]}
+        )
+
+    def test_empty_selection_does_not_replace_an_active_alias(self) -> None:
+        self.replay.history = [{"id": 1, "trade": {"trader": self.replay.addr}}]
+        query = """
+query($trader:String!) {
+  p: perp { tradeHistory(where:{trader:$trader}) @skip(if:true) { id } }
+  p: perp { tradeHistory(where:{trader:$trader}) { id } }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            data = self.query(base, query, trader=self.replay.addr)
+        self.assertEqual(data, {"p": {"tradeHistory": [{"id": 1}]}})
+
     def test_mutation_uses_the_bound_input_argument(self) -> None:
         key = "20261124T080000000Z_ABCDEFGHJKMNPQRT"
         query = (

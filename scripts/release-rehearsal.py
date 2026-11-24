@@ -760,9 +760,20 @@ class Replay:
                 except ValueError:
                     self.send_error(400)
                     return
-                if not selected:
-                    self.reply({"data": {}})
+                empty_objects = {}
+                active = []
+                for field in selected:
+                    if field.children == () and field.name in {
+                        "perp",
+                        "oneClickTrading",
+                    }:
+                        empty_objects[field.key] = {}
+                    else:
+                        active.append(field)
+                if not active:
+                    self.reply({"data": empty_objects})
                     return
+                selected = tuple(active)
                 roots = {field.name for field in selected}
                 perp = {
                     child.name
@@ -820,7 +831,7 @@ class Replay:
                     if len(data) != len(selected):
                         self.send_error(400)
                         return
-                    self.reply({"data": data})
+                    self.reply({"data": empty_objects | data})
                     return
                 elif "tradeHistory" in perp:
                     try:
@@ -840,7 +851,7 @@ class Replay:
                     except ValueError:
                         self.send_error(400)
                         return
-                    self.reply({"data": data})
+                    self.reply({"data": empty_objects | data})
                     return
                 elif "oneClickTrading" in roots:
                     data = {
@@ -863,14 +874,10 @@ class Replay:
                             ]
                         }
                     }
-                elif all(
-                    field.name == "perp" and field.children == () for field in selected
-                ):
-                    data = {"perp": {}}
                 else:
                     self.send_error(400)
                     return
-                self.reply({"data": project_fields(data, selected)})
+                self.reply({"data": empty_objects | project_fields(data, selected)})
 
         return Handler
 
