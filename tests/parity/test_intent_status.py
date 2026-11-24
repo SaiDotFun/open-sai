@@ -7,6 +7,7 @@ import json
 import os
 import select
 import shutil
+import signal
 import socket
 import sqlite3
 import ssl
@@ -881,6 +882,55 @@ def keeper_certificate(
     context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     context.load_cert_chain(certs / "server.pem", certs / "server.key")
     return context, certs
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a process-group SIGINT")
+def test_watch_reports_tls_certificate_failure(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+) -> None:
+    context, certs = keeper_certificate
+    with replay(context) as (endpoint, _replies, requests):
+        ws = endpoint.replace("https://", "wss://", 1)
+        for index, cli in enumerate(cli_pair):
+            home = tmp_path / str(index)
+            with subprocess.Popen(
+                [*cli, "--json", "--ws-endpoint", ws, "watch", "balances", ADDR],
+                env={
+                    "PATH": os.defpath,
+                    "HOME": str(tmp_path),
+                    "SAI_HOME": str(home),
+                    "SAI_LOG": "1",
+                    "SSL_CERT_FILE": str(certs / "other-ca.pem"),
+                },
+                cwd=tmp_path,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            ) as proc:
+                assert proc.stderr is not None
+                try:
+                    assert select.select([proc.stderr], [], [], 8)[0]
+                    warning = proc.stderr.readline()
+                    os.killpg(proc.pid, signal.SIGINT)
+                    stdout, _ = proc.communicate(timeout=5)
+                finally:
+                    if proc.poll() is None:
+                        os.killpg(proc.pid, signal.SIGKILL)
+                        proc.communicate(timeout=5)
+            assert proc.returncode == 1
+            assert json.loads(stdout)["error"]["message"] == "Aborted"
+            assert warning == (
+                b"Disconnected (SSLCertVerificationError); data may be stale;"
+                b" reconnecting in 2s\n"
+            )
+            assert [
+                (event["code"], event["errorType"])
+                for event in read_events(home)
+                if event["event"] == "watch.disconnected"
+            ] == [("STREAM_ERROR", "SSLCertVerificationError")]
+            assert not requests
 
 
 @pytest.mark.parametrize(

@@ -217,9 +217,12 @@ impl Connection {
             let stream = transport::websocket_socket(&url, OPEN_TIMEOUT)
                 .await
                 .map_err(|error| {
-                    let reason = match error.code {
-                        Code::NotSent => "ConnectionRefusedError",
-                        _ => "OSError",
+                    let reason = match error {
+                        transport::ConnectError::CertificateVerification => {
+                            "SSLCertVerificationError"
+                        }
+                        transport::ConnectError::NotSent => "ConnectionRefusedError",
+                        transport::ConnectError::InvalidRequest => "OSError",
                     };
                     Failure::Disconnected(reason)
                 })?;
