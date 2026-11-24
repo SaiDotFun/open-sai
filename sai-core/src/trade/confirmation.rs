@@ -251,6 +251,60 @@ mod tests {
     }
 
     #[test]
+    fn cancel_confirmation_refusal_carries_the_market_close_warning() {
+        use crate::trade::close_preview;
+
+        let account = "0xaa00000000000000000000000000000000000001";
+        let old = close_preview("8", true).unwrap();
+        let current = close_preview("7", true).unwrap();
+        let digest = preview_digest(&old, Some(account));
+        let refusal = Confirmation::new(&digest, None)
+            .unwrap()
+            .verify(&current, account)
+            .unwrap_err();
+        assert_eq!(refusal.code, Code::PreviewMismatch);
+        let replacement = &refusal.details.unwrap()["preview"];
+        assert_eq!(replacement["intent"]["target"]["userTradeId"], "7");
+        assert_eq!(
+            replacement["previewDigest"],
+            preview_digest(&current, Some(account))
+        );
+        for name in ["fees", "liquidationPrice", "worstCaseFill"] {
+            assert_eq!(
+                replacement["estimates"][name],
+                json!({
+                    "status": "unavailable",
+                    "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_price_movement_that_decimal_context_rounds_to_the_limit() {
+        let account = "0xaa00000000000000000000000000000000000001";
+        let mut preview = TradePreview::new(TradeIntent::new(
+            "OPEN_TRADE",
+            None,
+            json!({"orderType": "market", "maxSlippagePct": "10"}),
+        ));
+        let reference = "100000000000";
+        preview.reference_price = Some(reference.into());
+        let digest = preview_digest(&preview, Some(account));
+        preview.reference_price = Some("110000000000".into());
+        Confirmation::new(&digest, Some(reference))
+            .unwrap()
+            .verify(&preview, account)
+            .unwrap();
+        preview.reference_price = Some("110000000000.000000000000000001".into());
+        let refusal = Confirmation::new(&digest, Some(reference))
+            .unwrap()
+            .verify(&preview, account)
+            .unwrap_err();
+        assert_eq!(refusal.code, Code::PriceMoved);
+    }
+
+    #[test]
     fn confirmation_binds_the_account_before_checking_market_movement() {
         let account = "0xaa00000000000000000000000000000000000001";
         let mut preview = TradePreview::new(TradeIntent::new(

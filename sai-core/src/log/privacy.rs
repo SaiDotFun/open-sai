@@ -2,6 +2,8 @@ use std::sync::LazyLock;
 
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
+use sha2::{Digest, Sha256};
+use url::Host;
 
 use crate::endpoint::Endpoint;
 
@@ -35,6 +37,7 @@ pub enum Field {
     Untrusted(String),
     Arg(String),
     Endpoint(String),
+    EndpointIdentity([u8; 32]),
     Array(Vec<Field>),
     Object(Vec<(String, Field)>),
     Scalar(Value),
@@ -61,6 +64,23 @@ impl Field {
         Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Arg).collect())
     }
 
+    pub fn endpoint_identity(value: &str) -> Self {
+        let site = origin(value);
+        if site == REDACTED_URL {
+            return Self::Scalar(Value::Null);
+        }
+        let Some(endpoint) = Endpoint::split(value.trim()) else {
+            return Self::Scalar(Value::Null);
+        };
+        let path = if endpoint.path.is_empty() {
+            "/"
+        } else {
+            &endpoint.path
+        };
+        let digest = Sha256::digest(format!("{site}{path}?{}", endpoint.query));
+        Self::EndpointIdentity(digest.into())
+    }
+
     pub(super) fn snapshot(self, budget: &mut Budget, tokens: &[String], depth: usize) -> Self {
         budget.chars = budget.chars.saturating_sub(16);
         budget.nodes = budget.nodes.saturating_sub(1);
@@ -68,6 +88,7 @@ impl Field {
             Self::Text(text) => Self::Text(copy_text(&text, budget, tokens)),
             Self::Untrusted(text) => Self::Untrusted(copy_text(&text, budget, tokens)),
             Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
+            Self::EndpointIdentity(_) => self,
             Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
             Self::Scalar(Value::Number(number))
                 if number.is_i64()
@@ -123,6 +144,7 @@ impl Field {
             Self::Untrusted(text) => Value::String(scrub(&text, tokens, &URL_REST, true)),
             Self::Arg(text) => Value::String(scrub(&text, tokens, &URL_REST, false)),
             Self::Endpoint(text) => Value::String(origin(&text)),
+            Self::EndpointIdentity(_) => Value::Null,
             Self::Array(items) => {
                 Value::Array(items.into_iter().map(|item| item.clean(tokens)).collect())
             }
@@ -198,11 +220,18 @@ pub(super) fn replace_tokens(text: &str, tokens: &[String]) -> String {
     text
 }
 
-fn origin(text: &str) -> String {
+/// Strip credentials, path, query, and fragment for a public endpoint report.
+pub fn origin(text: &str) -> String {
     let Some(url) = Endpoint::split(text.trim()) else {
         return REDACTED_URL.into();
     };
-    let (host, port) = url.host_port();
+    let (mut host, port) = url.host_port();
+    if !host.is_ascii() && !host.starts_with('[') {
+        let Ok(encoded) = Host::parse(&host) else {
+            return REDACTED_URL.into();
+        };
+        host = encoded.to_string();
+    }
     if !HOST.is_match(&host) {
         return REDACTED_URL.into();
     }

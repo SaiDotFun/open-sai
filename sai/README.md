@@ -13,6 +13,11 @@ Session binding and ledger lookups use the full endpoint.
 Run `sai intent status ADDR --key KEY` to reconcile one intent, or omit
 `--key` to list the account's recent Keeper records. With `--json`, command
 failures use the same error codes and envelope as the Python CLI.
+The `market list`, `market prices`, and `account positions` commands
+return Keeper's GraphQL data. The `account history` command keeps the
+GraphQL envelope and projects each row to validated public fields. The `account balances`
+command reads one WebSocket snapshot. Use `watch price TOKEN_ID`, `watch
+balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 
 `sai trade open`, `sai trade close`, and `sai trade cancel` support
 `--dry-run`. Python spells cancellation `sai trade close ID --cancel-order`,
@@ -25,7 +30,12 @@ key to reconcile it before trading again.
 C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
 uses Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf` for
 Keeper requests, reconciliation, structured errors, and emitted events.
+Every Keeper query logs only public GraphQL error codes and an error count,
+following the current Python reference below.
 Logging v2 and intent wait have their own port work. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
+C5 compares read and watch commands against Python on `main` at
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. These commands emit schema v2
+events, including keyed endpoint IDs for Keeper HTTP reads.
 
 | Lane | Acceptance criteria |
 | --- | --- |
@@ -79,11 +89,23 @@ after `just rust-build` to compare `sai intent status` against the Python
 package in this checkout. The tests reuse the recorded Keeper outcomes
 and compare request bytes and counts, ledger rows, and log events.
 
-The C7a trade cases and digest fixtures use Python commit
+The C7a open and close cases and digest fixtures use Python commit
 `ea09f0d417a53a71079bb8c5e426005fa29051a4`. Set `SAI_PARITY_C7_PYTHON` to
 the absolute path of a `sai` binary installed from that checkout when
 running `pytest tests/parity/test_trade.py` with `SAI_PARITY_BIN`.
-Without that override the tests use Python from the current workspace.
+Without that override the open and close tests use Python from the current
+workspace. The cancellation cases use Python commit
+`bdc11da6c9938aa0371835d921f27d45daa77c36`. Set `SAI_PARITY_WAIT_PYTHON` to
+the absolute path of its `sai` launcher. Cancellation and wait tests share
+this checkout in CI.
+
+Compare the read and watch commands with the Python package in this
+checkout using the loopback replay cases:
+
+```sh
+SAI_PARITY_BIN="$PWD/target/debug/sai" uv run python tests/parity/parity.py \
+  --case 'market-*' --case 'account-*' --case 'watch-*'
+```
 
 Native archives and compatible shim wheels ship on the existing
 `sai-cli/v*` tags with SHA-256 checksums. Each shim version fetches and

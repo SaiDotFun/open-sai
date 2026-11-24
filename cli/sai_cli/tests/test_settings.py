@@ -337,7 +337,9 @@ def test_edit_file_creates_the_full_file(tmp_path):
 def test_public_view_redacts_urls():
     result = resolve(
         {"keeper.endpoint": "https://u:pw@k.example/q?key=s"},
-        {"SAI_LCD_ENDPOINT": "https://lcd.example/?apikey=s"},
+        {
+            "SAI_LCD_ENDPOINT": "https://lcd.example/fixture-lcd-path?apikey=fixture-lcd-query"
+        },
         {},
     )
     shown = settings.public(result)
@@ -350,7 +352,7 @@ def test_public_view_redacts_urls():
     }
     assert shown["keeper.ws_endpoint"]["value"] == "wss://k.example"
     assert shown["keeper.ws_endpoint"]["default"] is None
-    assert shown["lcd.endpoint"]["value"] == "https://lcd.example/"
+    assert shown["lcd.endpoint"]["value"] == "https://lcd.example"
     assert shown["update.auto"] == {
         "value": True,
         "source": "default",

@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import queue
+import select
 import shlex
 import shutil
 import signal
@@ -21,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 from compare import (
@@ -37,8 +39,10 @@ from compare import (
     stderr_category,
     stdout,
 )
+from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
+from sai_cli.core import log
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import HERE, ROOT, Endpoints, child_env, loopback, seed_home
@@ -85,6 +89,13 @@ class Case:
     mcp_calls: list[dict[str, Any]] | None = None
     rust: dict[str, Any] | None = None
     accepted_difference: str | None = None
+    client_seed: str | None = None
+    accepted_divergence: str | None = None
+    absent_log_text: list[str] | None = None
+    interrupt_after: int | None = None
+    interrupt_on_request: bool = False
+    expected_overview_help: str | None = None
+    exact_output: bool = False
 
     @property
     def command(self) -> str:
@@ -106,6 +117,7 @@ class Observation:
     output: Any
     stderr: tuple[str, ...]
     files: dict[str, Entry]
+    raw: tuple[bytes, bytes] | None = None
 
 
 def invoke(
@@ -120,18 +132,72 @@ def invoke(
         env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
-        encoding="utf-8",
         timeout=20,
         umask=0o022,
         check=False,
     )
     check_sandbox_exit(result.returncode)
-    return result
+    return subprocess.CompletedProcess(
+        result.args, result.returncode, result.stdout.decode(), result.stderr.decode()
+    )
 
 
 def check_sandbox_exit(exit_code: int) -> None:
     if exit_code in {-signal.SIGSYS, 128 + signal.SIGSYS}:
         raise ValueError("attempted a blocked host socket")
+
+
+def interrupt_command(
+    binary: list[str],
+    args: list[str],
+    home: Path,
+    env: dict[str, str],
+    *,
+    snapshots: int = 0,
+    ready: threading.Event | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Interrupt after a fixture sees the request or after the requested snapshots."""
+    with subprocess.Popen(
+        restricted([*binary, *args]),
+        cwd=home,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        umask=0o022,
+    ) as proc:
+        assert proc.stdout is not None
+        deadline = time.monotonic() + 12
+        seen = bytearray()
+        received = 0
+        try:
+            if ready is not None and not ready.wait(8):
+                raise ValueError(
+                    "Timed out waiting for the interrupted command's request"
+                )
+            while received < snapshots:
+                remaining = max(0, deadline - time.monotonic())
+                if not select.select([proc.stdout], [], [], remaining)[0]:
+                    raise ValueError("Timed out waiting for a watch snapshot")
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise ValueError("Watch exited before the expected snapshots")
+                seen.extend(chunk)
+                received += chunk.count(b"\n")
+            for line in seen.split(b"\n")[:snapshots]:
+                if "data" not in json.loads(line):
+                    raise ValueError("Watch exited before the expected snapshots")
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, stderr = proc.communicate(timeout=4)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=4)
+        check_sandbox_exit(proc.returncode)
+        return subprocess.CompletedProcess(
+            args, proc.returncode, (seen + stdout).decode(), stderr.decode()
+        )
 
 
 def mcp_exchange(
@@ -252,13 +318,21 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
 
 
 def observe(
-    case: Case, binary: list[str], home: Path, endpoints: Endpoints
+    case: Case,
+    binary: list[str],
+    home: Path,
+    endpoints: Endpoints,
+    *,
+    candidate: bool = False,
 ) -> Observation:
     started_at = time.time()
     seed_home(home, endpoints, case.seed)
     config = home / "sai" / "config.toml"
     before_config = config.read_bytes().decode("utf-8") if config.is_file() else None
     env = child_env(home, endpoints)
+    client_before = (
+        seed_clients(home, env, case.client_seed) if case.client_seed else {}
+    )
     for key in case.unset or ():
         env.pop(key, None)
     if case.setup:
@@ -298,6 +372,21 @@ def observe(
             result = first.result()
     elif case.mode == "mcp":
         result = mcp_exchange(binary, args, home, env, case.mcp_calls)
+    elif case.interrupt_on_request:
+        try:
+            result = interrupt_command(
+                binary, args, home, env, ready=endpoints.interrupt_ready
+            )
+            if case.server != "interrupt-http" and not endpoints.interrupt_closed.wait(
+                4
+            ):
+                raise ValueError("WebSocket did not close after SIGINT")
+        finally:
+            endpoints.interrupt_closed.set()
+    elif case.interrupt_after is not None:
+        result = interrupt_command(
+            binary, args, home, env, snapshots=case.interrupt_after
+        )
     else:
         result = invoke(binary, args, home, env)
         if case.retry_expect is not None:
@@ -331,8 +420,22 @@ def observe(
     expected_id = (
         normalize.identity("intentKey", admission_key) if admission_key else None
     )
-    files = snapshot(home / "sai", normalize)
-    check_state(case.state or {}, files)
+    if case.absent_log_text:
+        for path in (home / "sai" / "logs").glob("*.jsonl"):
+            text = path.read_text(encoding="utf-8")
+            if any(value in text for value in case.absent_log_text):
+                raise ValueError("Fixture credential appeared in a log")
+    files = snapshot(
+        home / "sai", normalize, raw_config=case.seed == "doctor-malformed-toml"
+    )
+    if case.client_seed:
+        if SECRET in result.stdout or SECRET in result.stderr:
+            raise ValueError("Client config value escaped into CLI output")
+        files.update(client_state(home, client_before, normalize))
+    state = dict(case.state or {})
+    if candidate and case.accepted_divergence == "codex-repair-rollback":
+        state["clients/.codex/config.toml#changed"] = False
+    check_state(state, files)
     if expected_id is not None:
         check_state({f"{LEDGER}#tables.intents.rows.0.id": expected_id}, files)
     try:
@@ -361,7 +464,13 @@ def observe(
         stderr += tuple(
             f"{followup} {category}" for category in stderr_category(contender.stderr)
         )
-    return Observation(result.returncode, output, stderr, files)
+    exact = case.exact_output or case.command.split()[0] in {
+        "market",
+        "account",
+        "watch",
+    }
+    raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
+    return Observation(result.returncode, output, stderr, files, raw)
 
 
 def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
@@ -390,6 +499,12 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
         diffs.append(f"stderr {a} to {b}")
     if found := first_difference(reference.output, candidate.output, "stdout"):
         diffs.append(found)
+    if reference.raw is not None and candidate.raw is not None:
+        for stream, expected, actual in zip(
+            ("stdout", "stderr"), reference.raw, candidate.raw, strict=True
+        ):
+            if expected != actual:
+                diffs.append(f"{stream} bytes differ")
     missing = sorted(reference.files.keys() - candidate.files.keys())
     extra = sorted(candidate.files.keys() - reference.files.keys())
     diffs.extend(f"missing {name}" for name in missing)
@@ -405,13 +520,56 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
     return diffs
 
 
+def matches_overview_help_difference(
+    reference: Observation, candidate: Observation
+) -> bool:
+    if reference.raw is None or candidate.raw is None:
+        return False
+    overview_line = (
+        b"  overview   Show Sai funds, positions, orders, local blockers, and...\n"
+    )
+    stdout_bytes, stderr = reference.raw
+    adjusted_stderr = stderr.replace(overview_line, b"", 1)
+    # Keep all other output and event fields under the usual comparison.
+    if adjusted_stderr == stderr or adjusted_stderr != candidate.raw[1]:
+        return False
+    name = "logs/cli.jsonl"
+    entry = reference.files.get(name)
+    if entry is None or len(entry.data) != 2:
+        return False
+    start, end = entry.data
+    if end.get("event") != "command.end":
+        return False
+    original, adjusted = [
+        log.clean(
+            log.untrusted(text.partition(b"\nError: ")[2].decode().removesuffix("\n")),
+            (),
+        )
+        for text in (stderr, adjusted_stderr)
+    ]
+    if end.get("error") != original:
+        return False
+    files = {
+        **reference.files,
+        name: replace(entry, data=[start, {**end, "error": adjusted}]),
+    }
+    adjusted_reference = replace(
+        reference, files=files, raw=(stdout_bytes, adjusted_stderr)
+    )
+    return not differences(adjusted_reference, candidate)
+
+
 def safe_observe(
     case: Case,
     binary: list[str],
     home: Path,
     endpoints: Endpoints,
+    *,
+    candidate: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
+    endpoints.interrupt_ready.clear()
+    endpoints.interrupt_closed.clear()
     endpoints.wire.clear()
     endpoints.admission.arrived.clear()
     endpoints.admission.release.clear()
@@ -419,7 +577,7 @@ def safe_observe(
     outbound = unroutable_packets()
     try:
         result: tuple[Observation | None, str] = (
-            observe(case, binary, home, endpoints),
+            observe(case, binary, home, endpoints, candidate=candidate),
             "",
         )
     except subprocess.TimeoutExpired:
@@ -435,9 +593,26 @@ def safe_observe(
     return result
 
 
+def project_reference_lcd_origin(output: dict[str, Any]) -> None:
+    """The pinned Python reference still displays the LCD URL path."""
+    error = output.get("error")
+    report = error["details"] if error is not None else output
+    lcd = next(check for check in report["checks"] if check["id"] == "lcd")
+    endpoint = lcd["details"]["endpoint"]
+    parts = urlsplit(endpoint)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    original_summary = lcd["summary"]
+    lcd["details"]["endpoint"] = origin
+    lcd["summary"] = original_summary.replace(endpoint, origin, 1)
+    if error is not None:
+        error["message"] = error["message"].replace(
+            f"lcd: {original_summary}", f"lcd: {lcd['summary']}", 1
+        )
+
+
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
-) -> tuple[list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
     candidate_case = case.rust_case() if rust else case
     with (
@@ -448,7 +623,11 @@ def run_case(
             case, reference, Path(temp) / "reference", endpoints
         )
         right, right_error = safe_observe(
-            candidate_case, candidate, Path(temp) / "candidate", endpoints
+            candidate_case,
+            candidate,
+            Path(temp) / "candidate",
+            endpoints,
+            candidate=rust,
         )
     tools = {}
     inventory_case = case.mode == "mcp" and case.mcp_calls is None
@@ -467,11 +646,28 @@ def run_case(
                     else "LISTED"
                 )
     if left is None or right is None:
-        return [
-            f"{side} {error}"
-            for side, error in (("reference", left_error), ("candidate", right_error))
-            if error
-        ], tools
+        return (
+            [
+                f"{side} {error}"
+                for side, error in (
+                    ("reference", left_error),
+                    ("candidate", right_error),
+                )
+                if error
+            ],
+            tools,
+            None,
+        )
+    if candidate != reference and case.accepted_divergence == "codex-repair-rollback":
+        # Both observations checked their expected change flag. Compare the
+        # saved file's existence and mode while allowing its contents to differ.
+        filename = "clients/.codex/config.toml"
+        for observation in (left, right):
+            observation.files[filename] = replace(
+                observation.files[filename], data=None
+            )
+    if candidate != reference and case.accepted_divergence == "lcd-origin-only":
+        project_reference_lcd_origin(left.output)
     if rust and case.accepted_difference and case.mode != "mcp":
         diffs = []
         if right.exit_code != candidate_case.expect:
@@ -492,6 +688,14 @@ def run_case(
                     )
             left = replace(left, output=json.loads(reference_output))
         diffs = differences(left, right)
+    expected = case.accepted_difference if rust else None
+    if (
+        diffs
+        and case.expected_overview_help
+        and matches_overview_help_difference(left, right)
+    ):
+        diffs = []
+        expected = case.expected_overview_help
     if left.exit_code != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
@@ -504,7 +708,7 @@ def run_case(
                 diffs.append(f"reference MCP call failed for {tool}")
             elif not diffs:
                 tools[tool] = "PASS"
-    return diffs, tools
+    return diffs, tools, expected
 
 
 def cli_commands(group: click.Group, prefix: str = "") -> set[str]:
@@ -565,6 +769,9 @@ def main() -> int:
             parser.error("SAI_PARITY_PYTHON must name an executable file or command")
         reference = [str(Path(executable).absolute())]
     candidate = reference
+    c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
+        Path(sys.executable).with_name("sai")
+    )
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -578,16 +785,31 @@ def main() -> int:
     )
     print("| Command | Status | Diff summary |\n| --- | --- | --- |", flush=True)
     mismatches = 0
+    expected_differences = 0
     tools: dict[str, str] = {}
     for case in selected:
-        diffs, listed = run_case(case, reference, candidate)
+        # uv run prepends its own bin directory to PATH. Launch the Python
+        # entry point directly so both CLIs inspect the fixture launcher.
+        if case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
+            case_reference = [c9a_python]
+        else:
+            case_reference = reference
+        case_candidate = case_reference if candidate is reference else candidate
+        diffs, listed, expected = run_case(case, case_reference, case_candidate)
         tools.update(listed)
         mismatches += bool(diffs)
-        accepted = case.accepted_difference if candidate is not reference else None
+        expected_differences += bool(expected and not diffs)
         row(
             f"`sai {shlex.join(case.args)}` ({case.name})",
-            "DIFF" if diffs else "ACCEPTED" if accepted else "PASS",
-            ", ".join(diffs) if diffs else accepted or "",
+            "DIFF" if diffs else "EXPECTED DIFF" if expected else "PASS",
+            ", ".join(diffs)
+            if diffs
+            else expected
+            or (
+                f"Accepted divergence ({case.accepted_divergence})"
+                if candidate is not reference and case.accepted_divergence
+                else ""
+            ),
         )
     if not args.case:
         for name, reason in sorted(deferred.items()):
@@ -596,7 +818,10 @@ def main() -> int:
         print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
         for name, status in tools.items():
             row(f"`{name}`", status, "tools/call" if status == "PASS" else "tools/list")
-    print(f"\n{len(selected) - mismatches}/{len(selected)} cases passed.")
+    passed = len(selected) - mismatches - expected_differences
+    print(f"\n{passed}/{len(selected)} cases passed.")
+    if expected_differences:
+        print(f"Expected differences: {expected_differences}.")
     return int(bool(mismatches))
 
 

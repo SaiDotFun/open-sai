@@ -11,6 +11,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from sai_cli.core import keeper, margin, reconcile, session, storage, stream, trading
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
@@ -102,8 +108,12 @@ class FakeKeeper:
         variables: dict[str, Any] | None = None,
         token: str | None = None,
         timeout: float = 20,
+        *,
+        attempt: keeper.RequestAttempt | None = None,
     ) -> dict[str, Any]:
         if query == keeper.SUBMIT:
+            if attempt is not None:
+                attempt.transport_started = True
             assert variables is not None
             envelope = variables["input"]
             self.submitted.append(envelope)
@@ -115,6 +125,11 @@ class FakeKeeper:
                     "evmAddress": ADDR,
                 }
             }
+        if query == keeper.POSITION and query not in self.answers:
+            assert variables is not None
+            return position_data(variables)
+        if query == keeper.ROUTE and query not in self.answers:
+            return POSITION_ROUTE
         return json.loads(json.dumps(self.answers[query]))
 
     def intent(self) -> dict[str, Any]:
@@ -179,7 +194,9 @@ def test_reconcile_matches_executed_trade_history(monkeypatch):
     fake = FakeKeeper(
         {
             keeper.INTENTS: intent_row("k2", "exec_pass"),
-            keeper.HISTORY: {"perp": {"tradeHistory": [row, {"intentKey": "x"}]}},
+            keeper.INTENT_HISTORY: {
+                "perp": {"tradeHistory": [row, {"intentKey": "x"}]}
+            },
         }
     )
     monkeypatch.setattr(keeper, "request", fake)
@@ -267,7 +284,6 @@ def test_live_market_order_refuses_a_closed_market(monkeypatch):
     ("action", "args"),
     [
         (trading.close_trade, {"trade_id": 3, "cancel_order": False}),
-        (trading.close_trade, {"trade_id": 3, "cancel_order": True}),
         (trading.set_leverage, {"trade_id": 3, "leverage": "4"}),
         (
             trading.set_tpsl,
@@ -286,9 +302,10 @@ def test_preview_is_exactly_what_is_submitted(
 ):
     fake = FakeKeeper()
     monkeypatch.setattr(keeper, "request", fake)
-    preview = action(ENDPOINT, no_session, dry_run=True, **args)
+    preview = action(ENDPOINT, session_for, dry_run=True, **args)
     assert preview["dryRun"] is True
-    result = action(ENDPOINT, session_for, dry_run=False, **args)
+    with keeper_server(PositionKeeperHandler) as lcd:
+        result = action(ENDPOINT, session_for, dry_run=False, lcd_endpoint=lcd, **args)
     assert result["status"] == "accepted"
     assert fake.intent() == preview["intent"]
 
@@ -313,22 +330,24 @@ def test_before_submit_sees_the_submitted_intent_and_can_refuse(monkeypatch):
     def refuse(_preview: dict[str, Any]) -> None:
         raise Refused
 
-    with pytest.raises(Refused):
+    with keeper_server(PositionKeeperHandler) as lcd, pytest.raises(Refused):
         trading.close_trade(
             ENDPOINT,
             session_for,
             trade_id=3,
             cancel_order=False,
             dry_run=False,
+            lcd_endpoint=lcd,
             before_submit=refuse,
         )
-    with pytest.raises(Refused):
+    with keeper_server(PositionKeeperHandler) as lcd, pytest.raises(Refused):
         trading.set_leverage(
             ENDPOINT,
             session_for,
             trade_id=3,
             leverage="4",
             dry_run=False,
+            lcd_endpoint=lcd,
             before_submit=refuse,
         )
     with pytest.raises(Refused):
@@ -356,7 +375,7 @@ def snapshots(monkeypatch, *collaterals: str) -> Iterator[margin.PositionSnapsho
             },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
-            "test-contract",
+            {"chainId": "test-1", "contractAddress": "test-contract"},
         )
         for amount in collaterals
     )

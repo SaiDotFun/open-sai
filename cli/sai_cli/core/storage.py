@@ -24,7 +24,36 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import log, paths
-from .errors import Code, SaiError, SessionError
+from .errors import Code, SaiError, SessionError, describe
+
+
+class IntentReservationError(SaiError):
+    """A local ledger failure prevented submission to Keeper."""
+
+    def __init__(
+        self,
+        cause: Exception | KeyboardInterrupt,
+        *,
+        intent_key: str | None = None,
+        hint: str | None = None,
+        account: str | None = None,
+    ) -> None:
+        if isinstance(cause, KeyboardInterrupt):
+            message, code = "Trade interrupted.", Code.INVALID_REQUEST
+        else:
+            failure = describe(cause)
+            detail = (
+                str(cause)
+                if isinstance(cause, (sqlite3.Error, OSError))
+                else failure.message
+            )
+            message = f"Could not reserve the trade intent. {detail}."
+            code = failure.code
+        message += " Nothing was sent."
+        if intent_key is not None:
+            message += " Sai could not verify or release the local reservation."
+        super().__init__(message, code, intent_key=intent_key, hint=hint)
+        self.account = account
 
 
 class UnresolvedIntent(SaiError, ValueError):
@@ -247,12 +276,30 @@ def save_session(session: dict[str, str]) -> None:
         accounts["sessions"][addr] = session
         accounts["active"] = addr
         _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def replace_session(previous: dict[str, str], session: dict[str, str]) -> None:
+    """Renew the same stored session without switching the active account."""
+    with _locked():
+        accounts = load_accounts()
+        addr = previous["evmAddress"].lower()
+        if accounts["sessions"].get(addr) != previous:
+            raise ValueError(
+                "Stored session changed during renewal. Run sai auth status."
+            )
+        accounts["sessions"][addr] = session
+        _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def _log_saved(session: dict[str, str], count: int) -> None:
     log.event(
         "session.saved",
         addr=session["evmAddress"],
         expiresAt=session["expiresAt"],
         endpoint=log.endpoint(session.get("endpoint")),
-        connectedAccounts=len(accounts["sessions"]),
+        connectedAccounts=count,
     )
 
 
@@ -439,11 +486,21 @@ def _check_open_pending(
         raise RecentOpenPending([row[0] for row in opens], endpoint, account)
 
 
+@contextmanager
+def _reservation_errors() -> Generator[None]:
+    try:
+        yield
+    except UnresolvedIntent:
+        raise
+    except (sqlite3.Error, OSError, ValueError, KeyboardInterrupt) as exc:
+        raise IntentReservationError(exc) from exc
+
+
 def check_open_pending(
     endpoint: str, account: str, *, allow_concurrent_open: bool
 ) -> None:
     """Refuse an already blocked open early. Reservation checks again."""
-    with contextlib.closing(db()) as connection:
+    with _reservation_errors(), contextlib.closing(db()) as connection:
         _check_open_pending(connection, endpoint, account, allow_concurrent_open)
 
 
@@ -458,7 +515,11 @@ def pending(
 ) -> None:
     opening = kind == "OPEN_TRADE"
     concurrent_open = opening and allow_concurrent_open
-    with db() as connection:
+    with _reservation_errors():
+        connection = db()
+    # Leave the error wrapper before committing. A commit error may have
+    # written the row, so the submitter must check the generated key.
+    with contextlib.closing(connection), connection, _reservation_errors():
         connection.execute("BEGIN IMMEDIATE")
         if opening:
             _check_open_pending(connection, endpoint, account, concurrent_open)
@@ -585,6 +646,19 @@ def list_pending(endpoint: str, account: str) -> list[dict[str, Any]]:
     return [{"intentKey": row[0], "kind": row[1], "status": row[2]} for row in rows]
 
 
+def intent_record(endpoint: str, key: str) -> tuple[str, str] | None:
+    """Return the recorded account and status for KEY on this endpoint."""
+    if not (home() / "intents.sqlite3").exists():
+        return None
+    with db() as connection:
+        row = connection.execute(
+            "SELECT account, COALESCE(keeper_status,status) FROM intents"
+            " WHERE id=? AND endpoint=?",
+            (key, endpoint),
+        ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
 def _key_time(key: str) -> float | None:
     """Read the reservation time embedded in an intent key, if it has one."""
     try:
@@ -592,6 +666,45 @@ def _key_time(key: str) -> float | None:
     except ValueError:
         return None
     return stamp.replace(tzinfo=UTC).timestamp()
+
+
+def unresolved_intents(endpoint: str, account: str) -> list[dict[str, Any]]:
+    """Read unknown, accepted, and pending intents without migrating a ledger."""
+    path = home() / "intents.sqlite3"
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return []
+    with contextlib.closing(
+        sqlite3.connect(
+            f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT.get()
+        )
+    ) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise ValueError("Intent database was written by a newer sai version")
+        created_column = "created_at" if version >= 1 else "NULL"
+        status = (
+            "COALESCE(keeper_status,status)"
+            if "keeper_status" in _intent_columns(connection)
+            else "status"
+        )
+        rows = connection.execute(
+            f"SELECT id, kind, {status}, entity, {created_column} FROM intents"
+            f" WHERE endpoint=? AND account=? AND {status} IN ('unknown', 'accepted', 'pending')"
+            " ORDER BY rowid DESC",
+            (endpoint, account.lower()),
+        ).fetchall()
+    return [
+        {
+            "intentKey": key,
+            "kind": kind,
+            "status": status,
+            "entity": entity,
+            "createdAt": created,
+        }
+        for key, kind, status, entity, created in rows
+    ]
 
 
 def mark_absent(

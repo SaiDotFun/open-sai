@@ -8,19 +8,26 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
-from sai_cli.core import keeper, margin, settings, storage, stream, update
+from sai_cli.core import confirmation, keeper, margin, settings, storage, stream, update
 from sai_cli.core import session as sessions
 from sai_cli.mcp_server import info as sai_info
 from sai_cli.mcp_server import server, tools
@@ -49,6 +56,7 @@ READ_TOOLS = {
     "account_positions",
     "account_history",
     "account_balances",
+    "account_overview",
     "intent_local",
     "intent_status",
     "preview_open",
@@ -58,6 +66,7 @@ READ_TOOLS = {
     "preview_margin",
     "preview_partial_close",
     "logs_intent",
+    "intent_wait",
 }
 LOCAL_TOOLS = {"mcp_info", "auth_status", "auth_list", "auth_use", "intent_local"}
 # Changes only which connected account is active on this machine.
@@ -115,9 +124,13 @@ class FakeKeeper:
         variables: dict[str, Any] | None = None,
         token: str | None = None,
         timeout: float = 20,
+        *,
+        attempt: keeper.RequestAttempt | None = None,
     ) -> dict[str, Any]:
         self.calls.append((query, variables))
         if query == keeper.SUBMIT:
+            if attempt is not None:
+                attempt.transport_started = True
             assert token == TOKEN and variables is not None
             envelope = variables["input"]
             self.submitted.append(envelope)
@@ -133,6 +146,11 @@ class FakeKeeper:
                     "evmAddress": ADDR,
                 }
             }
+        if query == keeper.POSITION and query not in self.answers:
+            assert variables is not None
+            return position_data(variables)
+        if query == keeper.ROUTE and query not in self.answers:
+            return POSITION_ROUTE
         return json.loads(json.dumps(self.answers[query]))
 
     def intent(self) -> dict[str, Any]:
@@ -144,8 +162,9 @@ class FakeKeeper:
 
 
 @pytest.fixture
-def mcp() -> FastMCP:
-    return server.create_server()
+def mcp() -> Iterator[FastMCP]:
+    with keeper_server(PositionKeeperHandler) as lcd:
+        yield server.create_server(settings.load(flags={"lcd.endpoint": lcd}))
 
 
 # Schema and listing
@@ -536,12 +555,12 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
             },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
-            "test-contract",
+            {"chainId": "test-1", "contractAddress": "test-contract"},
         )
         for amount in collaterals
     )
 
-    def snapshot(*args: Any) -> margin.PositionSnapshot:
+    def snapshot(*args: Any, **kwargs: Any) -> margin.PositionSnapshot:
         nonlocal current
         current = next(states)
         return current
@@ -578,7 +597,7 @@ def test_preview_open_is_exactly_what_trade_open_submits(mcp, monkeypatch):
     monkeypatch.setattr(keeper, "request", fake)
     preview = invoke(mcp, "preview_open", OPEN_ARGS)
     assert preview["dryRun"] is True
-    assert preview["previewDigest"] == tools.preview_digest(preview)
+    assert preview["previewDigest"] == confirmation.preview_digest(preview)
     assert fake.submitted == []
 
     result = invoke(
@@ -601,14 +620,14 @@ def test_digest_binds_account_and_reference_not_market_intent_price():
             },
         }
 
-    base = tools.preview_digest(market("5", "100", ADDR))
+    base = confirmation.preview_digest(market("5", "100", ADDR))
     # The refreshed intent price, reference spelling, and addr case don't
     # change what the user confirmed.
-    assert tools.preview_digest(market("6", "100.0", ADDR.upper())) == base
-    assert tools.preview_digest(market("5", "101", ADDR)) != base
-    assert tools.preview_digest(market("5", "100", OTHER)) != base
+    assert confirmation.preview_digest(market("6", "100.0", ADDR.upper())) == base
+    assert confirmation.preview_digest(market("5", "101", ADDR)) != base
+    assert confirmation.preview_digest(market("5", "100", OTHER)) != base
     limit = {"intent": {"kind": "OPEN_TRADE", "body": {"orderType": "limit"}}}
-    assert tools.preview_digest(limit) != tools.preview_digest(
+    assert confirmation.preview_digest(limit) != confirmation.preview_digest(
         {
             "intent": {
                 "kind": "OPEN_TRADE",
@@ -616,7 +635,7 @@ def test_digest_binds_account_and_reference_not_market_intent_price():
             }
         }
     )
-    assert len(tools.preview_digest(limit)) == 64
+    assert len(confirmation.preview_digest(limit)) == 64
 
 
 def test_trades_require_the_preview_digest(mcp):
@@ -634,7 +653,6 @@ PREVIEWS = (
     ("preview_open", OPEN_ARGS),
     ("preview_open", {**OPEN_ARGS, "order_type": "market", "price": None}),
     ("preview_close", {"trade_id": 7}),
-    ("preview_close", {"trade_id": 7, "cancel_order": True}),
     ("preview_tpsl", {"trade_id": 7, "take_profit": "120"}),
     ("preview_leverage", {"trade_id": 7, "leverage": "3"}),
     ("preview_margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
@@ -661,7 +679,8 @@ def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     storage.save_session(stored_session())
     fake = FakeKeeper({keeper.MARKETS: markets()})
     monkeypatch.setattr(keeper, "request", fake)
-    snapshots(monkeypatch, "4000000")
+    if name in ("preview_margin", "preview_partial_close"):
+        snapshots(monkeypatch, "4000000")
     preview = invoke(mcp, name, arguments)
     assert preview["dryRun"] is True
     assert len(preview["previewDigest"]) == 64
@@ -673,7 +692,6 @@ def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     ("name", "preview_args", "trade_args"),
     [
         ("close", {"trade_id": 7}, {"trade_id": 8}),
-        ("close", {"trade_id": 7}, {"trade_id": 7, "cancel_order": True}),
         (
             "leverage",
             {"trade_id": 7, "leverage": "3"},
@@ -990,7 +1008,7 @@ def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
     assert preview["addr"] is None
     storage.save_session(stored_session())
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)
@@ -1021,7 +1039,7 @@ def test_logout_during_the_refresh_refuses_a_confirmed_signed_in_trade(
     preview = invoke(mcp, "preview_open", MARKET_OPEN)
     assert preview["addr"] == ADDR
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)
@@ -1055,10 +1073,12 @@ def test_errors_redact_every_connected_token():
     assert tools.redact(text) == f"failed with {tools.REDACTED} and {tools.REDACTED}"
 
 
-def test_preview_without_a_session_names_no_account(mcp, monkeypatch):
-    monkeypatch.setattr(keeper, "request", FakeKeeper())
+def test_position_preview_requires_a_session(mcp, monkeypatch):
+    fake = FakeKeeper()
+    monkeypatch.setattr(keeper, "request", fake)
     preview = invoke(mcp, "preview_close", {"trade_id": 7})
-    assert preview["addr"] is None
+    assert preview["code"] == "SIGNED_OUT"
+    assert fake.calls == []
 
 
 def test_reference_price_is_only_for_market_orders(mcp, monkeypatch):
@@ -1200,7 +1220,7 @@ def test_lost_ack_reports_unknown_then_intent_status_reconciles(mcp, monkeypatch
     }
     fake.answers = {
         keeper.INTENTS: {"userIntents": [row]},
-        keeper.HISTORY: {"perp": {"tradeHistory": [trade]}},
+        keeper.INTENT_HISTORY: {"perp": {"tradeHistory": [trade]}},
     }
     status = invoke(mcp, "intent_status", {"key": key})
     assert status["matchedTradeHistory"] == [trade]
@@ -1296,19 +1316,27 @@ def test_logged_and_returned_errors_redact_the_session_token(mcp, monkeypatch, c
 
 def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
     monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s")
-    monkeypatch.setenv("SAI_LCD_ENDPOINT", "https://lcd.example/?apikey=s")
+    monkeypatch.setenv(
+        "SAI_LCD_ENDPOINT", "http://[::1]:9/fixture-lcd-path?key=fixture-lcd-query"
+    )
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")
     assert info["endpoints"] == {
         "keeper": "https://k.example:8443",
         "websocket": "wss://k.example:8443",
-        "lcd": "https://lcd.example/",
+        "lcd": "http://[::1]:9",
     }
     assert info["session"]["endpoint"] == "https://k.example"
     text = json.dumps(info)
-    for secret in ("user:pw", "key=", "apikey", "u:p@", "t=s"):
+    for secret in (
+        "user:pw",
+        "key=",
+        "fixture-lcd-path",
+        "fixture-lcd-query",
+        "u:p@",
+        "t=s",
+    ):
         assert secret not in text
-    assert settings.public_url("http://[::1]:9/q?x=1") == "http://[::1]:9/q"
 
 
 def test_mcp_info_reports_versions_without_network(mcp, monkeypatch):
@@ -1331,12 +1359,23 @@ def test_mcp_info_reports_versions_without_network(mcp, monkeypatch):
 def test_session_reports_never_include_the_token(mcp):
     storage.save_session(stored_session())
     status = invoke(mcp, "auth_status")
-    assert set(status) == {"addr", "expiresAt", "endpoint"}
-    assert status["addr"] == ADDR
-    assert status["endpoint"] == "https://sai-keeper.nibiru.fi"
+    assert set(status) == {
+        "addr",
+        "expiresAt",
+        "endpoint",
+        "expiryWarning",
+        "renewalCommand",
+    }
+    assert (status["addr"], status["endpoint"]) == (
+        ADDR,
+        ENDPOINT.removesuffix("/query"),
+    )
     info = invoke(mcp, "mcp_info")
     assert info["session"]["addr"] == ADDR
     assert info["session"]["usable"] is True
+    assert "expires in" in info["session"]["expiryWarning"]
+    assert info["session"]["renewalCommand"] == status["renewalCommand"]
+    assert "expiryWarning" in invoke(mcp, "auth_list")["accounts"][0]
     assert info["provenance"]["kind"] in ("source-checkout", "installed")
     assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"
 
@@ -1389,6 +1428,8 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
         "serve",
         "--endpoint",
         "http://127.0.0.1:9/query",
+        "--lcd-endpoint",
+        "http://127.0.0.1:8/fixture-lcd-path?key=fixture-lcd-query",
     ]
     with subprocess.Popen(
         command,
@@ -1423,8 +1464,13 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     info = json.loads(called["content"][0]["text"])
     assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
     assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
+    assert info["endpoints"]["lcd"] == "http://127.0.0.1:8"
     assert info["trading"]["reason"] == "signed-out"
     assert "agent client should launch it" not in stderr
+    logs = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.jsonl"))
+    assert '"event":"mcp.server_start"' in logs
+    for secret in ("fixture-lcd-path", "fixture-lcd-query"):
+        assert secret not in json.dumps(called) + stderr + logs
 
 
 def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):

@@ -1,8 +1,13 @@
 //! Trade previews and one reservation and submission path for CLI and MCP.
 
 mod actions;
+mod cancel;
 mod confirmation;
 mod position;
+mod position_change;
+mod update;
+
+use std::future::{Future, pending};
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -18,7 +23,10 @@ use crate::{
 
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
-pub use position::{MarginDirection, PositionAction, PositionMode, parse_partial_close_percent};
+pub use position_change::{
+    MarginDirection, PositionAction, PositionMode, parse_partial_close_percent,
+};
+pub use update::{leverage_preview, tpsl_preview};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TradeIntent {
@@ -55,6 +63,7 @@ pub struct TradePreview {
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
     position_route: Option<position::PositionRoute>,
+    estimates: Option<Value>,
 }
 
 impl TradePreview {
@@ -65,6 +74,7 @@ impl TradePreview {
             quote: None,
             warning: None,
             position_route: None,
+            estimates: None,
         }
     }
 
@@ -83,11 +93,20 @@ impl TradePreview {
         if let Some(warning) = self.warning {
             output["warning"] = json!(warning);
         }
+        if self.intent.kind == "CANCEL_PENDING_TRADE" {
+            output["estimates"] = cancel::estimates();
+        }
+        if let Some(estimates) = &self.estimates {
+            output["estimates"] = estimates.clone();
+        }
         output
     }
 
     pub fn confirmed_output(&self, account: Option<&str>) -> Value {
         let mut output = self.output(account);
+        if let Some(route) = &self.position_route {
+            output["positionRoute"] = json!(route);
+        }
         output["previewDigest"] = json!(preview_digest(self, account));
         output
     }
@@ -114,6 +133,7 @@ pub struct AcceptedTrade {
 /// Use the same Keeper endpoint for session validation, reservation, and submission.
 pub struct Trading<'a> {
     keeper: Keeper<'a>,
+    lcd_endpoint: Option<&'a str>,
     storage: &'a Storage<'a>,
     events: EventContext<'a>,
 }
@@ -122,15 +142,22 @@ impl<'a> Trading<'a> {
     pub fn new(endpoint: &'a str, storage: &'a Storage<'a>, events: EventContext<'a>) -> Self {
         Self {
             keeper: Keeper::new(endpoint, events),
+            lcd_endpoint: None,
             storage,
             events,
         }
     }
 
+    /// Select the LCD used for live contract checks and preview estimates.
+    pub fn with_lcd_endpoint(mut self, endpoint: &'a str) -> Self {
+        self.lcd_endpoint = Some(endpoint);
+        self
+    }
+
     pub fn load_session(&self, account: Option<&str>) -> Result<Session, SaiError> {
         Ok(self
             .storage
-            .load_active_session(self.keeper.endpoint(), account)?)
+            .load_active_trade_session(self.keeper.endpoint(), account)?)
     }
 
     pub fn check_open_pending(
@@ -153,28 +180,68 @@ impl<'a> Trading<'a> {
         preview: &TradePreview,
         options: SubmitOptions<'_>,
     ) -> Result<AcceptedTrade, SaiError> {
+        self.submit_with_reference_price(session, preview, options, pending())
+            .await
+            .map(|(accepted, _)| accepted)
+    }
+
+    /// Return the submitted market price and report an interruption during dispatch as unknown.
+    pub async fn submit_with_reference_price(
+        &self,
+        session: &Session,
+        preview: &TradePreview,
+        options: SubmitOptions<'_>,
+        interrupted: impl Future<Output = ()>,
+    ) -> Result<(AcceptedTrade, Option<String>), SaiError> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
-        self.storage.check_active(session, endpoint)?;
+        self.storage.check_active_trade(session, endpoint)?;
+        let cancelling = preview.intent.kind == "CANCEL_PENDING_TRADE";
+        let market = preview.requires_market_price_refresh();
+        if cancelling {
+            self.check_pending_order(session, preview).await?;
+        }
+        let update = if preview.is_standalone_position_update() {
+            Some(
+                self.preflight_position_update(account, preview, options.confirmation.is_some())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut prepared;
-        let preview = if preview.requires_market_price_refresh() {
-            let price = preview.reference_price.as_deref().ok_or_else(|| {
-                SaiError::new(
-                    Code::InvalidRequest,
-                    "Current open USDC market data is unavailable",
-                )
-            })?;
-            positive_decimal(price, "Current price")?;
+        let preview = if market {
             prepared = preview.clone();
+            self.refresh_market_open(&mut prepared).await?;
+            let price = prepared
+                .reference_price
+                .as_deref()
+                .ok_or_else(SaiError::internal)?;
+            positive_decimal(price, "Current price")?;
             prepared.intent.body["intentPrice"] = json!(price);
             &prepared
+        } else if let Some(update) = &update {
+            &update.preview
         } else {
             preview
         };
-        if let Some(confirmation) = options.confirmation {
-            // A logout or account expiry during a refresh invalidates confirmation.
-            self.load_session(Some(account))?;
-            confirmation.verify(preview, account)?;
+        // Live reads can outlast the session. Reload the pinned account
+        // before confirmation and reserve with its current token.
+        let reloaded;
+        let session = if cancelling || market || update.is_some() || options.confirmation.is_some()
+        {
+            reloaded = self.load_session(Some(account))?;
+            &reloaded
+        } else {
+            session
+        };
+        if let Some(confirmation) = options.confirmation
+            && let Err(error) = confirmation.verify(preview, account)
+        {
+            return Err(match update {
+                Some(update) => self.update_refusal(account, update, error).await,
+                None => error,
+            });
         }
 
         let (key, stamp) = intent_identity();
@@ -224,10 +291,16 @@ impl<'a> Trading<'a> {
             hint: Some(status_hint(&key)),
             ..SaiError::new(Code::OutcomeUnknown, message)
         };
-        let response = self
-            .keeper
-            .request(SUBMIT, variables, Some(session.token()), keeper::TIMEOUT)
-            .await;
+        let unknown_send = || {
+            unknown(format!(
+                "Outcome unknown for intent {key}; reconcile before another trade"
+            ))
+        };
+        let response = tokio::select! {
+            biased;
+            () = interrupted => return Err(unknown_send()),
+            response = self.keeper.request(SUBMIT, variables, Some(session.token()), keeper::TIMEOUT) => response,
+        };
         let ack = match response {
             Ok(ref data) if valid_ack(data.get("recordUserIntent"), &key, account) => {
                 &data["recordUserIntent"]
@@ -244,11 +317,7 @@ impl<'a> Trading<'a> {
                 error.intent_key = Some(key);
                 return Err(error);
             }
-            _ => {
-                return Err(unknown(format!(
-                    "Outcome unknown for intent {key}; reconcile before another trade"
-                )));
-            }
+            _ => return Err(unknown_send()),
         };
         let (hash, invalid_hash) = keeper::request_hash(&ack["txHash"]);
         self.events.event(
@@ -259,6 +328,7 @@ impl<'a> Trading<'a> {
                 ("kind", json!(kind).into()),
                 ("addr", json!(account).into()),
                 ("endpoint", Field::Endpoint(endpoint.into())),
+                ("endpointId", Field::endpoint_identity(endpoint)),
                 ("txHash", json!(hash).into()),
                 ("txHashInvalid", json!(invalid_hash.then_some(true)).into()),
             ],
@@ -268,11 +338,17 @@ impl<'a> Trading<'a> {
                 "Keeper accepted intent {key}, but the local ledger update failed; reconcile before another trade"
             )));
         }
-        Ok(AcceptedTrade {
-            intent_key: key,
-            status: "accepted",
-            message: "Accepted by Keeper; execution is not yet confirmed",
-        })
+        Ok((
+            AcceptedTrade {
+                intent_key: key,
+                status: "accepted",
+                message: "Accepted by Keeper; execution is not yet confirmed",
+            },
+            preview
+                .requires_market_price_refresh()
+                .then(|| preview.reference_price.clone())
+                .flatten(),
+        ))
     }
 
     fn record_status(&self, key: &str, account: &str, status: IntentStatus) -> bool {
@@ -292,6 +368,7 @@ impl<'a> Trading<'a> {
                 ("intentKey", json!(key).into()),
                 ("addr", json!(account).into()),
                 ("endpoint", Field::Endpoint(endpoint.into())),
+                ("endpointId", Field::endpoint_identity(endpoint)),
                 ("status", json!(status.as_str()).into()),
                 ("errorType", json!(error_type).into()),
             ],

@@ -9,15 +9,18 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import os
 import pty
+import secrets
 import subprocess
 import sys
 import termios
 import threading
 import time
 from collections.abc import Callable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -31,7 +34,6 @@ ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
 # Keeper sends the nonce as bare hex and the typed-data challenge with 0x.
 NONCE = "12" * 32
-SIGNATURE = "0x" + "1" * 130
 
 
 def make_token(addr: str = ADDR, hours: int = 720) -> str:
@@ -47,7 +49,9 @@ def make_token(addr: str = ADDR, hours: int = 720) -> str:
 class Env:
     """A temp SAI_HOME, a fake clipboard file, and a PATH of fake tools."""
 
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, command: tuple[str, ...] | None = None) -> None:
+        self.command = command or (sys.executable, "-m", "sai_cli")
+        self.extra_env: dict[str, str] = {}
         self.home = root / "sai-home"
         self.bin = root / "bin"
         self.clip = root / "clipboard.txt"
@@ -76,13 +80,14 @@ class Env:
             "SAI_HOME": str(self.home),
             "PATH": str(self.bin),
             "HOME": str(self.home),
+            **self.extra_env,
         }
 
     def run(
         self, *args: str, stdin: str | None = None
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [sys.executable, "-m", "sai_cli", *args],
+            [*self.command, *args],
             input=stdin,
             check=False,
             stdin=None if stdin is not None else subprocess.DEVNULL,
@@ -93,7 +98,11 @@ class Env:
         )
 
     def run_tty(
-        self, *args: str, typed: list[str | Callable[[], object]]
+        self,
+        *args: str,
+        typed: list[str | Callable[[], object]],
+        immediate_prompt: bool = False,
+        transcript: bytearray | None = None,
     ) -> tuple[int, str, str]:
         """Run with a pseudo-terminal on stdin and answer each hidden prompt.
 
@@ -102,10 +111,12 @@ class Env:
         previous answer, which `getpass` only does after reading it, and echo
         is off again for the next prompt. A callable entry runs once that
         next prompt is showing, before the line that answers it.
+        To check prompt ordering, send input immediately after seeing the prompt
+        and capture any echo from the PTY master separately from stderr.
         """
         primary, secondary = pty.openpty()
         proc = subprocess.Popen(
-            [sys.executable, "-m", "sai_cli", *args],
+            [*self.command, *args],
             stdin=secondary,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -128,18 +139,27 @@ class Env:
                 deadline = time.monotonic() + 20
                 while proc.poll() is None and time.monotonic() < deadline:
                     echo = termios.tcgetattr(primary)[3] & termios.ECHO
-                    if len(errors) > mark and not echo:
+                    if len(errors) > mark and (immediate_prompt or not echo):
                         break
                     time.sleep(0.01)
                 if callable(line):
                     line()
                     continue
+                if immediate_prompt:
+                    assert errors[mark:].endswith(b": "), "hidden prompt did not appear"
                 os.write(primary, (line + "\n").encode())
+                if immediate_prompt:
+                    assert not echo, "terminal echo was enabled at the prompt"
                 mark = len(errors)
             assert proc.stdout
             stdout = proc.stdout.read()
             proc.wait(timeout=30)
             reader.join(timeout=5)
+            if transcript is not None:
+                os.set_blocking(primary, False)
+                with suppress(BlockingIOError, OSError):
+                    while chunk := os.read(primary, 4096):
+                        transcript.extend(chunk)
         finally:
             proc.kill()
             os.close(primary)
@@ -475,13 +495,13 @@ def test_tampered_session_cannot_be_unlocked(env: Env) -> None:
     assert "Cannot unlock session; run `sai auth import`" in result.stderr
 
 
-def typed_data(**overrides) -> dict:
+def typed_data(*, chain_id: int | None = None, **overrides) -> dict:
+    domain: dict[str, str | int] = {"name": "Sai", "version": "1"}
     data: dict[str, Any] = {
         "types": {
             "EIP712Domain": [
                 {"name": "name", "type": "string"},
                 {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
             ],
             "UserTradingSession": [
                 {"name": "account", "type": "address"},
@@ -491,14 +511,17 @@ def typed_data(**overrides) -> dict:
             ],
         },
         "primaryType": "UserTradingSession",
-        "domain": {"name": "Sai", "version": "1", "chainId": 6900},
+        "domain": domain,
         "message": {
             "account": ADDR,
             "challenge": "0x" + NONCE,
             "action": "Enable Sai trading",
-            "expiresAt": "2026-11-17T00:05:00Z",
+            "expiresAt": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         },
     }
+    if chain_id is not None:
+        data["types"]["EIP712Domain"].append({"name": "chainId", "type": "uint256"})
+        domain["chainId"] = chain_id
     for key, value in overrides.items():
         section, _, field = key.partition("__")
         if field:
@@ -528,38 +551,93 @@ def test_check_session_typed_data_accepts_keeper_challenge() -> None:
     keeper.check_session_typed_data(typed_data(), ADDR.upper(), NONCE.upper())
 
 
+def fixture_signature(data: dict) -> str:
+    """Build a signer-shaped fixture signature bound to the typed challenge."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return "0x" + hashlib.sha512(encoded).hexdigest() + "1b"
+
+
+def fixture_exchange(state: dict) -> dict[str, str]:
+    issued = state["issued"]
+    return {
+        "challenge": issued["nonce"],
+        "signature": fixture_signature(issued["typedData"]),
+    }
+
+
 @pytest.fixture
 def keeper_auth():
-    """Serve Keeper's challenge and session mutations on loopback."""
+    """Serve Keeper's challenge and session mutations on loopback.
+
+    Keeper owns signature verification, expiry, chain agreement, and replay
+    prevention. The client signs only after checking the challenge identity.
+    """
     state: dict[str, Any] = {
         "typed": typed_data(),
+        "challenge_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
+        "challenge_addr": None,
+        "pending": False,
         "token": make_token(),
+        "expires_at": (datetime.now(UTC) + timedelta(days=30)).isoformat(),
+        "requests": [],
+        "paths": [],
         "signatures": [],
     }
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if "createUserIntentAuthChallenge" in body["query"]:
-                data = {
-                    "createUserIntentAuthChallenge": {
-                        "nonce": NONCE,
-                        "evmAddress": body["variables"]["address"],
-                        "expiresAt": "2026-11-17T00:05:00Z",
-                        "chainId": 6900,
-                        "typedData": state["typed"],
-                    }
+            state["requests"].append(body)
+            state["paths"].append(self.path)
+            query, variables = body["query"], body["variables"]
+            if query == keeper.CHALLENGE:
+                nonce = secrets.token_hex(32)
+                typed = json.loads(json.dumps(state["typed"]))
+                if typed["message"]["challenge"] == "0x" + NONCE:
+                    typed["message"]["challenge"] = "0x" + nonce
+                expiry = state["challenge_expires_at"]
+                typed["message"]["expiresAt"] = expiry
+                issued = {
+                    "nonce": nonce,
+                    "evmAddress": state["challenge_addr"] or variables["address"],
+                    "expiresAt": expiry,
+                    "chainId": "6900",
+                    "typedData": typed,
                 }
+                state.update(issued=issued, pending=True)
+                reply = {"data": {"createUserIntentAuthChallenge": issued}}
+            elif query == keeper.SESSION:
+                state["signatures"].append(variables)
+                live = state["pending"] and (
+                    datetime.fromisoformat(state["issued"]["expiresAt"])
+                    > datetime.now(UTC)
+                )
+                state["pending"] = False
+                issued = state.get("issued")
+                chain_matches = False
+                if issued is not None:
+                    domain = issued["typedData"]["domain"]
+                    chain_matches = (
+                        "chainId" not in domain
+                        or str(domain["chainId"]) == issued["chainId"]
+                    )
+                if live and chain_matches and variables == fixture_exchange(state):
+                    reply = {
+                        "data": {
+                            "createUserIntentSession": {
+                                "token": state["token"],
+                                "evmAddress": ADDR,
+                                "expiresAt": state["expires_at"],
+                            }
+                        }
+                    }
+                else:
+                    reply = {
+                        "errors": [{"message": "Expired or invalid fixture challenge"}]
+                    }
             else:
-                state["signatures"].append(body["variables"])
-                data = {
-                    "createUserIntentSession": {
-                        "token": state["token"],
-                        "evmAddress": ADDR,
-                        "expiresAt": "2026-12-17T00:00:00+00:00",
-                    }
-                }
-            encoded = json.dumps({"data": data}).encode()
+                reply = {"errors": [{"message": "Unsupported fixture operation"}]}
+            encoded = json.dumps(reply).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
@@ -579,17 +657,79 @@ def keeper_auth():
     thread.join()
 
 
-def fake_cast(env: Env) -> None:
+def test_keeper_fixture_uses_expiries_relative_to_now(keeper_auth) -> None:
+    now = datetime.now(UTC)
+    session_expiry = datetime.fromisoformat(keeper_auth["expires_at"])
+    challenge_expiry = datetime.fromisoformat(keeper_auth["challenge_expires_at"])
+    assert now + timedelta(days=29) < session_expiry <= now + timedelta(days=30)
+    assert now < challenge_expiry <= now + timedelta(minutes=5)
+
+
+@pytest.mark.parametrize("fault", ["expired", "signature"])
+def test_keeper_fixture_rejects_expired_or_unbound_signatures(
+    keeper_auth, fault
+) -> None:
+    if fault == "expired":
+        keeper_auth["challenge_expires_at"] = "2000-01-01T00:00:00Z"
+    endpoint = keeper_auth["endpoint"]
+    data = keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    issued = data["createUserIntentAuthChallenge"]
+    signature = (
+        fixture_signature(issued["typedData"])
+        if fault == "expired"
+        else "0x" + "1" * 130
+    )
+    with pytest.raises(keeper.KeeperError, match="Keeper rejected the request"):
+        keeper.request(
+            endpoint,
+            keeper.SESSION,
+            {"signature": signature, "challenge": issued["nonce"]},
+        )
+
+
+def test_keeper_fixture_rejects_a_consumed_challenge(keeper_auth) -> None:
+    endpoint = keeper_auth["endpoint"]
+    keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    exchange = fixture_exchange(keeper_auth)
+    accepted = keeper.request(endpoint, keeper.SESSION, exchange)
+    assert accepted["createUserIntentSession"]["evmAddress"] == ADDR
+    with pytest.raises(keeper.KeeperError, match="Keeper rejected the request"):
+        keeper.request(endpoint, keeper.SESSION, exchange)
+
+
+def test_keeper_fixture_accepts_challenge_without_signed_chain_id(keeper_auth) -> None:
+    typed = keeper_auth["typed"]
+    typed["domain"].pop("chainId", None)
+    typed["types"]["EIP712Domain"] = [
+        field for field in typed["types"]["EIP712Domain"] if field["name"] != "chainId"
+    ]
+    endpoint = keeper_auth["endpoint"]
+    challenge = keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    issued = challenge["createUserIntentAuthChallenge"]
+    assert "chainId" not in issued["typedData"]["domain"]
+    accepted = keeper.request(endpoint, keeper.SESSION, fixture_exchange(keeper_auth))
+    assert accepted["createUserIntentSession"]["evmAddress"] == ADDR
+    assert issued["chainId"] == "6900"
+
+
+def fake_cast(
+    env: Env, *, diagnostics: bool = False, signature: str | None = None
+) -> None:
     env.tool(
         "cast",
-        "import json\n"
-        "args = sys.argv[1:]\n"
+        "import hashlib, json, os, stat\n"
+        + inspect.getsource(fixture_signature)
+        + "args = sys.argv[1:]\n"
         "if args[:2] == ['wallet', 'address']:\n"
+        f"    if {diagnostics!r}: print('Fixture Cast address', file=sys.stderr)\n"
         f"    print({ADDR!r})\n"
         "elif args[:2] == ['wallet', 'sign']:\n"
+        f"    if {diagnostics!r}: print('Fixture Cast sign', file=sys.stderr)\n"
+        "    assert stat.S_IMODE(os.stat(os.path.dirname(args[-1])).st_mode) == 0o700\n"
+        "    assert stat.S_IMODE(os.stat(args[-1]).st_mode) == 0o600\n"
         "    data = json.load(open(args[-1]))\n"
         "    assert data['primaryType'] == 'UserTradingSession'\n"
-        f"    print({SIGNATURE!r})\n"
+        f"    print(fixture_signature(data) if {signature is None!r} else {signature!r})\n"
         "else:\n"
         "    sys.exit(2)\n",
     )
@@ -623,7 +763,7 @@ def test_cast_login_derives_addr_and_signs(env: Env, keeper_auth) -> None:
     calls = env.log.read_text().splitlines()
     assert calls[0].endswith("cast wallet address --account dev")
     assert " wallet sign --account dev --data --from-file " in calls[1]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
     status = env.run("--json", "--endpoint", keeper_auth["endpoint"], "auth", "status")
     assert status.returncode == 0, status.stderr
 
@@ -736,8 +876,9 @@ def fake_ud(
     }
     env.tool(
         "ud",
-        "import json\n"
-        "args = sys.argv[1:]\n"
+        "import hashlib, json\n"
+        + inspect.getsource(fixture_signature)
+        + "args = sys.argv[1:]\n"
         f"if args[:3] == ['evm', 'wallet', 'show'] and {down!r}:\n"
         "    sys.exit('Error: gpg: decryption failed: No secret key')\n"
         f"elif args[:3] == ['evm', 'wallet', 'show'] and args[3] == {known!r}:\n"
@@ -756,7 +897,7 @@ def fake_ud(
         "    assert args[7:9] == ['--data', '--from-file']\n"
         "    data = json.load(open(args[-1]))\n"
         "    assert data['primaryType'] == 'UserTradingSession'\n"
-        f"    print({SIGNATURE!r})\n"
+        "    print(fixture_signature(data))\n"
         "elif args[:3] == ['evm', 'wallet', 'show']:\n"
         "    sys.exit(f'Error: wallet {args[3]} is not in pass entry evm/wallets')\n"
         "else:\n"
@@ -775,6 +916,142 @@ def login_error(result: subprocess.CompletedProcess[str]) -> str:
     return json.loads(result.stdout)["error"]["message"]
 
 
+def test_renew_uses_saved_name_and_preserves_active_account(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, name="saved-key", addr=ADDR)
+    endpoint = keeper_auth["endpoint"]
+    assert login(env, keeper_auth, "saved-key").returncode == 0
+    env.clipboard()
+    env.clip.write_text(make_token(OTHER))
+    assert env.run("--endpoint", endpoint, "auth", "import").returncode == 0
+
+    keeper_auth["token"] = make_token(hours=1440)
+    renewed = env.run("--json", "--endpoint", endpoint, "auth", "renew", ADDR)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["addr"] == ADDR
+    assert keeper_auth["token"] not in renewed.stdout + renewed.stderr
+    assert env.log.read_text().count(" wallet sign --account saved-key ") == 2
+    status = env.run("--json", "--endpoint", endpoint, "auth", "status")
+    assert json.loads(status.stdout)["addr"] == OTHER
+
+    refused = env.run("--endpoint", endpoint, "auth", "renew")
+    assert refused.returncode == 1
+    assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in refused.stderr
+    assert "auth import" in refused.stderr
+    assert endpoint not in refused.stderr
+    assert len(keeper_auth["signatures"]) == 2
+
+
+def test_renew_refuses_a_key_that_changed_address(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    assert login(env, keeper_auth, "dev").returncode == 0
+    keystore(env, addr=OTHER)
+    result = env.run("--endpoint", keeper_auth["endpoint"], "auth", "renew")
+    assert result.returncode == 1
+    assert "does not match the wallet addr" in result.stderr
+    assert len(keeper_auth["signatures"]) == 1
+
+
+def test_cli_status_and_list_report_expiry_warnings(env: Env):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    status = env.run("--json", "auth", "status")
+    result = env.run("--json", "auth", "list")
+    row = json.loads(result.stdout)["accounts"][0]
+    assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
+    renewal = row["renewalCommand"]
+    assert renewal.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert "auth import" in renewal
+    assert keeper.MAINNET_HTTP not in renewal
+    assert status.stderr == result.stderr == ""
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    primary, secondary = pty.openpty()
+    flags = ["--json"] if json_output else []
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sai_cli",
+                *flags,
+                "config",
+                "get",
+                "keeper.endpoint",
+            ],
+            env={**env.vars(), "CI": "1"},
+            stdin=secondary,
+            stderr=secondary,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        os.set_blocking(primary, False)
+        try:
+            error = os.read(primary, 4096).decode()
+        except BlockingIOError:
+            error = ""
+    finally:
+        os.close(primary)
+        os.close(secondary)
+    assert "expires in" not in result.stdout
+    if json_output:
+        assert error == ""
+    else:
+        assert len(error.splitlines()) == 1
+        assert "expires in" in error
+        assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error
+        assert "auth import" in error
+        assert keeper.MAINNET_HTTP not in error
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["/query?api_key=synthetic-test-credential", "/synthetic-test-credential/query"],
+)
+def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
+    env: Env, suffix: str
+):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    origin = "http://127.0.0.1:9876"
+    endpoint = origin + suffix
+    args = ("--json", "--endpoint", endpoint, "auth")
+    assert env.run(*args, "import").returncode == 0
+    status = env.run(*args, "status")
+    row = json.loads(status.stdout)
+    assert row["endpoint"] == origin
+    assert f"reuse the Keeper endpoint at {origin}" in row["renewalCommand"]
+    refused = env.run(*args, "renew")
+    assert refused.returncode == 1
+    assert "reuse the Keeper endpoint" in login_error(refused)
+    assert (
+        "synthetic-test-credential"
+        not in status.stdout + refused.stdout + refused.stderr
+    )
+
+
+def test_renew_json_shows_only_the_keeper_origin(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    origin = keeper_auth["endpoint"].removesuffix("/query")
+    endpoint = f"{origin}/synthetic-test-credential/query"
+    args = ("--json", "--endpoint", endpoint, "auth")
+    assert env.run(*args, "login", "dev").returncode == 0
+    result = env.run(*args, "renew")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["endpoint"] == origin
+    assert "synthetic-test-credential" not in result.stdout
+
+
 def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
     fake_ud(env)
     result = login(env, keeper_auth, "dev")
@@ -785,7 +1062,7 @@ def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
     calls = env.log.read_text().splitlines()
     assert calls[0].endswith("ud evm wallet show dev")
     assert " evm wallet run dev -- wallet sign --data --from-file " in calls[1]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
     status = env.run("--json", "--endpoint", keeper_auth["endpoint"], "auth", "status")
     assert status.returncode == 0, status.stderr
 
@@ -966,7 +1243,7 @@ def test_cast_signs_in_a_terminal_when_ud_cannot_unlock_the_keystore(
     calls = env.log.read_text().splitlines()
     assert " evm wallet run dev -- wallet sign " in calls[1]
     assert " wallet sign --account dev --data --from-file " in calls[2]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
 
 
 @pytest.mark.parametrize(
