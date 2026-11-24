@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 from sai_cli.core import keeper
+from scenarios import ADDRESS, INTENT, loopback
 from test_intent_status import (
     ADDR,
     CLI,
@@ -22,6 +23,7 @@ from test_intent_status import (
     seed,
     wire,
 )
+from test_mcp_stdio import server
 
 
 @pytest.fixture
@@ -176,6 +178,38 @@ def test_malformed_unicode_hash_cannot_resolve_pending_intent(
     assert output["outcome"] == "pending"
     assert output["matchedTradeHistory"] == []
     assert output["userIntents"][0]["txHashInvalid"] is True
+
+
+@pytest.mark.parametrize("pending", [False, True], ids=["executed", "pending"])
+def test_mcp_equal_malformed_hash_uses_one_history_page(
+    release_pair: tuple[CLI, CLI], tmp_path: Path, pending: bool
+) -> None:
+    scenario = "mcp-pending-malformed-hash" if pending else "normal"
+    for index, (cli,) in enumerate(release_pair):
+        native = index == 1
+        home = tmp_path / str(index)
+        with (
+            loopback(scenario) as endpoints,
+            server(Path(cli), home, endpoints, seed="ledger") as stdio,
+        ):
+            result = stdio.call(2, "intent_status", addr=ADDRESS, key=INTENT)
+            assert result["isError"] is False
+            assert not endpoints.errors
+            assert [request.label for request in endpoints.wire] == [
+                "userIntents",
+                "intentTradeHistory",
+            ]
+            assert endpoints.wire[1].variables == {
+                "trader": ADDRESS,
+                "limit": 25,
+                "offset": 0,
+            }
+        document = json.loads(result["content"][0]["text"])
+        assert document["userIntents"][0]["txHashInvalid"] is True
+        # History can corroborate a fill only with a validated transaction hash.
+        assert len(document["matchedTradeHistory"]) == (0 if native else 1)
+        [row] = read_state(home / "sai")[3]
+        assert (row[7] or row[4]) == ("pending" if native and pending else "terminal")
 
 
 @pytest.mark.parametrize(

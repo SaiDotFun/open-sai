@@ -429,11 +429,17 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
     if hash.is_empty() {
         return Vec::new();
     }
-    // Preserve the release's reads for a nonempty hash, but require valid
-    // transaction evidence before allowing a match to release the ledger.
-    let valid_hash =
-        (hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(&hash);
+    // Use the release's matching rules to decide when to stop reading.
+    // Only a valid transaction hash can supply fill evidence.
+    let history = scan_history(context, row, &hash).await;
+    if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        history
+    } else {
+        Vec::new()
+    }
+}
 
+async fn scan_history(context: &KeyedIntent<'_>, row: &Value, hash: &str) -> Vec<Value> {
     let started = Instant::now();
     let budget = context.poll.timeout.min(HISTORY_TIMEOUT);
     let remaining = || {
@@ -491,11 +497,9 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
             for item in history {
                 if item["intentKey"] == context.key
                     && account_matches(&item["trade"]["trader"], context.account)
-                    && valid_hash.is_some_and(|hash| {
-                        ["txHash", "evmTxHash"]
-                            .iter()
-                            .any(|field| normalize_hash(&item[*field]) == *hash)
-                    })
+                    && ["txHash", "evmTxHash"]
+                        .iter()
+                        .any(|field| normalize_hash(&item[*field]) == hash)
                     && history_integer(&item["id"]).is_none_or(|id| seen.insert(id))
                 {
                     found.push(item.clone());
