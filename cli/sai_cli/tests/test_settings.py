@@ -343,12 +343,12 @@ def test_public_view_redacts_urls():
     shown = settings.public(result)
     assert list(shown) == list(settings.KEYS)
     assert shown["keeper.endpoint"] == {
-        "value": "https://k.example/q",
+        "value": "https://k.example",
         "source": "flag",
         "env": "SAI_ENDPOINT",
-        "default": keeper.MAINNET_HTTP,
+        "default": "https://sai-keeper.nibiru.fi",
     }
-    assert shown["keeper.ws_endpoint"]["value"] == "wss://k.example/q"
+    assert shown["keeper.ws_endpoint"]["value"] == "wss://k.example"
     assert shown["keeper.ws_endpoint"]["default"] is None
     assert shown["lcd.endpoint"]["value"] == "https://lcd.example/"
     assert shown["update.auto"] == {

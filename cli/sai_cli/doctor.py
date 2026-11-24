@@ -9,8 +9,8 @@ and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
 
-Every string leaves through `tools.redact` and every URL through
-`settings.public_url`, so the session token is never printed.
+Rendered diagnostics redact session tokens. Keeper endpoints are shown as
+origins.
 
 To add a check, write a function that takes a `Context` and returns a
 `Check` or a list of them (a check that repeats, such as one per MCP client),
@@ -35,6 +35,8 @@ from datetime import UTC, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
 from typing import Any
+
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from . import mcp_install
 from .core import (
@@ -215,13 +217,6 @@ def short(addr: str) -> str:
 
 def plural(count: int, noun: str) -> str:
     return f"{count} {noun}{'' if count == 1 else 's'}"
-
-
-def endpoint_flag(config: Settings) -> str:
-    """The `--endpoint` flag a fix command needs, or "" for mainnet."""
-    if config.endpoint == keeper.MAINNET_HTTP:
-        return ""
-    return f"--endpoint {public_url(config.endpoint)} "
 
 
 # Local checks
@@ -741,13 +736,25 @@ def check_session(ctx: Context) -> Check:
             details,
         )
     if not state["endpointMatches"]:
+        login = storage.keeper_command_hint(
+            ctx.config.endpoint, "auth", "login", "NAME"
+        )
+        stored_origin = state["endpoint"]
+        if stored_origin is None:
+            return Check(
+                "session",
+                "fail",
+                f"Session for {short(addr)} has no stored Keeper endpoint",
+                login,
+                details,
+            )
         return Check(
             "session",
             "fail",
-            f"Session for {short(addr)} belongs to {state['endpoint']}, not"
-            f" {public_url(ctx.config.endpoint)}",
-            f"sai {endpoint_flag(ctx.config)}auth login NAME, or run"
-            f" sai with --endpoint {state['endpoint']}",
+            f"Session for {short(addr)} belongs to a different Keeper endpoint."
+            f" Stored origin {stored_origin}, configured origin"
+            f" {log.origin(ctx.config.endpoint)}",
+            f"{login}, or restore the Keeper URL used to sign in",
             details,
         )
     left = datetime.fromisoformat(state["expiresAt"]) - ctx.now
@@ -1108,7 +1115,7 @@ def intents_status(
             "intents",
             "fail",
             f"{len(blocking)} unknown {noun} trading for {short(addr)}",
-            f"sai {endpoint_flag(ctx.config)}intent status {addr} --key {blocking[0]}",
+            storage.intent_status_hint(ctx.config.endpoint, addr, blocking[0]),
             details,
         )
     if others:
@@ -1141,7 +1148,7 @@ def elapsed_ms(start: float) -> int:
 
 
 def check_keeper(ctx: Context) -> Check:
-    url = public_url(ctx.config.endpoint)
+    url = log.origin(ctx.config.endpoint)
     start = time.monotonic()
     try:
         route = keeper.request(
@@ -1170,16 +1177,17 @@ def check_keeper(ctx: Context) -> Check:
 
 
 def check_websocket(ctx: Context) -> Check:
-    try:
-        ws = ctx.config.ws_endpoint
-    except stream.StreamError as exc:
-        return Check("websocket", "fail", str(exc), "Pass --ws-endpoint")
-    url = public_url(ws)
+    ws = ctx.config.ws_endpoint
+    url = log.origin(ws)
     start = time.monotonic()
     try:
         stream.handshake(ws, NETWORK_TIMEOUT)
     except (stream.StreamError, *stream.DISCONNECTS) as exc:
-        reason = str(exc) or type(exc).__name__
+        reason = type(exc).__name__
+        if isinstance(exc, ConnectionClosed) and exc.rcvd is not None:
+            reason += f" (close code {exc.rcvd.code})"
+        elif isinstance(exc, InvalidStatus):
+            reason += f" (HTTP status {exc.response.status_code})"
         return Check(
             "websocket",
             "fail",

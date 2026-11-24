@@ -1318,8 +1318,8 @@ def config_file() -> Path:
 def config_list(ctx: click.Context) -> None:
     """Show every setting with its value and source.
 
-    The source is flag, env, file, default, or derived. URLs are shown
-    without credentials; `sai config get` prints the exact value.
+    The source is flag, env, file, default, or derived. Keeper URLs are
+    shown as origins. `sai config get` prints the exact value.
     """
     shown = sai_settings.public(settings(ctx))
     if ctx.obj["json"]:
@@ -1831,7 +1831,7 @@ def logs_tail(
     """Show the most recent events, oldest first.
 
     Plain output is one line per event: time (UTC), surface, level, event,
-    then its fields. With --json, each line is the stored JSON object.
+    then its fields. With --json, each line is a JSON object.
 
     \b
     Examples:
