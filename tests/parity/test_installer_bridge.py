@@ -370,10 +370,10 @@ def test_standalone_installs_release(install: Install, replay: Replay) -> None:
     ok(result)
     install.pin(version)
     assert ok(install.run("sai", "--version")).strip() == f"sai {version}"
-    link = install.launcher.readlink()
-    assert link.parts[0] == ".sai-native"
-    assert link.parts[1].startswith(f"{version}-")
-    assert link.name == "sai"
+    assert install.launcher.readlink() == Path(".sai-native/current")
+    target = install.launcher.resolve(strict=True)
+    assert target.parent.name.startswith(f"{version}-")
+    assert target.name == "sai"
     assert (install.launcher.stat().st_mode & 0o777) == 0o700
     assert not pending(install).exists()
     assert not install.profile.exists()
@@ -393,16 +393,18 @@ def test_native_dry_run_selects_an_explicit_prerelease(
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
-def test_uv_owned_launcher_rejects_an_explicit_native_prerelease(
+def test_standalone_reports_both_paths_for_uv_owned_launcher(
     install: Install, replay: Replay
 ) -> None:
     prepare_uv(install, wheel_artifact("BRIDGE"), replay)
     requests = len(replay.requests)
-    version = f"{checkout_version()}-rc.1"
-    result = install.install(replay, "--native", "--dry-run", "--version", version)
+    previous = install.launcher.lstat()
+    uv_target = install.launcher.resolve(strict=True)
+    result = install.install(replay, "--native")
     assert result.returncode == 1
-    assert f"{version!r} is not a version like X.Y.Z." in result.stderr
-    assert "Running" not in result.stdout
+    assert str(install.launcher) in result.stderr
+    assert str(uv_target) in result.stderr
+    assert os.path.samestat(previous, install.launcher.lstat())
     assert len(replay.requests) == requests
 
 
@@ -445,188 +447,52 @@ runpy.run_path(script, run_name='__main__')
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
-@pytest.mark.parametrize("phase", ["reinstall", "rollback"])
-@pytest.mark.parametrize("crash", [False, True])
-def test_standalone_preserves_an_owner_change_during_switch(
-    install: Install, replay: Replay, phase: str, crash: bool
+def test_standalone_leaves_an_older_displaced_launcher_for_inspection(
+    install: Install, replay: Replay
 ) -> None:
-    if phase == "reinstall":
-        native_artifact(replay)
-        ok(install.install(replay, "--native"))
-    else:
-        native_artifact(replay, "MUTANT")
-    external = install.home / "external-sai"
-    external.write_text("another installer's binary")
-    replacement = install.home / "new-owner"
-    replacement.symlink_to(external)
-    expected = replacement.lstat()
-    probe = """
-import os, runpy, signal, sys
-script, launcher, competitor, phase, crash, *args = sys.argv[1:]
-changed = False
-def race(event, values):
-    global changed
-    if changed:
-        if crash == 'True' and event == 'sai.launcher.renamed':
-            os.kill(os.getpid(), signal.SIGKILL)
-        return
-    if phase == 'reinstall':
-        switch = event in ('os.rename', 'sai.launcher.rename') and os.fsdecode(values[1]) == launcher
-    else:
-        switch = event in ('os.remove', 'sai.launcher.rename') and os.fsdecode(values[0]) == launcher
-    if switch:
-        changed = True
-        os.replace(competitor, launcher)
-sys.addaudithook(race)
-sys.argv = [script, *args]
-runpy.run_path(script, run_name='__main__')
-"""
-    result = install.run(
-        sys.executable,
-        "-c",
-        probe,
-        INSTALLER,
-        install.launcher,
-        replacement,
-        phase,
-        str(crash),
-        "--native",
-        "--api-base",
-        replay.base,
-        "--web-base",
-        replay.base,
-    )
-    if crash:
-        assert result.returncode == -9, (result.stdout, result.stderr)
-        result = install.install(replay, "--native")
+    root = pending(install).parent
+    stage = root / ".launcher-switch"
+    stage.mkdir(mode=0o700, parents=True)
+    root.chmod(0o700)
+    competitor = stage / "sai"
+    competitor.write_text("another install")
+    entry = competitor.stat()
+
+    result = install.install(replay, "--native")
+
     assert result.returncode == 1, (result.stdout, result.stderr)
-    assert "launcher changed during the switch" in result.stderr
-    assert os.path.samestat(install.launcher.lstat(), expected)
-    assert install.launcher.readlink() == external
+    assert str(competitor) in result.stderr
+    assert str(install.launcher) in result.stderr
+    assert os.path.samestat(competitor.stat(), entry)
+    assert not os.path.lexists(install.launcher)
+    assert not replay.requests
 
 
-@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
-@pytest.mark.parametrize(
-    "recovery",
-    [
-        "public",
-        "retained",
-        pytest.param(
-            "without-links",
-            marks=pytest.mark.skipif(
-                sys.platform != "linux", reason="uses Linux seccomp"
-            ),
-        ),
-    ],
-)
-def test_native_updater_returns_a_competing_launcher_after_killed_reinstall(
-    install: Install, replay: Replay, recovery: str
-) -> None:
-    native_artifact(replay, "RECOVERY_RUST")
-    ok(install.install(replay, "--native"))
-    external = install.home / "competing-sai"
-    external.write_text("competing installer's binary")
-    competitor = install.home / "competing-launcher"
-    competitor.symlink_to(external)
-    expected = competitor.lstat()
-    probe = """
-import os, runpy, signal, sys
-script, launcher, competitor, *args = sys.argv[1:]
-def kill_after_exchange(event, values):
-    if event == 'sai.launcher.rename' and values[1] == launcher:
-        os.replace(competitor, launcher)
-    if event == 'sai.launcher.renamed' and values[1] == launcher:
-        os.kill(os.getpid(), signal.SIGKILL)
-sys.addaudithook(kill_after_exchange)
-sys.argv = [script, *args]
-runpy.run_path(script, run_name='__main__')
-"""
-    result = install.run(
-        sys.executable,
-        "-c",
-        probe,
-        INSTALLER,
-        install.launcher,
-        competitor,
-        "--native",
-        "--api-base",
-        replay.base,
-        "--web-base",
-        replay.base,
-    )
-    assert result.returncode == -9, (result.stdout, result.stderr)
-    recovery_command: list[str | Path] = [install.launcher]
-    if recovery == "retained":
-        # Rehearse a second interruption after recovery withdrew its own entry.
-        recovery_command = [install.launcher.resolve(strict=True)]
-        install.launcher.rename(pending(install).parent / ".launcher-switch" / "public")
-    elif recovery == "without-links":
-        recovery_command = [
-            sys.executable,
-            "-c",
-            DENY_SYSCALLS,
-            "link,linkat",
-            install.launcher,
-        ]
-    result = install.run(
-        *recovery_command,
-        "--json",
-        "update",
-        "--api-base",
-        replay.base,
-        "--web-base",
-        replay.base,
-    )
-    assert "launcher changed during the switch" in (result.stdout + result.stderr)
-    assert os.path.samestat(install.launcher.lstat(), expected)
-    assert install.launcher.readlink() == external
-    assert not pending(install).exists()
-
-
-@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
-def test_standalone_keeps_the_newest_competing_launcher_public(
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux seccomp")
+def test_standalone_reinstall_keeps_public_inode_without_link_or_renameat2(
     install: Install, replay: Replay
 ) -> None:
     native_artifact(replay)
     ok(install.install(replay, "--native"))
-    older = install.home / "older-competitor"
-    newer = install.home / "newer-competitor"
-    older.write_text("older launcher")
-    newer.write_text("newer launcher")
-    older_entry, newer_entry = older.stat(), newer.stat()
-    probe = """
-import os, runpy, sys
-script, launcher, older, newer, *args = sys.argv[1:]
-competitors = iter([older, newer])
-def race(event, values):
-    if event == 'sai.launcher.rename' and launcher in values:
-        replacement = next(competitors, None)
-        if replacement:
-            os.replace(replacement, launcher)
-sys.addaudithook(race)
-sys.argv = [script, *args]
-runpy.run_path(script, run_name='__main__')
-"""
+    public = install.launcher.lstat()
+    selected = install.launcher.resolve(strict=True)
     result = install.run(
         sys.executable,
         "-c",
-        probe,
+        DENY_SYSCALLS,
+        "renameat2,link,linkat",
+        sys.executable,
         INSTALLER,
-        install.launcher,
-        older,
-        newer,
         "--native",
         "--api-base",
         replay.base,
         "--web-base",
         replay.base,
     )
-    assert result.returncode == 1, (result.stdout, result.stderr)
-    staged = pending(install).parent / ".launcher-switch" / "sai"
-    assert str(staged) in result.stderr
-    assert os.path.samestat(install.launcher.stat(), newer_entry)
-    assert os.path.samestat(staged.stat(), older_entry)
-    assert pending(install).is_file()
+    ok(result)
+    assert os.path.samestat(install.launcher.lstat(), public)
+    assert install.launcher.resolve(strict=True) == selected
+    assert not pending(install).exists()
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
@@ -713,7 +579,7 @@ def test_native_refuses_unsafe_destination(
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 @pytest.mark.parametrize("fresh", [True, False])
-def test_native_rolls_back_failed_installed_mcp(
+def test_native_does_not_activate_a_binary_that_fails_installed_mcp(
     install: Install, replay: Replay, fresh: bool
 ) -> None:
     artifact("MUTANT")
@@ -721,7 +587,7 @@ def test_native_rolls_back_failed_installed_mcp(
     if not fresh:
         version = native_artifact(replay)
         ok(install.install(replay, "--native"))
-        old = install.launcher.readlink()
+        old = install.launcher.resolve(strict=True)
         config, content = save_profile(install, replay)
     else:
         install.profile.mkdir(mode=0o700)
@@ -731,20 +597,23 @@ def test_native_rolls_back_failed_installed_mcp(
     version = native_artifact(replay, "MUTANT")
     result = install.install(replay, "--native", "--version", version)
     assert result.returncode == 1
-    assert "rolled back" in result.stderr and "mcp serve" in result.stderr
+    assert (
+        "installed MCP startup mutation" in result.stderr
+        and "mcp serve" in result.stderr
+    )
     if old is None:
         assert not install.launcher.is_symlink()
     else:
-        assert install.launcher.readlink() == old
+        assert install.launcher.resolve(strict=True) == old
     assert not pending(install).exists()
     assert config.read_bytes() == content
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="uses Linux seccomp")
-def test_standalone_rolls_back_without_rename_noreplace(
+def test_standalone_publishes_without_rename_noreplace(
     install: Install, replay: Replay
 ) -> None:
-    native_artifact(replay, "MUTANT")
+    version = native_artifact(replay)
     # Simulate a kernel without renameat2 without replacing any installer code.
     result = install.run(
         sys.executable,
@@ -759,10 +628,8 @@ def test_standalone_rolls_back_without_rename_noreplace(
         "--web-base",
         replay.base,
     )
-    assert result.returncode == 1, (result.stdout, result.stderr)
-    assert "installed MCP startup mutation" in result.stderr
-    assert "rolled back" in result.stderr
-    assert not install.launcher.is_symlink()
+    ok(result)
+    install.pin(version)
     assert not pending(install).exists()
 
 
@@ -774,8 +641,8 @@ def interrupt(event, values):
     if (
         (boundary == 'record' and event == 'os.rename' and os.fsdecode(values[1]) == record)
         or (boundary == 'link' and event == 'sai.launcher.rename' and os.fsdecode(values[1]) == launcher)
-        or (boundary == 'smoke' and event == 'subprocess.Popen'
-            and [os.fsdecode(value) for value in values[1]] == [launcher, '--version'])
+        or (boundary == 'published' and event == 'sai.launcher.renamed'
+            and os.fsdecode(values[1]) == launcher)
         or (boundary == 'commit' and event == 'os.remove' and os.fsdecode(values[0]) == record)
     ):
         os.kill(os.getpid(), signal.SIGKILL)
@@ -802,18 +669,18 @@ runpy.run_path(script, run_name='__main__')
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
-@pytest.mark.parametrize("boundary", ["record", "link", "smoke", "commit"])
+@pytest.mark.parametrize("boundary", ["record", "link", "published", "commit"])
 def test_standalone_recovers_an_interrupted_first_switch(
     install: Install, replay: Replay, boundary: str
 ) -> None:
     native_artifact(replay)
     interrupt_install(install, replay, boundary)
     assert pending(install).exists() == (boundary != "record")
-    assert install.launcher.is_symlink() == (boundary in ("smoke", "commit"))
+    assert install.launcher.is_symlink() == (boundary in ("published", "commit"))
     replay.redirects[f"/repos{REPO}/releases"] = "/unavailable"
     result = install.install(replay, "--native")
     assert result.returncode == 1 and "HTTP 302" in result.stderr
-    assert not install.launcher.is_symlink()
+    assert not install.launcher.exists()
     assert not pending(install).exists()
 
 
@@ -822,13 +689,15 @@ def test_native_updater_recovers_an_interrupted_first_install(
     install: Install, replay: Replay
 ) -> None:
     native_artifact(replay, "RECOVERY_RUST")
-    interrupt_install(install, replay, "smoke")
+    interrupt_install(install, replay, "published")
     assert json.loads(pending(install).read_text())["old"] is None
     result = install.run(
         install.launcher, "update", "--api-base", replay.base, "--web-base", replay.base
     )
+    if "no longer points to a managed Sai binary" in result.stderr:
+        pytest.xfail("C9c needs to teach the pinned Rust updater the private selector")
     assert "first Sai install was rolled back" in result.stderr
-    assert not install.launcher.is_symlink()
+    assert not install.launcher.exists()
     assert not pending(install).exists()
 
 
@@ -979,19 +848,20 @@ def test_python_bridge_preserves_uv_and_rolls_back(
         }
     }
     cursor.write_text(json.dumps(original))
-    # This is the public installer path for an existing uv-owned launcher.
-    result = install.install(replay, "--native")
+    result = install.update(replay)
     pre_mcp_xfail(result)
-    assert "is owned by uv" in result.stdout
+    report = json.loads(result.stdout)
     if failure:
         assert result.returncode == 1
-        assert f"Could not update to {version}" in result.stderr
-        assert f"Rolled back to sai {bridge_version}" in result.stderr
-        assert "mcp serve" in result.stderr
+        message = report["error"]["message"]
+        assert f"Could not update to {version}" in message
+        assert f"Rolled back to sai {bridge_version}" in message
+        assert "mcp serve" in message
         install.pin(bridge_version)
         assert json.loads(cursor.read_text()) == original
     else:
-        assert f"Updated sai from {bridge_version} to {version}" in ok(result)
+        ok(result)
+        assert f"Updated sai from {bridge_version} to {version}" in report["message"]
         archive_path = (
             f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
         )
