@@ -97,6 +97,10 @@ class _LCDStatusError(ValueError):
     def __init__(self, endpoint: str, response: httpx.Response) -> None:
         super().__init__(f"LCD at {endpoint} returned HTTP {response.status_code}")
         self.body = response.text
+        self.query_heights = (
+            response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}"),
+            response.headers.get(BLOCK_HEIGHT_HEADER),
+        )
 
 
 async def _resolve_lcd_host(
@@ -359,6 +363,53 @@ class PositionSnapshot:
         return self.route["contractAddress"]
 
 
+def quote_leverage_liquidates(
+    lcd: str, state: PositionSnapshot, target: Decimal, *, height: str
+) -> bool:
+    """Ask Perp to run a leverage update against discarded query storage."""
+    try:
+        smart_value(
+            lcd,
+            state.contract,
+            {
+                "quote_trade": {
+                    "trader": state.raw["user"],
+                    "funds": [],
+                    "action": {
+                        "update_leverage": {
+                            "trade_index": state.raw["user_trade_index"],
+                            "new_leverage": format(target, "f"),
+                        }
+                    },
+                }
+            },
+            height=height,
+        )
+    except QueryHeightMismatch as exc:
+        failure = exc.__cause__
+        if not isinstance(failure, _LCDStatusError):
+            return False
+        # The gateway may omit block metadata on contract errors. The request
+        # pins the height and bypasses the LCD cache.
+        if any(value not in (None, height) for value in failure.query_heights):
+            return False
+        try:
+            body = json.loads(failure.body)
+        except ValueError:
+            return False
+        message = body.get("message") if isinstance(body, dict) else None
+        return (
+            isinstance(message, str)
+            and re.search(
+                r"\bliquidation price reached\. Liq price \d+(?:\.\d+)?, "
+                r"current price \d+(?:\.\d+)?\b",
+                message,
+            )
+            is not None
+        )
+    return False
+
+
 def _read_position(
     lcd: str, contract: str, trader: str, trade_id: int, timeout: float
 ) -> dict[str, Any]:
@@ -408,11 +459,12 @@ def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
 def verified_position_height(lcd: str, state: PositionSnapshot, trade_id: int) -> str:
     latest, height = _latest_position(lcd, state, trade_id)
     if (
-        height is None
-        or not _same_position(state.raw, latest)
+        not _same_position(state.raw, latest)
         or latest.get("long") is not state.raw.get("long")
         or latest.get("open_price") != state.raw.get("open_price")
     ):
+        raise PositionChanged("Position changed during the final preview check.")
+    if height is None:
         raise ValueError("Cannot verify the quoted position at the LCD query height")
     return height
 
@@ -523,6 +575,7 @@ def snapshot(
     *,
     indexed: dict[str, Any] | None = None,
     verified: VerifiedPosition | None = None,
+    require_open_market: bool = True,
 ) -> PositionSnapshot:
     """Read contract state, reusing any position data checked by the caller."""
     route = trading_route(endpoint, lcd) if verified is None else verified.route
@@ -547,7 +600,7 @@ def snapshot(
         not market
         or market["marketId"] != borrowing["marketId"]
         or market["collateralToken"]["id"] != collateral["id"]
-        or not market["isOpen"]
+        or (require_open_market and not market["isOpen"])
     ):
         raise MarketUnavailable("Open market data is unavailable")
 
@@ -593,14 +646,24 @@ def snapshot(
         if time.monotonic() >= end or not _same_margin(raw, position):
             raise IndexLag(INDEX_LAG)
     observed_at = intents.now()
-    funds = smart(
-        lcd,
-        contract,
-        {"get_exchange_balance": {"user": trader, "collateral_index": token}},
+    funds = exchange_balance(lcd, contract, trader, token)
+    return PositionSnapshot(raw, funds, market, route, observed_at)
+
+
+def exchange_balance(
+    lcd: str, contract: str, trader: str, token: str, *, height: str | None = None
+) -> dict[str, Any]:
+    message = {"get_exchange_balance": {"user": trader, "collateral_index": token}}
+    funds = (
+        smart(lcd, contract, message)
+        if height is None
+        else smart_value(lcd, contract, message, height=height)
     )
+    if not isinstance(funds, dict):
+        raise TypeError("Contract returned invalid exchange balance")
     if funds.get("collateral_index") != token:
         raise PositionChanged("Position changed. Review the margin change again.")
-    return PositionSnapshot(raw, funds, market, route, observed_at)
+    return funds
 
 
 def contract_decimal(value: Any) -> Decimal:
@@ -731,7 +794,7 @@ def _same_margin(raw: dict[str, Any], position: dict[str, Any]) -> bool:
 
 def margin_quote(
     raw: dict[str, Any],
-    funds: dict[str, Any],
+    funds: dict[str, Any] | None,
     market: dict[str, Any],
     direction: str,
     amount: str,
@@ -776,7 +839,11 @@ def margin_quote(
     actual = after - collateral if direction == "add" else collateral - after
     if next_leverage == old or actual <= 0 or actual > delta:
         raise ValueError("Margin change is too small after rounding")
-    if direction == "add" and actual > int(funds["available_to_trade"]):
+    if (
+        funds is not None
+        and direction == "add"
+        and actual > int(funds["available_to_trade"])
+    ):
         raise ValueError("Insufficient balance on Sai")
     whole, fraction = divmod(next_leverage, 10**18)
     leverage = f"{whole}.{fraction:018d}".rstrip("0").rstrip(".")
