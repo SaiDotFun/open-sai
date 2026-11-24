@@ -204,6 +204,7 @@ fn edit(
 
 fn uneditable(section: &str, path: &Path) -> SettingsError {
     SettingsError {
+        malformed_toml: false,
         message: format!(
             "{section} in {} is an inline table, dotted keys, or only subtables; rewrite it as a [{section}] table to edit it with sai config",
             path.display()

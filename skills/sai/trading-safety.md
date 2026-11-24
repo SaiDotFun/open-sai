@@ -8,6 +8,10 @@ the CLI or the MCP tools. A mistake here spends the person's money.
 1. **Preview first.** With MCP tools, call the matching `preview_*` tool. In
    the CLI, run the trade command with `--dry-run`. Show the person the
    result and the account it names, and wait for an explicit yes.
+   During a collateral oracle outage, a partial-close preview can show a
+   USDC estimate, and Sai requires a verifiable collateral price to submit
+   the trade. Once Sai can verify the price, run a fresh preview and get
+   the person's confirmation before submitting.
 2. **Pin the account and the network on both calls.** Each call resolves
    the active account and the Keeper endpoint by itself. Another terminal or
    MCP client can switch the account, and a changed setting can point the
@@ -125,20 +129,31 @@ contains the error. In text mode, read stderr.
 | 5 | Outcome unknown | Keep `intentKey` and run `sai --json intent status ADDR --key KEY` against the original Keeper endpoint. Do not resubmit. |
 | 6 | Signed out or session expired | Ask the person to sign in in their terminal. |
 
-`retryable: true` means the request executed nothing. It does not carry
-approval over to a revised trade. For MCP errors, read the top-level `code`
+`retryable: true` means Sai classified the failure as a rejection. Get fresh
+confirmation for a revised trade. An intent wait can return its outcome and
+receipt beside the `error` object. For MCP errors, read the top-level `code`
 and follow the same recovery rules for `NOT_SENT`, `ADMISSION_REJECTED`,
 `OUTCOME_UNKNOWN`, `SIGNED_OUT`, and `SESSION_EXPIRED`.
 
 ## Digest Confirmation in MCP
 
-Each preview returns `previewDigest`. A `trade_*` call must send it back as
+A preview for a connected account returns `previewDigest`. If a signed-out
+`preview_open` returns `addr: null`, preview again for the connected account
+after sign-in, then ask for confirmation. A `trade_*` call must send the
+confirmed preview's digest as
 input `preview_digest`, and a market `trade_open` must also send the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
 intent, position quote, or quoted price fails the confirmation check.
-Nothing is submitted on a refusal. Show the fresh preview from the result
-and ask again.
+Nothing is submitted on a refusal. Use the replacement `preview` only if
+Sai can verify the quote. For a partial close, check that
+`quote.collateralPriceUsd` has a value. A USDC estimate can still have a
+digest when that field is `null`.
+
+If the replacement is missing or lacks a verifiable quote, wait until Sai
+can verify the quote and call the matching `preview_*` tool again. Ask for
+confirmation only when the preview shows a verifiable quote, including the
+collateral price for a partial close. Discard the old digest.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
@@ -184,14 +199,21 @@ decision, refresh the preview and confirm the updated figures.
 
 ## CLI Trade Commands
 
-Each command's `--help` lists its parameters. These examples use `--dry-run`,
-a placeholder account, and an existing trade ID. They send nothing.
+Each command's `--help` lists its parameters. These open previews need no
+session and send no intent. Add `--as ADDR` when previewing for a connected
+account.
 
 ```bash
-sai --as 0xYOUR_ADDR --json trade open --market 0 --side long \
+sai --json trade open --market 0 --side long \
   --type market --amount 2 --leverage 2 --slippage 1 --dry-run
-sai --as 0xYOUR_ADDR --json trade open --market 0 --side long \
+sai --json trade open --market 0 --side long \
   --type limit --amount 2 --leverage 2 --price 60000 --slippage 1 --dry-run
+```
+
+For position previews, substitute the connected account and a trade ID
+from that account. Keep `--dry-run` while reviewing.
+
+```bash
 sai --as 0xYOUR_ADDR --json trade partial-close 42 --percent 50 --dry-run
 sai --as 0xYOUR_ADDR --json trade tpsl 42 --take-profit 70000 --dry-run
 sai --as 0xYOUR_ADDR --json trade leverage 42 --leverage 5 --dry-run
@@ -209,40 +231,45 @@ both calls, as rule 2 says; the examples leave it out to stay short.
 
 ### When It Is Safe to Drop `--dry-run`
 
-The CLI has no digest. The live command builds the trade again from current
-state and does not compare it with the dry run the person saw. Rerunning the
-command without `--dry-run` submits what the person approved only when the
-approval still describes the trade:
+For `trade partial-close` and `trade margin`, read `previewDigest` from the
+JSON dry run. After the person confirms the quote, replace `--dry-run` with
+`--preview-digest DIGEST` using the digest from that preview. The CLI
+refuses to submit if the live quote differs. If it refuses, run a fresh dry
+run and get confirmation again before submitting with the new digest.
+
+Without a digest, the CLI rebuilds the trade from current state. Drop
+`--dry-run` only when the person's approval covers what the live command
+will send.
 
 - **Limit and stop opens, `tpsl`, `leverage`, `close`, and `--cancel-order`**
   send exactly the arguments shown. Drop `--dry-run` once the person has
   confirmed the account, the network, and those arguments. For limit
   and stop opens, include the bound from rule 3 in the confirmation.
 
-- **Partial close** takes a percentage and recomputes the amount from the
-  position at submit. If the person approved "close 50%, about 50 USDC" and
-  the position doubles before submit, the live command closes 100 USDC. Ask
-  the person to approve the percentage of whatever the position is at submit,
-  and say so in those words. To confirm a quoted slice, use MCP tools
-  `preview_partial_close` and `trade_partial_close`. Show the person the
-  collateral reduction and quoted notional. If
+- **Partial close** takes a percentage. Without a digest, the CLI computes
+  the reduction from the position at submit. If the person saw "close 50%,
+  about 50 USDC" and the position doubles before submit, the live command
+  closes 100 USDC. Ask the person to approve the percentage of whatever the
+  position is at submit. For a quoted slice, show the person the collateral
+  reduction and quoted notional and submit with the confirmed digest. If
   `quote.closedNotionalIsEstimate` is true, say the notional is an estimate.
-  If the oracle price is unavailable, show the USDC estimate from
-  `quote.closedNotionalUsdc`. Keeper sends the collateral delta to Perp.
+  If the collateral oracle price is unavailable, show the USDC estimate
+  from `quote.closedNotionalUsdc`. Sai requires a verifiable price to
+  submit the partial close. When the price is available, preview again
+  and ask for confirmation. Keeper sends the collateral delta to Perp.
   Perp applies the position state and oracle price at execution, so the
   executed notional can differ from the confirmed quote. The after-hours
   risk guard can also reduce the position before Perp closes the requested
   slice.
 - **Margin** takes an amount, `--direction add|remove --amount USDC`, and
   computes the target from the effective leverage Perp will use, including
-  any applicable after-hours cap. The dry run's target is a quote: adding
-  25 USDC to 100 USDC of collateral at 5x previews
-  4x, but if the collateral doubles before submit the same command sends
-  about 4.44x. Ask the person to approve the amount, and say the CLI
-  computes the target leverage at submit. If they approve a specific target
-  leverage, use MCP tools `preview_margin` and `trade_margin`, whose digest
-  binds the whole quote, or `trade leverage ID --leverage VALUE`, which
-  sends the target they named. If `quote.marginChangeIsEstimate` is true,
+  any applicable after-hours cap. Adding 25 USDC to 100 USDC of collateral
+  at 5x previews a target of 4x. If the collateral doubles before submit,
+  the same command without a digest sends about 4.44x. When submitting
+  without a digest, ask the person to approve the amount and explain that
+  the CLI computes the target leverage at submit. To send a target the
+  person chose directly, use `trade leverage ID --leverage VALUE`.
+  If `quote.marginChangeIsEstimate` is true,
   tell the person the after-hours guard can deduct fees before Perp applies
   the target leverage. Perp determines the direction from effective leverage
   at execution.

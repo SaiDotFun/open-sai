@@ -23,7 +23,12 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from loopback_keeper import KeeperHandler, keeper_server
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from sai_cli.core import keeper, log, reconcile, settings, storage, wait
@@ -99,17 +104,25 @@ def submitted_keys() -> list[str]:
 
 
 @pytest.fixture
-def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]]]:
+def keeper_replay(
+    submitted_keys: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[str, deque[Reply]]]:
     replies: deque[Reply] = deque()
     active_key = KEY
     offset = 0
 
-    class Handler(KeeperHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self) -> None:
             nonlocal active_key, offset
             try:
                 request = self.read_json()
             except (ConnectionResetError, json.JSONDecodeError):
+                return
+            if request["query"] == keeper.POSITION:
+                self.reply({"data": position_data(request["variables"])})
+                return
+            if request["query"] == keeper.ROUTE:
+                self.reply({"data": POSITION_ROUTE})
                 return
             if request["query"] == keeper.SUBMIT:
                 active_key = request["variables"]["input"]["intentKey"]
@@ -190,6 +203,7 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                 slow.finished.set()
 
     with keeper_server(Handler) as base:
+        monkeypatch.setenv("SAI_LCD_ENDPOINT", base)
         yield f"{base}/query", replies
         assert not replies
 
@@ -1653,8 +1667,11 @@ def test_wait_returns_conditional_order_placement_without_fill(keeper_replay):
 def test_wait_reports_placement_even_when_history_is_empty(keeper_replay, order_type):
     endpoint, replies = keeper_replay
     reserve(endpoint)
-    completed = deepcopy(RESPONSES["limit_placement_exec_pass"])
-    completed["data"]["userIntents"][0]["body"] = {"orderType": order_type}
+    completed: Reply = "limit_placement_exec_pass"
+    if order_type == "stop":
+        stop_reply = deepcopy(RESPONSES["limit_placement_exec_pass"])
+        stop_reply["data"]["userIntents"][0]["body"] = {"orderType": order_type}
+        completed = stop_reply
     replies.extend((completed, "not_yet_in_history", "not_yet_in_history"))
     clock = FakeClock()
     result = wait.for_intent(
@@ -1699,7 +1716,18 @@ def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, out
         )
         replies.extend((completed, history))
     result = CliRunner().invoke(
-        main, ["--endpoint", endpoint, "--json", "trade", "close", "7", "--wait"]
+        main,
+        [
+            "--endpoint",
+            endpoint,
+            "--lcd-endpoint",
+            endpoint.removesuffix("/query"),
+            "--json",
+            "trade",
+            "close",
+            "7",
+            "--wait",
+        ],
     )
     assert result.exit_code == exit_code, result.output
     value = json.loads(result.output)

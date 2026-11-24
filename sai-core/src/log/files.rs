@@ -22,27 +22,27 @@ pub(super) struct LogDir(std::path::PathBuf);
 
 impl LogDir {
     pub fn open(root: &Path) -> io::Result<Self> {
-        if let Some(parent) = root.parent() {
-            paths::profile(parent)?;
-        }
-        // Existing log directories keep their owner bits. The open descriptor
-        // below clears group and other access.
-        if !root.exists() {
-            paths::managed(root)?;
-        }
+        let parent = root
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        paths::profile(parent)?;
         #[cfg(unix)]
         {
             use rustix::{
-                fs::{Mode, OFlags, open},
-                process::geteuid,
+                fs::{Mode, OFlags, open, openat},
+                process::{geteuid, getuid},
             };
             use std::os::unix::fs::MetadataExt;
 
-            let fd = open(
-                root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
+            let name = root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let parent = open(parent, flags, Mode::empty())?;
+            if rustix::fs::fstat(&parent)?.st_uid != getuid().as_raw() {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            paths::create_managed_at(&parent, Path::new(name))?;
+            let fd = openat(parent, name, flags, Mode::empty())?;
             let dir = File::from(fd);
             let info = dir.metadata()?;
             if info.uid() != geteuid().as_raw() {
@@ -53,6 +53,9 @@ impl LogDir {
         }
         #[cfg(not(unix))]
         {
+            if !root.exists() {
+                paths::managed(root)?;
+            }
             if redirected(&fs::symlink_metadata(root)?) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }

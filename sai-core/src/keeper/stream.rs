@@ -1,6 +1,6 @@
 //! Keeper snapshots over graphql-transport-ws.
 
-mod upgrade;
+pub(super) mod upgrade;
 
 use std::{env, io, pin::Pin, time::Duration};
 
@@ -244,7 +244,8 @@ impl Connection {
                         ping_count: 0,
                     });
                 }
-                Upgrade::Redirect(location) => url = redirect_target(&url, &location)?,
+                Upgrade::Redirect { location, .. } => url = redirect_target(&url, &location)?,
+                Upgrade::Rejected(_) => return Err(Failure::Disconnected("InvalidStatus")),
             }
         }
         Err(Failure::Disconnected("SecurityError"))
