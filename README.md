@@ -215,6 +215,10 @@ new preview before asking for confirmation again.
 - `trade_close`, `trade_tpsl`, and `trade_leverage`: nothing beyond the
   account and arguments.
 
+On `main`, Sai refuses trades on positions owned by a different account.
+A preview with `positionOwnerVerified: false` has no confirmation digest.
+Margin and partial-close digests also bind the chain ID and Perp contract.
+
 Ask the agent to call `mcp_info` to see the version, endpoints, and active
 account. Its `trading` field reports the active account's session readiness.
 Each trade checks the account it targets. If that trade fails a session

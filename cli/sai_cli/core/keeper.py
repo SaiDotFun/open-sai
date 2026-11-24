@@ -756,6 +756,12 @@ def canonical_account(value: object) -> str | None:
     return "0x" + payload.to_bytes(20, "big").hex()
 
 
+def same_account(first: object, second: object) -> bool:
+    """Compare two valid EVM or Nibiru addresses by account identity."""
+    account = canonical_account(first)
+    return account is not None and account == canonical_account(second)
+
+
 @dataclass(frozen=True)
 class UdWallet:
     """Public details from `ud evm wallet show`.

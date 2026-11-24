@@ -1,9 +1,10 @@
 # Sai CLI
 
-This guide describes the Python CLI in the
+This guide covers the Python CLI in the
 [sai-cli v0.1.2 release](https://github.com/SaiDotFun/open-sai/releases/tag/sai-cli/v0.1.2).
-Install it as the [root README](../../README.md) shows. By default, the CLI
-connects to mainnet Keeper.
+Notes about `main` describe changes after that release. See the
+[root README](../../README.md) to install Sai. The CLI connects to mainnet
+Keeper by default.
 
 ## Settings
 
@@ -31,11 +32,12 @@ sai config unset keeper.endpoint
 `value`, `source`, `env`, and `default` fields. The `source` is `flag`,
 `env`, `file`, `default`, `derived`, or `invalid`.
 
-The list shows Keeper URLs as origins. The LCD URL can include a path.
-`sai config get KEY` prints the exact resolved value. With the global
-`--json` flag, it returns `key`, `value`, and `source`. An unknown key or
-an invalid value passed to `config set` is a usage error. Sai lists the
-valid keys and exits 2 with code `INVALID_REQUEST`.
+The list shows Keeper URLs as origins. In v0.1.2, the LCD URL can include
+a path. On `main`, `config list`, `doctor`, and `mcp_info` show endpoint
+URLs as origins. `sai config get KEY` prints the exact resolved value. With
+the global `--json` flag, it returns `key`, `value`, and `source`. An
+unknown key or an invalid value passed to `config set` is a usage error.
+Sai lists the valid keys and exits 2 with code `INVALID_REQUEST`.
 
 In v0.1.2, the exit status of `sai --json config list` depends on which
 override is invalid.
@@ -403,6 +405,12 @@ finds a change, it returns `PREVIEW_MISMATCH` and includes the latest preview
 when it can still quote the position. The direct leverage tool confirms the
 requested target leverage.
 
+On `main`, margin and partial-close previews bind the chain ID and Perp
+contract address in `positionRoute`. For CLI submissions, pass the dry run's
+`previewDigest` to `--preview-digest` to require a match. A different route
+requires a new preview and confirmation. A position preview with
+`positionOwnerVerified: false` has no MCP confirmation digest.
+
 ## Commands
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
@@ -412,6 +420,11 @@ and live `watch` streams. Run any command with `--help` for details. Fund
 your Sai account in Sai Web before trading. Use `--dry-run` to inspect
 the intent and any available estimates. Some previews need a session and
 live position data. To preview an open without signing in, omit `--as`.
+
+On `main`, Sai refuses a position preview or submission if the position
+belongs to another account. A dry run with `positionOwnerVerified: false`
+is informational. Get a verified preview before submitting.
+
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
 requiring refresh and may include an optional supplied reference. A partial
