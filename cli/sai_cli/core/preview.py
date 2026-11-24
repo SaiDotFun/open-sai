@@ -12,10 +12,31 @@ ATOM = Decimal("1e-18")
 LIQUIDATION_THRESHOLD = Decimal("0.90")
 LIQUIDATION_FEE_RATE = Decimal("0.05")
 READ_ERRORS = (ValueError, TypeError, KeyError, DecimalException, keeper.KeeperError)
+ESTIMATE_FIELDS = ("fees", "liquidationPrice", "worstCaseFill")
 
 
 def unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason}
+
+
+def rejected(code: str, reason: str) -> dict[str, Any]:
+    return {
+        **dict.fromkeys(ESTIMATE_FIELDS, unavailable(reason)),
+        "execution": {"status": "would_be_rejected", "code": code, "reason": reason},
+    }
+
+
+def market_open_rejection(
+    pair: dict[str, Any], *, market_order: bool
+) -> dict[str, Any] | None:
+    state = pair.get("market_trading_state")
+    if state == "close_only":
+        return rejected(
+            "MarketClosed", "Perp rejects this request in a close-only market."
+        )
+    if state == "closed" and market_order:
+        return rejected("MarketClosed", "Perp rejects this request in a closed market.")
+    return None
 
 
 def not_applicable(reason: str) -> dict[str, Any]:
@@ -244,21 +265,17 @@ def open_estimates(
     )
     fees = unavailable("Perp fee schedule or collateral oracle price is unavailable.")
     liq = unavailable("An entry price and opening fee estimate are required.")
-    if lcd and row is not None:
+    if lcd:
         try:
-            token_id = row["collateralToken"]["id"]
             contract = margin.trading_contract(endpoint, lcd)
             pair = contract_market(lcd, contract, body["market"]["marketIndex"])
-            if (
-                order_type != "market"
-                and pair.get("market_trading_state") == "close_only"
+            if refusal := market_open_rejection(
+                pair, market_order=order_type == "market"
             ):
-                rejected = unavailable(
-                    "Perp rejects pending opens while the market is close-only."
-                )
-                return dict.fromkeys(
-                    ("fees", "liquidationPrice", "worstCaseFill"), rejected
-                )
+                return refusal
+            if row is None:
+                return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
+            token_id = row["collateralToken"]["id"]
             leverage = Decimal(body["leverage"])
             within_leverage = leverage_allowed(
                 lcd, contract, pair, row["marketId"], leverage

@@ -1524,36 +1524,54 @@ def test_queued_closes_defer_settlement_to_the_next_tick(position_service, price
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("order_type", ["limit", "stop"])
-def test_pending_open_estimates_follow_perp_market_state(position_service, order_type):
+@pytest.mark.parametrize("order_type", ["market", "limit", "stop"])
+def test_open_previews_follow_perp_market_state(position_service, order_type):
     position, base_url = position_service
     position.preview_inputs = True
-    position.keeper_market_open = False
-    position.market_trading_state = "closed"
+    position.keeper_market_open = order_type == "market"
+    position.market_trading_state = "open" if order_type == "market" else "closed"
     args = {
         "market_id": 0,
         "side": "long",
         "order_type": order_type,
-        "price": "100",
         "amount": "10",
         "leverage": "2",
         "slippage": "1",
     }
+    if order_type != "market":
+        args["price"] = "100"
 
     async def scenario():
         async with connected_client(base_url) as client:
             quote = await call(client, "preview_open", args)
             assert quote["estimates"]["fees"]["status"] == "estimate"
             assert quote["estimates"]["worstCaseFill"]["status"] == "bound"
-            position.keeper_market_open = True
             position.market_trading_state = "close_only"
-            quote = await call(client, "preview_open", args)
-            for field in ("fees", "liquidationPrice", "worstCaseFill"):
-                item = quote["estimates"][field]
-                assert item["status"] == "unavailable"
-                assert "close-only" in item["reason"]
+            for indexed_open in (True, False):
+                position.keeper_market_open = indexed_open
+                quote = await call(client, "preview_open", args)
+                assert_rejected_preview(quote, "MarketClosed", "close-only")
+
+            if order_type == "market":
+                position.market_trading_state = "closed"
+                quote = await call(client, "preview_open", args)
+                assert_rejected_preview(quote, "MarketClosed", "closed market")
+            assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+def assert_rejected_preview(quote: dict[str, Any], code: str, reason: str) -> None:
+    estimates = quote["estimates"]
+    execution = estimates["execution"]
+    assert execution["status"] == "would_be_rejected"
+    assert execution["code"] == code
+    assert reason in execution["reason"]
+    for field in ("fees", "liquidationPrice", "worstCaseFill"):
+        assert estimates[field] == {
+            "status": "unavailable",
+            "reason": execution["reason"],
+        }
 
 
 @pytest.mark.parametrize(

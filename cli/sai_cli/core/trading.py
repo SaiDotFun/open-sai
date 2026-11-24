@@ -188,18 +188,25 @@ def open_trade(
             allow_concurrent_open=allow_concurrent_open,
         )
     if dry_run:
-        if mcp_market:
-            read_market()
-        elif lcd_endpoint is not None:
+        market_error = None
+        if mcp_market or lcd_endpoint is not None:
             try:
-                read_market(estimates.QUOTE_TIMEOUT)
-            except estimates.READ_ERRORS:
-                pass
+                read_market(20 if mcp_market else estimates.QUOTE_TIMEOUT)
+            except estimates.READ_ERRORS as exc:
+                if mcp_market:
+                    market_error = exc
+        execution_estimates = estimate({})
+        if (
+            market_error is not None
+            and execution_estimates.get("execution", {}).get("status")
+            != "would_be_rejected"
+        ):
+            raise market_error
         preview = {
             "dryRun": True,
             "requiresMarketPriceRefresh": True,
             "intent": payload,
-            "estimates": estimate({}),
+            "estimates": execution_estimates,
         }
         if price is not None and not mcp_market:
             preview["referencePrice"] = price
