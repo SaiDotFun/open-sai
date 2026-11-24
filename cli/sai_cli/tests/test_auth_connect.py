@@ -617,6 +617,43 @@ def test_use_refuses_malformed_session_before_switching(
     assert path.read_bytes() == before
 
 
+@pytest.mark.parametrize("without_expiry", [False, True])
+@pytest.mark.parametrize("version", [2, 3])
+def test_use_classifies_non_string_or_missing_expiry_as_unavailable(
+    env: Env, monkeypatch: pytest.MonkeyPatch, version: int, without_expiry: bool
+) -> None:
+    marker = "synthetic-expiry-type-credential-marker"
+    numeric_marker = 5427086319284057731
+    selected: dict[str, Any] = session_for(marker)
+    if without_expiry:
+        del selected["expiresAt"]
+    else:
+        selected["expiresAt"] = numeric_marker
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    if version == 2:
+        write_v2_session(env.home, selected)
+        path = env.home / "trader" / "session.json"
+    else:
+        storage._save_accounts({"active": None, "sessions": {ADDR: selected}})
+        path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    stored = env.stored_bytes()
+    assert b"command.end" in stored and b"session.active" not in stored
+    for value in (marker, str(numeric_marker)):
+        assert value not in result.stdout + result.stderr
+        assert value.encode() not in stored
+    assert json.loads(result.stdout)["error"] == {
+        "code": "SESSION_UNAVAILABLE",
+        "message": storage.INVALID_EXPIRY,
+        "retryable": False,
+    }
+    assert path.read_bytes() == before
+
+
 def test_tampered_session_cannot_be_unlocked(env: Env) -> None:
     write_envelope(
         env.home,

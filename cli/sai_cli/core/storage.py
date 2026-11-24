@@ -101,8 +101,9 @@ _AAD = b"sai-sessions-v3"
 _V2_AAD = b"sai-session-v2-test"
 
 SIGN_IN_AGAIN = "run `sai auth import` or `sai auth login NAME` again"
+INVALID_EXPIRY = f"Stored session has an invalid expiry; {SIGN_IN_AGAIN}"
 NO_SESSION = "No Sai session; run `sai auth import` or `sai auth login NAME`"
-SESSION_FIELDS = ("token", "evmAddress", "expiresAt")
+SESSION_FIELDS = ("token", "evmAddress")
 # What delete_session reports after deleting a store it could not read.
 UNREADABLE_REMOVED = "unreadable session file"
 
@@ -128,6 +129,8 @@ def _check_session(session: Any) -> dict[str, str]:
         isinstance(session.get(k), str) for k in SESSION_FIELDS
     ):
         raise ValueError("Invalid session")
+    if not isinstance(session.get("expiresAt"), str):
+        raise SessionError(INVALID_EXPIRY)
     return session
 
 
@@ -159,6 +162,8 @@ def _load_v2(fields: dict[str, Any]) -> dict[str, Any]:
     try:
         session = _check_session(_decrypt(fields, _V2_AAD))
         log.remember([session["token"]])
+    except SessionError:
+        raise
     except (ValueError, KeyError, TypeError, InvalidTag) as exc:
         raise ValueError(f"Cannot unlock session; {SIGN_IN_AGAIN}") from exc
     addr = session["evmAddress"].lower()
@@ -193,6 +198,8 @@ def load_accounts() -> dict[str, Any]:
         active = accounts.get("active")
         if active is not None and active not in sessions:
             active = None
+    except SessionError:
+        raise
     except (ValueError, KeyError, TypeError, InvalidTag) as exc:
         raise ValueError(f"Cannot unlock session; {SIGN_IN_AGAIN}") from exc
     return {"active": active, "sessions": sessions}

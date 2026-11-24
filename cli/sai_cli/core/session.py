@@ -20,9 +20,7 @@ def expiry_time(result: dict[str, str]) -> datetime:
         if expiry.tzinfo is None:
             raise ValueError
     except (KeyError, TypeError, ValueError):
-        raise SessionError(
-            f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
-        ) from None
+        raise SessionError(storage.INVALID_EXPIRY) from None
     return expiry
 
 
