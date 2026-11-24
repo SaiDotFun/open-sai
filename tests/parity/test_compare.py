@@ -2,6 +2,7 @@ import json
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from compare import (
@@ -590,3 +591,49 @@ def test_noncanonical_log_time_fails_in_files_and_tail(
         )
     with pytest.raises(InvalidLogTime, match="UTC millisecond format"):
         stdout(json.dumps({"ts": stamp}), "jsonl", "logs tail", Normalize(tmp_path))
+
+
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ('{"price": 1.0, "size": 2}', '{"price": 1, "size": 2}'),
+        ('{"price": 1e+02}', '{"price": 100.0}'),
+        ('{"price": 1, "size": 2}', '{"size": 2, "price": 1}'),
+    ],
+)
+def test_mcp_compares_actual_json_text(tmp_path: Path, before: str, after: str) -> None:
+    def decode_tool(text: str) -> Any:
+        frame = {
+            "jsonrpc": "2.0",
+            "id": 3,
+            "result": {
+                "content": [{"type": "text", "text": text}],
+                "structuredContent": {"result": text},
+                "isError": False,
+            },
+        }
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    assert first_difference(decode_tool(before), decode_tool(after), "MCP")
+
+
+def test_mcp_compares_schema_property_order(tmp_path: Path) -> None:
+    def decode_inventory(properties: dict[str, Any]) -> Any:
+        frame = {
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {
+                "tools": [
+                    {"name": "fixture", "inputSchema": {"properties": properties}}
+                ]
+            },
+        }
+        return stdout(json.dumps(frame), "mcp", "mcp serve", Normalize(tmp_path))
+
+    one = {"type": "integer"}
+    two = {"type": "string"}
+    assert first_difference(
+        decode_inventory({"first": one, "second": two}),
+        decode_inventory({"second": two, "first": one}),
+        "MCP",
+    )
