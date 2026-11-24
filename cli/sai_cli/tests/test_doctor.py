@@ -1360,7 +1360,9 @@ def blocked_on(endpoint: str) -> None:
 @pytest.mark.parametrize(
     "matches", [False, True], ids=["same-origin-mismatch", "match"]
 )
-def test_doctor_shows_only_keeper_origins_in_reports_and_hints(http_stub, matches):
+def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
+    http_stub, matches, request
+):
     base, state = http_stub
     path_key, query_key = "fixture-keeper-path", "fixture-keeper-query"
     stored_path_key = "fixture-stored-path"
@@ -1370,9 +1372,9 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(http_stub, matche
         blocked_on(endpoint)
     else:
         save(endpoint=f"{base}/{stored_path_key}/query?key={query_key}")
-    ws_origin = base.replace("http:", "ws:", 1)
-    # websockets includes the raw URI in its error for an invalid fragment.
-    ws = ws_origin + route + "#fragment"
+    ws, stop = ws_stub(ack=True)
+    request.addfinalizer(stop)
+    ws_origin = ws.removesuffix("/query")
     for flags in ((), ("--json",)):
         code, output = run_cli(
             *flags,
@@ -1381,7 +1383,7 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(http_stub, matche
             "doctor",
             "--no-fix",
             "--ws-endpoint",
-            ws,
+            ws_origin + route,
             "--lcd-endpoint",
             base,
         )
@@ -1398,6 +1400,7 @@ def test_doctor_shows_only_keeper_origins_in_reports_and_hints(http_stub, matche
             assert checks["keeper"]["details"]["endpoint"] == base
             session = checks["session"]["details"]
             assert session["endpoint"] == base and session["endpointMatches"] is matches
+            assert checks["websocket"]["status"] == "pass"
             assert checks["websocket"]["details"]["endpoint"] == ws_origin
             fix = checks["intents" if matches else "session"]["fix"]
             command = (
