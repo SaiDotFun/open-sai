@@ -734,6 +734,7 @@ wire = ["borrowings", "oneClickTrading", "node_info", "get_market", "get_group",
 [[case]]
 name = "trade-close"
 args = ["--json","trade","close","7","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-cancel"
@@ -745,10 +746,12 @@ wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 [[case]]
 name = "trade-tpsl"
 args = ["--json","trade","tpsl","7","--take-profit","110","--clear-stop-loss","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-leverage"
 args = ["--json","trade","leverage","7","--leverage","5","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-margin"
@@ -780,11 +783,11 @@ args = ["--json", "trade", "close", "7"]
 seed = "session"
 server = "concurrent-close"
 wire = [
-    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
     "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
     "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
     "recordUserIntent",
-    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
     "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
     "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
 ]

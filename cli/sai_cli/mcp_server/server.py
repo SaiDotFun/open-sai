@@ -56,6 +56,8 @@ estimates.execution.status is would_be_rejected, report its reason and stop. \
 Otherwise, show the user the preview and the account it names. Get explicit \
 confirmation, then call the trade_* tool with the same arguments and the \
 previewDigest. For a market open, also send its referencePrice.
+- If a position preview reports positionOwnerVerified as false, request a \
+new preview when the contract position can be read.
 - If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was \
 submitted. Show the user any replacement preview. If it has a previewDigest, \
 get confirmation again before retrying. Otherwise follow the error's instructions.

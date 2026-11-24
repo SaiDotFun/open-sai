@@ -374,7 +374,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     }
     contract_args = {
         "get_trade_raw": {
-            "trader": ADDRESS if scenario == "pending-order" else position["trader"],
+            "trader": ADDRESS
+            if scenario in {"pending-order", "concurrent-close"}
+            else position["trader"],
             "index": 7,
         },
         "get_exchange_balance": {
@@ -600,7 +602,17 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        if not same_variables(query, {name: contract_args[name]}):
+                        expected = {name: contract_args[name]}
+                        # Ownership uses the account address. The next read
+                        # uses Perp's stored owner to pin the quote.
+                        if (
+                            scenario == "concurrent-close"
+                            and name == "get_trade_raw"
+                            and query
+                            == {name: {"trader": position["trader"], "index": 7}}
+                        ):
+                            expected = query
+                        if not same_variables(query, expected):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))

@@ -555,10 +555,13 @@ def submit_check(
 def finish(
     load: AccountSession, dry_run: bool, result: dict[str, Any]
 ) -> dict[str, Any]:
-    """Add the account to a result, and the previewDigest to a preview."""
+    """Add the account and issue a digest only for a confirmable preview."""
     if not dry_run:
         return {**result, "addr": load.pinned}
-    return confirmation.with_digest({**result, "addr": load.account()})
+    preview = {**result, "addr": load.account()}
+    if preview.get("positionOwnerVerified") is False:
+        return preview
+    return confirmation.with_digest(preview)
 
 
 # Trading: each action previews with dry_run and submits without it. A
