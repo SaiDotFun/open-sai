@@ -107,6 +107,12 @@ active. `sai auth list` shows them, `sai auth use ADDR` switches the active
 one, `sai --as ADDR ...` runs one command as another, and `sai auth logout
 [ADDR]` removes one.
 
+Run `sai auth renew [ADDR]` to sign a fresh session with the key saved by
+`sai auth login NAME`. Renewal keeps the active account selected. For a
+browser session, copy a fresh Sai Web token and run `sai auth import`.
+`sai auth status`, `sai auth list`, `sai doctor`, and the MCP tool
+`mcp_info` warn when a session has less than three days left.
+
 After connecting, commands run without prompts until the session expires. Know
 what the token is:
 
@@ -123,6 +129,18 @@ The CLI stores sessions in `~/.sai/trader/sessions.json` with mode 0600,
 encrypted with a key built into the CLI, like the Cosmos SDK `test` keyring.
 That keeps the token out of plaintext files and grep, but anyone who can read
 your files can decrypt it. There is no session passphrase.
+
+### Read an Account Overview
+
+Run `sai account overview` for your active account or `sai account overview
+--as ADDR --json` for any EVM account. The MCP tool `account_overview` takes
+the same optional address as `addr`.
+
+The overview shows Sai funds and credits, position risk, limit and stop
+orders, market orders waiting for the next oracle price, local trade
+blockers, and session expiry. Each section reports when it was fetched
+and keeps available data when another read fails. See the
+[CLI guide](cli/sai_cli/README.md#account-overview) for units and source age.
 
 ## Use Sai From Your Agent (MCP)
 

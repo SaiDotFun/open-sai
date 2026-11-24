@@ -20,11 +20,12 @@ import logging
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any
 
-from ..core import intents, keeper, reconcile, storage, stream, trading
+from ..core import intents, keeper, overview, reconcile, storage, stream, trading
 from ..core import log as sai_log
+from ..core import preview as estimates
 from ..core import session as sessions
 from ..core.errors import Code, SaiError, SessionError
 from ..core.errors import describe as describe_error
@@ -84,7 +85,7 @@ class SessionUnavailable(SessionError):
     """
 
 
-class Refused(SaiError, ValueError):
+class Refused(SaiError, trading.PreviewRefused):
     """A trade was refused before submission; CODE says why.
 
     PREVIEW, when set, is the fresh preview with its own previewDigest for
@@ -184,7 +185,7 @@ def trading_state(settings: Settings, addr: str | None = None) -> dict[str, Any]
         if not storage.session_exists():
             return {"available": False, "reason": "signed-out", "addr": None}
         stored = storage.load_session(addr)
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except (ValueError, KeyError) as exc:
         detail = (
             f"Stored session is malformed; {storage.SIGN_IN_AGAIN}"
@@ -278,7 +279,7 @@ def resolve_addr(settings: Settings, addr: str | None) -> dict[str, Any]:
         if not storage.session_exists():
             raise SessionUnavailable(NO_ADDR)
         stored = storage.load_session()
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except SessionUnavailable:
         raise
     except ValueError as exc:
@@ -299,10 +300,11 @@ def session_state(settings: Settings) -> dict[str, Any]:
         if not storage.session_exists():
             return {"signedIn": False}
         stored = storage.load_session()
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except ValueError as exc:
         return {"signedIn": False, "error": str(exc)}
-    expired = expiry <= datetime.now(UTC)
+    now = datetime.now(UTC)
+    expired = expiry <= now
     matches = stored.get("endpoint") == settings.endpoint
     try:
         connected = len(storage.load_accounts()["sessions"])
@@ -315,11 +317,17 @@ def session_state(settings: Settings) -> dict[str, Any]:
         **sessions.summary(stored),
         "expired": expired,
         "endpointMatches": matches,
+        **({"renewalCommand": sessions.renewal_command(stored)} if expired else {}),
+        **(sessions.expiry_fields(stored, now) if matches else {}),
     }
 
 
 def auth_status(settings: Settings, addr: str | None = None) -> dict[str, Any]:
-    return sessions.summary(session_loader(settings, addr)())
+    stored = session_loader(settings, addr)()
+    return {
+        **sessions.summary(stored),
+        **sessions.expiry_fields(stored),
+    }
 
 
 def account_rows(settings: Settings) -> dict[str, Any]:
@@ -328,7 +336,7 @@ def account_rows(settings: Settings) -> dict[str, Any]:
     now = datetime.now(UTC)
     rows = []
     for key, result in sorted(accounts["sessions"].items()):
-        expired = datetime.fromisoformat(result["expiresAt"]) <= now
+        expired = sessions.expiry_time(result) <= now
         matches = result.get("endpoint") == settings.endpoint
         rows.append(
             {
@@ -337,6 +345,7 @@ def account_rows(settings: Settings) -> dict[str, Any]:
                 "expired": expired,
                 "endpointMatches": matches,
                 "usable": matches and not expired,
+                **sessions.expiry_fields(result, now),
             }
         )
     return {"accounts": rows}
@@ -384,6 +393,13 @@ def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
     }
 
 
+def account_overview(settings: Settings, addr: str | None) -> dict[str, Any]:
+    try:
+        return overview.account_overview(settings, addr)
+    except overview.AccountUnavailable as exc:
+        raise SessionUnavailable(f"{exc}. Pass addr explicitly.") from exc
+
+
 def intent_local(settings: Settings, addr: str | None) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
     pending = storage.list_pending(settings.endpoint, account["addr"])
@@ -403,7 +419,8 @@ def intent_status(
 
 def canonical_price(value: object) -> str:
     """Write a price so equal amounts give equal text: 100, 100.0 -> 100."""
-    return format(Decimal(str(value)).normalize(), "f")
+    price = format(Decimal(str(value)), "f")
+    return price.rstrip("0").rstrip(".") if "." in price else price
 
 
 def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
@@ -484,12 +501,17 @@ def bound(
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
-        moved = abs(current - reference) / reference * 100
-        if moved > Decimal(slippage):
-            message = PRICE_MOVED.format(
-                moved=format(moved.quantize(Decimal("0.0001")), "f"),
-                slippage=slippage,
-            )
+        fraction = Decimal(slippage).scaleb(-2)
+        lower = estimates.slippage_price(reference, fraction, False)
+        upper = estimates.slippage_price(reference, fraction, True)
+        if not lower <= current <= upper:
+            with localcontext() as context:
+                context.prec = 90
+                moved = abs(current - reference) / reference * 100
+                message = PRICE_MOVED.format(
+                    moved=format(moved.quantize(Decimal("0.0001")), "f"),
+                    slippage=slippage,
+                )
             raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check
@@ -577,14 +599,12 @@ def open_trade(
         take_profit=take_profit,
         stop_loss=stop_loss,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
+        mcp_market=True,
         notify=notices.append,
         before_submit=check,
         allow_concurrent_open=allow_concurrent_open,
     )
-    if dry_run and market:
-        # Read-only: the price a live submit would refresh to now.
-        current = trading.open_usdc_market(settings.endpoint, market_id)["price"]
-        result["referencePrice"] = format(Decimal(str(current)), "f")
     if notices:
         result["notices"] = notices
     return finish(load, dry_run, result)
@@ -607,6 +627,7 @@ def close_trade(
         trade_id=trade_id,
         cancel_order=cancel_order,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)
@@ -635,6 +656,7 @@ def set_tpsl(
         clear_take_profit=clear_take_profit,
         clear_stop_loss=clear_stop_loss,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)
@@ -657,6 +679,7 @@ def set_leverage(
         trade_id=trade_id,
         leverage=leverage,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)

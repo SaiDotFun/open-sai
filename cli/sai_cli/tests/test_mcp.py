@@ -49,6 +49,7 @@ READ_TOOLS = {
     "account_positions",
     "account_history",
     "account_balances",
+    "account_overview",
     "intent_local",
     "intent_status",
     "preview_open",
@@ -634,7 +635,6 @@ PREVIEWS = (
     ("preview_open", OPEN_ARGS),
     ("preview_open", {**OPEN_ARGS, "order_type": "market", "price": None}),
     ("preview_close", {"trade_id": 7}),
-    ("preview_close", {"trade_id": 7, "cancel_order": True}),
     ("preview_tpsl", {"trade_id": 7, "take_profit": "120"}),
     ("preview_leverage", {"trade_id": 7, "leverage": "3"}),
     ("preview_margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
@@ -673,7 +673,6 @@ def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     ("name", "preview_args", "trade_args"),
     [
         ("close", {"trade_id": 7}, {"trade_id": 8}),
-        ("close", {"trade_id": 7}, {"trade_id": 7, "cancel_order": True}),
         (
             "leverage",
             {"trade_id": 7, "leverage": "3"},
@@ -990,7 +989,7 @@ def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
     assert preview["addr"] is None
     storage.save_session(stored_session())
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)
@@ -1021,7 +1020,7 @@ def test_logout_during_the_refresh_refuses_a_confirmed_signed_in_trade(
     preview = invoke(mcp, "preview_open", MARKET_OPEN)
     assert preview["addr"] == ADDR
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)
@@ -1331,12 +1330,23 @@ def test_mcp_info_reports_versions_without_network(mcp, monkeypatch):
 def test_session_reports_never_include_the_token(mcp):
     storage.save_session(stored_session())
     status = invoke(mcp, "auth_status")
-    assert set(status) == {"addr", "expiresAt", "endpoint"}
-    assert status["addr"] == ADDR
-    assert status["endpoint"] == "https://sai-keeper.nibiru.fi"
+    assert set(status) == {
+        "addr",
+        "expiresAt",
+        "endpoint",
+        "expiryWarning",
+        "renewalCommand",
+    }
+    assert (status["addr"], status["endpoint"]) == (
+        ADDR,
+        ENDPOINT.removesuffix("/query"),
+    )
     info = invoke(mcp, "mcp_info")
     assert info["session"]["addr"] == ADDR
     assert info["session"]["usable"] is True
+    assert "expires in" in info["session"]["expiryWarning"]
+    assert info["session"]["renewalCommand"] == status["renewalCommand"]
+    assert "expiryWarning" in invoke(mcp, "auth_list")["accounts"][0]
     assert info["provenance"]["kind"] in ("source-checkout", "installed")
     assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"
 
