@@ -104,7 +104,9 @@ def submitted_keys() -> list[str]:
 
 
 @pytest.fixture
-def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]]]:
+def keeper_replay(
+    submitted_keys: list[str], monkeypatch: pytest.MonkeyPatch
+) -> Iterator[tuple[str, deque[Reply]]]:
     replies: deque[Reply] = deque()
     active_key = KEY
     offset = 0
@@ -201,6 +203,7 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                 slow.finished.set()
 
     with keeper_server(Handler) as base:
+        monkeypatch.setenv("SAI_LCD_ENDPOINT", base)
         yield f"{base}/query", replies
         assert not replies
 
