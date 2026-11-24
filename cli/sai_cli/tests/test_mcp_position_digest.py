@@ -54,6 +54,7 @@ class Position:
     oracle_ttl: int = 300
     fill_at_next_oracle_price: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
+    snapshot_traders: deque[str] = field(default_factory=deque)
     after_hours: bool = False
     risk_block: int = 90
     cap: str | None = "5"
@@ -93,8 +94,11 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_POST(self) -> None:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            if request["query"] == keeper.POSITION and position.snapshot_leverages:
-                position.leverage = position.snapshot_leverages.popleft()
+            if request["query"] == keeper.POSITION:
+                if position.snapshot_leverages:
+                    position.leverage = position.snapshot_leverages.popleft()
+                if position.snapshot_traders:
+                    position.trader = position.snapshot_traders.popleft()
             if request["query"] == keeper.SUBMIT:
                 assert self.headers["Authorization"] == f"Bearer {TOKEN}"
                 envelope = request["variables"]["input"]
@@ -466,6 +470,36 @@ def test_mcp_refuses_another_accounts_position(position_service, action, args):
                 }
 
             assert position.position_reads == position_reads
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
+def test_mcp_refuses_another_account_during_quote_rebuild(position_service):
+    position, base_url = position_service
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            args = {"trade_id": 7, "direction": "add", "amount": "5"}
+            preview = await call(client, "preview_margin", args)
+            # Both quotes use the initial cap. The final LCD read changes it,
+            # so the third lookup must rebuild the quote from Keeper again.
+            position.caps_on_position_read.extend([None, None, "4"])
+            position.snapshot_traders.extend([TRADER, TRADER, OTHER_TRADER])
+            result = await call(
+                client,
+                "trade_margin",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert result == {
+                "code": "INVALID_REQUEST",
+                "error": "Keeper position belongs to a different account",
+            }
+            assert not position.snapshot_traders
             assert position.submitted == []
             assert not (storage.home() / "intents.sqlite3").exists()
 

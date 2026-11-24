@@ -60,6 +60,12 @@ class PositionUnavailable(ValueError):
     """Keeper has no open position for this ID."""
 
 
+class PositionOwnerMismatch(SaiError):
+    """The position could not be attributed to the selected account."""
+
+    code = Code.INVALID_REQUEST
+
+
 class MarketUnavailable(ValueError):
     """Keeper has no open market for the position."""
 
@@ -597,7 +603,7 @@ def _position(
         raise PositionUnavailable("Open position not found")
     account = keeper.canonical_account(addr)
     if account is None or keeper.canonical_account(position.get("trader")) != account:
-        raise ValueError("Keeper position belongs to a different account")
+        raise PositionOwnerMismatch("Keeper position belongs to a different account")
     return position
 
 
