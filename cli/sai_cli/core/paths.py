@@ -16,49 +16,6 @@ def sai_home(env: Mapping[str, str] | None = None) -> Path:
     return Path(values.get("SAI_HOME", Path.home() / ".sai"))
 
 
-def home_mode_repairable(path: Path, info: os.stat_result) -> bool:
-    """Recognize a dedicated profile without treating ownership as consent."""
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_mode & (stat.S_ISGID | stat.S_ISVTX | 0o022)
-    ):
-        return False
-    if Path(os.path.abspath(path)) == Path.home() / ".sai":
-        return True
-    managed = {
-        "trader",
-        "logs",
-        "config.toml",
-        ".config.lock",
-        "cache",
-        "update.json",
-        "update.lock",
-        "update-cache.lock",
-    }
-    trader = path / "trader"
-    try:
-        if any(entry.name not in managed for entry in path.iterdir()):
-            return False
-        trader_info = trader.lstat()
-    except OSError:
-        return False
-    if (
-        not stat.S_ISDIR(trader_info.st_mode)
-        or trader_info.st_uid != info.st_uid
-        or trader_info.st_mode & 0o022
-    ):
-        return False
-    for name in ("sessions.json", "session.json", "intents.sqlite3"):
-        try:
-            marker = (trader / name).lstat()
-        except OSError:
-            continue
-        if stat.S_ISREG(marker.st_mode) and marker.st_uid == info.st_uid:
-            return True
-    return False
-
-
 def mkdir_private(path: Path) -> None:
     """Create a directory while another first run may be repairing a parent."""
     deadline = time.monotonic() + 0.5
@@ -75,12 +32,16 @@ def mkdir_private(path: Path) -> None:
 
 
 def private_directory(
-    path: Path, *, profile_root: bool = False, only_new: bool = False
+    path: Path,
+    *,
+    profile_root: bool = False,
+    preserve_mode: bool = False,
+    only_new: bool = False,
 ) -> Path:
-    """Create PATH with owner-only access and tighten existing Sai paths.
+    """Create PATH with owner-only access and tighten managed directories.
 
     Repair a newly created ancestor before creating anything below it.
-    Existing ancestors keep their mode.
+    Existing ancestors and profile roots keep their modes.
     """
     created = False
     try:
@@ -93,7 +54,7 @@ def private_directory(
             mkdir_private(path)
         created = True
     except FileExistsError:
-        if only_new and not profile_root:
+        if only_new:
             return path
     info = path.lstat()
     if (
@@ -112,12 +73,10 @@ def private_directory(
     if hasattr(os, "getuid") and info.st_uid != os.getuid():
         raise PermissionError(f"{path} belongs to another user")
     mode = stat.S_IMODE(info.st_mode)
-    if os.name == "nt" or mode == PRIVATE_MODE or (only_new and not created):
-        return path
     if (
-        profile_root
-        and not created
-        and (not mode & 0o077 or not home_mode_repairable(path, info))
+        os.name == "nt"
+        or mode == PRIVATE_MODE
+        or (not created and (profile_root or preserve_mode))
     ):
         return path
     try:
@@ -133,10 +92,7 @@ def private_directory(
             current = os.fstat(fd)
             if not os.path.samestat(info, current):
                 raise OSError(f"{path} changed while setting its mode")
-            if profile_root and current.st_mode != info.st_mode:
-                return path
-            target = mode & ~0o077 if profile_root and not created else PRIVATE_MODE
-            os.fchmod(fd, target)
+            os.fchmod(fd, PRIVATE_MODE)
         finally:
             os.close(fd)
     return path

@@ -186,8 +186,8 @@ def test_a_loose_wheel_cache_is_made_private_before_uv_reads_it(fake_uv, tmp_pat
     wheels = home / "cache" / "wheels"
     wheels.mkdir(parents=True)
     home.chmod(0o700)
-    for directory in (home / "cache", wheels):
-        directory.chmod(0o777)
+    wheels.parent.chmod(0o700)
+    wheels.chmod(0o777)
     with Stub(release_routes(WHEELS)) as stub:
         result = run(fake_uv, stub)
     assert result.returncode == 0, result.stderr
@@ -198,32 +198,36 @@ def test_a_loose_wheel_cache_is_made_private_before_uv_reads_it(fake_uv, tmp_pat
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
 @pytest.mark.parametrize(
-    ("profile", "mode", "expected"),
+    ("profile", "mode"),
     [
-        ("dedicated", 0o755, 0o700),
-        ("empty", 0o755, 0o755),
-        ("mixed-use", 0o755, 0o755),
-        ("dedicated", 0o2770, 0o2770),
+        ("trader", 0o755),
+        ("empty", 0o755),
+        ("mixed-use", 0o755),
+        ("trader", 0o2770),
     ],
 )
-def test_installer_respects_existing_root_mode(
-    tmp_path, monkeypatch, profile, mode, expected
-):
+def test_installer_respects_existing_root_mode(tmp_path, monkeypatch, profile, mode):
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    cache = tmp_path / "cache"
+    if profile == "mixed-use":
+        cache.mkdir()
+        cache.chmod(0o755)
+        (cache / "other-app.db").write_text("unrelated data")
+    tmp_path.chmod(mode)
     if profile != "empty":
         storage.db().close()
-    if profile == "mixed-use":
-        (tmp_path / "project.txt").touch()
-    tmp_path.chmod(mode)
 
     if mode & 0o022:
         with pytest.raises(install.LookupFailed, match="writable by other users"):
             install.private_cache()
-        assert not (tmp_path / "cache").exists()
+        assert not cache.exists()
     else:
         wheels = install.private_cache()
         assert wheels.stat().st_mode & 0o777 == 0o700
-    assert tmp_path.stat().st_mode & 0o7777 == expected
+    assert tmp_path.stat().st_mode & 0o7777 == mode
+    if profile == "mixed-use":
+        assert cache.stat().st_mode & 0o777 == 0o755
+        assert (cache / "other-app.db").read_text() == "unrelated data"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership")

@@ -279,7 +279,7 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 @pytest.mark.parametrize("with_trader", [False, True])
-def test_doctor_reports_and_tightens_loose_sai_home(
+def test_doctor_reports_and_preserves_loose_sai_home(
     isolated_home, with_trader, monkeypatch
 ):
     if with_trader:
@@ -303,9 +303,9 @@ def test_doctor_reports_and_tightens_loose_sai_home(
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
-    assert check["status"] == "fixed"
-    assert f"chmod {isolated_home} 755 -> 700" in check["changes"]
-    assert isolated_home.stat().st_mode & 0o777 == 0o700
+    assert check["status"] == "warn"
+    assert [change for change in check["changes"] if change.startswith("chmod")] == []
+    assert isolated_home.stat().st_mode & 0o777 == 0o755
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
@@ -394,9 +394,9 @@ def test_symlinked_ledger_is_not_migrated(isolated_home, tmp_path_factory):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes and symlinks")
-@pytest.mark.parametrize(("mode", "expected"), [(0o755, 0o700), (0o2770, 0o2770)])
+@pytest.mark.parametrize("mode", [0o755, 0o2770])
 def test_doctor_checks_root_independently_of_a_symlinked_history(
-    isolated_home, tmp_path_factory, mode, expected
+    isolated_home, tmp_path_factory, mode
 ):
     storage.db().close()
     target = tmp_path_factory.mktemp("elsewhere") / "history"
@@ -415,11 +415,8 @@ def test_doctor_checks_root_independently_of_a_symlinked_history(
     assert check["details"]["looseModes"] == [
         {"path": str(isolated_home), "mode": f"{mode:o}"}
     ]
-    changes = (
-        [f"chmod {isolated_home} {mode:o} -> {expected:o}"] if mode != expected else []
-    )
-    assert check["changes"] == changes
-    assert isolated_home.stat().st_mode & 0o7777 == expected
+    assert check["changes"] == []
+    assert isolated_home.stat().st_mode & 0o7777 == mode
     assert history.is_symlink()
     assert target.stat().st_mode & 0o777 == 0o644
 
@@ -592,7 +589,9 @@ def user_version(path: Path) -> int:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
-def test_doctor_reports_root_repair_before_ledger_migration(isolated_home):
+def test_doctor_reports_loose_root_without_changing_it_during_ledger_migration(
+    isolated_home,
+):
     path = old_ledger(isolated_home)
     path.parent.chmod(0o770)
     isolated_home.chmod(0o755)
@@ -600,14 +599,11 @@ def test_doctor_reports_root_repair_before_ledger_migration(isolated_home):
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 0
     checks = {c["id"]: c for c in json.loads(output)["checks"]}
-    assert checks["home"]["status"] == "fixed"
-    assert checks["home"]["changes"] == [
-        f"chmod {path.parent} 770 -> 700",
-        f"chmod {isolated_home} 755 -> 700",
-    ]
+    assert checks["home"]["status"] == "warn"
+    assert checks["home"]["changes"] == [f"chmod {path.parent} 770 -> 700"]
     assert checks["intents"]["status"] == "fixed"
     assert user_version(path) == storage.SCHEMA_VERSION
-    assert isolated_home.stat().st_mode & 0o777 == 0o700
+    assert isolated_home.stat().st_mode & 0o777 == 0o755
 
 
 def test_no_fix_warns_about_an_old_ledger(isolated_home):

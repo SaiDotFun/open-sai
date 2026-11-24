@@ -144,17 +144,20 @@ def test_first_write_creates_private_home(entry: str, tmp_path: Path, monkeypatc
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 @pytest.mark.parametrize(
-    ("mode", "mixed_use", "expected"),
-    [(0o2770, False, 0o2770), (0o755, False, 0o700), (0o755, True, 0o755)],
+    ("mode", "other_app_file"),
+    [(0o2770, None), (0o755, None), (0o755, "cache/other-app.db")],
 )
 def test_log_write_respects_existing_root_mode(
-    tmp_path: Path, monkeypatch, mode, mixed_use, expected
+    tmp_path: Path, monkeypatch, mode, other_app_file
 ):
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
-    storage.db().close()
-    if mixed_use:
-        (tmp_path / "project.txt").touch()
+    if other_app_file:
+        foreign = tmp_path / other_app_file
+        foreign.parent.mkdir()
+        foreign.write_text("unrelated data")
     tmp_path.chmod(mode)
+    storage.db().close()
+    assert tmp_path.stat().st_mode & 0o7777 == mode
     result = subprocess.run(
         [sys.executable, "-c", FIRST_WRITE, "logging", "022"],
         input="start\n",
@@ -164,7 +167,9 @@ def test_log_write_respects_existing_root_mode(
         check=True,
     )
     assert result.stderr == ""
-    assert tmp_path.stat().st_mode & 0o7777 == expected
+    assert tmp_path.stat().st_mode & 0o7777 == mode
+    if other_app_file:
+        assert foreign.read_text() == "unrelated data"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")

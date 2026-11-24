@@ -246,8 +246,8 @@ class LoggedGroup(SaiGroup):
             else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
         ):
             if command == "doctor" and not quiet:
-                # The log writer also tightens SAI_HOME. Let doctor inspect
-                # and report its mode before the first event reaches that writer.
+                # Let doctor report directory creation before logging creates
+                # the profile to record its first event.
                 extra["obj"] = {
                     **(extra.get("obj") or {}),
                     "doctor_log_start": log_start,
@@ -1145,7 +1145,8 @@ def doctor_command(
     """Check the install, config, MCP registrations, session, intent ledger,
     and endpoints.
 
-    With fixes enabled, doctor makes the Sai home and its managed files private, repairs
+    With fixes enabled, doctor creates private Sai directories, tightens
+    permissions on managed files, repairs
     stale Codex and Cursor MCP registrations, migrates the intent ledger,
     and reconciles unknown intents for the signed-in account with Keeper.
     It reports stale Claude Code registrations with a command to repair

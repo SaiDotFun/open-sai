@@ -490,14 +490,15 @@ def write_record(prefix: Path, tag: str, digest: str, wheel: Path) -> None:
 
 
 def private_cache() -> Path:
-    """Return the absolute wheel cache after making $SAI_HOME, `cache`, and
-    `cache/wheels` private to the current user."""
+    """Return the private wheel cache beneath user-owned, non-writable parents."""
     cache = update.wheel_cache()
     try:
         home = paths.private_directory(cache.parent.parent, profile_root=True)
         if os.name != "nt" and home.stat().st_mode & 0o022:
             raise OSError(f"{home} is writable by other users")
-        paths.private_directory(cache.parent)
+        parent = paths.private_directory(cache.parent, preserve_mode=True)
+        if os.name != "nt" and parent.stat().st_mode & 0o022:
+            raise OSError(f"{parent} is writable by other users")
         paths.private_directory(cache)
     except OSError as exc:
         raise UpdateFailed(f"the wheel cache is unusable: {exc}") from exc

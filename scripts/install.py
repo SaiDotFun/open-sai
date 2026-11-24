@@ -324,83 +324,41 @@ def wheel_cache() -> Path:
     return Path(os.path.abspath(home)) / "cache" / "wheels"
 
 
-def home_mode_repairable(path: Path, info: os.stat_result) -> bool:
-    # Keep in step with sai_cli.core.paths. The standalone installer runs
-    # before it can import the CLI package.
-    if (
-        not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != os.getuid()
-        or info.st_mode & (stat.S_ISGID | stat.S_ISVTX | 0o022)
-    ):
-        return False
-    if Path(os.path.abspath(path)) == Path.home() / ".sai":
-        return True
-    managed = {
-        "trader",
-        "logs",
-        "config.toml",
-        ".config.lock",
-        "cache",
-        "update.json",
-        "update.lock",
-        "update-cache.lock",
-    }
-    trader = path / "trader"
-    try:
-        if any(entry.name not in managed for entry in path.iterdir()):
-            return False
-        trader_info = trader.lstat()
-    except OSError:
-        return False
-    if (
-        not stat.S_ISDIR(trader_info.st_mode)
-        or trader_info.st_uid != info.st_uid
-        or trader_info.st_mode & 0o022
-    ):
-        return False
-    for name in ("sessions.json", "session.json", "intents.sqlite3"):
-        try:
-            marker = (trader / name).lstat()
-        except OSError:
-            continue
-        if stat.S_ISREG(marker.st_mode) and marker.st_uid == info.st_uid:
-            return True
-    return False
-
-
-def private_dir(path: Path, *, profile_root: bool = False) -> None:
-    """Create a private cache path and refuse a writable shared Sai home."""
+def private_dir(path: Path, *, preserve_mode: bool = False) -> None:
+    """Create a private cache directory or check a parent without changing it."""
     if path.is_symlink():
         raise LookupFailed(f"{path} is a symlink; not keeping a wheel under it")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700, parents=True)
+        created = True
+    except FileExistsError:
+        created = False
     status = path.stat()
+    if not stat.S_ISDIR(status.st_mode):
+        raise NotADirectoryError(f"{path} is not a directory")
     if hasattr(os, "getuid") and status.st_uid != os.getuid():
         raise LookupFailed(f"{path} belongs to another user; not keeping a wheel there")
     if os.name == "nt":
         return
     mode = stat.S_IMODE(status.st_mode)
-    target = 0o700
-    if profile_root:
+    if preserve_mode and not created:
         if mode & 0o022:
             raise LookupFailed(
                 f"{path} is writable by other users; choose a private SAI_HOME"
             )
-        if not mode & 0o077 or not home_mode_repairable(path, status):
-            return
-        target = mode & ~0o077
-    if mode != target:
+        return
+    if mode != 0o700:
         try:
-            path.chmod(target, follow_symlinks=False)
+            path.chmod(0o700, follow_symlinks=False)
         except OSError as error:
             raise LookupFailed(f"{path} could not be made private") from error
 
 
 def private_cache() -> Path:
-    """Return the wheel cache after making $SAI_HOME, `cache`, and
-    `cache/wheels` private to the current user."""
+    """Return the private wheel cache beneath user-owned, non-writable parents."""
     cache = wheel_cache()
-    private_dir(cache.parent.parent, profile_root=True)
-    private_dir(cache.parent)
+    private_dir(cache.parent.parent, preserve_mode=True)
+    private_dir(cache.parent, preserve_mode=True)
     private_dir(cache)
     return cache
 

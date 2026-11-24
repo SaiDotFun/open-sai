@@ -3,8 +3,8 @@ fix the rest.
 
 Each check returns pass, warn, fail, skipped, or fixed. A fixed check lists
 what it changed in `changes`. Doctor fixes only what it can from inspection:
-it creates `$SAI_HOME/trader`, tightens modes on `$SAI_HOME` and its managed
-files, repairs stale MCP registrations, migrates the intent ledger,
+it creates private Sai directories, tightens modes on managed files,
+repairs stale MCP registrations, migrates the intent ledger,
 and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
@@ -378,9 +378,7 @@ def loose_modes(paths: Sequence[Path]) -> list[tuple[Path, int, int]]:
     return loose
 
 
-def tighten(
-    root: Path, names: Sequence[str], *, profile_root: bool = False
-) -> tuple[list[str], list[str]]:
+def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
     """Clear group and other bits on ROOT and each of NAMES in it.
 
     Every chmod goes through a descriptor opened with O_NOFOLLOW, and the
@@ -414,12 +412,6 @@ def tighten(
                 continue
             try:
                 info_ = os.fstat(fd)
-                if (
-                    profile_root
-                    and name is None
-                    and not paths.home_mode_repairable(root, info_)
-                ):
-                    return changes, [f"Inspect the permissions on {root} by hand"]
                 if (
                     name is None
                     and hasattr(os, "getuid")
@@ -458,17 +450,9 @@ def check_home(ctx: Context) -> Check:
     details["looseModes"] = [
         {"path": str(path), "mode": f"{mode:o}"} for path, mode, _ in loose
     ]
-    manual_home = bool(home_loose) and not paths.home_mode_repairable(
-        sai_home, sai_home.lstat()
-    )
-    changes, failed = (
-        tighten(sai_home, (), profile_root=True)
-        if ctx.fix and home_loose and not manual_home
-        else ([], [])
-    )
     if links:
-        fixes = [SYMLINK_FIX, *failed]
-        if home_loose and (manual_home or not ctx.fix):
+        fixes = [SYMLINK_FIX]
+        if home_loose:
             fixes.append(f"Review permissions on {sai_home}")
         return Check(
             "home",
@@ -476,7 +460,6 @@ def check_home(ctx: Context) -> Check:
             f"{', '.join(map(str, links))}: profile path is a symlink",
             "; ".join(fixes),
             {**details, "symlinks": [str(path) for path in links]},
-            changes=changes,
         )
     trader_exists = root.is_dir()
     if loose and not ctx.fix:
@@ -495,26 +478,16 @@ def check_home(ctx: Context) -> Check:
             None,
             details,
         )
-    if not failed and not trader_exists:
+    changes: list[str] = []
+    failed: list[str] = []
+    if not trader_exists:
         home_exists = sai_home.is_dir()
         storage.directory()
         if not home_exists:
             changes.append(f"created {sai_home} with mode {paths.PRIVATE_MODE:o}")
         changes.append(f"created {root} with mode {paths.PRIVATE_MODE:o}")
-    elif not failed and trader_loose:
-        trader_changes, failed = tighten(root, MANAGED)
-        changes.extend(trader_changes)
-        # Tightening trader can make its files safe evidence of a dedicated
-        # profile. Report any resulting root repair before ledger migration.
-        if (
-            manual_home
-            and trader_changes
-            and paths.home_mode_repairable(sai_home, sai_home.lstat())
-        ):
-            manual_home = False
-            home_changes, home_failures = tighten(sai_home, (), profile_root=True)
-            changes.extend(home_changes)
-            failed.extend(home_failures)
+    elif trader_loose:
+        changes, failed = tighten(root, MANAGED)
     if failed:
         return Check(
             "home",
@@ -524,7 +497,7 @@ def check_home(ctx: Context) -> Check:
             details,
             changes=changes,
         )
-    if manual_home:
+    if home_loose:
         return Check(
             "home",
             "warn",
