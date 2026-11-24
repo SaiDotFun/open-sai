@@ -479,6 +479,18 @@ def test_published_python_updater_can_skip_bridge(
             )
             tool.verify_version(BASELINE)
             launcher = tool.sai.resolve(strict=True)
+            previous_release = json.loads(
+                run(
+                    tool,
+                    "Capture the verified Python release record",
+                    tool.python,
+                    "-I",
+                    "-c",
+                    "import json, sys; from pathlib import Path; "
+                    "from sai_cli.core.update import read_release_record; "
+                    "print(json.dumps(read_release_record(Path(sys.prefix)).to_json()))",
+                )
+            )
             tool.json("Disable auto-update", "config", "set", "update.auto", "false")
             endpoint = f"{base}/query"
             tool.json(
@@ -545,8 +557,12 @@ def test_published_python_updater_can_skip_bridge(
 
         tool.verify_version(d.version)
         # Reinstall the baseline wheel already verified and kept by the old installer.
-        rollback_wheel = tool.sai_home / "cache" / "wheels" / old_wheel.name
-        assert rollback_wheel.read_bytes() == old_wheel.read_bytes()
+        rollback_wheel = Path(previous_release["wheel"])
+        assert rollback_wheel == tool.sai_home / "cache" / "wheels" / old_wheel.name
+        assert (
+            hashlib.sha256(rollback_wheel.read_bytes()).hexdigest()
+            == previous_release["sha256"]
+        )
         run(
             tool,
             "Roll back through uv without an asset server",
@@ -558,7 +574,31 @@ def test_published_python_updater_can_skip_bridge(
             rollback_wheel,
         )
         tool.verify_version(BASELINE)
+        run(
+            tool,
+            "Restore the verified release record for the reinstalled Python wheel",
+            tool.python,
+            "-I",
+            "-c",
+            "import sys; from pathlib import Path; "
+            "from sai_cli.core.updater import write_record; "
+            "write_record(Path(sys.prefix), sys.argv[1], sys.argv[2], Path(sys.argv[3]))",
+            previous_release["tag"],
+            previous_release["sha256"],
+            rollback_wheel,
+        )
         assert tool.sai.resolve(strict=True) == launcher
+        assert (
+            run(
+                tool,
+                "Check that the rolled-back install can use sai update",
+                tool.python,
+                "-I",
+                "-c",
+                "from sai_cli.core.update import install_kind; print(install_kind().kind)",
+            )
+            == "uv-tool-release\n"
+        )
         assert (
             tool.json(
                 "Read the live ledger after rollback", "intent", "local", replay.addr
