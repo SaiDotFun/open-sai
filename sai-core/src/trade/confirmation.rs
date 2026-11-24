@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 
-use super::TradePreview;
+use super::{TradePreview, position::PositionRoute};
 use crate::errors::{Code, SaiError};
 
 const NEEDS_DIGEST: &str = "preview_digest is required: call the matching preview_* tool, show the user the preview, get confirmation, then pass its previewDigest";
@@ -49,8 +49,11 @@ impl<'a> Confirmation<'a> {
         &self,
         preview: &TradePreview,
         account: &str,
+        route: &PositionRoute,
     ) -> Result<(), SaiError> {
-        if self.digest_matches(preview, account)? {
+        let mut current = preview.clone();
+        current.position_route = Some(route.clone());
+        if self.digest_matches(&current, account)? {
             return Ok(());
         }
         Err(SaiError::new(

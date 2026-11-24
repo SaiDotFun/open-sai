@@ -43,6 +43,7 @@ pub(super) enum SnapshotError {
 
 const KEEPER_OWNER: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER: &str = "Contract position belongs to a different account";
+const ROUTE_MISMATCH: &str = "Keeper trading route and LCD network do not match";
 
 impl From<SaiError> for SnapshotError {
     fn from(_: SaiError) -> Self {
@@ -54,48 +55,62 @@ pub(super) fn contract_owner_error() -> SaiError {
     invalid(CONTRACT_OWNER)
 }
 
+impl PositionRoute {
+    pub(super) fn from_keeper(route: &Value) -> Result<Self, SaiError> {
+        let chain = field(route, "enabled")?
+            .as_bool()
+            .filter(|&enabled| enabled)
+            .and_then(|_| route["chainId"].as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid(ROUTE_MISMATCH))?;
+        let contract = route["contractAddress"]
+            .as_str()
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| invalid("Keeper trading route has no contract address"))?;
+        Ok(Self {
+            chain_id: chain.into(),
+            contract_address: contract.into(),
+        })
+    }
+
+    pub(super) fn verify_network(&self, network: &str, confirming: bool) -> Result<(), SaiError> {
+        if network != self.chain_id {
+            return Err(if confirming {
+                SaiError::new(
+                    Code::PreviewMismatch,
+                    format!(
+                        "{ROUTE_MISMATCH}. Use an LCD on Keeper's chain and request a new preview."
+                    ),
+                )
+            } else {
+                invalid(ROUTE_MISMATCH)
+            });
+        }
+        Ok(())
+    }
+}
+
 impl Trading<'_> {
+    pub(super) async fn keeper_position_route(&self) -> Result<Value, SaiError> {
+        let mut data = self
+            .keeper
+            .request(ROUTE, Map::new(), None, TIMEOUT)
+            .await?;
+        data.get_mut("oneClickTrading")
+            .map(Value::take)
+            .ok_or_else(|| incomplete("KeyError"))
+    }
+
     pub(super) async fn position_route(
         &self,
         lcd: &Lcd<'_>,
         confirming: bool,
     ) -> Result<PositionRoute, SaiError> {
-        let route = self
-            .keeper
-            .request(ROUTE, Map::new(), None, TIMEOUT)
-            .await?;
-        let route = route
-            .get("oneClickTrading")
-            .ok_or_else(|| incomplete("KeyError"))?;
+        let data = self.keeper_position_route().await?;
         let network = lcd.network().await?;
-        let network = network.as_str().filter(|id| !id.is_empty());
-        let chain = field(route, "enabled")?
-            .as_bool()
-            .filter(|&enabled| enabled)
-            .and_then(|_| route["chainId"].as_str())
-            .filter(|id| !id.is_empty());
-        let mismatch = "Keeper trading route and LCD network do not match";
-        let Some(chain) = chain.filter(|_| network.is_some()) else {
-            return Err(invalid(mismatch));
-        };
-        let contract = route["contractAddress"]
-            .as_str()
-            .filter(|address| !address.is_empty())
-            .ok_or_else(|| invalid("Keeper trading route has no contract address"))?;
-        if network != Some(chain) {
-            return Err(if confirming {
-                SaiError::new(
-                    Code::PreviewMismatch,
-                    format!("{mismatch}. Use an LCD on Keeper's chain and request a new preview."),
-                )
-            } else {
-                invalid(mismatch)
-            });
-        }
-        Ok(PositionRoute {
-            chain_id: chain.into(),
-            contract_address: contract.into(),
-        })
+        let route = PositionRoute::from_keeper(&data)?;
+        route.verify_network(&network, confirming)?;
+        Ok(route)
     }
 
     async fn read_contract_target(

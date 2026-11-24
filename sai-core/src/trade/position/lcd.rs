@@ -13,7 +13,7 @@ use crate::{
     keeper::{self, TIMEOUT},
 };
 
-use super::{invalid, malformed};
+use super::{ROUTE_MISMATCH, invalid, malformed};
 use crate::trade::cancel::lcd_url;
 
 const HEIGHT: &str = "x-cosmos-block-height";
@@ -29,14 +29,19 @@ pub(in crate::trade) enum Read<'a> {
 }
 
 impl Lcd<'_> {
-    pub(in crate::trade) async fn network(&self) -> Result<Value, SaiError> {
-        self.get(
-            "/cosmos/base/tendermint/v1beta1/node_info",
-            Read::Snapshot,
-            false,
-        )
-        .await
-        .map(|(response, _)| response["default_node_info"]["network"].clone())
+    pub(in crate::trade) async fn network(&self) -> Result<String, SaiError> {
+        let (response, _) = self
+            .get(
+                "/cosmos/base/tendermint/v1beta1/node_info",
+                Read::Snapshot,
+                false,
+            )
+            .await?;
+        response["default_node_info"]["network"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid(ROUTE_MISMATCH))
     }
 
     pub(in crate::trade) async fn smart(

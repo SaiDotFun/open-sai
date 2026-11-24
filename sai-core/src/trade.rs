@@ -235,13 +235,12 @@ impl<'a> Trading<'a> {
         confirmation: Option<&Confirmation<'_>>,
     ) -> Result<Option<position::PositionRoute>, SaiError> {
         let account = session.addr();
-        let mut close_id = None;
         let no_lcd = match preview.intent.kind {
             "CLOSE_POSITION" => {
-                let id = preview.position_id()?;
-                self.indexed_position(account, &id, keeper::TIMEOUT).await?;
-                close_id = Some(id);
-                "Cannot verify the position without an LCD"
+                return self
+                    .close_submit_route(session, preview, confirmation)
+                    .await
+                    .map(Some);
             }
             "CANCEL_PENDING_TRADE" => "Cannot verify the pending order without an LCD",
             "OPEN_TRADE" if bind_open => "Cannot verify the trade route without an LCD",
@@ -253,19 +252,46 @@ impl<'a> Trading<'a> {
             .ok_or_else(|| actions::invalid(no_lcd))?;
         let route = self.position_route(&lcd, confirmation.is_some()).await?;
         if let Some(confirmation) = confirmation {
-            let mut current = preview.clone();
-            current.position_route = Some(route.clone());
             // A replacement contract may not contain the target or market.
             // Route checks cannot issue a digest before those reads.
-            confirmation.verify_route_digest(&current, account)?;
+            confirmation.verify_route_digest(preview, account, &route)?;
         }
-        if let Some(id) = close_id {
-            Self::verify_contract_owner(&lcd, account, &id, &route).await?;
-        } else if preview.intent.kind == "CANCEL_PENDING_TRADE" {
+        if preview.intent.kind == "CANCEL_PENDING_TRADE" {
             self.check_pending_target(session, preview, &lcd, &route)
                 .await?;
         }
         Ok(Some(route))
+    }
+
+    async fn close_submit_route(
+        &self,
+        session: &Session,
+        preview: &TradePreview,
+        confirmation: Option<&Confirmation<'_>>,
+    ) -> Result<position::PositionRoute, SaiError> {
+        let account = session.addr();
+        let id = preview.position_id()?;
+        let confirmed_route = if let Some(confirmation) = confirmation {
+            // Route drift can remove the position from Keeper's index.
+            let route = position::PositionRoute::from_keeper(&self.keeper_position_route().await?)?;
+            confirmation.verify_route_digest(preview, account, &route)?;
+            Some(route)
+        } else {
+            None
+        };
+        self.indexed_position(account, &id, keeper::TIMEOUT).await?;
+        let lcd = self
+            .lcd_endpoint
+            .map(position::Lcd)
+            .ok_or_else(|| actions::invalid("Cannot verify the position without an LCD"))?;
+        let route = if let Some(route) = confirmed_route {
+            route.verify_network(&lcd.network().await?, true)?;
+            route
+        } else {
+            self.position_route(&lcd, false).await?
+        };
+        Self::verify_contract_owner(&lcd, account, &id, &route).await?;
+        Ok(route)
     }
 
     /// Verify a confirmed preview, commit the reservation, then send once.

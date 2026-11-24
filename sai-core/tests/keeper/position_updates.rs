@@ -38,6 +38,7 @@ struct ReplyState {
     price: &'static str,
     market_available: bool,
     trade_type: &'static str,
+    indexed_position_missing: bool,
     target_missing: bool,
 }
 
@@ -64,6 +65,7 @@ impl PositionServer {
             price: "100",
             market_available: true,
             trade_type: "trade",
+            indexed_position_missing: false,
             target_missing: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -132,7 +134,12 @@ impl ReplyState {
                 POSITION => {
                     assert_eq!(request["variables"], json!({"trader": ACCOUNT, "id": 7}));
                     self.requests.push("position".into());
-                    json!({"perp": {"trade": {"id": 7, "trader": self.keeper_owner}}})
+                    let position = if self.indexed_position_missing {
+                        Value::Null
+                    } else {
+                        json!({"id": 7, "trader": self.keeper_owner})
+                    };
+                    json!({"perp": {"trade": position}})
                 }
                 MARKETS => {
                     self.requests.push("markets".into());
@@ -613,11 +620,7 @@ async fn basic_trade_confirmation_checks_live_chain_and_contract() {
 async fn basic_confirmation_reports_keeper_only_chain_drift() {
     for (preview, reference, preflight) in [
         (market_open(), Some("100"), &["route", "node_info"][..]),
-        (
-            close_preview("7", false).unwrap(),
-            None,
-            &["position", "route", "node_info"][..],
-        ),
+        (close_preview("7", false).unwrap(), None, &["route"][..]),
         (
             close_preview("7", true).unwrap(),
             None,
@@ -698,6 +701,76 @@ async fn market_confirmation_reports_contract_drift_before_reading_missing_marke
     assert!(error.message.contains("Request a fresh preview"));
     assert_eq!(server.requests(), ["route", "node_info"]);
     assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn close_confirmation_checks_route_before_reading_the_indexed_position() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = close_preview("7", false).unwrap();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    let digest = issued["previewDigest"].as_str().unwrap();
+
+    for (contract, missing, owner, code, message, requests) in [
+        (
+            "nibi1differentcontract",
+            true,
+            ACCOUNT,
+            Code::PreviewMismatch,
+            "Request a fresh preview",
+            &["route"][..],
+        ),
+        (
+            CONTRACT,
+            true,
+            ACCOUNT,
+            Code::InvalidRequest,
+            "Position not found for this account",
+            &["route", "position"][..],
+        ),
+        (
+            CONTRACT,
+            false,
+            OTHER_ACCOUNT,
+            Code::InvalidRequest,
+            "Keeper position belongs to a different account",
+            &["route", "position"][..],
+        ),
+    ] {
+        {
+            let mut state = server.state.lock().unwrap();
+            state.contract = contract;
+            state.indexed_position_missing = missing;
+            state.keeper_owner = owner;
+            state.requests.clear();
+        }
+
+        let error = trading
+            .submit(
+                &session,
+                &preview,
+                SubmitOptions {
+                    confirmation: Some(Confirmation::new(digest, None).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code, code);
+        assert!(error.message.contains(message));
+        assert!(error.details.is_none());
+        assert_eq!(server.requests(), requests);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
 }
 
 #[tokio::test]
