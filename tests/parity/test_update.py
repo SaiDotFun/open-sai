@@ -30,9 +30,7 @@ fcntl = pytest.importorskip("fcntl")
 pty = pytest.importorskip("pty")
 
 REPO = "/SaiDotFun/open-sai"
-OLD = "0.1.0"
-NEW = "0.99.0"
-OLD_DIR = f"{OLD}-{'b' * 64}"
+NEW = "9999.0.0"
 PLATFORM = {
     ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
     ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
@@ -107,11 +105,12 @@ def archive(version: str = NEW, *, fail: str = "", bad_entry: str = "") -> bytes
 
 
 def wheel(tmp: Path, version: str, *, fail: str = "", forward: bool = False) -> Path:
-    filename = f"sai_cli-{version}-py3-none-any.whl"
-    name = f"sai_cli-{version}.dist-info"
+    wheel_version = version.replace("-rc.", "rc")
+    filename = f"sai_cli-{wheel_version}-py3-none-any.whl"
+    name = f"sai_cli-{wheel_version}.dist-info"
     files = {
         "fixture_sai.py": executable(version, fail=fail, forward=forward),
-        f"{name}/METADATA": f"Metadata-Version: 2.1\nName: sai-cli\nVersion: {version}\n",
+        f"{name}/METADATA": f"Metadata-Version: 2.1\nName: sai-cli\nVersion: {wheel_version}\n",
         f"{name}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
         f"{name}/entry_points.txt": "[console_scripts]\nsai = fixture_sai:run\n",
     }
@@ -199,6 +198,7 @@ class NativeInstall:
     executable: Path
     home: Path
     env: dict[str, str]
+    installed: str
 
     def invoke(
         self, *args: str, exe: Path | None = None, **overrides: str
@@ -229,28 +229,30 @@ def standalone(
 ) -> NativeInstall:
     tmp_path = tmp_path.resolve()
     root = tmp_path / "bin"
-    old = root / ".sai-native" / OLD_DIR / "sai"
-    old.parent.mkdir(parents=True, mode=0o700)
-    old.parent.parent.chmod(0o700)
-    shutil.copy2(cli_pair[1][0], old)
     launcher = root / "sai"
-    launcher.symlink_to(old.relative_to(root))
     home = tmp_path / "profile"
     home.mkdir(mode=0o700)
-    return NativeInstall(
-        launcher,
-        old,
-        home,
-        {
-            "PATH": os.pathsep.join([str(root), os.defpath]),
-            "HOME": str(tmp_path),
-            "SAI_HOME": str(home),
-            "SAI_LOG": "false",
-            "CI": "1",
-            "FIXTURE_STABLE_LAUNCHER": str(launcher),
-            "NO_PROXY": "127.0.0.1,localhost,::1",
-        },
-    )
+    env = {
+        "PATH": os.pathsep.join([str(root), os.defpath]),
+        "HOME": str(tmp_path),
+        "SAI_HOME": str(home),
+        "SAI_LOG": "false",
+        "CI": "1",
+        "FIXTURE_STABLE_LAUNCHER": str(launcher),
+        "NO_PROXY": "127.0.0.1,localhost,::1",
+    }
+    binary = cli_pair[1][0]
+    version = subprocess.check_output(
+        [binary, "--version"], env=env, text=True, timeout=10
+    ).strip()
+    executable, installed = version.split(" ", 1)
+    assert executable == "sai"
+    old = root / ".sai-native" / f"{installed}-{'b' * 64}" / "sai"
+    old.parent.mkdir(parents=True, mode=0o700)
+    old.parent.parent.chmod(0o700)
+    shutil.copy2(binary, old)
+    launcher.symlink_to(old.relative_to(root))
+    return NativeInstall(launcher, old, home, env, installed)
 
 
 def test_standalone_update_replaces_only_the_launcher(
@@ -301,7 +303,7 @@ def test_invalid_assets_keep_the_working_launcher(
     assert standalone.launcher.readlink() == initial
     assert sorted(
         path.name for path in standalone.executable.parent.parent.iterdir()
-    ) == [OLD_DIR]
+    ) == [standalone.executable.parent.name]
 
 
 @pytest.mark.parametrize("phase", ["trial", "installed"])
@@ -314,7 +316,9 @@ def test_failed_smoke_check_keeps_or_restores_standalone(
     assert result.returncode == 1
     assert "did not initialize" in json.loads(result.stdout)["error"]["message"]
     assert standalone.launcher.readlink() == initial
-    assert standalone.invoke("--version").stdout.strip() == f"sai {OLD}"
+    assert (
+        standalone.invoke("--version").stdout.strip() == f"sai {standalone.installed}"
+    )
     assert standalone.state()["result"]["rolledBack"] is (phase == "installed")
     assert not (standalone.executable.parent.parent / "pending.json").exists()
 
@@ -331,9 +335,10 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
     standalone.launcher.symlink_to(staged.relative_to(standalone.launcher.parent))
     record = root / "pending.json"
     record.write_text(
-        json.dumps({"old": OLD_DIR, "new": interrupted}), encoding="utf-8"
+        json.dumps({"old": standalone.executable.parent.name, "new": interrupted}),
+        encoding="utf-8",
     )
-    with releases({}, tags=(OLD,)) as server:
+    with releases({}, tags=(standalone.installed,)) as server:
         checked = standalone.update(server, "--check")
         assert checked.returncode == 0, checked.stdout
         assert standalone.launcher.resolve() == staged
@@ -574,7 +579,7 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
         "FIXTURE_NATIVE_BINARY": str(candidate),
         "FIXTURE_STABLE_UV_PREFIX": str(tools / "sai-cli"),
     }
-    initial = wheel(tmp_path, OLD, forward=True)
+    initial = wheel(tmp_path, standalone.installed, forward=True)
     replacement = wheel(tmp_path, NEW, fail=fail)
     result = subprocess.run(
         [uv, "tool", "install", "--offline", "--python", sys.executable, initial],
@@ -586,10 +591,12 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
     )
     assert result.returncode == 0, result.stderr
     launcher = bins / "sai"
-    install = NativeInstall(launcher, candidate, standalone.home, env)
+    install = NativeInstall(
+        launcher, candidate, standalone.home, env, standalone.installed
+    )
     link = launcher.readlink()
     local_assets = {
-        **assets(OLD, initial.name, initial.read_bytes()),
+        **assets(standalone.installed, initial.name, initial.read_bytes()),
         **assets(NEW, replacement.name, replacement.read_bytes()),
     }
     with releases(local_assets) as server:
@@ -631,7 +638,9 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
             assert pinned.returncode == 3, pinned.stdout + pinned.stderr
             assert server.reads == before
         changed = install.update(server)
-        assert server.reads.count(asset_key(OLD, initial.name)) == 1, changed.stdout
+        assert server.reads.count(asset_key(standalone.installed, initial.name)) == 1, (
+            changed.stdout
+        )
         assert server.reads.count(asset_key(NEW, replacement.name)) == 1
     assert launcher.is_symlink() and launcher.readlink() == link
     assert (tools / "sai-cli" / "uv-receipt.toml").is_file()
@@ -640,7 +649,9 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
         assert changed.returncode == 1
         assert "Rolled back" in json.loads(changed.stdout)["error"]["message"]
         assert install.state()["result"]["rolledBack"] is True
-        assert install.invoke("--version").stdout.strip() == f"sai {OLD}"
+        assert (
+            install.invoke("--version").stdout.strip() == f"sai {standalone.installed}"
+        )
     else:
         assert changed.returncode == 0, changed.stdout
         assert json.loads(changed.stdout)["status"] == "updated"
