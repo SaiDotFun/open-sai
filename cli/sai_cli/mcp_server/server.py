@@ -339,6 +339,9 @@ async def preview_open(
     referencePrice. Submit refreshes the price and checks it against the
     referencePrice from the preview.
 
+    For a preview with confirmationStatus "informational", connect a Sai
+    account and call preview_open again before asking for confirmation.
+
     Args:
         market_id: Market id from market_list.
         side: long or short.

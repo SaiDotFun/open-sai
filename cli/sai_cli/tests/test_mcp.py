@@ -963,27 +963,6 @@ def test_unknown_arguments_are_rejected(mcp, monkeypatch):
 MARKET_OPEN = {**OPEN_ARGS, "order_type": "market", "price": None}
 
 
-def test_preview_with_no_account_never_authorizes_a_trade(mcp, monkeypatch):
-    fake = FakeKeeper({keeper.MARKETS: markets()})
-    monkeypatch.setattr(keeper, "request", fake)
-    preview = invoke(mcp, "preview_open", MARKET_OPEN)
-    assert preview["addr"] is None
-    storage.save_session(stored_session())
-    error = invoke(
-        mcp,
-        "trade_open",
-        {
-            **MARKET_OPEN,
-            "preview_digest": preview["previewDigest"],
-            "reference_price": preview["referencePrice"],
-            "allow_concurrent_open": True,
-        },
-    )
-    assert error["code"] == "PREVIEW_MISMATCH"
-    assert error["preview"]["addr"] == ADDR
-    assert fake.submitted == []
-
-
 def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
     """A signed-out preview, then sign-in, then logout while the market
     price refreshes: the trade must not submit with the session it loaded
@@ -1005,7 +984,7 @@ def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
         "trade_open",
         {
             **MARKET_OPEN,
-            "preview_digest": preview["previewDigest"],
+            "preview_digest": confirmation.preview_digest(preview),
             "reference_price": preview["referencePrice"],
             "allow_concurrent_open": True,
         },

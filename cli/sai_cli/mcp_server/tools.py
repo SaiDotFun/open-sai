@@ -650,7 +650,19 @@ def open_trade(
     )
     if notices:
         result["notices"] = notices
-    return finish(load, dry_run, result)
+    if not dry_run:
+        return finish(load, dry_run, result)
+    preview = {**result, "addr": load.account()}
+    if preview["addr"] is not None:
+        return confirmation.with_digest(preview)
+    return {
+        **preview,
+        "confirmationStatus": "informational",
+        "recovery": {
+            "action": "connect_and_preview",
+            "message": "Connect a Sai account, then call preview_open again for that account.",
+        },
+    }
 
 
 def close_trade(

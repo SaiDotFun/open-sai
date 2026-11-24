@@ -24,7 +24,7 @@ from click.testing import CliRunner
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
-from sai_cli.core import keeper, margin, settings, storage
+from sai_cli.core import confirmation, keeper, margin, settings, storage
 from sai_cli.core.errors import ExitCode
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
@@ -1141,6 +1141,65 @@ def test_cli_preview_text_and_json_use_the_order_trigger(
         Decimal(".0001")
     ) == Decimal(60)
     assert position.submitted == []
+
+
+def test_signed_out_market_open_requires_an_account_preview(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            session = storage.load_session(ADDR)
+            assert storage.delete_session(ADDR) == ADDR
+            preview = await call(client, "preview_open", args)
+            assert preview["addr"] is None
+            assert preview["confirmationStatus"] == "informational"
+            assert preview["recovery"]["action"] == "connect_and_preview"
+            assert "preview_open" in preview["recovery"]["message"]
+            assert "previewDigest" not in preview
+            assert preview["referencePrice"] == "100.5"
+            assert preview["estimates"]["worstCaseFill"]["status"] == "bound"
+            assert position.submitted == []
+
+            # Older versions emitted this digest for the same accountless quote.
+            legacy_digest = confirmation.preview_digest(preview)
+            storage.save_session(session)
+            trade = {**args, "reference_price": preview["referencePrice"]}
+            refused = await call(
+                client, "trade_open", {**trade, "preview_digest": legacy_digest}
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["preview"]["addr"] == ADDR
+            assert position.submitted == []
+
+            fresh = await call(client, "preview_open", {**args, "addr": ADDR})
+            assert fresh["addr"] == ADDR
+            assert fresh["previewDigest"] != legacy_digest
+            result = await call(
+                client,
+                "trade_open",
+                {**trade, "addr": ADDR, "preview_digest": fresh["previewDigest"]},
+            )
+            assert result["status"] == "accepted"
+            assert result["addr"] == ADDR
+            (submitted,) = position.submitted
+            assert submitted["kind"] == fresh["intent"]["kind"]
+            assert submitted["body"] == {
+                **fresh["intent"]["body"],
+                "intentPrice": fresh["referencePrice"],
+            }
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

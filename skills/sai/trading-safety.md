@@ -132,13 +132,16 @@ and follow the same recovery rules for `NOT_SENT`, `ADMISSION_REJECTED`,
 
 ## Digest Confirmation in MCP
 
-Each preview returns `previewDigest`. A `trade_*` call must send it back as
-input `preview_digest`, and a market `trade_open` must also send the
+For confirmation, use an account-bound preview with a `previewDigest`.
+If `preview_open` returns `confirmationStatus: "informational"`, connect an
+account and preview again. A `trade_*` call must pass the preview digest as
+input `preview_digest`, and a market `trade_open` must also pass the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
 intent, position quote, or quoted price fails the confirmation check.
-Nothing is submitted on a refusal. Show the fresh preview from the result
-and ask again.
+The server refuses submission. Show the replacement preview if present and
+ask for confirmation again. If the quote is unavailable, follow the result's
+recovery instructions.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.

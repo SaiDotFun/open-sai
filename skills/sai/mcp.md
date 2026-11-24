@@ -105,6 +105,11 @@ for the token and never returns it.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
+A signed-out `preview_open` with no account returns estimates with
+`confirmationStatus: "informational"` and omits `previewDigest`. When
+`recovery.action` is `connect_and_preview`, connect a Sai account, then call
+`preview_open` for that account and show that preview for confirmation.
+
 Outputs use camelCase and inputs use snake_case:
 
 | Preview output | `trade_*` input | Needed by |
