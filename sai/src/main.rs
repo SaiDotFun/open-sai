@@ -158,7 +158,6 @@ fn main() -> process::ExitCode {
                         }
                         Command::Trade { command } => {
                             trade::run(command, cli.account.as_deref(), &flags, env, json, events)
-                                .map(|()| ExitCode::Ok)
                         }
                     }
                 });

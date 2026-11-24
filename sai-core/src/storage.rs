@@ -115,7 +115,7 @@ pub enum StorageEvent<'a> {
 }
 
 /// Project a stored endpoint onto the same fields as Python's log.origin.
-pub(crate) fn endpoint_origin(endpoint: &str) -> String {
+fn endpoint_origin(endpoint: &str) -> String {
     fn origin(endpoint: &str) -> Option<String> {
         let normalized = endpoint.trim().replace(['\t', '\n', '\r'], "");
         let (scheme, rest) = normalized.split_once("://")?;
@@ -187,6 +187,10 @@ impl<'a> Storage<'a> {
     }
 
     pub fn intent_status_hint(&self, endpoint: &str, account: &str, key: &str) -> String {
+        self.keeper_command_hint(endpoint, &["intent", "status", account, "--key", key])
+    }
+
+    pub fn keeper_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
         use crate::session::shell_quote;
 
         let flag = if endpoint_origin(endpoint) == endpoint
@@ -200,11 +204,12 @@ impl<'a> Storage<'a> {
             r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
                 .into()
         };
-        format!(
-            "sai --endpoint {flag} intent status {} --key {}",
-            shell_quote(account),
-            shell_quote(key)
-        )
+        let args = args
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("sai --endpoint {flag} {args}")
     }
 
     pub(crate) fn emit(&self, event: StorageEvent<'_>) {

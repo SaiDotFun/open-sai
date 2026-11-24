@@ -1,9 +1,6 @@
 //! Wait for an intent within one deadline, including Keeper reads and ledger updates.
 
-use std::{
-    path::Path,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use rusqlite::ErrorCode;
 use serde_json::{Value, json};
@@ -11,11 +8,10 @@ use serde_json::{Value, json};
 use crate::{
     errors::{Code, SaiError},
     keeper::{self, Keeper},
-    log::{self, EventContext, Field, Level},
+    log::{EventContext, Field, Level},
     receipt::Evidence,
     reconcile::{self, PollError, WaitBudget, classify_outcome},
-    session::shell_quote,
-    storage::{Storage, StorageError, endpoint_origin},
+    storage::{Storage, StorageError},
 };
 
 pub const DEFAULT_TIMEOUT: f64 = 30.0;
@@ -293,6 +289,20 @@ pub fn unknown_result(key: &str) -> ResultReceipt {
     )
 }
 
+pub fn rejected_result(key: &str, addr: &str, message: &str) -> ResultReceipt {
+    let mut receipt = result(
+        key,
+        Some(addr),
+        Outcome::Rejected,
+        &Value::Null,
+        &[],
+        &Value::Null,
+        &Value::Null,
+    );
+    receipt.body["message"] = json!(message);
+    receipt
+}
+
 fn result(
     key: &str,
     addr: Option<&str>,
@@ -337,17 +347,23 @@ fn result(
 }
 
 pub fn recovery_result(
-    home: &Path,
+    storage: &Storage<'_>,
     endpoint: &str,
     addr: &str,
     key: &str,
     interrupted: bool,
+    confirmed: Option<Outcome>,
 ) -> ResultReceipt {
-    let storage = Storage::new(home).with_busy_timeout(Duration::ZERO);
+    let storage = storage.clone().with_busy_timeout(Duration::ZERO);
     let status = local_status(&storage, endpoint, addr, key).ok().flatten();
-    let outcome = status
+    let recorded = status
         .as_deref()
         .map_or(Outcome::Unknown, Outcome::recorded);
+    let outcome = if recorded == Outcome::Unknown {
+        confirmed.unwrap_or(Outcome::Unknown)
+    } else {
+        recorded
+    };
     let body = json!({
         "intentKey": key,
         "addr": addr,
@@ -356,26 +372,7 @@ pub fn recovery_result(
         "code": outcome.code(),
         "receipt": null,
         "interrupted": interrupted,
-        "hint": command_hint(home, endpoint, &["intent", "status", addr, "--key", key]),
+        "hint": storage.intent_status_hint(endpoint, addr, key),
     });
     ResultReceipt { outcome, body }
-}
-
-pub fn command_hint(home: &Path, endpoint: &str, args: &[&str]) -> String {
-    let origin = endpoint_origin(endpoint);
-    let endpoint = if origin != "[redacted url]"
-        && origin == endpoint
-        && log::redact(home, endpoint) == endpoint
-    {
-        shell_quote(endpoint)
-    } else {
-        r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-            .into()
-    };
-    let args = args
-        .iter()
-        .map(|arg| shell_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("sai --endpoint {endpoint} {args}")
 }

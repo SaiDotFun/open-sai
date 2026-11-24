@@ -271,12 +271,12 @@ pub fn intent(
                 tokio::select! {
                     biased;
                     signal = tokio::signal::ctrl_c() => (
-                        wait::recovery_result(&env.home, endpoint, &addr, &key, signal.is_ok()), true,
+                        wait::recovery_result(&storage, endpoint, &addr, &key, signal.is_ok(), None), true,
                     ),
                     receipt = wait::for_intent(endpoint, &addr, &key, timeout, started, &storage, events) => {
                         match receipt {
                             Ok(receipt) => (receipt, false),
-                            Err(_) => (wait::recovery_result(&env.home, endpoint, &addr, &key, false), true),
+                            Err(_) => (wait::recovery_result(&storage, endpoint, &addr, &key, false, None), true),
                         }
                     }
                 }
@@ -287,7 +287,7 @@ pub fn intent(
     Ok(ExitCode::Ok)
 }
 
-fn emit_wait(
+pub(crate) fn emit_wait(
     wait::ResultReceipt { outcome, mut body }: wait::ResultReceipt,
     endpoint: &str,
     env: &Environment,
@@ -303,7 +303,7 @@ fn emit_wait(
         if let Some(addr) = body["addr"].as_str().filter(|addr| !addr.is_empty()) {
             args.extend(["--addr", addr]);
         }
-        body["hint"] = json!(wait::command_hint(&env.home, endpoint, &args));
+        body["hint"] = json!(Storage::new(&env.home).keeper_command_hint(endpoint, &args));
     }
     let mut exit = ExitCode::Ok;
     if let Some(code) = outcome.code() {
