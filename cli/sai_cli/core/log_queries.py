@@ -584,6 +584,7 @@ def intent(
         ]
         if not rows and scan.resume == cursor.position:
             scan.resume = None
+    complete_scan = not scan.truncated
     anchors = sorted((line for _, line in evidence.values()), key=log.event_order)
     identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
     scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
@@ -724,16 +725,28 @@ def intent(
     if frontier := stop or scan.resume:
         # Scope evidence can be deeper than the next page's scan. Links to
         # unread anchors are only needed when the scan already saw related rows.
+        remaining_rows = rows
+        if complete_scan and stop is not None:
+            first_unread = next(
+                index for index, (position, _, _) in enumerate(rows) if position == stop
+            )
+            remaining_rows = rows[first_unread:]
         related_invocations = {
             match
-            for _, _, line in rows
-            if not _has_intent(line, key) and (match := _invocation(line)) is not None
+            for _, _, line in remaining_rows
+            if (not _has_intent(line, key) or _scope(line) is None)
+            and (match := _invocation(line)) is not None
         }
         related_runs = {
             _id(line, "runId")
-            for _, _, line in rows
+            for _, _, line in remaining_rows
             if line.get("event") == "log.dropped"
         }
+        if complete_scan:
+            # The entire unread range was visible. Drop links it cannot use.
+            needed = {_link_tag("invocation", match) for match in related_invocations}
+            needed.update(_link_tag("run", run) for run in related_runs if run)
+            links = {tag: refs for tag, refs in links.items() if tag in needed}
         summaries: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
         for group, (position, line) in evidence.items():
             authority = (group[0], *group[3:])
@@ -748,11 +761,13 @@ def intent(
                 )
             )
             if (match := _invocation(line)) and (
-                not unread or match in related_invocations
+                (not unread and (not complete_scan or match in related_invocations))
+                or (not complete_scan and match in related_invocations)
             ):
                 links.setdefault(_link_tag("invocation", match), set()).add(position)
             if (run_id := _id(line, "runId")) and (
-                not unread or run_id in related_runs
+                (not unread and (not complete_scan or run_id in related_runs))
+                or (not complete_scan and run_id in related_runs)
             ):
                 links.setdefault(_link_tag("run", run_id), set()).add(position)
         _save_intent_cursor(

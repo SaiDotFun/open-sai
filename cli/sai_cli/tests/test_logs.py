@@ -3421,12 +3421,20 @@ def test_intent_response_budget_includes_saved_attribution(home):
     assert second["events"][-1]["seq"] + 1 == first["events"][0]["seq"]
 
 
-@pytest.mark.parametrize("spread_days", [False, True])
-def test_intent_cursor_budgets_only_replay_needed_by_the_page(home, spread_days):
+@pytest.mark.parametrize(
+    "case", ["large_rows", "many_files", "direct_rows", "linked_rows"]
+)
+def test_intent_cursor_budgets_only_replay_needed_by_the_page(home, case):
     root = home / "logs"
     root.mkdir()
     day = date(2026, 11, 24)
-    total = 129 if spread_days else 1300
+    spread_days = case == "many_files"
+    total = {
+        "large_rows": 1300,
+        "many_files": 129,
+        "direct_rows": 4000,
+        "linked_rows": 4000,
+    }[case]
     streams: dict[Path, list[bytes]] = {}
     for seq in range(total):
         row_day = day + timedelta(days=seq // 3) if spread_days else day
@@ -3440,8 +3448,14 @@ def test_intent_cursor_budgets_only_replay_needed_by_the_page(home, spread_days)
             "endpointId": "h1_" + "a" * 64,
             "seq": seq,
             "runId": f"run-{seq}",
-            "padding": "" if spread_days else "x" * 14_000,
+            "padding": "x" * 14_000 if case == "large_rows" else "",
         }
+        if case == "linked_rows":
+            row.update(runId="process", commandId=f"command-{seq // 2}")
+            if seq % 2 == 0:
+                row.update(
+                    event="command.start", intentKey=None, addr=None, endpointId=None
+                )
         streams.setdefault(log.file_path(surface, row_day, root), []).append(
             log.encode(row)
         )
@@ -3449,7 +3463,7 @@ def test_intent_cursor_budgets_only_replay_needed_by_the_page(home, spread_days)
         path.write_bytes(b"".join(rows))
     seen = []
     before = None
-    for _ in range(15):
+    for _ in range(total // log_queries.MAX_REPORT_ROWS + 6):
         report = log_queries.intent("KEY", offline=True, before=before, root=root)
         seen.extend(line["seq"] for line in report["events"])
         before = report.get("nextBefore")
