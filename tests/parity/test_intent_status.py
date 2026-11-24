@@ -1166,9 +1166,11 @@ def test_watch_reports_rejected_upgrade(
         for value in values:
             response.headers[header] = value
 
-    with graphql_ws(
-        lambda connection: connection.close(), process_response=replace_header
-    ) as ws:
+    def wait_for_client_disconnect(connection: ServerConnection) -> None:
+        # A server close frame can race with Python's failed handshake cleanup.
+        connection.wait_closed()
+
+    with graphql_ws(wait_for_client_disconnect, process_response=replace_header) as ws:
         for index, cli in enumerate(cli_pair):
             assert_watch_disconnect(cli, tmp_path / str(index), ws, error_type)
 
