@@ -69,6 +69,12 @@ class PositionUnavailable(ValueError):
     """Keeper has no open position for this ID."""
 
 
+class PositionOwnerMismatch(SaiError):
+    """The position could not be attributed to the selected account."""
+
+    code = Code.INVALID_REQUEST
+
+
 class MarketUnavailable(ValueError):
     """Keeper has no open market for the position."""
 
@@ -374,6 +380,8 @@ def _latest_position(
     raw = result.get("data")
     if not isinstance(raw, dict):
         raise TypeError("Contract returned invalid state")
+    if not keeper.same_account(state.raw["user"], raw.get("user")):
+        raise PositionOwnerMismatch("Contract position belongs to a different account")
     if height is not None and (
         not height.isascii() or not height.isdecimal() or not height.lstrip("0")
     ):
@@ -386,7 +394,6 @@ def _latest_position(
 
 def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
     fields = (
-        "user",
         "user_trade_index",
         "market_index",
         "collateral_index",
@@ -479,10 +486,49 @@ def trading_contract(endpoint: str, lcd: str) -> str:
     return trading_route(endpoint, lcd)["contractAddress"]
 
 
-def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
+@dataclass(frozen=True)
+class VerifiedPosition:
+    route: PositionRoute
+    raw: dict[str, Any]
+
+
+def verify_position_owner(
+    endpoint: str, lcd: str, addr: str, trade_id: int
+) -> VerifiedPosition:
+    """Read the live target and check its trade index and owner."""
     route = trading_route(endpoint, lcd)
+    raw = smart_value(
+        lcd,
+        route["contractAddress"],
+        {"get_trade_raw": {"trader": addr, "index": trade_id}},
+        fresh=True,
+    )
+    if (
+        not isinstance(raw, dict)
+        or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+    ):
+        raise ValueError(f"Unable to verify contract position {trade_id}")
+    if not keeper.same_account(addr, raw.get("user")):
+        raise PositionOwnerMismatch("Contract position belongs to a different account")
+    return VerifiedPosition(route, raw)
+
+
+def snapshot(
+    endpoint: str,
+    lcd: str,
+    addr: str,
+    trade_id: int,
+    *,
+    indexed: dict[str, Any] | None = None,
+    verified: VerifiedPosition | None = None,
+) -> PositionSnapshot:
+    """Read contract state, reusing any position data checked by the caller."""
+    route = trading_route(endpoint, lcd) if verified is None else verified.route
     contract = route["contractAddress"]
-    position = _position(endpoint, addr, trade_id, timeout=20)
+    position = (
+        indexed if indexed is not None else indexed_position(endpoint, addr, trade_id)
+    )
+    _require_open_position(position)
     borrowing = position["perpBorrowing"]
     collateral = borrowing["collateralToken"]
     if collateral["symbol"] != "USDC":
@@ -503,11 +549,15 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
     ):
         raise MarketUnavailable("Open market data is unavailable")
 
-    def raw_trade(timeout: float) -> dict[str, Any]:
-        raw = _read_position(lcd, contract, trader, trade_id, timeout)
+    def raw_trade(timeout: float, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+        if raw is None:
+            raw = _read_position(lcd, contract, trader, trade_id, timeout)
+        if not keeper.same_account(addr, raw.get("user")):
+            raise PositionOwnerMismatch(
+                "Contract position belongs to a different account"
+            )
         if (
-            raw.get("user") != trader
-            or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+            raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
             or raw.get("market_index") != f"MarketIndex({borrowing['marketId']})"
             or raw.get("collateral_index") != token
             or raw.get("is_open") is not True
@@ -516,7 +566,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
             raise PositionChanged("Position changed. Review the margin change again.")
         return raw
 
-    raw = raw_trade(20)
+    raw = raw_trade(20, None if verified is None else verified.raw)
     if not _same_margin(raw, position):
         end = time.monotonic() + INDEX_RETRY_BUDGET
         for delay in INDEX_RETRY_DELAYS:
@@ -526,8 +576,9 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
             left = end - time.monotonic()
             if left <= 0:
                 break
-            position = _position(endpoint, addr, trade_id, timeout=left)
-            if position["trader"] != trader or position["perpBorrowing"] != borrowing:
+            position = indexed_position(endpoint, addr, trade_id, timeout=left)
+            _require_open_position(position)
+            if position["perpBorrowing"] != borrowing:
                 raise PositionChanged(
                     "Position changed. Review the margin change again."
                 )
@@ -649,15 +700,25 @@ def _effective_leverage(
     return min(stored, cap)
 
 
-def _position(
-    endpoint: str, addr: str, trade_id: int, *, timeout: float
+def indexed_position(
+    endpoint: str, addr: str, trade_id: int, *, timeout: float = 20
 ) -> dict[str, Any]:
+    """Look up a position and verify that its trader and index match."""
     position = keeper.request(
         endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}, timeout=timeout
     )["perp"]["trade"]
-    if not position or not position["isOpen"] or position["tradeType"] != "trade":
-        raise PositionUnavailable("Open position not found")
+    if not position:
+        raise PositionUnavailable("Position not found for this account")
+    if not keeper.same_account(addr, position.get("trader")):
+        raise PositionOwnerMismatch("Keeper position belongs to a different account")
+    if type(position.get("id")) is not int or position["id"] != trade_id:
+        raise PositionUnavailable("Keeper returned a different position index")
     return position
+
+
+def _require_open_position(position: dict[str, Any]) -> None:
+    if not position["isOpen"] or position["tradeType"] != "trade":
+        raise PositionUnavailable("Open position not found")
 
 
 def _same_margin(raw: dict[str, Any], position: dict[str, Any]) -> bool:
