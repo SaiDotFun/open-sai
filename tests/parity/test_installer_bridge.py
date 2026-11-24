@@ -939,9 +939,8 @@ main()
     assert result.returncode == -9, (result.stdout, result.stderr)
     record = install.tools / ".sai-cli-native-pending.json"
     assert json.loads(record.read_text())["next"]["version"] == version
-    del replay.assets[
-        f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
-    ]
+    archive_path = f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+    native_archive = replay.assets.pop(archive_path)
     install.pin(version)
     result = install.run(
         install.launcher,
@@ -958,6 +957,18 @@ main()
     assert install.launcher.resolve(strict=True) == previous
     assert profile.read_bytes() == contents
     assert not record.exists()
+
+    # Retry after the old wheel becomes unavailable from the release server.
+    replay.assets[archive_path] = native_archive
+    old_release = f"{REPO}/releases/download/sai-cli/v{wheel_version(python_wheel)}/"
+    del replay.assets[old_release + "SHA256SUMS"]
+    del replay.assets[old_release + python_wheel.name]
+    requests = len(replay.requests)
+    result = install.update(replay)
+    assert json.loads(ok(result))["status"] == "updated"
+    assert not any(path.startswith(old_release) for path in replay.requests[requests:])
+    install.pin(version)
+    assert profile.read_bytes() == contents
 
 
 @pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")

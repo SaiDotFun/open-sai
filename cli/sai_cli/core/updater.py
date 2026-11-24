@@ -865,18 +865,26 @@ def swap_back(prefix: Path, snapshot: Path, launcher: Path) -> str | None:
     return None
 
 
+def bridge_wheel_path(tools: Path, version: str, digest: str) -> Path:
+    return tools / NATIVE_WHEELS / digest / update.wheel_name(version)
+
+
 def rollback_wheel(current: Current, options: Options) -> tuple[str, str, Path] | None:
-    """A verified wheel of CURRENT's version for a release install, or None:
-    the kept one, while it lies in the private cache and its bytes still
-    hash to what the release record says, or else the current release
-    downloaded and checked against its SHA256SUMS now."""
+    """Use the verified wheel kept by the updater or offline recovery.
+    Download the current release's wheel if neither cache has it."""
     record, install = current.record, current.install
     if record is not None and record.wheel:
         kept = Path(record.wheel)
         try:
+            recovery_wheel = bridge_wheel_path(
+                current.prefix.parent.resolve(), record.version, record.sha256
+            )
+            if kept == recovery_wheel:
+                in_cache = kept.resolve(strict=True) == kept
+            else:
+                in_cache = kept.is_absolute() and kept.parent == private_cache()
             intact = (
-                kept.is_absolute()
-                and kept.parent == private_cache()
+                in_cache
                 and kept.is_file()
                 and not kept.is_symlink()
                 and sha256(kept) == record.sha256
@@ -930,7 +938,7 @@ def publish_bridge_wheel(
     tag, digest, source = wheel
     version = update.tag_version(tag)
     cache = tools / NATIVE_WHEELS
-    destination = cache / digest / update.wheel_name(version)
+    destination = bridge_wheel_path(tools, version, digest)
     for directory in (cache, destination.parent):
         paths.private_directory(directory)
         if directory.resolve() != directory:
