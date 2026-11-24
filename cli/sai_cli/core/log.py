@@ -4,10 +4,8 @@ Each surface writes its own file per UTC day, `<surface>-YYYY-MM-DD.jsonl`,
 where the surface is `cli`, `mcp`, or `update`. The directory has mode 0700
 and the files 0600.
 
-Every line carries `ts`, `level`, `event`, `surface`, `pid`, `version`,
-`runId` (one per process), and `seq` (the event's number within the run,
-which orders events that share a millisecond), then the fields bound with
-`bind`, then the event's own fields.
+The event registry in `core.log_events` defines the common fields and the
+fields for each event. Fields bound with `bind` accompany the event.
 
 `event` does no I/O and never blocks: it stamps the line, copies its fields
 within a fixed budget, and puts it on a bounded queue. One daemon thread
@@ -54,18 +52,23 @@ what the person chose. Old files are deleted once per UTC day.
 from __future__ import annotations
 
 import atexit
+import hashlib
+import hmac
 import itertools
 import json
+import math
 import os
 import queue
 import re
 import stat
+import sys
 import threading
 import time
 import uuid
-from collections.abc import Generator, Iterator, Mapping
-from contextlib import contextmanager, suppress
+from collections.abc import Callable, Generator, Iterator, Mapping
+from contextlib import ExitStack, contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
@@ -73,12 +76,16 @@ from types import MappingProxyType
 from typing import Any, Self
 from urllib.parse import urlsplit
 
+from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
+
 DIR_NAME = "logs"
 SURFACES = ("cli", "mcp", "update")
 LEVELS = ("info", "warn", "error")
 DIR_MODE, FILE_MODE = 0o700, 0o600
 DEFAULT_KEEP_DAYS = 14
 PRUNE_MARKER = ".pruned"
+ENDPOINT_KEY = ".endpoint-key"
+ENDPOINT_KEY_LOCK = ".endpoint-key.lock"
 # Longest string kept in a field, longest text from outside sai, and
 # longest line written.
 MAX_TEXT = 2000
@@ -110,7 +117,7 @@ TAIL_CHUNK = 64 * 1024
 REDACTED = "[redacted session token]"
 REDACTED_HEX = "[redacted hex]"
 REDACTED_URL = "[redacted url]"
-COMMON = ("ts", "level", "event", "surface", "pid", "version", "runId", "seq")
+COMMON = tuple(COMMON_REQUIRED)
 
 RUN_ID = uuid.uuid4().hex
 _seq = itertools.count(1)
@@ -304,6 +311,41 @@ def origin(value: str) -> str:
         return REDACTED_URL
 
 
+class EndpointIdentity(str):
+    """An intermediate digest. Only the writer may serialize its keyed form."""
+
+    __slots__ = ()
+
+
+def endpoint_identity(value: str) -> EndpointIdentity | None:
+    """Hash the normalized request URL before handing it to the writer."""
+    site = origin(value)
+    if site == REDACTED_URL:
+        return None
+    parts = urlsplit(value.strip())
+    request_url = site + (parts.path or "/") + "?" + parts.query
+    return EndpointIdentity(
+        hashlib.sha256(request_url.encode(errors="surrogatepass")).hexdigest()
+    )
+
+
+def _keyed_endpoint(identity: EndpointIdentity, key: bytes) -> str:
+    return "h1_" + hmac.digest(key, bytes.fromhex(identity), "sha256").hex()
+
+
+def endpoint_id(value: str, root: Path | None = None) -> str | None:
+    """Read the persisted identity for VALUE without creating a key."""
+    identity = endpoint_identity(value)
+    if identity is None:
+        return None
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        return None
+    with opened:
+        key = opened.endpoint_key()
+    return _keyed_endpoint(identity, key) if key is not None else None
+
+
 # Session tokens this process has seen. Tokens are only added: one that was
 # signed out or replaced may still sit in an event waiting to be written,
 # and Keeper keeps honoring it until it expires.
@@ -427,11 +469,16 @@ def _snapshot(
     budget[1] -= 1
     if budget[0] < 0 or budget[1] < 0:
         return CUT
-    if value is None or isinstance(value, (bool, float)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, int):
         # An integer of any size is legal JSON; one this long is not a count.
         return value if value.bit_length() <= 64 else CUT
+    if isinstance(value, EndpointIdentity):
+        budget[0] -= len(value)
+        return value
     if isinstance(value, str):
         # Look a little past the cut, so a token that straddles it goes.
         text = value[: MAX_TEXT + 4096]
@@ -617,6 +664,59 @@ class LogDir:
             os.write(fd, data)
         finally:
             os.close(fd)
+
+    def _read_endpoint_key(self) -> bytes | None:
+        try:
+            fd = self.read_fd(ENDPOINT_KEY)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as source:
+            if os.name != "nt" and os.fstat(source.fileno()).st_mode & 0o077:
+                raise OSError("log identity key is not private")
+            key = source.read(33)
+            if len(key) != 32:
+                raise OSError("invalid log identity key")
+            return key
+
+    def endpoint_key(self, *, create: bool = False) -> bytes | None:
+        try:
+            key = self._read_endpoint_key()
+            if key is not None or not create:
+                return key
+            fd = self._open_file(ENDPOINT_KEY_LOCK, os.O_RDWR | os.O_CREAT)
+            try:
+                if sys.platform == "win32":
+                    import msvcrt
+
+                    msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(fd, fcntl.LOCK_EX)
+                key = self._read_endpoint_key()
+                if key is not None:
+                    return key
+                key = os.urandom(32)
+                name = f".endpoint-key-{uuid.uuid4().hex}"
+                try:
+                    staged = self._open_file(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+                    with os.fdopen(staged, "wb") as output:
+                        output.write(key)
+                    source, _ = self._target(name)
+                    destination, _ = self._target(ENDPOINT_KEY)
+                    if self.fd is None:
+                        os.replace(source, destination)
+                    else:
+                        os.replace(
+                            source, destination, src_dir_fd=self.fd, dst_dir_fd=self.fd
+                        )
+                finally:
+                    self.unlink(name)
+                return key
+            finally:
+                os.close(fd)
+        except OSError:
+            return None
 
     def read_fd(self, name: str) -> int:
         return self._open_file(name, os.O_RDONLY)
@@ -821,7 +921,14 @@ def _write(item: _Item) -> None:
         return
     with opened:
         _skip.pop(key, None)
-        line = clean(item.line, known_tokens(check=True))
+        row = item.line
+        identity = row.get("endpointId")
+        if isinstance(identity, EndpointIdentity):
+            row = dict(row)
+            row.pop("endpointId")
+            if identity_key := opened.endpoint_key(create=True):
+                row["endpointId"] = _keyed_endpoint(identity, identity_key)
+        line = clean(row, known_tokens(check=True))
         today = now().date()
         # The file is the one for the day the event happened, which a slow
         # write across midnight would otherwise get wrong.
@@ -829,6 +936,9 @@ def _write(item: _Item) -> None:
             day = date.fromisoformat(str(line["ts"])[:10])
         except ValueError:
             day = today
+        if line["event"] in EVENTS and not valid_event(line):
+            _dropped += 1
+            return
         data = encode(line)
         if _dropped:
             lost, _dropped = _dropped, 0
@@ -908,9 +1018,14 @@ def event(name: str, level: str = "info", /, **fields: Any) -> None:
             return
         context = dict(_context.get())
         surface = context.pop("surface", "cli")
-        extra = {k: v for k, v in {**context, **fields}.items() if v is not None}
+        extra = {
+            k: v
+            for k, v in {**context, **fields}.items()
+            if v is not None and k not in COMMON
+        }
         budget = [EVENT_CHARS, EVENT_NODES]
         line = {
+            "schema": SCHEMA_VERSION,
             "ts": stamp(now()),
             "level": level if level in LEVELS else "info",
             "event": str(name)[:MAX_UNTRUSTED],
@@ -977,23 +1092,48 @@ def reset() -> None:
 # Reading
 
 
-def _last_lines(fd: int, chunk: int) -> Iterator[bytes]:
-    """The lines of the file at FD, last first, read backwards CHUNK bytes
-    at a time."""
-    position = os.fstat(fd).st_size
-    rest = b""
-    while position > 0:
+def _line_blocks(
+    fd: int,
+    chunk: int,
+    *,
+    end: int,
+    read: Callable[[int, int], bytes] = os.read,
+    max_line: int | None = None,
+    complete_end: bool = True,
+) -> Iterator[list[bytes]]:
+    """Read a snapshot backwards, yielding once per disk chunk."""
+    position = end
+    rest: bytes | None = b"" if complete_end else None
+    while position:
         size = min(chunk, position)
         position -= size
         os.lseek(fd, position, os.SEEK_SET)
-        data = os.read(fd, size) + rest
+        data = read(fd, size)
+        if len(data) != size:
+            return
         pieces = data.split(b"\n")
-        rest = pieces[0]
-        for piece in reversed(pieces[1:]):
-            if piece:
-                yield piece
+        if len(pieces) == 1:
+            if rest is not None:
+                combined = pieces[0] + rest
+                rest = (
+                    combined if max_line is None or len(combined) <= max_line else None
+                )
+            yield []
+            continue
+        tail = pieces[-1] + rest if rest is not None else b""
+        rest = pieces[0] if max_line is None or len(pieces[0]) <= max_line else None
+        yield [
+            piece
+            for piece in (tail, *reversed(pieces[1:-1]))
+            if piece and (max_line is None or len(piece) <= max_line)
+        ]
     if rest:
-        yield rest
+        yield [rest]
+
+
+def _last_lines(fd: int, chunk: int) -> Iterator[bytes]:
+    for block in _line_blocks(fd, chunk, end=os.fstat(fd).st_size, read=os.read):
+        yield from block
 
 
 def matches(line: Mapping[str, Any], name: str | None) -> bool:
@@ -1016,8 +1156,8 @@ def _file_tail(
     try:
         for raw in _last_lines(fd, chunk):
             try:
-                line = json.loads(raw)
-            except ValueError:
+                line = decode_row(raw)
+            except (ValueError, RecursionError):
                 continue
             if isinstance(line, dict) and matches(line, name):
                 found.append(line)
@@ -1032,6 +1172,194 @@ def _file_tail(
 
 def _number(value: Any) -> int:
     return value if isinstance(value, int) else 0
+
+
+def event_order(line: Mapping[str, Any]) -> tuple[str, int]:
+    return str(line.get("ts", "")), _number(line.get("seq"))
+
+
+def _finite_number(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("Non-finite JSON number")
+    return value
+
+
+def _invalid_constant(_text: str) -> Any:
+    raise ValueError("Invalid JSON constant")
+
+
+def decode_row(raw: bytes) -> Any:
+    return json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
+
+
+MAX_SCAN_BYTES = 16 * 1024 * 1024
+MAX_SCAN_ROWS = 20_000
+MAX_SCAN_FILES = 128
+
+
+# Writers put ts before any event data. This recognizes that header in
+# both schema versions, so older rows can be skipped before JSON decoding.
+_TS_HEADER = re.compile(rb'^\{"(?:schema":[0-9]+,"|)ts":"([0-9TZ:.-]{24})"')
+
+
+@dataclass
+class LogScan:
+    max_bytes: int = MAX_SCAN_BYTES
+    max_rows: int = MAX_SCAN_ROWS
+    max_files: int = MAX_SCAN_FILES
+    truncated: bool = False
+    frontier: str | None = None
+    visited: set[str] = field(default_factory=set)
+
+    def _stop_at_frontier(self, pending: Mapping[str, str | None]) -> None:
+        # A fully read sparse file cannot advance a cursor past an
+        # unfinished busy file on the same UTC day.
+        known = [ts for ts in pending.values() if ts is not None]
+        if known and len(known) == len(pending):
+            self.frontier = max(known)
+
+    def rows(
+        self,
+        root: Path | None = None,
+        *,
+        first_day: date | None = None,
+        last_day: date | None = None,
+        since: str | None = None,
+        before: str | None = None,
+        days: set[date] | None = None,
+        skip: set[str] | None = None,
+        prefix: bool = False,
+        accept: Callable[[dict[str, Any]], bool] | None = None,
+        frontier_before: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Read bounded snapshots in UTC day order, alternating surfaces."""
+        opened = LogDir.open(root or directory())
+        if opened is None:
+            return
+        remaining_bytes, remaining_rows = self.max_bytes, self.max_rows
+        lower = since.encode() if since else None
+        upper = before.encode() if before else None
+        byte_limit = False
+
+        def read(fd: int, size: int) -> bytes:
+            nonlocal remaining_bytes, byte_limit
+            if size > remaining_bytes:
+                self.truncated = True
+                byte_limit = True
+                return b""
+            data = os.read(fd, size)
+            remaining_bytes -= len(data)
+            return data
+
+        with opened:
+            files = [
+                (day, name)
+                for day, _, name in reversed(opened.files())
+                if (first_day is None or day >= first_day)
+                and (last_day is None or day <= last_day)
+                and (days is None or day in days)
+                and (skip is None or name not in skip)
+            ]
+            self.truncated = len(files) > self.max_files
+            for _, daily in itertools.groupby(
+                files[: self.max_files], key=lambda item: item[0]
+            ):
+                if remaining_bytes == 0:
+                    self.truncated = True
+                    return
+                names = [name for _, name in daily]
+                with ExitStack() as active:
+                    readers = []
+                    for name in names:
+                        try:
+                            fd = opened.read_fd(name)
+                            active.callback(os.close, fd)
+                            size = os.fstat(fd).st_size
+                            if not size:
+                                continue
+                            if prefix:
+                                # Context after midnight starts at the head of each file.
+                                length = min(size, self.max_bytes // len(names))
+                                data = read(fd, length)
+                                self.truncated |= len(data) < size
+                                readers.append((name, iter([data.split(b"\n")[:-1]])))
+                            else:
+                                os.lseek(fd, size - 1, os.SEEK_SET)
+                                complete = read(fd, 1) == b"\n"
+                                readers.append(
+                                    (
+                                        name,
+                                        _line_blocks(
+                                            fd,
+                                            TAIL_CHUNK,
+                                            end=size,
+                                            read=read,
+                                            max_line=MAX_LINE,
+                                            complete_end=complete,
+                                        ),
+                                    )
+                                )
+                        except OSError:
+                            self.truncated = True
+                    # Read one chunk per surface before advancing a busy file.
+                    pending: dict[str, str | None] = {name: None for name, _ in readers}
+
+                    while readers:
+                        next_readers = []
+                        for name, reader in readers:
+                            try:
+                                block = next(reader)
+                            except StopIteration:
+                                if byte_limit:
+                                    self._stop_at_frontier(pending)
+                                    return
+                                pending.pop(name)
+                                continue
+                            except OSError:
+                                self.truncated = True
+                                continue
+                            self.visited.add(name)
+                            next_readers.append((name, reader))
+                            for raw in block:
+                                if len(raw) > MAX_LINE:
+                                    continue
+                                if (lower or upper) and (
+                                    header := _TS_HEADER.match(raw)
+                                ):
+                                    ts = header[1]
+                                    if lower and ts < lower or upper and ts >= upper:
+                                        continue
+                                try:
+                                    line = decode_row(raw)
+                                except (ValueError, RecursionError):
+                                    continue
+                                if not isinstance(line, dict):
+                                    continue
+                                if since or before:
+                                    ts = line.get("ts")
+                                    if not isinstance(ts, str) or (
+                                        since and ts < since or before and ts >= before
+                                    ):
+                                        continue
+                                if accept is not None and not accept(line):
+                                    continue
+                                if remaining_rows == 0:
+                                    self.truncated = True
+                                    self._stop_at_frontier(pending)
+                                    return
+                                remaining_rows -= 1
+                                ts = line.get("ts")
+                                if (
+                                    isinstance(ts, str)
+                                    and (
+                                        frontier_before is None or ts < frontier_before
+                                    )
+                                    and (current := pending[name]) != ts
+                                ):
+                                    pending[name] = min(current, ts) if current else ts
+                                yield line
+                        readers = next_readers
 
 
 def tail(
@@ -1066,7 +1394,7 @@ def tail(
                 lines += _file_tail(opened, file, count + TAIL_SLACK, name, chunk)
             if len(lines) >= count:
                 break
-    lines.sort(key=lambda line: (str(line.get("ts", "")), _number(line.get("seq"))))
+    lines.sort(key=event_order)
     return lines[-count:]
 
 

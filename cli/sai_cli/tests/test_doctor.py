@@ -44,6 +44,7 @@ TOKEN = f"{HEADER}.{PAYLOAD}.{SIGNATURE}"
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "")
     for name in ("SAI_ENDPOINT", "SAI_WS_ENDPOINT", "SAI_LCD_ENDPOINT"):
         monkeypatch.delenv(name, raising=False)
     return tmp_path
@@ -106,6 +107,68 @@ def snapshot(root: Path) -> dict[str, tuple[int, bytes | None]]:
 def run_cli(*args: str) -> tuple[int, str]:
     result = CliRunner().invoke(main, list(args), catch_exceptions=False)
     return result.exit_code, result.output
+
+
+@pytest.mark.parametrize(
+    ("content", "expected", "summary"),
+    [
+        (b"[update]\nauto = false\n", "pass", "Config file settings are valid"),
+        (b"[future]\nprivate_setting = 'private_value'\n", "warn", "unknown settings"),
+        (b"[update\n", "fail", "not valid TOML"),
+        (b"[keeper]\nendpoint = 'https://[private_value'\n", "fail", "keeper.endpoint"),
+        (b"[update]\nauto = 'private_value'\n", "fail", "update.auto"),
+        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", "logs.keep_days"),
+        (b"\xff", "fail", "UTF-8"),
+        pytest.param(
+            b"[logs]\nkeep_days = " + b"9" * 5000,
+            "fail",
+            "not valid TOML",
+            id="oversized-TOML-integer",
+        ),
+    ],
+)
+def test_config_check_reports_file_errors_without_echoing_values(
+    isolated_home, monkeypatch, content, expected, summary
+):
+    path = isolated_home / "config.toml"
+    path.write_bytes(content)
+    # File validation still applies to keys shadowed by an environment value.
+    monkeypatch.setenv("SAI_UPDATE_AUTO", "false")
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    report = json.loads(output)
+    if expected == "fail":
+        assert report["error"]["code"] == "INVALID_REQUEST"
+        report = report["error"]["details"]
+    checks = {check["id"]: check for check in report["checks"]}
+    assert checks["config"]["status"] == expected
+    assert summary in checks["config"]["summary"]
+    assert "home" in checks
+    assert code == (1 if expected == "fail" else 0)
+    assert "private_setting" not in output and "private_value" not in output
+    assert path.read_bytes() == content
+
+
+def test_unusable_config_skips_checks_that_need_resolved_settings(isolated_home):
+    (isolated_home / "config.toml").write_text("[keeper\n")
+    code, output = run_cli("--json", "doctor", "--no-fix")
+    report = json.loads(output)["error"]["details"]
+    checks = {check["id"]: check for check in report["checks"]}
+    assert code == 1
+    for name in ("session", "intents", "keeper", "websocket", "lcd"):
+        assert checks[name]["status"] == "skipped"
+
+
+def test_config_warns_about_invalid_logging_override(monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "private-invalid-boolean")
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 0
+    checks = {check["id"]: check for check in json.loads(output)["checks"]}
+    assert checks["config"]["status"] == "warn"
+    assert "SAI_LOG" in checks["config"]["summary"]
+    assert "logs.enabled" in checks["config"]["summary"]
+    assert "private-invalid-boolean" not in output
 
 
 # Session
@@ -259,10 +322,9 @@ def test_symlinked_trader_directory_is_never_written(isolated_home, tmp_path_fac
     before = snapshot(outside)
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 1
-    by_id = {c["id"]: c for c in json.loads(output)["checks"]}
-    assert by_id["home"]["status"] == "fail"
-    assert "symlink" in by_id["home"]["summary"]
-    assert by_id["intents"]["status"] == "fail"
+    error = json.loads(output)["error"]
+    assert error["code"] == "INTERNAL_ERROR"
+    assert "symlink" in error["message"] and "intents:" in error["message"]
     assert outside.stat().st_mode & 0o777 == 0o755
     assert snapshot(outside) == before
 
@@ -557,13 +619,12 @@ def test_naive_session_expiry_fails_the_session_check_and_continues(isolated_hom
             "expiresAt": "2099-01-01T00:00:00",
         }
     )
-    code, output = run_cli("--json", "doctor", "--offline")
+    result = CliRunner().invoke(main, ["doctor", "--offline"])
+    code, output = result.exit_code, result.stderr
     assert code == 1
-    report = json.loads(output)
-    by_id = {check["id"]: check for check in report["checks"]}
-    assert by_id["session"]["status"] == "fail"
-    assert "invalid" in by_id["session"]["summary"]
-    assert by_id["intents"]["status"] == "pass"
+    assert result.stdout == ""
+    assert "fail    session" in output and "invalid" in output
+    assert "pass    intents" in output
 
 
 # Install
@@ -1135,12 +1196,11 @@ def test_offline_or_no_fix_never_reconciles(http_stub):
 
 
 def test_json_report_shape_and_exit_code():
-    save(hours=-1)
     code, output = run_cli("--json", "doctor", "--offline")
-    assert code == 1
+    assert code == 0
     report = json.loads(output)
     assert report["schemaVersion"] == 1
-    assert report["overall"] == "fail"
+    assert report["overall"] == "warn"
     assert set(report["sai"]) == {"version", "install"}
     datetime.fromisoformat(report["generatedAt"])
     for check in report["checks"]:
@@ -1155,6 +1215,20 @@ def test_json_report_shape_and_exit_code():
         }
         assert check["status"] in doctor.STATUSES
         assert isinstance(check["durationMs"], int)
+
+    save(hours=-1)
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 1
+    error = json.loads(output)["error"]
+    assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
+    assert "expired" in error["message"]
+    assert "sai auth login NAME" in error["message"]
+    details = error["details"]
+    assert details["schemaVersion"] == 1 and details["overall"] == "fail"
+    checks = {check["id"]: check for check in details["checks"]}
+    assert checks["session"]["status"] == "fail"
+    assert "sai auth login NAME" in checks["session"]["fix"]
+    assert checks["keeper"]["status"] == "skipped"
 
 
 def test_overall_ignores_skipped():

@@ -3,18 +3,18 @@
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import json
 import os
 import shlex
 import sys
 import time
-from collections.abc import Mapping
+import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import click
 
@@ -23,6 +23,7 @@ from .core import (
     clipboard,
     keeper,
     log,
+    log_queries,
     reconcile,
     storage,
     stream,
@@ -32,6 +33,7 @@ from .core import (
 )
 from .core import session as sessions
 from .core import settings as sai_settings
+from .core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
@@ -67,10 +69,7 @@ def settings(ctx: click.Context) -> sai_settings.Settings:
     then mainnet defaults."""
     obj = ctx.find_root().obj
     if obj.get("settings") is None:
-        try:
-            obj["settings"] = sai_settings.load(obj["flags"], warn=warn)
-        except sai_settings.SettingsError as exc:
-            raise click.ClickException(str(exc)) from exc
+        obj["settings"] = sai_settings.load(obj["flags"], warn=warn)
     return obj["settings"]
 
 
@@ -117,6 +116,64 @@ def command_path(group: click.Group, args: list[str]) -> list[str]:
 INFO_FLAGS = ("--help", "--version", "--skill")
 
 
+def json_requested(argv: Sequence[str]) -> bool:
+    """Find the root --json flag even if Click fails before invoking main."""
+    valued = {option for option, _ in GLOBAL_FLAGS} | {"--as"}
+    args = iter(argv)
+    for arg in args:
+        if arg == "--" or not arg.startswith("-"):
+            break
+        if arg == "--json":
+            return True
+        if arg in valued:
+            next(args, None)
+    return False
+
+
+def cli_failure(exc: Exception) -> SaiError:
+    if isinstance(exc, click.ClickException):
+        return SaiError(
+            exc.format_message(),
+            Code.INVALID_REQUEST,
+            exit_code=(
+                ExitCode.USAGE if isinstance(exc, click.UsageError) else ExitCode.ERROR
+            ),
+        )
+    if isinstance(exc, click.Abort):
+        return SaiError("Aborted", Code.INVALID_REQUEST)
+    if isinstance(exc, mcp_install.InstallError):
+        return SaiError(
+            str(exc), exit_code=ExitCode.UNSUPPORTED, hint="sai mcp install --help"
+        )
+    return describe(exc)
+
+
+def redact_error(value: Any) -> Any:
+    """Redact stored tokens in an error without changing its JSON structure."""
+    if isinstance(value, dict):
+        return {log.redact(key): redact_error(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_error(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return log.redact(str(value))
+
+
+def show_failure(exc: Exception, failure: SaiError, json_output: bool) -> None:
+    if json_output and not isinstance(failure, McpStdioError):
+        error = failure.as_dict()
+        for key in ("message", "hint", "details"):
+            if key in error:
+                error[key] = redact_error(error[key])
+        click.echo(json.dumps({"error": error}, separators=(",", ":")))
+    elif isinstance(exc, click.UsageError):
+        click.UsageError(log.redact(failure.message), exc.ctx).show()
+    elif isinstance(exc, click.Abort):
+        click.echo("Aborted!", err=True)
+    else:
+        click.ClickException(log.redact(failure.message)).show()
+
+
 def unlogged(names: list[str], argv: list[str]) -> bool:
     """True for runs that write no log lines: reading the log, which should
     not add to it; `sai doctor --no-fix`, which promises to change nothing
@@ -130,76 +187,93 @@ def unlogged(names: list[str], argv: list[str]) -> bool:
     )
 
 
-class LoggedGroup(click.Group):
+class HelpOnMissingInput(click.Command):
+    """Show full help when Click requires input and the command received none."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        bare = not args
+        try:
+            return super().parse_args(ctx, args)
+        except click.MissingParameter:
+            if not bare or ctx.find_root().params.get("json_output"):
+                raise
+            click.echo(ctx.get_help(), err=True, color=ctx.color)
+            ctx.exit(ExitCode.USAGE)
+
+
+class SaiGroup(click.Group):
+    command_class = HelpOnMissingInput
+    group_class = type
+
+
+class LoggedGroup(SaiGroup):
     """The root group: logs `command.start` and `command.end` for each run.
 
     Events written while the command runs carry its `command`. `sai mcp
     serve` logs to the `mcp` surface and `sai update` to `update`.
     """
 
-    # One entry per `main` in progress; the REPL runs commands inside one.
-    runs: ClassVar[list[dict[str, Any]]] = []
+    group_class = SaiGroup
 
-    def main(self, args: Any = None, *rest: Any, **extra: Any) -> Any:
-        # Nothing here may fail the command: argv is logged as given, and
-        # the log writer removes credentials later.
-        try:
-            argv = [str(a) for a in (sys.argv[1:] if args is None else args)]
-            names = command_path(self, argv)
-            quiet = unlogged(names, argv)
-        except Exception:  # noqa: BLE001 - logging must not fail a command
-            argv, names, quiet = [], [], True
-        if quiet:
-            with log.silenced():
-                return super().main(args, *rest, **extra)
+    def main(
+        self,
+        args: Sequence[str] | None = None,
+        prog_name: str | None = None,
+        complete_var: str | None = None,
+        standalone_mode: bool = True,
+        windows_expand_args: bool = True,
+        **extra: Any,
+    ) -> Any:
+        argv = list(sys.argv[1:] if args is None else args)
+        names = command_path(self, argv)
+        quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
-        run: dict[str, Any] = {"exitCode": 0}
         started = time.monotonic()
-        with log.bind(surface=surface, command=command):
-            log.event("command.start", argv=log.argv(argv[:64]))
-            self.runs.append(run)
+        exit_code: int = ExitCode.OK
+        failure: SaiError | None = None
+        with (
+            log.silenced()
+            if quiet
+            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
+        ):
+            if not quiet:
+                log.event("command.start", argv=log.argv(argv[:64]))
             try:
-                return super().main(args, *rest, **extra)
-            except SystemExit as exc:
-                code = exc.code
-                run["exitCode"] = code if isinstance(code, int) else int(bool(code))
-                raise
-            except click.exceptions.Exit as exc:
-                run["exitCode"] = exc.exit_code
-                raise
-            except click.ClickException as exc:
-                run.update(exitCode=exc.exit_code, error=exc.format_message())
-                raise
-            except BaseException as exc:
-                run.update(exitCode=1)
-                run.setdefault("error", type(exc).__name__)
-                raise
-            finally:
-                self.runs.pop()
-                # The message can quote what the person typed.
-                if isinstance(run.get("error"), str):
-                    run["error"] = log.untrusted(run["error"])
-                log.event(
-                    "command.end",
-                    "info" if run["exitCode"] == 0 else "warn",
-                    durationMs=round((time.monotonic() - started) * 1000),
-                    **run,
+                result = super().main(
+                    args,
+                    prog_name,
+                    complete_var,
+                    standalone_mode=False,
+                    windows_expand_args=windows_expand_args,
+                    **extra,
                 )
-
-    def invoke(self, ctx: click.Context) -> Any:
-        """Keep the error message: in standalone mode click prints it and
-        exits before `main` can see it."""
-        try:
-            return super().invoke(ctx)
-        except click.ClickException as exc:
-            if self.runs:
-                self.runs[-1]["error"] = exc.format_message()
-            raise
-        except click.Abort:
-            if self.runs:
-                self.runs[-1]["error"] = "Aborted"
-            raise
+            except Exception as exc:
+                failure = cli_failure(exc)
+                exit_code = failure.exit_code
+                if not standalone_mode:
+                    raise
+                show_failure(exc, failure, json_requested(argv))
+            else:
+                # With standalone mode disabled, Click returns explicit exit codes.
+                if isinstance(result, int):
+                    exit_code = result
+                if not standalone_mode:
+                    return result
+            finally:
+                if not quiet:
+                    log.event(
+                        "command.end",
+                        "info" if exit_code == ExitCode.OK else "warn",
+                        durationMs=round((time.monotonic() - started) * 1000),
+                        exitCode=exit_code,
+                        code=failure.code if failure is not None else None,
+                        error=log.untrusted(failure.message)
+                        if failure is not None
+                        else None,
+                        intentKey=failure.intent_key if failure is not None else None,
+                    )
+        raise SystemExit(exit_code)
 
 
 @click.group(cls=LoggedGroup, invoke_without_command=True)
@@ -257,6 +331,8 @@ def main(
     if auto_update_applies(ctx.invoked_subcommand, json_output):
         updater.tick(warn)
     if ctx.invoked_subcommand is None:
+        if json_output:
+            raise click.UsageError("Pass a command when using --json.", ctx)
         repl(ctx)
 
 
@@ -330,6 +406,7 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
             break
         if line in ("exit", "quit"):
             break
+        args: list[str] = []
         try:
             args = repl_args(line)
             if args:
@@ -340,8 +417,8 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
                 )
         except (click.Abort, KeyboardInterrupt):
             click.echo("Interrupted", err=True)
-        except (click.ClickException, ValueError, keeper.KeeperError) as exc:
-            click.echo(f"Error: {exc}", err=True)
+        except Exception as exc:  # noqa: BLE001 - keep the REPL open
+            show_failure(exc, cli_failure(exc), json_requested(args))
 
 
 @main.group()
@@ -384,19 +461,24 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
       sai auth import
           Use a session token copied from Sai Web instead of a key.
     """
+    endpoint = keeper_url(ctx)
     try:
-        result = signed_login(keeper_url(ctx), name, addr)
-        result["endpoint"] = keeper_url(ctx)
+        result = signed_login(endpoint, name, addr)
+        result["endpoint"] = endpoint
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
-        # The same command, so the endpoint and --addr stay in force.
-        flags = forwarded_flags(ctx.find_root().obj)
-        chosen = ["--addr", addr] if addr else []
-        command = shlex.join(["sai", *flags, "auth", "login", name, *chosen])
-        raise click.ClickException(f"{exc} Run `{command}` in a terminal.") from exc
-    except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        json_flag = ("--json",) if ctx.obj["json"] else ()
+        chosen = ("--addr", addr) if addr else ()
+        command = storage.keeper_command_hint(
+            endpoint, *json_flag, "auth", "login", name, *chosen
+        )
+        raise SaiError(
+            f"{exc} Run `{command}` in a terminal.",
+            Code.INVALID_REQUEST,
+            hint=command,
+            exit_code=ExitCode.UNSUPPORTED,
+        ) from exc
 
 
 class NeedsTerminal(ValueError):
@@ -568,7 +650,12 @@ def read_token() -> str:
     if copied is None:
         if sys.stdin.isatty():
             raise ValueError(f"No working clipboard command ({clipboard.NAMES})")
-        raise ValueError(NO_CLIPBOARD.format(names=clipboard.NAMES))
+        raise SaiError(
+            NO_CLIPBOARD.format(names=clipboard.NAMES),
+            Code.INVALID_REQUEST,
+            hint="sai auth import",
+            exit_code=ExitCode.UNSUPPORTED,
+        )
     if not copied[0]:
         raise ValueError(
             "Clipboard is empty; copy the session token from Sai Web and retry"
@@ -586,18 +673,15 @@ def import_token(ctx: click.Context) -> None:
     clipboard. After storing the token, clear the clipboard if it still holds
     the token. Prints the addr, expiry, and endpoint, never the token.
     """
-    try:
-        token = read_token()
-        result = sessions.import_session(token, keeper_url(ctx))
-        storage.save_session(result)
-        # Re-read: the person may have copied something else since, and that
-        # must survive.
-        copied = clipboard.read()
-        if copied is not None and copied[0] == token and not clipboard.clear(copied[1]):
-            click.echo("Warning: could not clear the clipboard", err=True)
-        emit(ctx, sessions.summary(result))
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    token = read_token()
+    result = sessions.import_session(token, keeper_url(ctx))
+    storage.save_session(result)
+    # Re-read: the person may have copied something else since, and that
+    # must survive.
+    copied = clipboard.read()
+    if copied is not None and copied[0] == token and not clipboard.clear(copied[1]):
+        click.echo("Warning: could not clear the clipboard", err=True)
+    emit(ctx, sessions.summary(result))
 
 
 @auth.command("logout")
@@ -611,10 +695,7 @@ def logout(ctx: click.Context, addr: str | None) -> None:
     revoke session tokens yet, so a token copied elsewhere stays valid until
     it expires.
     """
-    try:
-        removed = storage.delete_session(addr or ctx.obj["as_addr"])
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    removed = storage.delete_session(addr or ctx.obj["as_addr"])
     emit(
         ctx,
         {
@@ -645,10 +726,7 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
 @click.pass_context
 def auth_list(ctx: click.Context) -> None:
     """List connected accounts, their expiry, and which one is active."""
-    try:
-        emit(ctx, {"accounts": account_rows(keeper_url(ctx))})
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(ctx, {"accounts": account_rows(keeper_url(ctx))})
 
 
 @auth.command("use")
@@ -660,10 +738,7 @@ def auth_use(ctx: click.Context, addr: str) -> None:
     Commands without `--as` act on the active account. Sign in again to
     connect a new one: `sai auth login NAME` and `sai auth import` add accounts.
     """
-    try:
-        emit(ctx, {**sessions.summary(storage.use_session(addr)), "active": True})
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(ctx, {**sessions.summary(storage.use_session(addr)), "active": True})
 
 
 @auth.command("status")
@@ -671,11 +746,8 @@ def auth_use(ctx: click.Context, addr: str) -> None:
 def auth_status(ctx: click.Context) -> None:
     """Show the active account, or the --as account, and its expiry without
     showing the token."""
-    try:
-        result = session(ctx)
-        emit(ctx, sessions.summary(result))
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    result = session(ctx)
+    emit(ctx, sessions.summary(result))
 
 
 @main.group()
@@ -705,10 +777,7 @@ def account() -> None:
 def perform_query(
     ctx: click.Context, query: str, variables: dict[str, Any] | None = None
 ) -> None:
-    try:
-        emit(ctx, keeper.request(keeper_url(ctx), query, variables))
-    except keeper.KeeperError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(ctx, keeper.request(keeper_url(ctx), query, variables))
 
 
 @account.command("positions")
@@ -733,18 +802,15 @@ def history(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def balances(ctx: click.Context, addr: str, ws_endpoint: str | None) -> None:
     """Read one account balance snapshot from Keeper's subscription."""
-    try:
-        emit(
-            ctx,
-            stream.snapshot(
-                ws_url(ctx, ws_endpoint),
-                stream.BALANCES,
-                {"user": addr},
-                notify=warn,
-            ),
-        )
-    except stream.StreamError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(
+        ctx,
+        stream.snapshot(
+            ws_url(ctx, ws_endpoint),
+            stream.BALANCES,
+            {"user": addr},
+            notify=warn,
+        ),
+    )
 
 
 @main.group()
@@ -757,11 +823,11 @@ def intent() -> None:
 @click.option("--key", help="Specific intent key.")
 @click.pass_context
 def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
-    """Read Keeper's latest intent records; reconcile a known key."""
-    try:
-        emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
-    except keeper.KeeperError as exc:
-        raise click.ClickException(str(exc)) from exc
+    """Read Keeper's latest intent records and record local pending fills.
+
+    Use --key to check one intent for a final outcome.
+    """
+    emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
 
 
 @intent.command("local")
@@ -843,6 +909,13 @@ def warn(message: str) -> None:
 @click.option("--slippage", required=True, help="Maximum slippage percentage.")
 @click.option("--take-profit")
 @click.option("--stop-loss")
+@click.option(
+    "--allow-concurrent-open",
+    is_flag=True,
+    help="Allow another open while an earlier open is unknown or accepted."
+    " Any locally pending open on the same account and Keeper still blocks,"
+    " including a late acknowledgement.",
+)
 @click.option("--dry-run", is_flag=True)
 @click.pass_context
 def trade_open(
@@ -856,31 +929,30 @@ def trade_open(
     slippage: str,
     take_profit: str | None,
     stop_loss: str | None,
+    allow_concurrent_open: bool,
     dry_run: bool,
 ) -> None:
     """Open a market, limit, or stop trade."""
-    try:
-        emit_trade(
-            ctx,
-            trading.open_trade(
-                keeper_url(ctx),
-                loader(ctx),
-                market_id=market_id,
-                side=side,
-                order_type=order_type,
-                amount=amount,
-                leverage=leverage,
-                price=price,
-                slippage=slippage,
-                take_profit=take_profit,
-                stop_loss=stop_loss,
-                dry_run=dry_run,
-                lcd_endpoint=settings(ctx).lcd_endpoint,
-                notify=warn,
-            ),
-        )
-    except (ValueError, KeyError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit_trade(
+        ctx,
+        trading.open_trade(
+            keeper_url(ctx),
+            loader(ctx),
+            market_id=market_id,
+            side=side,
+            order_type=order_type,
+            amount=amount,
+            leverage=leverage,
+            price=price,
+            slippage=slippage,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            allow_concurrent_open=allow_concurrent_open,
+            dry_run=dry_run,
+            lcd_endpoint=settings(ctx).lcd_endpoint,
+            notify=warn,
+        ),
+    )
 
 
 @trade.command("close")
@@ -896,20 +968,17 @@ def trade_close(
     ctx: click.Context, trade_id: int, cancel_order: bool, dry_run: bool
 ) -> None:
     """Close a position or cancel a pending order."""
-    try:
-        emit_trade(
-            ctx,
-            trading.close_trade(
-                keeper_url(ctx),
-                loader(ctx),
-                trade_id=trade_id,
-                cancel_order=cancel_order,
-                dry_run=dry_run,
-                lcd_endpoint=settings(ctx).lcd_endpoint,
-            ),
-        )
-    except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit_trade(
+        ctx,
+        trading.close_trade(
+            keeper_url(ctx),
+            loader(ctx),
+            trade_id=trade_id,
+            cancel_order=cancel_order,
+            dry_run=dry_run,
+            lcd_endpoint=settings(ctx).lcd_endpoint,
+        ),
+    )
 
 
 @trade.command("tpsl")
@@ -930,22 +999,19 @@ def trade_tpsl(
     dry_run: bool,
 ) -> None:
     """Set or clear take-profit and stop-loss prices."""
-    try:
-        emit_trade(
-            ctx,
-            trading.set_tpsl(
-                keeper_url(ctx),
-                loader(ctx),
-                trade_id=trade_id,
-                take_profit=take_profit,
-                stop_loss=stop_loss,
-                clear_take_profit=clear_take_profit,
-                clear_stop_loss=clear_stop_loss,
-                dry_run=dry_run,
-            ),
-        )
-    except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit_trade(
+        ctx,
+        trading.set_tpsl(
+            keeper_url(ctx),
+            loader(ctx),
+            trade_id=trade_id,
+            take_profit=take_profit,
+            stop_loss=stop_loss,
+            clear_take_profit=clear_take_profit,
+            clear_stop_loss=clear_stop_loss,
+            dry_run=dry_run,
+        ),
+    )
 
 
 @trade.command("leverage")
@@ -957,20 +1023,17 @@ def trade_leverage(
     ctx: click.Context, trade_id: int, leverage: str, dry_run: bool
 ) -> None:
     """Set target leverage without changing TP or SL."""
-    try:
-        emit_trade(
-            ctx,
-            trading.set_leverage(
-                keeper_url(ctx),
-                loader(ctx),
-                trade_id=trade_id,
-                leverage=leverage,
-                dry_run=dry_run,
-                lcd_endpoint=settings(ctx).lcd_endpoint,
-            ),
-        )
-    except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit_trade(
+        ctx,
+        trading.set_leverage(
+            keeper_url(ctx),
+            loader(ctx),
+            trade_id=trade_id,
+            leverage=leverage,
+            dry_run=dry_run,
+            lcd_endpoint=settings(ctx).lcd_endpoint,
+        ),
+    )
 
 
 @trade.command("margin")
@@ -1000,21 +1063,18 @@ def trade_margin(
 
     The amount is a quote, not a cap: collateral can change before execution.
     """
-    try:
-        emit_trade(
-            ctx,
-            trading.change_margin(
-                keeper_url(ctx),
-                loader(ctx),
-                trade_id=trade_id,
-                direction=direction,
-                amount=amount,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
-                dry_run=dry_run,
-            ),
-        )
-    except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit_trade(
+        ctx,
+        trading.change_margin(
+            keeper_url(ctx),
+            loader(ctx),
+            trade_id=trade_id,
+            direction=direction,
+            amount=amount,
+            lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+            dry_run=dry_run,
+        ),
+    )
 
 
 @trade.command("partial-close")
@@ -1035,20 +1095,17 @@ def partial_close(
     dry_run: bool,
 ) -> None:
     """Reduce an open USDC position by a whole percentage."""
-    try:
-        emit_trade(
-            ctx,
-            trading.partial_close(
-                keeper_url(ctx),
-                loader(ctx),
-                trade_id=trade_id,
-                percent=percent,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
-                dry_run=dry_run,
-            ),
-        )
-    except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit_trade(
+        ctx,
+        trading.partial_close(
+            keeper_url(ctx),
+            loader(ctx),
+            trade_id=trade_id,
+            percent=percent,
+            lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+            dry_run=dry_run,
+        ),
+    )
 
 
 @main.command("doctor")
@@ -1072,38 +1129,61 @@ def doctor_command(
     ws_endpoint: str | None,
     lcd_endpoint: str | None,
 ) -> None:
-    """Check the install, session, intent ledger, and endpoints, and fix what
-    is safe to fix.
+    """Check the install, config, MCP registrations, session, intent ledger,
+    and endpoints.
 
-    Fixes: create $SAI_HOME/trader, make it, $SAI_HOME/logs, and their files
-    private, migrate the intent ledger, and reconcile unknown intents for the signed-in
-    account with Keeper (a read; no trade is placed or cancelled). It never
-    deletes or rewrites the session, and never prints its token. Each check
-    prints pass, fixed, warn, fail, or skipped, with a fix for the rest. Exits
-    1 if any check still fails.
+    With fixes enabled, doctor makes trader and log files private, repairs
+    stale Codex and Cursor MCP registrations, migrates the intent ledger,
+    and reconciles unknown intents for the signed-in account with Keeper.
+    It reports stale Claude Code registrations with a command to repair
+    each existing entry. It never deletes or rewrites the session, and
+    never prints its token. Each check prints pass, fixed, warn, fail, or
+    skipped. Doctor exits 1 if any check still fails.
     """
     from . import doctor
 
-    config = dataclasses.replace(
-        settings(ctx),
-        ws_endpoint=ws_url(ctx, ws_endpoint),
-        lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+    flags = dict(ctx.find_root().obj["flags"])
+    for key, value in (
+        ("keeper.ws_endpoint", ws_endpoint),
+        ("lcd.endpoint", lcd_endpoint),
+    ):
+        if value:
+            flags[key] = value
+    config_check, config = doctor.check_config(flags)
+    checks = [
+        config_check,
+        *doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline)),
+    ]
+    overall = doctor.overall(checks)
+    code = (
+        Code.INVALID_REQUEST if config_check.status == "fail" else Code.INTERNAL_ERROR
     )
-    checks = doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline))
     log.event(
         "doctor.result",
-        "info" if doctor.overall(checks) == "pass" else "warn",
-        overall=doctor.overall(checks),
+        "info" if overall == "pass" else "warn",
+        overall=overall,
         fix=not no_fix,
         offline=offline,
         checks=[doctor.log_entry(check) for check in checks],
+        code=code if overall == "fail" else None,
     )
+    if overall == "fail":
+        if not ctx.obj["json"]:
+            report = doctor.render_text(checks)
+        else:
+            report = "\n".join(
+                f"{check.id}: {check.summary}"
+                + (f" Fix: {check.fix}" if check.fix else "")
+                for check in checks
+                if check.status == "fail"
+            )
+        raise SaiError(
+            report, code, details=doctor.report(checks) if ctx.obj["json"] else None
+        )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
     else:
         click.echo(doctor.render_text(checks))
-    if doctor.overall(checks) == "fail":
-        ctx.exit(1)
 
 
 @main.group()
@@ -1162,23 +1242,24 @@ def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
     """Print each snapshot as a JSON line, reconnecting until interrupted."""
-    try:
-        stream.check_ws(ws_endpoint)
-        while True:
-            try:
-                for payload in stream.payloads(
-                    ws_endpoint, query, variables, notify=warn
-                ):
-                    click.echo(json.dumps(payload, separators=(",", ":")))
-            except stream.DISCONNECTS as exc:
-                click.echo(
-                    f"Disconnected ({type(exc).__name__}); data may be stale;"
-                    " reconnecting in 2s",
-                    err=True,
-                )
-                time.sleep(2)
-    except stream.StreamError as exc:
-        raise click.ClickException(str(exc)) from exc
+    stream.check_ws(ws_endpoint)
+    while True:
+        try:
+            for payload in stream.payloads(ws_endpoint, query, variables, notify=warn):
+                click.echo(json.dumps(payload, separators=(",", ":")))
+        except stream.DISCONNECTS as exc:
+            log.event(
+                "watch.disconnected",
+                "warn",
+                code=Code.STREAM_ERROR,
+                errorType=type(exc).__name__,
+                endpoint=log.endpoint(ws_endpoint),
+            )
+            warn(
+                f"Disconnected ({type(exc).__name__}); data may be stale;"
+                " reconnecting in 2s"
+            )
+            time.sleep(2)
 
 
 @main.group("config")
@@ -1257,8 +1338,6 @@ def config_set(ctx: click.Context, key: str, value: str) -> None:
         )
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    except sai_settings.SettingsError as exc:
-        raise click.ClickException(str(exc)) from exc
     report_change(ctx, spec, {"key": spec.key, "value": parsed, "path": str(path)})
 
 
@@ -1281,8 +1360,6 @@ def config_unset(ctx: click.Context, key: str) -> None:
         sai_settings.edit_file(path, edit)
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    except sai_settings.SettingsError as exc:
-        raise click.ClickException(str(exc)) from exc
     report_change(
         ctx, spec, {"key": spec.key, "removed": removed[0], "path": str(path)}
     )
@@ -1452,29 +1529,44 @@ def quiet_target(ctx: click.Context) -> mcp_install.Target | None:
     return target
 
 
-def refuse(ctx: click.Context, exc: mcp_install.InstallError) -> None:
-    emit(ctx, {"error": str(exc), "code": exc.code})
-    ctx.exit(1)
-
-
 def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
     summary = mcp_install.summarize(results)
-    emit(ctx, summary)
     if summary["reconnectNeeded"]:
         warn("Restart or reconnect the changed clients to load the change.")
     if any(r.client == "cursor" and r.action in ("added", "replaced") for r in results):
         warn(mcp_install.Cursor.HINT)
-    if any(r.action == "failed" for r in results):
-        ctx.exit(1)
+    if any(result.action == "failed" for result in results):
+        if ctx.obj["json"]:
+            lines = []
+            for result in results:
+                target = (
+                    f"{result.client} ({result.scope})"
+                    if result.scope
+                    else result.client
+                )
+                detail = f": {result.error}" if result.error else ""
+                lines.append(f"{target}: {result.action}{detail}")
+            if summary["reconnectNeeded"]:
+                lines.append("Client registrations changed.")
+            details = "\n".join(lines)
+        else:
+            details = json.dumps(summary, indent=2)
+        report = {
+            **summary,
+            "results": [{**r.to_json(), "changed": r.changed} for r in results],
+        }
+        raise SaiError(details, hint="sai mcp list", details=report)
+    emit(ctx, summary)
 
 
 SCOPE_OPTION = click.option(
     "--scope",
-    type=click.Choice(mcp_install.SCOPES),
+    type=click.Choice(mcp_install.UNINSTALL_SCOPES),
     default="user",
     show_default=True,
     help="user: every project. project: this directory's shared config"
-    " (Claude Code .mcp.json, Cursor .cursor/mcp.json). Codex is user only.",
+    " (Claude Code .mcp.json, Cursor .cursor/mcp.json)."
+    " local: this directory's Claude Code local config. Codex is user only.",
 )
 
 
@@ -1503,6 +1595,17 @@ def mcp_list(ctx: click.Context) -> None:
 
 @mcp_group.command("install", cls=ArgvAfterDash)
 @click.argument("clients", nargs=-1)
+@click.option("--client", "client_options", multiple=True, help="Name a client.")
+@click.option(
+    "--repair-existing",
+    type=click.Choice(mcp_install.SERVER_NAMES),
+    help="Repair only this existing Claude Code entry in the selected scope.",
+)
+@click.option(
+    "--reset-args",
+    is_flag=True,
+    help="Use default server arguments when repairing an existing entry.",
+)
 @click.option("--all", "all_clients", is_flag=True, help="Every detected client.")
 @click.option("--dry-run", is_flag=True, help="Show the changes; make none.")
 @SCOPE_OPTION
@@ -1510,6 +1613,9 @@ def mcp_list(ctx: click.Context) -> None:
 def mcp_install_command(
     ctx: click.Context,
     clients: tuple[str, ...],
+    client_options: tuple[str, ...],
+    repair_existing: str | None,
+    reset_args: bool,
     all_clients: bool,
     dry_run: bool,
     scope: str,
@@ -1524,13 +1630,34 @@ def mcp_install_command(
     With no CLIENT and no --all, a terminal asks which clients to register;
     without a terminal, this lists detected clients and changes nothing.
     """
+    names = chosen_clients((*clients, *client_options))
+    if reset_args and repair_existing is None:
+        raise click.UsageError("--reset-args requires --repair-existing.")
+    if repair_existing is not None and (
+        names != ["claude"] or all_clients or ctx.meta.get("server_argv")
+    ):
+        raise click.UsageError(
+            "--repair-existing requires --client claude and the default server command."
+        )
     found = mcp_clients()
-    try:
-        target = server_target(ctx)
-    except mcp_install.InstallError as exc:
-        refuse(ctx, exc)
+    target = server_target(ctx)
+    if repair_existing is not None:
+        claude = found["claude"]
+        assert isinstance(claude, mcp_install.Claude)
+        finish(
+            ctx,
+            [
+                mcp_install.repair_claude_existing(
+                    claude,
+                    scope,
+                    repair_existing,
+                    target,
+                    dry_run,
+                    reset_args=reset_args,
+                )
+            ],
+        )
         return
-    names = chosen_clients(clients)
     detected = [n for n, c in found.items() if c.detected()[0]]
     if all_clients:
         names = list(dict.fromkeys([*names, *detected]))
@@ -1551,6 +1678,8 @@ def mcp_install_command(
         if not detected:
             raise click.UsageError("No agent clients found; name one to register.")
         names = pick("Register Sai with (numbers, names, or all)", detected)
+    if scope == "local" and names != ["claude"]:
+        raise click.UsageError("Install scope local requires the Claude Code client.")
     results = [mcp_install.install_one(found[n], scope, target, dry_run) for n in names]
     finish(ctx, results)
 
@@ -1575,7 +1704,7 @@ def mcp_uninstall(
 ) -> None:
     """Remove Sai from Claude Code, Codex, or Cursor.
 
-    Removes sai from every scope it is registered in for each client, unless
+    Removes canonical and legacy Sai entries from every scope for each client, unless
     --scope names one. With no CLIENT and no --all, a terminal asks which to
     remove; without a terminal this is a usage error that names where Sai is
     registered.
@@ -1686,6 +1815,99 @@ def logs_tail(
             click.echo(json.dumps(line, separators=(",", ":"), default=str))
         else:
             click.echo(log.render(line))
+
+
+def print_log_trail(ctx: click.Context, report: dict[str, Any]) -> None:
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    lines = sorted(report["events"] + report["gaps"], key=log.event_order)
+    if not lines:
+        click.echo("No matching log events.")
+    for line in lines:
+        prefix = "Gap  " if line.get("event") == "log.dropped" else ""
+        click.echo(prefix + log.render(line))
+    if warning := report.get("scopeWarning"):
+        click.echo(warning)
+    for line in report.get("unattributedGaps", ()):
+        click.echo("Unattributed gap  " + log.render(line))
+    if (count := report.get("unattributedGapCount", 0)) > len(
+        report.get("unattributedGaps", ())
+    ):
+        click.echo(f"Unattributed drop notices in scan  {count}")
+    print_log_limit(report)
+
+
+def print_log_limit(report: dict[str, Any]) -> None:
+    if report.get("truncated"):
+        click.echo("Report truncated. " + report["more"])
+        if before := report.get("nextBefore"):
+            click.echo(f"Earlier timestamps  --before {before}")
+
+
+@logs_group.command("intent")
+@click.argument("key")
+@click.option("--offline", is_flag=True, help="Read local logs only.")
+@click.option("--addr", help="EVM address to use for the Keeper lookup.")
+@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.pass_context
+def logs_intent(
+    ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None
+) -> None:
+    """Show an intent's CLI and MCP trail and its current Keeper record."""
+    endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
+    account = addr if addr is not None else ctx.obj["as_addr"]
+    report = log_queries.intent(
+        key, endpoint=endpoint, addr=account, offline=offline, before=before
+    )
+    print_log_trail(ctx, report)
+    if ctx.obj["json"]:
+        return
+    if report["txHash"]:
+        click.echo(f"Request transaction {report['txHash']}")
+    if record := report["keeper"]:
+        click.echo("Keeper " + json.dumps(record, separators=(",", ":")))
+    elif error := report.get("keeperError"):
+        click.echo(f"Keeper lookup failed ({error['code']}). {error['message']}")
+    elif not offline:
+        click.echo("Keeper has no record for this intent.")
+
+
+@logs_group.command("run")
+@click.argument("id")
+@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.pass_context
+def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
+    """Show one process run or one MCP call by ID."""
+    print_log_trail(ctx, log_queries.run(id, before=before))
+
+
+@logs_group.command("stats")
+@click.option(
+    "--since", metavar="DURATION", help="Look back by a duration such as 24h."
+)
+@click.option("--before", help="Use events before this UTC timestamp.")
+@click.pass_context
+def logs_stats(ctx: click.Context, since: str | None, before: str | None) -> None:
+    """Summarize Keeper latency and error codes in the retained logs."""
+    report = log_queries.stats(since, before=before)
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    if report["keeper"]:
+        click.echo("Keeper operation  Requests  p50 (ms)  p95 (ms)")
+        for name, values in report["keeper"].items():
+            click.echo(
+                f"{name:16}  {values['count']:8}  {values['p50Ms']:8}  {values['p95Ms']:8}"
+            )
+    else:
+        click.echo("No timed Keeper requests.")
+    click.echo("Errors by code" if report["errors"] else "No coded errors.")
+    for code, count in report["errors"].items():
+        click.echo(f"{code}  {count}")
+    for line in report["gaps"]:
+        click.echo("Gap  " + log.render(line))
+    print_log_limit(report)
 
 
 # Exit code for an install `sai update` cannot change in place.
@@ -1814,13 +2036,14 @@ def log_update(outcome: updater.Outcome, *, background: bool) -> None:
     """Record what an update run did in the log's `update` surface."""
     log.event(
         "update.result",
-        "warn" if outcome.status == updater.FAILED else "info",
+        "warn" if outcome.exit_code else "info",
         status=outcome.status,
         installed=outcome.installed,
         target=outcome.target,
         rolledBack=outcome.rolled_back,
         background=background,
         message=log.untrusted(outcome.message),
+        code=Code.INTERNAL_ERROR if outcome.exit_code else None,
     )
 
 
@@ -1831,8 +2054,14 @@ def check_update(ctx: click.Context, api_base: str, web_base: str) -> None:
     except update.NoRelease:
         latest = None
     except update.UpdateError as exc:
-        log.event("update.check", "warn", ok=False, error=log.untrusted(str(exc)))
-        raise click.ClickException(f"update check failed: {exc}") from exc
+        log.event(
+            "update.check",
+            "warn",
+            ok=False,
+            code=Code.INTERNAL_ERROR,
+            error=log.untrusted(str(exc)),
+        )
+        raise SaiError(f"update check failed: {exc}") from exc
     # No release is a result too: it replaces a cached, withdrawn one.
     changes = {"latest": latest.tag if latest else None, "checkedAt": update.now()}
     if not updater.save_state(changes):
@@ -1884,8 +2113,8 @@ def update_command(
     Downloads the release wheel, checks it against the release's SHA256SUMS,
     installs it with `uv tool install`, and then runs the new version. If any
     step fails, the previous version stays or is put back. The `sai` path and
-    everything under $SAI_HOME stay as they are, so registered MCP clients
-    keep working; restart them to load the new version.
+    your Sai data stay in place. The update repairs stale MCP registrations.
+    Restart agent clients to load the new version.
 
     Only a `uv tool install` of a release or of the official Git source is
     updated; a checkout, uvx, or other install gets a note and exit code 3.
@@ -1927,11 +2156,20 @@ def update_command(
         return
     outcome = updater.update_now(options)
     log_update(outcome, background=False)
+    if outcome.exit_code:
+        raise SaiError(
+            outcome.message,
+            exit_code=outcome.exit_code,
+            hint=update.INSTALL_COMMAND
+            if outcome.exit_code == ExitCode.UNSUPPORTED
+            else None,
+        )
     if ctx.obj["json"]:
         emit(ctx, outcome.to_json())
     else:
-        click.echo(outcome.message, err=outcome.exit_code != 0)
-    ctx.exit(outcome.exit_code)
+        click.echo(outcome.message)
+        if notice := updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes):
+            click.echo(notice)
 
 
 if __name__ == "__main__":

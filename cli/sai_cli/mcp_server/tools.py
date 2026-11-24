@@ -17,7 +17,6 @@ import copy
 import hashlib
 import json
 import logging
-import time
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
@@ -27,6 +26,8 @@ from typing import Any
 from ..core import intents, keeper, reconcile, storage, stream, trading
 from ..core import log as sai_log
 from ..core import session as sessions
+from ..core.errors import Code, SaiError, SessionError
+from ..core.errors import describe as describe_error
 from ..core.settings import Settings, public_url
 
 log = logging.getLogger("sai_cli.mcp_server")
@@ -45,12 +46,12 @@ SIGN_IN = (
     " import` in a terminal, then retry. Reads and most previews work without it."
 )
 NOT_SIGNED_IN = {
-    "signed-out": ("No Sai account is signed in." + SIGN_IN, "SIGNED_OUT"),
-    "expired": ("The Sai trading session expired." + SIGN_IN, "SESSION_EXPIRED"),
+    "signed-out": ("No Sai account is signed in." + SIGN_IN, Code.SIGNED_OUT),
+    "expired": ("The Sai trading session expired." + SIGN_IN, Code.SESSION_EXPIRED),
     "other-endpoint": (
         "The signed-in Sai session belongs to a different Keeper endpoint than"
         " this server's." + SIGN_IN,
-        "SESSION_UNAVAILABLE",
+        Code.SESSION_UNAVAILABLE,
     ),
 }
 INTERNAL = "Unexpected error in the Sai MCP server; see its stderr log"
@@ -68,14 +69,6 @@ MISMATCH = (
     " was submitted. Show the user this new preview, get their confirmation"
     " again, then retry with its previewDigest."
 )
-RECENT_OPEN = (
-    "An open-trade intent for this account from the last {minutes} minutes"
-    " is still {statuses}, so this open was not submitted: after a timeout or"
-    " error the first request may have gone through. Call intent_local, then"
-    " intent_status with each key in intentKeys. Retry with"
-    " allow_concurrent_open=true only once the user confirms they want"
-    " another open position."
-)
 PRICE_MOVED = (
     "The market price moved {moved}% from the confirmed referencePrice, more"
     " than the {slippage}% slippage, so nothing was submitted. Show the user"
@@ -84,18 +77,14 @@ PRICE_MOVED = (
 )
 
 
-class SessionUnavailable(ValueError):
+class SessionUnavailable(SessionError):
     """The stored session is missing, expired, or unusable by the server.
 
     CODE is SIGNED_OUT, SESSION_EXPIRED, or SESSION_UNAVAILABLE.
     """
 
-    def __init__(self, message: str, code: str = "SESSION_UNAVAILABLE") -> None:
-        super().__init__(message)
-        self.code = code
 
-
-class Refused(trading.PreviewRefused):
+class Refused(SaiError, trading.PreviewRefused):
     """A trade was refused before submission; CODE says why.
 
     PREVIEW, when set, is the fresh preview with its own previewDigest for
@@ -105,12 +94,12 @@ class Refused(trading.PreviewRefused):
     def __init__(
         self,
         message: str,
-        code: str,
+        code: Code,
         preview: dict[str, Any] | None = None,
         **extra: Any,
     ) -> None:
-        super().__init__(message, preview)
-        self.code = code
+        super().__init__(message, code)
+        self.preview = preview
         self.extra = extra
 
 
@@ -122,51 +111,44 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
 
 
 def describe(exc: Exception) -> dict[str, Any]:
-    """Map a known error to a stable code; messages carry no secrets."""
-    if isinstance(exc, keeper.OutcomeUnknown):
-        key = exc.intent_key
+    """Format the shared classification using the MCP response fields."""
+    failure = describe_error(exc)
+    if failure.code == Code.OUTCOME_UNKNOWN:
+        key = failure.intent_key
         return error(
-            str(exc),
-            "OUTCOME_UNKNOWN",
+            failure.message,
+            failure.code,
             intentKey=key,
             next=(
                 f"Call intent_status with key {key} to reconcile. Do not"
                 " resubmit until it reports a final outcome."
             ),
         )
-    if isinstance(exc, keeper.AdmissionRejected):
-        return error(str(exc), "ADMISSION_REJECTED")
-    if isinstance(exc, keeper.NotSent):
-        return error(str(exc), "NOT_SENT")
-    if isinstance(exc, keeper.KeeperError):
-        return error(str(exc), "KEEPER_ERROR")
+    if isinstance(exc, storage.RecentOpenPending):
+        return error(
+            f"Earlier open intent {failure.intent_key} may still execute. Call"
+            " intent_status with each key in intentKeys before retrying.",
+            failure.code,
+            intentKeys=exc.keys,
+        )
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
-        return error(str(exc), exc.code, **extra, **exc.extra)
+        return error(failure.message, failure.code, **extra, **exc.extra)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
-            return error(str(exc), "PREVIEW_MISMATCH")
+            return error(failure.message, Code.PREVIEW_MISMATCH)
         return error(
             "The position or quote changed during confirmation, so nothing was"
             " submitted. Show the user the latest preview, get their confirmation"
             " again, then retry with its previewDigest.",
-            "PREVIEW_MISMATCH",
+            Code.PREVIEW_MISMATCH,
             preview=with_digest(exc.preview),
         )
-    if isinstance(exc, SessionUnavailable):
-        return error(str(exc), exc.code)
-    if isinstance(exc, stream.StreamError):
-        return error(str(exc), "STREAM_ERROR")
-    if isinstance(exc, ValueError):
-        return error(str(exc), "INVALID_REQUEST")
-    if isinstance(exc, (KeyError, TypeError)):
-        return error(
-            f"Keeper or contract data was missing or malformed ({type(exc).__name__})",
-            "INCOMPLETE_DATA",
-        )
-    trace = "".join(traceback.format_exception(exc))
-    log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
-    return error(INTERNAL, "INTERNAL_ERROR")
+    if failure.code == Code.INTERNAL_ERROR:
+        trace = "".join(traceback.format_exception(exc))
+        log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
+        return error(INTERNAL, failure.code)
+    return error(failure.message, failure.code)
 
 
 REDACTED = sai_log.REDACTED
@@ -412,14 +394,55 @@ def intent_local(settings: Settings, addr: str | None) -> dict[str, Any]:
     return {**account, "intents": pending}
 
 
+def _reconcile_fields(data: dict[str, Any]) -> dict[str, Any]:
+    """Keep the outcome and guidance Sai derives while reconciling."""
+    result = {}
+    if data.get("outcome") in (
+        "accepted",
+        "pending",
+        "terminal-filled",
+        "terminal-failed",
+        "unknown",
+    ):
+        result["outcome"] = data["outcome"]
+    if data.get("localStatus") in (
+        "unknown",
+        "accepted",
+        "pending",
+        "terminal",
+        "rejected",
+        "not_sent",
+        "absent",
+    ):
+        result["localStatus"] = data["localStatus"]
+    if data.get("hint") in (
+        reconcile.PENDING_HINT,
+        reconcile.UNINDEXED_HINT,
+        reconcile.HISTORY_HINT,
+        reconcile.LOCAL_PENDING_HINT,
+    ):
+        result["hint"] = data["hint"]
+    return result
+
+
 def intent_status(
     settings: Settings, addr: str | None, key: str | None
 ) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
-    return {
-        **account,
-        **reconcile.reconcile(settings.endpoint, account["addr"], key),
-    }
+    data = reconcile.reconcile(settings.endpoint, account["addr"], key)
+    report: dict[str, Any] = {**account, **_reconcile_fields(data)}
+    for name, sanitize in (
+        ("userIntents", keeper.safe_intent_record),
+        ("matchedTradeHistory", keeper.safe_intent_history),
+    ):
+        if isinstance(rows := data.get(name), list):
+            report[name] = [
+                sanitize(row)
+                | (_reconcile_fields(row) if name == "userIntents" else {})
+                for row in rows
+                if isinstance(row, dict)
+            ]
+    return report
 
 
 # Preview binding
@@ -504,7 +527,7 @@ def bound(
             else {**fresh, "referencePrice": format(reference, "f")}
         )
         if preview_digest(confirmed) != digest:
-            raise Refused(MISMATCH, "PREVIEW_MISMATCH", fresh)
+            raise Refused(MISMATCH, Code.PREVIEW_MISMATCH, fresh)
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
@@ -514,7 +537,7 @@ def bound(
                 moved=format(moved.quantize(Decimal("0.0001")), "f"),
                 slippage=slippage,
             )
-            raise Refused(message, "PRICE_MOVED", fresh)
+            raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check
 
@@ -535,66 +558,6 @@ def submit_check(
         return lambda _preview: None
     load.require()
     return bound(load, digest, reference_price, slippage)
-
-
-# Statuses of an open that may still fill, and how long one can. Keeper
-# fails a queued intent after its admission expiry; past that margin, an
-# open no longer stands in for the one being submitted.
-OPEN_PENDING = ("unknown", "accepted")
-RECENT_OPEN_SECONDS = keeper.ABSENT_AFTER_SECONDS
-
-
-def recent_opens(
-    endpoint: str, account: str, now: float | None = None
-) -> list[dict[str, str]]:
-    """Return this account's OPEN_TRADE intents that may still fill.
-
-    The store keeps no payload, so any recent unknown or accepted open
-    counts, whatever its market, side, or amount.
-    """
-    current = time.time() if now is None else now
-    with storage.db() as connection:
-        rows = connection.execute(
-            "SELECT id, status, created_at FROM intents WHERE endpoint=?"
-            " AND account=? AND kind='OPEN_TRADE' AND status IN (?, ?)"
-            " ORDER BY rowid DESC",
-            (endpoint, account.lower(), *OPEN_PENDING),
-        ).fetchall()
-    recent: list[dict[str, str]] = []
-    for key, status, created in rows:
-        stamp = created if created is not None else storage._key_time(key)
-        if stamp is None or current - stamp <= RECENT_OPEN_SECONDS:
-            recent.append({"intentKey": key, "status": status})
-    return recent
-
-
-def no_recent_open(settings: Settings, load: AccountSession) -> trading.SubmitCheck:
-    """Return a check that refuses an open while a recent one may fill."""
-
-    def check(_preview: dict[str, Any]) -> None:
-        account = load()["evmAddress"]
-        pending = recent_opens(settings.endpoint, account)
-        if pending:
-            statuses = " or ".join(sorted({row["status"] for row in pending}))
-            raise Refused(
-                RECENT_OPEN.format(
-                    minutes=RECENT_OPEN_SECONDS // 60, statuses=statuses
-                ),
-                "RECENT_OPEN_PENDING",
-                intentKeys=[row["intentKey"] for row in pending],
-            )
-
-    return check
-
-
-def both(
-    first: trading.SubmitCheck, second: trading.SubmitCheck
-) -> trading.SubmitCheck:
-    def check(preview: dict[str, Any]) -> None:
-        first(preview)
-        second(preview)
-
-    return check
 
 
 def finish(
@@ -641,8 +604,12 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
-    if not dry_run and not allow_concurrent_open:
-        check = both(no_recent_open(settings, load), check)
+    if not dry_run:
+        storage.check_open_pending(
+            settings.endpoint,
+            load()["evmAddress"],
+            allow_concurrent_open=allow_concurrent_open,
+        )
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
@@ -661,6 +628,7 @@ def open_trade(
         mcp_market=True,
         notify=notices.append,
         before_submit=check,
+        allow_concurrent_open=allow_concurrent_open,
     )
     if notices:
         result["notices"] = notices

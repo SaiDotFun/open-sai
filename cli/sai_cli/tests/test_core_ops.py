@@ -151,6 +151,7 @@ def intent_row(key: str, step: str) -> dict[str, Any]:
                 "lifecycleStep": step,
                 "execActor": "server",
                 "evmAddress": ADDR.upper().replace("0X", "0x"),
+                "txHash": "A" * 64,
             }
         ]
     }
@@ -173,7 +174,7 @@ def test_reconcile_marks_server_failure_terminal(monkeypatch):
 
 def test_reconcile_matches_executed_trade_history(monkeypatch):
     storage.pending("k2", ENDPOINT, ADDR, "CLOSE_TRADE", "1")
-    row = {"intentKey": "k2", "trade": {"id": 1}}
+    row = {"intentKey": "k2", "txHash": "a" * 64, "trade": {"id": 1, "trader": ADDR}}
     fake = FakeKeeper(
         {
             keeper.INTENTS: intent_row("k2", "exec_pass"),

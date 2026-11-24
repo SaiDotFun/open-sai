@@ -59,6 +59,52 @@ def test_mark_absent_waits_for_admission_expiry():
     storage.pending("K2", endpoint, ADDR, "CLOSE_POSITION", "7")
 
 
+def test_open_guard_scopes_aged_acknowledgement_to_account_and_keeper():
+    endpoint = "http://127.0.0.1:1/query"
+    storage.pending("accepted-open", endpoint, ADDR, "OPEN_TRADE", "")
+    storage.set_status("accepted-open", endpoint, ADDR, "accepted")
+    with storage.db() as connection:
+        connection.execute("UPDATE intents SET created_at=0 WHERE id='accepted-open'")
+
+    with pytest.raises(storage.RecentOpenPending, match="accepted-open"):
+        storage.pending("retry", endpoint, ADDR.upper(), "OPEN_TRADE", "")
+    storage.pending("other-keeper", "http://127.0.0.1:2/query", ADDR, "OPEN_TRADE", "")
+    storage.pending("other-account", endpoint, "0x" + "b" * 40, "OPEN_TRADE", "")
+    storage.pending("close", endpoint, ADDR, "CLOSE_POSITION", "7")
+
+
+def test_concurrent_open_override_applies_only_to_unknown_or_accepted_opens():
+    endpoint = "http://127.0.0.1:1/query"
+    storage.pending("unknown-open", endpoint, ADDR, "OPEN_TRADE", "")
+    with pytest.raises(storage.RecentOpenPending, match="unknown-open"):
+        storage.pending("retry", endpoint, ADDR, "OPEN_TRADE", "")
+    storage.pending(
+        "override", endpoint, ADDR, "OPEN_TRADE", "", allow_concurrent_open=True
+    )
+    storage.set_status("unknown-open", endpoint, ADDR, "pending")
+    with pytest.raises(storage.RecentOpenPending, match="unknown-open"):
+        storage.pending(
+            "retry", endpoint, ADDR, "OPEN_TRADE", "", allow_concurrent_open=True
+        )
+
+
+def test_v010_trade_guard_sees_pending_intent_after_downgrade():
+    endpoint = closed_endpoint()
+    storage.pending("K1", endpoint, ADDR, "OPEN_TRADE", "")
+    assert storage.set_status("K1", endpoint, ADDR, "pending") == "pending"
+    assert storage.list_pending(endpoint, ADDR)[0]["status"] == "pending"
+
+    with sqlite3.connect(storage.home() / "intents.sqlite3") as old_db:
+        assert old_db.execute("PRAGMA user_version").fetchone() == (1,)
+        # sai-cli/v0.1.0's reservation query for a different trade entity.
+        blocker = old_db.execute(
+            "SELECT id FROM intents WHERE endpoint=? AND account=?"
+            " AND (status='unknown' OR (status='accepted' AND entity <> '' AND entity=?)) LIMIT 1",
+            (endpoint, ADDR.lower(), "99"),
+        ).fetchone()
+    assert blocker == ("K1",)
+
+
 def test_unversioned_database_migrates_and_uses_key_time():
     path = storage.directory() / "intents.sqlite3"
     old = sqlite3.connect(path)

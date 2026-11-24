@@ -38,18 +38,20 @@ import threading
 import time
 import tomllib
 from collections.abc import Callable, Generator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
 import httpx
 
+from .. import mcp_install
 from . import log, update
+from .errors import ExitCode
 
-EXIT_OK = 0
-EXIT_FAILED = 1
+EXIT_OK = ExitCode.OK
+EXIT_FAILED = ExitCode.ERROR
 # The install is one `sai update` does not change.
-EXIT_UNSUPPORTED = 3
+EXIT_UNSUPPORTED = ExitCode.UNSUPPORTED
 
 MAX_WHEEL = 64 << 20
 MAX_SUMS = 1 << 16
@@ -80,6 +82,12 @@ FAILED = "failed"
 UNSUPPORTED = "unsupported"
 NO_RELEASE = "no-release"
 BUSY = "busy"
+
+MCP_NOTES = {
+    "background": "Background updates check user MCP registrations. Run `sai doctor` in each project to check project registrations.",
+    "cwd-missing": "The working directory is gone. Run `sai doctor` in a project to check its MCP registrations.",
+    "failed": "Could not check MCP registrations. Run `sai doctor` for details.",
+}
 
 # Runs a command and returns its exit code and its combined output.
 Runner = Callable[[Sequence[str], float], tuple[int, str]]
@@ -140,13 +148,14 @@ def write_state(changes: dict[str, Any], path: Path | None = None) -> None:
     update.write_json(target, state)
 
 
-def save_state(changes: dict[str, Any]) -> bool:
+def save_state(changes: dict[str, Any], path: Path | None = None) -> bool:
     """Take the state lock and merge CHANGES into update.json. Return False
     when the lock or the file could not be had; state is best effort."""
     try:
-        with locked(wait=STATE_WAIT) as held:
+        lock_path = path.with_name("update.lock") if path is not None else None
+        with locked(lock_path, wait=STATE_WAIT) as held:
             if held:
-                write_state(changes)
+                write_state(changes, path)
             return held
     except OSError:
         return False
@@ -560,21 +569,59 @@ class Outcome:
     installed: str | None = None
     target: str | None = None
     rolled_back: bool = False
+    mcp: tuple[mcp_install.RegistrationCheck, ...] = ()
+    mcp_notes: tuple[str, ...] = ()
 
     @property
-    def exit_code(self) -> int:
+    def exit_code(self) -> ExitCode:
         if self.status == UNSUPPORTED:
             return EXIT_UNSUPPORTED
         return EXIT_FAILED if self.status == FAILED else EXIT_OK
 
     def to_json(self) -> dict[str, Any]:
-        return {
+        result = {
             "status": self.status,
             "message": self.message,
             "installed": self.installed,
             "target": self.target,
             "rolledBack": self.rolled_back,
         }
+        if self.mcp:
+            result["mcp"] = self.mcp_results()
+        if self.mcp_notes:
+            result["mcpNotes"] = [MCP_NOTES[note] for note in self.mcp_notes]
+        return result
+
+    def mcp_results(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "client": check.client,
+                "status": check.status,
+                "changes": list(check.changes),
+                **({"pinned": True} if check.pinned else {}),
+                **(
+                    {
+                        "manualRepairs": [
+                            {
+                                "scope": repair.scope,
+                                "name": repair.name,
+                                **({"resetArgs": True} if repair.reset_args else {}),
+                            }
+                            for repair in check.manual_repairs
+                        ],
+                        "fix": check.fix,
+                    }
+                    if check.manual_repairs
+                    else {}
+                ),
+                **(
+                    {"legacyName": mcp_install.RETIRED_NAME}
+                    if check.legacy_name
+                    else {}
+                ),
+            }
+            for check in self.mcp
+        ]
 
 
 @dataclass(frozen=True)
@@ -605,7 +652,9 @@ class Options:
     download_timeout: float = DOWNLOAD_TIMEOUT
 
 
-def _record(outcome: Outcome, before: str | None, seen: bool) -> None:
+def _record(
+    outcome: Outcome, before: str | None, seen: bool, path: Path | None = None
+) -> None:
     """Save OUTCOME as the last update attempt.
 
     SEEN says the person watched this run, so no notice repeats it later.
@@ -618,10 +667,14 @@ def _record(outcome: Outcome, before: str | None, seen: bool) -> None:
         "error": outcome.message if outcome.status == FAILED else None,
         "rolledBack": outcome.rolled_back,
     }
+    if outcome.mcp:
+        result["mcp"] = outcome.mcp_results()
+    if outcome.mcp_notes:
+        result["mcpNotes"] = list(outcome.mcp_notes)
     changes: dict[str, Any] = {"result": result}
     if seen:
         changes["notified"] = f"{outcome.status}:{outcome.target}"
-    save_state(changes)
+    save_state(changes, path)
 
 
 def _resolve(options: Options) -> update.Release | None:
@@ -1025,6 +1078,9 @@ def update_now(options: Options | None = None) -> Outcome:
         clear_snapshots(prefix)
         # The cache lock comes second, always after the tool lock, and is
         # held until the install is verified or rolled back.
+        # Capture the absolute state path while a relative SAI_HOME can
+        # still be resolved, even if the working directory goes away.
+        state_path = update.cache_path()
         with locked(cache_lock_path(), wait) as cache_held:
             if not cache_held:
                 message = (
@@ -1034,13 +1090,135 @@ def update_now(options: Options | None = None) -> Outcome:
                 status = BUSY if options.background else FAILED
                 return Outcome(status, message, installed, target)
             outcome, interrupted = _install(options, current, release, uv)
-        _record(outcome, installed, seen)
+        try:
+            if outcome.status == UPDATED:
+                outcome = repair_after_update(
+                    outcome, current.launcher, options.background
+                )
+        finally:
+            _record(outcome, installed, seen, state_path)
         if interrupted:
             raise KeyboardInterrupt
         return outcome
 
 
+def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> Outcome:
+    """Keep registration errors separate from the verified install outcome."""
+    notes: list[str] = []
+    cwd = None
+    if background:
+        notes.append("background")
+    else:
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            notes.append("cwd-missing")
+    checks: list[mcp_install.RegistrationCheck] = []
+    try:
+        target = mcp_install.launcher_target(str(launcher), {})
+        checks = mcp_install.check_registrations(target, fix=True, cwd=cwd)
+    except Exception:  # noqa: BLE001 - the installation has already succeeded
+        notes.append("failed")
+    outcome = replace(
+        outcome,
+        mcp=tuple(
+            check
+            for check in checks
+            if check.status in ("fixed", "fail") or check.pinned or check.legacy_name
+        ),
+        mcp_notes=tuple(notes),
+    )
+    if outcome.mcp or notes:
+        level = (
+            "warn"
+            if "failed" in notes
+            or any(c.status in ("warn", "fail") for c in outcome.mcp)
+            else "info"
+        )
+        log.event(
+            "update.mcp_repair",
+            level,
+            background=background,
+            clients=outcome.mcp_results(),
+            notes=notes,
+        )
+    return outcome
+
+
 # Automatic updates
+
+
+def mcp_notice(results: Any, notes: Any = None) -> str:
+    """Summarize this update's repairs using only known client names."""
+    repaired, failed, pinned, legacy = [], [], [], []
+    claude_manual: list[mcp_install.ClaudeRepair] = []
+    old_claude_notice = False
+    for entry in results if isinstance(results, list) else []:
+        if (
+            not isinstance(entry, dict)
+            or entry.get("client") not in mcp_install.CLIENTS
+        ):
+            continue
+        if entry.get("status") == "fixed" or (
+            entry.get("status") == "warn" and entry.get("changes")
+        ):
+            repaired.append(entry["client"])
+        manual = entry.get("manualRepairs")
+        if entry["client"] == "claude" and isinstance(manual, list):
+            claude_manual.extend(
+                mcp_install.ClaudeRepair(
+                    repair["scope"], repair["name"], repair.get("resetArgs") is True
+                )
+                for repair in manual
+                if isinstance(repair, dict)
+                and repair.get("scope") in mcp_install.UNINSTALL_SCOPES
+                and repair.get("name") in mcp_install.SERVER_NAMES
+            )
+        if entry.get("status") == "fail" and not manual:
+            failed.append(entry["client"])
+        keeps_name = entry.get("legacyName") == mcp_install.RETIRED_NAME
+        if keeps_name:
+            legacy.append(entry["client"])
+        old_blocked = (
+            entry.get("client") == "claude" and entry.get("policyBlocked") is True
+        )
+        old_claude_notice |= old_blocked
+        # Older update records used warn exclusively for a pinned launcher.
+        if entry.get("pinned") is True or (
+            entry.get("status") == "warn" and not keeps_name and not old_blocked
+        ):
+            pinned.append(entry["client"])
+    messages = []
+    if repaired:
+        messages.append(f"Repaired Sai MCP registrations for {', '.join(repaired)}.")
+    if failed:
+        messages.append(
+            f"Sai MCP registrations need attention for {', '.join(failed)}."
+            " Run `sai doctor` for details."
+        )
+    if pinned:
+        messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
+    if claude_manual:
+        messages.append(
+            "Claude Code MCP registrations need manual repair. "
+            + mcp_install.claude_repair_hint(tuple(claude_manual))
+        )
+    elif old_claude_notice:
+        messages.append(
+            "Claude Code MCP registrations need manual repair. Run `sai doctor` for the repair command."
+        )
+    if legacy:
+        messages.append(
+            f"Sai MCP kept the existing {mcp_install.RETIRED_NAME} name"
+            f" for {', '.join(legacy)}."
+        )
+    if isinstance(notes, (list, tuple)):
+        messages.extend(
+            MCP_NOTES[note]
+            for note in notes
+            if isinstance(note, str) and note in MCP_NOTES
+        )
+    return " ".join(messages)
 
 
 def notice(state: dict[str, Any], installed: str | None) -> tuple[str, str] | None:
@@ -1058,8 +1236,13 @@ def notice(state: dict[str, Any], installed: str | None) -> tuple[str, str] | No
     if state.get("notified") == key:
         return None
     if status == UPDATED:
-        return key, (
+        message = (
             f"sai updated itself to {target}. Restart agent clients so they load it."
+        )
+        return key, " ".join(
+            filter(
+                None, [message, mcp_notice(result.get("mcp"), result.get("mcpNotes"))]
+            )
         )
     if installed is not None and not update.is_newer(update.tag_for(target), installed):
         return None

@@ -71,6 +71,8 @@ def preview_or_submit(
     dry_run: bool,
     before_submit: SubmitCheck = _accept,
     estimate: Estimate | None = None,
+    *,
+    allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
     """Return the dry-run preview of PAYLOAD, or check and submit it."""
     preview = {"dryRun": True, "intent": payload}
@@ -80,7 +82,9 @@ def preview_or_submit(
         return preview
     active = get_session()
     _checked(before_submit, preview, estimate)
-    return intents.submit(endpoint, active, payload)
+    return intents.submit(
+        endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
+    )
 
 
 def open_usdc_market(
@@ -120,6 +124,7 @@ def open_trade(
     mcp_market: bool = False,
     notify: Notify = _ignore,
     before_submit: SubmitCheck = _accept,
+    allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
     """Open a market, limit, or stop trade.
 
@@ -165,7 +170,13 @@ def open_trade(
 
     if order_type != "market":
         return preview_or_submit(
-            endpoint, get_session, payload, dry_run, before_submit, estimate
+            endpoint,
+            get_session,
+            payload,
+            dry_run,
+            before_submit,
+            estimate,
+            allow_concurrent_open=allow_concurrent_open,
         )
     if dry_run:
         if mcp_market:
@@ -203,7 +214,9 @@ def open_trade(
         },
         estimate,
     )
-    result = intents.submit(endpoint, active, payload)
+    result = intents.submit(
+        endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
+    )
     result["referencePrice"] = current_price
     return result
 

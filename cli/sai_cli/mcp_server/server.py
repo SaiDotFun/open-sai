@@ -19,19 +19,27 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import partial
+from threading import BoundedSemaphore
 from typing import Any, Literal
 
+from anyio import BrokenResourceError
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
-from pydantic import ConfigDict
+from pydantic import ConfigDict, ValidationError
 
 from ..core import log as sai_log
+from ..core import log_queries
 from ..core import settings as sai_settings
+from ..core.errors import Code, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
 
 log = logging.getLogger("sai_cli.mcp_server")
+BAD_SETTINGS = "BAD_SETTINGS"  # Legacy MCP result code.
 
 INSTRUCTIONS = """\
 Sai perpetuals trading on Nibiru through Sai Keeper.
@@ -55,9 +63,9 @@ executed. Use intent_status with the intent key to follow it.
 - If a trade returns code OUTCOME_UNKNOWN, call intent_status with its \
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
-retrying. trade_open refuses with RECENT_OPEN_PENDING while a recent open \
-is unknown or accepted; check those intents with intent_status, and pass \
-allow_concurrent_open=true only if the user wants another open position.
+retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
+Wait for a final outcome on pending fills. For recent accepted opens, use \
+allow_concurrent_open=true only after the user confirms another position.
 - The user can connect several accounts; one is active. auth_list shows \
 them. Preview and trade tools act on the active account unless given \
 addr, which must be a connected account. Every preview and trade names \
@@ -117,7 +125,7 @@ async def call(action: Callable[..., Any], /, *args: Any, **kwargs: Any) -> str:
     try:
         config = server_settings()
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     return await asyncio.to_thread(tools.run, partial(action, config, *args, **kwargs))
 
 
@@ -202,7 +210,8 @@ async def account_balances(addr: str | None = None) -> str:
 async def intent_local(addr: str | None = None) -> str:
     """List intents this machine recorded, with their local status.
 
-    Status `unknown` blocks new trades until intent_status reconciles it.
+    Statuses `unknown` and `pending` block new trades until intent_status
+    reconciles them.
     The result names the `addr` read and its `addrSource`.
 
     Args:
@@ -215,11 +224,9 @@ async def intent_local(addr: str | None = None) -> str:
 async def intent_status(addr: str | None = None, key: str | None = None) -> str:
     """Read Keeper's latest intent records; with KEY, reconcile that intent.
 
-    With KEY this also writes: it updates this machine's local intent cache,
-    the record intent_local lists and trades check. It never changes
-    anything on Keeper. Reconciling updates only the local record: a server failure or matched
-    trade history is final, a server acceptance is accepted, and a key
-    Keeper never recorded past its admission window stops blocking trades.
+    The account list records pending observations in the local ledger.
+    With KEY this also checks for a final outcome. If the result includes
+    outcome `pending`, follow its hint and check the same key again.
 
     Args:
         addr: EVM addr (0x...). Defaults to the signed-in account,
@@ -227,6 +234,49 @@ async def intent_status(addr: str | None = None, key: str | None = None) -> str:
         key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
     """
     return await call(tools.intent_status, addr, key)
+
+
+LOG_WORKERS = 2
+_log_slots = BoundedSemaphore(LOG_WORKERS)
+_log_executor = ThreadPoolExecutor(
+    max_workers=LOG_WORKERS, thread_name_prefix="sai-logs"
+)
+
+
+async def logs_intent(
+    key: str, offline: bool = False, addr: str | None = None, before: str | None = None
+) -> str:
+    """Read one intent's local log trail and current Keeper record.
+
+    Args:
+        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
+        offline: Read local logs only.
+        addr: EVM address to select if the trail has several accounts.
+        before: UTC timestamp from a truncated report's nextBefore field.
+    """
+    try:
+        endpoint = None if offline else server_settings().endpoint
+    except sai_settings.SettingsError:
+        return json.dumps(tools.error("Could not read Sai settings.", BAD_SETTINGS))
+    if not _log_slots.acquire(blocking=False):
+        return json.dumps(
+            tools.error("Log queries are busy. Retry shortly.", Code.INTERNAL_ERROR)
+        )
+    action = partial(
+        log_queries.intent, key, endpoint=endpoint, addr=addr, before=before
+    )
+    context = copy_context()
+
+    def execute() -> str:
+        return context.run(tools.run, action)
+
+    try:
+        future = _log_executor.submit(execute)
+    except RuntimeError:
+        _log_slots.release()
+        raise
+    future.add_done_callback(lambda _future: _log_slots.release())
+    return await asyncio.wrap_future(future)
 
 
 # Previews and trades share one implementation per action.
@@ -306,9 +356,8 @@ async def trade_open(
     from the confirmed preview, and, for a market order, PRICE_MOVED when
     Keeper's current price moved from reference_price by more than the
     slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an open for this account from the last few
-    minutes is still unknown or accepted: call intent_local and
-    intent_status before retrying.
+    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or
+    pending. Check its key with intent_status before retrying.
 
     Args:
         market_id: Market id from market_list.
@@ -324,10 +373,11 @@ async def trade_open(
         preview_digest: previewDigest from the confirmed preview_open.
         reference_price: referencePrice from the confirmed preview_open;
             required for market orders only.
-        allow_concurrent_open: True to submit despite a recent pending
-            open, only after intent_status shows it and the user confirms
-            they want another position. An intent still `unknown` blocks
-            every trade until intent_status reconciles it.
+        allow_concurrent_open: True to submit while an earlier open is unknown
+            or accepted, after checking its status and getting confirmation for
+            another position. Any locally pending open on the same account and
+            Keeper still blocks submission, including a late acknowledgement
+            or an outcome that is still waiting to be indexed.
         addr: Connected account to act as (0x...). Defaults to the
             active account.
     """
@@ -653,6 +703,7 @@ READ_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
     (preview_leverage, read_only("Preview Leverage")),
     (preview_margin, read_only("Preview Margin Change")),
     (preview_partial_close, read_only("Preview Partial Close")),
+    (logs_intent, read_only("Intent Log Trail")),
 )
 
 TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
@@ -698,11 +749,14 @@ class SaiMCP(FastMCP):
                 # first line is kept, as untrusted text, and nothing for an
                 # unknown tool, whose message is the name the client sent.
                 first = str(exc).partition("\n")[0] if known is not None else None
+                cause = exc.__cause__
+                failure = describe(cause if isinstance(cause, Exception) else exc)
                 sai_log.event(
                     "mcp.tool_result",
                     "error",
                     ok=False,
-                    code="TOOL_ERROR",
+                    code=Code.INVALID_REQUEST if known is None else failure.code,
+                    intentKey=failure.intent_key,
                     errorType=type(exc).__name__,
                     error=sai_log.untrusted(first),
                     durationMs=round((time.monotonic() - started) * 1000),
@@ -718,7 +772,13 @@ class SaiMCP(FastMCP):
                 "mcp.tool_result",
                 "info" if summary["ok"] else "warn",
                 durationMs=round((time.monotonic() - started) * 1000),
-                **summary,
+                ok=summary["ok"],
+                code=summary.get("code"),
+                error=summary.get("error"),
+                account=summary.get("account"),
+                status=summary.get("status"),
+                intentKey=summary.get("intentKey"),
+                previewDigest=summary.get("previewDigest"),
             )
             return result
 
@@ -738,6 +798,8 @@ class SaiMCP(FastMCP):
             if tool is None:
                 return None, len(given)
             names = tool.parameters.get("properties", {})
+            if name == "logs_intent":
+                return {}, sum(key not in names for key in given)
             known = {key: loggable_value(given[key]) for key in names if key in given}
             return known, len(given) - len(known)
         except Exception:  # noqa: BLE001 - logging must not fail a call
@@ -759,7 +821,31 @@ class SaiMCP(FastMCP):
                 ]
                 result = (content, {"result": refusal})
                 return result  # ty: ignore[invalid-explicit-return]
-        return await super().call_tool(name, arguments)
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            cause = exc.__cause__
+            if name != "logs_intent" or not isinstance(cause, ValidationError):
+                raise
+            # SDK validation renders the rejected input in its exception.
+            # Use known fields and type names only, including for extra keys.
+            types = {
+                "key": "a string",
+                "offline": "a boolean",
+                "addr": "a string or null",
+                "before": "a string or null",
+            }
+            detail = cause.errors(
+                include_input=False, include_context=False, include_url=False
+            )[0]
+            field = detail["loc"][0] if detail["loc"] else None
+            expected = types.get(field) if isinstance(field, str) else None
+            if expected is not None:
+                message = f"Argument '{field}' must be {expected}."
+            else:
+                accepted = ", ".join(f"'{key}' ({kind})" for key, kind in types.items())
+                message = f"Expected audit arguments {accepted}."
+            raise ToolError(message) from SaiError(message, Code.INVALID_REQUEST)
 
 
 def loggable_value(value: Any) -> Any:
@@ -810,10 +896,16 @@ def result_summary(text: str | None) -> dict[str, Any]:
     for name in RESULT_FIELDS:
         if isinstance(value.get(name), str):
             summary[name] = sai_log.Arg(value[name])
-        elif isinstance(value.get(name), (bool, int, float)):
-            summary[name] = value[name]
     if isinstance(summary.get("error"), str):
         summary["error"] = sai_log.untrusted(summary["error"])
+    if not summary["ok"]:
+        if summary.get("code") == BAD_SETTINGS:
+            summary["code"] = Code.INVALID_REQUEST
+        else:
+            try:
+                summary["code"] = Code(summary.get("code"))
+            except ValueError:
+                summary["code"] = Code.INTERNAL_ERROR
     account = value.get("account", value.get("addr"))
     if isinstance(account, str):
         summary["account"] = sai_log.Arg(account)
@@ -826,7 +918,7 @@ def session_refusal(addr: str | None = None) -> str | None:
     try:
         tools.require_session(server_settings(), addr)
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     except tools.SessionUnavailable as exc:
         return json.dumps(tools.describe(exc))
     return None
@@ -921,7 +1013,7 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
     try:
         settings = sai_settings.load(flags, warn=log.warning)
     except sai_settings.SettingsError as exc:
-        raise SystemExit(f"sai mcp serve: {exc}") from None
+        raise SaiError(f"sai mcp serve: {exc}", Code.INVALID_REQUEST) from exc
     with sai_log.bind(surface="mcp"):
         sai_log.event(
             "mcp.server_start",
@@ -929,4 +1021,10 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             websocket=sai_log.endpoint(settings.ws_endpoint),
             lcd=sai_log.endpoint(settings.lcd_endpoint),
         )
-        create_server(settings).run()
+        server = create_server(settings)
+        try:
+            server.run()
+        except* (KeyboardInterrupt, BrokenPipeError, BrokenResourceError):
+            pass
+        except* Exception as exc:
+            raise McpStdioError("Sai MCP stdio session failed") from exc

@@ -1,0 +1,584 @@
+{
+  "address": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "key": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+  "recorded": {
+    "server_finality": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_finality_observed",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 49819075,
+            "execBlockTs": "2026-11-18T02:28:28.082Z",
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "user_finality": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_finality_observed",
+            "execActor": "user",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "execBlock": 44814933,
+            "execBlockTs": "2026-08-21T21:59:17.294Z",
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "user_rejected": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "sign_reject",
+            "execActor": "user",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": "wallet_rejected",
+            "errorMsg": "User rejected the wallet transaction",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "user_sign_failed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "sign_failed",
+            "execActor": "user",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": "intent_validation_failed",
+            "errorMsg": "payment amount invalid: cannot be zero: 0",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "user_submitted": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_req_pass",
+            "execActor": "user",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "open_history": {
+      "data": {
+        "perp": {
+          "tradeHistory": [
+            {
+              "id": 1007,
+              "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+              "tradeChangeType": "position_opened",
+              "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+              "evmTxHash": null,
+              "block": {
+                "block": 49819075,
+                "block_ts": "2026-11-18T02:28:28.082149Z"
+              },
+              "trade": {
+                "id": 7,
+                "trader": "nibi1424242424242424242424242424242422mldj0"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "other_trade_finality": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "CANCEL_PENDING_TRADE",
+            "lifecycleStep": "exec_finality_observed",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 49546789,
+            "execBlockTs": "2026-11-13T05:31:28.136Z",
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "other_trade_history": {
+      "data": {
+        "perp": {
+          "tradeHistory": [
+            {
+              "id": 1008,
+              "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+              "tradeChangeType": "order_closed_user",
+              "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+              "evmTxHash": null,
+              "block": {
+                "block": 49546789,
+                "block_ts": "2026-11-13T05:31:28.136036Z"
+              },
+              "trade": {
+                "id": 8,
+                "trader": "nibi1424242424242424242424242424242422mldj0"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "limit_placement_history": {
+      "data": {
+        "perp": {
+          "tradeHistory": [
+            {
+              "id": 1009,
+              "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+              "tradeChangeType": "limit_order_created",
+              "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+              "evmTxHash": null,
+              "block": {
+                "block": 49546780,
+                "block_ts": "2026-11-13T05:31:14.738045Z"
+              },
+              "trade": {
+                "id": 9,
+                "trader": "nibi1424242424242424242424242424242422mldj0"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "replays": {
+    "absent": {
+      "data": {
+        "userIntents": []
+      }
+    },
+    "started": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "intent_start",
+            "execActor": "user",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "jwt_failed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "jwt_failed",
+            "execActor": "user",
+            "evmAddress": null,
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": "authentication_failed",
+            "errorMsg": "Could not authenticate",
+            "nibiAddress": null
+          }
+        ]
+      }
+    },
+    "accepted": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "jwt_pass",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "submitted": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_req_pass",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "pending_exec": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "pending_exec",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109595,
+            "execBlockTs": "2026-11-20T15:43:30.000Z",
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "outcome_not_indexed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50110650,
+            "execBlockTs": "2026-11-20T16:04:31.000Z",
+            "errorCode": "market_order_outcome_not_indexed",
+            "errorMsg": "outcome_not_indexed",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "filled": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109596,
+            "execBlockTs": "2026-11-20T15:43:31.000Z",
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "not_yet_in_history": {
+      "data": {
+        "perp": {
+          "tradeHistory": [
+            {
+              "id": 1007,
+              "intentKey": "unrelated",
+              "tradeChangeType": "position_opened",
+              "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+              "evmTxHash": null,
+              "block": {
+                "block": 50109596,
+                "block_ts": "2026-11-20T15:43:31.000Z"
+              },
+              "trade": {
+                "id": 7,
+                "trader": "nibi1424242424242424242424242424242422mldj0"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "filled_history": {
+      "data": {
+        "perp": {
+          "tradeHistory": [
+            {
+              "id": 1007,
+              "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+              "tradeChangeType": "position_opened",
+              "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+              "evmTxHash": null,
+              "block": {
+                "block": 50109596,
+                "block_ts": "2026-11-20T15:43:31.000Z"
+              },
+              "trade": {
+                "id": 7,
+                "trader": "nibi1424242424242424242424242424242422mldj0"
+              }
+            }
+          ]
+        }
+      }
+    },
+    "chain_execution_failed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109596,
+            "execBlockTs": "2026-11-20T15:43:31.000Z",
+            "errorCode": "chain_execution_failed",
+            "errorMsg": "Perp rejected the request transaction",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "other_trade_executed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "CANCEL_PENDING_TRADE",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 49546789,
+            "execBlockTs": "2026-11-13T05:31:28.136Z",
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "market_order_expired": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109596,
+            "execBlockTs": "2026-11-20T15:43:31.000Z",
+            "errorCode": "market_order_expired",
+            "errorMsg": "expired",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "market_order_fill_failed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109596,
+            "execBlockTs": "2026-11-20T15:43:31.000Z",
+            "errorCode": "market_order_fill_failed",
+            "errorMsg": "fill_failed",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "market_order_trading_paused": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109596,
+            "execBlockTs": "2026-11-20T15:43:31.000Z",
+            "errorCode": "market_order_trading_paused",
+            "errorMsg": "trading_paused",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "market_order_market_closed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109596,
+            "execBlockTs": "2026-11-20T15:43:31.000Z",
+            "errorCode": "market_order_market_closed",
+            "errorMsg": "market_closed",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "market_order_trade_not_open": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 50109596,
+            "execBlockTs": "2026-11-20T15:43:31.000Z",
+            "errorCode": "market_order_trade_not_open",
+            "errorMsg": "trade_not_open",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "simulation_failed": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_req_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": "simulation_failed",
+            "errorMsg": "simulation_failed",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "admission_expired": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_req_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": "admission_expired",
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "broadcast_rejected": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_req_fail",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": null,
+            "execBlock": null,
+            "execBlockTs": null,
+            "errorCode": "broadcast_rejected",
+            "errorMsg": "broadcast_rejected",
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    },
+    "limit_placement_exec_pass": {
+      "data": {
+        "userIntents": [
+          {
+            "intentKey": "20261118T022825100Z_ABCDEFGHJKMNPQRS",
+            "kind": "OPEN_TRADE",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "evmAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "txHash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "execBlock": 49546780,
+            "execBlockTs": "2026-11-13T05:31:14.738Z",
+            "errorCode": null,
+            "errorMsg": null,
+            "nibiAddress": "nibi1424242424242424242424242424242422mldj0"
+          }
+        ]
+      }
+    }
+  }
+}

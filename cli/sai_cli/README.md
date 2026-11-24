@@ -85,9 +85,12 @@ before changing anything, when uv's current tool or executable directory is
 not where this `sai` is installed, or when the `sai` on your `PATH` now
 belongs to another install.
 
-The update does not move `~/.local/bin/sai` or change anything else under
-`$SAI_HOME`, so MCP registrations keep working. A running `sai mcp serve`
-keeps the old code until its client restarts; `mcp_info` reports
+The update keeps the path to `~/.local/bin/sai` stable. After verifying the
+install, it checks MCP registrations and can repair stale Codex and Cursor
+launchers. For stale Claude Code registrations, it prints an explicit repair
+command. Background updates include that command in the next update notice
+for any stale user registration they find. A running `sai mcp serve` keeps
+the old code until its client restarts. The `mcp_info` tool reports
 `restartNeeded`.
 
 With `update.auto` on, which is the default, sai also updates by itself. A
@@ -328,26 +331,73 @@ marks it `absent` and trading resumes. A connection that fails before the
 request is sent marks the intent `not_sent`, which does not block. Keeper
 admission does not establish execution or finality.
 
-`sai doctor` checks the install, the version, `$SAI_HOME/trader`,
-`$SAI_HOME/logs`, the session, the intent ledger, and the Keeper HTTP,
-WebSocket, and LCD endpoints, and fixes what it safely can. It creates
+`sai doctor` checks the install, the version, config, MCP registrations,
+`$SAI_HOME/trader`, `$SAI_HOME/logs`, the session, the intent ledger, and
+the Keeper HTTP, WebSocket, and LCD endpoints. It creates
 `$SAI_HOME/trader`, removes group and other access from it and the files sai
 keeps there (the connected accounts, the ledger and its journals, and the
 shell history) and from the logs directory and its log files, migrates the
 intent ledger, and reconciles
-unknown intents for the signed-in account the way `sai intent status` does
+unknown and pending intents for the signed-in account the way `sai intent status` does
 (a Keeper read; it never places or cancels a trade). It never deletes or
 rewrites the session, never writes through a symlink in `$SAI_HOME/trader`,
 and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
 
+Doctor can repair stale Codex and Cursor launchers. It prints a repair command
+for each stale Claude Code launcher, such as
+`sai mcp install --client claude --scope user --repair-existing sai`.
+Use the name and scope in the command doctor prints. Run project and local
+repairs from the directory doctor checked. The command preserves the
+registration's environment and compatible server arguments. If the command
+includes `--reset-args`, it uses default server arguments.
+
 Each check prints pass, fixed, warn, fail, or skipped, with what changed or
-the command that fixes it. Doctor exits 1 if any check still fails;
-`sai --json doctor` prints the same report as JSON. `--no-fix` reports
-without changing anything, log lines included, and `--offline` skips the network checks, which
+the command that fixes it. `sai --json doctor` prints a structured report on
+success. If a check fails, doctor exits 1 and the JSON error message lists the
+failed checks and their fixes. `--no-fix` reports without changing anything,
+log lines included, and `--offline` skips the network checks, which
 otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 `--lcd-endpoint` override them for one run.
+
+## Errors and Exit Codes
+
+Put `--json` before the command to read errors on stdout. A failed command
+writes one JSON object with `error.code`, `error.message`, and
+`error.retryable`. The error includes `intentKey` when it refers to a
+recorded intent and `hint` when a command can help. Failed doctor checks and
+MCP registration commands include their structured reports in
+`error.details`. The registration report includes `changed` per client and
+the aggregate `reconnectNeeded` flag. If a stream such as `watch` has already
+emitted JSON lines, the error object is its final line. Once `sai mcp serve`
+starts the stdio transport, stdout carries MCP protocol traffic. Without
+`--json`, error text goes to stderr.
+
+| Exit | Meaning | What to Do |
+| --- | --- | --- |
+| 0 | Success | Read the result. |
+| 1 | Other failure | Read `error.code` and the message before deciding what to do. |
+| 2 | Command usage error | Check the command's `--help`. |
+| 3 | Unsupported install or environment | Follow the error's installation or terminal instructions. |
+| 4 | Request rejected or never sent | The request executed nothing. Review the error before retrying. |
+| 5 | Outcome unknown | Keep the intent key and reconcile it. Do not resubmit. |
+| 6 | Signed out or session expired | Sign in with `sai auth login NAME` or `sai auth import`. |
+
+`ADMISSION_REJECTED` and `NOT_SENT` have exit 4 and `retryable: true`.
+`OUTCOME_UNKNOWN` has exit 5 and `retryable: false`. The reconciliation
+and sign-in hints pin the original Keeper endpoint. For URLs that may
+contain credentials, including custom gateway paths, set
+`SAI_RECONCILE_ENDPOINT` to the original URL before running the hint.
+Exit 6 covers `SIGNED_OUT` and
+`SESSION_EXPIRED`. `SESSION_UNAVAILABLE` has exit 1 and describes a local
+session the command could not use, for example one for another Keeper
+endpoint.
+
+The CLI, MCP tools, and failure logs share codes. MCP tool errors have
+top-level `error` and `code` fields. The `command.end` event includes the
+CLI process's numeric `exitCode`. The `mcp.tool_result` event carries the
+symbolic `code` on failures. Each MCP call returns within the same process.
 
 ## Agent Skill
 
@@ -394,67 +444,83 @@ day: `cli-YYYY-MM-DD.jsonl`, `mcp-YYYY-MM-DD.jsonl` for `sai mcp serve`, and
 the files 0600.
 
 ```bash
-sai logs path                        # the directory
-sai logs tail                        # the last 20 events, oldest first
-sai logs tail -n 50 --surface mcp    # cli, mcp, or update
-sai logs tail --event keeper.request
-sai logs tail --event intent         # a prefix matches intent.reserved, intent.status, intent.keeper
-sai --json logs tail                 # the stored JSON objects, one per line
+sai logs path
+sai logs tail -n 50 --surface mcp
+sai logs tail --event intent
+sai logs intent KEY
+sai logs intent KEY --offline
+sai logs run ID
+sai logs stats --since 24h
+sai --json logs intent KEY
 ```
 
-Plain `tail` output is one line per event: UTC time, surface, level, event,
-then `key=value` fields. `sai --json logs path` returns `{"dir", "enabled",
-"keepDays", "files"}`.
+The `intent` command joins a key's events for one EVM account and Keeper
+endpoint to other events from the same CLI invocation or MCP call. A REPL
+process gives each command its own `commandId`. The `run` command accepts
+a process `runId` or a single MCP `callId`. Both order events by timestamp
+and sequence. They report `log.dropped` notices separately because those
+notices cover whole processes. An intent report also includes an
+`unattributedGapCount` and up to eight `unattributedGaps` where a notice
+cannot be tied to the key. Lost events can include the original match.
 
-Every line has these fields:
+The `intent` command reads Keeper's current record and returns the request
+transaction hash when available. The configured Keeper endpoint selects the
+trail. The endpoint identity uses a local key to hash the full request URL,
+including its path and query. The printed `endpoint` field shows the origin.
+Use the root `--as` flag to select an account. The command's `--addr` flag
+takes precedence when both are present. Use `--offline` to skip Keeper.
+If the local trail has several endpoint
+identities, pass a root `--endpoint` flag to select one offline. The report
+warns when the scope is ambiguous or an older line lacks enough information
+to assign it. The read leaves the local intent ledger untouched.
 
-| Field     | Meaning                                                        |
-| --------- | -------------------------------------------------------------- |
-| `ts`      | UTC time with milliseconds, such as `2026-11-18T14:03:07.412Z` |
-| `level`   | `info`, `warn`, or `error`                                     |
-| `event`   | The event name, below                                          |
-| `surface` | `cli`, `mcp`, or `update`; also the file the line is in        |
-| `pid`     | Process id                                                     |
-| `version` | The `sai` version that wrote the line                          |
-| `runId`   | One id per process; it ties a command's lines together         |
-| `seq`     | The line's number within the run                               |
+The read-only MCP tool `logs_intent` accepts `offline`, `addr`, and
+`before`. It handles up to two log queries at a time and returns a busy
+error when both slots are occupied. Log reports omit stored arguments and
+free-text diagnostics. Keeper failures return a recognized code and a
+short Sai message. Request hashes use lowercase hex and retain an existing
+`0x` prefix. A malformed hash is omitted and sets `txHashInvalid` in the
+corresponding record or event.
 
-Lines written while a CLI command runs also carry `command`, such as `market
-prices`. Lines written during an MCP tool call carry `tool` and `callId`.
+The `stats` command uses the retained scan window by default. Pass a positive
+whole number followed by `s`, `m`, `h`, `d`, or `w` to limit the lookback.
+The p50 and p95 use the nearest rank for each Keeper operation. Error totals
+count each coded event, so a failure can count at more than one level.
 
-| Event              | When                                    | Fields                                                                                               |
-| ------------------ | --------------------------------------- | ---------------------------------------------------------------------------------------------------- |
-| `command.start`    | A CLI command starts                    | `command`, `argv`                                                                                    |
-| `command.end`      | It ends                                 | `exitCode`, `durationMs`, `error`                                                                    |
-| `mcp.server_start` | `sai mcp serve` starts                  | `keeper`, `websocket`, `lcd`                                                                         |
-| `mcp.tool_call`    | An agent calls a tool                   | `tool`, `callId`, `arguments`, `unknownArguments`                                                    |
-| `mcp.tool_result`  | The tool returns                        | `ok`, `code`, `error`, `errorType`, `account`, `status`, `intentKey`, `previewDigest`, `durationMs`  |
-| `keeper.request`   | Each Keeper GraphQL request             | `operation`, `endpoint`, `status`, `httpStatus`, `keeperErrors`, `error`, `addr`, `authenticated`, `durationMs` |
-| `intent.reserved`  | A trade intent gets its key             | `intentKey`, `kind`, `status`, `addr`, `tradeId`, `endpoint`                                         |
-| `intent.status`    | Its local status changes                | `intentKey`, `kind`, `previous`, `status`, `addr`, `endpoint`                                        |
-| `intent.keeper`    | Keeper reports its record of the intent | `intentKey`, `kind`, `lifecycleStep`, `execActor`, `errorCode`, `errorMsg`, `txHash`, `found`, `addr` |
-| `session.saved`    | Sign-in stores a session                | `addr`, `expiresAt`, `endpoint`, `connectedAccounts`                                                 |
-| `session.active`   | `auth use` switches account             | `addr`                                                                                               |
-| `session.removed`  | `auth logout` removes one               | `addr`, `connectedAccounts`                                                                          |
-| `session.expired`  | A command finds the session expired     | `addr`, `expiresAt`                                                                                  |
-| `doctor.result`    | `sai doctor` finishes                   | `overall`, `fix`, `offline`, `checks`                                                                |
-| `update.check`     | `sai update --check` finishes           | `ok`, `installed`, `latest`, `updateAvailable`, `installKind`, `error`                               |
-| `update.scheduled` | A command starts the daily background update | none                                                                                            |
-| `update.result`    | `sai update` or the background update finishes | `status`, `installed`, `target`, `rolledBack`, `background`, `message`                        |
-| `log.dropped`      | Events were lost because the disk was slow | `count`                                                                                           |
+Queries scan up to 128 files, 16 MiB, and 20,000 rows. Stats seek by UTC day
+and skip out-of-window rows before charging the row budget. The scan
+alternates surfaces within a day. Intent reports reserve part of the scan
+budget for finding command starts and anchors across midnight. A report contains
+up to 128 event or gap rows and uses a 96 KiB response budget. When
+`truncated` is true, use `nextBefore` with `--before` or the MCP `before`
+argument for earlier timestamps within the scan window. Use the files
+listed by `sai logs path` when the scan limit prevents reaching older rows
+or when events share the cutoff timestamp.
+
+Use `sai --json logs ...` for machine-readable output. The `intent` and
+`run` reports return arrays `events` and `gaps`. The intent report also
+returns `intentKey`, `keeper`, and `txHash`. A failed Keeper read adds
+`keeperError` alongside the local trail. The `stats` report maps operations
+to `count`, `p50Ms`, and `p95Ms` under `keeper`, with counts by code under
+`errors`. It also returns `gaps` and the UTC cutoff `since`, if set.
+The `tail` command prints stored JSON objects one per line.
 
 A `keeper.request` has `status` `ok`, `error`, `rejected` (Keeper refused
 admission), or `not_sent` (the connection failed first). Its `operation` is
 `markets`, `prices`, `positions`, `history`, `intents`, `submit`, and so on.
 To follow one trade, filter on its `intentKey`: `intent.reserved` (status
 `unknown`), then `keeper.request` with operation `submit`, then
-`intent.status` as it becomes `accepted`, `rejected`, `not_sent`, `terminal`,
-or `absent`, with `intent.keeper` lines for each time `intent status` asked
-Keeper.
+`intent.status` as it becomes `accepted`, `pending`, `rejected`, `not_sent`,
+`terminal`, or `absent`, with `intent.keeper` lines for each time
+`intent status` asked Keeper. An intent in `pending` blocks new trades for
+the account. [Keeper intent outcome mapping](core/intent-outcomes.md)
 
-The logs never hold the session token, a signature, clipboard text, request
-variables, or response data. sai passes none of these to the logger, and the
-logger also treats every string as untrusted:
+See the [log event schema](../../docs/log-events.md) for event names and
+field types. The `run` query and statistics also read older logs.
+
+Sai logs allowlisted fields such as the account, intent key, and request
+transaction hash. It omits session tokens, signatures, clipboard text, and
+Keeper request and response payloads. The logger also scrubs every string.
 
 - A URL anywhere, including in `argv` and `endpoint`, is cut to its scheme,
   host, and port, so an API key in a path or query is not written. In
@@ -472,6 +538,7 @@ logger also treats every string as untrusted:
 - `mcp.tool_call` logs only the parameters the tool defines.
   `unknownArguments` counts the rest, and a call to a tool the server does
   not have is logged as tool `unknown` with no arguments.
+  The `logs_intent` tool omits its arguments from the log.
 - Other strings are cut at 2000 characters, lists and objects at 64 items,
   and one event at 512 values and about 12,000 characters. A list or object
   passed where a tool takes a single value is logged as its type and length.
