@@ -689,7 +689,7 @@ def launcher_target(launcher: Path) -> Path | None:
         raise LookupFailed(
             f"{launcher} already exists. Update it through its installer"
         )
-    return launcher.resolve()
+    return launcher.parent / launcher.readlink()
 
 
 def uv_launcher(target: Path) -> bool:
@@ -731,17 +731,27 @@ def installed_directory(launcher: Path, root: Path) -> str | None:
     return directory
 
 
-def switch_launcher(launcher: Path, root: Path, directory: str | None) -> None:
+def switch_launcher(
+    launcher: Path, root: Path, directory: str | None, *, previous: str | None
+) -> None:
     if directory is None:
+        if installed_directory(launcher, root) != previous:
+            raise LookupFailed("the Sai launcher changed during the switch")
         launcher.unlink()
     else:
-        binary = native_binary(root, directory)
-        with tempfile.TemporaryDirectory(
-            dir=launcher.parent, prefix=".sai-link-"
-        ) as stage:
-            link = Path(stage) / "sai"
-            link.symlink_to(binary.relative_to(launcher.parent))
-            link.replace(launcher)
+        target = native_binary(root, directory).relative_to(launcher.parent)
+        if previous is None:
+            # symlink(2) atomically fails with EEXIST, including for a dangling link.
+            launcher.symlink_to(target)
+        else:
+            with tempfile.TemporaryDirectory(
+                dir=launcher.parent, prefix=".sai-link-"
+            ) as stage:
+                link = Path(stage) / "sai"
+                link.symlink_to(target)
+                if installed_directory(launcher, root) != previous:
+                    raise LookupFailed("the Sai launcher changed during the switch")
+                link.replace(launcher)
     sync_dir(launcher.parent)
 
 
@@ -764,7 +774,7 @@ def recover_native(launcher: Path, root: Path) -> str | None:
     if old is not None:
         native_binary(root, old)
     if active == new and old != new:
-        switch_launcher(launcher, root, old)
+        switch_launcher(launcher, root, old, previous=new)
     elif active != old:
         raise LookupFailed("the launcher changed during an interrupted Sai install")
     pending.unlink()
@@ -909,6 +919,8 @@ def install_native(args: argparse.Namespace) -> int:
     check_ancestors(launcher.parent, create=True)
     checked_directory(launcher.parent)
     with native_lock(launcher.parent / NATIVE_LOCK):
+        check_path(launcher)
+        installed_directory(launcher, root)
         checked_directory(root, private=True)
         old = recover_native(launcher, root)
         tag, version, asset = native_release(args)
@@ -941,9 +953,20 @@ def install_native(args: argparse.Namespace) -> int:
             try:
                 if installed_directory(launcher, root) != old:
                     raise LookupFailed("the Sai launcher changed during the install")
-                switch_launcher(launcher, root, new)
+                try:
+                    switch_launcher(launcher, root, new, previous=old)
+                except FileExistsError as error:
+                    if old is None:
+                        pending.unlink()
+                        sync_dir(root)
+                        raise LookupFailed(
+                            f"{launcher} was created by another installer"
+                        ) from error
+                    raise
                 smoke_native(launcher, Path(profile), version)
             except (LookupFailed, OSError, KeyboardInterrupt) as error:
+                if not pending.exists():
+                    raise
                 recover_native(launcher, root)
                 raise LookupFailed(
                     f"the installed launcher failed verification and was rolled back: {error}"

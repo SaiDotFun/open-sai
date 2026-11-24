@@ -317,6 +317,61 @@ def test_native_dry_run_selects_an_explicit_prerelease(
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_preserves_a_concurrent_launcher(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay)
+    # Publish a competing launcher at the syscall boundary, after all reads.
+    probe = """
+import os, runpy, sys
+from pathlib import Path
+script, destination, *args = sys.argv[1:]
+def race(event, values):
+    if event in ('os.rename', 'os.symlink') and os.fsdecode(values[1]) == destination:
+        try:
+            with Path(destination).open('x') as file:
+                file.write('another installer owns this launcher')
+        except FileExistsError:
+            pass
+sys.addaudithook(race)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert install.launcher.read_text() == "another installer owns this launcher"
+    assert not pending(install).exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_refuses_an_indirect_managed_target(
+    install: Install, replay: Replay
+) -> None:
+    root = install.launcher.parent / ".sai-native"
+    binary = root / ("0.1.2-" + "a" * 64) / "sai"
+    binary.parent.mkdir(mode=0o700, parents=True)
+    binary.write_text("#!/bin/sh\n")
+    binary.chmod(0o700)
+    alias = install.home / "external-alias"
+    alias.symlink_to(binary)
+    install.launcher.symlink_to(alias)
+    result = install.install(replay, "--native", "--dry-run")
+    assert result.returncode == 1 and "through its installer" in result.stderr
+    assert install.launcher.readlink() == alias
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 @pytest.mark.parametrize(
     "fault", ["wrong target", "digest", "duplicate manifest", "traversal"]
 )
