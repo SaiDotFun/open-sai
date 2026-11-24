@@ -5,6 +5,7 @@ use std::{
     ffi::OsStr,
     fs,
     io::{self, Read, Write},
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -359,8 +360,13 @@ impl Uv {
         allowed: impl Fn() -> bool,
     ) -> Change {
         let result = async {
-            let home = TempDir::new().map_err(io_error)?;
-            let trial = TempDir::new().map_err(io_error)?;
+            let permissions = fs::Permissions::from_mode(0o700);
+            let home = tempfile::Builder::new()
+                .permissions(permissions.clone())
+                .tempdir()
+                .map_err(io_error)?;
+            fs::set_permissions(home.path(), permissions).map_err(io_error)?;
+            let trial = TempDir::new_in(home.path()).map_err(io_error)?;
             let uv = find_uv()?;
             if let Err(reason) = self.check_destination(&uv, home.path()).await {
                 return Ok(Change::Unsupported(reason));

@@ -83,6 +83,26 @@ def run():
 """
 
 
+CACHE_SHIM = """
+from urllib.request import urlopen
+
+def main():
+    home = Path(os.environ["SAI_HOME"])
+    if home.stat().st_mode & 0o022:
+        return 8
+    cache = home / "bin" / "fixture-shim" / VERSION
+    cached = cache / "verified"
+    if not cached.exists():
+        base = os.environ["SAI_NATIVE_RELEASE_BASE"]
+        with urlopen(base + ARCHIVE_PATH, timeout=5) as response:
+            if not response.read():
+                return 7
+        cache.mkdir(parents=True, exist_ok=True)
+        cached.touch()
+    return run()
+"""
+
+
 def executable(version: str, *, fail: str = "", forward: bool = False) -> str:
     return f"VERSION = {version!r}\nFAIL = {fail!r}\nFORWARD = {forward!r}\n{MCP}"
 
@@ -105,15 +125,32 @@ def archive(version: str = NEW, *, fail: str = "", bad_entry: str = "") -> bytes
     return buffer.getvalue()
 
 
-def wheel(tmp: Path, version: str, *, fail: str = "", forward: bool = False) -> Path:
+def wheel(
+    tmp: Path,
+    version: str,
+    *,
+    fail: str = "",
+    forward: bool = False,
+    cached: bool = False,
+) -> Path:
     wheel_version = version.replace("-rc.", "rc")
     filename = f"sai_cli-{wheel_version}-py3-none-any.whl"
     name = f"sai_cli-{wheel_version}.dist-info"
+    script = executable(version, fail=fail, forward=forward)
+    entry = "run"
+    if cached:
+        entry = "main"
+        source = os.environ.get("SAI_PARITY_C10_SHIM")
+        if source:
+            script = Path(source).read_text(encoding="utf-8")
+        else:
+            route = asset_key(version, archive_name(version))
+            script += f"\nARCHIVE_PATH = {route!r}\n{CACHE_SHIM}"
     files = {
-        "fixture_sai.py": executable(version, fail=fail, forward=forward),
+        "fixture_sai.py": script,
         f"{name}/METADATA": f"Metadata-Version: 2.1\nName: sai-cli\nVersion: {wheel_version}\n",
         f"{name}/WHEEL": "Wheel-Version: 1.0\nRoot-Is-Purelib: true\nTag: py3-none-any\n",
-        f"{name}/entry_points.txt": "[console_scripts]\nsai = fixture_sai:run\n",
+        f"{name}/entry_points.txt": f"[console_scripts]\nsai = fixture_sai:{entry}\n",
     }
     files[f"{name}/RECORD"] = "".join(
         f"{path},,\n" for path in [*files, f"{name}/RECORD"]
@@ -202,7 +239,7 @@ class NativeInstall:
     installed: str
 
     def invoke(
-        self, *args: str, exe: Path | None = None, **overrides: str
+        self, *args: str, exe: Path | None = None, umask: int = -1, **overrides: str
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [exe or self.launcher, *args],
@@ -213,6 +250,7 @@ class NativeInstall:
             text=True,
             check=False,
             timeout=20,
+            umask=umask,
         )
 
     def update(
@@ -604,6 +642,32 @@ def uv_install(standalone: NativeInstall, tmp_path: Path) -> tuple[NativeInstall
     return NativeInstall(
         launcher, candidate, standalone.home, env, standalone.installed
     ), initial
+
+
+def cached_shim_release(
+    install: NativeInstall, initial: Path, tmp_path: Path
+) -> dict[str, bytes]:
+    replacement = wheel(tmp_path, NEW, cached=True)
+    wheel_assets = assets(NEW, replacement.name, replacement.read_bytes())
+    native_assets = assets(NEW, archive_name(), archive())
+    manifest = asset_key(NEW, "SHA256SUMS")
+    native_assets[manifest] += wheel_assets[manifest]
+    return {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **wheel_assets,
+        **native_assets,
+    }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_uv_trial_home_is_private_under_a_group_writable_umask(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    with releases(cached_shim_release(install, initial, tmp_path)) as server:
+        result = install.invoke("--json", "update", *server.args, umask=0o002)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert json.loads(result.stdout)["status"] == "updated"
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
