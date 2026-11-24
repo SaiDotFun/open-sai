@@ -718,6 +718,7 @@ class Install:
         self.diagnostics = diagnostics
         self.home = root / "home"
         self.sai_home = self.home / ".sai"
+        self.session_file = self.sai_home / "trader/sessions.json"
         bin_dir = self.home / ".local" / "bin"
         self.sai = bin_dir / "sai"
         self.uv = bin_dir / "uv"
@@ -832,19 +833,19 @@ class Install:
             "Candidate did not resolve the saved Keeper endpoint from the config file",
         )
 
-    def verify_session(self, original: dict[str, str]) -> None:
+    def verify_session(self, original: bytes, expected: dict[str, str]) -> None:
         require(
-            self.json("Read the stored session", "auth", "status") == original,
-            "The stored session changed",
+            self.session_file.is_file() and self.session_file.read_bytes() == original,
+            "The stored session file changed",
         )
         self.run(
-            "Read the stored synthetic token",
+            "Verify the stored session record",
             self.python,
             "-I",
             "-c",
-            "import sys; from sai_cli.core.storage import load_session; "
-            "sys.exit(load_session()['token'] != sys.stdin.read())",
-            input_text=SYNTHETIC_TOKEN,
+            "import json, sys; from sai_cli.core.storage import load_session; "
+            "sys.exit(load_session() != json.load(sys.stdin))",
+            input_text=json.dumps(expected),
         )
 
     def verify_mcp(self, version: str) -> None:
@@ -1154,6 +1155,12 @@ def rehearse_staged(
             "Configure loopback Keeper", "config", "set", "keeper.endpoint", endpoint
         )
         tool.json("Disable auto-update", "config", "set", "update.auto", "false")
+        session_record = {
+            "evmAddress": replay.addr,
+            "endpoint": endpoint,
+            "token": SYNTHETIC_TOKEN,
+            "expiresAt": (datetime.now(UTC) + timedelta(days=7)).isoformat(),
+        }
         tool.run(
             "Save the synthetic session",
             tool.python,
@@ -1161,16 +1168,10 @@ def rehearse_staged(
             "-c",
             "import json, sys; from sai_cli.core.storage import save_session; "
             "save_session(json.load(sys.stdin))",
-            input_text=json.dumps(
-                {
-                    "evmAddress": replay.addr,
-                    "endpoint": endpoint,
-                    "token": SYNTHETIC_TOKEN,
-                    "expiresAt": (datetime.now(UTC) + timedelta(days=7)).isoformat(),
-                }
-            ),
+            input_text=json.dumps(session_record),
         )
-        session = tool.json("Read the baseline session", "auth", "status")
+        session_file = tool.session_file.read_bytes()
+        tool.verify_session(session_file, session_record)
         config = tool.sai_home / "config.toml"
         configured = config.read_bytes()
         tool.json("Register MCP clients", "mcp", "install", *CLIENTS)
@@ -1211,7 +1212,7 @@ def rehearse_staged(
         )
         require(config.read_bytes() == configured, "Update changed the user config")
         tool.verify_saved_endpoint(endpoint)
-        tool.verify_session(session)
+        tool.verify_session(session_file, session_record)
         tool.verify_mcp(version)
         args = ("intent", "status", replay.addr, "--key", key)
         status = tool.json("Reconcile with the candidate", *args)
@@ -1258,7 +1259,7 @@ def rehearse_staged(
         )
         tool.verify_version(baseline)
         require(config.read_bytes() == configured, "Downgrade changed the user config")
-        tool.verify_session(session)
+        tool.verify_session(session_file, session_record)
         tool.verify_mcp(baseline)
         local = tool.json(
             "Read the migrated ledger with the old CLI", "intent", "local", replay.addr

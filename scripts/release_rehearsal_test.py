@@ -217,6 +217,30 @@ class BaselineTest(unittest.TestCase):
         )
 
 
+class SessionTest(unittest.TestCase):
+    def test_changed_or_missing_session_file_fails_without_exposing_token(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            tool = REHEARSAL["Install"](Path(temp), prepared=True)
+            tool.session_file.parent.mkdir(parents=True)
+            original = b"original encrypted session"
+            tool.session_file.write_bytes(original)
+            snapshot = tool.session_file.read_bytes()
+            token = REHEARSAL["SYNTHETIC_TOKEN"]
+            expected = {"endpoint": "http://127.0.0.1:12345/query", "token": token}
+
+            for contents in (b"changed encrypted session", None):
+                with self.subTest(contents=contents):
+                    if contents is None:
+                        tool.session_file.unlink()
+                    else:
+                        tool.session_file.write_bytes(contents)
+                    with self.assertRaisesRegex(
+                        REHEARSAL["RehearsalError"], "The stored session file changed"
+                    ) as error:
+                        tool.verify_session(snapshot, expected)
+                    self.assertNotIn(token, str(error.exception))
+
+
 class NetworkTest(unittest.TestCase):
     def test_strict_requires_a_namespace_before_installing(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
