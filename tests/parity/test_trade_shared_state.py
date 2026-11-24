@@ -570,18 +570,24 @@ def test_wait_deadline_then_restart(
         assert_trade_events(home, key, ["accepted", "pending", "terminal"], acked=True)
 
 
+@pytest.mark.parametrize(
+    ("submitter", "reconciler"), [("python", "rust"), ("rust", "python")]
+)
 def test_submission_times_out_after_keeper_receives_mutation(
+    submitter: str,
+    reconciler: str,
     request: pytest.FixtureRequest,
     tmp_path: Path,
     python_reference: Path | None,
 ) -> None:
     # Exercise the real transport deadline in the pinned mixed-runtime run.
-    reader = runtime("rust", request, python_reference)
-    writer = runtime("python", request, python_reference)
+    reader = runtime(reconciler, request, python_reference)
+    writer = runtime(submitter, request, python_reference)
     replay = TradeReplay(hold_admission=True)
     with loopback("default", trade_replay=replay) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
+        trade_help(home, writer, "close")
         started = time.monotonic()
         try:
             error = home.json(writer, "trade", "close", "7", code=5)["error"]
