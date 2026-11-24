@@ -106,8 +106,8 @@ by an exit before submission.
 The C11 parity fixes use Python tag `sai-cli/v0.1.2` at commit
 `8557a7e13dceab0accc369191182c8e01423c91b`. Install that checkout with
 `uv sync --locked` and point `SAI_PARITY_PYTHON` at its `.venv/bin/sai`.
-The endpoint, directory, and intent cases skip the older Python reference
-used by Rust CI.
+The Rust CI job runs these cases in a focused step using the v0.1.2
+checkout. Its broader comparison still uses the legacy C4 reference.
 
 ```sh
 SAI_PARITY_PYTHON=/absolute/path/to/v0.1.2/.venv/bin/sai \
