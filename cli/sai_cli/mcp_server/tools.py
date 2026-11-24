@@ -345,7 +345,7 @@ def session_state(settings: Settings) -> dict[str, Any]:
         **sessions.summary(stored),
         "expired": expired,
         "endpointMatches": matches,
-        **({"renewalCommand": sessions.renewal_command(stored)} if expired else {}),
+        **(sessions.renewal_fields(stored) if expired else {}),
         **(sessions.expiry_fields(stored, now) if matches else {}),
     }
 
