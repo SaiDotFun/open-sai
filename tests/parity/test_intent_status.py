@@ -882,7 +882,7 @@ def test_public_history_projects_after_raw_hash_correlation(
                     {
                         "data": {
                             "userIntents": [
-                                {**intent, "txHash": opaque, "execBlockTs": c4_time}
+                                {**intent, "txHash": "cd" * 32, "execBlockTs": c4_time}
                             ],
                             "extra": opaque,
                         }
@@ -927,7 +927,9 @@ def test_public_history_preserves_liquidation_label(
             replies.clear()
             replies.extend(
                 [
-                    response({"data": {"userIntents": [{**intent, "txHash": opaque}]}}),
+                    response(
+                        {"data": {"userIntents": [{**intent, "txHash": "cd" * 32}]}}
+                    ),
                     response({"data": {"perp": {"tradeHistory": [history]}}}),
                 ]
             )

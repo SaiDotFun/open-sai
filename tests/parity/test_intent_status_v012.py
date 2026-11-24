@@ -133,6 +133,25 @@ def test_pending_history_retries_once_with_five_request_cap(
     assert output["matchedTradeHistory"] == []
 
 
+def test_malformed_unicode_hash_cannot_resolve_pending_intent(
+    release_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    intent = RESPONSES["outcome_not_indexed"]["data"]["userIntents"][0]
+    fill = RESPONSES["filled_history"]["data"]["perp"]["tradeHistory"][0]
+    page = history_page([{**fill, "txHash": "σ"}])
+    output = replay_status(
+        release_pair,
+        tmp_path,
+        monkeypatch,
+        ({"data": {"userIntents": [{**intent, "txHash": "0xΣ"}]}}, page, page),
+        (0, 0),
+        "pending",
+    )
+    assert output["outcome"] == "pending"
+    assert output["matchedTradeHistory"] == []
+    assert output["userIntents"][0]["txHashInvalid"] is True
+
+
 @pytest.mark.parametrize(
     "malformed", [{"data": {}}, history_page(None), history_page({})]
 )

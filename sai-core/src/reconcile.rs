@@ -300,11 +300,11 @@ fn store_outcome(
 }
 
 fn normalize_hash(value: &Value) -> String {
-    let hash = value.as_str().unwrap_or_default();
-    hash.strip_prefix("0x")
-        .or_else(|| hash.strip_prefix("0X"))
-        .unwrap_or(hash)
-        .to_lowercase()
+    let hash = value.as_str().unwrap_or_default().to_lowercase();
+    match hash.strip_prefix("0x") {
+        Some(digits) => digits.to_owned(),
+        None => hash,
+    }
 }
 
 async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
@@ -312,6 +312,10 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
     if hash.is_empty() {
         return Vec::new();
     }
+    // Preserve the release's reads for a nonempty hash, but require valid
+    // transaction evidence before allowing a match to release the ledger.
+    let valid_hash =
+        (hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit())).then_some(&hash);
 
     let end = Instant::now() + context.timeout.min(HISTORY_TIMEOUT);
     let remaining = || end.saturating_duration_since(Instant::now());
@@ -360,9 +364,11 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
             for item in history {
                 if item["intentKey"] == context.key
                     && account_matches(&item["trade"]["trader"], context.account)
-                    && ["txHash", "evmTxHash"]
-                        .iter()
-                        .any(|field| normalize_hash(&item[*field]) == hash)
+                    && valid_hash.is_some_and(|hash| {
+                        ["txHash", "evmTxHash"]
+                            .iter()
+                            .any(|field| normalize_hash(&item[*field]) == *hash)
+                    })
                     && item["id"].as_i64().is_none_or(|id| seen.insert(id))
                 {
                     found.push(item.clone());
