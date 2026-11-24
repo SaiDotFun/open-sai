@@ -49,12 +49,10 @@ Trading needs a Sai session. When the person asks you to connect Sai:
    selected, connected wallet with an active trading session. Ask them to
    check the expiry and click **Copy session token**. If they can't use the
    button, they can sign in with a Foundry keystore as described below.
-2. Run `sai --json auth import` without a terminal. If the CLI uses a different
-   endpoint, pass `--endpoint` before `auth import` with the Mainnet URL shown
-   in the dialog.
-   The command reads the clipboard, stores the token, and prints `addr`,
-   `expiresAt`, and `endpoint`. It tries to clear the clipboard if it still
-   holds the token.
+2. Run `sai --json --endpoint https://sai-keeper.nibiru.fi/query auth import`
+   without a terminal. The command reads the clipboard, stores the token,
+   and prints `addr`, `expiresAt`, and `endpoint`. It tries to clear the
+   clipboard if it still holds the token.
 3. If your commands run in a pseudo-terminal, `auth import` shows a hidden
    prompt instead. Send only an empty line, which makes it read the
    clipboard.
@@ -65,6 +63,14 @@ Trading needs a Sai session. When the person asks you to connect Sai:
 
 Never ask the person to paste the token into the chat. `auth import` does not
 accept the token as an argument, environment variable, or piped input.
+
+The import command pins Mainnet for that invocation only. Check the session
+with `sai --endpoint https://sai-keeper.nibiru.fi/query auth status`. Later CLI
+commands and any MCP server using the session must target the same Keeper
+endpoint. To save Mainnet as the default, run
+`sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query`.
+Update any conflicting `--endpoint` or `SAI_ENDPOINT` overrides and restart
+running MCP servers to pick up the change.
 
 A person with a Foundry keystore can run `sai auth login NAME` in their own
 terminal instead. `NAME` is a keystore in `~/.foundry/keystores`, and `cast`

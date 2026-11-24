@@ -21,6 +21,13 @@ session token**. Run the dialog's `sai auth import` command. Paste the token at
 the hidden prompt or press Enter to read the clipboard. Agents can run the
 command without a terminal to read the clipboard directly.
 
+The dialog pins the Mainnet Keeper endpoint for import only. Check the session
+with `sai --endpoint https://sai-keeper.nibiru.fi/query auth status`. Later CLI
+commands and any MCP server must use that endpoint to access the session. To
+save it as your default, run
+`sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query`.
+Update any endpoint overrides and restart running MCP servers to pick up the change.
+
 `auth login NAME` signs the challenge with the Foundry keystore of that name
 through `cast`. `auth logout` deletes the local copy. The CLI
 stores the session under `$SAI_HOME/trader` at mode 0600, encrypted with a

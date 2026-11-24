@@ -95,6 +95,13 @@ Trading needs a Sai session. There are two ways to get one:
   sign` asks for the keystore password, unless the `ud` tool is on your
   `PATH` with a wallet of the same name, which signs without a prompt.
 
+The Sai Web dialog pins Mainnet for the import command only. Check the
+imported session with `sai --endpoint https://sai-keeper.nibiru.fi/query auth status`.
+Later CLI commands and any MCP server using the session must target the same
+Keeper endpoint. To save Mainnet as your CLI default, run
+`sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query`.
+Update any endpoint overrides and restart running MCP servers to pick up the change.
+
 You can connect several accounts. Each sign-in adds an account and makes it
 active. `sai auth list` shows them, `sai auth use ADDR` switches the active
 one, `sai --as ADDR ...` runs one command as another, and `sai auth logout
