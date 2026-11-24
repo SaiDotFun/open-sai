@@ -194,8 +194,10 @@ it.
 
 Each preview names the signed-in account in `addr`. Pass the confirmed
 preview's `previewDigest` as `preview_digest` in the trade call. Before submitting, the
-server rebuilds the trade and refuses it with a fresh preview when it no
-longer matches:
+server rebuilds the trade and checks the confirmed terms listed below.
+If the trade returns `PREVIEW_MISMATCH` or `PRICE_MOVED`, it has submitted
+nothing. Use the returned `preview` when present. If it is missing, obtain a
+new preview before asking for confirmation again.
 
 - Every trade: the signed-in account and the trade's arguments.
 - `trade_margin` also binds the margin quote, including the position's
