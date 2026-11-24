@@ -86,15 +86,21 @@ impl<'a> Evidence<'a> {
         }
     }
 
-    pub fn build(&self, outcome: Outcome, request_hash: &Value, request_block: &Value) -> Value {
+    pub fn build(
+        &self,
+        outcome: Outcome,
+        request_hash: &Value,
+        request_block: &Value,
+        project: impl Fn(Value) -> Value,
+    ) -> Value {
         let public = self
             .indexed
             .as_object()
-            .map_or(Value::Null, keeper::intent_history);
+            .map_or(Value::Null, |row| project(keeper::intent_history(row)));
         let intent = self
             .row
             .as_object()
-            .map_or(Value::Null, keeper::intent_record);
+            .map_or(Value::Null, |row| project(keeper::intent_record(row)));
         let order = &self.indexed["marketOrder"];
         let change = match self.indexed["tradeChangeType"].as_str() {
             Some(change @ ("order_updated" | "position_liquidated")) => json!(change),
@@ -105,7 +111,7 @@ impl<'a> Evidence<'a> {
             let extra_effects: Vec<_> = self.matching.iter().copied()
                 .filter(|item| !ptr::eq(*item, self.indexed) && item["tradeChangeType"] == "after_hours_risk_trigger")
                 .filter_map(Value::as_object)
-                .map(keeper::intent_history)
+                .map(|row| project(keeper::intent_history(row)))
                 .map(|extra| json!({
                     "tradeChangeType": extra["tradeChangeType"],
                     "historyId": extra["id"],
@@ -139,7 +145,7 @@ impl<'a> Evidence<'a> {
             .iter()
             .any(|(_, value)| !value.is_null())
             .then(|| Map::from_iter(fees.map(|(key, value)| (key.into(), value))));
-        json!({
+        project(json!({
             "requestTxHash": keeper::request_hash(request_hash).0
                 .or_else(|| keeper::request_hash(&order["orderReqTxHash"]).0)
                 .or_else(|| public["txHash"].as_str().map(str::to_owned)),
@@ -149,7 +155,7 @@ impl<'a> Evidence<'a> {
             "fill": fill,
             "positionNow": position(&self.indexed["trade"], &public["trade"]),
             "positionFeesUsd": fees,
-        })
+        }))
     }
 }
 

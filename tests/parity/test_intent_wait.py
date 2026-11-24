@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sai_cli.core import storage
 from test_intent_status import (
     ADDR,
     CLI,
@@ -244,6 +245,52 @@ def ledger_state(home: Path) -> list[tuple[str, str, str | None]]:
         return connection.execute(
             "SELECT id, status, keeper_status FROM intents ORDER BY id"
         ).fetchall()
+
+
+def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
+    wait_cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    token = "e1" * 32
+    with replay() as (endpoint, replies, requests):
+        for index, cli in enumerate(wait_cli_pair):
+            home = tmp_path / str(index) / "sai"
+            seed(home, endpoint, monkeypatch, "unknown")
+            storage.save_session(
+                {
+                    "evmAddress": ADDR,
+                    "endpoint": endpoint,
+                    "expiresAt": "2099-01-01T00:00:00Z",
+                    "token": token,
+                }
+            )
+            requests.clear()
+            replies.extend(
+                map(
+                    response,
+                    (
+                        "user_finality",
+                        history(
+                            indexed(
+                                "position_closed_user",
+                                txHash=token,
+                                evmTxHash="b" * 64,
+                                marketOrder=None,
+                            )
+                        ),
+                    ),
+                )
+            )
+            result = invoke(
+                cli, home, "--endpoint", endpoint, "--json", "intent", "wait", KEY
+            )
+            assert token.encode() not in result.stdout + result.stderr, (
+                "receipt disclosed a stored token"
+            )
+            assert result.returncode == 0
+            receipt = json.loads(result.stdout)["receipt"]
+            assert receipt["requestTxHash"] == "[redacted session token]"
+            assert len(requests) == 2
+            assert all("authorization" not in request.headers for request in requests)
 
 
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)

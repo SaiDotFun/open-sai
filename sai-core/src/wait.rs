@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::{
     errors::{Code, SaiError},
     keeper::{self, Keeper},
-    log::{EventContext, Field, Level},
+    log::{self, EventContext, Field, Level},
     receipt::Evidence,
     reconcile::{self, PollError, WaitBudget, classify_outcome},
     storage::{Storage, StorageError},
@@ -194,9 +194,7 @@ pub async fn for_intent(
                 Some(addr),
                 initial,
                 &Value::Null,
-                &[],
-                &Value::Null,
-                &Value::Null,
+                empty_receipt(initial),
             ));
         }
     }
@@ -266,15 +264,18 @@ pub async fn for_intent(
     if wait_log.outcome == Outcome::Unknown {
         wait_log.outcome = recorded()?;
     }
-    Ok(result(
-        key,
-        Some(addr),
+    let home = storage
+        .trader
+        .parent()
+        .expect("trader directory has a parent");
+    let scrub = log::scrubber(home);
+    let receipt = Evidence::new(&row, &history).build(
         wait_log.outcome,
-        &row,
-        &history,
         &request_hash,
         &request_block,
-    ))
+        |value| scrub(value.into()),
+    );
+    Ok(result(key, Some(addr), wait_log.outcome, &row, receipt))
 }
 
 pub fn unknown_result(key: &str) -> ResultReceipt {
@@ -283,9 +284,7 @@ pub fn unknown_result(key: &str) -> ResultReceipt {
         None,
         Outcome::Unknown,
         &Value::Null,
-        &[],
-        &Value::Null,
-        &Value::Null,
+        empty_receipt(Outcome::Unknown),
     )
 }
 
@@ -295,12 +294,14 @@ pub fn rejected_result(key: &str, addr: &str, message: &str) -> ResultReceipt {
         Some(addr),
         Outcome::Rejected,
         &Value::Null,
-        &[],
-        &Value::Null,
-        &Value::Null,
+        empty_receipt(Outcome::Rejected),
     );
     receipt.body["message"] = json!(message);
     receipt
+}
+
+fn empty_receipt(outcome: Outcome) -> Value {
+    Evidence::new(&Value::Null, &[]).build(outcome, &Value::Null, &Value::Null, |value| value)
 }
 
 fn result(
@@ -308,11 +309,8 @@ fn result(
     addr: Option<&str>,
     outcome: Outcome,
     row: &Value,
-    history: &[Value],
-    request_hash: &Value,
-    request_block: &Value,
+    receipt: Value,
 ) -> ResultReceipt {
-    let receipt = Evidence::new(row, history).build(outcome, request_hash, request_block);
     let mut body = json!({"intentKey": key, "addr": addr, "outcome": outcome, "receipt": receipt});
     let message = match outcome {
         Outcome::Failed => {
