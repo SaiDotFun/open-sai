@@ -94,8 +94,7 @@ def session(ctx: click.Context) -> dict[str, str]:
 
 
 def command_path(group: click.Group, args: list[str]) -> list[str]:
-    """The command names in ARGS, such as ["market", "prices"], found by
-    walking GROUP's commands past options and their values."""
+    """Return the known command names before the leaf's arguments."""
     names: list[str] = []
     current: click.Command = group
     skip = False
@@ -122,6 +121,11 @@ def command_path(group: click.Group, args: list[str]) -> list[str]:
         names.append(token)
         current = found
     return names
+
+
+def auth_attempt(names: list[str], argv: list[str]) -> bool:
+    """Also recognize auth after an unrecognized root option or operand."""
+    return names[:1] == ["auth"] or (not names and "auth" in argv)
 
 
 # Options that print something and exit before any command runs.
@@ -227,6 +231,23 @@ class HelpOnMissingInput(click.Command):
             ctx.exit(ExitCode.USAGE)
 
 
+def auth_usage_error(exc: click.UsageError, command: str | None) -> click.UsageError:
+    """Keep Click's diagnostics for auth independent of supplied values."""
+    if isinstance(exc, click.NoSuchOption) and exc.option_name == "--json":
+        message = "No such option: --json"
+    elif command == "auth import":
+        message = "Unexpected arguments to auth import."
+    elif isinstance(exc, click.NoSuchOption):
+        message = "No such option for auth."
+    elif isinstance(exc, click.MissingParameter) and isinstance(
+        exc.param, click.Argument
+    ):
+        message = f"Missing argument '{exc.param.human_readable_name}'."
+    else:
+        message = "Invalid arguments to auth."
+    return click.UsageError(message, exc.ctx)
+
+
 class SaiGroup(click.Group):
     command_class = HelpOnMissingInput
     group_class = type
@@ -252,8 +273,11 @@ class LoggedGroup(SaiGroup):
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
         names = command_path(self, argv)
+        private_args = auth_attempt(names, argv)
         quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
+        # Keep only command words for auth, even if a parent parser fails.
+        logged_argv = names if private_args else argv
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
         started = time.monotonic()
         exit_code: int = ExitCode.OK
@@ -263,7 +287,7 @@ class LoggedGroup(SaiGroup):
         def log_start() -> None:
             nonlocal start_logged
             if not quiet and not start_logged:
-                log.event("command.start", argv=log.argv(argv[:64]))
+                log.event("command.start", argv=log.argv(logged_argv[:64]))
                 start_logged = True
 
         with (
@@ -290,11 +314,18 @@ class LoggedGroup(SaiGroup):
                     **extra,
                 )
             except Exception as exc:
-                failure = cli_failure(exc)
+                safe_usage = (
+                    auth_usage_error(exc, command)
+                    if private_args and isinstance(exc, click.UsageError)
+                    else None
+                )
+                failure = cli_failure(safe_usage or exc)
                 exit_code = failure.exit_code
                 if not standalone_mode:
+                    if safe_usage is not None:
+                        raise safe_usage from None
                     raise
-                show_failure(exc, failure, json_requested(argv))
+                show_failure(safe_usage or exc, failure, json_requested(argv))
             else:
                 # With standalone mode disabled, Click returns explicit exit codes.
                 if isinstance(result, int):
@@ -457,6 +488,15 @@ def repl_args(line: str) -> list[str]:
     return args
 
 
+def store_repl_line_immediately(line: str) -> bool:
+    """Defer auth history until the command has run."""
+    try:
+        args = repl_args(line)
+    except ValueError:
+        return False
+    return not auth_attempt(command_path(main, args), args)
+
+
 def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> None:
     """Run the interactive shell.
 
@@ -468,7 +508,9 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
     skin.print_banner()
     click.echo("Enter a command, 'help', or 'exit'.")
     pt_session = (
-        skin.create_prompt_session(input=pt_input, output=pt_output)
+        skin.create_prompt_session(
+            history_filter=store_repl_line_immediately, input=pt_input, output=pt_output
+        )
         if pt_input is not None or sys.stdin.isatty()
         else None
     )
@@ -486,11 +528,19 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
         try:
             args = repl_args(line)
             if args:
-                main.main(
+                result = main.main(
                     args=[*forwarded_flags(ctx.obj), *args],
                     prog_name="sai",
                     standalone_mode=False,
                 )
+                names = command_path(main, args)
+                if (
+                    pt_session is not None
+                    and result is None
+                    and names[:1] == ["auth"]
+                    and names != ["auth", "import"]
+                ):
+                    pt_session.history.record(line)
         except (click.Abort, KeyboardInterrupt):
             click.echo("Interrupted", err=True)
         except Exception as exc:  # noqa: BLE001 - keep the REPL open
@@ -542,6 +592,7 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
         result = signed_login(endpoint, name, addr)
         result["endpoint"] = endpoint
         result["keyName"] = name
+        sessions.validate_issued_session(result)
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
@@ -585,6 +636,7 @@ def renew(ctx: click.Context, addr: str | None) -> None:
             raise ValueError(f"{message} {guidance}".rstrip())
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
+        sessions.validate_issued_session(result)
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
@@ -864,7 +916,14 @@ def auth_use(ctx: click.Context, addr: str) -> None:
     Commands without `--as` act on the active account. Sign in again to
     connect a new one: `sai auth login NAME` and `sai auth import` add accounts.
     """
-    emit(ctx, {**sessions.summary(storage.use_session(addr)), "active": True})
+
+    def response(accounts: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **sessions.summary(accounts["sessions"][accounts["active"]]),
+            "active": True,
+        }
+
+    emit(ctx, storage.use_session(addr, response))
 
 
 @auth.command("status")
