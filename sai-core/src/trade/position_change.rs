@@ -236,7 +236,9 @@ impl Trading<'_> {
         trade_id: &Value,
         action: PositionAction<'_>,
     ) -> Result<PositionQuote, SaiError> {
-        let snapshot = self.read_position_change_snapshot(lcd, addr, trade_id).await?;
+        let snapshot = self
+            .read_position_change_snapshot(lcd, addr, trade_id)
+            .await?;
         let delta = if let PositionAction::PartialClose { percent } = action {
             let markets = self.position_request(MARKETS, Map::new()).await?;
             let markets = field(field(&markets, "perp")?, "borrowings")?
