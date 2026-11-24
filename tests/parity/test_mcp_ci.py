@@ -19,3 +19,7 @@ def test_rust_ci_runs_pinned_mcp_transcript() -> None:
     )
     assert "SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai" in transcript
     assert ".parity-mcp-python/.venv/bin/sai" in transcript
+    cli = next(
+        step for step in steps if step.startswith("Compare the Rust and Python CLIs")
+    )
+    assert steps.index(transcript) < steps.index(cli)
