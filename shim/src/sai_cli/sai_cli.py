@@ -387,10 +387,15 @@ def install_binary(cache: Path, url: str, name: str, base: str) -> None:
                         and info.st_uid == os.getuid()
                         and digest_directory_inaccessible(info)
                     ):
-                        # Keep the rename in the trusted, locked parent. A
-                        # cross-directory move can need write access to '..'.
-                        with tempfile.TemporaryDirectory(dir=cache) as discarded:
-                            folder.replace(discarded)
+                        if os.chmod in os.supports_follow_symlinks:
+                            # Restore the owned directory's mode so we can
+                            # open it and check its ACL before publishing.
+                            os.chmod(folder, 0o700, follow_symlinks=False)
+                        else:
+                            # Keep the rename in the locked parent. Moving
+                            # between parents can need write access to '..'.
+                            with tempfile.TemporaryDirectory(dir=cache) as discarded:
+                                folder.replace(discarded)
                 folder.mkdir(mode=0o700, exist_ok=True)
                 repair_digest_mode(folder)
                 binary = folder / "sai"
