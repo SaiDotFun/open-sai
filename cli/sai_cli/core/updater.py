@@ -8,10 +8,10 @@ restores the previous version. Only an official uv tool install is changed.
 Interactive commands call `tick`, which prints at most one notice per state
 change and starts a detached `sai update --background` at most once a day.
 
-Two locks keep this safe. The tool lock sits beside the uv tool environment
-and covers a whole install, verify, and rollback, so every SAI_HOME that
-shares the tool takes the same one. The state lock is `$SAI_HOME/update.lock`
-and covers each read-modify-write of that profile's `update.json`.
+The tool lock covers installation and rollback for one uv environment.
+The public install lock sits beside the launcher and coordinates all Sai
+installers using that path. The state lock covers each read-modify-write of
+a profile's `update.json`.
 
 What this protects against is a bad release, a failed network, two commands
 racing, and mistakes such as uv pointed at another directory. It does not
@@ -35,6 +35,7 @@ import re
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -78,6 +79,7 @@ CHECK_INTERVAL = 24 * 60 * 60
 # this long instead of a day later.
 RETRY_INTERVAL = 15 * 60
 TOOL_LOCK_NAME = ".sai-cli-update.lock"
+INSTALL_LOCK_NAME = ".sai-update.lock"
 NATIVE_PENDING = ".sai-cli-native-pending.json"
 NATIVE_WHEELS = ".sai-cli-native-wheels"
 NATIVE_RECOVERY = ".sai-cli-recover"
@@ -190,13 +192,26 @@ def _try_lock(fd: int) -> bool:
 
 
 @contextlib.contextmanager
-def locked(path: Path | None = None, wait: float = 0.0) -> Generator[bool]:
+def locked(
+    path: Path | None = None, wait: float = 0.0, *, private_file: bool = False
+) -> Generator[bool]:
     """Hold the lock file at PATH (default: the state lock). Yields False
     when another process still holds it after WAIT seconds."""
     path = path or state_lock_path()
     update.prepare_parent(path)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    flags = os.O_RDWR | os.O_CREAT
+    if private_file and os.name != "nt":
+        flags |= os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(path, flags, 0o600)
     try:
+        if private_file and os.name != "nt":
+            info = os.fstat(fd)
+            if (
+                not stat.S_ISREG(info.st_mode)
+                or info.st_uid != os.getuid()
+                or info.st_mode & 0o077
+            ):
+                raise PermissionError(f"{path} must be a private lock file")
         deadline = time.monotonic() + wait
         held = _try_lock(fd)
         while not held and time.monotonic() < deadline:
@@ -1378,8 +1393,8 @@ def update_now(options: Options | None = None) -> Outcome:
         return _unsupported(install)
     prefix = Path(os.path.abspath(install.prefix))
     wait = 0.0 if options.background else LOCK_WAIT
-    with locked(tool_lock_path(prefix), wait) as held:
-        if not held:
+    with contextlib.ExitStack() as locks:
+        if not locks.enter_context(locked(tool_lock_path(prefix), wait)):
             message = "Another sai update is still running; try again shortly."
             status = BUSY if options.background else FAILED
             return Outcome(status, message, update.installed_version(prefix))
@@ -1435,11 +1450,25 @@ def update_now(options: Options | None = None) -> Outcome:
             return outcome
         uv = os.path.abspath(found)
         launcher = registered_launcher(prefix)
-        mismatch = (
-            "this install's uv receipt names no `sai` executable"
-            if launcher is None
-            else destination_error(prefix, launcher, uv, options.runner)
-        )
+        if launcher is None:
+            mismatch = "this install's uv receipt names no `sai` executable"
+        else:
+            try:
+                lock = launcher.parent.resolve() / INSTALL_LOCK_NAME
+                held = locks.enter_context(locked(lock, wait, private_file=True))
+            except OSError as error:
+                return Outcome(
+                    FAILED, f"Could not lock {launcher}: {error}", installed, target
+                )
+            if not held:
+                status = BUSY if options.background else FAILED
+                return Outcome(
+                    status,
+                    f"Another Sai install or update is using {launcher}.",
+                    installed,
+                    target,
+                )
+            mismatch = destination_error(prefix, launcher, uv, options.runner)
         if mismatch is not None or launcher is None:
             message = (
                 f"`sai update` stopped before changing anything: {mismatch}."
@@ -1453,8 +1482,8 @@ def update_now(options: Options | None = None) -> Outcome:
         except (OSError, UpdateFailed) as error:
             return Outcome(FAILED, str(error), installed, target)
         clear_snapshots(prefix)
-        # The cache lock comes second, always after the tool lock, and is
-        # held until the install is verified or rolled back.
+        # Acquire the cache lock after the tool and launcher locks. Keep it
+        # until the install is verified or rolled back.
         # Capture the absolute state path while a relative SAI_HOME can
         # still be resolved, even if the working directory goes away.
         state_path = update.cache_path()

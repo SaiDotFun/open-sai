@@ -671,6 +671,24 @@ def test_with_no_previous_wheel_the_environment_copy_restores_the_install(uv_dir
     assert list(update.wheel_cache().glob("*.whl")) == []
 
 
+@needs_uv
+def test_uv_update_obeys_the_standalone_install_lock(uv_dirs):
+    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    with Stub(release_routes(wheels)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        public = tool.sai.lstat()
+        with updater.locked(tool.sai.parent / ".sai-update.lock") as held:
+            assert held
+            outcome = tool.update(background=True)
+        assert outcome.status == updater.BUSY
+        assert str(tool.sai) in outcome.message
+        assert tool.version() == "0.1.0"
+        assert os.path.samestat(tool.sai.lstat(), public)
+        assert tool.update().status == updater.UPDATED
+        assert tool.version() == "0.2.0"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="test replaces a public POSIX symlink")
 @needs_uv
 def test_updating_the_uv_environment_does_not_replace_a_late_competitor(uv_dirs):
