@@ -11,8 +11,11 @@ import shutil
 import subprocess
 import sys
 import tarfile
+import tomllib
+import zipfile
 from collections.abc import Iterator
 from dataclasses import dataclass, field
+from email import message_from_bytes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread
@@ -23,7 +26,6 @@ import pytest
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "scripts" / "install.py"
 REPO = "/SaiDotFun/open-sai"
-PRE_BRIDGE = "0.1.2"
 PRE_BRIDGE_COMMIT = "8557a7e13dceab0accc369191182c8e01423c91b"
 OLD_MCP_COMMAND = "sai" + "-mcp"
 WINDOWS = os.name == "nt"
@@ -51,8 +53,18 @@ os.execv(binary, [binary, *args])
 """
 
 
+def checkout_version() -> str:
+    return tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]["version"]
+
+
 def wheel_version(wheel: Path) -> str:
-    return wheel.name.split("-")[1]
+    with zipfile.ZipFile(wheel) as archive:
+        (metadata,) = (
+            name for name in archive.namelist() if name.endswith(".dist-info/METADATA")
+        )
+        version = message_from_bytes(archive.read(metadata))["Version"]
+    assert version
+    return version
 
 
 def asset_name(version: str) -> str:
@@ -77,7 +89,7 @@ def archive(binary: Path | None = None, *, member: str = "sai") -> bytes:
 
 class Replay:
     def __init__(self) -> None:
-        self.latest = "0.2.0"
+        self.releases: dict[str, None] = {}
         self.requests: list[str] = []
         self.assets: dict[str, bytes] = {}
         self.redirects: dict[str, str] = {}
@@ -98,7 +110,10 @@ class Replay:
                         [
                             {"tag_name": "other/v99.0.0"},
                             {"tag_name": "sai-cli/v99.0.0-rc.1", "prerelease": True},
-                            {"tag_name": f"sai-cli/v{replay.latest}"},
+                            *(
+                                {"tag_name": f"sai-cli/v{version}"}
+                                for version in reversed(replay.releases)
+                            ),
                             {"tag_name": "sai-cli/v0.0.1"},
                         ]
                     ).encode()
@@ -116,7 +131,7 @@ class Replay:
         self.base = f"http://127.0.0.1:{self.server.server_port}"
 
     def add(self, version: str, files: dict[str, bytes]) -> None:
-        self.latest = version
+        self.releases[version] = None
         folder = f"{REPO}/releases/download/sai-cli/v{version}"
         manifest = "".join(
             f"{hashlib.sha256(data).hexdigest()}  {name}\n"
@@ -173,7 +188,7 @@ class Install:
             *args,
         )
 
-    def update(self, replay: Replay) -> subprocess.CompletedProcess[str]:
+    def update(self, replay: Replay, *args: str) -> subprocess.CompletedProcess[str]:
         return self.run(
             self.launcher,
             "--json",
@@ -182,6 +197,7 @@ class Install:
             replay.base,
             "--web-base",
             replay.base,
+            *args,
         )
 
     def pin(self, version: str) -> None:
@@ -240,17 +256,35 @@ def artifact(name: str) -> Path:
     return Path(value).resolve(strict=True)
 
 
-def test_bridge_build_refuses_the_published_python_version(install: Install) -> None:
+def only_wheel(directory: Path) -> Path:
+    wheels = list(directory.glob("sai_cli-*.whl"))
+    assert len(wheels) == 1, f"expected one Sai wheel in {directory}, found {wheels}"
+    return wheels[0]
+
+
+def wheel_artifact(name: str) -> Path:
+    path = artifact(name)
+    return only_wheel(path) if path.is_dir() else path
+
+
+def test_bridge_rehearsal_refuses_the_checkout_version(install: Install) -> None:
+    scripts = install.home / "scripts"
+    scripts.mkdir()
+    for name in ("build-bridge.py", "check_release.py"):
+        shutil.copy2(ROOT / "scripts" / name, scripts)
+    major, minor, patch = map(int, checkout_version().split("."))
+    version = f"{major}.{minor}.{patch + 1}"
+    (install.home / "pyproject.toml").write_text(f'[project]\nversion = "{version}"\n')
     result = install.run(
         sys.executable,
-        ROOT / "scripts" / "build-bridge.py",
+        scripts / "build-bridge.py",
         "--version",
-        PRE_BRIDGE,
+        version,
         "--out-dir",
         install.home / "dist",
     )
     assert result.returncode == 2
-    assert "requires a distinct stable version newer than 0.1.2" in result.stderr
+    assert f"requires a distinct stable version newer than {version}" in result.stderr
     assert not (install.home / "dist").exists()
 
 
@@ -290,7 +324,7 @@ def prepare_uv(
     )
     version = wheel_version(wheel)
     replay.add(version, {wheel.name: wheel.read_bytes()})
-    ok(install.install(replay, script=script))
+    ok(install.install(replay, "--version", version, script=script))
     install.pin(version)
 
 
@@ -348,7 +382,7 @@ def test_standalone_installs_release(install: Install, replay: Replay) -> None:
 def test_native_dry_run_selects_an_explicit_prerelease(
     install: Install, replay: Replay
 ) -> None:
-    version = "0.2.0-rc.1"
+    version = f"{checkout_version()}-rc.1"
     command = install.install(replay, "--native", "--dry-run", "--version", version)
     assert asset_name(version) in ok(command)
     assert not replay.requests
@@ -360,11 +394,12 @@ def test_native_dry_run_selects_an_explicit_prerelease(
 def test_uv_owned_launcher_rejects_an_explicit_native_prerelease(
     install: Install, replay: Replay
 ) -> None:
-    prepare_uv(install, artifact("BRIDGE"), replay)
+    prepare_uv(install, wheel_artifact("BRIDGE"), replay)
     requests = len(replay.requests)
-    result = install.install(replay, "--native", "--dry-run", "--version", "0.2.0-rc.1")
+    version = f"{checkout_version()}-rc.1"
+    result = install.install(replay, "--native", "--dry-run", "--version", version)
     assert result.returncode == 1
-    assert "'0.2.0-rc.1' is not a version like 0.2.0." in result.stderr
+    assert f"{version!r} is not a version like X.Y.Z." in result.stderr
     assert "Running" not in result.stdout
     assert len(replay.requests) == requests
 
@@ -597,7 +632,7 @@ def test_standalone_refuses_an_indirect_managed_target(
     install: Install, replay: Replay
 ) -> None:
     root = install.launcher.parent / ".sai-native"
-    binary = root / ("0.1.2-" + "a" * 64) / "sai"
+    binary = root / (f"{checkout_version()}-" + "a" * 64) / "sai"
     binary.parent.mkdir(mode=0o700, parents=True)
     binary.write_text("#!/bin/sh\n")
     binary.chmod(0o700)
@@ -616,7 +651,7 @@ def test_standalone_refuses_an_indirect_managed_target(
 def test_native_rejects_invalid_assets(
     install: Install, replay: Replay, fault: str
 ) -> None:
-    version = replay.latest
+    version = checkout_version()
     name = asset_name(version)
     data = archive(member="../sai")
     if fault == "wrong target":
@@ -894,10 +929,21 @@ def add_shim(replay: Replay, wheel: Path, binary: Path | None = None) -> str:
 def test_python_bridge_preserves_uv_and_rolls_back(
     install: Install, replay: Replay, failure: bool
 ) -> None:
-    wheel = artifact("SHIM")
-    python_wheel = artifact("BRIDGE")
+    wheel = wheel_artifact("SHIM")
+    python_wheel = wheel_artifact("BRIDGE")
     binary = artifact("MUTANT" if failure else "RUST")
-    prepare_uv(install, python_wheel, replay)
+    # The native tag is already published when the bridge becomes available.
+    version = add_shim(replay, wheel, binary)
+    bridge_version = wheel_version(python_wheel)
+    if failure:
+        prepare_uv(install, python_wheel, replay)
+    else:
+        baseline, script = pre_bridge_files()
+        prepare_uv(install, baseline, replay, script)
+        replay.add(bridge_version, {python_wheel.name: python_wheel.read_bytes()})
+        chosen = json.loads(ok(install.update(replay, "--to", bridge_version)))
+        assert (chosen["status"], chosen["target"]) == ("updated", bridge_version)
+        install.pin(bridge_version)
     previous = install.launcher.resolve(strict=True)
     profile, contents = save_profile(install, replay)
     python = install.tools / "sai-cli" / "bin" / "python"
@@ -930,18 +976,19 @@ def test_python_bridge_preserves_uv_and_rolls_back(
         }
     }
     cursor.write_text(json.dumps(original))
-    version = add_shim(replay, wheel, binary)
     # This is the public installer path for an existing uv-owned launcher.
     result = install.install(replay, "--native")
     pre_mcp_xfail(result)
     assert "is owned by uv" in result.stdout
     if failure:
         assert result.returncode == 1
-        assert "Rolled back to sai" in result.stderr and "mcp serve" in result.stderr
-        install.pin(wheel_version(python_wheel))
+        assert f"Could not update to {version}" in result.stderr
+        assert f"Rolled back to sai {bridge_version}" in result.stderr
+        assert "mcp serve" in result.stderr
+        install.pin(bridge_version)
         assert json.loads(cursor.read_text()) == original
     else:
-        ok(result)
+        assert f"Updated sai from {bridge_version} to {version}" in ok(result)
         archive_path = (
             f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
         )
@@ -966,14 +1013,14 @@ def test_python_bridge_preserves_uv_and_rolls_back(
 def pre_bridge_files() -> tuple[Path, Path]:
     baseline = artifact("PRE_BRIDGE")
     assert (baseline / "commit").read_text().strip() == PRE_BRIDGE_COMMIT
-    return baseline / f"sai_cli-{PRE_BRIDGE}-py3-none-any.whl", baseline / "install.py"
+    return only_wheel(baseline), baseline / "install.py"
 
 
 @pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
 def test_native_updater_recovers_an_interrupted_bridge(
     install: Install, replay: Replay
 ) -> None:
-    python_wheel, shim = artifact("BRIDGE"), artifact("SHIM")
+    python_wheel, shim = wheel_artifact("BRIDGE"), wheel_artifact("SHIM")
     binary = artifact("RECOVERY_RUST")
     prepare_uv(install, python_wheel, replay)
     profile, contents = save_profile(install, replay)
@@ -1043,10 +1090,10 @@ main()
 def test_bridge_recovers_when_uv_removed_the_environment_and_launcher(
     install: Install, replay: Replay
 ) -> None:
-    python_wheel = artifact("BRIDGE")
+    python_wheel = wheel_artifact("BRIDGE")
     prepare_uv(install, python_wheel, replay)
     profile, contents = save_profile(install, replay)
-    candidate = add_shim(replay, artifact("SHIM"), artifact("RECOVERY_RUST"))
+    candidate = add_shim(replay, wheel_artifact("SHIM"), artifact("RECOVERY_RUST"))
     original_env = install.env.copy()
     uv = shutil.which("uv", path=original_env["PATH"])
     assert uv is not None
@@ -1098,7 +1145,7 @@ def test_bridge_recovers_when_uv_removed_the_environment_and_launcher(
 def test_bridge_requires_an_offline_rollback_install(
     install: Install, replay: Replay
 ) -> None:
-    python_wheel, shim = artifact("BRIDGE"), artifact("SHIM")
+    python_wheel, shim = wheel_artifact("BRIDGE"), wheel_artifact("SHIM")
     prepare_uv(install, python_wheel, replay)
     add_shim(replay, shim, artifact("RUST"))
     install.env["UV_CACHE_DIR"] = str(install.home / "empty-uv-cache")
@@ -1117,9 +1164,9 @@ def test_bridge_requires_an_offline_rollback_install(
 def test_bridge_honors_opt_out_during_the_offline_rollback_trial(
     install: Install, replay: Replay
 ) -> None:
-    python_wheel = artifact("BRIDGE")
+    python_wheel = wheel_artifact("BRIDGE")
     prepare_uv(install, python_wheel, replay)
-    add_shim(replay, artifact("SHIM"), artifact("RUST"))
+    add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
     profile, _ = save_profile(install, replay)
     opt_out = """
 import sys
@@ -1160,7 +1207,7 @@ main()
 def test_bridge_explains_how_to_convert_an_official_uv_git_install(
     install: Install, replay: Replay
 ) -> None:
-    python_wheel = artifact("BRIDGE")
+    python_wheel = wheel_artifact("BRIDGE")
     prepare_uv(install, python_wheel, replay)
     version = wheel_version(python_wheel)
     profile, contents = save_profile(install, replay)
@@ -1177,7 +1224,7 @@ def test_bridge_explains_how_to_convert_an_official_uv_git_install(
             }
         )
     )
-    candidate = add_shim(replay, artifact("SHIM"), artifact("RUST"))
+    candidate = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
     result = install.update(replay)
     assert result.returncode == 1
     instruction = json.loads(result.stdout)["error"]["message"]
@@ -1195,8 +1242,8 @@ def test_bridge_explains_how_to_convert_an_official_uv_git_install(
 def test_python_bridge_rejects_cross_origin_manifest_redirect(
     install: Install, replay: Replay
 ) -> None:
-    python_wheel = artifact("BRIDGE")
-    wheel = artifact("SHIM")
+    python_wheel = wheel_artifact("BRIDGE")
+    wheel = wheel_artifact("SHIM")
     prepare_uv(install, python_wheel, replay)
     version = add_shim(replay, wheel)
     manifest = f"{REPO}/releases/download/sai-cli/v{version}/SHA256SUMS"
@@ -1218,7 +1265,7 @@ def test_pre_bridge_updater_can_skip_to_the_native_shim(
     baseline, script = pre_bridge_files()
     prepare_uv(install, baseline, replay, script)
     profile, contents = save_profile(install, replay)
-    version = add_shim(replay, artifact("SHIM"), artifact("RUST"))
+    version = add_shim(replay, wheel_artifact("SHIM"), artifact("RUST"))
     result = json.loads(ok(install.update(replay)))
     assert result["status"] == "updated"
     install.pin(version)
@@ -1230,11 +1277,11 @@ def test_pre_bridge_updater_can_skip_to_the_native_shim(
 def test_windows_keeps_a_runnable_python_launcher(
     install: Install, replay: Replay, pre_bridge: bool
 ) -> None:
-    wheel = artifact("SHIM")
+    wheel = wheel_artifact("SHIM")
     if pre_bridge:
         python_wheel, script = pre_bridge_files()
     else:
-        python_wheel = artifact("BRIDGE")
+        python_wheel = wheel_artifact("BRIDGE")
         script = INSTALLER
     prepare_uv(install, python_wheel, replay, script)
     profile, contents = save_profile(install, replay)
@@ -1246,7 +1293,7 @@ def test_windows_keeps_a_runnable_python_launcher(
     expected = (
         "Native Sai supports Linux and macOS"
         if pre_bridge
-        else f"sai-cli=={PRE_BRIDGE}"
+        else f"sai-cli=={wheel_version(python_wheel)}"
     )
     assert expected in message
     assert not any(f"/sai-{version}-" in path for path in replay.requests)

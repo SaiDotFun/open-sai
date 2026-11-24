@@ -1,4 +1,4 @@
-"""Build a full Python bridge wheel at an explicitly chosen release version."""
+"""Rehearse a full Python bridge wheel at a proposed release version."""
 
 from __future__ import annotations
 
@@ -9,8 +9,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-PRE_BRIDGE = (0, 1, 2)
+from check_release import ROOT, pyproject_version
+
 VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)")
 
 
@@ -20,8 +20,16 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, required=True)
     args = parser.parse_args()
     match = VERSION.fullmatch(args.version)
-    if match is None or tuple(map(int, match.groups())) <= PRE_BRIDGE:
-        parser.error("the bridge requires a distinct stable version newer than 0.1.2")
+    current_version = pyproject_version()
+    current = VERSION.fullmatch(current_version)
+    if current is None:
+        parser.error("the checkout must name a stable Python version in pyproject.toml")
+    if match is None or tuple(map(int, match.groups())) <= tuple(
+        map(int, current.groups())
+    ):
+        parser.error(
+            f"the bridge requires a distinct stable version newer than {current_version}"
+        )
     with tempfile.TemporaryDirectory(prefix="sai-bridge-source-") as scratch:
         source = Path(scratch)
         project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")

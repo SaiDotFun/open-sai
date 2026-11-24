@@ -1238,7 +1238,7 @@ def test_no_release_and_bad_versions_install_nothing(tmp_path, sai_home):
     assert none.status == updater.NO_RELEASE
     assert none.exit_code == 0
     assert bad.status == updater.FAILED
-    assert "is not a version like 0.2.0" in bad.message
+    assert "is not a version like X.Y.Z" in bad.message
     assert script.commands == []
     assert updater.read_state()["latest"] is None
 

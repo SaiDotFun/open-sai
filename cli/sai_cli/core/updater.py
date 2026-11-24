@@ -81,7 +81,6 @@ TOOL_LOCK_NAME = ".sai-cli-update.lock"
 NATIVE_PENDING = ".sai-cli-native-pending.json"
 NATIVE_WHEELS = ".sai-cli-native-wheels"
 NATIVE_RECOVERY = ".sai-cli-recover"
-PRE_BRIDGE_PIN = "0.1.2"
 # A copy of the tool's environment, kept beside it while an update that has
 # no verified wheel to go back to replaces it.
 SNAPSHOT_PREFIX = ".sai-cli-rollback-"
@@ -763,7 +762,7 @@ def _resolve(options: Options) -> update.Release | None:
     no release yet."""
     if options.to is not None:
         if update.parse_version(options.to) is None:
-            raise UpdateFailed(f"{options.to!r} is not a version like 0.2.0")
+            raise UpdateFailed(f"{options.to!r} is not a version like X.Y.Z")
         return update.release_for(update.tag_for(options.to), options.web_base)
     try:
         release = update.fetch_latest(
@@ -1155,7 +1154,7 @@ def _install(
             discard()
             message = (
                 f"Sai {target} requires a native binary for a supported platform. "
-                f"Keep sai {installed}. The supported Python pin is `sai-cli=={PRE_BRIDGE_PIN}`."
+                f"Keep your full Python release `sai-cli=={installed}`."
             )
             return Outcome(UNSUPPORTED, message, installed, target), False
         if native and current.install.kind == update.UV_TOOL_GIT:

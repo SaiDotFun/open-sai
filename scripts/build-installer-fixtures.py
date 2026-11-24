@@ -1,4 +1,4 @@
-"""Build the pinned loopback fixtures for the Linux installer rehearsal."""
+"""Build the pinned loopback fixtures for the installer rehearsals."""
 
 from __future__ import annotations
 
@@ -10,13 +10,19 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
+from check_release import ROOT, pyproject_version
+
 BASELINE = "8557a7e13dceab0accc369191182c8e01423c91b"
 MCP = "df224a3477c1151636cd2ac90fece7d38e4b4c07"
 UPDATE = "d5e0437d2e664a70063a2246fb90cae9d9656aa2"
 DIST = "4bd968eb956c154f0a0ab53ccc288ceb78dd8713"
-NATIVE = "0.2.0"
-BRIDGE_FIXTURE = "0.1.3"
+
+
+def fixture_versions() -> tuple[str, str]:
+    major, minor, patch = map(int, pyproject_version().split("."))
+    # These versions exist only on the replay server. Use a nonzero native
+    # patch to exercise release selection independently of the cutover tag.
+    return f"{major}.{minor}.{patch + 1}", f"{major}.{minor + 1}.{patch + 1}"
 
 
 def run(*command: str, cwd: Path = ROOT, env: dict[str, str] | None = None) -> str:
@@ -75,7 +81,7 @@ impl<'a> EventContext<'a> {
 """
 
 
-def prepare_rust(source: Path) -> None:
+def prepare_rust(source: Path, version: str) -> None:
     for directory in ("sai", "sai-core", ".cargo"):
         if (ROOT / directory).is_dir():
             shutil.copytree(ROOT / directory, source / directory)
@@ -89,7 +95,7 @@ def prepare_rust(source: Path) -> None:
     workspace.write_text(
         re.sub(
             r'^version = ".*"$',
-            f'version = "{NATIVE}"',
+            f'version = "{version}"',
             metadata,
             count=1,
             flags=re.MULTILINE,
@@ -171,7 +177,7 @@ def prepare_rust(source: Path) -> None:
     )
 
 
-def build_wheels(output: Path) -> None:
+def build_wheels(output: Path, bridge: str, native: str) -> None:
     baseline = output / "pre-bridge"
     old = output / "baseline-source"
     run("git", "worktree", "add", "--detach", str(old), BASELINE)
@@ -182,7 +188,7 @@ def build_wheels(output: Path) -> None:
         sys.executable,
         "scripts/build-bridge.py",
         "--version",
-        BRIDGE_FIXTURE,
+        bridge,
         "--out-dir",
         str(output / "bridge"),
     )
@@ -202,7 +208,7 @@ def build_wheels(output: Path) -> None:
     project.write_text(
         re.sub(
             r'^version = ".*"$',
-            f'version = "{NATIVE}"',
+            f'version = "{native}"',
             project.read_text(),
             flags=re.MULTILINE,
         )
@@ -213,12 +219,23 @@ def build_wheels(output: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--rust-only", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--rust-only", action="store_true")
+    mode.add_argument("--wheels-only", action="store_true")
     args = parser.parse_args()
     output = args.output.resolve()
+    bridge, native = fixture_versions()
+    output.mkdir(parents=True, exist_ok=True)
+    if not args.wheels_only:
+        build_rust(output, native)
+    if not args.rust_only:
+        build_wheels(output, bridge, native)
+
+
+def build_rust(output: Path, version: str) -> None:
     source = output / "rust-source"
-    source.mkdir(parents=True)
-    prepare_rust(source)
+    source.mkdir()
+    prepare_rust(source, version)
     cargo = ["cargo", "build", "--bin", "sai"]
     subprocess.run(cargo, cwd=source, check=True)
     binary = Path(os.environ.get("CARGO_TARGET_DIR", source / "target")) / "debug/sai"
@@ -229,8 +246,6 @@ def main() -> None:
     )
     shutil.copy2(binary, output / "sai-mutant")
     subprocess.run(["strip", "--strip-debug", output / "sai-mutant"], check=True)
-    if not args.rust_only:
-        build_wheels(output)
 
 
 if __name__ == "__main__":

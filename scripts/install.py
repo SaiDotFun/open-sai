@@ -82,7 +82,6 @@ NATIVE_PENDING = "pending.json"
 LAUNCHER_SWITCH = ".launcher-switch/sai"
 MAX_BINARY = 96 << 20
 VERIFY_TIMEOUT = 60
-PYTHON_PIN = "0.1.2"
 
 T = TypeVar("T")
 
@@ -523,7 +522,8 @@ def native_asset(version: str) -> str:
     if system is None or cpu is None:
         raise LookupFailed(
             "native Sai supports Linux and macOS on x86-64 and ARM64."
-            f" For the Python release, run this installer with --version {PYTHON_PIN}"
+            " Run this installer with --version VERSION using a full Python version"
+            " from the release notes."
         )
     return f"sai-{version}-{cpu}-{system}.tar.gz"
 
@@ -1118,7 +1118,7 @@ def install_native(args: argparse.Namespace) -> int:
     target = launcher_target(launcher)
     if target is not None and uv_launcher(target):
         if args.version and parse_tag(TAG_PREFIX + args.version) is None:
-            raise LookupFailed(f"{args.version!r} is not a version like 0.2.0.")
+            raise LookupFailed(f"{args.version!r} is not a version like X.Y.Z.")
         command = [str(launcher), "update"]
         if args.version:
             command += ["--to", args.version]

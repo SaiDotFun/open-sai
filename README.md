@@ -22,23 +22,36 @@ curl -fsSL https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/ins
 sai --help
 ```
 
-If you installed Sai with [uv](https://docs.astral.sh/uv/), run `sai update`
-after the full-Python bridge release is available. Run it again after the
-first native release to switch to the shim and keep your uv launcher.
-On Windows, stay on the full Python release `sai-cli==0.1.2` until native
-binaries are available. The pinned installer checks the Python wheel
-against `SHA256SUMS` and caches it under `$SAI_HOME/cache/wheels`.
+If you installed Sai from a release wheel with [uv](https://docs.astral.sh/uv/),
+find the full Python bridge version in the release notes. Install it explicitly
+before running the native update. The bridge is published after the first
+native release, whose version is higher, so an unpinned update can skip the
+bridge.
 
-```powershell
-uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version 0.1.2
+```bash
+sai update --to BRIDGE_VERSION
+sai update
 ```
 
-The full-Python bridge release must ship after `sai-cli/v0.1.2` and before
-the first native tag. Rehearse its wheel with
-`uv run python scripts/build-bridge.py --version <bridge-version> --out-dir dist`.
-Before tagging the bridge, set that same version in `pyproject.toml` so the
-existing release workflow builds the matching wheel. The first native tag
-must use a higher version.
+Replace `BRIDGE_VERSION` with the version in the release notes. The second
+command selects the native release by its tag, verifies the matching shim,
+and keeps your uv launcher.
+
+On Windows, use the latest full Python release listed in the release notes.
+Replace `PYTHON_VERSION` with that release version. The installer verifies the
+wheel against `SHA256SUMS` and caches it under `$SAI_HOME/cache/wheels`.
+
+```powershell
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version PYTHON_VERSION
+```
+
+For maintainers, ship the next regular Python release, then publish the
+native archives and matching shim. Cut the bridge afterward as the last full
+Python release in the existing series. Choose its version at cut time and set
+it in `pyproject.toml` for the ordinary Python release build. It must be newer
+than the earlier full Python releases and lower than the first native
+release. To rehearse a proposed version before bumping the package metadata,
+run `uv run python scripts/build-bridge.py --version BRIDGE_VERSION --out-dir dist`.
 
 If uv installed Sai from Git, run `uv tool uninstall sai-cli` and use the
 pinned installer above with the published full-Python bridge version. Then
@@ -61,7 +74,8 @@ uv tool install git+https://github.com/SaiDotFun/open-sai
 To try the CLI without installing it:
 
 ```bash
-uvx --from https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v0.1.2/sai_cli-0.1.2-py3-none-any.whl sai --json market prices
+PYTHON_VERSION=X.Y.Z
+uvx --from "https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v${PYTHON_VERSION}/sai_cli-${PYTHON_VERSION}-py3-none-any.whl" sai --json market prices
 ```
 
 The Git install builds `main`. Run `sai --version` to check your installed version.
@@ -334,7 +348,8 @@ GitHub Release. The install script and `sai update` look for the highest
 ### Rehearse an Upgrade and Downgrade
 
 After the version bump lands on `main`, build the candidate and run the
-rehearsal with `--strict` before tagging. The release gate requires a Linux
+rehearsal with `--strict` before tagging. Replace `X.Y.Z` with the version in
+`pyproject.toml`. The release gate requires a Linux
 host that can create a loopback-only network namespace with `unshare` and
 `ip`. The script also needs Python 3.11 or later, `uv`, `claude`, and
 `codex` on `PATH`, and network access to GitHub and the Python package
@@ -342,7 +357,7 @@ index. Use executables that can run with a fresh home directory.
 
 ```bash
 uv build --wheel --out-dir dist
-python3 scripts/release-rehearsal.py --strict dist/sai_cli-0.1.2-py3-none-any.whl
+python3 scripts/release-rehearsal.py --strict dist/sai_cli-X.Y.Z-py3-none-any.whl
 ```
 
 The script installs the latest published `sai-cli` wheel in a temporary home

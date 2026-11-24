@@ -110,13 +110,14 @@ to run the release replay:
 | Variable | Local artifact |
 | --- | --- |
 | `SAI_C10B_RUST` | Rust binary built for the runner with the same version as the shim. |
-| `SAI_C10B_SHIM` | Shim wheel built from PR #116 or its merged source. For loopback downloads, substitute the fixture release source from `tests/parity/native_release_source.py` before building. |
-| `SAI_C10B_BRIDGE` | Full Python wheel built from the branch under test, at a lower version than the shim. |
-| `SAI_C10B_PRE_BRIDGE` | Directory with the Python wheel and `install.py` from `sai-cli/v0.1.2` (`8557a7e13dceab0accc369191182c8e01423c91b`), and that commit SHA in a file named `commit`. |
+| `SAI_C10B_SHIM` | Shim wheel or a directory containing it. Build it from PR #116 or its merged source. For loopback downloads, substitute the fixture release source from `tests/parity/native_release_source.py` before building. |
+| `SAI_C10B_BRIDGE` | Full Python wheel or a directory containing it. Build it from the branch under test at a lower version than the shim. |
+| `SAI_C10B_PRE_BRIDGE` | Directory with the Python wheel and `install.py` from the pinned pre-bridge commit `8557a7e13dceab0accc369191182c8e01423c91b`, and that commit SHA in a file named `commit`. |
 | `SAI_C10B_MUTANT` | A build of the same Rust source that fails `mcp serve` only when invoked via the installed standalone launcher or the persistent uv tool environment. |
 
-The Windows workflow builds both Python wheels and the shim locally, then runs
-the compatibility checks with real uv launchers. Native MCP startup is an
+The fixture builder derives rehearsal versions from `pyproject.toml`. Both
+workflows build the wheels locally and run the compatibility checks with
+real uv launchers. Native MCP startup is an
 expected failure when a build from before PR #120 reports a missing command.
 
 ## Comparison Rules
