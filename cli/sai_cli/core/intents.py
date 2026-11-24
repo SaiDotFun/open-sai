@@ -91,7 +91,7 @@ def open_intent(
         valid_slippage = False
     if not valid_slippage:
         raise SaiError(
-            "Slippage must be greater than 0 and at most 100 percent,"
+            "Slippage (--slippage) must be greater than 0 and at most 100 percent,"
             " with at most 18 decimal places and only zeros after the 16th place",
             Code.INVALID_REQUEST,
             exit_code=ExitCode.USAGE,
