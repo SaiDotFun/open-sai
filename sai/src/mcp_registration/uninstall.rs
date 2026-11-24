@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::Args;
 use sai_core::errors::SaiError;
@@ -165,14 +165,33 @@ impl Clients {
             result.planned("removed");
             return Ok(());
         }
-        if let Some(step) = step {
+        let published = if let Some(step) = step {
             client::check_writable(&path)?;
             client::run_step(&step, self.cwd(), deadline)?;
             result.changed = true;
+            None
         } else {
-            result.changed = client.remove(&path, name, entry, deadline)?;
+            let published = client.remove(&path, name, entry, deadline)?;
+            result.changed = published.is_some();
+            published
+        };
+        match self.verify_removed(client, name, scope, deadline) {
+            Ok(true) => return Err(CODEX_STILL_ACTIVE.into()),
+            Ok(false) => {}
+            Err(error) => {
+                if client == Client::Codex
+                    && let Some(published) = published
+                {
+                    if let Err(restore) =
+                        published.restore(&path, Instant::now() + Duration::from_secs(1))
+                    {
+                        return Err(format!("{error} {restore}"));
+                    }
+                    result.changed = false;
+                }
+                return Err(error);
+            }
         }
-        self.verify_removed(client, name, scope, deadline)?;
         result.report["action"] = json!("removed");
         Ok(())
     }
@@ -183,19 +202,20 @@ impl Clients {
         name: &str,
         scope: Scope,
         deadline: Instant,
-    ) -> ClientResult<()> {
-        if self
-            .registrations(client, name, deadline)?
-            .iter()
-            .any(|entry| entry.scope == scope)
-        {
+    ) -> ClientResult<bool> {
+        let entries = self.registrations(client, name, deadline)?;
+        if entries.iter().any(|entry| entry.scope == scope) {
             return Err(format!("{} still shows the sai entry", client.name()));
         }
-        if client == Client::Codex
-            && client::codex_get(self.cwd(), Scope::Project, name, deadline)?.is_some()
-        {
-            return Err(CODEX_STILL_ACTIVE.into());
+        if client == Client::Codex {
+            // A confirmed project override remains active even though the
+            // user entry was removed successfully.
+            return match client::codex_get(self.cwd(), Scope::Project, name, deadline) {
+                Ok(entry) => Ok(entry.is_some()),
+                Err(_) if entries.iter().any(|entry| entry.scope == Scope::Project) => Ok(true),
+                Err(error) => Err(error),
+            };
         }
-        Ok(())
+        Ok(false)
     }
 }

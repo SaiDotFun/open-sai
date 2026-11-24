@@ -392,6 +392,13 @@ def observe(
     state = dict(case.state or {})
     if candidate and case.accepted_divergence == "codex-repair-rollback":
         state["clients/.codex/config.toml#changed"] = False
+    if candidate and case.accepted_divergence == "codex-uninstall-rollback":
+        state["clients/.codex/config.toml#changed"] = False
+        state["clients/.codex/config.toml#data.settings.mcp_servers.sai.args"] = [
+            "mcp",
+            "serve",
+        ]
+        del state["clients/.codex/config.toml#data.settings.mcp_servers.sai"]
     check_state(state, files)
     try:
         output = stdout(result.stdout, case.mode, case.command, normalize)
@@ -616,6 +623,24 @@ def run_case(
             )
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
+    if (
+        candidate != reference
+        and case.accepted_divergence == "codex-uninstall-rollback"
+    ):
+        # The fixture asserts deletion on Python and byte-for-byte restoration
+        # on Rust. Compare the error and every other file and log record.
+        error = left.output["error"]
+        report = error["details"]
+        report["results"][0]["changed"] = False
+        report["reconnectNeeded"] = False
+        error["message"] = error["message"].removesuffix(
+            "\nClient registrations changed."
+        )
+        filename = "clients/.codex/config.toml"
+        left.files[filename] = right.files[filename]
+        left = replace(
+            left, stderr=tuple(item for item in left.stderr if item != "diagnostic")
+        )
     diffs = differences(left, right)
     expected = None
     if (

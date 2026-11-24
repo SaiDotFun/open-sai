@@ -182,8 +182,8 @@ impl Client {
         name: &str,
         old: &Registration,
         deadline: Instant,
-    ) -> Result<bool> {
-        let published = edit(path, false, deadline, |source| {
+    ) -> Result<Option<PublishedConfig>> {
+        edit(path, false, deadline, |source| {
             if self == Self::Codex {
                 return remove_codex(source, name, old);
             }
@@ -202,8 +202,7 @@ impl Client {
             let rendered =
                 serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
             Ok(format!("{}\n", crate::local::ascii_json(&rendered)))
-        })?;
-        Ok(published.is_some())
+        })
     }
 
     pub(super) fn replace_claude(
@@ -612,7 +611,7 @@ fn read_json(path: &Path, deadline: Instant) -> Result<Value> {
     }
 }
 
-struct PublishedConfig {
+pub(super) struct PublishedConfig {
     destination: PathBuf,
     original: Option<Vec<u8>>,
     replacement: String,
@@ -620,7 +619,7 @@ struct PublishedConfig {
 }
 
 impl PublishedConfig {
-    fn restore(self, path: &Path, deadline: Instant) -> Result<()> {
+    pub(super) fn restore(self, path: &Path, deadline: Instant) -> Result<()> {
         // A concurrent edit belongs to the client or user. Restore only the
         // file this repair published, even if a newer file has identical text.
         let original = self

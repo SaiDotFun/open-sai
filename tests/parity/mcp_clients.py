@@ -43,8 +43,15 @@ if program == "codex":
     entry = servers.get(name)
     project = Path(os.environ["CODEX_HOME"]) / "project.json"
     if Path.cwd() == home and name == "sai" and project.exists():
+        if entry is None and (home / "fail-second-project-query").exists():
+            observed = home / "first-project-query"
+            if observed.exists():
+                sys.exit(9)
+            observed.touch()
         entry = json.loads(project.read_text())
     if entry is None:
+        if name == "sai" and (home / "fail-uninstall-verification").exists():
+            sys.exit(9)
         sys.exit(f"Error: No MCP server named '{name}' found.")
     if (home / "fail-verification").exists() and entry["command"] == str(home / "bin/sai"):
         print("private-fixture-value-must-stay-in-client-config", file=sys.stderr)
@@ -92,6 +99,8 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
     if scenario == "empty":
         (home / ".cursor").mkdir()
         return {}
+    if scenario == "uninstall-query-failure":
+        (home / "fail-uninstall-verification").touch()
     stable = programs / "sai"
     saved = stable
     args = ["mcp", "serve"]

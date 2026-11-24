@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tomllib
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -326,6 +327,29 @@ def test_uninstall_does_not_replace_read_only_client_config(
     assert row["error"] == "The client config is read-only"
     assert row["changed"] is False
     assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444
+
+
+def test_uninstall_keeps_removal_after_confirmed_codex_override(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    seed_clients(tmp_path, fixture_env, "shadowed")
+    (tmp_path / "fail-second-project-query").touch()
+    config = tmp_path / ".codex/config.toml"
+    result = subprocess.run(
+        [candidate, "--json", "mcp", "uninstall", "codex", "--scope", "user"],
+        cwd=tmp_path,
+        env=fixture_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 1
+    details = json.loads(result.stdout)["error"]["details"]
+    (row,) = details["results"]
+    assert row["changed"] and details["reconnectNeeded"]
+    assert row["error"] == "a project .codex/config.toml entry is still active"
+    assert "sai" not in tomllib.loads(config.read_text())["mcp_servers"]
 
 
 def test_doctor_shows_only_origin_for_an_unreachable_lcd(
