@@ -569,7 +569,9 @@ class KeeperReplayTest(unittest.TestCase):
         self.key = "20261124T080000000Z_ABCDEFGHJKMNPQRS"
         self.replay.submitted.append(self.key)
 
-    def query(self, base: str, text: str, **variables: str | None) -> dict[str, Any]:
+    def query(
+        self, base: str, text: str, **variables: str | int | None
+    ) -> dict[str, Any]:
         request = urllib.request.Request(
             f"{base}/query",
             data=json.dumps({"query": text, "variables": variables}).encode(),
@@ -597,6 +599,43 @@ class KeeperReplayTest(unittest.TestCase):
             REHEARSAL["project_fields"](payload, fields),
             {"rows": [{"intentKey": "the-key", "trade": {"owner": "trader-address"}}]},
         )
+
+    def test_projects_trade_history_with_variable_pagination_and_legacy_limit(
+        self,
+    ) -> None:
+        self.replay.history = [
+            {"id": number, "intentKey": self.key, "trade": {"trader": self.replay.addr}}
+            for number in (3, 2, 1)
+        ]
+        paginated = """
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) { id trade { trader } }
+  }
+}
+"""
+        legacy = (
+            "query($trader:String!) { perp { tradeHistory(where:{trader:$trader},"
+            " limit:50, order_desc:true) { id } } }"
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for offset, ids in ((0, (3, 2)), (2, (1,)), (4, ())):
+                with self.subTest(offset=offset):
+                    data = self.query(
+                        base, paginated, trader=self.replay.addr, limit=2, offset=offset
+                    )
+                    self.assertEqual(
+                        data["perp"]["tradeHistory"],
+                        [
+                            {"id": number, "trade": {"trader": self.replay.addr}}
+                            for number in ids
+                        ],
+                    )
+            data = self.query(base, legacy, trader=self.replay.addr)
+            self.assertEqual(
+                data["perp"]["tradeHistory"], [{"id": n} for n in (3, 2, 1)]
+            )
 
     def test_requires_the_original_intent_key_and_account(self) -> None:
         addr, key = self.replay.addr, self.key

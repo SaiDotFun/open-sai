@@ -567,6 +567,7 @@ class Replay:
         self.latest = version
         self.submitted: list[str] = []
         self.lifecycle = "outcome_not_indexed"
+        self.history: list[dict[str, Any]] = []
 
     def add_release(self, wheel: Path, version: str) -> None:
         payload = wheel.read_bytes()
@@ -619,7 +620,7 @@ class Replay:
                     self.send_error(400)
                     return
                 roots = {field.name: field.children for field in selected}
-                perp = {field.name for field in roots.get("perp", ())}
+                perp = {field.name: field for field in roots.get("perp", ())}
                 if "recordUserIntent" in roots:
                     if self.headers.get("Authorization") != f"Bearer {SYNTHETIC_TOKEN}":
                         self.send_error(403)
@@ -662,7 +663,21 @@ class Replay:
                     self.reply({"data": data})
                     return
                 elif "tradeHistory" in perp:
-                    data = {"perp": {"tradeHistory": []}}
+                    arguments = perp["tradeHistory"].arguments
+                    offset = arguments.get("offset", 0)
+                    limit = arguments.get("limit", len(replay.history))
+                    if (
+                        type(offset) is not int
+                        or type(limit) is not int
+                        or min(offset, limit) < 0
+                    ):
+                        self.send_error(400)
+                        return
+                    data = {
+                        "perp": {
+                            "tradeHistory": replay.history[offset : offset + limit]
+                        }
+                    }
                 elif "oneClickTrading" in roots:
                     data = {
                         "oneClickTrading": {
@@ -1046,6 +1061,38 @@ def probe_retry(
     return True
 
 
+def probe_intent_projection(tool: Install, replay: Replay, key: str) -> None:
+    row = replay.responses["filled_history"]["data"]["perp"]["tradeHistory"][0]
+    # Intent status requests 25 rows per page. Place the matching row on page two.
+    replay.history = [{**row, "id": row["id"] + i} for i in range(25, 0, -1)]
+    replay.history.append(
+        {**row, "intentKey": key, "block": {**row["block"], "block_ts": "invalid"}}
+    )
+    replay.lifecycle = "outcome_not_indexed"
+    result = tool.json(
+        "Probe intent status projection", "intent", "status", replay.addr, "--key", key
+    )
+    require(
+        result.get("outcome") == "terminal-filled"
+        and result.get("matchedTradeHistory")
+        == [
+            {
+                "id": row["id"],
+                "intentKey": key,
+                "tradeChangeType": row["tradeChangeType"],
+                "txHash": row["txHash"].lower(),
+                "block": {"block": row["block"]["block"], "block_tsInvalid": True},
+                "trade": row["trade"],
+            }
+        ],
+        "Intent status did not project the matching history row from the next page",
+    )
+    print(
+        "Intent status projected the matching row from paginated trade history.",
+        flush=True,
+    )
+
+
 def rehearse(
     root: Path,
     wheel: Path,
@@ -1241,8 +1288,10 @@ def rehearse_staged(
                 ledger_row(ledger, key, migrated=True) == ("terminal", "terminal"),
                 "Doctor did not preserve the original open as terminal",
             )
+            probe_intent_projection(tool, replay, key)
         finally:
             replay.lifecycle = "outcome_not_indexed"
+            replay.history.clear()
             backup_ledger(checkpoint, ledger)
         print(
             "Doctor passed after Keeper reported a terminal outcome. Restored the pending ledger for downgrade.",
