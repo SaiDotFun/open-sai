@@ -58,6 +58,8 @@ def auth_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
 def auth_privacy_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     reference = os.environ.get("SAI_PARITY_AUTH_PRIVACY_PYTHON")
     if reference is None:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail("native parity CI must supply SAI_PARITY_AUTH_PRIVACY_PYTHON")
         pytest.skip("set SAI_PARITY_AUTH_PRIVACY_PYTHON to the auth privacy reference")
     executable = shutil.which(reference)
     if executable is None:

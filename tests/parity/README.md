@@ -101,6 +101,13 @@ reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
 
+## Auth Argument Privacy Reference
+
+Set `SAI_PARITY_AUTH_PRIVACY_PYTHON` to the `.venv/bin/sai` from Python
+[PR #152](https://github.com/SaiDotFun/open-sai/pull/152) at commit
+`3725b66446da215f3e84e65ad9fce36679b80c20`. The CLI tests check the
+`auth use` diagnostic and the `command.start` arguments against that build.
+
 ## C11 Python Reference
 
 The C11 parity fixes use Python tag `sai-cli/v0.1.2` at commit
