@@ -378,6 +378,8 @@ def test_import_rejects_bad_clipboard(
 def renewal_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     path = os.environ.get("SAI_PARITY_RENEW_PYTHON")
     if path is None:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail("native parity CI must supply SAI_PARITY_RENEW_PYTHON")
         pytest.skip("set SAI_PARITY_RENEW_PYTHON to the Python executable with PR 61")
     executable = shutil.which(path)
     if executable is None:

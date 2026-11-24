@@ -68,8 +68,8 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
 Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.
 Set `SAI_PARITY_AUTH_PYTHON` to the Python `sai` executable from PR 96 at
 `ea32e8e` to compare the origin-only auth output.
-Until PR 61 lands, set `SAI_PARITY_RENEW_PYTHON` to the executable from that
-branch to include renewal and expiry recovery. The test runs use private
+Set `SAI_PARITY_RENEW_PYTHON` to the Python `sai` executable from PR 61 at
+`bb92585` to include renewal and expiry recovery. CI uses both pins. The test runs use private
 temporary homes, fixture clipboard and signing commands, and loopback Keeper.
 
 The `legacy` seed contains a config file and an encrypted synthetic session
