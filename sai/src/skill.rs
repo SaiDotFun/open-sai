@@ -10,7 +10,7 @@ use std::{
 use clap::Subcommand;
 use sai_core::{
     errors::{Code, SaiError},
-    interrupt,
+    interrupt, log,
     settings::repr,
 };
 use serde_json::{Value, json};
@@ -114,9 +114,13 @@ pub fn show(page: Option<&str>) -> Result<(), SaiError> {
             } else {
                 "is ambiguous"
             };
+            let subject = if log::contains_url(name) {
+                "Skill page".to_owned()
+            } else {
+                format!("Skill page {}", repr(name))
+            };
             return Err(skill_error(format!(
-                "Skill page {} {problem}. Pages: {}",
-                repr(name),
+                "{subject} {problem}. Pages: {}",
                 known.join(", ")
             )));
         };

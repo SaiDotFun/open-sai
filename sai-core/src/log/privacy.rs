@@ -33,12 +33,22 @@ fn regex(pattern: &str) -> Regex {
 
 /// Detect URL-shaped values, including malformed ones rejected by the CLI.
 pub fn contains_url(text: &str) -> bool {
-    URL.find_iter(text).any(|matched| {
-        let (_, value) = matched.as_str().split_once("://").unwrap();
-        !value
-            .trim_end_matches(['.', ',', ':', ';', ')', ']', '}', '\'', '"'])
-            .is_empty()
-    })
+    diagnostic_urls(text).next().is_some()
+}
+
+/// Detect URLs that include more than an origin in CLI diagnostics.
+pub fn contains_private_url(text: &str) -> bool {
+    diagnostic_urls(text).any(|url| origin(url) != url)
+}
+
+fn diagnostic_urls(text: &str) -> impl Iterator<Item = &str> {
+    URL.find_iter(text)
+        .map(|matched| {
+            matched
+                .as_str()
+                .trim_end_matches(['.', ',', ':', ';', ')', '}', '\'', '"'])
+        })
+        .filter(|url| !url.ends_with("://"))
 }
 
 /// A log field with its text redaction policy.

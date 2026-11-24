@@ -309,9 +309,11 @@ fn load_settings(flags: &Flags, env: &Environment) -> Result<Settings, SettingsE
 
 const INVALID_ARGUMENTS: &str = "Invalid command arguments.";
 
-fn usage_diagnostic(text: &str) -> &str {
-    if log::contains_url(text) {
+fn error_diagnostic(text: &str, code: ExitCode) -> &str {
+    if code == ExitCode::Usage && log::contains_url(text) {
         INVALID_ARGUMENTS
+    } else if log::contains_private_url(text) {
+        "Command failed. The error contained a private URL."
     } else {
         text
     }
@@ -334,11 +336,7 @@ fn complete(
         return (error.exit_code, Some(error));
     }
     let redact = |text: &str| {
-        let text = if error.exit_code == ExitCode::Usage {
-            usage_diagnostic(text)
-        } else {
-            text
-        };
+        let text = error_diagnostic(text, error.exit_code);
         home.map_or_else(|| text.to_owned(), |home| log::redact(home, text))
     };
     let message = redact(&error.message);
@@ -448,9 +446,15 @@ fn finish(
         ];
         if let Some(error) = error {
             fields.push(("code", json!(error.code).into()));
-            fields.push(("error", Field::Untrusted(error.message)));
+            fields.push((
+                "error",
+                Field::Untrusted(error_diagnostic(&error.message, code).into()),
+            ));
             if let Some(key) = error.intent_key {
-                fields.push(("intentKey", Field::Text(key)));
+                fields.push((
+                    "intentKey",
+                    Field::Text(error_diagnostic(&key, code).into()),
+                ));
             }
         }
         writer.event(Surface::Cli, "command.end", level, fields);
@@ -717,7 +721,10 @@ fn print_parse_error(
     if let Some(usage) = usage_error(error, usage_command, operands) {
         if !json && error.kind() == ErrorKind::InvalidValue && usage.message.starts_with("Option ")
         {
-            eprintln!("Error: {}", usage_diagnostic(&usage.message));
+            eprintln!(
+                "Error: {}",
+                error_diagnostic(&usage.message, ExitCode::Usage)
+            );
             return (ExitCode::Usage, Some(usage));
         }
         return complete(Err(usage), Some(usage_command), json, home);

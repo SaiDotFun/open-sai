@@ -1036,6 +1036,32 @@ def test_usage_errors_hide_rejected_endpoint_credentials(
             assert all(marker in output for marker in markers)
 
 
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_skill_page_error_hides_endpoint_credentials(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    flags: tuple[str, ...],
+) -> None:
+    _, rust = local_pair
+    rejected = "https://fixture.invalid/page?api_key=fixture-page-key"
+    result = invoke(
+        rust, tmp_path, *flags, "skill", "show", "--page", rejected, logging="1"
+    )
+    assert result.returncode == 1
+    assert b"fixture-page-key" not in result.stdout + result.stderr
+    message = (
+        json.loads(result.stdout)["error"]["message"]
+        if flags
+        else result.stderr.decode()
+    )
+    assert (
+        "Skill page" in message
+        and "Pages: " in message
+        and "references/contracts" in message
+    )
+    assert not list((tmp_path / "sai-home/logs").glob("*.jsonl"))
+
+
 @pytest.mark.parametrize(
     "args",
     [
