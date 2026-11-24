@@ -19,10 +19,16 @@ from compare import (
 from parity import Observation, differences
 
 
-def test_log_ids_preserve_joins_and_sequence(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("field", "prefix", "length"),
+    [("callId", "", 12), ("commandId", "", 32), ("endpointId", "h1_", 64)],
+)
+def test_log_ids_preserve_joins_and_sequence(
+    tmp_path: Path, field: str, prefix: str, length: int
+) -> None:
     def records(run: str, calls: list[str], times: list[str]) -> list[dict]:
         return [
-            {"runId": run, "callId": call, "seq": seq, "ts": stamp, "event": event}
+            {"runId": run, field: call, "seq": seq, "ts": stamp, "event": event}
             for seq, (call, stamp, event) in enumerate(
                 zip(
                     calls,
@@ -40,27 +46,49 @@ def test_log_ids_preserve_joins_and_sequence(tmp_path: Path) -> None:
         "2026-11-24T01:00:02.000Z",
     ]
     reference = Normalize(tmp_path).log_records(
-        records("a" * 32, ["b" * 12] * 3, times)
+        records("a" * 32, [prefix + "b" * length] * 3, times)
     )
+    candidate_id = prefix + "d" * length
     candidate = records(
-        "c" * 32, ["d" * 12] * 3, [stamp.replace("01:", "02:", 1) for stamp in times]
+        "c" * 32,
+        [candidate_id] * 3,
+        [stamp.replace("01:", "02:", 1) for stamp in times],
     )
     assert (
         first_difference(reference, Normalize(tmp_path).log_records(candidate), "logs")
         is None
     )
 
-    candidate[1]["callId"] = "e" * 12
+    candidate[1][field] = prefix + "e" * length
     assert (
         first_difference(reference, Normalize(tmp_path).log_records(candidate), "logs")
-        == "logs[1].callId"
+        == f"logs[1].{field}"
     )
-    candidate[1]["callId"] = "d" * 12
+    candidate[1][field] = candidate_id
     candidate.reverse()
     assert (
         first_difference(reference, Normalize(tmp_path).log_records(candidate), "logs")
         == "logs[0].event"
     )
+
+
+def test_snapshot_compares_log_endpoint_key_mode_and_length(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    key = logs / ".endpoint-key"
+    key.write_bytes(b"a" * 32)
+    key.chmod(0o600)
+    normalize = Normalize(tmp_path)
+    expected = snapshot(tmp_path, normalize)
+    key.write_bytes(b"b" * 32)
+    assert snapshot(tmp_path, normalize) == expected
+
+    key.chmod(0o644)
+    assert snapshot(tmp_path, normalize) != expected
+    key.chmod(0o600)
+    key.write_bytes(b"b" * 31)
+    with pytest.raises(ValueError, match=r"Cannot decode logs/\.endpoint-key"):
+        snapshot(tmp_path, normalize)
 
 
 def test_json_compares_keys_and_types() -> None:

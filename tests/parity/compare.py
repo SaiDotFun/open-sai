@@ -83,8 +83,8 @@ def config_text(text: str, edited_key: str) -> str:
     return "".join(lines)
 
 
-# Can be supplied to Normalize from docs/log-events.json once the registry
-# defines its format. Values select a normalization rule, never a deletion.
+# The log schema lists volatile fields in docs/log-events.json. Intent keys
+# are also generated in parity cases and must join to the ledger and stdout.
 LOG_VOLATILE_FIELDS: Mapping[str, str] = {
     "ts": "timestamp",
     "durationMs": "duration",
@@ -92,6 +92,8 @@ LOG_VOLATILE_FIELDS: Mapping[str, str] = {
     "pid": "pid",
     "runId": "runId",
     "callId": "callId",
+    "commandId": "commandId",
+    "endpointId": "endpointId",
     "intentKey": "intentKey",
 }
 
@@ -180,6 +182,8 @@ class Normalize:
         id_shapes = {
             "runId": r"[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
             "callId": r"[0-9a-fA-F]{12}",
+            "commandId": r"[0-9a-f]{32}",
+            "endpointId": r"h1_[0-9a-f]{64}",
             "intentKey": INTENT_ID,
         }
         for field, rule in self.log_fields.items():
@@ -550,6 +554,10 @@ def content(path: Path, name: str, normalize: Normalize) -> Any:
         value = normalize.paths(json.loads(path.read_text(encoding="utf-8")))
         replace_if(value, "checkedAt", timestamp)
         return value
+    if name == "logs/.endpoint-key":
+        if path.stat().st_size != 32:
+            raise ValueError("Expected a 32-byte log endpoint key")
+        return "<generated endpoint key>"
     return path.read_bytes()
 
 
