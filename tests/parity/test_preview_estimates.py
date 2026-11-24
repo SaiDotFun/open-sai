@@ -6,11 +6,12 @@ import json
 import os
 import re
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 from scenarios import child_env, loopback, seed_home
-from test_trade import CANCEL, CLI, CLOSE, OPEN, rows
+from test_trade import CANCEL, CLI, CLOSE, OPEN, rows, run
 
 OBSERVED_AT = re.compile(rb'"observedAt": "\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"')
 OPEN_READS = (
@@ -221,8 +222,67 @@ def test_dry_run_estimates(
             assert (completed.returncode, completed.stderr) == (0, b"")
             preview = json.loads(completed.stdout)
             assert preview["estimates"][status_field]["status"] == status
-            assert [request.label for request in endpoints.wire] == wire.split()
+            expected_wire = wire.split()
+            if index == 1 and wire.startswith(POSITION_READS):
+                # PR 148 validates both owners before reading market inputs.
+                expected_wire = [
+                    "trade",
+                    *expected_wire[:2],
+                    "get_trade_raw",
+                    "borrowing",
+                    *expected_wire[5:],
+                ]
+            assert [request.label for request in endpoints.wire] == expected_wire
             assert not endpoints.errors
             assert not rows(home)
             outputs.append(OBSERVED_AT.sub(b'"observedAt": "<time>"', completed.stdout))
     assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize(
+    ("scenario", "message", "wire"),
+    [
+        (
+            "quote-foreign-keeper-owner",
+            "Keeper position belongs to a different account",
+            "trade",
+        ),
+        (
+            "quote-wrong-position-index",
+            "Keeper returned a different position index",
+            "trade",
+        ),
+        (
+            "quote-foreign-contract-owner",
+            "Contract position belongs to a different account",
+            "trade oneClickTrading node_info get_trade_raw",
+        ),
+    ],
+)
+def test_close_quote_checks_the_position_owner_and_index(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, scenario: str, message: str, wire: str
+) -> None:
+    # The workspace Python includes the merged PR 148, which checks Perp
+    # ownership before querying the borrowing.
+    reference = str(Path(sys.executable).with_name("sai"))
+    for index, cli in enumerate(((reference,), cli_pair[1])):
+        with loopback(scenario) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, output, stderr = run(
+                cli, home, endpoints, (*CLOSE, "--dry-run"), python=index == 0
+            )
+            assert (code, output, stderr) == (
+                1,
+                {
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": message,
+                        "retryable": False,
+                    }
+                },
+                "",
+            )
+            assert [request.label for request in endpoints.wire] == wire.split()
+            assert not endpoints.errors
+            assert not rows(home)

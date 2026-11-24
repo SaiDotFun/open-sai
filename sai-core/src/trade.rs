@@ -251,7 +251,7 @@ impl<'a> Trading<'a> {
                     PreviewMode::Mcp,
                     market_row,
                 )
-                .await;
+                .await?;
                 *fresh = replacement.confirmed_output(Some(account));
             }
             return Err(error);

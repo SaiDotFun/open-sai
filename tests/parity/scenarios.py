@@ -285,6 +285,10 @@ def loopback(
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
+    if scenario == "quote-foreign-keeper-owner":
+        trade["trader"] = OTHER_ADDRESS
+    if scenario == "quote-wrong-position-index":
+        trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
     history = {
         "id": 7,
@@ -459,6 +463,8 @@ def loopback(
         contracts["get_market"].update(block_last_opened=50, block_last_closed=100)
     if scenario == "quote-close-fee-cap":
         contracts["get_fees"]["close_fee_p"] = "2"
+    if scenario == "quote-foreign-contract-owner":
+        contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
     contract_args = {
         "get_trade_raw": {
             "trader": (
@@ -804,12 +810,17 @@ def loopback(
                         expected = {name: contract_args[name]}
                         # Ownership uses the account address. The next read
                         # uses Perp's stored owner to pin the quote.
+                        owner_read = (
+                            scenario.startswith("quote-")
+                            and name == "get_trade_raw"
+                            and query == {name: {"trader": ADDRESS, "index": 7}}
+                        )
                         if (
                             scenario == "concurrent-close"
                             and name == "get_trade_raw"
                             and query
                             == {name: {"trader": position["trader"], "index": 7}}
-                        ):
+                        ) or owner_read:
                             expected = query
                         if not same_variables(query, expected):
                             self.reject(f"Wrong LCD variables for {name}")
@@ -828,7 +839,9 @@ def loopback(
                             ):
                                 self.reject(f"Quote must pin {name} to block 120")
                                 return
-                            if (pinned or anchor) and "_sai_query" not in parse_qs(
+                            if (
+                                pinned or anchor or owner_read
+                            ) and "_sai_query" not in parse_qs(
                                 urlsplit(self.path).query
                             ):
                                 self.reject(f"Expected a fresh {name} query")

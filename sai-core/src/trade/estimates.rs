@@ -60,7 +60,7 @@ impl Trading<'_> {
             self.check_pending_order(session, &preview).await?;
         }
         self.estimate_preview(&mut preview, session, mode, market_row)
-            .await;
+            .await?;
         Ok(preview)
     }
 
@@ -70,13 +70,14 @@ impl Trading<'_> {
         session: Option<&Session>,
         mode: PreviewMode,
         market_row: Option<Value>,
-    ) {
+    ) -> Result<(), SaiError> {
         preview.estimates = match preview.intent.kind {
             "OPEN_TRADE" => Some(self.open_estimates(preview, mode, market_row).await),
-            "CLOSE_POSITION" => Some(self.close_estimates(preview, session).await),
+            "CLOSE_POSITION" => Some(self.close_estimates(preview, session).await?),
             "CANCEL_PENDING_TRADE" => Some(cancel::estimates()),
             _ => None,
         };
+        Ok(())
     }
 
     async fn open_estimates(
