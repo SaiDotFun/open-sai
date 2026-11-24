@@ -21,7 +21,8 @@ use crate::{
 
 pub use diagnostics::{lcd_network, websocket_handshake};
 pub(crate) use public::{
-    known_intent_field, log_intent_error_code, log_intent_record, request_hash,
+    intent_history, intent_record, known_intent_field, log_intent_error_code, log_intent_record,
+    request_hash, wait_error_code,
 };
 pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
@@ -91,7 +92,7 @@ impl<'a> Keeper<'a> {
             .into_iter()
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
-        let intent = if query == INTENTS {
+        let intent = if matches!(query, INTENTS | WAIT_INTENTS) {
             variables
                 .get("key")
                 .and_then(Value::as_str)
@@ -100,10 +101,20 @@ impl<'a> Keeper<'a> {
             None
         };
         let mut response = ResponseLog::default();
+        let post = async {
+            let post = self.post(query, &variables, token, timeout, &mut response);
+            if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
+                tokio::time::timeout(timeout, post)
+                    .await
+                    .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))
+            } else {
+                post.await
+            }
+        };
         let (result, interrupted) = tokio::select! {
             biased;
             error = interrupt => (Err(error), true),
-            result = self.post(query, &variables, token, timeout, &mut response) => (result, false),
+            result = post => (result, false),
         };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {

@@ -276,7 +276,7 @@ fn keep_intent_key(out: &mut Map<String, Value>, key: &Value) {
     );
 }
 
-fn intent_record(row: &Map<String, Value>) -> Value {
+pub(crate) fn intent_record(row: &Map<String, Value>) -> Value {
     project_intent_record(row, false)
 }
 
@@ -373,7 +373,7 @@ fn error_code(row: &Map<String, Value>, logging: bool) -> Option<&str> {
     })
 }
 
-fn intent_history(row: &Map<String, Value>) -> Value {
+pub(crate) fn intent_history(row: &Map<String, Value>) -> Value {
     history_row(row, |block, timestamp| {
         keep(block, "block_ts", timestamp, block_time(timestamp));
     })
@@ -422,4 +422,27 @@ fn history_row(
         history.insert("block".into(), Value::Object(public));
     }
     Value::Object(history)
+}
+
+pub(crate) fn wait_error_code(row: &Value, public: &Value) -> Value {
+    const ADDITIONAL_CODES: &[&str] = &[
+        "withdraw_evm_unconfigured",
+        "invalid_withdraw",
+        "intent_validation_failed",
+        "chain_switch_failed",
+        "gas_estimation_failed",
+        "wallet_rejected",
+        "wallet_sign_failed",
+        "chain_mismatch",
+        "request_pending",
+        "rpc_submission_failed",
+        "sign_failed_unknown",
+        "intent_auth_rejected",
+        "jwt_failed",
+    ];
+    if known(&row["errorCode"], ADDITIONAL_CODES) {
+        row["errorCode"].clone()
+    } else {
+        public["errorCode"].clone()
+    }
 }

@@ -22,7 +22,7 @@ sha2.workspace = true
 tempfile.workspace = true
 signal-hook = { version = "0.3", default-features = false }
 toml_edit = { workspace = true, features = ["display"] }
-tokio = { workspace = true, features = ["process", "signal"] }
+tokio = { workspace = true, features = ["process", "signal", "sync"] }
 uuid.workspace = true
 zeroize.workspace = true
 zmij = "1"

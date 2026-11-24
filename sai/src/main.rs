@@ -129,7 +129,7 @@ impl Cli {
         operands: &[String],
         start_log: impl FnOnce(),
         writer: Option<&Arc<LogWriter>>,
-    ) -> Result<(), SaiError> {
+    ) -> Result<ExitCode, SaiError> {
         let flags = Flags {
             endpoint: self.endpoint,
             ws_endpoint: self.ws_endpoint,
@@ -140,7 +140,7 @@ impl Cli {
                 auth::dispatch(command, self.account.as_deref(), &flags, env, json, events)
             }
             Some(Command::Intent { command, .. }) => {
-                local::intent(command, &flags, env, json, events)
+                local::intent(command, self.account.as_deref(), &flags, env, json, events)
             }
             Some(Command::Config { command }) => command.run(&flags, env, json),
             Some(Command::Mcp(args)) => args.run(
@@ -173,6 +173,7 @@ impl Cli {
                 })
             }
         }
+        .map(|()| ExitCode::Ok)
     }
 }
 
@@ -269,7 +270,15 @@ fn execute(
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
                 .and_then(|env| cli.run(env, json, events, operands, start_log, writer.as_ref()));
-            complete(result, usage_command, json && command != "mcp serve", home)
+            match result {
+                Ok(code) => (code, None),
+                Err(error) => complete(
+                    Err(error),
+                    usage_command,
+                    json && command != "mcp serve",
+                    home,
+                ),
+            }
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
@@ -400,6 +409,7 @@ fn usage(command: &str) -> String {
         "logs intent" => " KEY",
         "logs run" => " ID",
         "trade close" | "trade cancel" => " TRADE_ID",
+        "intent wait" => " KEY",
         "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
@@ -587,9 +597,17 @@ fn print_parse_error(
             {
                 return complete(Err(SaiError::usage(help)), Some(command), json, home);
             }
+            if command == "intent wait" && json {
+                return complete(
+                    Err(SaiError::usage("Missing argument 'KEY'.")),
+                    Some(command),
+                    true,
+                    home,
+                );
+            }
             if matches!(
                 command,
-                "config" | "intent" | "auth" | "market" | "account" | "watch"
+                "config" | "intent" | "intent wait" | "auth" | "market" | "account" | "watch"
             ) && let Some(help) = help()
             {
                 let error = SaiError::usage(help);
