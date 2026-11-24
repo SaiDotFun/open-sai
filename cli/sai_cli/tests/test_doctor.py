@@ -17,7 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import pytest
 from click.testing import CliRunner
@@ -955,7 +955,7 @@ class Stub:
         self.queries: list[str] = []
         self.paths: list[str] = []
         self.lcd_paths: list[str] = []
-        self.echo_lcd_target = False
+        self.reflect_lcd_network: Callable[[str], str] | None = None
 
 
 @pytest.fixture
@@ -1011,7 +1011,11 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
         def do_GET(self):
             state.lcd_paths.append(self.path)
             assert urlsplit(self.path).path.endswith(margin.NODE_INFO_PATH)
-            network = self.path if state.echo_lcd_target else state.network
+            network = (
+                state.reflect_lcd_network(self.path)
+                if state.reflect_lcd_network is not None
+                else state.network
+            )
             info = {} if network is None else {"network": network}
             self.reply({"default_node_info": info})
 
@@ -1098,7 +1102,8 @@ def test_network_checks_pass_against_stubs(http_stub):
     assert by_id["keeper"].status == "pass"
     assert by_id["websocket"].status == "pass"
     assert by_id["lcd"].status == "pass"
-    assert by_id["lcd"].details["network"] == "cataclysm-1"
+    assert by_id["lcd"].details == {"endpoint": base, "matchesKeeperChain": True}
+    assert "matches Keeper chain cataclysm-1" in by_id["lcd"].summary
     assert state.lcd_paths == [
         f"/fixture-lcd-path{margin.NODE_INFO_PATH}?key=fixture-lcd-query"
     ]
@@ -1114,9 +1119,29 @@ def test_lcd_with_an_invalid_network_fails(http_stub, network):
     assert check.details == {"endpoint": base}
 
 
-def test_doctor_does_not_echo_an_lcd_request_target(http_stub, isolated_home):
+@pytest.mark.parametrize(
+    ("reflect", "status", "summary"),
+    [
+        pytest.param(lambda target: target, "fail", "invalid chain ID", id="target"),
+        pytest.param(
+            lambda target: urlsplit(target).path.split("/")[1],
+            "warn",
+            "LCD network differs from Keeper chain cataclysm-1",
+            id="path-segment",
+        ),
+        pytest.param(
+            lambda target: parse_qs(urlsplit(target).query)["key"][0],
+            "warn",
+            "LCD network differs from Keeper chain cataclysm-1",
+            id="query-key",
+        ),
+    ],
+)
+def test_doctor_does_not_echo_a_reflected_lcd_network(
+    http_stub, isolated_home, reflect, status, summary
+):
     base, state = http_stub
-    state.echo_lcd_target = True
+    state.reflect_lcd_network = reflect
     path_key, query_key = "fixture-private-lcd-path", "fixture-private-lcd-query"
     target = f"/{path_key}{margin.NODE_INFO_PATH}?key={query_key}"
     ws, stop = ws_stub(ack=True)
@@ -1132,13 +1157,19 @@ def test_doctor_does_not_echo_an_lcd_request_target(http_stub, isolated_home):
                 "--lcd-endpoint",
                 f"{base}/{path_key}?key={query_key}",
             )
-            assert code == 1
-            assert "invalid chain ID" in output
+            assert code == (1 if status == "fail" else 0)
+            assert summary in output
             assert path_key not in output and query_key not in output
             if flags:
-                checks = json.loads(output)["error"]["details"]["checks"]
-                lcd = next(check for check in checks if check["id"] == "lcd")
-                assert lcd["details"] == {"endpoint": base}
+                report = json.loads(output)
+                if status == "fail":
+                    report = report["error"]["details"]
+                lcd = next(check for check in report["checks"] if check["id"] == "lcd")
+                assert lcd["status"] == status
+                details = {"endpoint": base}
+                if status == "warn":
+                    details["matchesKeeperChain"] = False
+                assert lcd["details"] == details
     finally:
         stop()
     assert state.lcd_paths == [target, target]
@@ -1146,8 +1177,19 @@ def test_doctor_does_not_echo_an_lcd_request_target(http_stub, isolated_home):
     logs = "".join(
         path.read_text() for path in (isolated_home / "logs").glob("*.jsonl")
     )
-    assert '"event":"doctor.result"' in logs
     assert path_key not in logs and query_key not in logs
+    results = [json.loads(line) for line in logs.splitlines()]
+    lcd_results = [
+        check
+        for result in results
+        if result["event"] == "doctor.result"
+        for check in result["checks"]
+        if check["id"] == "lcd"
+    ]
+    assert len(lcd_results) == 2
+    assert all(
+        row["status"] == status and summary in row["summary"] for row in lcd_results
+    )
 
 
 @pytest.fixture
@@ -1274,7 +1316,8 @@ def test_lcd_on_another_chain_warns(http_stub):
         stop()
     lcd = next(check for check in checks if check.id == "lcd")
     assert lcd.status == "warn"
-    assert "Keeper trades on cataclysm-1" in lcd.summary
+    assert "LCD network differs from Keeper chain cataclysm-1" in lcd.summary
+    assert lcd.details == {"endpoint": base, "matchesKeeperChain": False}
 
 
 def test_silent_websocket_fails_within_the_timeout():

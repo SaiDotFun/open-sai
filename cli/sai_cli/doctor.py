@@ -76,6 +76,7 @@ class Check:
     duration_ms: int = 0
     changes: list[str] = field(default_factory=list)
     invalid_endpoint: bool = False
+    _lcd_chain_id: str | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1230,9 +1231,9 @@ def check_lcd(ctx: Context) -> Check:
     return Check(
         "lcd",
         "pass",
-        f"{url} answered in {elapsed_ms(start)} ms (network {network})",
-        None,
-        {"endpoint": url, "network": network},
+        f"{url} answered in {elapsed_ms(start)} ms",
+        details={"endpoint": url},
+        _lcd_chain_id=network,
     )
 
 
@@ -1246,11 +1247,17 @@ def cross_check_network(checks: list[Check]) -> None:
     if keeper_check is None or lcd_check is None or lcd_check.status != "pass":
         return
     chain = keeper_check.details.get("chainId")
-    network = lcd_check.details.get("network")
-    if chain and network and chain != network:
-        lcd_check.status = "warn"
-        lcd_check.summary += f"; Keeper trades on {chain}"
-        lcd_check.fix = "Pass the --lcd-endpoint for Keeper's chain"
+    network = lcd_check._lcd_chain_id
+    if not isinstance(chain, str) or not chain or network is None:
+        return
+    matches = chain == network
+    lcd_check.details["matchesKeeperChain"] = matches
+    if matches:
+        lcd_check.summary += f" (matches Keeper chain {chain})"
+        return
+    lcd_check.status = "warn"
+    lcd_check.summary += f"; LCD network differs from Keeper chain {chain}"
+    lcd_check.fix = "Pass the --lcd-endpoint for Keeper's chain"
 
 
 LOCAL_CHECKS: list[tuple[str, CheckFn]] = [
