@@ -111,13 +111,11 @@ class Registration:
         )
 
     def matches_command(self, target: Target) -> bool:
-        if self.argv == target.argv:
-            return True
         return bool(
             self.argv
             and target.argv
             and self.argv[1:] == target.argv[1:]
-            and shutil.which(self.argv[0]) is not None
+            and not missing_absolute_launcher(self.argv[0])
             and normalize_launcher(self.argv[0]) == normalize_launcher(target.argv[0])
         )
 
@@ -255,6 +253,10 @@ def normalize_launcher(command: str) -> str:
         return command
     directory, name = os.path.split(command)
     return os.path.join(os.path.realpath(directory), name)
+
+
+def missing_absolute_launcher(command: str) -> bool:
+    return os.path.isabs(command) and shutil.which(command) is None
 
 
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
@@ -929,6 +931,10 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
     result = Result(client.name, "failed", command=target.argv, scope=scope)
     try:
+        if missing_absolute_launcher(target.argv[0]):
+            raise ClientError(
+                "The requested server launcher is missing or not executable"
+            )
         if isinstance(client, Codex):
             client.check_scope(scope)
             client.require_exe()

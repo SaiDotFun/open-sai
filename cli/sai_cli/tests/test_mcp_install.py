@@ -937,6 +937,21 @@ def test_codex_install_replaces_launcher_with_a_missing_path_component(env: Env)
     assert entry["command"] == str(env.sai)
 
 
+def test_codex_install_rejects_a_matching_broken_explicit_launcher(env: Env):
+    launcher = env.root / "removed-directory" / ".." / "bin" / "sai"
+    argv = [str(launcher), *serve(env)[1:]]
+    env.write_codex({"sai": claude_entry(argv, {"CUSTOM": SECRET})})
+    original = env.codex_path().read_bytes()
+
+    result = invoke("mcp", "install", "codex", "--", *argv)
+
+    assert "requested server launcher is missing or not executable" in failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    assert row["action"] == "failed" and not row["changed"]
+    assert env.codex_path().read_bytes() == original
+    assert not env.calls()
+
+
 def test_install_uses_each_clients_registration_backend(env: Env):
     result = invoke("mcp", "install", "claude", "codex", "cursor")
     assert result.exit_code == 0, result.output
