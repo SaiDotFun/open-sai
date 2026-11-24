@@ -137,6 +137,44 @@ def test_auth_use_missing(
 
 
 @pytest.mark.parametrize(
+    ("args", "command_words", "parse_error"),
+    [
+        (("--json", "--as", "{private}", "auth", "list"), ["auth", "list"], None),
+        (("auth", "use", "{private}"), ["auth", "use"], None),
+        (("{private}", "auth", "import"), [], "Invalid arguments to auth."),
+        (
+            ("auth", "use", "--{private}"),
+            ["auth", "use"],
+            "No such option for auth.",
+        ),
+    ],
+    ids=["root-value", "leaf-value", "unrecognized-root-operand", "unknown-option"],
+)
+def test_auth_logs_omit_argument_values(
+    tmp_path: Path,
+    auth_privacy_pair: tuple[CLI, CLI],
+    args: CLI,
+    command_words: list[str],
+    parse_error: str | None,
+) -> None:
+    marker = "synthetic-auth-argument-value"
+    for env in homes(tmp_path, auth_privacy_pair):
+        env.extra_env["SAI_LOG"] = "1"
+        env.run(*(arg.replace("{private}", marker) for arg in args))
+        logs = [
+            path.read_text(encoding="utf-8")
+            for path in (env.home / "logs").glob("*.jsonl")
+        ]
+        assert all(marker not in text for text in logs)
+        events = [json.loads(line) for text in logs for line in text.splitlines()]
+        [start] = [event for event in events if event["event"] == "command.start"]
+        assert start["argv"] == command_words
+        if parse_error is not None:
+            [end] = [event for event in events if event["event"] == "command.end"]
+            assert end["error"] == parse_error
+
+
+@pytest.mark.parametrize(
     ("case", "expected_code", "challenges", "exchanges"),
     [
         ("cast", 0, 1, 1),

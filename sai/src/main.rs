@@ -144,6 +144,8 @@ fn main() -> process::ExitCode {
         .collect();
     let (command, operands) = command_path(&argv);
     let command = command.as_str();
+    let auth_attempt = command.split(' ').next() == Some("auth")
+        || (command.is_empty() && argv.iter().any(|arg| arg == "auth"));
     let environment = Environment::from_process();
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
@@ -207,20 +209,16 @@ fn main() -> process::ExitCode {
         if let Some(writer) = &writer
             && !log_started.replace(true)
         {
-            // A stray argument to import can contain a token.
-            let logged_argv = if command == "auth import" {
-                &argv[..argv.len() - operands.len()]
+            let logged_argv = if auth_attempt {
+                Field::argv(command.split_whitespace().map(str::to_owned))
             } else {
-                &argv
+                Field::argv(argv.iter().take(64).cloned())
             };
             writer.event(
                 surface,
                 "command.start",
                 Level::Info,
-                [
-                    ("command", command_field()),
-                    ("argv", Field::argv(logged_argv.iter().take(64).cloned())),
-                ],
+                [("command", command_field()), ("argv", logged_argv)],
             );
         }
     };
@@ -237,7 +235,17 @@ fn main() -> process::ExitCode {
                 .and_then(|env| cli.run(env, json, events, operands, start_log, writer.as_ref()));
             complete(result, usage_command, json && command != "mcp serve", home)
         }
-        Err(error) => print_parse_error(&error, command, operands, requested_json, home),
+        Err(error) => {
+            let (code, mut failure) =
+                print_parse_error(&error, command, operands, requested_json, home);
+            if auth_attempt
+                && code == ExitCode::Usage
+                && let Some(failure) = &mut failure
+            {
+                failure.message = auth_usage_log_message(&error, command, &failure.message).into();
+            }
+            (code, failure)
+        }
     };
     start_log();
     finish(
@@ -452,6 +460,25 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
         Some(value)
     } else {
         None
+    }
+}
+
+// Clap's usage diagnostics can include operands and unknown option names.
+fn auth_usage_log_message<'a>(error: &clap::Error, command: &str, message: &'a str) -> &'a str {
+    let option = (error.kind() == ErrorKind::UnknownArgument)
+        .then(|| context_text(error, ContextKind::InvalidArg))
+        .flatten()
+        .filter(|arg| arg.starts_with('-'));
+    if option == Some("--json") {
+        "No such option: --json"
+    } else if command == "auth import" {
+        "Unexpected arguments to auth import."
+    } else if option.is_some() {
+        "No such option for auth."
+    } else if error.kind() == ErrorKind::MissingRequiredArgument {
+        message
+    } else {
+        "Invalid arguments to auth."
     }
 }
 
