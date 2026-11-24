@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
@@ -123,6 +123,21 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         (sai_home / "trader").chmod(0o700)
         for name in ("config.toml", "trader/sessions.json"):
             (sai_home / name).chmod(0o600)
+        return
+    if seed == "update-state":
+        path = sai_home / "update.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "latest": "sai-cli/v0.88.0",
+                    "result": {"status": "failed", "to": "0.88.0", "rolledBack": True},
+                    "notified": "failed:0.88.0",
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
         return
     if seed in {"config", "config-logs-disabled"}:
         path = sai_home / "config.toml"
@@ -277,7 +292,12 @@ def loopback(scenario: str) -> Generator[Endpoints]:
 
     class Handler(BaseHTTPRequestHandler):
         def reply(
-            self, value: object, status_code: int = 200, *, lcd: bool = False
+            self,
+            value: object,
+            status_code: int = 200,
+            *,
+            lcd: bool = False,
+            next_page: bool = False,
         ) -> None:
             body = json.dumps(value).encode()
             self.send_response(status_code)
@@ -285,6 +305,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             if lcd:
                 self.send_header("grpc-metadata-x-cosmos-block-height", "120")
             self.send_header("Content-Length", str(len(body)))
+            if next_page:
+                self.send_header("Link", '<ignored>; rel="next"')
             self.end_headers()
             self.wfile.write(body)
 
@@ -363,6 +385,56 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 pass
             self.reject("Unsupported Keeper request")
 
+        def do_HEAD(self) -> None:
+            if (
+                urlsplit(self.path).path
+                != f"{scope}/SaiDotFun/open-sai/releases/latest"
+            ):
+                self.reject("Unsupported release redirect request")
+                return
+            wire.append(WireRequest("release-redirect"))
+            path = f"{scope}/SaiDotFun/open-sai/releases"
+            if scenario == "update-rate-limit-tag":
+                path += "/tag/sai-cli/v0.99.0"
+            self.send_response(302)
+            self.send_header("Location", path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def releases(self) -> None:
+            query = parse_qs(urlsplit(self.path).query)
+            if (
+                query == {"per_page": ["100"], "page": ["2"]}
+                and scenario == "update-pages"
+            ):
+                wire.append(WireRequest("releases-page-2"))
+                self.reply([{"tag_name": "sai-cli/v0.99.0"}])
+                return
+            if query != {"per_page": ["100"], "page": ["1"]}:
+                self.reject("Unexpected release-list page")
+                return
+            wire.append(WireRequest("releases"))
+            if scenario.startswith("update-rate-limit-"):
+                self.reply({}, 429)
+            elif scenario == "update-bad-json":
+                self.reply({"not": "a list"})
+            elif scenario == "update-no-release":
+                self.reply([{"tag_name": "docs/v99.0.0"}])
+            elif scenario == "update-pages":
+                self.reply(
+                    [
+                        {"tag_name": "sai-cli/v0.9.0"},
+                        {"tag_name": "sai-cli/v9.0.0", "draft": True},
+                        {"tag_name": "sai-cli/v8.0.0", "prerelease": True},
+                        {"tag_name": "sai-cli/v7.0.0-rc.1"},
+                        {"tag_name": "sai-cli/v06.0.0"},
+                        {"tag_name": "other/v100.0.0"},
+                    ],
+                    next_page=True,
+                )
+            else:
+                self.reply([{"tag_name": "sai-cli/v0.99.0"}])
+
         def do_GET(self) -> None:
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
@@ -375,16 +447,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     self.reply({"default_node_info": {"network": "cataclysm-1"}})
                     return
                 if path == RELEASES:
-                    wire.append(WireRequest("releases"))
-                    self.reply(
-                        [
-                            {
-                                "tag_name": "sai-cli/v0.99.0",
-                                "draft": False,
-                                "prerelease": False,
-                            }
-                        ]
-                    )
+                    self.releases()
                     return
                 prefix = f"/cosmwasm/wasm/v1/contract/{CONTRACT}/smart/"
                 if path.startswith(prefix):

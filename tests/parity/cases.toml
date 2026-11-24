@@ -257,11 +257,60 @@ mode = "jsonl"
 setup = ["--json","market","prices"]
 wire = ["tokenPricesUsd"]
 
+# Python reference for these update cases: ea09f0d417a53a71079bb8c5e426005fa29051a4.
 [[case]]
 name = "update-check"
 args = ["--json","update","--check","--api-base","{http}","--web-base","{http}"]
 wire = ["releases"]
 state = { "update.json#latest" = "sai-cli/v0.99.0", "update.json#schema" = 1, "update.json#@mode" = 0o600 }
+
+[[case]]
+name = "update-check-pages"
+args = ["--json","update","--check","--api-base","{http}","--web-base","{http}"]
+server = "update-pages"
+seed = "update-state"
+wire = ["releases", "releases-page-2"]
+state = {"update.json#latest" = "sai-cli/v0.99.0", "update.json#result.to" = "0.88.0", "update.json#notified" = "failed:0.88.0"}
+
+[[case]]
+name = "update-check-no-release"
+args = ["--json","update","--check","--api-base","{http}","--web-base","{http}"]
+server = "update-no-release"
+seed = "update-state"
+wire = ["releases"]
+state = {"update.json#result.to" = "0.88.0"}
+
+[[case]]
+name = "update-check-rate-limit-empty"
+args = ["--json","update","--check","--api-base","{http}","--web-base","{http}"]
+server = "update-rate-limit-empty"
+seed = "update-state"
+wire = ["releases", "release-redirect"]
+state = {"update.json#result.rolledBack" = true}
+
+[[case]]
+name = "update-check-rate-limit-tag"
+args = ["--json","update","--check","--api-base","{http}","--web-base","{http}"]
+server = "update-rate-limit-tag"
+seed = "update-state"
+wire = ["releases", "release-redirect"]
+state = {"update.json#latest" = "sai-cli/v0.88.0", "update.json#checkedAt" = "<absent>"}
+expect = 1
+
+[[case]]
+name = "update-check-bad-json"
+args = ["--json","update","--check","--api-base","{http}","--web-base","{http}"]
+server = "update-bad-json"
+seed = "update-state"
+wire = ["releases"]
+state = {"update.json#latest" = "sai-cli/v0.88.0", "update.json#checkedAt" = "<absent>"}
+expect = 1
+
+[[case]]
+name = "update-check-conflict"
+args = ["--json","update","--check","--to","0.1.0"]
+expect = 2
+state = { "update.json" = "<absent>" }
 
 [[case]]
 name = "trade-open-market"
