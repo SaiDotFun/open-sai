@@ -1102,7 +1102,24 @@ def _line_blocks(
     complete_end: bool = True,
 ) -> Iterator[list[bytes]]:
     """Read a snapshot backwards, yielding once per disk chunk."""
+    for _, block in _positioned_blocks(
+        fd, chunk, end=end, read=read, max_line=max_line, complete_end=complete_end
+    ):
+        yield [raw for _, raw in block]
+
+
+def _positioned_blocks(
+    fd: int,
+    chunk: int,
+    *,
+    end: int,
+    read: Callable[[int, int], bytes],
+    max_line: int | None,
+    complete_end: bool,
+) -> Iterator[tuple[int, list[tuple[int, bytes]]]]:
+    """Yield each row's start and a safe resume offset after each chunk."""
     position = end
+    resume = end
     rest: bytes | None = b"" if complete_end else None
     while position:
         size = min(chunk, position)
@@ -1118,17 +1135,28 @@ def _line_blocks(
                 rest = (
                     combined if max_line is None or len(combined) <= max_line else None
                 )
-            yield []
+            if rest is None:
+                resume = position
+            if position == 0:
+                yield 0, [(0, rest)] if rest else []
+                return
+            yield resume, []
             continue
-        tail = pieces[-1] + rest if rest is not None else b""
+        offset = position + size
+        block = []
+        for index, piece in enumerate(reversed(pieces[1:])):
+            offset -= len(piece)
+            raw = piece if index else (piece + rest if rest is not None else b"")
+            if raw and (max_line is None or len(raw) <= max_line):
+                block.append((offset, raw))
+            offset -= 1
         rest = pieces[0] if max_line is None or len(pieces[0]) <= max_line else None
-        yield [
-            piece
-            for piece in (tail, *reversed(pieces[1:-1]))
-            if piece and (max_line is None or len(piece) <= max_line)
-        ]
-    if rest:
-        yield [rest]
+        resume = position + len(pieces[0]) + 1
+        if position == 0:
+            if rest:
+                block.append((0, rest))
+            resume = 0
+        yield resume, block
 
 
 def _last_lines(fd: int, chunk: int) -> Iterator[bytes]:
@@ -1360,6 +1388,178 @@ class LogScan:
                                     pending[name] = min(current, ts) if current else ts
                                 yield line
                         readers = next_readers
+
+
+@dataclass(frozen=True)
+class ScanPosition:
+    day: date
+    # Exclusive byte endpoints in SURFACES order. None starts a fresh day.
+    offsets: tuple[int, ...] | None = None
+
+
+@dataclass
+class PageScan:
+    max_bytes: int = MAX_SCAN_BYTES
+    max_rows: int = MAX_SCAN_ROWS
+    max_files: int = MAX_SCAN_FILES
+    truncated: bool = False
+    resume: ScanPosition | None = None
+
+    def rows(
+        self,
+        root: Path | None = None,
+        *,
+        start: ScanPosition | None = None,
+        first_day: date | None = None,
+        last_day: date | None = None,
+        since: str | None = None,
+        before: str | None = None,
+        observe: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Generator[tuple[ScanPosition, dict[str, Any]]]:
+        """Merge reverse file reads one day at a time and checkpoint each file."""
+        opened = LogDir.open(root or directory())
+        if opened is None:
+            return
+        bytes_left, rows_left, files_left = (
+            self.max_bytes,
+            self.max_rows,
+            self.max_files,
+        )
+        byte_limit = False
+
+        def read(fd: int, size: int) -> bytes:
+            nonlocal bytes_left, byte_limit
+            if size > bytes_left:
+                self.truncated = byte_limit = True
+                return b""
+            data = os.read(fd, size)
+            bytes_left -= len(data)
+            return data
+
+        def decode_block(
+            block: list[tuple[int, bytes]],
+        ) -> Iterator[tuple[int, int, dict[str, Any]]]:
+            for offset, raw in block:
+                if (
+                    observe is None
+                    and (since or before)
+                    and (header := _TS_HEADER.match(raw))
+                ):
+                    ts = header[1].decode()
+                    if (since and ts < since) or (before and ts >= before):
+                        continue
+                try:
+                    line = decode_row(raw)
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(line, dict):
+                    continue
+                if observe is not None:
+                    observe(line)
+                ts = line.get("ts")
+                if isinstance(ts, str) and (
+                    (since is None or ts >= since) and (before is None or ts < before)
+                ):
+                    yield offset, offset + len(raw) + 1, line
+
+        def read_rows(
+            slot: int, fd: int, end: int, offsets: list[int]
+        ) -> Iterator[tuple[int, dict[str, Any]]]:
+            os.lseek(fd, end - 1, os.SEEK_SET)
+            complete = read(fd, 1) == b"\n"
+            for resume, block in _positioned_blocks(
+                fd,
+                TAIL_CHUNK,
+                end=end,
+                read=read,
+                max_line=MAX_LINE,
+                complete_end=complete,
+            ):
+                # Observe the whole chunk before choosing its first merge candidate.
+                # A call in the chunk can identify gaps from other files.
+                candidates = decode_block(block)
+                for offset, row_end, line in (
+                    list(candidates) if observe is not None else candidates
+                ):
+                    offsets[slot] = row_end
+                    yield offset, line
+                offsets[slot] = resume
+
+        def advance(
+            slot: int,
+            readers: dict[int, Iterator[tuple[int, dict[str, Any]]]],
+            heads: dict[int, tuple[int, dict[str, Any]]],
+            offsets: list[int],
+        ) -> None:
+            try:
+                heads[slot] = next(readers[slot])
+            except StopIteration:
+                heads.pop(slot, None)
+                if not byte_limit:
+                    offsets[slot] = 0
+            except OSError:
+                heads.pop(slot, None)
+                self.truncated = True
+
+        with opened:
+            files = (
+                (day, surface, name)
+                for day, surface, name in reversed(opened.files())
+                if (first_day is None or day >= first_day)
+                and (last_day is None or day <= last_day)
+                and (start is None or day <= start.day)
+            )
+            for day, daily in itertools.groupby(files, key=lambda item: item[0]):
+                names = list(daily)
+                if len(names) > files_left:
+                    self.truncated = True
+                    self.resume = ScanPosition(day)
+                    return
+                files_left -= len(names)
+                offsets = [0] * len(SURFACES)
+                with ExitStack() as active:
+                    readers: dict[int, Iterator[tuple[int, dict[str, Any]]]] = {}
+
+                    for _, surface, name in names:
+                        slot = SURFACES.index(surface)
+                        try:
+                            fd = opened.read_fd(name)
+                            active.callback(os.close, fd)
+                            end = os.fstat(fd).st_size
+                            if (
+                                start is not None
+                                and day == start.day
+                                and start.offsets is not None
+                            ):
+                                end = min(end, start.offsets[slot])
+                            offsets[slot] = end
+                            if end:
+                                readers[slot] = read_rows(slot, fd, end, offsets)
+                        except OSError:
+                            self.truncated = True
+
+                    heads: dict[int, tuple[int, dict[str, Any]]] = {}
+
+                    for slot in readers:
+                        advance(slot, readers, heads, offsets)
+                        if byte_limit:
+                            return
+                    while heads:
+                        if rows_left == 0:
+                            self.truncated = True
+                            self.resume = ScanPosition(day, tuple(offsets))
+                            return
+                        slot = max(
+                            heads, key=lambda key: (event_order(heads[key][1]), key)
+                        )
+                        offset, line = heads[slot]
+                        position = ScanPosition(day, tuple(offsets))
+                        offsets[slot] = offset
+                        rows_left -= 1
+                        yield position, line
+                        advance(slot, readers, heads, offsets)
+                        if byte_limit:
+                            return
 
 
 def tail(

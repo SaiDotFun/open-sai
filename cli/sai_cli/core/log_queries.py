@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import Counter, defaultdict
 from collections.abc import Callable
+from contextlib import closing
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -18,7 +21,7 @@ LogLine = dict[str, Any]
 Scope = tuple[str, str]
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,128}")
 ENDPOINT_ID = re.compile(r"h1_[a-f0-9]{64}")
-PREVIEW_DIGEST = re.compile(r"[a-f0-9]{64}")
+SHA256_HEX = re.compile(r"[a-f0-9]{64}")
 MCP_STATUSES = frozenset(
     {"accepted", "rejected", "not_sent", "unknown", "terminal", "absent"}
 )
@@ -168,9 +171,7 @@ START_EVENTS = {"command.start", "mcp.tool_call"}
 def _scan(
     root: Path | None,
     before: str | None,
-    anchor: Callable[[LogLine], bool] | None = None,
-    *,
-    observe_context: Callable[[LogLine], None] | None = None,
+    anchor: Callable[[LogLine], bool],
 ) -> tuple[list[LogLine], bool, str | None, str | None]:
     instant = _before(before)
     cutoff = log.stamp(instant) if instant else None
@@ -181,18 +182,13 @@ def _scan(
         max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
     )
 
-    def accept_context(line: LogLine) -> bool:
-        if observe_context is not None:
-            observe_context(line)
-        return anchor is not None and anchor(line)
-
     log.flush(1.0)
     rows = [
         line
         for line in scan.rows(
             root,
             last_day=page_day,
-            accept=lambda line: _in_window(line, cutoff) or accept_context(line),
+            accept=lambda line: _in_window(line, cutoff) or anchor(line),
             frontier_before=cutoff,
         )
         if _timestamp(line)
@@ -215,7 +211,7 @@ def _scan(
                 root,
                 days={page_day + timedelta(days=1)},
                 prefix=True,
-                accept=accept_context,
+                accept=anchor,
             )
         )
         scan.visited.update(following.visited)
@@ -225,8 +221,7 @@ def _scan(
     missing = {
         invocation: date.fromisoformat(ts[:10]) - timedelta(days=1)
         for line in rows
-        if anchor is not None
-        and anchor(line)
+        if anchor(line)
         and (invocation := _invocation(line)) is not None
         and invocation not in starts
         and (ts := _timestamp(line))
@@ -252,6 +247,67 @@ def _scan(
 
 def _in_window(line: LogLine, cutoff: str | None) -> bool:
     return cutoff is None or (ts := _id(line, "ts")) is not None and ts < cutoff
+
+
+@dataclass(frozen=True)
+class _Cursor:
+    upper: str | None
+    position: log.ScanPosition | None = None
+    timestamp: str | None = None
+    parent: str = ""
+
+    @classmethod
+    def parse(cls, value: str | None) -> _Cursor:
+        if value is None or "~" not in value:
+            instant = _before(value)
+            return cls(log.stamp(instant) if instant else None)
+        try:
+            if len(value) > 200:
+                raise ValueError
+            timestamp, day, parts, upper, parent = value.split("~")
+            if (
+                _timestamp({"ts": timestamp}) is None
+                or (upper and _timestamp({"ts": upper}) is None)
+                or (parent and SHA256_HEX.fullmatch(parent) is None)
+            ):
+                raise ValueError
+            offsets = (
+                None if parts == "-" else tuple(int(part) for part in parts.split(","))
+            )
+            if offsets is not None and (
+                len(offsets) != len(log.SURFACES)
+                or any(not 0 <= offset < 2**63 for offset in offsets)
+            ):
+                raise ValueError
+            return cls(
+                upper or None,
+                log.ScanPosition(date.fromisoformat(day), offsets),
+                timestamp,
+                parent,
+            )
+        except ValueError:
+            raise SaiError(
+                "Pass a log cursor or a UTC timestamp to --before.",
+                Code.INVALID_REQUEST,
+                exit_code=ExitCode.USAGE,
+            ) from None
+
+    def bounds(self) -> tuple[str | None, date | None]:
+        upper = self.upper
+        if self.timestamp is not None:
+            instant = datetime.fromisoformat(self.timestamp)
+            if instant.date() < date.max:
+                edge = log.stamp(instant + timedelta(milliseconds=1))
+                upper = min(upper, edge) if upper else edge
+        return upper, date.fromisoformat(self.upper[:10]) if self.upper else None
+
+    def encode(self, position: log.ScanPosition, timestamp: str, parent: str) -> str:
+        offsets = (
+            "-" if position.offsets is None else ",".join(map(str, position.offsets))
+        )
+        return "~".join(
+            (timestamp, position.day.isoformat(), offsets, self.upper or "", parent)
+        )
 
 
 def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
@@ -286,7 +342,7 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     if name == "mcp.tool_result":
         if "status" in safe and safe["status"] not in MCP_STATUSES:
             del safe["status"]
-        if "previewDigest" in safe and not PREVIEW_DIGEST.fullmatch(
+        if "previewDigest" in safe and not SHA256_HEX.fullmatch(
             str(safe["previewDigest"])
         ):
             del safe["previewDigest"]
@@ -310,20 +366,15 @@ def _limit(
     scan_truncated: bool,
     oldest_scanned: str | None,
 ) -> LogLine:
-    tokens = log.known_tokens(check=True)
-    bytes_left = MAX_REPORT_BYTES - 8192
+    page = _PageReport(report)
     last_returned = None
     output_limited = False
-    for rows, (field, line) in enumerate(reversed(entries)):
-        safe = _export(line, tokens)
-        size = len(json.dumps(safe, allow_nan=False).encode()) + 2
-        if rows == MAX_REPORT_ROWS or size > bytes_left:
+    for field, line in reversed(entries):
+        if not page.add(field, line):
             output_limited = True
             break
-        report[field].append(safe)
         if field != "unattributedGaps":
             last_returned = _timestamp(line)
-        bytes_left -= size
     for field in {field for field, _line in entries}:
         report[field].reverse()
     if scan_truncated or output_limited:
@@ -338,6 +389,43 @@ def _limit(
             "To read past the scan limit, inspect files from sai logs path."
         )
     return report
+
+
+class _PageReport:
+    def __init__(self, report: LogLine) -> None:
+        self.report = report
+        self.tokens = log.known_tokens(check=True)
+        self.bytes_left = MAX_REPORT_BYTES - 8192
+        self.rows_left = MAX_REPORT_ROWS
+        self.fields: set[str] = set()
+
+    def add(self, field: str, line: LogLine) -> bool:
+        safe = _export(line, self.tokens)
+        size = len(json.dumps(safe, allow_nan=False).encode()) + 2
+        if self.rows_left == 0 or size > self.bytes_left:
+            return False
+        self.report[field].append(safe)
+        self.fields.add(field)
+        self.rows_left -= 1
+        self.bytes_left -= size
+        return True
+
+    def finish(
+        self,
+        scan: log.PageScan,
+        cursor: _Cursor,
+        last: str | None,
+        stop: log.ScanPosition | None,
+        parent: str = "",
+    ) -> LogLine:
+        for field in self.fields:
+            self.report[field].sort(key=log.event_order)
+        if scan.truncated or stop is not None:
+            self.report["truncated"] = True
+            self.report["more"] = "Use --before to continue reading the retained logs."
+            if last is not None and (position := stop or scan.resume) is not None:
+                self.report["nextBefore"] = cursor.encode(position, last, parent)
+        return self.report
 
 
 def intent(
@@ -466,50 +554,79 @@ def run(
     if TOKEN.fullmatch(identifier) is None:
         raise SaiError("Invalid log run or call ID.", Code.INVALID_REQUEST)
 
-    def matches_id(line: LogLine) -> bool:
-        return identifier in (_id(line, "runId"), _id(line, "callId"))
+    cursor = _Cursor.parse(before)
+    cutoff, last_day = cursor.bounds()
+    parent = cursor.parent
 
-    runs = {identifier}
+    def parent_key(run_id: str) -> str:
+        return hashlib.sha256(f"{identifier}~{run_id}".encode()).hexdigest()
 
     def remember_call_run(line: LogLine) -> None:
+        nonlocal parent
         # A newer call event can identify the parent of an earlier gap.
         # The event itself does not need a slot in this page's row budget.
         if (
             _id(line, "callId") == identifier
             and line.get("event") != "log.dropped"
             and (run_id := _id(line, "runId"))
+            and TOKEN.fullmatch(run_id)
             and _timestamp(line)
         ):
-            runs.add(run_id)
+            parent = parent_key(run_id)
 
-    rows, scan_truncated, cutoff, frontier = _scan(
-        root, before, observe_context=remember_call_run
-    )
-    events = [
-        line for line in rows if line.get("event") != "log.dropped" and matches_id(line)
-    ]
-    runs.update(run_id for line in events if (run_id := _id(line, "runId")))
+    log.flush(1.0)
+    if cursor.position is None and last_day is not None and last_day < date.max:
+        context = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
+        for line in context.rows(
+            root,
+            days={last_day + timedelta(days=1)},
+            prefix=True,
+            accept=lambda line: _id(line, "callId") == identifier,
+        ):
+            remember_call_run(line)
 
-    def in_page(line: LogLine) -> bool:
-        return _in_window(line, cutoff) and (
-            not scan_truncated or frontier is None or line["ts"] >= frontier
-        )
+    scan = log.PageScan(
+        max_bytes=log.MAX_SCAN_BYTES - 2 * CONTEXT_BYTES,
+        max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
+        max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
+    )
+    entries = []
+    last = None
+    for position, line in scan.rows(
+        root,
+        start=cursor.position,
+        last_day=last_day,
+        before=cutoff,
+        observe=remember_call_run,
+    ):
+        if (ts := _timestamp(line)) is None:
+            continue
+        last = ts
+        if line.get("event") == "log.dropped" or identifier in (
+            _id(line, "runId"),
+            _id(line, "callId"),
+        ):
+            entries.append((position, ts, line))
 
-    entries = [("events", line) for line in events if in_page(line)]
-    entries.extend(
-        ("gaps", line)
-        for line in rows
-        if line.get("event") == "log.dropped"
-        and _id(line, "runId") in runs
-        and in_page(line)
-    )
-    entries.sort(key=lambda entry: log.event_order(entry[1]))
-    return _limit(
-        {"id": identifier, "events": [], "gaps": []},
-        entries,
-        scan_truncated,
-        frontier,
-    )
+    report = _PageReport({"id": identifier, "events": [], "gaps": []})
+    displayed = None
+    for position, ts, line in entries:
+        if line.get("event") == "log.dropped":
+            run_id = _id(line, "runId")
+            if run_id != identifier and not (
+                parent
+                and run_id
+                and TOKEN.fullmatch(run_id)
+                and parent_key(run_id) == parent
+            ):
+                continue
+            field = "gaps"
+        else:
+            field = "events"
+        if not report.add(field, line):
+            return report.finish(scan, cursor, displayed, position, parent)
+        displayed = ts
+    return report.finish(scan, cursor, last, None, parent)
 
 
 def _seconds(duration: str) -> int:
@@ -532,8 +649,8 @@ def stats(
     since: str | None = None, *, before: str | None = None, root: Path | None = None
 ) -> LogLine:
     """Summarize the timed samples and coded failures within the scan budget."""
-    instant = _before(before)
-    upper = log.stamp(instant) if instant else None
+    cursor = _Cursor.parse(before)
+    upper, last_day = cursor.bounds()
     first_day = None
     cutoff = None
     if since is not None:
@@ -545,51 +662,44 @@ def stats(
         first_day, cutoff = start.date(), log.stamp(start)
 
     log.flush(1.0)
-    scan = log.LogScan()
-    gaps: list[tuple[str, LogLine]] = []
-    samples: list[tuple[str, str | None, str | None, int | None]] = []
-    for line in scan.rows(
-        root,
-        first_day=first_day,
-        last_day=instant.date() if instant else None,
-        since=cutoff,
-        before=upper,
-    ):
-        ts = _timestamp(line)
-        if ts is None:
-            continue
-        event = line.get("event")
-        if event == "log.dropped":
-            gaps.append(("gaps", line))
-            continue
-        code = _id(line, "code")
-        operation = None
-        duration = None
-        if event == "keeper.request":
-            name, ms = _id(line, "operation"), line.get("durationMs")
-            if name in OPERATIONS and type(ms) is int and ms >= 0:
-                operation, duration = name, ms
-        if code in CODES or operation is not None:
-            samples.append((ts, code, operation, duration))
-    # Alternating between files can read sparse older rows before the
-    # busiest file reaches the same timestamp. Defer those to the next page.
-    frontier = scan.frontier if scan.truncated else None
-    if frontier is not None:
-        gaps = [entry for entry in gaps if entry[1]["ts"] >= frontier]
-    gaps.sort(key=lambda entry: log.event_order(entry[1]))
-    report = _limit({"since": cutoff, "gaps": []}, gaps, scan.truncated, frontier)
-
-    # The report cap can move the boundary forward when there are many gaps.
-    page_start = report.get("nextBefore")
+    scan = log.PageScan()
+    page = _PageReport({"since": cutoff, "gaps": []})
     durations: defaultdict[str, list[int]] = defaultdict(list)
     codes: Counter[str] = Counter()
-    for ts, code, operation, duration in samples:
-        if page_start is not None and ts < page_start:
-            continue
-        if code and code in CODES:
-            codes[code] += 1
-        if operation is not None and duration is not None:
-            durations[operation].append(duration)
+    last = None
+    stop = None
+    with closing(
+        scan.rows(
+            root,
+            start=cursor.position,
+            first_day=first_day,
+            last_day=last_day,
+            since=cutoff,
+            before=upper,
+        )
+    ) as rows:
+        for position, line in rows:
+            ts = _timestamp(line)
+            if ts is None:
+                continue
+            event = line.get("event")
+            if event == "log.dropped":
+                if not page.add("gaps", line):
+                    stop = position
+                    break
+            else:
+                if (code := _id(line, "code")) and code in CODES:
+                    codes[code] += 1
+                if event == "keeper.request":
+                    operation, duration = _id(line, "operation"), line.get("durationMs")
+                    if (
+                        operation is not None
+                        and operation in OPERATIONS
+                        and type(duration) is int
+                        and duration >= 0
+                    ):
+                        durations[operation].append(duration)
+            last = ts
     operations = {}
     for name, samples in sorted(durations.items()):
         samples.sort()
@@ -599,6 +709,7 @@ def stats(
             "p50Ms": samples[(count * 50 + 99) // 100 - 1],
             "p95Ms": samples[(count * 95 + 99) // 100 - 1],
         }
+    report = page.finish(scan, cursor, last, stop)
     report["keeper"] = operations
     report["errors"] = dict(sorted(codes.items()))
     return report
