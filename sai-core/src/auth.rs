@@ -17,6 +17,7 @@ use zeroize::Zeroizing;
 use crate::{
     errors::{Code, SaiError},
     keeper::{CHALLENGE, Keeper, SESSION, TIMEOUT},
+    session::parse_expiry,
     storage::Session,
 };
 
@@ -177,6 +178,9 @@ async fn exchange(
         ));
     }
     let expires_at = required(session, "expiresAt")?;
+    if parse_expiry(expires_at).is_none() {
+        return Err(keeper_error("Keeper returned an invalid session expiry"));
+    }
     let token = required(session, "token")?;
     let mut session = Session::new(
         token.to_owned().into(),
