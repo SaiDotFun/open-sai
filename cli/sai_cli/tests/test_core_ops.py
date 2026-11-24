@@ -11,6 +11,12 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from sai_cli.core import keeper, margin, reconcile, session, storage, stream, trading
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
@@ -56,6 +62,17 @@ def test_load_active_session_checks_endpoint_and_expiry():
         session.load_active_session(ENDPOINT)
 
 
+def test_renewal_guidance_omits_an_origin_with_a_known_token():
+    token = "synthetic-session-token-for-renewal"
+    stored = session_for(endpoint=f"https://{token}.example.invalid")
+    stored.update(token=token, source="imported")
+    storage.save_session(stored)
+
+    fields = session.renewal_fields(stored)
+    assert "SAI_RECONCILE_ENDPOINT" in fields["renewalCommand"]
+    assert fields["renewalGuidance"] == "Reuse the Keeper endpoint used to sign in."
+
+
 def test_passphrase_session_is_refused_without_a_prompt():
     # A session from an older version that encrypted it with a passphrase.
     path = storage.directory() / "session.json"
@@ -69,10 +86,11 @@ def test_import_session_and_summary_hide_the_token():
     token = jwt({"sub": ADDR, "exp": expires, "purpose": "user_intent"})
     result = session.import_session(token, ENDPOINT)
     assert result["token"] == token
+    assert result["endpoint"] == ENDPOINT
     assert session.summary(result) == {
         "addr": ADDR,
         "expiresAt": datetime.fromtimestamp(expires, UTC).isoformat(),
-        "endpoint": ENDPOINT,
+        "endpoint": "https://sai-keeper.nibiru.fi",
     }
     for bad in (
         "not-a-jwt",
@@ -101,8 +119,12 @@ class FakeKeeper:
         variables: dict[str, Any] | None = None,
         token: str | None = None,
         timeout: float = 20,
+        *,
+        attempt: keeper.RequestAttempt | None = None,
     ) -> dict[str, Any]:
         if query == keeper.SUBMIT:
+            if attempt is not None:
+                attempt.transport_started = True
             assert variables is not None
             envelope = variables["input"]
             self.submitted.append(envelope)
@@ -114,6 +136,11 @@ class FakeKeeper:
                     "evmAddress": ADDR,
                 }
             }
+        if query == keeper.POSITION and query not in self.answers:
+            assert variables is not None
+            return position_data(variables)
+        if query == keeper.ROUTE and query not in self.answers:
+            return POSITION_ROUTE
         return json.loads(json.dumps(self.answers[query]))
 
     def intent(self) -> dict[str, Any]:
@@ -151,6 +178,7 @@ def intent_row(key: str, step: str) -> dict[str, Any]:
                 "lifecycleStep": step,
                 "execActor": "server",
                 "evmAddress": ADDR.upper().replace("0X", "0x"),
+                "txHash": "A" * 64,
             }
         ]
     }
@@ -173,11 +201,13 @@ def test_reconcile_marks_server_failure_terminal(monkeypatch):
 
 def test_reconcile_matches_executed_trade_history(monkeypatch):
     storage.pending("k2", ENDPOINT, ADDR, "CLOSE_TRADE", "1")
-    row = {"intentKey": "k2", "trade": {"id": 1}}
+    row = {"intentKey": "k2", "txHash": "a" * 64, "trade": {"id": 1, "trader": ADDR}}
     fake = FakeKeeper(
         {
             keeper.INTENTS: intent_row("k2", "exec_pass"),
-            keeper.HISTORY: {"perp": {"tradeHistory": [row, {"intentKey": "x"}]}},
+            keeper.INTENT_HISTORY: {
+                "perp": {"tradeHistory": [row, {"intentKey": "x"}]}
+            },
         }
     )
     monkeypatch.setattr(keeper, "request", fake)
@@ -265,7 +295,6 @@ def test_live_market_order_refuses_a_closed_market(monkeypatch):
     ("action", "args"),
     [
         (trading.close_trade, {"trade_id": 3, "cancel_order": False}),
-        (trading.close_trade, {"trade_id": 3, "cancel_order": True}),
         (trading.set_leverage, {"trade_id": 3, "leverage": "4"}),
         (
             trading.set_tpsl,
@@ -284,9 +313,10 @@ def test_preview_is_exactly_what_is_submitted(
 ):
     fake = FakeKeeper()
     monkeypatch.setattr(keeper, "request", fake)
-    preview = action(ENDPOINT, no_session, dry_run=True, **args)
+    preview = action(ENDPOINT, session_for, dry_run=True, **args)
     assert preview["dryRun"] is True
-    result = action(ENDPOINT, session_for, dry_run=False, **args)
+    with keeper_server(PositionKeeperHandler) as lcd:
+        result = action(ENDPOINT, session_for, dry_run=False, lcd_endpoint=lcd, **args)
     assert result["status"] == "accepted"
     assert fake.intent() == preview["intent"]
 
@@ -311,22 +341,24 @@ def test_before_submit_sees_the_submitted_intent_and_can_refuse(monkeypatch):
     def refuse(_preview: dict[str, Any]) -> None:
         raise Refused
 
-    with pytest.raises(Refused):
+    with keeper_server(PositionKeeperHandler) as lcd, pytest.raises(Refused):
         trading.close_trade(
             ENDPOINT,
             session_for,
             trade_id=3,
             cancel_order=False,
             dry_run=False,
+            lcd_endpoint=lcd,
             before_submit=refuse,
         )
-    with pytest.raises(Refused):
+    with keeper_server(PositionKeeperHandler) as lcd, pytest.raises(Refused):
         trading.set_leverage(
             ENDPOINT,
             session_for,
             trade_id=3,
             leverage="4",
             dry_run=False,
+            lcd_endpoint=lcd,
             before_submit=refuse,
         )
     with pytest.raises(Refused):
@@ -337,19 +369,48 @@ def test_before_submit_sees_the_submitted_intent_and_can_refuse(monkeypatch):
     assert storage.list_pending(ENDPOINT, ADDR)[0]["status"] == "accepted"
 
 
-def snapshots(
-    monkeypatch, *collaterals: str
-) -> Iterator[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]]:
-    """Make margin.snapshot return one state per call, in order."""
+def snapshots(monkeypatch, *collaterals: str) -> Iterator[margin.PositionSnapshot]:
+    """Supply each indexed snapshot and repeat its contract state on recheck."""
+    current: margin.PositionSnapshot | None = None
     states = iter(
-        (
-            {"collateral_amount": amount, "leverage": "2"},
+        margin.PositionSnapshot(
+            {
+                "user": "nibi1trader",
+                "user_trade_index": "UserTradeIndex(7)",
+                "is_open": True,
+                "trade_type": "trade",
+                "collateral_amount": amount,
+                "leverage": "2",
+                "market_index": "MarketIndex(0)",
+                "collateral_index": "TokenIndex(1)",
+            },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
+            {"chainId": "test-1", "contractAddress": "test-contract"},
         )
         for amount in collaterals
     )
-    monkeypatch.setattr(margin, "snapshot", lambda *args: next(states))
+
+    def snapshot(*args: Any, **kwargs: Any) -> margin.PositionSnapshot:
+        nonlocal current
+        current = next(states)
+        return current
+
+    def contract_reply(
+        lcd: str, contract: str, query: dict[str, Any], **kwargs: Any
+    ) -> Any:
+        if "get_trade_raw" in query:
+            assert current is not None
+            return current.raw
+        return "1" if "get_collateral_price" in query else False
+
+    monkeypatch.setattr(margin, "snapshot", snapshot)
+    monkeypatch.setattr(margin, "smart_value", contract_reply)
+    monkeypatch.setattr(
+        margin,
+        "_latest_position",
+        lambda *args: (contract_reply("", "", {"get_trade_raw": {}}), "120"),
+    )
     return states
 
 

@@ -13,21 +13,32 @@ prompt, and never returns the token.
 
 from __future__ import annotations
 
-import copy
-import hashlib
 import json
 import logging
-import time
+import sqlite3
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any
 
-from ..core import intents, keeper, reconcile, storage, stream, trading
+from ..core import (
+    confirmation,
+    intents,
+    keeper,
+    overview,
+    reconcile,
+    storage,
+    stream,
+    trading,
+    wait,
+)
 from ..core import log as sai_log
+from ..core import preview as estimates
 from ..core import session as sessions
-from ..core.settings import Settings, public_url
+from ..core.errors import Code, SaiError, SessionError
+from ..core.errors import describe as describe_error
+from ..core.settings import Settings
 
 log = logging.getLogger("sai_cli.mcp_server")
 
@@ -45,12 +56,12 @@ SIGN_IN = (
     " import` in a terminal, then retry. Reads and most previews work without it."
 )
 NOT_SIGNED_IN = {
-    "signed-out": ("No Sai account is signed in." + SIGN_IN, "SIGNED_OUT"),
-    "expired": ("The Sai trading session expired." + SIGN_IN, "SESSION_EXPIRED"),
+    "signed-out": ("No Sai account is signed in." + SIGN_IN, Code.SIGNED_OUT),
+    "expired": ("The Sai trading session expired." + SIGN_IN, Code.SESSION_EXPIRED),
     "other-endpoint": (
         "The signed-in Sai session belongs to a different Keeper endpoint than"
         " this server's." + SIGN_IN,
-        "SESSION_UNAVAILABLE",
+        Code.SESSION_UNAVAILABLE,
     ),
 }
 INTERNAL = "Unexpected error in the Sai MCP server; see its stderr log"
@@ -68,14 +79,6 @@ MISMATCH = (
     " was submitted. Show the user this new preview, get their confirmation"
     " again, then retry with its previewDigest."
 )
-RECENT_OPEN = (
-    "An open-trade intent for this account from the last {minutes} minutes"
-    " is still {statuses}, so this open was not submitted: after a timeout or"
-    " error the first request may have gone through. Call intent_local, then"
-    " intent_status with each key in intentKeys. Retry with"
-    " allow_concurrent_open=true only once the user confirms they want"
-    " another open position."
-)
 PRICE_MOVED = (
     "The market price moved {moved}% from the confirmed referencePrice, more"
     " than the {slippage}% slippage, so nothing was submitted. Show the user"
@@ -84,18 +87,14 @@ PRICE_MOVED = (
 )
 
 
-class SessionUnavailable(ValueError):
+class SessionUnavailable(SessionError):
     """The stored session is missing, expired, or unusable by the server.
 
     CODE is SIGNED_OUT, SESSION_EXPIRED, or SESSION_UNAVAILABLE.
     """
 
-    def __init__(self, message: str, code: str = "SESSION_UNAVAILABLE") -> None:
-        super().__init__(message)
-        self.code = code
 
-
-class Refused(ValueError):
+class Refused(SaiError, trading.PreviewRefused):
     """A trade was refused before submission; CODE says why.
 
     PREVIEW, when set, is the fresh preview with its own previewDigest for
@@ -105,12 +104,11 @@ class Refused(ValueError):
     def __init__(
         self,
         message: str,
-        code: str,
+        code: Code,
         preview: dict[str, Any] | None = None,
         **extra: Any,
     ) -> None:
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code)
         self.preview = preview
         self.extra = extra
 
@@ -123,41 +121,63 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
 
 
 def describe(exc: Exception) -> dict[str, Any]:
-    """Map a known error to a stable code; messages carry no secrets."""
-    if isinstance(exc, keeper.OutcomeUnknown):
-        key = exc.intent_key
+    """Format the shared classification using the MCP response fields."""
+    failure = describe_error(exc)
+    if failure.code == Code.OUTCOME_UNKNOWN:
+        key = failure.intent_key
         return error(
-            str(exc),
-            "OUTCOME_UNKNOWN",
+            failure.message,
+            failure.code,
             intentKey=key,
             next=(
                 f"Call intent_status with key {key} to reconcile. Do not"
                 " resubmit until it reports a final outcome."
             ),
         )
-    if isinstance(exc, keeper.AdmissionRejected):
-        return error(str(exc), "ADMISSION_REJECTED")
-    if isinstance(exc, keeper.NotSent):
-        return error(str(exc), "NOT_SENT")
-    if isinstance(exc, keeper.KeeperError):
-        return error(str(exc), "KEEPER_ERROR")
+    if isinstance(exc, storage.RecentOpenPending):
+        return error(
+            f"Earlier open intent {failure.intent_key} may still execute. Call"
+            " intent_status with each key in intentKeys before retrying.",
+            failure.code,
+            intentKeys=exc.keys,
+        )
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
-        return error(str(exc), exc.code, **extra, **exc.extra)
-    if isinstance(exc, SessionUnavailable):
-        return error(str(exc), exc.code)
-    if isinstance(exc, stream.StreamError):
-        return error(str(exc), "STREAM_ERROR")
-    if isinstance(exc, ValueError):
-        return error(str(exc), "INVALID_REQUEST")
-    if isinstance(exc, (KeyError, TypeError)):
+        reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
+        return error(reason or failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.ExecutionRejected):
+        return error(failure.message, failure.code, preview=exc.preview)
+    if isinstance(exc, trading.PositionChanged):
+        if exc.preview is None:
+            return error(failure.message, Code.PREVIEW_MISMATCH)
+        reason = estimates.rejection_reason(exc.preview.get("estimates", {}))
         return error(
-            f"Keeper or contract data was missing or malformed ({type(exc).__name__})",
-            "INCOMPLETE_DATA",
+            reason
+            or (
+                "The position, quote, or route changed during confirmation, so nothing was"
+                " submitted. Show the user the latest preview, get their confirmation"
+                " again, then retry with its previewDigest."
+            ),
+            Code.PREVIEW_MISMATCH,
+            preview=confirmation.with_digest(exc.preview),
         )
-    trace = "".join(traceback.format_exception(exc))
-    log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
-    return error(INTERNAL, "INTERNAL_ERROR")
+    if isinstance(exc, storage.IntentReservationError):
+        if key := failure.intent_key:
+            return error(
+                failure.message,
+                failure.code,
+                intentKey=key,
+                next=(
+                    f"Call intent_status with key {key} and addr {exc.account}"
+                    " to check the local reservation."
+                ),
+            )
+        return error(failure.message, failure.code)
+    if failure.code == Code.INTERNAL_ERROR:
+        trace = "".join(traceback.format_exception(exc))
+        log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
+        return error(INTERNAL, failure.code)
+    return error(failure.message, failure.code)
 
 
 REDACTED = sai_log.REDACTED
@@ -193,7 +213,7 @@ def trading_state(settings: Settings, addr: str | None = None) -> dict[str, Any]
         if not storage.session_exists():
             return {"available": False, "reason": "signed-out", "addr": None}
         stored = storage.load_session(addr)
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except (ValueError, KeyError) as exc:
         detail = (
             f"Stored session is malformed; {storage.SIGN_IN_AGAIN}"
@@ -287,7 +307,7 @@ def resolve_addr(settings: Settings, addr: str | None) -> dict[str, Any]:
         if not storage.session_exists():
             raise SessionUnavailable(NO_ADDR)
         stored = storage.load_session()
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except SessionUnavailable:
         raise
     except ValueError as exc:
@@ -308,10 +328,11 @@ def session_state(settings: Settings) -> dict[str, Any]:
         if not storage.session_exists():
             return {"signedIn": False}
         stored = storage.load_session()
-        expiry = datetime.fromisoformat(stored["expiresAt"])
+        expiry = sessions.expiry_time(stored)
     except ValueError as exc:
         return {"signedIn": False, "error": str(exc)}
-    expired = expiry <= datetime.now(UTC)
+    now = datetime.now(UTC)
+    expired = expiry <= now
     matches = stored.get("endpoint") == settings.endpoint
     try:
         connected = len(storage.load_accounts()["sessions"])
@@ -321,17 +342,20 @@ def session_state(settings: Settings) -> dict[str, Any]:
         "signedIn": True,
         "connectedAccounts": connected,
         "usable": matches and not expired,
-        "addr": stored["evmAddress"],
-        "expiresAt": stored["expiresAt"],
+        **sessions.summary(stored),
         "expired": expired,
-        "endpoint": public_url(stored.get("endpoint")),
         "endpointMatches": matches,
+        **(sessions.renewal_fields(stored) if expired else {}),
+        **(sessions.expiry_fields(stored, now) if matches else {}),
     }
 
 
 def auth_status(settings: Settings, addr: str | None = None) -> dict[str, Any]:
-    result = sessions.summary(session_loader(settings, addr)())
-    return {**result, "endpoint": public_url(result["endpoint"])}
+    stored = session_loader(settings, addr)()
+    return {
+        **sessions.summary(stored),
+        **sessions.expiry_fields(stored),
+    }
 
 
 def account_rows(settings: Settings) -> dict[str, Any]:
@@ -340,17 +364,16 @@ def account_rows(settings: Settings) -> dict[str, Any]:
     now = datetime.now(UTC)
     rows = []
     for key, result in sorted(accounts["sessions"].items()):
-        expired = datetime.fromisoformat(result["expiresAt"]) <= now
+        expired = sessions.expiry_time(result) <= now
         matches = result.get("endpoint") == settings.endpoint
         rows.append(
             {
-                "addr": result["evmAddress"],
+                **sessions.summary(result),
                 "active": key == accounts["active"],
-                "expiresAt": result["expiresAt"],
                 "expired": expired,
-                "endpoint": public_url(result.get("endpoint")),
                 "endpointMatches": matches,
                 "usable": matches and not expired,
+                **sessions.expiry_fields(result, now),
             }
         )
     return {"accounts": rows}
@@ -385,7 +408,8 @@ def account_positions(settings: Settings, addr: str | None) -> dict[str, Any]:
 def account_history(settings: Settings, addr: str | None) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
     variables = {"trader": account["addr"]}
-    return {**account, **keeper.request(settings.endpoint, keeper.HISTORY, variables)}
+    data = keeper.request(settings.endpoint, keeper.HISTORY, variables)
+    return {**account, **keeper.safe_history_response(data)}
 
 
 def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
@@ -395,6 +419,13 @@ def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
         **account,
         **stream.snapshot(settings.ws_endpoint, stream.BALANCES, variables),
     }
+
+
+def account_overview(settings: Settings, addr: str | None) -> dict[str, Any]:
+    try:
+        return overview.account_overview(settings, addr)
+    except overview.AccountUnavailable as exc:
+        raise SessionUnavailable(f"{exc}. Pass addr explicitly.") from exc
 
 
 def intent_local(settings: Settings, addr: str | None) -> dict[str, Any]:
@@ -407,56 +438,44 @@ def intent_status(
     settings: Settings, addr: str | None, key: str | None
 ) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
-    return {
-        **account,
-        **reconcile.reconcile(settings.endpoint, account["addr"], key),
-    }
+    data = reconcile.reconcile(settings.endpoint, account["addr"], key)
+    return {**account, **reconcile.status_report(data)}
+
+
+async def intent_wait(
+    settings: Settings, key: str, addr: str | None, timeout: float, started: float
+) -> dict[str, Any]:
+    timeout = min(wait.validate_timeout(timeout), wait.MCP_MAX_TIMEOUT)
+    try:
+        with storage.busy_timeout(0):
+            local = (
+                storage.intent_record(settings.endpoint, key) if addr is None else None
+            )
+        account = (
+            {"addr": local[0], "addrSource": "ledger"}
+            if local
+            else resolve_addr(settings, addr)
+        )
+        result = await wait.for_intent_async(
+            settings.endpoint,
+            account["addr"],
+            key,
+            timeout=timeout,
+            started=started,
+        )
+    except sqlite3.OperationalError as exc:
+        if not wait.ledger_busy(exc):
+            raise
+        account = {}
+        result = wait.unknown_result(key, addr)
+    if result["outcome"] == "unknown":
+        result["hint"] = (
+            "Call intent_wait again with the same key and address. Do not resubmit."
+        )
+    return {**account, **result}
 
 
 # Preview binding
-
-
-def canonical_price(value: object) -> str:
-    """Write a price so equal amounts give equal text: 100, 100.0 -> 100."""
-    return format(Decimal(str(value)).normalize(), "f")
-
-
-def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
-    """Return the parts of PREVIEW the user confirms.
-
-    That is the account the trade would be submitted under, the intent, and
-    the margin quote when there is one. A market open leaves out its intent
-    price, which is refreshed at submit, and binds the referencePrice the
-    user confirmed instead.
-    """
-    intent = copy.deepcopy(preview["intent"])
-    body = intent.get("body", {})
-    account = preview.get("addr")
-    material: dict[str, Any] = {
-        "addr": account.lower() if isinstance(account, str) else None,
-        "intent": intent,
-    }
-    if intent.get("kind") == "OPEN_TRADE" and body.get("orderType") == "market":
-        body.pop("intentPrice", None)
-        reference = preview.get("referencePrice")
-        material["referencePrice"] = (
-            canonical_price(reference) if reference is not None else None
-        )
-    if "quote" in preview:
-        material["quote"] = preview["quote"]
-    return material
-
-
-def preview_digest(preview: dict[str, Any]) -> str:
-    """Hash the confirmed parts of PREVIEW as canonical JSON."""
-    canonical = json.dumps(
-        digest_material(preview), sort_keys=True, separators=(",", ":")
-    )
-    return hashlib.sha256(canonical.encode()).hexdigest()
-
-
-def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
-    return {**preview, "previewDigest": preview_digest(preview)}
 
 
 def bound(
@@ -488,24 +507,29 @@ def bound(
     def check(preview: dict[str, Any]) -> None:
         # Strict: never None, and SessionUnavailable propagates.
         account = load()["evmAddress"]
-        fresh = with_digest({**preview, "addr": account})
+        fresh = confirmation.with_digest({**preview, "addr": account})
         confirmed = (
             fresh
             if reference is None
             else {**fresh, "referencePrice": format(reference, "f")}
         )
-        if preview_digest(confirmed) != digest:
-            raise Refused(MISMATCH, "PREVIEW_MISMATCH", fresh)
+        if confirmation.preview_digest(confirmed) != digest:
+            raise Refused(MISMATCH, Code.PREVIEW_MISMATCH, fresh)
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
-        moved = abs(current - reference) / reference * 100
-        if moved > Decimal(slippage):
-            message = PRICE_MOVED.format(
-                moved=format(moved.quantize(Decimal("0.0001")), "f"),
-                slippage=slippage,
-            )
-            raise Refused(message, "PRICE_MOVED", fresh)
+        fraction = Decimal(slippage).scaleb(-2)
+        lower = estimates.slippage_price(reference, fraction, False)
+        upper = estimates.slippage_price(reference, fraction, True)
+        if not lower <= current <= upper:
+            with localcontext() as context:
+                context.prec = 90
+                moved = abs(current - reference) / reference * 100
+                message = PRICE_MOVED.format(
+                    moved=format(moved.quantize(Decimal("0.0001")), "f"),
+                    slippage=slippage,
+                )
+            raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check
 
@@ -528,73 +552,16 @@ def submit_check(
     return bound(load, digest, reference_price, slippage)
 
 
-# Statuses of an open that may still fill, and how long one can. Keeper
-# fails a queued intent after its admission expiry; past that margin, an
-# open no longer stands in for the one being submitted.
-OPEN_PENDING = ("unknown", "accepted")
-RECENT_OPEN_SECONDS = keeper.ABSENT_AFTER_SECONDS
-
-
-def recent_opens(
-    endpoint: str, account: str, now: float | None = None
-) -> list[dict[str, str]]:
-    """Return this account's OPEN_TRADE intents that may still fill.
-
-    The store keeps no payload, so any recent unknown or accepted open
-    counts, whatever its market, side, or amount.
-    """
-    current = time.time() if now is None else now
-    with storage.db() as connection:
-        rows = connection.execute(
-            "SELECT id, status, created_at FROM intents WHERE endpoint=?"
-            " AND account=? AND kind='OPEN_TRADE' AND status IN (?, ?)"
-            " ORDER BY rowid DESC",
-            (endpoint, account.lower(), *OPEN_PENDING),
-        ).fetchall()
-    recent: list[dict[str, str]] = []
-    for key, status, created in rows:
-        stamp = created if created is not None else storage._key_time(key)
-        if stamp is None or current - stamp <= RECENT_OPEN_SECONDS:
-            recent.append({"intentKey": key, "status": status})
-    return recent
-
-
-def no_recent_open(settings: Settings, load: AccountSession) -> trading.SubmitCheck:
-    """Return a check that refuses an open while a recent one may fill."""
-
-    def check(_preview: dict[str, Any]) -> None:
-        account = load()["evmAddress"]
-        pending = recent_opens(settings.endpoint, account)
-        if pending:
-            statuses = " or ".join(sorted({row["status"] for row in pending}))
-            raise Refused(
-                RECENT_OPEN.format(
-                    minutes=RECENT_OPEN_SECONDS // 60, statuses=statuses
-                ),
-                "RECENT_OPEN_PENDING",
-                intentKeys=[row["intentKey"] for row in pending],
-            )
-
-    return check
-
-
-def both(
-    first: trading.SubmitCheck, second: trading.SubmitCheck
-) -> trading.SubmitCheck:
-    def check(preview: dict[str, Any]) -> None:
-        first(preview)
-        second(preview)
-
-    return check
-
-
 def finish(
     load: AccountSession, dry_run: bool, result: dict[str, Any]
 ) -> dict[str, Any]:
-    """Add the account to a result, and the previewDigest to a preview."""
+    """Add the account and issue a digest only for a confirmable preview."""
     if not dry_run:
         return {**result, "addr": load.pinned}
-    return with_digest({**result, "addr": load.account()})
+    preview = {**result, "addr": load.account()}
+    if preview.get("positionOwnerVerified") is False:
+        return preview
+    return confirmation.with_digest(preview)
 
 
 # Trading: each action previews with dry_run and submits without it. A
@@ -632,8 +599,12 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
-    if not dry_run and not allow_concurrent_open:
-        check = both(no_recent_open(settings, load), check)
+    if not dry_run:
+        storage.check_open_pending(
+            settings.endpoint,
+            load()["evmAddress"],
+            allow_concurrent_open=allow_concurrent_open,
+        )
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
@@ -648,13 +619,12 @@ def open_trade(
         take_profit=take_profit,
         stop_loss=stop_loss,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
+        mcp_market=True,
         notify=notices.append,
         before_submit=check,
+        allow_concurrent_open=allow_concurrent_open,
     )
-    if dry_run and market:
-        # Read-only: the price a live submit would refresh to now.
-        current = trading.open_usdc_market(settings.endpoint, market_id)["price"]
-        result["referencePrice"] = format(Decimal(str(current)), "f")
     if notices:
         result["notices"] = notices
     return finish(load, dry_run, result)
@@ -677,6 +647,7 @@ def close_trade(
         trade_id=trade_id,
         cancel_order=cancel_order,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)
@@ -705,6 +676,7 @@ def set_tpsl(
         clear_take_profit=clear_take_profit,
         clear_stop_loss=clear_stop_loss,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)
@@ -727,6 +699,7 @@ def set_leverage(
         trade_id=trade_id,
         leverage=leverage,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)

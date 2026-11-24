@@ -1,0 +1,16 @@
+{
+  "borrowings": "query { perp { borrowings { marketId price isOpen visible minLeverage maxLeverage minPositionSizeUSD openFeePct closeFeePct baseToken { id symbol name } quoteToken { symbol } collateralToken { id symbol } } } }",
+  "borrowing": "query($market:Int!, $collateral:Int!) { perp { borrowing(marketId:$market,collateralId:$collateral) { marketId isOpen minLeverage maxLeverage collateralToken { id symbol } } } }",
+  "tokenPricesUsd": "query { oracle { tokenPricesUsd(limit: 100) { priceUsd token { id symbol name } lastUpdatedBlock { block block_ts } } } }",
+  "trades": "query($trader:String!) { perp { trades(where:{trader:$trader,isOpen:true}, limit:100) { id trader isOpen isLong tradeType collateralAmount leverage openPrice tp sl state { liquidationPrice pnlCollateral pnlPct positionValue } perpBorrowing { marketId baseToken { symbol } collateralToken { symbol } } } } }",
+  "trade": "query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }",
+  "oneClickTrading": "query { oneClickTrading { enabled chainId contractAddress } }",
+  "tradeHistory": "query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }",
+  "userIntents": "query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }",
+  "recordUserIntent": "mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }",
+  "ws:userBalances": "subscription($user:String!) { userBalances(where:{user:$user}) { amount usd_value token_info { name symbol decimals type } } }",
+  "ws:perpTrades": "subscription($user:String!) { perpTrades(where:{trader:$user}) { id trader isOpen isLong tradeType leverage openPrice tp sl } }",
+  "ws:tokenPricesUsd": "subscription($id:Int!) { tokenPricesUsd(where:{tokenId:$id}) { priceUsd token { id symbol } lastUpdatedBlock { block block_ts } } }",
+  "intentTradeHistory": "query($trader:String!, $limit:Int!, $offset:Int!) {\n  perp {\n    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,\n                 limit:$limit, offset:$offset) {\n      id intentKey tradeChangeType txHash evmTxHash block { block block_ts }\n      marketOrder { orderReqBlock orderReqTxHash orderExecBlock sequence execPrice collateralAmount }\n      openingFeeUsd closingFeeUsd borrowingFeeUsd\n      trade {\n        id trader tradeType isOpen isLong collateralAmount openCollateralAmount\n        leverage openPrice closePrice tp sl openBlock { block } closeBlock { block }\n        perpBorrowing { marketId collateralToken { symbol } }\n      }\n    }\n  }\n}",
+  "waitUserIntents": "query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"
+}

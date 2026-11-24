@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,6 +39,7 @@ import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable
+from http.client import HTTPException
 from pathlib import Path
 from typing import Any, TypeVar
 from urllib.parse import quote, urlsplit
@@ -94,12 +96,18 @@ def latest_tag(releases: list[Any]) -> str | None:
     return best[1] if best else None
 
 
-def within(seconds: float, what: str, work: Callable[[float], T]) -> T:
+def within(
+    seconds: float,
+    what: str,
+    work: Callable[[float], T],
+    *,
+    check_cancelled: Callable[[], None] | None = None,
+) -> T:
     """Run WORK(deadline) and give up after SECONDS of wall-clock time.
 
     Socket timeouts only bound each read, so a server that keeps sending a
     little could hold a request open forever. WORK runs in a daemon thread
-    that this stops waiting for at the deadline.
+    that this stops waiting for at the deadline or when CHECK_CANCELLED raises.
     """
     deadline = time.monotonic() + seconds
     outcome: dict[str, Any] = {}
@@ -112,9 +120,15 @@ def within(seconds: float, what: str, work: Callable[[float], T]) -> T:
 
     worker = threading.Thread(target=run, name="sai-install", daemon=True)
     worker.start()
-    worker.join(seconds)
-    if worker.is_alive():
-        raise LookupFailed(f"timed out {what}")
+    while worker.is_alive():
+        if check_cancelled is not None:
+            check_cancelled()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise LookupFailed(f"timed out {what}")
+        worker.join(min(0.1, remaining) if check_cancelled is not None else remaining)
+    if check_cancelled is not None:
+        check_cancelled()
     if "error" in outcome:
         raise outcome["error"]
     return outcome["value"]
@@ -155,6 +169,10 @@ def request(
     except urllib.error.HTTPError as error:
         found = {name.lower(): value for name, value in error.headers.items()}
         return error.code, found, b""
+    except HTTPException as error:
+        raise LookupFailed(
+            f"incomplete or invalid GitHub HTTP response: {type(error).__name__}"
+        ) from error
     except (OSError, ValueError) as error:
         raise LookupFailed(f"could not reach GitHub: {type(error).__name__}") from error
 
@@ -218,7 +236,11 @@ def any_release(web_base: str, deadline: float) -> bool:
 
 
 def find_latest(
-    api_base: str = API_BASE, web_base: str = WEB_BASE, timeout: float = TOTAL_TIMEOUT
+    api_base: str = API_BASE,
+    web_base: str = WEB_BASE,
+    timeout: float = TOTAL_TIMEOUT,
+    *,
+    check_cancelled: Callable[[], None] | None = None,
 ) -> str | None:
     """Return the latest sai-cli release tag, or None when there is none yet."""
 
@@ -230,7 +252,9 @@ def find_latest(
             raise LookupFailed(RATE_LIMITED)
         return None
 
-    return within(timeout, "looking up the latest release", work)
+    return within(
+        timeout, "looking up the latest release", work, check_cancelled=check_cancelled
+    )
 
 
 def version_of(tag: str) -> str:
@@ -323,40 +347,42 @@ def wheel_cache() -> Path:
     return Path(os.path.abspath(home)) / "cache" / "wheels"
 
 
-def private_dir(path: Path, exact: bool) -> None:
-    """Make sure directory PATH is the current user's and that no one else
-    can write to it, creating it if needed.
-
-    A directory another user can write to would let them swap the verified
-    wheel before uv opens it. One of ours with loose modes is tightened to
-    0700; EXACT makes it 0700 in any case. One that is a symlink, belongs to
-    someone else, or cannot be tightened is refused.
-    """
+def private_dir(path: Path, *, preserve_mode: bool = False) -> None:
+    """Create a private cache directory or check a parent without changing it."""
     if path.is_symlink():
         raise LookupFailed(f"{path} is a symlink; not keeping a wheel under it")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700, parents=True)
+        created = True
+    except FileExistsError:
+        created = False
     status = path.stat()
+    if not stat.S_ISDIR(status.st_mode):
+        raise NotADirectoryError(f"{path} is not a directory")
     if hasattr(os, "getuid") and status.st_uid != os.getuid():
         raise LookupFailed(f"{path} belongs to another user; not keeping a wheel there")
     if os.name == "nt":
         return
-    mode = status.st_mode & 0o777
-    if mode & 0o022 or (exact and mode != 0o700):
-        try:
-            path.chmod(0o700)
-        except OSError as error:
+    mode = stat.S_IMODE(status.st_mode)
+    if preserve_mode and not created:
+        if mode & 0o022:
             raise LookupFailed(
-                f"{path} is writable by other users and could not be made private"
-            ) from error
+                f"{path} is writable by other users; choose a private SAI_HOME"
+            )
+        return
+    if mode != 0o700:
+        try:
+            path.chmod(0o700, follow_symlinks=False)
+        except OSError as error:
+            raise LookupFailed(f"{path} could not be made private") from error
 
 
 def private_cache() -> Path:
-    """Return the wheel cache after making $SAI_HOME, `cache`, and
-    `cache/wheels` private to the current user."""
+    """Return the private wheel cache beneath user-owned, non-writable parents."""
     cache = wheel_cache()
-    private_dir(cache.parent.parent, exact=False)
-    private_dir(cache.parent, exact=True)
-    private_dir(cache, exact=True)
+    private_dir(cache.parent.parent, preserve_mode=True)
+    private_dir(cache.parent, preserve_mode=True)
+    private_dir(cache)
     return cache
 
 

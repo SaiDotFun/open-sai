@@ -19,19 +19,27 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import partial
+from threading import BoundedSemaphore
 from typing import Any, Literal
 
+from anyio import BrokenResourceError
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
-from pydantic import ConfigDict
+from pydantic import ConfigDict, ValidationError
 
 from ..core import log as sai_log
+from ..core import log_queries, wait
 from ..core import settings as sai_settings
+from ..core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
 
 log = logging.getLogger("sai_cli.mcp_server")
+BAD_SETTINGS = "BAD_SETTINGS"  # Legacy MCP result code.
 
 INSTRUCTIONS = """\
 Sai perpetuals trading on Nibiru through Sai Keeper.
@@ -43,21 +51,24 @@ signed in for this server's endpoint.
 trade_* call while signed out returns SIGNED_OUT (or SESSION_EXPIRED, or \
 SESSION_UNAVAILABLE for another endpoint) and submits nothing: ask the user \
 to run `sai auth login NAME` or `sai auth import` in a terminal, then retry.
-- Before any trade, call the matching preview_* tool, show the user the \
-preview and the account it names, and get their explicit confirmation. Only then call the trade_* \
-tool with the same arguments plus the preview's previewDigest, and for a \
-market open also its referencePrice.
+- Before any trade, call the matching preview_* tool. If \
+estimates.execution.status is would_be_rejected, report its reason and stop. \
+Otherwise, show the user the preview and the account it names. Get explicit \
+confirmation, then call the trade_* tool with the same arguments and the \
+previewDigest. For a market open, also send its referencePrice.
+- If a position preview reports positionOwnerVerified as false, request a \
+new preview when the contract position can be read.
 - If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was \
-submitted: show the user the new preview in the result, get confirmation \
-again, and retry with the new previewDigest (and referencePrice).
-- "accepted" means Keeper admitted the intent. It does not mean the trade \
-executed. Use intent_status with the intent key to follow it.
-- If a trade returns code OUTCOME_UNKNOWN, call intent_status with its \
+submitted. Show the user any replacement preview. If it has a previewDigest, \
+get confirmation again before retrying. Otherwise follow the error's instructions.
+- "accepted" means Keeper admitted the intent. Use intent_wait with its key \
+to check for a final outcome.
+- If a trade returns code OUTCOME_UNKNOWN, call intent_wait with its \
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
-retrying. trade_open refuses with RECENT_OPEN_PENDING while a recent open \
-is unknown or accepted; check those intents with intent_status, and pass \
-allow_concurrent_open=true only if the user wants another open position.
+retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
+Wait for a final outcome on pending fills. For recent accepted opens, use \
+allow_concurrent_open=true only after the user confirms another position.
 - The user can connect several accounts; one is active. auth_list shows \
 them. Preview and trade tools act on the active account unless given \
 addr, which must be a connected account. Every preview and trade names \
@@ -117,7 +128,7 @@ async def call(action: Callable[..., Any], /, *args: Any, **kwargs: Any) -> str:
     try:
         config = server_settings()
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     return await asyncio.to_thread(tools.run, partial(action, config, *args, **kwargs))
 
 
@@ -199,10 +210,21 @@ async def account_balances(addr: str | None = None) -> str:
     return await call(tools.account_balances, addr)
 
 
+async def account_overview(addr: str | None = None) -> str:
+    """Read Sai funds, position risk, pending and queued orders, local blockers,
+    and session expiry. Check each section for its fetch time and any error.
+
+    Args:
+        addr: EVM addr (0x...). Defaults to the active account for this endpoint.
+    """
+    return await call(tools.account_overview, addr)
+
+
 async def intent_local(addr: str | None = None) -> str:
     """List intents this machine recorded, with their local status.
 
-    Status `unknown` blocks new trades until intent_status reconciles it.
+    Statuses `unknown` and `pending` block new trades until intent_status
+    reconciles them.
     The result names the `addr` read and its `addrSource`.
 
     Args:
@@ -215,11 +237,9 @@ async def intent_local(addr: str | None = None) -> str:
 async def intent_status(addr: str | None = None, key: str | None = None) -> str:
     """Read Keeper's latest intent records; with KEY, reconcile that intent.
 
-    With KEY this also writes: it updates this machine's local intent cache,
-    the record intent_local lists and trades check. It never changes
-    anything on Keeper. Reconciling updates only the local record: a server failure or matched
-    trade history is final, a server acceptance is accepted, and a key
-    Keeper never recorded past its admission window stops blocking trades.
+    The account list records pending observations in the local ledger.
+    With KEY this also checks for a final outcome. If the result includes
+    outcome `pending`, follow its hint and check the same key again.
 
     Args:
         addr: EVM addr (0x...). Defaults to the signed-in account,
@@ -227,6 +247,75 @@ async def intent_status(addr: str | None = None, key: str | None = None) -> str:
         key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
     """
     return await call(tools.intent_status, addr, key)
+
+
+LOG_WORKERS = 2
+_log_slots = BoundedSemaphore(LOG_WORKERS)
+_log_executor = ThreadPoolExecutor(
+    max_workers=LOG_WORKERS, thread_name_prefix="sai-logs"
+)
+
+
+async def logs_intent(
+    key: str, offline: bool = False, addr: str | None = None, before: str | None = None
+) -> str:
+    """Read one intent's local log trail and current Keeper record.
+
+    Args:
+        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
+        offline: Read local logs only.
+        addr: EVM address to select if the trail has several accounts.
+        before: UTC timestamp from a truncated report's nextBefore field.
+    """
+    try:
+        endpoint = None if offline else server_settings().endpoint
+    except sai_settings.SettingsError:
+        return json.dumps(tools.error("Could not read Sai settings.", BAD_SETTINGS))
+    if not _log_slots.acquire(blocking=False):
+        return json.dumps(
+            tools.error("Log queries are busy. Retry shortly.", Code.INTERNAL_ERROR)
+        )
+    action = partial(
+        log_queries.intent, key, endpoint=endpoint, addr=addr, before=before
+    )
+    context = copy_context()
+
+    def execute() -> str:
+        return context.run(tools.run, action)
+
+    try:
+        future = _log_executor.submit(execute)
+    except RuntimeError:
+        _log_slots.release()
+        raise
+    future.add_done_callback(lambda _future: _log_slots.release())
+    return await asyncio.wrap_future(future)
+
+
+async def intent_wait(
+    key: str, addr: str | None = None, timeout: float = wait.MCP_MAX_TIMEOUT
+) -> str:
+    """Wait up to 10 seconds for a final outcome and return an intent receipt.
+
+    If the outcome is unknown, call this tool again with the same key and
+    address. Keep using the original key for follow-up.
+
+    Args:
+        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
+        addr: EVM or Nibiru address. Defaults to the local intent account, then the active account.
+        timeout: Wait in seconds, capped at 10.
+    """
+    started = time.monotonic()
+    try:
+        config = server_settings()
+    except sai_settings.SettingsError as exc:
+        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+    try:
+        result = await tools.intent_wait(config, key, addr, timeout, started)
+    except Exception as exc:  # noqa: BLE001 - tools return structured errors
+        result = tools.describe(exc)
+        result["error"] = sai_log.redact(result["error"])
+    return json.dumps(result, default=str)
 
 
 # Previews and trades share one implementation per action.
@@ -247,9 +336,10 @@ async def preview_open(
     """Preview opening a market, limit, or stop trade without submitting.
 
     Show the user the result and get confirmation; trade_open then needs its
-    previewDigest. A market order preview sets requiresMarketPriceRefresh
-    and reports Keeper's current price as referencePrice: the submit uses
-    the price current at that time, and trade_open needs referencePrice too.
+    previewDigest. Use estimates for execution fees, liquidation price, and
+    the worst-case fill. A market order reports Keeper's current price as
+    referencePrice. Submit refreshes the price and checks it against the
+    referencePrice from the preview.
 
     Args:
         market_id: Market id from market_list.
@@ -305,9 +395,8 @@ async def trade_open(
     from the confirmed preview, and, for a market order, PRICE_MOVED when
     Keeper's current price moved from reference_price by more than the
     slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an open for this account from the last few
-    minutes is still unknown or accepted: call intent_local and
-    intent_status before retrying.
+    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or
+    pending. Check its key with intent_status before retrying.
 
     Args:
         market_id: Market id from market_list.
@@ -323,10 +412,11 @@ async def trade_open(
         preview_digest: previewDigest from the confirmed preview_open.
         reference_price: referencePrice from the confirmed preview_open;
             required for market orders only.
-        allow_concurrent_open: True to submit despite a recent pending
-            open, only after intent_status shows it and the user confirms
-            they want another position. An intent still `unknown` blocks
-            every trade until intent_status reconciles it.
+        allow_concurrent_open: True to submit while an earlier open is unknown
+            or accepted, after checking its status and getting confirmation for
+            another position. Any locally pending open on the same account and
+            Keeper still blocks submission, including a late acknowledgement
+            or an outcome that is still waiting to be indexed.
         addr: Connected account to act as (0x...). Defaults to the
             active account.
     """
@@ -516,9 +606,11 @@ async def preview_margin(
     """Quote adding or removing margin from exact contract state.
 
     The change is a target-leverage intent: the amount is a quote, not a
-    cap, and the actual change may differ if the position moves first.
-    Needs a signed-in session to read the position. Show the user the quote;
-    trade_margin needs its previewDigest.
+    cap, and the actual change may differ at execution. Uses effective
+    leverage after any applicable after-hours cap. If
+    quote.marginChangeIsEstimate is true, tell the user that the guard can
+    deduct fees first. A signed-in session is required. trade_margin needs
+    the previewDigest the user confirms.
 
     Args:
         trade_id: Trade id from account_positions.
@@ -575,9 +667,11 @@ async def preview_partial_close(
 ) -> str:
     """Preview reducing an open USDC position by a whole percentage.
 
-    Sized from contract state and checked against the market minimum.
-    Needs a signed-in session to read the position. Show the user the
-    result; trade_partial_close needs its previewDigest.
+    Sizes the reduction from contract state, checks the market minimum, and
+    quotes the closed notional. Needs a signed-in session to read the
+    position. Show the user the quoted notional and collateral reduction.
+    When quote.closedNotionalIsEstimate is true, say that the notional is
+    an estimate. trade_partial_close needs the previewDigest they confirm.
 
     Args:
         trade_id: Trade id from account_positions.
@@ -648,6 +742,9 @@ READ_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
     (preview_leverage, read_only("Preview Leverage")),
     (preview_margin, read_only("Preview Margin Change")),
     (preview_partial_close, read_only("Preview Partial Close")),
+    (logs_intent, read_only("Intent Log Trail")),
+    (account_overview, read_only("Account Overview")),
+    (intent_wait, read_only("Wait for Intent")),
 )
 
 TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
@@ -693,11 +790,14 @@ class SaiMCP(FastMCP):
                 # first line is kept, as untrusted text, and nothing for an
                 # unknown tool, whose message is the name the client sent.
                 first = str(exc).partition("\n")[0] if known is not None else None
+                cause = exc.__cause__
+                failure = describe(cause if isinstance(cause, Exception) else exc)
                 sai_log.event(
                     "mcp.tool_result",
                     "error",
                     ok=False,
-                    code="TOOL_ERROR",
+                    code=Code.INVALID_REQUEST if known is None else failure.code,
+                    intentKey=failure.intent_key,
                     errorType=type(exc).__name__,
                     error=sai_log.untrusted(first),
                     durationMs=round((time.monotonic() - started) * 1000),
@@ -713,7 +813,13 @@ class SaiMCP(FastMCP):
                 "mcp.tool_result",
                 "info" if summary["ok"] else "warn",
                 durationMs=round((time.monotonic() - started) * 1000),
-                **summary,
+                ok=summary["ok"],
+                code=summary.get("code"),
+                error=summary.get("error"),
+                account=summary.get("account"),
+                status=summary.get("status"),
+                intentKey=summary.get("intentKey"),
+                previewDigest=summary.get("previewDigest"),
             )
             return result
 
@@ -733,6 +839,8 @@ class SaiMCP(FastMCP):
             if tool is None:
                 return None, len(given)
             names = tool.parameters.get("properties", {})
+            if name == "logs_intent":
+                return {}, sum(key not in names for key in given)
             known = {key: loggable_value(given[key]) for key in names if key in given}
             return known, len(given) - len(known)
         except Exception:  # noqa: BLE001 - logging must not fail a call
@@ -754,7 +862,31 @@ class SaiMCP(FastMCP):
                 ]
                 result = (content, {"result": refusal})
                 return result  # ty: ignore[invalid-explicit-return]
-        return await super().call_tool(name, arguments)
+        try:
+            return await super().call_tool(name, arguments)
+        except ToolError as exc:
+            cause = exc.__cause__
+            if name != "logs_intent" or not isinstance(cause, ValidationError):
+                raise
+            # SDK validation renders the rejected input in its exception.
+            # Use known fields and type names only, including for extra keys.
+            types = {
+                "key": "a string",
+                "offline": "a boolean",
+                "addr": "a string or null",
+                "before": "a string or null",
+            }
+            detail = cause.errors(
+                include_input=False, include_context=False, include_url=False
+            )[0]
+            field = detail["loc"][0] if detail["loc"] else None
+            expected = types.get(field) if isinstance(field, str) else None
+            if expected is not None:
+                message = f"Argument '{field}' must be {expected}."
+            else:
+                accepted = ", ".join(f"'{key}' ({kind})" for key, kind in types.items())
+                message = f"Expected audit arguments {accepted}."
+            raise ToolError(message) from SaiError(message, Code.INVALID_REQUEST)
 
 
 def loggable_value(value: Any) -> Any:
@@ -805,10 +937,16 @@ def result_summary(text: str | None) -> dict[str, Any]:
     for name in RESULT_FIELDS:
         if isinstance(value.get(name), str):
             summary[name] = sai_log.Arg(value[name])
-        elif isinstance(value.get(name), (bool, int, float)):
-            summary[name] = value[name]
     if isinstance(summary.get("error"), str):
         summary["error"] = sai_log.untrusted(summary["error"])
+    if not summary["ok"]:
+        if summary.get("code") == BAD_SETTINGS:
+            summary["code"] = Code.INVALID_REQUEST
+        else:
+            try:
+                summary["code"] = Code(summary.get("code"))
+            except ValueError:
+                summary["code"] = Code.INTERNAL_ERROR
     account = value.get("account", value.get("addr"))
     if isinstance(account, str):
         summary["account"] = sai_log.Arg(account)
@@ -821,7 +959,7 @@ def session_refusal(addr: str | None = None) -> str | None:
     try:
         tools.require_session(server_settings(), addr)
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     except tools.SessionUnavailable as exc:
         return json.dumps(tools.describe(exc))
     return None
@@ -862,9 +1000,9 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 "mcpVersion": info.version("mcp"),
                 "provenance": info.provenance(),
                 "endpoints": {
-                    "keeper": sai_settings.public_url(config.endpoint),
-                    "websocket": sai_settings.public_url(config.ws_endpoint),
-                    "lcd": sai_settings.public_url(config.lcd_endpoint),
+                    "keeper": sai_log.origin(config.endpoint),
+                    "websocket": sai_log.origin(config.ws_endpoint),
+                    "lcd": sai_log.origin(config.lcd_endpoint),
                 },
                 "configFile": str(sai_settings.config_path(os.environ)),
                 "logs": {
@@ -916,7 +1054,13 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
     try:
         settings = sai_settings.load(flags, warn=log.warning)
     except sai_settings.SettingsError as exc:
-        raise SystemExit(f"sai mcp serve: {exc}") from None
+        raise SaiError(
+            f"sai mcp serve: {exc}",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE
+            if isinstance(exc, sai_settings.InvalidEndpoint)
+            else None,
+        ) from exc
     with sai_log.bind(surface="mcp"):
         sai_log.event(
             "mcp.server_start",
@@ -924,4 +1068,10 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             websocket=sai_log.endpoint(settings.ws_endpoint),
             lcd=sai_log.endpoint(settings.lcd_endpoint),
         )
-        create_server(settings).run()
+        server = create_server(settings)
+        try:
+            server.run()
+        except* (KeyboardInterrupt, BrokenPipeError, BrokenResourceError):
+            pass
+        except* Exception as exc:
+            raise McpStdioError("Sai MCP stdio session failed") from exc

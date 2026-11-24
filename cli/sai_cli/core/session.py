@@ -4,9 +4,90 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import UTC, datetime
+import shlex
+from collections.abc import Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
-from . import log, storage
+from . import keeper, log, storage
+from .errors import Code, SessionError
+
+EXPIRY_WARNING = timedelta(days=3)
+INVALID_RENEWAL_ADDRESS = "Stored session address is invalid. Sign in again."
+
+
+def expiry_time(result: dict[str, str]) -> datetime:
+    expiry = datetime.fromisoformat(result["expiresAt"])
+    if expiry.tzinfo is None:
+        raise ValueError("Stored session is invalid: expiry has no time zone")
+    return expiry
+
+
+def renewal_fields(result: dict[str, str]) -> dict[str, str]:
+    """Return a shell command and any guidance needed to renew the session."""
+    addr = result["evmAddress"]
+    if not keeper.is_address(addr):
+        return {"renewalGuidance": INVALID_RENEWAL_ADDRESS}
+    if result.get("keyName"):
+        args = ("auth", "renew", addr)
+    else:
+        args = ("auth", "import", "--addr", addr)
+    endpoint = result.get("endpoint") or ""
+    origin = log.origin(endpoint)
+    show_origin = origin != log.REDACTED_URL and log.redact(origin) == origin
+    public_default = (
+        endpoint == keeper.MAINNET_HTTP and log.redact(endpoint) == endpoint
+    )
+    command = (
+        shlex.join(("sai", "--endpoint", endpoint, *args))
+        if public_default
+        else storage.keeper_command_hint(endpoint, *args)
+    )
+    guidance = []
+    if not public_default and (endpoint != origin or not show_origin):
+        where = f" at {origin}" if show_origin else ""
+        guidance.append(f"Reuse the Keeper endpoint{where} used to sign in.")
+    if not result.get("keyName") and result.get("source") != "imported":
+        guidance.append("You can also sign in again with your Foundry keystore.")
+    fields = {"renewalCommand": command}
+    if guidance:
+        fields["renewalGuidance"] = " ".join(guidance)
+    return fields
+
+
+def expiry_notice_text(fields: Mapping[str, str]) -> str:
+    command = fields.get("renewalCommand")
+    parts = (
+        fields["expiryWarning"],
+        fields.get("renewalGuidance"),
+        f"Run {command}" if command else None,
+    )
+    return " ".join(part for part in parts if part)
+
+
+def escape_warning_text(value: str) -> str:
+    return "".join(
+        ascii(c)[1:-1]
+        if ord(c) < 32 or 0x7F <= ord(c) <= 0x9F or c in "\u2028\u2029"
+        else c
+        for c in value
+    )
+
+
+def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
+    left = expiry_time(result) - now
+    if not timedelta(0) < left < EXPIRY_WARNING:
+        return None
+    minutes = int(left.total_seconds() // 60)
+    when = (
+        "under 1 min"
+        if minutes == 0
+        else f"{minutes} min"
+        if minutes < 120
+        else f"{minutes // 60} h"
+    )
+    addr = escape_warning_text(result["evmAddress"])
+    return f"Sai session for {addr} expires in {when}."
 
 
 def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str]:
@@ -15,30 +96,68 @@ def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str
 
     Never prompts: sessions are encrypted with the CLI's built-in key.
     """
-    return check_active(storage.load_session(addr), endpoint)
+    try:
+        return check_active(storage.load_session(addr), endpoint)
+    except SessionError as exc:
+        if exc.code == Code.SIGNED_OUT:
+            flags = ("--addr", addr) if addr is not None else ()
+            exc.hint = storage.keeper_command_hint(
+                endpoint, "auth", "login", "NAME", *flags
+            )
+        raise
+    except ValueError as exc:
+        raise SessionError(str(exc)) from exc
 
 
 def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
     """Return RESULT if it belongs to ENDPOINT and has not expired."""
     if result.get("endpoint") != endpoint:
-        raise ValueError("Stored session belongs to another Keeper endpoint")
-    expiry = datetime.fromisoformat(result["expiresAt"])
+        raise SessionError("Stored session belongs to another Keeper endpoint")
+    try:
+        expiry = expiry_time(result)
+    except (KeyError, ValueError) as exc:
+        raise SessionError(
+            f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
+        ) from exc
     if expiry <= datetime.now(UTC):
         log.event(
             "session.expired",
             "warn",
+            code=Code.SESSION_EXPIRED,
             addr=result.get("evmAddress"),
             expiresAt=result["expiresAt"],
         )
-        raise ValueError("Trading session expired; sign in again")
+        if not keeper.is_address(result["evmAddress"]):
+            error = SessionError(INVALID_RENEWAL_ADDRESS, Code.SESSION_EXPIRED)
+            error.hint = None
+            raise error
+        message = "Trading session expired; sign in again"
+        if result.get("keyName") or result.get("source") == "imported":
+            fields = renewal_fields(result)
+            if guidance := fields.get("renewalGuidance"):
+                message += f". {guidance}"
+            hint = fields["renewalCommand"]
+        else:
+            hint = storage.keeper_command_hint(
+                endpoint, "auth", "login", "NAME", "--addr", result["evmAddress"]
+            )
+        raise SessionError(message, Code.SESSION_EXPIRED, hint=hint)
     return result
+
+
+def token_claims(token: str) -> dict[str, Any]:
+    """Decode the public claims without verifying the token's signature."""
+    payload = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    if not isinstance(claims, dict):
+        raise TypeError("Expected session claims")
+    return claims
 
 
 def import_session(token: str, endpoint: str) -> dict[str, str]:
     """Validate a Sai Web session TOKEN and build the session to store."""
     try:
-        payload = token.split(".")[1]
-        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        data = token_claims(token)
         addr = data["sub"]
         expires = datetime.fromtimestamp(data["exp"], UTC)
         if (
@@ -46,23 +165,36 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
             or not addr.startswith("0x")
             or len(addr) != 42
             or data.get("purpose") != "user_intent"
-            or expires <= datetime.now(UTC)
         ):
             raise ValueError
     except (ValueError, KeyError, IndexError, TypeError, OverflowError) as exc:
         raise ValueError("Invalid or expired Sai session token") from exc
+    if expires <= datetime.now(UTC):
+        raise SessionError("Invalid or expired Sai session token", Code.SESSION_EXPIRED)
     return {
         "token": token,
         "evmAddress": addr,
         "expiresAt": expires.isoformat(),
         "endpoint": endpoint,
+        "source": "imported",
     }
 
 
-def summary(result: dict[str, str]) -> dict[str, str]:
-    """Return the fields safe to show: addr, expiry, endpoint; no token."""
+def summary(result: dict[str, str]) -> dict[str, str | None]:
+    """Return the address, expiry, and Keeper origin for display."""
+    endpoint = result.get("endpoint")
     return {
         "addr": result["evmAddress"],
         "expiresAt": result["expiresAt"],
-        "endpoint": result["endpoint"],
+        "endpoint": log.origin(endpoint) if endpoint is not None else None,
     }
+
+
+def expiry_fields(
+    result: dict[str, str], now: datetime | None = None
+) -> dict[str, str]:
+    """Report a near-expiry warning without exposing the stored signer."""
+    warning = expiry_warning(result, now or datetime.now(UTC))
+    if warning is None:
+        return {}
+    return {"expiryWarning": warning, **renewal_fields(result)}

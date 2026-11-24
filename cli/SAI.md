@@ -1,23 +1,43 @@
 # Sai CLI Design
 
-Sai Keeper exposes market and account data over GraphQL and accepts semantic
-trading intents authenticated with a wallet session JWT. This CLI constructs
-those requests directly. The client defaults to mainnet and accepts explicit
-HTTP and WebSocket endpoints for local development and tests.
+The Python CLI in sai-cli v0.1.2 reads Sai Keeper's GraphQL API and submits
+trading intents. An intent tells Keeper what operation to execute for a
+wallet. The CLI defaults to mainnet. Use endpoint flags or config settings
+to select another Keeper and its matching Nibiru REST endpoint.
 
-One command submits one intent. Before submission, the CLI records its identity
-locally. A transport error can follow acceptance, so the CLI reports an unknown
-outcome and requires reconciliation rather than retrying a new intent. Keeper
-expires recorded intents after two minutes, so `intent status` treats a key
-that Keeper has not recorded five minutes after submission as never admitted
-and marks it `absent`. Keeper's acceptance is not trade finality. `intent status` reads Keeper's current state.
+## Submission and Reconciliation
 
-Keeper issues one credential: a session JWT signed after a wallet challenge,
-valid for 30 days in production, with no scopes and no revocation. The CLI
-uses that same token. `auth import` takes it from Sai Web through a hidden
-prompt or the clipboard. `auth login NAME` signs the challenge with the
-Foundry keystore of that name through `cast`. `auth logout` deletes the local
-copy. The CLI
-stores the session under `$SAI_HOME/trader` at mode 0600, encrypted with a
-fixed built-in key, so no command prompts for a passphrase.
-Per-device credentials are not yet part of this repository.
+A live trade command reserves one intent key in the local ledger before
+sending the request. Keeper admission can precede execution by several
+blocks. For example, a mainnet market open can wait for the next oracle
+price. `sai intent wait KEY` follows the same key and returns a receipt.
+Use `--addr ADDR` if you do not have the ledger or a session on this machine.
+
+A connection can fail after Keeper receives the request. In that case the
+CLI reports `OUTCOME_UNKNOWN` and exits 5. Keep the key and reconcile it
+against the original Keeper endpoint. After five minutes, an empty Keeper
+result can mark an unresolved local intent `absent` and let trading resume.
+A delayed admission can still appear.
+
+## Sessions
+
+A Sai session is a JWT that Keeper issues after a wallet signs a challenge.
+Production sessions last 30 days. For a browser session, use **Connect Sai
+CLI / MCP** in the Sai Web Mainnet wallet menu and follow the dialog's
+`sai auth import` command. The CLI reads a token from a hidden prompt or
+the clipboard.
+
+The dialog sets the Mainnet Keeper endpoint for that command. Use the same
+endpoint for later CLI and MCP calls. Set it as the default with
+`sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query`.
+
+Use `sai auth login NAME` to sign in with a Foundry keystore, then
+`sai auth renew [ADDR]` to renew using the saved key name. To refresh an
+imported session, copy a fresh token in Sai Web and import it again.
+
+The CLI keeps sessions in `$SAI_HOME/trader/sessions.json` at mode 0600 and
+encrypts them with a built-in key. Anyone who can read the file can decrypt
+it. `sai auth logout [ADDR]` removes the local copy. A token copied elsewhere
+remains usable until it expires.
+
+See the [CLI guide](sai_cli/README.md) for command options and JSON fields.

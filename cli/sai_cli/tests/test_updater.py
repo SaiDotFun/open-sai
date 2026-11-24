@@ -23,13 +23,24 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import tomlkit
 from click.testing import CliRunner
 from fake_release import build_wheel, downloads, release_routes
-from sai_cli.core import update, updater
+from sai_cli.core import log, update, updater
 from sai_cli.sai_cli import EXIT_UNSUPPORTED, auto_update_applies, main
+from test_mcp_install import (
+    FAKE_CLAUDE,
+    FAKE_CODEX,
+    OLD_COMMAND,
+    OTHER,
+    SECRET,
+    write_exe,
+    write_project_mcp_denials,
+)
 from test_update import API_PATH, Stub, listing, make_prefix
 
-REAL_UV = shutil.which("uv")
+_uv_executable = shutil.which(os.environ.get("UV") or "uv")
+REAL_UV = os.path.abspath(_uv_executable) if _uv_executable else None
 needs_uv = pytest.mark.skipif(REAL_UV is None, reason="uv is not on PATH")
 
 
@@ -91,12 +102,23 @@ def sai_home(tmp_path, monkeypatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def private_updater_path(tmp_path, monkeypatch) -> None:
+    """Keep installed MCP clients out of post-update discovery."""
+    executables = tmp_path / "path"
+    executables.mkdir()
+    if REAL_UV is not None:
+        (executables / "uv").symlink_to(REAL_UV)
+    monkeypatch.setenv("PATH", str(executables))
+
+
 @pytest.fixture
 def uv_dirs(tmp_path, monkeypatch, sai_home) -> Path:
     """Point uv at temporary tool, bin, and cache directories."""
     monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "tools"))
     monkeypatch.setenv("UV_TOOL_BIN_DIR", str(tmp_path / "bin"))
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("UV_PYTHON", str(Path(sys.executable).resolve()))
     monkeypatch.setenv("UV_PYTHON_DOWNLOADS", "never")
     monkeypatch.setenv("UV_NO_CONFIG", "1")
     monkeypatch.delenv("UV", raising=False)
@@ -124,6 +146,191 @@ BROKEN_WHEN_INSTALLED = (
 
 
 # Real uv
+
+
+@pytest.mark.slow
+@needs_uv
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "foreground",
+        "json",
+        "background",
+        "failed",
+        "deleted-cwd",
+        "deleted-cwd-relative",
+        "legacy-project",
+    ],
+)
+def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
+    home = uv_dirs / "home"
+    home.mkdir()
+    codex_home = uv_dirs / "codex-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("FAKE_LOG", str(uv_dirs / "client-calls.jsonl"))
+    project = uv_dirs / "project"
+    project.mkdir()
+    legacy = mode == "legacy-project"
+    background = mode == "background"
+    name = OLD_COMMAND if legacy else "sai"
+    scope = "project" if legacy else "user"
+    config = project / ".mcp.json" if legacy else home / ".claude.json"
+    entry = {
+        "command": OLD_COMMAND,
+        "args": ["--endpoint", "https://private.example/" + SECRET],
+        "env": {"CUSTOM": SECRET},
+    }
+    other = {"url": "https://private.example/mcp", "headers": {"X-Token": SECRET}}
+    original = json.dumps({"mcpServers": {name: entry, OTHER: other}})
+    config.write_text(original)
+    cursor = project / ".cursor" / "mcp.json"
+    server_body = ""
+    if mode.startswith("deleted-cwd"):
+        # An installed release's import runs in the updater's neutral directory.
+        # Remove the CLI's actual cwd during post-install verification.
+        server_body = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"project = Path({str(project)!r})\n"
+            "if 'tools' in Path(sys.prefix).parts and project.is_dir():\n"
+            "    project.rmdir()\n"
+        )
+    else:
+        (home / ".cursor").mkdir()
+        cursor.parent.mkdir()
+        cursor.write_text(original)
+    if legacy:
+        policies = write_project_mcp_denials(project)
+        codex_home.mkdir()
+        codex_config = codex_home / "config.toml"
+        codex_config.write_text(
+            tomlkit.dumps(
+                {
+                    "mcp_servers": {
+                        name: {**entry, "enabled": False, "enabled_tools": []}
+                    }
+                }
+            )
+        )
+    wheels = {
+        "0.1.0": build_wheel("0.1.0"),
+        "0.2.0": build_wheel("0.2.0", server_body),
+    }
+    bad_hash = ("0.2.0",) if mode == "failed" else ()
+    with Stub(release_routes(wheels, bad_hash=bad_hash)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        write_exe(tool.sai.with_name("claude"), FAKE_CLAUDE)
+        if legacy:
+            write_exe(tool.sai.with_name("codex"), FAKE_CODEX)
+        # Supply the installed tool prefix to the real CLI. Keep the test
+        # runner's Python and dependencies while uv replaces the tool.
+        monkeypatch.setenv(
+            "PATH", str(tool.sai.parent) + os.pathsep + os.environ["PATH"]
+        )
+        args = ["update", "--api-base", stub.url, "--web-base", stub.url]
+        if mode == "json":
+            args.insert(0, "--json")
+        if background:
+            args.append("--background")
+        monkeypatch.chdir(project)
+        if mode == "deleted-cwd-relative":
+            monkeypatch.setenv("SAI_HOME", "../sai-home")
+            monkeypatch.setenv("SAI_LOG", "false")
+        with monkeypatch.context() as runtime:
+            runtime.setattr(sys, "prefix", str(tool.prefix))
+            result = CliRunner().invoke(main, args, catch_exceptions=False)
+        monkeypatch.chdir(uv_dirs)
+        if mode == "deleted-cwd-relative":
+            monkeypatch.setenv("SAI_HOME", str(uv_dirs / "sai-home"))
+        if mode == "failed":
+            assert result.exit_code == 1
+            assert config.read_text() == original
+            assert not (uv_dirs / "client-calls.jsonl").exists()
+            return
+        assert result.exit_code == 0, result.output
+        assert tool.version() == "0.2.0"
+        expected = {
+            name: {
+                **entry,
+                "command": str(tool.sai),
+                "args": ["mcp", "serve", *entry["args"]],
+            },
+            OTHER: other,
+        }
+        assert config.read_text() == original
+        if background:
+            assert cursor.read_text() == original
+        elif mode.startswith("deleted-cwd"):
+            assert not project.exists()
+        else:
+            assert json.loads(cursor.read_text())["mcpServers"] == expected
+        if legacy:
+            assert all(
+                path.read_bytes() == content for path, content in policies.items()
+            )
+            assert tomlkit.parse(codex_config.read_text()).unwrap()["mcp_servers"] == {
+                name: {**expected[name], "enabled": False, "enabled_tools": []},
+            }
+        state = updater.read_state()
+        assert state["result"]["status"] == updater.UPDATED
+        if mode == "deleted-cwd-relative":
+            assert "The working directory is gone." in result.stdout
+            assert state["result"]["mcpNotes"] == ["cwd-missing"]
+            return
+        assert log.flush()
+        repair = [
+            event
+            for path in log.directory().glob("update-*.jsonl")
+            for line in path.read_text().splitlines()
+            if (event := json.loads(line))["event"] == "update.mcp_repair"
+        ]
+        assert len(repair) == 1
+        assert repair[0]["background"] is background
+        claude = repair[0]["clients"][0]
+        assert claude["client"] == "claude"
+        assert claude["status"] == "fail" and claude["changes"] == []
+        assert claude["manualRepairs"] == [{"scope": scope, "name": name}]
+        command = (
+            f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
+        )
+        assert command in claude["fix"]
+        assert state["result"]["mcp"] == repair[0]["clients"]
+        if legacy:
+            clients = {client["client"]: client for client in repair[0]["clients"]}
+            assert set(clients) == {"claude", "codex", "cursor"}
+            assert all(client["legacyName"] == name for client in clients.values())
+            assert f"kept the existing {name} name" in result.stdout
+        message = "Claude Code MCP registrations need manual repair."
+        if background:
+            assert result.output == ""
+            notices: list[str] = []
+            # This check just ran. The next terminal command announces it once.
+            updater.save_state({"scheduledAt": time.time()})
+            updater.tick(notices.append, prefix=tool.prefix)
+            updater.tick(notices.append, prefix=tool.prefix)
+            assert len(notices) == 1 and message in notices[0]
+            assert "sai doctor" in notices[0]
+            assert command in notices[0]
+            assert "project registrations" in notices[0]
+            assert state["result"]["mcpNotes"] == ["background"]
+        elif mode == "deleted-cwd":
+            assert "The working directory is gone." in result.stdout
+            assert command in result.stdout
+            assert state["result"]["mcpNotes"] == ["cwd-missing"]
+        elif mode == "json":
+            assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
+        else:
+            assert message in result.stdout
+            assert command in result.stdout
+        assert "Repaired Sai MCP registrations for claude" not in result.stdout
+        if not background:
+            assert updater.notice(state, "0.2.0") is None
+        output = result.output + json.dumps(repair) + json.dumps(updater.read_state())
+        for value in (OTHER, SECRET, "private.example"):
+            assert value not in output
 
 
 @pytest.mark.slow
@@ -880,11 +1087,22 @@ def test_the_wheel_cache_must_be_private_and_ours(tmp_path, sai_home, monkeypatc
     wheel. Ours is tightened; someone else's is refused."""
     wheels = sai_home / "cache" / "wheels"
     wheels.mkdir(parents=True)
-    for directory in (sai_home, sai_home / "cache", wheels):
-        directory.chmod(0o777)
+    wheels.parent.chmod(0o777)
+    wheels.chmod(0o777)
+    sai_home.chmod(0o2770)
+    with pytest.raises(updater.UpdateFailed, match="writable by other users"):
+        updater.private_cache()
+    assert sai_home.stat().st_mode & 0o7777 == 0o2770
+
+    sai_home.chmod(0o700)
+    with pytest.raises(updater.UpdateFailed, match="writable by other users"):
+        updater.private_cache()
+    assert wheels.parent.stat().st_mode & 0o777 == 0o777
+
+    wheels.parent.chmod(0o755)
     assert updater.private_cache() == wheels
-    for directory in (sai_home, sai_home / "cache", wheels):
-        assert directory.stat().st_mode & 0o777 == 0o700, directory
+    assert wheels.parent.stat().st_mode & 0o777 == 0o755
+    assert wheels.stat().st_mode & 0o777 == 0o700
 
     other = os.getuid() + 1
     monkeypatch.setattr(updater.os, "getuid", lambda: other)
@@ -1095,7 +1313,9 @@ def test_sai_update_from_a_checkout_exits_3_with_a_note(sai_home):
     assert "only updates an official uv tool install" in result.stderr
     data = CliRunner().invoke(main, ["--json", "update"])
     assert data.exit_code == EXIT_UNSUPPORTED
-    assert json.loads(data.stdout)["status"] == updater.UNSUPPORTED
+    error = json.loads(data.stdout)["error"]
+    assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
+    assert error["hint"] == update.INSTALL_COMMAND
 
 
 def test_check_takes_no_install_options(sai_home):

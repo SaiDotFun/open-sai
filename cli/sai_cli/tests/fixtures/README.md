@@ -10,6 +10,13 @@ with `sai --json watch price 3` at the same time. It is the decoded GraphQL
 payload printed by the CLI, not the WebSocket transport frame. Values and
 timestamps are historical observations and must not be used as current quotes.
 
+`mainnet_account_overview.json` records public Keeper reads from 2026-11-24.
+The account had Sai USDC and credits, with no open trades or queued market
+orders. Two historical trades record the deployed response shape with a
+synthetic trader identifier. Overview
+tests add synthetic states and orders to exercise positions, limit and stop
+orders, and next-oracle orders. The loopback LCD fixture supplies block times.
+
 `synthetic_protocol.json` is independently authored from the Keeper schema and
 the protocol shape exercised by the CLI. It is not a network capture. Its
 address, account data, signature placeholder, session token, and transaction
@@ -24,3 +31,33 @@ stored examples contain no real JWT or private key.
 An autouse fixture blocks external TCP connections in the pytest process.
 It does not affect spawned CLI processes, whose integration tests explicitly
 select loopback endpoints.
+
+## Log Event Goldens
+
+The JSONL files in `logs/` come from real subprocesses with temporary
+`SAI_HOME` directories. Each line follows the [log event schema](../../../../docs/log-events.md).
+
+- `cli-trade-close.jsonl` records `sai --json --endpoint URL trade close 7`
+  when the loopback Keeper acknowledges the request and returns a synthetic
+  transaction hash.
+- `mcp-prices-failure.jsonl` records the `market_prices` call after
+  `mcp_info` in one stdio server session. The Keeper URL has no listener,
+  so the request and tool result carry `NOT_SENT`.
+
+The capture checks field types against the registry before replacing
+volatile values, the loopback port and its endpoint identity, and the
+generated intent key. It preserves sequence numbers and ID relationships. Regenerate both files with this command.
+
+```sh
+SAI_REGENERATE_LOG_GOLDENS=1 uv run pytest cli/sai_cli/tests/test_logs.py \
+  -k 'joins_cli_and_mcp or serve_logs_tool_calls'
+```
+
+`intent_outcomes.json` contains selected mainnet `userIntents` and
+`tradeHistory` rows captured on 2026-11-24 under `recorded`. The fixture
+replaces wallet addresses, intent keys, transaction hashes, and trade and
+history IDs. The account's latest history was from November 18, before
+next-oracle activation. The `replays` section adapts the mainnet wire shape
+using Keeper PR #682's lifecycle producers and cancellation codes. Those
+rows include a request, a sweep with a missing outcome, and a later fill.
+The tests serve the responses over loopback HTTP.

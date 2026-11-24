@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sai-cli"
-version = "0.1.0"
+version = "0.1.2"
 description = "Command-line access to Sai trading and market data"
 requires-python = ">=3.11"
 license = "Apache-2.0"
@@ -22,7 +22,12 @@ dependencies = [
 sai = "sai_cli.sai_cli:main"
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.11", "ty>=0.0.1a6"]
+dev = [
+    "graphql-core>=3.2,<3.3",
+    "pytest>=8",
+    "ruff>=0.11",
+    "ty>=0.0.1a6",
+]
 
 [tool.setuptools.packages.find]
 where = ["cli"]
@@ -33,8 +38,12 @@ include = ["sai_cli*"]
 # here would skip hidden directories.
 
 [tool.pytest.ini_options]
-testpaths = ["cli/sai_cli/tests"]
-markers = ["slow: runs real uv installs; deselect with -m 'not slow'"]
+testpaths = ["cli/sai_cli/tests", "tests/parity"]
+addopts = '-m "not parity_namespace"'
+markers = [
+    "slow: runs real uv installs; deselect with -m 'not slow and not parity_namespace'",
+    "parity_namespace: needs the Linux loopback namespace and libseccomp",
+]
 
 [tool.ruff]
 target-version = "py311"
