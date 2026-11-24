@@ -502,6 +502,7 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     [
         ("cli", "IMMEDIATE"),
         ("cli-wait", "IMMEDIATE"),
+        ("cli-wait", "DEFERRED"),
         ("mcp", "IMMEDIATE"),
         ("mcp", "EXCLUSIVE"),
     ],
@@ -524,11 +525,13 @@ def test_locked_ledger_reports_open_was_not_sent(
         }
 
     # IMMEDIATE lets MCP's precheck read the ledger, then blocks reservation.
-    # EXCLUSIVE also blocks the precheck, before the refreshed quote.
-    if lock == "IMMEDIATE":
+    # DEFERRED with a read blocks the commit. EXCLUSIVE blocks the precheck.
+    if lock != "EXCLUSIVE":
         replies.append(MARKET)
     with closing(storage.db()) as connection, connection, storage.busy_timeout(0):
         connection.execute(f"BEGIN {lock}")
+        if lock == "DEFERRED":
+            connection.execute("SELECT count(*) FROM intents").fetchone()
         if surface == "mcp":
             response = call_mcp(mcp, "trade_open", args)
             error, message = response, response["error"]
@@ -953,15 +956,18 @@ def test_sigint_during_trade_wait_preserves_original_key(
 # writes still run through the installed CLI code with a disposable SAI_HOME.
 WAIT_FAULT_DRIVER = """
 import signal
+import sqlite3
 import sys
 
-from sai_cli.core import keeper
+from sai_cli.core import keeper, storage
 from sai_cli.sai_cli import main
 
 module, name, event, selector, failure = sys.argv[1:6]
 sys.argv[1:6] = []
+ledger_lock = None
 
 def inject(frame, what, arg):
+    global ledger_lock
     if what != event or frame.f_code.co_name != name:
         return
     if frame.f_globals.get("__name__") != module:
@@ -970,15 +976,96 @@ def inject(frame, what, arg):
         return
     if selector.startswith("caller:") and frame.f_back.f_code.co_name != selector[7:]:
         return
+    if selector == "reserved" and frame.f_locals.get("name") != "intent.reserved":
+        return
+    if selector == "submit" and frame.f_locals.get("query") != keeper.SUBMIT:
+        return
     sys.setprofile(None)
     if failure == "sigint":
         signal.raise_signal(signal.SIGINT)
-    else:
-        raise RuntimeError("Injected failure")
+        return
+    if failure == "commit-result-lost-locked":
+        ledger_lock = storage.db()
+        ledger_lock.execute("BEGIN IMMEDIATE")
+    if failure.startswith("commit-result-lost"):
+        raise sqlite3.OperationalError("Lost reservation result")
+    raise RuntimeError("Injected failure")
 
 sys.setprofile(inject)
-main()
+if failure == "commit-result-lost-locked":
+    with storage.busy_timeout(0):
+        main()
+else:
+    main()
 """
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+@pytest.mark.parametrize(
+    ("hook", "fault", "json_output"),
+    [
+        (("log", "event", "call", "reserved"), "sigint", True),
+        (("keeper", "_request", "call", "submit"), "sigint", True),
+        (("storage", "pending", "return", ""), "commit-result-lost", True),
+        (("storage", "pending", "return", ""), "commit-result-lost-locked", True),
+        (("storage", "pending", "return", ""), "commit-result-lost-locked", False),
+    ],
+)
+def test_trade_recovers_reservation_when_stopped_before_transport(
+    connected_replay: tuple[str, deque[Reply]],
+    submitted_keys: list[str],
+    hook: tuple[str, str, str, str],
+    fault: str,
+    json_output: bool,
+) -> None:
+    endpoint, replies = connected_replay
+    replies.append(MARKET)
+    module, *target = hook
+    output_flags = ["--json"] if json_output else []
+    args = ["--endpoint", endpoint, *output_flags, *CLI_OPEN]
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            WAIT_FAULT_DRIVER,
+            f"sai_cli.core.{module}",
+            *target,
+            fault,
+            *args,
+            "--wait",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert submitted_keys == []
+    [entry] = storage.list_pending(endpoint, ADDR)
+    key = entry["intentKey"]
+    cleanup_locked = fault == "commit-result-lost-locked"
+    assert entry["status"] == ("unknown" if cleanup_locked else "not_sent")
+    hint = storage.intent_status_hint(endpoint, ADDR, key)
+    if not json_output:
+        assert "Nothing was sent" in result.stderr
+        assert hint in result.stderr
+        return
+
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == (
+        "INVALID_REQUEST" if fault == "sigint" else "INTERNAL_ERROR"
+    )
+    assert "Nothing was sent" in error["message"]
+    if cleanup_locked:
+        assert error["intentKey"] == key
+        assert error["hint"] == hint
+    else:
+        assert "intentKey" not in error and "hint" not in error
+        replies.extend((MARKET, "admission_ack"))
+        retry = CliRunner().invoke(main, args)
+        assert retry.exit_code == 0, retry.output
+        assert submitted_keys == [json.loads(retry.stdout)["intentKey"]]
+        assert key not in submitted_keys
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")

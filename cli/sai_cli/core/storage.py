@@ -30,6 +30,31 @@ from .errors import Code, SaiError, SessionError, describe
 class IntentReservationError(SaiError):
     """A local ledger failure prevented submission to Keeper."""
 
+    def __init__(
+        self,
+        cause: Exception | KeyboardInterrupt,
+        *,
+        intent_key: str | None = None,
+        hint: str | None = None,
+        account: str | None = None,
+    ) -> None:
+        if isinstance(cause, KeyboardInterrupt):
+            message, code = "Trade interrupted.", Code.INVALID_REQUEST
+        else:
+            failure = describe(cause)
+            detail = (
+                str(cause)
+                if isinstance(cause, (sqlite3.Error, OSError))
+                else failure.message
+            )
+            message = f"Could not reserve the trade intent. {detail}."
+            code = failure.code
+        message += " Nothing was sent."
+        if intent_key is not None:
+            message += " Sai could not verify or release the local reservation."
+        super().__init__(message, code, intent_key=intent_key, hint=hint)
+        self.account = account
+
 
 class UnresolvedIntent(SaiError, ValueError):
     """The intent ledger already blocks a submission for this account."""
@@ -467,11 +492,8 @@ def _reservation_errors() -> Generator[None]:
         yield
     except UnresolvedIntent:
         raise
-    except (sqlite3.Error, OSError, ValueError) as exc:
-        raise IntentReservationError(
-            f"Could not reserve the trade intent. {exc}. Nothing was sent.",
-            describe(exc).code,
-        ) from exc
+    except (sqlite3.Error, OSError, ValueError, KeyboardInterrupt) as exc:
+        raise IntentReservationError(exc) from exc
 
 
 def check_open_pending(
@@ -493,7 +515,11 @@ def pending(
 ) -> None:
     opening = kind == "OPEN_TRADE"
     concurrent_open = opening and allow_concurrent_open
-    with _reservation_errors(), db() as connection:
+    with _reservation_errors():
+        connection = db()
+    # Leave the error wrapper before committing. A commit error may have
+    # written the row, so the submitter must check the generated key.
+    with contextlib.closing(connection), connection, _reservation_errors():
         connection.execute("BEGIN IMMEDIATE")
         if opening:
             _check_open_pending(connection, endpoint, account, concurrent_open)
