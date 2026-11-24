@@ -15,7 +15,8 @@ use serde_json::{Value, json};
 
 use client::{Result as ClientResult, absolute, basename, resolved, which};
 
-const NAMES: [&str; 2] = ["sai", "sai-mcp"];
+const RETIRED_NAME: &str = "sai-mcp";
+const NAMES: [&str; 2] = ["sai", RETIRED_NAME];
 const CLIENTS: [Client; 3] = [Client::Claude, Client::Codex, Client::Cursor];
 const INSTALL: &str = "uv tool install git+https://github.com/SaiDotFun/open-sai";
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -624,7 +625,7 @@ impl Clients {
             return check("warn", "Sai is not registered", Some(install));
         }
         let legacy = inspected.iter().any(|(name, _, _)| *name == NAMES[1]);
-        let legacy_warning = "Sai retains its existing sai-mcp registration name";
+        let legacy_warning = format!("Sai retains its existing {RETIRED_NAME} registration name");
         let issues = inspected
             .iter()
             .filter_map(|(name, entry, issue)| issue.as_ref().map(|issue| (*name, *entry, issue)))
@@ -683,14 +684,14 @@ impl Clients {
         let mut result = if let Some((mut summary, hint)) = failure {
             if legacy {
                 summary.push_str(". ");
-                summary.push_str(legacy_warning);
+                summary.push_str(&legacy_warning);
             }
             check("fail", &summary, Some(hint.into()))
         } else if pinned || different_profile || legacy {
             let warnings = [
                 pinned.then_some("Sai uses a pinned launcher from a different install"),
                 different_profile.then_some("Sai registration has a different SAI_HOME setting"),
-                legacy.then_some(legacy_warning),
+                legacy.then_some(legacy_warning.as_str()),
             ];
             check(
                 "warn",
