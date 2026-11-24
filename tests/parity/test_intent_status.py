@@ -1211,10 +1211,6 @@ def write_trusted_pem(path: Path, certificate: Path, aux: bytes) -> None:
     )
 
 
-@pytest.mark.skipif(
-    ssl.OPENSSL_VERSION_INFO < (3, 5),
-    reason="OpenSSL 3.5 skips unreadable entries in a hashed CA directory",
-)
 def test_hashed_store_continues_after_malformed_aux(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
@@ -1237,7 +1233,12 @@ def test_hashed_store_continues_after_malformed_aux(
         f"{subject_hash}.1",
     )
     assert_keeper_tls_trust(
-        cli_pair, tmp_path, context, {"SSL_CERT_DIR": str(tmp_path)}, True
+        cli_pair,
+        tmp_path,
+        context,
+        {"SSL_CERT_DIR": str(tmp_path)},
+        True,
+        skip_if_reference_rejects=True,
     )
 
 
@@ -1475,6 +1476,7 @@ def assert_keeper_tls_trust(
     trusted: bool,
     *,
     failure: tuple[int, str] = (4, "NOT_SENT"),
+    skip_if_reference_rejects: bool = False,
 ) -> None:
     with replay(context) as (endpoint, replies, requests):
         observed = []
@@ -1493,6 +1495,15 @@ def assert_keeper_tls_trust(
                 ADDR,
                 overrides=trust,
             )
+            if (
+                index == 0
+                and skip_if_reference_rejects
+                and result.returncode == 4
+                and not requests
+                and not result.stderr
+                and json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
+            ):
+                pytest.skip("The Python reference stopped at the malformed hash entry")
             assert result.returncode == (0 if trusted else failure[0]), result.stdout
             assert not result.stderr
             assert not replies
