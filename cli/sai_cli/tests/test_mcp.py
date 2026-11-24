@@ -547,7 +547,7 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
         for amount in collaterals
     )
 
-    def snapshot(*args: Any) -> margin.PositionSnapshot:
+    def snapshot(*args: Any, **kwargs: Any) -> margin.PositionSnapshot:
         nonlocal current
         current = next(states)
         return current
