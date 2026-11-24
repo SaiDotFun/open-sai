@@ -24,6 +24,9 @@ hyper-util = { version = "0.1", features = ["client-legacy", "client-proxy", "cl
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 url = "2"
 webpki-roots = "1"
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+ring = "0.17"
+rustls-native-certs = "0.8"
 rustix = { version = "1", features = ["fs", "process"] }
 serde = "1"
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }

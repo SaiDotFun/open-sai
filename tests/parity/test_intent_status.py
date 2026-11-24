@@ -8,6 +8,7 @@ import os
 import shutil
 import socket
 import sqlite3
+import ssl
 import subprocess
 import threading
 import time
@@ -56,7 +57,9 @@ class Request:
 
 
 @contextmanager
-def replay() -> Iterator[tuple[str, deque[Reply], list[Request]]]:
+def replay(
+    tls: ssl.SSLContext | None = None,
+) -> Iterator[tuple[str, deque[Reply], list[Request]]]:
     replies: deque[Reply] = deque()
     requests: list[Request] = []
 
@@ -97,18 +100,26 @@ def replay() -> Iterator[tuple[str, deque[Reply], list[Request]]]:
             pass
 
     with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        if tls is not None:
+            server.socket = tls.wrap_socket(server.socket, server_side=True)
+        scheme = "https" if tls is not None else "http"
         worker = threading.Thread(
             target=server.serve_forever, args=(0.01,), daemon=True
         )
         worker.start()
         try:
-            yield f"http://127.0.0.1:{server.server_port}/query", replies, requests
+            yield f"{scheme}://127.0.0.1:{server.server_port}/query", replies, requests
         finally:
             server.shutdown()
             worker.join()
 
 
-def invoke(cli: CLI, home: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
+def invoke(
+    cli: CLI,
+    home: Path,
+    *args: str,
+    trust: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [*cli, *args],
         env={
@@ -118,6 +129,7 @@ def invoke(cli: CLI, home: Path, *args: str) -> subprocess.CompletedProcess[byte
             "SAI_LOG": "1",
             "SAI_UPDATE_AUTO": "0",
             "PYTHONUTF8": "1",
+            **(trust or {}),
         },
         cwd=home.parent,
         capture_output=True,
@@ -752,3 +764,145 @@ def test_public_intent_status_scrubs_keeper_message(
             public = json.loads(output)["userIntents"][0]
             assert public["errorCode"] == expected
             assert public["errorMsg"] == "Keeper reported an intent error."
+
+
+@pytest.fixture(scope="module")
+def keeper_certificate(
+    tmp_path_factory: pytest.TempPathFactory,
+) -> tuple[ssl.SSLContext, Path]:
+    certs = tmp_path_factory.mktemp("keeper-ca")
+
+    def openssl(*args: str) -> str:
+        return subprocess.run(
+            ["openssl", *args],
+            cwd=certs,
+            check=True,
+            capture_output=True,
+            timeout=10,
+            text=True,
+        ).stdout
+
+    key_args = ("-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256", "-nodes")
+    for name in ("keeper-ca", "other-ca"):
+        openssl(
+            "req",
+            "-x509",
+            *key_args,
+            "-days",
+            "2",
+            "-subj",
+            f"/CN={name}   Root/O=Fixture CA",
+            "-keyout",
+            f"{name}.key",
+            "-out",
+            f"{name}.pem",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+        )
+    openssl(
+        "req",
+        "-new",
+        *key_args,
+        "-subj",
+        "/CN=127.0.0.1",
+        "-keyout",
+        "server.key",
+        "-out",
+        "server.csr",
+    )
+    (certs / "server.ext").write_text("subjectAltName=IP:127.0.0.1\n", encoding="ascii")
+    openssl(
+        "x509",
+        "-req",
+        "-in",
+        "server.csr",
+        "-CA",
+        "keeper-ca.pem",
+        "-CAkey",
+        "keeper-ca.key",
+        "-CAcreateserial",
+        "-out",
+        "server.pem",
+        "-days",
+        "2",
+        "-extfile",
+        "server.ext",
+    )
+    hashed = certs / "hashed"
+    hashed.mkdir()
+    shutil.copy(certs / "keeper-ca.pem", hashed / "keeper-ca.pem")
+    openssl("rehash", "hashed")
+    raw = certs / "unhashed"
+    raw.mkdir()
+    shutil.copy(certs / "keeper-ca.pem", raw / "keeper-ca.pem")
+    hash_name = openssl(
+        "x509", "-in", "keeper-ca.pem", "-noout", "-subject_hash"
+    ).strip()
+    for name, filename in (("wrong_hash", "00000000.0"), ("gap", f"{hash_name}.1")):
+        invalid = certs / name
+        invalid.mkdir()
+        shutil.copy(certs / "keeper-ca.pem", invalid / filename)
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certs / "server.pem", certs / "server.key")
+    return context, certs
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "file",
+        "dir",
+        "file_precedes_dir",
+        "unhashed_dir",
+        "wrong_hash",
+        "gap",
+        "default",
+    ],
+)
+def test_keeper_tls_trust_matches_httpx(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    mode: str,
+) -> None:
+    context, certs = keeper_certificate
+    trust = {
+        "file": {"SSL_CERT_FILE": str(certs / "keeper-ca.pem")},
+        "dir": {"SSL_CERT_DIR": str(certs / "hashed")},
+        "file_precedes_dir": {
+            "SSL_CERT_FILE": str(certs / "other-ca.pem"),
+            "SSL_CERT_DIR": str(certs / "hashed"),
+        },
+        "unhashed_dir": {"SSL_CERT_DIR": str(certs / "unhashed")},
+        "wrong_hash": {"SSL_CERT_DIR": str(certs / "wrong_hash")},
+        "gap": {"SSL_CERT_DIR": str(certs / "gap")},
+        "default": {},
+    }[mode]
+    trusted = mode in {"file", "dir"}
+    with replay(context) as (endpoint, replies, requests):
+        observed = []
+        for index, cli in enumerate(cli_pair):
+            requests.clear()
+            if trusted:
+                replies.append(response("pending_exec"))
+            result = invoke(
+                cli,
+                tmp_path / str(index),
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "status",
+                ADDR,
+                trust=trust,
+            )
+            assert result.returncode == (0 if trusted else 4)
+            assert not result.stderr
+            assert not replies
+            assert [request.body for request in requests] == (
+                [wire(keeper.INTENTS, user=ADDR, key=None)] if trusted else []
+            )
+            if not trusted:
+                assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
+            observed.append((result.stdout, list(requests)))
+        assert observed[0] == observed[1]

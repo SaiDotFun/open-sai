@@ -1,6 +1,6 @@
 //! One HTTP/1.1 request with timeouts on connection, socket reads, and writes.
 
-use std::{future::ready, io, io::Read as _, sync::Arc, time::Duration};
+use std::{env, future::ready, io, io::Read as _, path::Path, sync::Arc, time::Duration};
 
 use flate2::read::{DeflateDecoder, MultiGzDecoder, ZlibDecoder};
 use http_body_util::{BodyExt, Full};
@@ -13,7 +13,10 @@ use hyper_util::{
     },
     rt::TokioIo,
 };
-use rustls::{ClientConfig, RootCertStore, pki_types::ServerName};
+use rustls::{
+    ClientConfig, RootCertStore,
+    pki_types::{CertificateDer, ServerName, pem::PemObject},
+};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpStream, lookup_host},
@@ -23,7 +26,7 @@ use tokio_rustls::TlsConnector;
 use tower::{ServiceExt, service_fn};
 use url::Url;
 
-use super::{not_sent, request_failed};
+use super::{ca_dir, not_sent, request_failed};
 use crate::errors::SaiError;
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -78,7 +81,7 @@ pub(super) async fn post(
     let request = request
         .body(Full::new(Bytes::from(body)))
         .map_err(|_| request_failed())?;
-    let tls = Arc::new(tls_config());
+    let tls = Arc::new(tls_config()?);
     let socket = if let Some(proxy) = proxy {
         let socket = connect(proxy.uri(), &tls, timeout).await?;
         if forward {
@@ -237,12 +240,40 @@ async fn receive(
     Ok((parts.status, bytes))
 }
 
-fn tls_config() -> ClientConfig {
+fn tls_config() -> Result<ClientConfig, SaiError> {
     let mut roots = RootCertStore::empty();
-    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_safe_default_protocol_versions()
-        .expect("valid Rustls protocol versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth()
+    // HTTPX treats an explicit file or CA directory as the entire trust store.
+    if let Some(file) = env::var_os("SSL_CERT_FILE").filter(|value| !value.is_empty()) {
+        add_pem_file(&mut roots, Path::new(&file))?;
+        if roots.is_empty() {
+            return Err(SaiError::internal());
+        }
+    } else if let Some(dirs) = env::var_os("SSL_CERT_DIR").filter(|value| !value.is_empty()) {
+        for dir in env::split_paths(&dirs).filter(|path| !path.as_os_str().is_empty()) {
+            ca_dir::add_roots(&mut roots, &dir);
+        }
+    } else {
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+        if roots.is_empty() {
+            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        }
+    }
+    let mut config =
+        ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .expect("valid Rustls protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+fn add_pem_file(roots: &mut RootCertStore, path: &Path) -> Result<(), SaiError> {
+    let certs = CertificateDer::pem_file_iter(path).map_err(|_| SaiError::internal())?;
+    for cert in certs {
+        roots
+            .add(cert.map_err(|_| SaiError::internal())?)
+            .map_err(|_| SaiError::internal())?;
+    }
+    Ok(())
 }
