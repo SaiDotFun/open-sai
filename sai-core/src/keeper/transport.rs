@@ -28,9 +28,9 @@ use url::Url;
 use super::{ca_dir, not_sent, proxy, request_failed};
 use crate::errors::SaiError;
 
-trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
+pub(super) trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T: AsyncRead + AsyncWrite + Unpin + Send> Socket for T {}
-type SocketBox = Box<dyn Socket>;
+pub(super) type SocketBox = Box<dyn Socket>;
 
 impl Connection for SocketBox {
     fn connected(&self) -> Connected {
@@ -91,26 +91,69 @@ pub(super) async fn post(
         if forward {
             socket
         } else {
-            let mut socket = Some(with_inactivity(socket, timeout).await);
-            let connector = service_fn(move |_| {
-                ready(Ok::<_, io::Error>(
-                    socket.take().expect("one proxy connection"),
-                ))
-            });
-            let mut tunnel = Tunnel::new(proxy.uri().clone(), connector);
-            if let Some(auth) = proxy.basic_auth() {
-                tunnel = tunnel.with_auth(auth.clone());
-            }
-            let tunnel = tunnel
-                .oneshot(destination.clone())
-                .await
-                .map_err(|_| request_failed())?;
-            start_tls(Box::new(TokioIo::new(tunnel)), &destination, tls, timeout).await?
+            let socket =
+                tunnel(with_inactivity(socket, timeout).await, &proxy, &destination).await?;
+            start_tls(socket, &destination, tls, timeout).await?
         }
     } else {
         connect(&destination, &tls, timeout).await?
     };
     exchange(socket, request, timeout).await
+}
+
+pub(super) async fn websocket_socket(url: &Url, timeout: Duration) -> Result<SocketBox, SaiError> {
+    let secure = url.scheme() == "wss";
+    // CONNECT and the shared TCP/TLS connector use HTTP scheme names.
+    let mut target = url.clone();
+    target
+        .set_scheme(if secure { "https" } else { "http" })
+        .map_err(|_| request_failed())?;
+    let destination = target
+        .as_str()
+        .parse::<Uri>()
+        .map_err(|_| request_failed())?;
+    let proxy = proxy::for_websocket(url, &destination).map_err(|_| request_failed())?;
+    let mut roots = RootCertStore::empty();
+    if secure
+        || proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.uri().scheme_str() == Some("https"))
+    {
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    }
+    let tls = Arc::new(tls_config(roots));
+    let Some(proxy) = proxy else {
+        return connect(&destination, &tls, timeout).await;
+    };
+    let socket = connect(proxy.uri(), &tls, timeout).await?;
+    let socket = tunnel(TokioIo::new(socket), &proxy, &destination).await?;
+    if secure {
+        start_tls(socket, &destination, tls, timeout).await
+    } else {
+        Ok(socket)
+    }
+}
+
+async fn tunnel(
+    socket: impl hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
+    proxy: &hyper_util::client::proxy::matcher::Intercept,
+    destination: &Uri,
+) -> Result<SocketBox, SaiError> {
+    let mut socket = Some(socket);
+    let connector = service_fn(move |_| {
+        ready(Ok::<_, io::Error>(
+            socket.take().expect("one proxy connection"),
+        ))
+    });
+    let mut tunnel = Tunnel::new(proxy.uri().clone(), connector);
+    if let Some(auth) = proxy.basic_auth() {
+        tunnel = tunnel.with_auth(auth.clone());
+    }
+    let tunneled = tunnel
+        .oneshot(destination.clone())
+        .await
+        .map_err(|_| request_failed())?;
+    Ok(Box::new(TokioIo::new(tunneled)))
 }
 
 fn host(destination: &Uri) -> Result<&str, SaiError> {

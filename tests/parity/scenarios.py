@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
@@ -84,6 +85,7 @@ class Endpoints:
             "{keeper}": self.keeper,
             "{http}": self.http,
             "{ws}": self.ws,
+            "{ws_http}": self.ws.replace("ws://", "http://", 1),
         }.items():
             value = value.replace(key, replacement)
         return value
@@ -383,7 +385,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         def log_message(self, format: str, *args: object) -> None:
             pass
 
+    disconnected_at = 0.0
+
     def websocket(connection: ServerConnection) -> None:
+        nonlocal disconnected_at
         try:
             if (
                 connection.request is None
@@ -396,6 +401,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 errors.append("Expected WebSocket connection_init")
                 return
             wire.append(WireRequest("ws:init"))
+            if scenario == "ws-no-ack":
+                connection.send(json.dumps({"type": "connection_error"}))
+                return
             connection.send(json.dumps({"type": "connection_ack"}))
             subscription = json.loads(connection.recv(timeout=5))
             if subscription["type"] != "subscribe":
@@ -422,11 +430,30 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 )
                 return
             payload = queue_payloads[name]
+            if scenario == "ws-partial":
+                connection.send(json.dumps({"type": "ping"}))
+                if json.loads(connection.recv(timeout=5)) != {"type": "pong"}:
+                    errors.append("Expected GraphQL pong")
+                    return
+                wire.append(WireRequest("ws:pong"))
+                payload = {**payload, "errors": [{"message": "partial balance"}]}
+            count = sum(item.label == "ws:userBalances" for item in wire)
+            if scenario == "watch-reconnect":
+                if count > 1 and not 1.9 <= time.monotonic() - disconnected_at < 7:
+                    errors.append("Watch did not reconnect after the two-second delay")
+                    return
+                payload = {"data": {"userBalances": [{"amount": str(count)}]}}
             connection.send(
                 json.dumps({"id": request_id, "type": "next", "payload": payload})
             )
             if scenario == "watch":
                 connection.send(json.dumps({"id": request_id, "type": "complete"}))
+            if scenario == "watch-reconnect" and count == 1:
+                disconnected_at = time.monotonic()
+                connection.close()
+            if scenario in {"watch-idle", "watch-reconnect"}:
+                # Wait for the interrupted client to close the connection.
+                connection.recv(timeout=10)
         except ConnectionClosed:
             # Doctor only needs the handshake, and balances closes after its snapshot.
             pass

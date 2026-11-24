@@ -4,6 +4,7 @@ mod ca_dir;
 mod proxy;
 mod public;
 mod queries;
+pub mod stream;
 mod transport;
 
 use std::time::{Duration, Instant};

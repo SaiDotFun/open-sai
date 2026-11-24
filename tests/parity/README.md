@@ -55,6 +55,8 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   order may vary. LCD requests also check their arguments. Doctor runs its
   network checks in parallel, so its wire list is compared without regard
   to order.
+- Set `interrupt_after` to send SIGINT after that many JSONL snapshots.
+  The runner checks the final output, exit status, and flushed events.
 - The `state` table pins persisted values on each side. A key takes the
   form `file#object.key.0.field`, with zero-based list indexes. Use
   `file#@mode` to assert a mode, or `"<absent>"` to assert that a file or

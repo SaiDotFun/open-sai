@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import queue
+import select
 import shlex
 import shutil
 import signal
@@ -80,6 +81,7 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    interrupt_after: int | None = None
 
     @property
     def command(self) -> str:
@@ -118,6 +120,49 @@ def invoke(
 def check_sandbox_exit(exit_code: int) -> None:
     if exit_code in {-signal.SIGSYS, 128 + signal.SIGSYS}:
         raise ValueError("attempted a blocked host socket")
+
+
+def interrupt_watch(
+    binary: list[str], args: list[str], home: Path, env: dict[str, str], snapshots: int
+) -> subprocess.CompletedProcess[str]:
+    """Interrupt the foreground session after the requested snapshots."""
+    with subprocess.Popen(
+        restricted([*binary, *args]),
+        cwd=home,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+        umask=0o022,
+    ) as proc:
+        assert proc.stdout is not None
+        deadline = time.monotonic() + 12
+        seen = bytearray()
+        received = 0
+        try:
+            while received < snapshots:
+                remaining = max(0, deadline - time.monotonic())
+                if not select.select([proc.stdout], [], [], remaining)[0]:
+                    raise ValueError("Timed out waiting for a watch snapshot")
+                chunk = os.read(proc.stdout.fileno(), 65536)
+                if not chunk:
+                    raise ValueError("Watch exited before the expected snapshots")
+                seen.extend(chunk)
+                received += chunk.count(b"\n")
+            for line in seen.split(b"\n")[:snapshots]:
+                if "data" not in json.loads(line):
+                    raise ValueError("Watch exited before the expected snapshots")
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, stderr = proc.communicate(timeout=4)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=4)
+        check_sandbox_exit(proc.returncode)
+        return subprocess.CompletedProcess(
+            args, proc.returncode, (seen + stdout).decode(), stderr.decode()
+        )
 
 
 def mcp_exchange(
@@ -265,6 +310,8 @@ def observe(
             finally:
                 admission.release.set()
             result = first.result()
+    elif case.interrupt_after is not None:
+        result = interrupt_watch(binary, args, home, env, case.interrupt_after)
     else:
         result = run(binary, args, home, env)
     ended_at = time.time()

@@ -86,6 +86,12 @@ args = ["--json","market","prices"]
 wire = ["tokenPricesUsd"]
 
 [[case]]
+name = "market-prices-text"
+args = ["market","prices"]
+mode = "text"
+wire = ["tokenPricesUsd"]
+
+[[case]]
 name = "market-keeper-error"
 args = ["--json","market","prices"]
 server = "keeper-error"
@@ -125,6 +131,26 @@ wire = ["tradeHistory"]
 name = "account-balances"
 args = ["--json","account","balances","{addr}"]
 wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "account-balances-derived-endpoint"
+args = ["--json","--endpoint","{ws_http}","account","balances","{addr}"]
+unset = ["SAI_WS_ENDPOINT"]
+wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "account-balances-partial-error"
+args = ["--json","account","balances","{addr}","--ws-endpoint","{ws}"]
+server = "ws-partial"
+expect = 1
+wire = ["ws:init","ws:userBalances","ws:pong"]
+
+[[case]]
+name = "account-balances-unacknowledged"
+args = ["--json","account","balances","{addr}"]
+server = "ws-no-ack"
+expect = 1
+wire = ["ws:init"]
 
 [[case]]
 name = "auth-status-signed-out"
@@ -231,6 +257,40 @@ mode = "jsonl"
 server = "watch"
 expect = 1
 wire = ["ws:init","ws:perpTrades"]
+
+[[case]]
+name = "watch-balances-reconnect-interrupt"
+args = ["--json","watch","balances","{addr}","--ws-endpoint","{ws}"]
+mode = "jsonl"
+server = "watch-reconnect"
+expect = 1
+interrupt_after = 2
+wire = ["ws:init","ws:userBalances","ws:init","ws:userBalances"]
+
+[[case]]
+name = "watch-price-interrupt"
+args = ["--json","watch","price","+0_3"]
+mode = "jsonl"
+server = "watch-idle"
+expect = 1
+interrupt_after = 1
+wire = ["ws:init","ws:tokenPricesUsd"]
+
+[[case]]
+name = "watch-price-invalid-token"
+args = ["--json","watch","price","abc"]
+expect = 2
+
+[[case]]
+name = "watch-help"
+args = ["watch","--help"]
+mode = "text"
+
+[[case]]
+name = "account-balances-missing-address"
+args = ["account","balances"]
+mode = "text"
+expect = 2
 
 [[case]]
 name = "skill-show"
