@@ -140,6 +140,7 @@ def open_trade(
     lcd_endpoint: str | None = None,
     mcp_market: bool = False,
     notify: Notify = _ignore,
+    before_price_refresh: SubmitCheck | None = None,
     before_submit: SubmitCheck | None = None,
     allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
@@ -189,18 +190,16 @@ def open_trade(
 
     active = None if dry_run else get_session()
     preview: dict[str, Any] = {"dryRun": True, "intent": payload}
-    if lcd_endpoint is not None and (dry_run or before_submit is not None):
-        try:
-            preview["positionRoute"] = _trading_route(
-                endpoint, lcd_endpoint, confirming=not dry_run
-            )
-        except estimates.READ_ERRORS:
-            if not dry_run:
-                raise
+    if lcd_endpoint is not None and not dry_run and before_submit is not None:
+        preview["positionRoute"] = _trading_route(
+            endpoint, lcd_endpoint, confirming=True
+        )
 
     if order_type == "market":
         preview["requiresMarketPriceRefresh"] = True
         if not dry_run:
+            if before_price_refresh is not None:
+                before_price_refresh(preview)
             if price is not None:
                 notify(MARKET_PRICE_NOTICE)
             read_market()
@@ -219,6 +218,11 @@ def open_trade(
             preview["referencePrice"] = reference["price"]
 
     if active is None:
+        if lcd_endpoint is not None:
+            try:
+                preview["positionRoute"] = margin.trading_route(endpoint, lcd_endpoint)
+            except estimates.READ_ERRORS:
+                pass
         preview["estimates"] = estimate(preview)
         return preview
     _checked(before_submit, preview, estimate)

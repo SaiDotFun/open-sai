@@ -496,6 +496,14 @@ def _reservation_errors() -> Generator[None]:
         raise IntentReservationError(exc) from exc
 
 
+def check_open_pending(
+    endpoint: str, account: str, *, allow_concurrent_open: bool
+) -> None:
+    """Refuse an already blocked open early. Reservation checks again."""
+    with _reservation_errors(), contextlib.closing(db()) as connection:
+        _check_open_pending(connection, endpoint, account, allow_concurrent_open)
+
+
 def pending(
     key: str,
     endpoint: str,

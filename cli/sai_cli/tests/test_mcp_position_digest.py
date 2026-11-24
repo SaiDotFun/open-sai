@@ -849,6 +849,13 @@ def test_trade_confirmation_binds_verified_route(
                 )
                 assert accepted.exit_code == 0, accepted.output
                 assert json.loads(accepted.stdout)["status"] == "accepted"
+                if field == "contract_address" and args.get("order_type") == "market":
+                    blocked = await call(client, "trade_open", trade_args)
+                    assert blocked["code"] == "PREVIEW_MISMATCH"
+                    (pending,) = storage.list_pending(f"{base_url}/query", ADDR)
+                    assert (
+                        pending["intentKey"] == json.loads(accepted.stdout)["intentKey"]
+                    )
             assert len(position.submitted) == 1
 
     asyncio.run(scenario())

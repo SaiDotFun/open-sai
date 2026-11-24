@@ -594,6 +594,20 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
+
+    def check_pending(preview: dict[str, Any]) -> None:
+        # Use the caller's reference to check the route before the ledger.
+        # A mismatch needs the refreshed price before it can offer a preview.
+        try:
+            bound(load, preview_digest, reference_price)(preview)
+        except Refused:
+            return
+        storage.check_open_pending(
+            settings.endpoint,
+            load()["evmAddress"],
+            allow_concurrent_open=allow_concurrent_open,
+        )
+
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
@@ -611,6 +625,7 @@ def open_trade(
         lcd_endpoint=settings.lcd_endpoint,
         mcp_market=True,
         notify=notices.append,
+        before_price_refresh=check_pending,
         before_submit=check,
         allow_concurrent_open=allow_concurrent_open,
     )
