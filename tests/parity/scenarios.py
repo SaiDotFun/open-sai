@@ -373,6 +373,11 @@ def loopback(
                 self.reject("Wrong fixture authorization")
                 return
             key = variables["input"]["intentKey"]
+            if scenario == "trade-reconcile-offline":
+                admission.key = key
+                admission.arrived.set()
+                self.close_connection = True
+                return
             if scenario == "trade-timeout" and not admission.arrived.is_set():
                 admission.key = key
                 admission.arrived.set()
@@ -426,7 +431,10 @@ def loopback(
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
                     self.admit_trade(request.variables)
                     return
-                if name == "userIntents" and scenario == "trade-timeout":
+                if name == "userIntents" and scenario in {
+                    "trade-timeout",
+                    "trade-reconcile-offline",
+                }:
                     if not admission.arrived.is_set() or not same_variables(
                         request.variables, {"user": ADDRESS, "key": admission.key}
                     ):
@@ -435,12 +443,16 @@ def loopback(
                         row = {
                             **status,
                             "intentKey": admission.key,
-                            "kind": "OPEN_TRADE",
+                            "kind": "OPEN_TRADE"
+                            if scenario == "trade-timeout"
+                            else "CLOSE_POSITION",
                             "lifecycleStep": "exec_fail",
                             "execActor": "server",
                             "nibiAddress": None,
                             "errorCode": "chain_execution_failed",
                         }
+                        if scenario == "trade-reconcile-offline":
+                            row["txHash"] = TRADE_REQUEST_HASH
                         self.reply({"data": {"userIntents": [row]}})
                     return
                 if name in responses:

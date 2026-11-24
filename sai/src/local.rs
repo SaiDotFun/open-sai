@@ -156,9 +156,11 @@ pub fn intent(
     json: bool,
     events: EventContext<'_>,
 ) -> Result<(), SaiError> {
-    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
-    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let settings = load_settings(flags, env)?;
+    let log_storage = |event: StorageEvent<'_>| {
+        storage_event_with_endpoint(events, event, Some(settings.endpoint()))
+    };
+    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     match command {
         IntentCommand::Status { addr, key } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -257,6 +259,7 @@ pub(crate) fn storage_event_with_endpoint(
                     ("code", json!(Code::SessionExpired).into()),
                     ("addr", json!(addr).into()),
                     ("expiresAt", json!(expires_at).into()),
+                    ("endpointId", endpoint_id()),
                 ],
             );
         }

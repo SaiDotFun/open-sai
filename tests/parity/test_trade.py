@@ -181,6 +181,50 @@ def test_python_reads_rust_trade_events_offline(
         assert endpoint_key.stat().st_mode & 0o777 == 0o600
 
 
+def test_python_reads_rust_reconciliation_evidence_offline(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    python, rust = trade_pair
+    with loopback("trade-reconcile-offline") as endpoints:
+        home = tmp_path / "shared"
+        seed_home(home, endpoints, "session")
+        code, result, _ = run(rust, home, endpoints, CLOSE, python=False)
+        assert code == 5
+        key = result["error"]["intentKey"]
+        assert rows(home)[0][2] == "unknown"
+
+        status = ("intent", "status", ADDRESS, "--key", key)
+        assert run(rust, home, endpoints, status, python=False)[0] == 0
+        assert rows(home)[0][2] == "terminal"
+        code, report, _ = run(
+            python, home, endpoints, ("logs", "intent", key, "--offline"), python=True
+        )
+        assert code == 0
+        assert report["intentKey"] == key
+        assert report["txHash"] == TRADE_REQUEST_HASH.lower()
+        assert "scopeWarning" not in report
+        assert {entry["event"] for entry in report["events"]} >= {
+            "intent.reserved",
+            "intent.keeper",
+            "intent.status",
+        }
+        assert [request.label for request in endpoints.wire] == [
+            "recordUserIntent",
+            "userIntents",
+        ]
+        assert not endpoints.errors
+        events = [
+            json.loads(line)
+            for path in (home / "sai" / "logs").glob("cli-*.jsonl")
+            for line in path.read_text(encoding="utf-8").splitlines()
+        ]
+        scoped = [
+            row for row in events if row["event"].startswith(("intent.", "keeper."))
+        ]
+        assert len(scoped) >= 5
+        assert len({row["endpointId"] for row in scoped}) == 1
+
+
 def trade_events(home: Path, key: str, endpoint: str) -> list[tuple[str, str | None]]:
     events = [
         json.loads(line)
