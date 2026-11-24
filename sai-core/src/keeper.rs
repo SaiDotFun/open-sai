@@ -21,7 +21,7 @@ use crate::{
 
 pub use diagnostics::{lcd_network, websocket_handshake};
 pub(crate) use public::{
-    intent_history, intent_record, known_intent_field, log_intent_error_code, log_intent_record,
+    intent_history, intent_log_fields, intent_record, known_intent_field, log_intent_record,
     request_hash, wait_error_code,
 };
 pub use public::{public_account_history, public_intent_status};
@@ -59,8 +59,15 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, token, timeout, std::future::pending())
-            .await
+        self.request_with(
+            query,
+            variables,
+            token,
+            timeout,
+            std::future::pending(),
+            false,
+        )
+        .await
     }
 
     /// Make an interruptible public read.
@@ -71,8 +78,26 @@ impl<'a> Keeper<'a> {
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, None, timeout, interrupt)
+        self.request_with(query, variables, None, timeout, interrupt, false)
             .await
+    }
+
+    /// Bound the entire request for an intent wait. Status reads use socket inactivity timeouts.
+    pub(crate) async fn wait_request(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        timeout: Duration,
+    ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(
+            query,
+            variables,
+            None,
+            timeout,
+            std::future::pending(),
+            true,
+        )
+        .await
     }
 
     async fn request_with(
@@ -82,6 +107,7 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
+        bounded: bool,
     ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
@@ -103,7 +129,7 @@ impl<'a> Keeper<'a> {
         let mut response = ResponseLog::default();
         let post = async {
             let post = self.post(query, &variables, token, timeout, &mut response);
-            if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
+            if bounded {
                 tokio::time::timeout(timeout, post)
                     .await
                     .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))

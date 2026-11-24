@@ -5,6 +5,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use num_bigint::BigInt;
 use serde_json::{Map, Value, json};
 
 use crate::{
@@ -200,7 +201,13 @@ async fn poll(
     let mut data = if let Some(budget) = poll.budget {
         variables.insert("includeAction".into(), json!(true));
         let timeout = poll.timeout.min(budget.remaining());
-        bounded_request(keeper, keeper::WAIT_INTENTS, variables, timeout).await?
+        if timeout.is_zero() {
+            return Err(PollError::Deadline);
+        }
+        keeper
+            .wait_request(keeper::WAIT_INTENTS, variables, timeout)
+            .await
+            .map_err(PollError::Keeper)?
     } else {
         keeper
             .request(keeper::INTENTS, variables, None, poll.timeout)
@@ -210,36 +217,29 @@ async fn poll(
     let Some(rows) = data.get_mut("userIntents").filter(|rows| !rows.is_null()) else {
         return Ok(data);
     };
-    if poll.budget.is_some() && !rows.is_array() {
+    let Some(items) = rows.as_array_mut() else {
         *rows = Value::Null;
         return Ok(data);
-    }
-    let absent = rows.as_array().is_some_and(Vec::is_empty);
+    };
+    let absent = items.is_empty();
     let account = canonical_account(addr);
-    let original = rows.take();
+    let items = std::mem::take(items);
     let mut matching = Vec::new();
-    match (original, &account) {
-        (Value::Array(items), Some(account)) => {
-            for row in items {
-                if !row.is_object() && poll.budget.is_none() {
+    if let Some(account) = &account {
+        for row in items {
+            if !row.is_object() {
+                if poll.budget.is_none() {
                     return Err(PollError::Data(SaiError::internal()));
                 }
-                if account_matches(&row["evmAddress"], account)
-                    && (row["nibiAddress"].is_null()
-                        || account_matches(&row["nibiAddress"], account))
-                    && key.is_none_or(|key| row["intentKey"] == key)
-                {
-                    matching.push(row);
-                }
+                continue;
+            }
+            if account_matches(&row["evmAddress"], account)
+                && (row["nibiAddress"].is_null() || account_matches(&row["nibiAddress"], account))
+                && key.is_none_or(|key| row["intentKey"] == key)
+            {
+                matching.push(row);
             }
         }
-        (Value::Array(_), None) => {}
-        (other, _) if !truthy(&other) => {}
-        (Value::String(_) | Value::Object(_), None) => {}
-        (Value::String(_) | Value::Object(_), Some(_)) => {
-            return Err(PollError::Data(SaiError::internal()));
-        }
-        _ => return Err(PollError::Data(incomplete_data("TypeError"))),
     }
     let Some(account) = account else {
         *rows = Value::Array(matching);
@@ -252,19 +252,9 @@ async fn poll(
     };
     *rows = Value::Array(matching);
 
+    let wait = poll.budget.is_some();
     if absent {
-        log_keeper(
-            events,
-            endpoint,
-            if poll.budget.is_some() {
-                &account
-            } else {
-                addr
-            },
-            key,
-            None,
-            poll.budget.is_some(),
-        );
+        log_keeper(events, endpoint, &account, key, None, wait);
         poll.before_write()?;
         let local =
             storage.mark_absent(key, endpoint, &account, keeper::ABSENT_AFTER_SECONDS, None)?;
@@ -276,18 +266,7 @@ async fn poll(
         }
     } else if let Some(row) = data["userIntents"].get(0).cloned() {
         let outcome = classify_outcome(&row);
-        log_keeper(
-            events,
-            endpoint,
-            if poll.budget.is_some() {
-                &account
-            } else {
-                addr
-            },
-            key,
-            Some((&row, outcome)),
-            poll.budget.is_some(),
-        );
+        log_keeper(events, endpoint, &account, key, Some((&row, outcome)), wait);
         if outcome != Outcome::Unknown {
             let context = KeyedIntent {
                 storage,
@@ -369,11 +348,7 @@ async fn reconcile_key(
     if (outcome == Outcome::TerminalFilled && (row["kind"].is_null() || perp_history(&row["kind"])))
         || (outcome == Outcome::Pending && row["lifecycleStep"] != "pending_exec")
     {
-        let matches = if let Some(budget) = context.poll.budget {
-            read_wait_history(context, row, budget).await
-        } else {
-            read_history(context, row).await.map_err(PollError::Data)?
-        };
+        let matches = read_history(context, row).await;
         let established_fill = !matches.is_empty() && outcome == Outcome::Pending;
         data.insert("matchedTradeHistory".into(), json!(matches));
         if established_fill {
@@ -433,108 +408,46 @@ fn store_outcome(
     )
 }
 
-fn normalize_hash(value: &Value) -> Result<String, SaiError> {
-    if !truthy(value) {
-        return Ok(String::new());
+fn normalize_hash(value: &Value) -> String {
+    let hash = value.as_str().unwrap_or_default().to_lowercase();
+    match hash.strip_prefix("0x") {
+        Some(digits) => digits.to_owned(),
+        None => hash,
     }
-    let lower = value
-        .as_str()
-        .ok_or_else(SaiError::internal)?
-        .to_lowercase();
-    Ok(lower.strip_prefix("0x").unwrap_or(&lower).into())
 }
 
-async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Result<Vec<Value>, SaiError> {
-    let hash = normalize_hash(&row["txHash"])?;
-    if hash.is_empty() {
-        return Ok(Vec::new());
+fn history_integer(value: &Value) -> Option<BigInt> {
+    // Python's isinstance(value, int) includes booleans and unbounded integers.
+    if let Some(flag) = value.as_bool() {
+        return Some(BigInt::from(u8::from(flag)));
     }
-    for attempt in 0..2 {
-        if attempt > 0 {
-            tokio::time::sleep(HISTORY_RETRY_DELAY).await;
-        }
-        let Ok(data) = context
-            .keeper
-            .request(
-                keeper::HISTORY,
-                Map::from_iter([("trader".into(), json!(context.addr))]),
-                None,
-                context.poll.timeout.min(HISTORY_TIMEOUT),
-            )
-            .await
-        else {
-            break;
-        };
-        let perp = data
-            .get("perp")
-            .ok_or_else(|| incomplete_data("KeyError"))?;
-        let history = perp
-            .as_object()
-            .ok_or_else(|| incomplete_data("TypeError"))?
-            .get("tradeHistory")
-            .ok_or_else(|| incomplete_data("KeyError"))?;
-        let history = match history {
-            Value::Array(items) => items,
-            // Python iterates these containers. An empty one yields no matches.
-            Value::Object(_) | Value::String(_) if !truthy(history) => continue,
-            Value::Object(_) | Value::String(_) => {
-                return Err(SaiError::internal());
-            }
-            _ => return Err(incomplete_data("TypeError")),
-        };
-        let mut matches = Vec::new();
-        for item in history {
-            if !item.is_object() {
-                return Err(SaiError::internal());
-            }
-            if item["intentKey"] == context.key
-                && account_matches(&item["trade"]["trader"], context.account)
-            {
-                let tx_hash = normalize_hash(&item["txHash"])?;
-                let evm_tx_hash = normalize_hash(&item["evmTxHash"])?;
-                if hash == tx_hash || hash == evm_tx_hash {
-                    matches.push(item.clone());
-                }
-            }
-        }
-        if !matches.is_empty() {
-            return Ok(matches);
-        }
-    }
-    Ok(Vec::new())
+    value.as_number()?.as_str().parse().ok()
 }
 
-async fn bounded_request(
-    keeper: &Keeper<'_>,
-    query: &str,
-    variables: Map<String, Value>,
-    timeout: Duration,
-) -> Result<Map<String, Value>, PollError> {
-    if timeout.is_zero() {
-        return Err(PollError::Deadline);
-    }
-    keeper
-        .request(query, variables, None, timeout)
-        .await
-        .map_err(PollError::Keeper)
-}
-
-async fn read_wait_history(
-    context: &KeyedIntent<'_>,
-    row: &Value,
-    budget: WaitBudget,
-) -> Vec<Value> {
-    let Ok(hash) = normalize_hash(&row["txHash"]) else {
-        return Vec::new();
-    };
+async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
+    let hash = normalize_hash(&row["txHash"]);
     if hash.is_empty() {
         return Vec::new();
     }
+    // Use the release's matching rules to decide when to stop reading.
+    // Only a valid transaction hash can supply fill evidence.
+    let history = scan_history(context, row, &hash).await;
+    if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        history
+    } else {
+        Vec::new()
+    }
+}
+
+async fn scan_history(context: &KeyedIntent<'_>, row: &Value, hash: &str) -> Vec<Value> {
     let started = Instant::now();
+    let budget = context.poll.timeout.min(HISTORY_TIMEOUT);
     let remaining = || {
-        budget
-            .remaining()
-            .min(HISTORY_TIMEOUT.saturating_sub(started.elapsed()))
+        let remaining = budget.saturating_sub(started.elapsed());
+        context
+            .poll
+            .budget
+            .map_or(remaining, |wait| remaining.min(wait.remaining()))
     };
     let mut pages_left = HISTORY_MAX_PAGES + 1;
     let mut found = Vec::new();
@@ -546,26 +459,39 @@ async fn read_wait_history(
             tokio::time::sleep(HISTORY_RETRY_DELAY).await;
         }
         let mut seen = HashSet::new();
-        let mut execution_block = (row["lifecycleStep"] == "exec_pass")
-            .then(|| row["execBlock"].as_i64())
-            .flatten();
+        let mut execution_block = None;
+        if row["lifecycleStep"] == "exec_pass" {
+            execution_block = history_integer(&row["execBlock"]);
+        }
         for page in 0..pages_left.min(HISTORY_MAX_PAGES) {
+            let timeout = remaining();
+            if timeout.is_zero() {
+                return found;
+            }
             pages_left -= 1;
-            let Ok(data) = bounded_request(
-                context.keeper,
-                keeper::INTENT_HISTORY,
-                Map::from_iter([
-                    ("trader".into(), json!(context.addr)),
-                    ("limit".into(), json!(HISTORY_PAGE_SIZE)),
-                    ("offset".into(), json!(page * HISTORY_PAGE_SIZE)),
-                ]),
-                remaining(),
-            )
-            .await
-            else {
+            let variables = Map::from_iter([
+                ("trader".into(), json!(context.addr)),
+                ("limit".into(), json!(HISTORY_PAGE_SIZE)),
+                ("offset".into(), json!(page * HISTORY_PAGE_SIZE)),
+            ]);
+            let response = if context.poll.budget.is_some() {
+                context
+                    .keeper
+                    .wait_request(keeper::INTENT_HISTORY, variables, timeout)
+                    .await
+            } else {
+                context
+                    .keeper
+                    .request(keeper::INTENT_HISTORY, variables, None, timeout)
+                    .await
+            };
+            let Ok(data) = response else {
                 return found;
             };
-            let Some(history) = data["perp"]["tradeHistory"].as_array() else {
+            let Some(history) = data
+                .get("perp")
+                .and_then(|perp| perp["tradeHistory"].as_array())
+            else {
                 return found;
             };
             for item in history {
@@ -573,8 +499,8 @@ async fn read_wait_history(
                     && account_matches(&item["trade"]["trader"], context.account)
                     && ["txHash", "evmTxHash"]
                         .iter()
-                        .any(|field| normalize_hash(&item[*field]).is_ok_and(|value| value == hash))
-                    && item["id"].as_i64().is_none_or(|id| seen.insert(id))
+                        .any(|field| normalize_hash(&item[*field]) == hash)
+                    && history_integer(&item["id"]).is_none_or(|id| seen.insert(id))
                 {
                     found.push(item.clone());
                 }
@@ -583,12 +509,14 @@ async fn read_wait_history(
                 break;
             }
             if let Some(first) = found.first() {
-                execution_block = execution_block.or_else(|| first["block"]["block"].as_i64());
-                if let Some((oldest, execution)) = history
+                execution_block =
+                    execution_block.or_else(|| history_integer(&first["block"]["block"]));
+                let oldest = history
                     .last()
-                    .and_then(|item| item["block"]["block"].as_i64())
-                    .zip(execution_block)
-                    && oldest < execution
+                    .and_then(|item| history_integer(&item["block"]["block"]));
+                if oldest
+                    .zip(execution_block.as_ref())
+                    .is_some_and(|(oldest, execution)| &oldest < execution)
                 {
                     break;
                 }
@@ -601,13 +529,6 @@ async fn read_wait_history(
     found
 }
 
-fn incomplete_data(kind: &str) -> SaiError {
-    SaiError::new(
-        Code::IncompleteData,
-        format!("Keeper or contract data was missing or malformed ({kind})"),
-    )
-}
-
 fn log_keeper(
     events: EventContext<'_>,
     endpoint: &str,
@@ -616,12 +537,13 @@ fn log_keeper(
     observed: Option<(&Value, Outcome)>,
     wait: bool,
 ) {
-    let mut fields = vec![
+    let common = [
         ("intentKey", json!(key).into()),
         ("addr", json!(addr).into()),
         ("endpoint", Field::Endpoint(endpoint.into())),
         ("endpointId", Field::endpoint_identity(endpoint)),
     ];
+    let mut fields = Map::new();
     if let Some((row, outcome)) = observed {
         if wait {
             let mut public = row.as_object().map_or(Value::Null, keeper::intent_record);
@@ -634,29 +556,24 @@ fn log_keeper(
                 "txHash",
                 "txHashInvalid",
             ] {
-                fields.push((key, public[key].clone().into()));
+                fields.insert(key.into(), public[key].clone());
             }
-        } else {
-            for key in ["kind", "lifecycleStep", "execActor"] {
-                if keeper::known_intent_field(key, &row[key]) {
-                    fields.push((key, row[key].clone().into()));
-                }
-            }
-            if let Some(code) = row.as_object().and_then(keeper::log_intent_error_code) {
-                fields.push(("errorCode", json!(code).into()));
-            }
-            let (hash, invalid) = keeper::request_hash(&row["txHash"]);
-            if let Some(hash) = hash {
-                fields.push(("txHash", json!(hash).into()));
-            } else if invalid {
-                fields.push(("txHashInvalid", json!(true).into()));
-            }
+        } else if let Some(row) = row.as_object() {
+            fields = keeper::intent_log_fields(row);
         }
         if outcome == Outcome::TerminalFailed {
-            fields.push(("code", json!(Code::KeeperError).into()));
+            fields.insert("code".into(), json!(Code::KeeperError));
         }
     } else {
-        fields.push(("found", json!(false).into()));
+        fields.insert("found".into(), json!(false));
     }
-    events.event("intent.keeper", Level::Info, fields);
+    events.event(
+        "intent.keeper",
+        Level::Info,
+        common.into_iter().chain(
+            fields
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.clone().into())),
+        ),
+    );
 }

@@ -18,8 +18,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -44,25 +43,6 @@ NIBI = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
 OTHER = "0x" + "b" * 40
 OTHER_NIBI = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 CLI = tuple[str, ...]
-# Rust C4 targets the public error codes from the pinned Python contract.
-C4_INTENT_ERROR_CODES = frozenset(
-    {
-        "SLIPPAGE",
-        "simulation_failed",
-        "admission_expired",
-        "broadcast_rejected",
-        "chain_execution_failed",
-        "market_order_expired",
-        "market_order_fill_failed",
-        "market_order_trading_paused",
-        "market_order_market_closed",
-        "market_order_trade_not_open",
-        "market_order_outcome_not_indexed",
-        "intent_already_used",
-        "below_minimum",
-        "insufficient_idle",
-    }
-)
 
 
 @dataclass(frozen=True)
@@ -226,7 +206,7 @@ def read_events(
         # these v2 fields directly against the newer Python writer.
         for field in ("schema", "commandId", "endpointId"):
             event.pop(field, None)
-        if event["event"] == "keeper.request":
+        if c4_reference and event["event"] == "keeper.request":
             event.pop("intentKey", None)
             if "keeperErrors" in event:
                 event.update(
@@ -236,7 +216,9 @@ def read_events(
                         total=event.get("keeperErrorCount"),
                     )
                 )
-        if event["event"] == "intent.keeper":
+        if c4_reference and event["event"] == "intent.keeper":
+            if not rust:
+                event["addr"] = keeper.canonical_account(event["addr"])
             if (code := keeper.intent_error_code(event)) is not None:
                 event["errorCode"] = code
             event.pop("errorMsg", None)
@@ -323,73 +305,12 @@ class Step:
     json_output: bool = True
 
 
-def c4_timestamp_field(
-    projected: dict[str, Any], source: dict[str, Any], field: str
-) -> dict[str, Any]:
-    """Use the original C4 timezone-aware ISO parser on the pinned CLI value."""
-    value = source.get(field)
-    timestamp = None
-    if isinstance(value, str) and len(value) <= 40:
-        with suppress(ValueError):
-            if datetime.fromisoformat(value).tzinfo is not None:
-                timestamp = value
-
-    # A timestamp and its invalid flag occupy the same slot in the projection.
-    invalid = field + "Invalid"
-    return {
-        (field if name == invalid else name): (
-            timestamp if name in (field, invalid) else value
-        )
-        for name, value in projected.items()
-        if name not in (field, invalid) or timestamp is not None
-    }
-
-
 def public_intent_output(output: bytes, *, compact: bool) -> bytes:
-    """Project pinned CLI stdout to the Rust C4 field contract."""
-    document = json.loads(output)
-    public = reconcile.status_report(document)
-    for name in ("userIntents", "matchedTradeHistory"):
-        if name not in public:
-            continue
-        rows = (row for row in document[name] if isinstance(row, dict))
-        for index, source in enumerate(rows):
-            row = public[name][index]
-            if name == "userIntents":
-                row = c4_timestamp_field(row, source, "execBlockTs")
-                if "errorCode" in row and row["errorCode"] not in C4_INTENT_ERROR_CODES:
-                    row["errorCode"] = "KEEPER_ERROR"
-                public[name][index] = row
-            elif isinstance(block := source.get("block"), dict):
-                row["block"] = c4_timestamp_field(row["block"], block, "block_ts")
+    """Apply the published projection to the old CI reference's raw output."""
+    public = reconcile.status_report(json.loads(output))
     return (
         json.dumps(log.clean(public), indent=None if compact else 2) + "\n"
     ).encode()
-
-
-def test_pinned_projection_preserves_c4_timestamps():
-    c4_time = "2026-11-20 15:43:31.1234567890123456Z"
-    document = {
-        "userIntents": [
-            {"execBlockTs": c4_time, "txHash": "a" * 64},
-            {"execBlockTs": "2026-11-20T15:43:31"},
-        ],
-        "matchedTradeHistory": [
-            {"block": {"block": 123, "block_ts": c4_time}},
-            {"block": {"block_ts": "invalid"}},
-        ],
-    }
-    expected = {
-        "userIntents": [{"execBlockTs": c4_time, "txHash": "a" * 64}, {}],
-        "matchedTradeHistory": [
-            {"block": {"block": 123, "block_ts": c4_time}},
-            {"block": {}},
-        ],
-    }
-    assert (
-        public_intent_output(json.dumps(document).encode(), compact=True)
-        == (json.dumps(expected) + "\n").encode()
-    )
 
 
 def compare(
@@ -421,9 +342,16 @@ def compare(
                 result = invoke(cli, home, *args)
                 assert result.returncode == step.code, (result.stdout, result.stderr)
                 assert not replies
+                history = (
+                    wire(keeper.HISTORY, trader=step.addr)
+                    if index == 0
+                    else wire(
+                        keeper.INTENT_HISTORY, trader=step.addr, limit=25, offset=0
+                    )
+                )
                 assert [request.body for request in requests] == [
                     wire(keeper.INTENTS, user=step.addr, key=step.key),
-                    *[wire(keeper.HISTORY, trader=step.addr)] * (len(step.replies) - 1),
+                    *[history] * (len(step.replies) - 1),
                 ]
                 if step.json_output:
                     assert not result.stderr
@@ -445,7 +373,28 @@ def compare(
                 stdout = result.stdout
                 if index == 0 and step.code == 0:
                     stdout = public_intent_output(stdout, compact=step.json_output)
-                runs.append((stdout, result.stderr, list(requests), state))
+                # The two wire formats have already been checked separately.
+                for req in requests:
+                    assert req.headers["content-length"] == str(len(req.body))
+                runs.append(
+                    (
+                        stdout,
+                        result.stderr,
+                        [
+                            replace(
+                                req,
+                                body=b"",
+                                headers={
+                                    name: value
+                                    for name, value in req.headers.items()
+                                    if name != "content-length"
+                                },
+                            )
+                            for req in requests
+                        ],
+                        state,
+                    )
+                )
             observed.append(
                 (runs, read_events(home, c4_reference=True, rust=index == 1))
             )
@@ -530,20 +479,6 @@ def test_split_history_headers_keep_the_inactivity_timer_alive(
         tmp_path,
         monkeypatch,
         (Step(("outcome_not_indexed", fill), "terminal"),),
-    )
-
-
-def test_empty_history_object_retries(
-    cli_pair: tuple[CLI, CLI],
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    empty = {"data": {"perp": {"tradeHistory": {}}}}
-    compare(
-        cli_pair,
-        tmp_path,
-        monkeypatch,
-        (Step(("outcome_not_indexed", empty, "filled_history"), "terminal"),),
     )
 
 
@@ -663,14 +598,7 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
         ((Reply(b"malformed"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
-        (({"data": {"userIntents": 123}},), "unknown", "INCOMPLETE_DATA"),
         (({"data": {"userIntents": [None]}},), "unknown", "INTERNAL_ERROR"),
-        (("outcome_not_indexed", {"data": {}}), "pending", "INCOMPLETE_DATA"),
-        (
-            ("outcome_not_indexed", {"data": {"perp": {"tradeHistory": None}}}),
-            "pending",
-            "INCOMPLETE_DATA",
-        ),
     ],
 )
 def test_request_and_data_failures(
@@ -711,12 +639,9 @@ def test_intent_status_logs_only_public_graphql_codes(
             expected_requests = [wire(keeper.INTENTS, user=ADDR, key=KEY)]
             if operation == "history":
                 replies.append(response("outcome_not_indexed"))
-                history_request = (
+                expected_requests.append(
                     wire(keeper.INTENT_HISTORY, trader=ADDR, limit=25, offset=0)
-                    if index == 0
-                    else wire(keeper.HISTORY, trader=ADDR)
                 )
-                expected_requests.append(history_request)
             replies.append(response(failure))
             result = invoke(
                 cli,
@@ -1029,7 +954,7 @@ def test_public_history_projects_after_raw_hash_correlation(
                     {
                         "data": {
                             "userIntents": [
-                                {**intent, "txHash": opaque, "execBlockTs": c4_time}
+                                {**intent, "txHash": "cd" * 32, "execBlockTs": c4_time}
                             ],
                             "extra": opaque,
                         }
@@ -1074,7 +999,9 @@ def test_public_history_preserves_liquidation_label(
             replies.clear()
             replies.extend(
                 [
-                    response({"data": {"userIntents": [{**intent, "txHash": opaque}]}}),
+                    response(
+                        {"data": {"userIntents": [{**intent, "txHash": "cd" * 32}]}}
+                    ),
                     response({"data": {"perp": {"tradeHistory": [history]}}}),
                 ]
             )

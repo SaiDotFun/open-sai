@@ -10,7 +10,6 @@ use super::{canonical_account, is_evm_address, truthy};
 use crate::{
     log,
     reconcile::{HISTORY_HINT, LOCAL_PENDING_HINT, PENDING_HINT, UNINDEXED_HINT},
-    session::parse_expiry,
 };
 
 static INTENT_KEY: LazyLock<Regex> = LazyLock::new(|| {
@@ -60,6 +59,7 @@ const STEPS: &[&str] = &[
     "exec_fail",
     "exec_finality_observed",
 ];
+const ACTORS: &[&str] = &["client", "server", "user"];
 const TRADE_CHANGES: &[&str] = &[
     "position_opened",
     "limit_order_created",
@@ -90,13 +90,11 @@ const ERROR_CODES: &[&str] = &[
     "market_order_market_closed",
     "market_order_trade_not_open",
     "market_order_outcome_not_indexed",
+    "withdraw_evm_unconfigured",
+    "invalid_withdraw",
     "intent_already_used",
     "below_minimum",
     "insufficient_idle",
-];
-const LOG_ERROR_CODES: &[&str] = &[
-    "withdraw_evm_unconfigured",
-    "invalid_withdraw",
     "intent_validation_failed",
     "chain_switch_failed",
     "gas_estimation_failed",
@@ -154,20 +152,20 @@ pub fn public_account_history(home: &Path, data: &Map<String, Value>) -> Value {
     let projected: Vec<_> = rows
         .iter()
         .filter_map(Value::as_object)
-        .map(|row| scrub(history_row(row, account_history_timestamp).into()))
+        .map(|row| scrub(intent_history(row).into()))
         .collect();
     json!({"perp": {"tradeHistory": projected}})
 }
 
-fn account_history_timestamp(block: &mut Map<String, Value>, timestamp: &Value) {
+fn keep_timestamp(out: &mut Map<String, Value>, key: &str, timestamp: &Value) {
     if timestamp.as_str().is_some_and(|text| {
         HISTORY_TIMESTAMP.is_match(text)
             && !text.starts_with("0000-")
             && chrono::DateTime::parse_from_rfc3339(text).is_ok()
     }) {
-        block.insert("block_ts".into(), timestamp.clone());
+        out.insert(key.into(), timestamp.clone());
     } else if !timestamp.is_null() {
-        block.insert("block_tsInvalid".into(), json!(true));
+        out.insert(format!("{key}Invalid"), json!(true));
     }
 }
 
@@ -187,12 +185,6 @@ fn number(value: &Value) -> bool {
 
 fn row_id(value: &Value) -> bool {
     number(value) || value.as_str().is_some_and(|text| ROW_ID.is_match(text))
-}
-
-fn block_time(value: &Value) -> bool {
-    value
-        .as_str()
-        .is_some_and(|text| text.chars().count() <= 40 && parse_expiry(text).is_some())
 }
 
 fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
@@ -226,9 +218,7 @@ pub(crate) fn known_intent_field(field: &str, value: &Value) -> bool {
         "kind" => known(value, KINDS),
         "lifecycleStep" => known(value, STEPS),
         "execActor" => known(value, &["client", "server", "user"]),
-        "errorCode" => {
-            known(value, ERROR_CODES) || known(value, LOG_ERROR_CODES) || value == "KEEPER_ERROR"
-        }
+        "errorCode" => known(value, ERROR_CODES) || value == "KEEPER_ERROR",
         _ => false,
     }
 }
@@ -276,6 +266,57 @@ fn keep_intent_key(out: &mut Map<String, Value>, key: &Value) {
     );
 }
 
+fn keep_intent_lifecycle(out: &mut Map<String, Value>, row: &Map<String, Value>) {
+    for (key, allowed) in [
+        ("kind", KINDS),
+        ("lifecycleStep", STEPS),
+        ("execActor", ACTORS),
+    ] {
+        if let Some(field) = row.get(key) {
+            keep(out, key, field, known(field, allowed));
+        }
+    }
+}
+
+fn intent_error_code(row: &Map<String, Value>) -> Option<&str> {
+    let code = row.get("errorCode");
+    if code.is_some_and(truthy)
+        || row.get("errorMsg").is_some_and(truthy)
+        || row.get("lifecycleStep").is_some_and(|step| {
+            known(
+                step,
+                &[
+                    "jwt_failed",
+                    "sign_reject",
+                    "sign_failed",
+                    "exec_req_fail",
+                    "exec_fail",
+                ],
+            )
+        })
+    {
+        Some(
+            code.and_then(Value::as_str)
+                .filter(|code| ERROR_CODES.contains(code))
+                .unwrap_or("KEEPER_ERROR"),
+        )
+    } else {
+        None
+    }
+}
+
+pub(crate) fn intent_log_fields(row: &Map<String, Value>) -> Map<String, Value> {
+    let mut fields = Map::new();
+    keep_intent_lifecycle(&mut fields, row);
+    if let Some(code) = intent_error_code(row) {
+        fields.insert("errorCode".into(), json!(code));
+    }
+    if let Some(hash) = row.get("txHash") {
+        keep_hash(&mut fields, "txHash", hash);
+    }
+    fields
+}
+
 pub(crate) fn intent_record(row: &Map<String, Value>) -> Value {
     project_intent_record(row, false)
 }
@@ -305,14 +346,7 @@ fn project_intent_record(row: &Map<String, Value>, logging: bool) -> Value {
             }),
         );
     }
-    for (key, allowed) in [
-        ("kind", KINDS),
-        ("lifecycleStep", STEPS),
-        ("execActor", &["client", "server", "user"][..]),
-    ] {
-        let field = value(key);
-        keep(&mut record, key, field, known(field, allowed));
-    }
+    keep_intent_lifecycle(&mut record, row);
     keep(
         &mut record,
         "execBlock",
@@ -320,21 +354,21 @@ fn project_intent_record(row: &Map<String, Value>, logging: bool) -> Value {
         number(value("execBlock")),
     );
     let timestamp = value("execBlockTs");
-    let valid = if logging {
-        timestamp.as_str().is_some_and(|ts| {
+    if logging {
+        let valid = timestamp.as_str().is_some_and(|ts| {
             BLOCK_TIMESTAMP.is_match(ts)
                 && DateTime::parse_from_rfc3339(ts)
                     .is_ok_and(|ts| ts.year() > 0 && ts.nanosecond() < 1_000_000_000)
-        })
+        });
+        keep(&mut record, "execBlockTs", timestamp, valid);
+        if !timestamp.is_null() && !valid {
+            record.insert("execBlockTsInvalid".into(), json!(true));
+        }
     } else {
-        block_time(timestamp)
-    };
-    keep(&mut record, "execBlockTs", timestamp, valid);
-    if logging && !timestamp.is_null() && !valid {
-        record.insert("execBlockTsInvalid".into(), json!(true));
+        keep_timestamp(&mut record, "execBlockTs", timestamp);
     }
     keep_hash(&mut record, "txHash", value("txHash"));
-    if let Some(code) = error_code(row, logging) {
+    if let Some(code) = intent_error_code(row) {
         record.insert("errorCode".into(), json!(code));
         // This fixed message is shorter than the untrusted-text limit.
         record.insert("errorMsg".into(), json!("Keeper reported an intent error."));
@@ -345,44 +379,7 @@ fn project_intent_record(row: &Map<String, Value>, logging: bool) -> Value {
     Value::Object(record)
 }
 
-pub(crate) fn log_intent_error_code(row: &Map<String, Value>) -> Option<&str> {
-    error_code(row, true)
-}
-
-fn error_code(row: &Map<String, Value>, logging: bool) -> Option<&str> {
-    let value = |key| row.get(key).unwrap_or(&Value::Null);
-    let code = value("errorCode");
-    let failed = truthy(code)
-        || truthy(value("errorMsg"))
-        || known(
-            value("lifecycleStep"),
-            &[
-                "jwt_failed",
-                "sign_reject",
-                "sign_failed",
-                "exec_req_fail",
-                "exec_fail",
-            ],
-        );
-    failed.then(|| {
-        code.as_str()
-            .filter(|code| {
-                ERROR_CODES.contains(code) || (logging && LOG_ERROR_CODES.contains(code))
-            })
-            .unwrap_or("KEEPER_ERROR")
-    })
-}
-
 pub(crate) fn intent_history(row: &Map<String, Value>) -> Value {
-    history_row(row, |block, timestamp| {
-        keep(block, "block_ts", timestamp, block_time(timestamp));
-    })
-}
-
-fn history_row(
-    row: &Map<String, Value>,
-    project_timestamp: impl FnOnce(&mut Map<String, Value>, &Value),
-) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut history = Map::new();
     keep_intent_key(&mut history, value("intentKey"));
@@ -417,7 +414,7 @@ fn history_row(
             keep(&mut public, "block", height, row_id(height));
         }
         if let Some(timestamp) = block.get("block_ts") {
-            project_timestamp(&mut public, timestamp);
+            keep_timestamp(&mut public, "block_ts", timestamp);
         }
         history.insert("block".into(), Value::Object(public));
     }
