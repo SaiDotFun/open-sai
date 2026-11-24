@@ -2,12 +2,13 @@
 # requires-python = ">=3.10"
 # dependencies = []
 # ///
-"""Install the newest sai-cli release with uv.
+"""Install a verified Sai release.
 
 Finds the highest `sai-cli/vX.Y.Z` release of SaiDotFun/open-sai, downloads
 its wheel and SHA256SUMS, checks the hash, and runs `uv tool install` on the
 downloaded file. `--source` builds that release's tag from Git instead.
 Before the first release exists, it installs from `main` and says so.
+Pass `--native` for the standalone Linux and macOS install.
 
 What it checks: the wheel it downloads must match the release's SHA256SUMS,
 and the cache it keeps the wheel in must be private to you. It does not defend
@@ -18,31 +19,37 @@ It needs only uv and the standard library, so it runs straight from GitHub:
 
     uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py
 
-Usage: install.py [--source] [--dry-run]
+Usage: install.py [--native | --source] [--version VERSION] [--dry-run]
 """
 
 from __future__ import annotations
 
 import argparse
+import errno
+import gzip
 import hashlib
 import json
 import os
+import platform
 import re
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tarfile
 import tempfile
 import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable
+import zlib
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from http.client import HTTPException
 from pathlib import Path
-from typing import Any, TypeVar
-from urllib.parse import quote, urlsplit
+from typing import Any, BinaryIO, TypeVar
+from urllib.parse import quote, urljoin, urlsplit
 
 # Keep these in step with cli/sai_cli/core/update.py; a test compares them.
 REPO = "SaiDotFun/open-sai"
@@ -63,8 +70,17 @@ FALLBACK_STATUSES = frozenset({403, 429})
 RECORD_NAME = ".sai-cli-release.json"
 RECORD_SCHEMA = 1
 
-NUMBER = r"(0|[1-9]\d*)"
+NUMBER = r"(0|[1-9][0-9]*)"
 TAG = re.compile(rf"^{re.escape(TAG_PREFIX)}{NUMBER}\.{NUMBER}\.{NUMBER}$")
+NATIVE_VERSION = rf"{NUMBER}\.{NUMBER}\.{NUMBER}(?:-rc\.{NUMBER})?"
+DIGEST = r"[0-9a-f]{64}"
+NATIVE_DIRECTORY = re.compile(rf"{NATIVE_VERSION}-{DIGEST}")
+NATIVE_ROOT = ".sai-native"
+NATIVE_LOCK = ".sai-update.lock"
+NATIVE_PENDING = "pending.json"
+MAX_BINARY = 96 << 20
+VERIFY_TIMEOUT = 60
+PYTHON_PIN = "0.1.2"
 
 T = TypeVar("T")
 
@@ -273,15 +289,46 @@ def wheel_url(tag: str, web_base: str = WEB_BASE) -> str:
     return f"{download_base(tag, web_base)}/{wheel_name(version_of(tag))}"
 
 
-def download(url: str, target: Path, limit: int, deadline: float) -> None:
+class AssetRedirect(urllib.request.HTTPRedirectHandler):
+    def __init__(self, origin: str):
+        self.origin = origin
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        target = urlsplit(urljoin(req.full_url, newurl))
+        origin = f"{target.scheme}://{target.netloc}"
+        official = (
+            self.origin == WEB_BASE
+            and target.scheme == "https"
+            and (
+                target.netloc
+                in (
+                    "github.com",
+                    "release-assets.githubusercontent.com",
+                    "objects.githubusercontent.com",
+                )
+            )
+        )
+        if origin != self.origin and not official:
+            raise LookupFailed("the release redirected outside its download hosts")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def download(
+    url: str, target: Path, limit: int, deadline: float, *, origin: str | None = None
+) -> None:
     """Save URL to TARGET, following redirects, within LIMIT bytes."""
     name = url.rsplit("/", 1)[-1]
     what = f"downloading {name}"
     call = urllib.request.Request(url, headers={"User-Agent": "sai-cli"})
     size = 0
+    open_url = (
+        urllib.request.urlopen
+        if origin is None
+        else urllib.request.build_opener(AssetRedirect(origin)).open
+    )
     try:
         with (
-            urllib.request.urlopen(call, timeout=left(deadline, what)) as response,
+            open_url(call, timeout=left(deadline, what)) as response,
             target.open("wb") as handle,
         ):
             while True:
@@ -457,11 +504,463 @@ def uv_tool_install(uv: str | None, requirement: str, shown: str, dry_run: bool)
     return code
 
 
+def native_asset(version: str) -> str:
+    system = {"Linux": "unknown-linux-gnu", "Darwin": "apple-darwin"}.get(
+        platform.system()
+    )
+    cpu = {
+        "x86_64": "x86_64",
+        "amd64": "x86_64",
+        "aarch64": "aarch64",
+        "arm64": "aarch64",
+    }.get(platform.machine().lower())
+    if system is None or cpu is None:
+        raise LookupFailed(
+            "native Sai supports Linux and macOS on x86-64 and ARM64."
+            f" For the Python release, run this installer with --version {PYTHON_PIN}"
+        )
+    return f"sai-{version}-{cpu}-{system}.tar.gz"
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1 << 16), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def fetch_native(
+    tag: str, name: str, stage: Path, web_base: str, timeout: float
+) -> str:
+    archive, manifest = stage / name, stage / "SHA256SUMS"
+    base = download_base(tag, web_base)
+
+    def work(deadline: float) -> None:
+        download(f"{base}/SHA256SUMS", manifest, MAX_SUMS, deadline, origin=web_base)
+        download(f"{base}/{name}", archive, MAX_WHEEL, deadline, origin=web_base)
+
+    within(timeout, "downloading the native release", work)
+    matches = [
+        fields[0].lower()
+        for line in manifest.read_text(errors="replace").splitlines()
+        if len(fields := line.split(maxsplit=1)) == 2 and fields[1].lstrip("*") == name
+    ]
+    if len(matches) != 1 or re.fullmatch(DIGEST, matches[0]) is None:
+        raise LookupFailed(f"SHA256SUMS must contain one checksum for {name}")
+    if file_digest(archive) != matches[0]:
+        raise LookupFailed(f"{name} does not match its SHA256SUMS entry")
+    unpack_native(archive, stage / "sai")
+    archive.unlink()
+    manifest.unlink()
+    return matches[0]
+
+
+def unpack_native(archive: Path, binary: Path) -> None:
+    """Read a single USTAR member and allow only bounded zero padding."""
+    block = tarfile.BLOCKSIZE
+    try:
+        with gzip.open(archive, "rb") as source, binary.open("xb") as output:
+            member = tarfile.TarInfo.frombuf(source.read(block), "utf-8", "strict")
+            if (
+                member.name != "sai"
+                or member.type not in (tarfile.REGTYPE, tarfile.AREGTYPE)
+                or member.linkname
+                or not 0 < member.size <= MAX_BINARY
+            ):
+                raise LookupFailed(
+                    "the native archive must contain one regular file named sai"
+                )
+            remaining = member.size
+            while remaining:
+                data = source.read(min(remaining, 1 << 16))
+                if not data:
+                    raise LookupFailed(
+                        "the native archive contains a truncated sai binary"
+                    )
+                output.write(data)
+                remaining -= len(data)
+            minimum = -member.size % block + 2 * block
+            padding = source.read(minimum + 62 * block + 1)
+            if (
+                not minimum <= len(padding) <= minimum + 62 * block
+                or (len(padding) - minimum) % block
+                or any(padding)
+            ):
+                raise LookupFailed(
+                    "the native archive contains invalid padding or extra members"
+                )
+            output.flush()
+            os.fchmod(output.fileno(), 0o700)
+            os.fsync(output.fileno())
+    except (EOFError, OSError, UnicodeError, tarfile.HeaderError, zlib.error) as error:
+        raise LookupFailed("could not extract the verified native archive") from error
+
+
+def sync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    except OSError as error:
+        if sys.platform != "darwin" or error.errno != errno.EINVAL:
+            raise
+    finally:
+        os.close(fd)
+
+
+def checked_directory(path: Path, *, private: bool = False) -> None:
+    path.mkdir(mode=0o700, exist_ok=True)
+    info = path.lstat()
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & (0o077 if private else 0o022)
+    ):
+        raise LookupFailed(
+            f"{path} must be a user-owned directory with safe permissions"
+        )
+
+
+def check_ancestors(path: Path, *, create: bool = False) -> None:
+    trusted_owners = {0, os.getuid(), Path(path.anchor).stat().st_uid}
+    for parent in reversed(path.parents):
+        try:
+            info = parent.lstat()
+        except FileNotFoundError:
+            if not create:
+                continue
+            parent.mkdir(mode=0o700, exist_ok=True)
+            info = parent.lstat()
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or info.st_uid not in trusted_owners
+            or (info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX)
+        ):
+            raise LookupFailed(f"{parent} is not a trusted launcher directory")
+
+
+@contextmanager
+def native_lock(path: Path) -> Generator[None]:
+    from fcntl import LOCK_EX, LOCK_NB, flock
+
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid != os.getuid()
+            or info.st_mode & 0o077
+        ):
+            raise LookupFailed(f"{path} must be a private lock file")
+        try:
+            flock(fd, LOCK_EX | LOCK_NB)
+        except BlockingIOError as error:
+            raise LookupFailed("another Sai install or update is running") from error
+        yield
+    finally:
+        os.close(fd)
+
+
+def native_binary(root: Path, directory: str) -> Path:
+    if not NATIVE_DIRECTORY.fullmatch(directory):
+        raise LookupFailed("the Sai install record names an invalid version directory")
+    binary = root / directory / "sai"
+    info = binary.lstat()
+    parent = binary.parent.lstat()
+    if (
+        not stat.S_ISDIR(parent.st_mode)
+        or parent.st_uid != os.getuid()
+        or parent.st_mode & 0o022
+        or not stat.S_ISREG(info.st_mode)
+        or info.st_uid != os.getuid()
+        or info.st_mode & 0o022
+        or not info.st_mode & stat.S_IXUSR
+    ):
+        raise LookupFailed(f"{binary} must be an owner-controlled executable")
+    return binary
+
+
+def launcher_target(launcher: Path) -> Path | None:
+    try:
+        info = launcher.lstat()
+    except FileNotFoundError:
+        return None
+    if info.st_uid != os.getuid() or not stat.S_ISLNK(info.st_mode):
+        raise LookupFailed(
+            f"{launcher} already exists. Update it through its installer"
+        )
+    return launcher.resolve()
+
+
+def uv_launcher(target: Path) -> bool:
+    prefix = target.parent.parent
+    return (
+        target.name == "sai"
+        and target.parent.name == "bin"
+        and prefix.name == "sai-cli"
+        and (prefix / "uv-receipt.toml").is_file()
+    )
+
+
+def check_path(launcher: Path) -> None:
+    for directory in os.get_exec_path():
+        path = Path(directory or ".").resolve() / "sai"
+        if path == launcher:
+            found = shutil.which("sai")
+            if found is not None and Path(found).parent.resolve() / "sai" != launcher:
+                print(
+                    f"PATH currently launches {found}. After install it will launch {launcher}.",
+                    file=sys.stderr,
+                )
+            return
+        if path.is_file() and os.access(path, os.X_OK):
+            raise LookupFailed(f"PATH launches {path}, which shadows {launcher}")
+    print(f"Add {launcher.parent} to PATH to run sai.", file=sys.stderr)
+
+
+def installed_directory(launcher: Path, root: Path) -> str | None:
+    target = launcher_target(launcher)
+    if target is None:
+        return None
+    if target.parent.parent != root or target.name != "sai":
+        raise LookupFailed(
+            f"{launcher} points to {target}. Update it through its installer"
+        )
+    directory = target.parent.name
+    native_binary(root, directory)
+    return directory
+
+
+def switch_launcher(launcher: Path, root: Path, directory: str | None) -> None:
+    if directory is None:
+        launcher.unlink()
+    else:
+        binary = native_binary(root, directory)
+        with tempfile.TemporaryDirectory(
+            dir=launcher.parent, prefix=".sai-link-"
+        ) as stage:
+            link = Path(stage) / "sai"
+            link.symlink_to(binary.relative_to(launcher.parent))
+            link.replace(launcher)
+    sync_dir(launcher.parent)
+
+
+def recover_native(launcher: Path, root: Path) -> str | None:
+    active = installed_directory(launcher, root)
+    pending = root / NATIVE_PENDING
+    try:
+        with pending.open("rb") as handle:
+            record = json.loads(handle.read(4096))
+    except FileNotFoundError:
+        return active
+    except ValueError as error:
+        raise LookupFailed("could not read the pending Sai install record") from error
+    if not isinstance(record, dict) or set(record) != {"old", "new"}:
+        raise LookupFailed("the pending Sai install record is invalid")
+    old, new = record["old"], record["new"]
+    if not isinstance(new, str) or (old is not None and not isinstance(old, str)):
+        raise LookupFailed("the pending Sai install record is invalid")
+    native_binary(root, new)
+    if old is not None:
+        native_binary(root, old)
+    if active == new and old != new:
+        switch_launcher(launcher, root, old)
+    elif active != old:
+        raise LookupFailed("the launcher changed during an interrupted Sai install")
+    pending.unlink()
+    sync_dir(root)
+    return old
+
+
+def smoke_native(binary: Path, home: Path, version: str) -> None:
+    env = {**os.environ, "SAI_HOME": str(home), "SAI_LOG": "false", "CI": "1"}
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        for args in (["--version"], ["config", "get", "update.auto"], ["mcp", "serve"]):
+            label = f"sai {' '.join(args)}"
+            try:
+                with subprocess.Popen(
+                    [binary, *args],
+                    cwd=home,
+                    env=env,
+                    stdin=subprocess.PIPE,
+                    stdout=output,
+                    stderr=errors,
+                ) as process:
+                    try:
+                        if args[0] == "mcp":
+                            assert process.stdin is not None
+                            process.stdin.write(MCP_INITIALIZE)
+                            process.stdin.flush()
+                            read_mcp(output, errors, process)
+                        process.communicate(timeout=VERIFY_TIMEOUT)
+                    except BaseException:
+                        process.kill()
+                        raise
+                    if process.returncode != 0:
+                        errors.seek(0)
+                        diagnostic = errors.read(512).decode(errors="replace").strip()
+                        raise LookupFailed(
+                            f"`{label}` failed: {diagnostic or 'no diagnostic'}"
+                        )
+                if args[0] == "--version":
+                    output.seek(0)
+                    if output.read(512).strip() != f"sai {version}".encode():
+                        raise LookupFailed(f"`{label}` did not report {version}")
+            except subprocess.TimeoutExpired as error:
+                raise LookupFailed(f"`{label}` timed out") from error
+            finally:
+                for stream in (output, errors):
+                    stream.seek(0)
+                    stream.truncate()
+
+
+MCP_INITIALIZE = (
+    b'{"jsonrpc":"2.0","id":1,"method":"initialize","params":'
+    b'{"protocolVersion":"2025-11-25","capabilities":{},'
+    b'"clientInfo":{"name":"sai-install","version":"1.0.0"}}}\n'
+)
+
+
+def read_mcp(
+    output: BinaryIO, errors: BinaryIO, process: subprocess.Popen[bytes]
+) -> None:
+    # pread keeps the writer's offset independent of the probe.
+    deadline = time.monotonic() + VERIFY_TIMEOUT
+    while True:
+        first = os.pread(output.fileno(), 1 << 16, 0)
+        if b"\n" in first:
+            break
+        if process.poll() is not None:
+            diagnostic = (
+                os.pread(errors.fileno(), 512, 0).decode(errors="replace").strip()
+            )
+            raise LookupFailed(
+                f"`sai mcp serve` did not initialize: {diagnostic or 'no diagnostic'}"
+            )
+        if len(first) >= (1 << 16):
+            raise LookupFailed("`sai mcp serve` did not initialize")
+        left(deadline, "waiting for sai mcp serve")
+        time.sleep(0.02)
+    try:
+        reply = json.loads(first.split(b"\n", 1)[0])
+        result = reply["result"]
+        if (
+            reply["jsonrpc"] == "2.0"
+            and reply["id"] == 1
+            and isinstance(result["protocolVersion"], str)
+            and result["protocolVersion"]
+            and isinstance(result["serverInfo"]["name"], str)
+            and result["serverInfo"]["name"]
+            and isinstance(result["capabilities"], dict)
+        ):
+            return
+    except (KeyError, TypeError, ValueError):
+        pass
+    raise LookupFailed("`sai mcp serve` returned an invalid initialization reply")
+
+
+def install_native(args: argparse.Namespace) -> int:
+    # Validate the platform before looking up a release or creating directories.
+    native_asset("")
+    for given, official in ((args.api_base, API_BASE), (args.web_base, WEB_BASE)):
+        if (
+            given != official
+            and re.fullmatch(r"http://127\.0\.0\.1:[0-9]+", given) is None
+        ):
+            raise LookupFailed(
+                "the native installer requires official or loopback release URLs"
+            )
+    home = Path.home().resolve()
+    launcher = (home / ".local" / "bin").resolve() / "sai"
+    root = launcher.parent / NATIVE_ROOT
+    check_ancestors(launcher.parent)
+    check_path(launcher)
+    target = launcher_target(launcher)
+    if target is not None and uv_launcher(target):
+        command = [str(launcher), "update"]
+        if args.version:
+            command += ["--to", args.version]
+        if args.api_base != API_BASE:
+            command += ["--api-base", args.api_base]
+        if args.web_base != WEB_BASE:
+            command += ["--web-base", args.web_base]
+        print(f"{launcher} is owned by uv. Running {shlex.join(command)}.", flush=True)
+        return 0 if args.dry_run else subprocess.run(command, check=False).returncode
+    if target is not None:
+        installed_directory(launcher, root)
+    tag = (
+        TAG_PREFIX + args.version
+        if args.version
+        else find_latest(args.api_base, args.web_base, args.timeout)
+    )
+    if tag is None:
+        raise LookupFailed("no stable Sai release was found")
+    version = version_of(tag)
+    asset = native_asset(version)
+    if args.dry_run:
+        print(f"Would verify and install {asset} at {launcher}.")
+        return 0
+    # A symlinked bin directory can be on a separate filesystem. Stage beside
+    # its canonical launcher so the version and symlink renames stay local.
+    check_ancestors(launcher.parent, create=True)
+    checked_directory(launcher.parent)
+    with native_lock(launcher.parent / NATIVE_LOCK):
+        checked_directory(root, private=True)
+        old = recover_native(launcher, root)
+        with (
+            tempfile.TemporaryDirectory(dir=root, prefix=".stage-") as scratch,
+            tempfile.TemporaryDirectory(prefix="sai-install-profile-") as profile,
+        ):
+            staging = Path(scratch)
+            digest = fetch_native(tag, asset, staging, args.web_base, args.timeout * 4)
+            new = f"{version}-{digest}"
+            smoke_native(staging / "sai", Path(profile), version)
+            published = root / new
+            if published.exists() or published.is_symlink():
+                existing = native_binary(root, new)
+                if file_digest(existing) != file_digest(staging / "sai"):
+                    raise LookupFailed("the existing Sai version has different bytes")
+            else:
+                sync_dir(staging)
+                staging.rename(published)
+                sync_dir(root)
+            pending = root / NATIVE_PENDING
+            with tempfile.NamedTemporaryFile(
+                mode="w", dir=root, delete=False
+            ) as record:
+                json.dump({"old": old, "new": new}, record)
+                record.flush()
+                os.fsync(record.fileno())
+            Path(record.name).replace(pending)
+            sync_dir(root)
+            try:
+                if installed_directory(launcher, root) != old:
+                    raise LookupFailed("the Sai launcher changed during the install")
+                switch_launcher(launcher, root, new)
+                smoke_native(launcher, Path(profile), version)
+            except (LookupFailed, OSError, KeyboardInterrupt) as error:
+                recover_native(launcher, root)
+                raise LookupFailed(
+                    f"the installed launcher failed verification and was rolled back: {error}"
+                ) from error
+            pending.unlink()
+            sync_dir(root)
+    print(f"Installed sai {version} at {launcher}.")
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=(__doc__ or "").splitlines()[0])
-    parser.add_argument(
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument(
         "--source", action="store_true", help="build from Git instead of the wheel"
     )
+    mode.add_argument(
+        "--native",
+        action="store_true",
+        help="install the standalone Linux or macOS binary",
+    )
+    parser.add_argument("--version", help="install an exact release version")
     parser.add_argument(
         "--dry-run", action="store_true", help="print the command without running it"
     )
@@ -471,6 +970,18 @@ def main(argv: list[str]) -> int:
         "--timeout", type=float, default=TOTAL_TIMEOUT, help=argparse.SUPPRESS
     )
     args = parser.parse_args(argv)
+    if args.version and (
+        re.fullmatch(NATIVE_VERSION, args.version) is None
+        if args.native
+        else parse_tag(TAG_PREFIX + args.version) is None
+    ):
+        parser.error("--version requires X.Y.Z (or X.Y.Z-rc.N with --native)")
+    if args.native:
+        try:
+            return install_native(args)
+        except (LookupFailed, OSError) as error:
+            print(f"error: {error}", file=sys.stderr)
+            return 1
     git = f"git+{WEB_BASE}/{REPO}"
 
     def give_up(error: Exception) -> int:
@@ -479,7 +990,11 @@ def main(argv: list[str]) -> int:
         return 1
 
     try:
-        tag = find_latest(args.api_base, args.web_base, args.timeout)
+        tag = (
+            TAG_PREFIX + args.version
+            if args.version
+            else find_latest(args.api_base, args.web_base, args.timeout)
+        )
     except LookupFailed as error:
         return give_up(error)
     uv = find_uv()
