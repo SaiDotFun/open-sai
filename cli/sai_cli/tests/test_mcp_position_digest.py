@@ -64,6 +64,7 @@ class Position:
     position_reads: int = 0
     trade_type: str = "trade"
     keeper_market_open: bool = True
+    keeper_market_visible: bool = True
     market_trading_state: str = "open"
     switch_and_logout_on_keeper_read: str | None = None
     logout_on_position_read: bool = False
@@ -97,6 +98,8 @@ class Position:
     collateral_price: str | None = "1"
     close_fee: str = "0.002"
     minimum_position_microusd: str = "1"
+    keeper_minimum_position_microusd: int = 1
+    market_reads: int = 0
     preview_inputs: bool = False
     malformed_node_info: bool = False
     deny_lcd: bool = False
@@ -119,7 +122,6 @@ def position_service() -> Iterator[tuple[Position, str]]:
         "isOpen": True,
         "minLeverage": 1,
         "maxLeverage": 100,
-        "minPositionSizeUSD": 1,
         "collateralToken": {"id": 1, "symbol": "USDC"},
     }
 
@@ -128,6 +130,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             position_open = True
+            if request["query"] == keeper.MARKETS:
+                position.market_reads += 1
             indexed_collateral = position.collateral
             if request["query"] == keeper.POSITION:
                 if position.switch_and_logout_on_keeper_read is not None:
@@ -155,10 +159,13 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     }
                 }
             else:
-                market_row = market
+                market_row = {
+                    **market,
+                    "minPositionSizeUSD": position.keeper_minimum_position_microusd,
+                }
                 if position.preview_inputs:
                     market_row = {
-                        **market,
+                        **market_row,
                         "price": position.price,
                         "isOpen": position.keeper_market_open,
                         "maxLeverage": position.max_leverage
@@ -189,7 +196,13 @@ def position_service() -> Iterator[tuple[Position, str]]:
                         }
                     },
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
-                    keeper.MARKETS: {"perp": {"borrowings": [market_row]}},
+                    keeper.MARKETS: {
+                        "perp": {
+                            "borrowings": [market_row]
+                            if position.keeper_market_visible
+                            else []
+                        }
+                    },
                 }[request["query"]]
             self.reply({"data": data})
 
@@ -901,6 +914,41 @@ def test_position_confirmation_refuses_lcd_only_network_switch(
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("market_visible", [True, False], ids=["visible", "hidden"])
+def test_partial_close_allows_remainder_below_fee_schedule_minimum(
+    position_service: tuple[Position, str], tmp_path, monkeypatch, market_visible: bool
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.keeper_market_visible = market_visible
+    position.collateral = 100_000_000
+    position.leverage = "2"
+    position.keeper_minimum_position_microusd = 100_000_000
+    position.minimum_position_microusd = "100000000"
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(
+                client, "preview_partial_close", {"trade_id": 7, "percent": 60}
+            )
+            result = CliRunner().invoke(
+                main,
+                position_cli_args(
+                    base_url, ["partial-close", "7", "--percent", "60", "--dry-run"]
+                ),
+            )
+            assert result.exit_code == 0, result.output
+            assert json.loads(result.stdout)["intent"] == preview["intent"]
+            assert preview["intent"]["body"]["collateral"]["amountUsdc"] == "60000000"
+            assert preview["quote"]["closedNotionalUsd"] == "120"
+            assert preview["estimates"]["fees"]["amountUsdc"] == "0.6"
+            assert position.market_reads == 0
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("collateral", "leverage", "closed_notional"),
     [(4_000_000, "2.5", "5"), (4_000_001, "2", "4")],
@@ -1525,6 +1573,104 @@ def test_signed_out_market_open_requires_an_account_preview(
                 **fresh["intent"]["body"],
                 "intentPrice": fresh["referencePrice"],
             }
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("slippage", "accepted"),
+    [
+        ("0", False),
+        ("0.0", False),
+        ("0.00000000000000001", False),
+        ("0.0000000000000001", True),
+        ("0.000000000000000100", True),
+        ("100", True),
+        ("100.00000000000000000", True),
+        ("100.0000000000000000000", False),
+        ("100.0000000000000001", False),
+    ],
+)
+@pytest.mark.parametrize("order_type", ["market", "limit", "stop"])
+def test_open_checks_slippage_before_preview(
+    position_service: tuple[Position, str],
+    tmp_path,
+    monkeypatch,
+    slippage: str,
+    accepted: bool,
+    order_type: str,
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": order_type,
+        "amount": "10",
+        "leverage": "2",
+        "slippage": slippage,
+    }
+    price_options = []
+    trade_args = {"preview_digest": "0" * 64}
+    if order_type == "market":
+        trade_args["reference_price"] = "100.5"
+    else:
+        args["price"] = "100"
+        price_options = ["--price", "100"]
+    cli = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            f"{base_url}/query",
+            "--lcd-endpoint",
+            base_url,
+            "trade",
+            "open",
+            "--market",
+            "0",
+            "--side",
+            "long",
+            "--type",
+            order_type,
+            "--amount",
+            "10",
+            "--leverage",
+            "2",
+            "--slippage",
+            slippage,
+            *price_options,
+            "--dry-run",
+        ],
+    )
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_open", args)
+            if accepted:
+                assert cli.exit_code == 0, cli.output
+                assert json.loads(cli.stdout)["intent"]["body"]["maxSlippagePct"] == (
+                    slippage
+                )
+                assert preview["intent"]["body"]["maxSlippagePct"] == slippage
+                if order_type == "market":
+                    assert preview["referencePrice"] == "100.5"
+            else:
+                assert cli.exit_code == 2, cli.output
+                error = json.loads(cli.stdout)["error"]
+                assert error["code"] == "INVALID_REQUEST"
+                assert "Slippage" in error["message"]
+                assert preview["code"] == "INVALID_REQUEST"
+                assert preview["error"] == error["message"]
+                trade = await call(
+                    client,
+                    "trade_open",
+                    {**args, **trade_args},
+                )
+                assert trade == preview
+                assert position.market_reads == 0
+            assert position.submitted == []
 
     asyncio.run(scenario())
 
