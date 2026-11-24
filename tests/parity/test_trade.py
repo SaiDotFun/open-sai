@@ -282,6 +282,49 @@ def test_signed_out_submits_nothing(
 
 
 @pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (
+            ("--leverage", "340282366920938463463.374607431768211456"),
+            "Leverage must be a positive finite decimal",
+        ),
+        (
+            ("--amount", "100000000000000000000.000000000000000001"),
+            "Amount must have at most six decimal places",
+        ),
+    ],
+)
+def test_exact_decimal_checks_intentionally_differ_from_python(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI, message: str
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("trade-accepted") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "empty")
+            exact_max = ("--leverage", "340282366920938463463.374607431768211455")
+            assert (
+                run(
+                    cli,
+                    home,
+                    endpoints,
+                    (*OPEN, *exact_max, "--dry-run"),
+                    python=index == 0,
+                )[0]
+                == 0
+            )
+            code, result, stderr = run(
+                cli, home, endpoints, (*OPEN, *args, "--dry-run"), python=index == 0
+            )
+            assert stderr == ""
+            if index == 0:
+                assert code == 0 and result["dryRun"]
+            else:
+                assert code == 1 and result["error"]["message"] == message
+            assert not endpoints.wire
+            assert not rows(home)
+
+
+@pytest.mark.parametrize(
     ("args", "intent"),
     [
         (OPEN, MARKET_PREVIEW),
