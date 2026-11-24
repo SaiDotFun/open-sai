@@ -39,8 +39,8 @@ pub struct Session {
     token: Zeroizing<String>,
     #[serde(rename = "evmAddress")]
     addr: String,
-    #[serde(rename = "expiresAt")]
-    expires_at: String,
+    #[serde(rename = "expiresAt", default, deserialize_with = "deserialize_expiry")]
+    expires_at: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -63,7 +63,7 @@ impl Session {
         Self {
             token,
             addr,
-            expires_at,
+            expires_at: Some(expires_at),
             extra: BTreeMap::from([("endpoint".to_owned(), Value::String(endpoint))]),
         }
     }
@@ -77,7 +77,9 @@ impl Session {
     }
 
     pub fn expires_at(&self) -> &str {
-        &self.expires_at
+        self.expires_at
+            .as_deref()
+            .expect("stored expiry is checked on read")
     }
 
     pub fn endpoint(&self) -> Option<&str> {
@@ -150,6 +152,16 @@ fn deserialize_token<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Zeroizing<String>, D::Error> {
     String::deserialize(deserializer).map(Zeroizing::new)
+}
+
+// Decode the other fields before classifying a missing or non-string expiry.
+fn deserialize_expiry<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match Value::deserialize(deserializer)? {
+        Value::String(expiry) => Ok(Some(expiry)),
+        _ => Ok(None),
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -264,7 +276,14 @@ fn load_v2(envelope: &Value) -> Result<Accounts, SessionError> {
 
 impl Storage<'_> {
     pub fn load_accounts(&self) -> Result<Accounts, StorageError> {
-        self.read_accounts().map_err(StorageError::SessionData)
+        let accounts = self.read_accounts().map_err(StorageError::SessionData)?;
+        if accounts
+            .iter()
+            .any(|(session, _)| session.expires_at.is_none())
+        {
+            return Err(StorageError::InvalidSessionExpiry);
+        }
+        Ok(accounts)
     }
 
     fn read_accounts(&self) -> Result<Accounts, SessionError> {
@@ -357,7 +376,9 @@ impl Storage<'_> {
     fn save_session_locked(&self, lock: fs::File, session: Session) -> Result<(), StorageError> {
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::SessionData(_)) => Accounts::default(),
+            Err(StorageError::SessionData(_) | StorageError::InvalidSessionExpiry) => {
+                Accounts::default()
+            }
             Err(error) => return Err(error),
         };
         let key = session.addr.to_lowercase();
@@ -522,7 +543,9 @@ impl Storage<'_> {
         }
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::SessionData(_)) if addr.is_none() => {
+            Err(StorageError::SessionData(_) | StorageError::InvalidSessionExpiry)
+                if addr.is_none() =>
+            {
                 self.remove_session_files()?;
                 drop(lock);
                 self.emit(StorageEvent::UnreadableSessionRemoved);

@@ -13,6 +13,8 @@ use crate::{
     storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
 
+pub(crate) const INVALID_EXPIRY: &str =
+    "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again";
 const INVALID_RENEWAL_ADDRESS: &str = "Stored session address is invalid. Sign in again.";
 pub(crate) const ORIGINAL_KEEPER_HINT: &str =
     r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#;
@@ -22,11 +24,7 @@ pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionErr
 }
 
 pub fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> {
-    parse_expiry(session.expires_at()).ok_or_else(|| {
-        SessionError::new(
-            "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again",
-        )
-    })
+    parse_expiry(session.expires_at()).ok_or_else(|| SessionError::new(INVALID_EXPIRY))
 }
 
 #[derive(Serialize)]

@@ -812,6 +812,22 @@ seed = "mcp-invalid-expiry"
 state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111" }
 
 [[case]]
+name = "mcp-auth-numeric-expiry"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-use-invalid-expiry"
+seed = "mcp-numeric-expiry"
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#payload.sessions.0x1111111111111111111111111111111111111111.expiresAt" = 123 }
+
+[[case]]
+name = "mcp-auth-missing-expiry"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-use-invalid-expiry"
+seed = "mcp-missing-expiry"
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#payload.sessions.0x1111111111111111111111111111111111111111.expiresAt" = "<absent>" }
+
+[[case]]
 name = "mcp-auth-redaction"
 args = ["mcp","serve"]
 mode = "mcp"

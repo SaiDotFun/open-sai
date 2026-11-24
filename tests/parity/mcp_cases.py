@@ -136,6 +136,7 @@ CALLS = {
         Call("auth_list"),
     ),
     "auth-use-invalid-expiry": (
+        Call("auth_list", expected="SESSION_UNAVAILABLE"),
         Call("auth_use", {"addr": "{other_addr}"}, "SESSION_UNAVAILABLE"),
         Call("auth_status", expected="SESSION_UNAVAILABLE"),
     ),
