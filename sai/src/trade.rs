@@ -1,6 +1,11 @@
+use std::{
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
+
 use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
-    errors::{Code, SaiError},
+    errors::{Code, ExitCode, SaiError},
     log::EventContext,
     settings::{Environment, Flags, Key, Settings, repr},
     storage::{Session, Storage, StorageEvent},
@@ -8,8 +13,9 @@ use sai_core::{
         self, MarginDirection, OpenTrade, PositionAction, PositionMode, SubmitOptions,
         TradePreview, Trading, close_preview,
     },
+    wait,
 };
-use serde_json::json;
+use serde_json::{Map, Value, json};
 
 use crate::{load_settings, local};
 
@@ -25,12 +31,18 @@ pub enum TradeCommand {
         cancel_order: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Wait up to 30 seconds for the intent outcome.
+        #[arg(long)]
+        wait: bool,
     },
     /// Cancel a pending order.
     Cancel {
         trade_id: String,
         #[arg(long)]
         dry_run: bool,
+        /// Wait up to 30 seconds for the intent outcome.
+        #[arg(long)]
+        wait: bool,
     },
     /// Set or clear take-profit and stop-loss prices.
     Tpsl {
@@ -133,6 +145,9 @@ pub struct Open {
     allow_concurrent_open: bool,
     #[arg(long)]
     dry_run: bool,
+    /// Wait up to 30 seconds for the intent outcome.
+    #[arg(long)]
+    wait: bool,
 }
 
 impl Open {
@@ -166,7 +181,7 @@ pub fn run(
     env: &Environment,
     json: bool,
     events: EventContext<'_>,
-) -> Result<(), SaiError> {
+) -> Result<ExitCode, SaiError> {
     let settings = load_settings(flags, env)?;
     let log_storage = |event: StorageEvent<'_>| {
         local::storage_event_with_endpoint(events, event, Some(settings.endpoint()))
@@ -182,10 +197,11 @@ pub fn run(
                 ..
             }
     );
-    let (preview, dry_run, allow_concurrent_open, supplied_price) = match command {
+    let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price) = match command {
         TradeCommand::Open(open) => (
             open.preview()?,
             open.dry_run,
+            open.wait,
             open.allow_concurrent_open,
             open.price.is_some(),
         ),
@@ -193,15 +209,19 @@ pub fn run(
             trade_id,
             cancel_order,
             dry_run,
+            wait,
         } => (
             close_preview(&trade_id, cancel_order)?,
             dry_run,
+            wait,
             false,
             false,
         ),
-        TradeCommand::Cancel { trade_id, dry_run } => {
-            (close_preview(&trade_id, true)?, dry_run, false, false)
-        }
+        TradeCommand::Cancel {
+            trade_id,
+            dry_run,
+            wait,
+        } => (close_preview(&trade_id, true)?, dry_run, wait, false, false),
         TradeCommand::Margin {
             position,
             direction,
@@ -257,6 +277,7 @@ pub fn run(
             dry_run,
             false,
             false,
+            false,
         ),
         TradeCommand::Leverage {
             trade_id,
@@ -265,6 +286,7 @@ pub fn run(
         } => (
             trade::leverage_preview(&trade_id, &leverage)?,
             dry_run,
+            false,
             false,
             false,
         ),
@@ -277,7 +299,8 @@ pub fn run(
         Err(error) => return Err(error),
     };
     if dry_run && !cancelling && !preview.is_standalone_position_update() {
-        return local::emit(&preview.output(session.as_ref().map(Session::addr)), json);
+        local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
+        return Ok(ExitCode::Ok);
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -290,26 +313,115 @@ pub fn run(
                 session.as_ref(),
                 false,
             ))?;
-            return local::emit(&output, json);
+            local::emit(&output, json)?;
+            return Ok(ExitCode::Ok);
         }
-        return local::emit(
+        local::emit(
             &runtime.block_on(
                 trading.cancel_preview(session.as_ref().ok_or_else(SaiError::internal)?, &preview),
             )?,
             json,
-        );
+        )?;
+        return Ok(ExitCode::Ok);
     }
     let session = session.ok_or_else(SaiError::internal)?;
+    let endpoint = settings.endpoint();
+    let addr = session.addr();
+    let reservation = OnceLock::<String>::new();
+    let track = |key: &str| {
+        let _ = reservation.set(key.to_owned());
+    };
     if preview.requires_market_price_refresh() && supplied_price {
         eprintln!("{}", trade::MARKET_PRICE_NOTICE);
+    }
+    let options = SubmitOptions {
+        allow_concurrent_open,
+        on_reserved: wait_for_trade.then_some(&track as &(dyn Fn(&str) + Sync)),
+        ..SubmitOptions::default()
+    };
+    if wait_for_trade {
+        let recover = |interrupted, error: SaiError| {
+            let Some(key) = reservation.get() else {
+                return Err(error);
+            };
+            let confirmed = (error.code == Code::NotSent).then_some(wait::Outcome::NotSent);
+            Ok((
+                wait::recovery_result(&storage, endpoint, addr, key, interrupted, confirmed),
+                None,
+                true,
+            ))
+        };
+        return runtime.block_on(async {
+            let mut signal = local::wait_signal()?;
+            let waited = async {
+                let submission = trading
+                    .submit_with_reference_price(
+                        &session,
+                        &preview,
+                        options,
+                        std::future::pending(),
+                    )
+                    .await;
+                let (key, metadata) = match submission {
+                    Ok((accepted, price)) => {
+                        let mut metadata = Map::from_iter([
+                            ("intentKey".into(), json!(accepted.intent_key)),
+                            ("status".into(), json!(accepted.status)),
+                        ]);
+                        if let Some(price) = price {
+                            metadata.insert("referencePrice".into(), json!(price));
+                        }
+                        (accepted.intent_key, Some(metadata))
+                    }
+                    Err(error) if error.code == Code::AdmissionRejected => {
+                        let Some(key) = reservation.get() else {
+                            return Err(error);
+                        };
+                        return Ok((
+                            wait::rejected_result(key, addr, &error.message),
+                            None,
+                            false,
+                        ));
+                    }
+                    Err(error) if error.code == Code::OutcomeUnknown => {
+                        (reservation.get().ok_or(error)?.clone(), None)
+                    }
+                    Err(error) => return Err(error),
+                };
+                let receipt = wait::for_intent(
+                    endpoint,
+                    addr,
+                    &key,
+                    Duration::from_secs_f64(wait::DEFAULT_TIMEOUT),
+                    Instant::now(),
+                    &storage,
+                    events,
+                )
+                .await?;
+                Ok((receipt, metadata, false))
+            };
+            let (mut receipt, metadata, recovered) = tokio::select! {
+                biased;
+                _ = signal.recv() => recover(true, local::wait_aborted()),
+                result = waited => result.or_else(|error| recover(false, error)),
+            }?;
+            if let Some(mut metadata) = metadata {
+                let Value::Object(body) = receipt.body else {
+                    return Err(SaiError::internal());
+                };
+                metadata.extend(body);
+                receipt.body = Value::Object(metadata);
+            }
+            if !recovered {
+                receipt.body["status"] = json!(receipt.outcome);
+            }
+            local::emit_wait(receipt, endpoint, env, json, recovered, &mut signal).await
+        });
     }
     let (result, reference_price) = runtime.block_on(trading.submit_with_reference_price(
         &session,
         &preview,
-        SubmitOptions {
-            allow_concurrent_open,
-            ..SubmitOptions::default()
-        },
+        options,
         trade_interrupt(),
     ))?;
     let mut output = json!({
@@ -319,7 +431,8 @@ pub fn run(
     if let Some(price) = reference_price {
         output["referencePrice"] = json!(price);
     }
-    local::emit(&output, json)
+    local::emit(&output, json)?;
+    Ok(ExitCode::Ok)
 }
 
 pub fn missing_position_option(argument: &str) -> Option<SaiError> {
@@ -340,7 +453,7 @@ impl Position {
         account: Option<&str>,
         action: PositionAction<'_>,
         json: bool,
-    ) -> Result<(), SaiError> {
+    ) -> Result<ExitCode, SaiError> {
         if let Some(endpoint) = &self.lcd_endpoint {
             Key::LcdEndpoint.parse_value(endpoint)?;
         }
@@ -378,7 +491,8 @@ impl Position {
                 }
                 error
             })?;
-        local::emit(&result, json)
+        local::emit(&result, json)?;
+        Ok(ExitCode::Ok)
     }
 }
 

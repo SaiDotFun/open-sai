@@ -122,6 +122,8 @@ impl TradePreview {
 pub struct SubmitOptions<'a> {
     pub allow_concurrent_open: bool,
     pub confirmation: Option<Confirmation<'a>>,
+    /// Receive the committed reservation key before Keeper can see the request.
+    pub on_reserved: Option<&'a (dyn Fn(&str) + Sync)>,
 }
 
 #[derive(Serialize)]
@@ -271,6 +273,9 @@ impl<'a> Trading<'a> {
                     error.into()
                 }
             })?;
+        if let Some(on_reserved) = options.on_reserved {
+            on_reserved(&key);
+        }
 
         let mut semantic = json!({"intentSchemaVersion": "v0", "tsIntentInit": stamp});
         let fields = json!(intent);
