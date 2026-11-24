@@ -16,7 +16,7 @@ from check_release import ROOT, pyproject_version
 
 BASELINE = "8557a7e13dceab0accc369191182c8e01423c91b"
 MCP = "df224a3477c1151636cd2ac90fece7d38e4b4c07"
-UPDATE = "d5e0437d2e664a70063a2246fb90cae9d9656aa2"
+UPDATE = "d64bbd6039a98b6d2ba8f94fecd32c8115ece934"
 DIST = "4bd968eb956c154f0a0ab53ccc288ceb78dd8713"
 
 

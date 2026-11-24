@@ -740,13 +740,13 @@ def test_native_updater_recovers_an_interrupted_first_install(
     native_artifact(replay, "RECOVERY_RUST")
     interrupt_install(install, replay, "published")
     assert json.loads(pending(install).read_text())["old"] is None
+    public = install.launcher.lstat()
     result = install.run(
         install.launcher, "update", "--api-base", replay.base, "--web-base", replay.base
     )
-    if "no longer points to a managed Sai binary" in result.stderr:
-        pytest.xfail("C9c needs to teach the pinned Rust updater the private selector")
     assert "first Sai install was rolled back" in result.stderr
     assert not install.launcher.exists()
+    assert os.path.samestat(install.launcher.lstat(), public)
     assert not pending(install).exists()
 
 
