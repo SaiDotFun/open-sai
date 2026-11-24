@@ -16,7 +16,9 @@ import subprocess
 import sys
 import threading
 import time
+import tracemalloc
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1025,7 +1027,7 @@ def test_doctor_logs_the_invalid_request_code_for_a_failed_config_check(
 ):
     monkeypatch.setenv("PATH", "")
     code, _ = run_cli("--endpoint", "invalid-value", "doctor", "--offline")
-    assert code == 1
+    assert code == 2
     result = events(home, "doctor.result")[0]
     assert result["code"] == "INVALID_REQUEST"
     assert any(
@@ -1190,11 +1192,142 @@ def test_disabled_in_the_config_file_writes_nothing(home, keeper_stub):
     assert log.flush(60) and not (home / "logs").exists()
     code, output = run_cli("--json", "logs", "path")
     assert code == 0 and json.loads(output)["enabled"] is False
-    # Turning it back on takes effect in the same process.
-    (home / "config.toml").write_text("[logs]\nenabled = true\n")
-    log.reset()
+    # A config edit also refreshes the writer after it has skipped an event.
+    assert run_cli("config", "unset", "logs.enabled")[0] == 0
     log.event("something")
-    assert [line["event"] for line in read_logs(home)] == ["something"]
+    assert events(home, "something")
+
+
+def rewrite_with_same_mtime(path: Path, replacement: str) -> None:
+    before = path.stat()
+    path.write_text(replacement)
+    deadline = time.monotonic() + 3
+    while True:
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = path.stat()
+        if after.st_ctime_ns != before.st_ctime_ns:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("Filesystem did not update ctime after the rewrite")
+        time.sleep(0.01)
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+@posix_only
+def test_log_config_refreshes_after_a_same_size_rewrite(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true \n")
+    assert log.resolve_config(home, None, None)[0] is True
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
+    assert log.resolve_config(home, None, None)[0] is False
+
+
+@posix_only
+def test_log_writer_honors_external_disable_and_reenable(home):
+    path = home / "config.toml"
+    enabled = "[logs]\nenabled = true \n"
+    path.write_text(enabled)
+    log.event("test.before")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, enabled)
+    log.event("test.resumed")
+    assert [line["event"] for line in read_logs(home)] == [
+        "test.before",
+        "test.resumed",
+    ]
+
+
+def test_log_retry_only_stats_config_on_the_caller_thread(home, monkeypatch):
+    monkeypatch.delenv("SAI_LOG", raising=False)
+    (home / "config.toml").write_text("[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    operations = []
+
+    def record(frame, event, arg):
+        if event == "c_call" and arg.__name__ in {"stat", "open", "read", "acquire"}:
+            operations.append(arg.__name__)
+        if event == "call" and frame.f_code.co_name in {"read_file", "parse_file"}:
+            operations.append(frame.f_code.co_name)
+
+    previous = sys.getprofile()
+    sys.setprofile(record)
+    try:
+        active = log.active()
+        log.event("test.still.disabled")
+    finally:
+        sys.setprofile(previous)
+
+    assert not active
+    assert operations == ["stat", "stat"]
+    assert not (home / "logs").exists()
+
+
+def test_log_writer_reads_unchanged_config_once(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true\n")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """\
+import sys
+from sai_cli.core import log
+
+reads = 0
+
+def count_config_reads(event, args):
+    global reads
+    if event == "open" and args[0] == sys.argv[1]:
+        reads += 1
+
+sys.addaudithook(count_config_reads)
+for index in range(20):
+    log.event("test.config", index=index)
+assert log.flush(10)
+print(reads)
+""",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "SAI_LOG": "1", "SAI_LOG_KEEP_DAYS": "14"},
+    )
+    assert len(events(home, "test.config")) == 20
+    assert int(result.stdout) == 1
+
+
+def test_config_edits_finish_while_log_writer_is_stalled(home):
+    path = home / "config.toml"
+    with ThreadPoolExecutor(max_workers=1) as pool, log._io_lock:
+        log.event("test.config")
+        for key, value in (("logs.enabled", "false"), ("logs.keep_days", "3")):
+            edit = pool.submit(
+                settings.edit_file,
+                path,
+                lambda text, key=key, value=value: settings.set_value(
+                    text, key, value, path
+                )[0],
+            )
+            edit.result(timeout=5)
+
+    assert settings.read_file(path)[0] == {
+        "logs.enabled": False,
+        "logs.keep_days": 3,
+    }
+    assert log.flush(10)
 
 
 def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):
@@ -2515,6 +2648,264 @@ def test_log_reports_cap_rows_and_bytes_and_offer_earlier_timestamps(home):
     assert len(log_queries.run("process")["events"]) == log_queries.MAX_REPORT_ROWS
 
 
+def test_logs_run_before_skips_newer_rows_in_long_run(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    rows = [
+        {
+            "event": "command.start",
+            "runId": "process",
+            "seq": i,
+            "ts": log.stamp(start + timedelta(milliseconds=i)),
+        }
+        for i in range(21_000)
+    ]
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(log.encode(row) for row in rows)
+    )
+
+    before = log.stamp(start + timedelta(milliseconds=10))
+    code, output = run_cli("--json", "logs", "run", "process", "--before", before)
+    assert code == 0
+    report = json.loads(output)
+    assert report["events"] == rows[:10]
+    assert "truncated" not in report
+
+
+def test_logs_run_before_attributes_gap_using_later_call_event(home):
+    root = home / "logs"
+    root.mkdir()
+    gap = {
+        "event": "log.dropped",
+        "count": 2,
+        "runId": "process",
+        "ts": "2026-11-24T00:00:00.000Z",
+    }
+    result = {
+        "event": "mcp.tool_result",
+        "callId": "call",
+        "runId": "process",
+        "ts": "2026-11-24T00:00:01.000Z",
+    }
+    log.file_path("mcp", date(2026, 11, 24), root).write_bytes(
+        log.encode(gap) + log.encode(result)
+    )
+
+    code, output = run_cli("--json", "logs", "run", "call", "--before", result["ts"])
+    assert code == 0
+    report = json.loads(output)
+    assert report["events"] == []
+    assert report["gaps"] == [gap]
+
+
+def test_logs_run_continuation_keeps_call_gap_attribution(home):
+    root = home / "logs"
+    root.mkdir()
+    stamp = "2026-11-24T11:00:00.000Z"
+    total = log_queries.MAX_REPORT_ROWS
+    gap = {"event": "log.dropped", "runId": "parent", "ts": stamp}
+    call = {**gap, "event": "mcp.tool_result", "callId": "call", "seq": total}
+    # JSON can decode escaped surrogates even though the writer cannot emit
+    # such a run ID. A malformed unrelated gap must not break this query.
+    malformed = json.dumps({**gap, "runId": "\ud800"}).encode() + b"\n"
+    log.file_path("mcp", date(2026, 11, 24), root).write_bytes(
+        malformed
+        + b"".join(log.encode({**gap, "seq": i}) for i in range(total))
+        + log.encode(call)
+    )
+
+    first = log_queries.run("call")
+    assert first["events"] == [call]
+    assert len(first["gaps"]) == total - 1
+    second = log_queries.run("call", before=first["nextBefore"])
+    assert second["events"] == []
+    assert second["gaps"] == [{**gap, "seq": 0}]
+    assert "nextBefore" not in second
+
+
+def test_logs_run_attributes_gap_before_consuming_the_call_file(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    call = {
+        "event": "mcp.tool_call",
+        "callId": "call",
+        "runId": "parent",
+        "ts": log.stamp(start),
+    }
+    noise = {"event": "command.start", "runId": "other"}
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(call)
+        + log.encode({**noise, "ts": log.stamp(start + timedelta(milliseconds=1))})
+    )
+    gap = {
+        "event": "log.dropped",
+        "runId": "parent",
+        "ts": log.stamp(start + timedelta(minutes=1)),
+    }
+    log.file_path("mcp", start.date(), root).write_bytes(
+        b"".join(
+            log.encode(
+                {**noise, "ts": log.stamp(start + timedelta(milliseconds=i + 2))}
+            )
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+        + log.encode(gap)
+    )
+
+    first = log_queries.run("call")
+    assert first["events"] == []
+    assert first["gaps"] == [gap]
+    second = log_queries.run("call", before=first["nextBefore"])
+    assert second["events"] == [call]
+    assert second["gaps"] == []
+    assert "nextBefore" not in second
+
+
+@pytest.mark.parametrize("parent_found", [True, False])
+def test_logs_run_defers_gap_until_call_parent_is_found(home, parent_found):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    call = {
+        "event": "mcp.tool_call",
+        "callId": "call" if parent_found else "some-other-call",
+        "runId": "parent",
+        "ts": log.stamp(start),
+    }
+    padding = {
+        "event": "mcp.tool_result",
+        "runId": "other",
+        "ts": log.stamp(start + timedelta(milliseconds=1)),
+        "extra": "x" * 8_192,
+    }
+    gap = {
+        "event": "log.dropped",
+        "runId": "parent",
+        "count": 2,
+        "ts": log.stamp(start + timedelta(minutes=1)),
+    }
+    unrelated = {**gap, "runId": "other"}
+    middle = log.encode(padding) * 10
+    assert len(middle) > log.TAIL_CHUNK
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(call) + middle + log.encode(gap) + log.encode(unrelated)
+    )
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(
+            log.encode(
+                {
+                    "event": "command.start",
+                    "runId": "other",
+                    "ts": log.stamp(start + timedelta(milliseconds=i + 2)),
+                }
+            )
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+
+    before = None
+    seen = set()
+    events, gaps = [], []
+    while True:
+        args = ("--before", before) if before is not None else ()
+        code, output = run_cli("--json", "logs", "run", "call", *args)
+        assert code == 0
+        page = json.loads(output)
+        events.extend(page["events"])
+        gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in seen and len(seen) < 5
+        seen.add(before)
+
+    assert events == ([call] if parent_found else [])
+    assert gaps == ([gap] if parent_found else [])
+
+
+def test_logs_run_returns_process_events_before_resolving_unrelated_gaps(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    run_id = "12345678123443218123456789012345"
+    older = 50_000
+    end = older + 2 * log_queries.MAX_REPORT_ROWS
+    with log.file_path("cli", start.date(), root).open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {
+                    "event": "command.start",
+                    "runId": "other" if i < older else run_id,
+                    "seq": i,
+                    "ts": log.stamp(start + timedelta(milliseconds=i)),
+                }
+            )
+            for i in range(end)
+        )
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(
+            {
+                "event": "log.dropped",
+                "runId": "other",
+                "count": 1,
+                "ts": log.stamp(start + timedelta(minutes=1)),
+            }
+        )
+    )
+
+    args = ("--json", "logs", "run", run_id)
+    code, output = run_cli(*args)
+    assert code == 0
+    first = json.loads(output)
+    halfway = older + log_queries.MAX_REPORT_ROWS
+    assert [row["seq"] for row in first["events"]] == list(range(halfway, end))
+    assert first["gaps"] == []
+
+    code, output = run_cli(*args, "--before", first["nextBefore"])
+    assert code == 0
+    second = json.loads(output)
+    assert [row["seq"] for row in second["events"]] == list(range(older, halfway))
+    assert second["gaps"] == []
+
+
+@pytest.mark.parametrize("cli_count", [1, log_queries.MAX_REPORT_ROWS + 1])
+def test_logs_run_paging_defers_rows_below_the_scan_frontier(home, cli_count):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+
+    def row(i: int, run_id: str) -> dict[str, Any]:
+        return {
+            "event": "command.start",
+            "runId": run_id,
+            "seq": i,
+            "ts": log.stamp(start + timedelta(milliseconds=i)),
+        }
+
+    early = [row(i, "target") for i in range(cli_count)]
+    buried = row(10_000, "target")
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(log.encode(line) for line in early)
+    )
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(buried)
+        + b"".join(
+            log.encode(row(10_001 + i, "other")) for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+
+    report = log_queries.run("target")
+    assert report["events"] == []
+    pages = []
+    while before := report.get("nextBefore"):
+        report = log_queries.run("target", before=before)
+        pages.append(report["events"])
+        assert len(pages) <= 3
+    assert [line for page in reversed(pages) for line in page] == [*early, buried]
+
+
 def test_earlier_intent_page_keeps_same_day_invocation_anchor(home, keeper_stub):
     endpoint, state = keeper_stub
     state.intents = [
@@ -2613,25 +3004,243 @@ def test_stats_does_not_spend_row_budget_on_stale_other_surface(home):
 def test_stats_caps_the_number_of_scanned_rows(home):
     root = home / "logs"
     root.mkdir()
-    today = date(2026, 11, 24)
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    row = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("mcp", start.date(), root).write_bytes(
+        b"".join(
+            log.encode({**row, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(
+            {
+                **row,
+                "operation": "markets",
+                "ts": log.stamp(start - timedelta(hours=10)),
+            }
+        )
+    )
+    report = log_queries.stats()
+    assert (
+        report["truncated"] and report["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    )
+    assert "markets" not in report["keeper"]
+    assert report["errors"] == {"KEEPER_ERROR": log.MAX_SCAN_ROWS}
+    assert report["nextBefore"].startswith(log.stamp(start + timedelta(milliseconds=1)))
+
+    earlier = log_queries.stats(before=report["nextBefore"])
+    assert earlier["keeper"] == {
+        "markets": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+        "prices": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+    }
+    assert earlier["errors"] == {"KEEPER_ERROR": 2}
+    assert "truncated" not in earlier
+
+
+def test_logs_stats_does_not_retain_decoded_request_payloads(home):
+    root = home / "logs"
+    root.mkdir()
     row = {
         "event": "keeper.request",
         "operation": "prices",
         "durationMs": 7,
         "ts": "2026-11-24T11:00:00.000Z",
+        "extra": "x" * 4096,
     }
-    path = log.file_path("mcp", today, root)
-    path.write_bytes(log.encode(row) * (log.MAX_SCAN_ROWS + 1))
-    log.file_path("cli", today, root).write_bytes(
-        log.encode({**row, "operation": "markets", "ts": "2026-11-24T01:00:00.000Z"})
+    log.file_path("cli", date(2026, 11, 24), root).write_bytes(log.encode(row) * 2_000)
+
+    tracemalloc.start()
+    try:
+        report = log_queries.stats()
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+
+    assert report["keeper"]["prices"]["count"] == 2_000
+    assert peak < 4 * 1024 * 1024
+
+
+def test_logs_stats_counts_older_rows_once_when_gap_output_is_capped(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    gap = {"event": "log.dropped", "count": 1, "runId": "process"}
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode({**sample, "ts": log.stamp(start)})
+        + b"".join(
+            log.encode({**gap, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(1, log_queries.MAX_REPORT_ROWS + 2)
+        )
+        + log.encode({**sample, "ts": log.stamp(start + timedelta(seconds=1))})
     )
-    report = log_queries.stats()
-    assert (
-        report["truncated"]
-        and report["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS - 1
+
+    code, output = run_cli("--json", "logs", "stats")
+    assert code == 0
+    report = json.loads(output)
+    assert report["keeper"] == {"prices": {"count": 1, "p50Ms": 7, "p95Ms": 7}}
+    assert report["errors"] == {"KEEPER_ERROR": 1}
+    assert len(report["gaps"]) == log_queries.MAX_REPORT_ROWS
+    assert report["nextBefore"].startswith(log.stamp(start + timedelta(milliseconds=2)))
+
+    code, output = run_cli("--json", "logs", "stats", "--before", report["nextBefore"])
+    assert code == 0
+    earlier = json.loads(output)
+    assert earlier["keeper"] == report["keeper"]
+    assert earlier["errors"] == report["errors"]
+    assert earlier["gaps"] == [
+        {**gap, "ts": log.stamp(start + timedelta(milliseconds=1))}
+    ]
+    assert "truncated" not in earlier
+
+
+@pytest.mark.parametrize("query", ["run", "stats"])
+def test_log_reports_resume_inside_one_millisecond(home, query):
+    root = home / "logs"
+    root.mkdir()
+    stamp = "2026-11-24T11:00:00.000Z"
+    name = "command.start" if query == "run" else "log.dropped"
+    row = {"event": name, "runId": "process", "ts": stamp}
+    # Split the timestamp across files and leave one row on the second page.
+    total = log_queries.MAX_REPORT_ROWS + 1
+    for parity, surface in enumerate(("cli", "mcp")):
+        log.file_path(surface, date(2026, 11, 24), root).write_bytes(
+            b"".join(log.encode({**row, "seq": i}) for i in range(parity, total, 2))
+        )
+    args = ("--json", "logs", query, *(("process",) if query == "run" else ()))
+    field = "events" if query == "run" else "gaps"
+    code, output = run_cli(*args)
+    assert code == 0
+    first = json.loads(output)
+    assert len(first[field]) == log_queries.MAX_REPORT_ROWS
+    assert first["nextBefore"].startswith(stamp + "~")
+
+    code, output = run_cli(*args, "--before", first["nextBefore"])
+    assert code == 0
+    second = json.loads(output)
+    assert "nextBefore" not in second
+    assert [line["seq"] for line in second[field] + first[field]] == list(range(total))
+
+    code, output = run_cli(*args, "--before", stamp)
+    assert code == 0
+    assert json.loads(output)[field] == []
+
+
+def test_log_stats_scan_continues_inside_one_millisecond(home):
+    root = home / "logs"
+    root.mkdir()
+    row = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+        "ts": "2026-11-24T11:00:00.000Z",
+    }
+    total = log.MAX_SCAN_ROWS + 1
+    log.file_path("cli", date(2026, 11, 24), root).write_bytes(log.encode(row) * total)
+
+    first = log_queries.stats()
+    assert first["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    second = log_queries.stats(before=first["nextBefore"])
+    assert second["keeper"]["prices"]["count"] == 1
+    assert first["errors"]["KEEPER_ERROR"] + second["errors"]["KEEPER_ERROR"] == total
+    assert "nextBefore" not in second
+
+
+def test_logs_stats_continuation_keeps_out_of_order_appends(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    buried_at = 101
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+    }
+    log.file_path("cli", start.date(), root).write_bytes(
+        log.encode(
+            {
+                **sample,
+                "operation": "markets",
+                "ts": log.stamp(start + timedelta(milliseconds=buried_at)),
+            }
+        )
+        + b"".join(
+            log.encode({**sample, "ts": log.stamp(start + timedelta(milliseconds=i))})
+            for i in range(log.MAX_SCAN_ROWS + 1)
+            if i != buried_at
+        )
     )
-    assert report["keeper"]["markets"]["count"] == 1
-    assert report["nextBefore"] == row["ts"]
+
+    first = log_queries.stats()
+    assert first["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    assert first["errors"] == {"KEEPER_ERROR": log.MAX_SCAN_ROWS}
+    earlier = log_queries.stats(before=first["nextBefore"])
+    assert earlier["keeper"] == {"markets": {"count": 1, "p50Ms": 7, "p95Ms": 7}}
+    assert earlier["errors"] == {"KEEPER_ERROR": 1}
+    assert "nextBefore" not in earlier
+
+
+@pytest.mark.parametrize("query", ["run", "stats"])
+def test_log_cursor_reaches_early_rows_past_the_byte_cap(home, query):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, 11, tzinfo=UTC)
+    retained = 300
+    sample = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "code": "KEEPER_ERROR",
+        "runId": "process",
+        "extra": "x" * 1_800,
+    }
+    path = log.file_path("cli", start.date(), root)
+    with path.open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {**sample, "seq": i, "ts": log.stamp(start + timedelta(milliseconds=i))}
+            )
+            for i in range(10_000)
+        )
+    assert path.stat().st_size > log.MAX_SCAN_BYTES
+
+    args = ("--json", "logs", query, *(("process",) if query == "run" else ()))
+    before = log.stamp(start + timedelta(milliseconds=retained))
+    code, output = run_cli(*args, "--before", before)
+    assert code == 0
+    first = json.loads(output)
+    assert first["truncated"]
+    assert first["events" if query == "run" else "keeper"] == (
+        [] if query == "run" else {}
+    )
+    pages = []
+    while next_before := (pages[-1] if pages else first).get("nextBefore"):
+        code, output = run_cli(*args, "--before", next_before)
+        assert code == 0
+        pages.append(json.loads(output))
+        assert len(pages) <= 3
+
+    if query == "run":
+        assert [
+            line["seq"] for page in reversed(pages) for line in page["events"]
+        ] == list(range(retained))
+    else:
+        assert len(pages) == 1
+        assert pages[0]["keeper"]["prices"]["count"] == retained
+        assert pages[0]["errors"] == {"KEEPER_ERROR": retained}
 
 
 def test_mcp_log_concurrency_leaves_normal_tools_available(keeper_stub):

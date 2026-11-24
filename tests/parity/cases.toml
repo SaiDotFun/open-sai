@@ -71,6 +71,13 @@ expect = 2
 state = { "config.toml" = "<absent>" }
 
 [[case]]
+name = "config-invalid-endpoint"
+args = ["--json","config","set","keeper.endpoint","https://[::1]suffix/path"]
+expect = 2
+seed = "config-logs-disabled"
+state = { "config.toml#keeper.endpoint" = "<absent>", "config.toml#logs.enabled" = false, ".config.lock" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
 name = "config-unknown-key"
 args = ["config","get","fixture.unknown"]
 mode = "text"
@@ -279,14 +286,21 @@ args = ["--json","trade","leverage","7","--leverage","5","--dry-run"]
 name = "trade-margin"
 args = ["--json","trade","margin","7","--direction","add","--amount","1","--dry-run"]
 seed = "session"
-wire = ["oneClickTrading","node_info","trade","borrowing","get_trade_raw","get_exchange_balance"]
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market",
+]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
 [[case]]
 name = "trade-partial-close"
 args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
 seed = "session"
-wire = ["oneClickTrading","node_info","trade","borrowing","get_trade_raw","get_exchange_balance","borrowings"]
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market",
+    "get_collateral_price",
+]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
 [[case]]
