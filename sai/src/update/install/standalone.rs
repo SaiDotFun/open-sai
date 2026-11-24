@@ -1,7 +1,10 @@
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
-    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
+    os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, PermissionsExt, symlink},
+    },
     path::{Path, PathBuf},
 };
 
@@ -41,6 +44,7 @@ struct Pending {
 }
 
 type LauncherEntry = (u64, u64, Option<PathBuf>);
+type CompetitorIdentity = (u64, u64, Option<String>);
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -48,6 +52,15 @@ struct LauncherSwitch {
     staged: String,
     expected: LauncherEntry,
     published: Option<LauncherEntry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    competitor: Option<CompetitorIdentity>,
+}
+
+fn competitor_identity((device, inode, link): &LauncherEntry) -> CompetitorIdentity {
+    let digest = link
+        .as_ref()
+        .map(|target| release::sha256(target.as_os_str().as_bytes()));
+    (*device, *inode, digest)
 }
 
 fn launcher_entry(path: &Path) -> io::Result<Option<LauncherEntry>> {
@@ -190,78 +203,148 @@ impl Standalone {
             .map(|active| dir_version(&active).expect("validated managed target"))
     }
 
-    fn settle_launcher_switch(&self, switch: &LauncherSwitch) -> Result<bool> {
+    fn settle_launcher_switch(&self, pending: &mut Pending) -> Result<bool> {
+        let Some(switch) = &pending.launcher_switch else {
+            return Ok(false);
+        };
         if switch.staged != LAUNCHER_STAGE {
             return Err("the pending Sai launcher switch names an invalid staging path".into());
         }
         let displaced = self.root.join(LAUNCHER_STAGE);
         let stage = displaced.parent().expect("staged launcher has a parent");
-        let info = match stage.symlink_metadata() {
-            Ok(info) => info,
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(false);
+        let stage_exists = match stage.symlink_metadata() {
+            Ok(info)
+                if info.is_dir()
+                    && info.uid() == rustix::process::geteuid().as_raw()
+                    && info.mode() & 0o077 == 0 =>
+            {
+                true
             }
+            Ok(_) => {
+                return Err("the pending Sai launcher staging directory is not private".into());
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => false,
             Err(err) => return Err(io_error(err)),
         };
-        if !info.is_dir()
-            || info.uid() != rustix::process::geteuid().as_raw()
-            || info.mode() & 0o077 != 0
+        let entry = if stage_exists {
+            launcher_entry(&displaced).map_err(io_error)?
+        } else {
+            None
+        };
+        let restored = if let Some(entry) = entry
+            .as_ref()
+            .filter(|entry| *entry != &switch.expected && Some(*entry) != switch.published.as_ref())
         {
-            return Err("the pending Sai launcher staging directory is not private".into());
-        }
-        let entry = launcher_entry(&displaced).map_err(io_error)?;
-        let external = entry.is_some()
-            && entry.as_ref() != Some(&switch.expected)
-            && entry != switch.published;
-        if external {
-            self.restore_displaced(switch, &displaced, stage)
+            self.restore_displaced(pending, &displaced, stage, entry)
                 .map_err(|error| format!(
                     "The Sai launcher changed during the switch. The displaced launcher is at {}: {error}",
                     displaced.display()
                 ))?;
+            true
+        } else if let Some(competitor) = &switch.competitor {
+            if entry.is_some() {
+                return Err("the staged launcher changed during recovery".into());
+            }
+            let active = launcher_entry(&self.launcher).map_err(io_error)?;
+            if active.as_ref().map(competitor_identity).as_ref() != Some(competitor) {
+                return Err("the public launcher no longer matches the recorded competitor".into());
+            }
+            true
+        } else {
+            false
+        };
+        if stage_exists || restored {
+            state::sync_dir(self.launcher.parent().expect("launcher has a parent"))
+                .map_err(io_error)?;
         }
-        state::sync_dir(self.launcher.parent().expect("launcher has a parent"))
-            .map_err(io_error)?;
-        fs::remove_dir_all(stage).map_err(io_error)?;
-        state::sync_dir(&self.root).map_err(io_error)?;
-        Ok(external)
+        if stage_exists {
+            fs::remove_dir_all(stage).map_err(io_error)?;
+            state::sync_dir(&self.root).map_err(io_error)?;
+        }
+        Ok(restored)
     }
 
     fn restore_displaced(
         &self,
-        switch: &LauncherSwitch,
+        pending: &mut Pending,
         displaced: &Path,
         stage: &Path,
+        competitor: &LauncherEntry,
     ) -> io::Result<()> {
+        let switch = pending
+            .launcher_switch
+            .as_ref()
+            .expect("pending launcher switch");
+        let identity = competitor_identity(competitor);
+        if switch
+            .competitor
+            .as_ref()
+            .is_some_and(|entry| entry != &identity)
+        {
+            return Err(io::Error::other(
+                "the staged launcher changed during recovery",
+            ));
+        }
+        let published = switch.published.clone();
         let withdrawn = stage.join("public");
         let active = launcher_entry(&self.launcher)?;
-        if active.is_some() && active == launcher_entry(displaced)? {
-            return Ok(());
-        }
-        let Some(ours) = switch.published.as_ref() else {
-            return publish_displaced(displaced, &self.launcher);
-        };
-        if launcher_entry(&withdrawn)?.is_none() && active.as_ref() == Some(ours) {
-            match rename_exclusive(&self.launcher, &withdrawn) {
-                Ok(()) => {}
-                Err(error) if unsupported_rename(error) => {
-                    // Confirm the filesystem can publish the competitor before
-                    // making the public path vacant.
-                    let probe = TempDir::new_in(stage)?;
-                    link_displaced(displaced, &probe.path().join("sai"))?;
-                    fs::rename(&self.launcher, &withdrawn)?;
+        let mut recorded_before_withdrawal = false;
+        if active.as_ref() != Some(competitor)
+            && let Some(ours) = published.as_ref()
+        {
+            if launcher_entry(&withdrawn)?.is_none() && active.as_ref() == Some(ours) {
+                self.record_competitor(pending, &identity)?;
+                recorded_before_withdrawal = true;
+                match rename_exclusive(&self.launcher, &withdrawn) {
+                    Ok(()) => {}
+                    Err(error) if unsupported_rename(error) => {
+                        // Confirm the filesystem can publish the competitor before
+                        // making the public path vacant.
+                        let probe = TempDir::new_in(stage)?;
+                        link_displaced(displaced, &probe.path().join("sai"))?;
+                        fs::rename(&self.launcher, &withdrawn)?;
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
+            }
+            match launcher_entry(&withdrawn)?.as_ref() {
+                Some(entry) if entry == ours => {}
+                Some(_) => {
+                    publish_displaced(&withdrawn, &self.launcher)?;
+                    return Err(io::Error::other("a newer launcher owns the public path"));
+                }
+                None => return Err(io::Error::other("the public launcher is no longer ours")),
             }
         }
-        match launcher_entry(&withdrawn)?.as_ref() {
-            Some(entry) if entry == ours => publish_displaced(displaced, &self.launcher),
-            Some(_) => {
-                publish_displaced(&withdrawn, &self.launcher)?;
-                Err(io::Error::other("a newer launcher owns the public path"))
-            }
-            None => Err(io::Error::other("the public launcher is no longer ours")),
+        if launcher_entry(&self.launcher)?
+            .as_ref()
+            .is_some_and(|entry| entry != competitor)
+        {
+            return Err(io::ErrorKind::AlreadyExists.into());
         }
+        if !recorded_before_withdrawal {
+            self.record_competitor(pending, &identity)?;
+        }
+        publish_displaced(displaced, &self.launcher)
+    }
+
+    fn record_competitor(
+        &self,
+        pending: &mut Pending,
+        identity: &CompetitorIdentity,
+    ) -> io::Result<()> {
+        // An exclusive rename consumes the staged entry. Keep its identity
+        // durable so a retry can recognize publication before clearing the record.
+        let switch = pending
+            .launcher_switch
+            .as_mut()
+            .expect("pending launcher switch");
+        if switch.competitor.is_some() {
+            // A prior write may have stopped after publishing the record.
+            return state::sync_dir(&self.root);
+        }
+        switch.competitor = Some(identity.clone());
+        state::atomic_json(&self.root.join(RECORD), pending)
     }
 
     fn pending(&self) -> Result<Option<Pending>> {
@@ -278,8 +361,8 @@ impl Standalone {
     }
 
     pub(super) fn recover_staged_launcher(&self) -> Result<()> {
-        if let Some(switch) = self.pending()?.and_then(|pending| pending.launcher_switch)
-            && self.settle_launcher_switch(&switch)?
+        if let Some(mut pending) = self.pending()?
+            && self.settle_launcher_switch(&mut pending)?
         {
             remove_record(&self.root.join(RECORD))?;
             return Err("the Sai launcher changed during the switch".into());

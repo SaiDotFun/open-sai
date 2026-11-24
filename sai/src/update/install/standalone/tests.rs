@@ -106,6 +106,89 @@ fn recovery_returns_competitor(withdrawn: bool) {
     assert!(!record.exists());
 }
 
+#[test]
+fn recovery_cleans_up_after_publishing_the_competing_launcher() {
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().canonicalize().unwrap();
+    let root = bin.join(ROOT);
+    let old = format!("0.1.0-{}", "a".repeat(64));
+    let binary = root.join(&old).join("sai");
+    state::private_dir(binary.parent().unwrap()).unwrap();
+    fs::write(&binary, "managed binary").unwrap();
+    let launcher = bin.join("sai");
+    symlink(&binary, &launcher).unwrap();
+    let expected = launcher_entry(&launcher).unwrap().unwrap();
+    fs::remove_file(&launcher).unwrap();
+
+    let staged = root.join(LAUNCHER_STAGE);
+    let stage = staged.parent().unwrap();
+    state::private_dir(stage).unwrap();
+    let target = std::ffi::OsStr::from_bytes(b"competitor-\xff");
+    symlink(target, &staged).unwrap();
+    let competitor = launcher_entry(&staged).unwrap().unwrap();
+    let mut pending = Pending {
+        old: Some(old),
+        new: format!("0.2.0-{}", "b".repeat(64)),
+        launcher_switch: Some(LauncherSwitch {
+            staged: LAUNCHER_STAGE.into(),
+            expected,
+            published: None,
+            competitor: None,
+        }),
+    };
+    let record = root.join(RECORD);
+    state::atomic_json(&record, &pending).unwrap();
+    let install = Standalone::discover(&binary).unwrap();
+    install
+        .restore_displaced(&mut pending, &staged, stage, &competitor)
+        .unwrap();
+    // On filesystems that fall back to a hard link, model the same state as
+    // exclusive rename by removing the staged name before retrying.
+    if staged.symlink_metadata().is_ok() {
+        fs::remove_file(&staged).unwrap();
+    }
+    let recorded = fs::read(&record).unwrap();
+    assert_eq!(
+        launcher_entry(&launcher).unwrap().as_ref(),
+        Some(&competitor)
+    );
+
+    let restored = bin.join("restored");
+    fs::rename(&launcher, &restored).unwrap();
+    symlink(target, &launcher).unwrap();
+    let replacement = launcher_entry(&launcher).unwrap();
+    assert!(
+        install
+            .recover_staged_launcher()
+            .unwrap_err()
+            .contains("no longer matches the recorded competitor")
+    );
+    assert_eq!(fs::read(&record).unwrap(), recorded);
+    assert_eq!(launcher_entry(&launcher).unwrap(), replacement);
+    assert!(stage.exists());
+    fs::rename(&restored, &launcher).unwrap();
+
+    for stage_exists in [true, false] {
+        assert_eq!(stage.exists(), stage_exists);
+        if !stage_exists {
+            // Model a second interruption after stage cleanup but before record removal.
+            fs::write(&record, &recorded).unwrap();
+        }
+        assert!(
+            install
+                .recover_staged_launcher()
+                .unwrap_err()
+                .contains("launcher changed during the switch")
+        );
+        assert_eq!(
+            launcher_entry(&launcher).unwrap().as_ref(),
+            Some(&competitor)
+        );
+        assert!(!record.exists());
+        assert!(!stage.exists());
+    }
+}
+
 #[tokio::test(start_paused = true)]
 async fn download_deadline_leaves_the_launcher_untouched() {
     let temp = TempDir::new().unwrap();
