@@ -790,11 +790,9 @@ seed = "session"
 server = "concurrent-close"
 wire = [
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
     "recordUserIntent",
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
