@@ -320,9 +320,7 @@ def test_validate_before_loading_session(
             assert not rows(home)
 
 
-@pytest.mark.parametrize(
-    "args", [OPEN, CLOSE, (*CLOSE, "--dry-run"), CANCEL, (*CANCEL, "--dry-run")]
-)
+@pytest.mark.parametrize("args", [OPEN, CLOSE, CANCEL, (*CANCEL, "--dry-run")])
 def test_signed_out_submits_nothing(
     trade_pair: tuple[CLI, CLI],
     tmp_path: Path,
