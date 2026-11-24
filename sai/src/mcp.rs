@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::reads::output;
 
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
-// Wire metadata captured from Python main at 6a2e3af1edab943f204d4110db97024c9d7b8c63.
+// Wire metadata captured from Python main at aaf32399ce415f351a1fb2617d5ea34810d6735a.
 static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
 });

@@ -36,7 +36,7 @@ means the MCP tool's schema and metadata matched in `tools/list`.
 
 ## Compare MCP Stdio
 
-Check out Python commit `6a2e3af1edab943f204d4110db97024c9d7b8c63` in a
+Check out Python commit `aaf32399ce415f351a1fb2617d5ea34810d6735a` in a
 separate directory. Use CPython 3.12, which preserves the tool description
 indentation recorded in the Rust inventory.
 

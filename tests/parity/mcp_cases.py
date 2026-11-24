@@ -1,4 +1,4 @@
-"""Stdio calls for the Python MCP contract at 6a2e3af1edab943f204d4110db97024c9d7b8c63."""
+"""Stdio calls for the Python MCP contract at aaf32399ce415f351a1fb2617d5ea34810d6735a."""
 
 from __future__ import annotations
 

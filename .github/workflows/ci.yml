@@ -170,7 +170,7 @@ jobs:
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 6a2e3af1edab943f204d4110db97024c9d7b8c63
+          ref: aaf32399ce415f351a1fb2617d5ea34810d6735a
           path: .parity-mcp-python
           persist-credentials: false
 

@@ -10,7 +10,7 @@ def test_rust_ci_runs_pinned_mcp_transcript() -> None:
     )
     steps = rust_job.split("\n      - name: ")
     reference = next(step for step in steps if step.startswith("Check out the C8 MCP"))
-    assert "ref: 6a2e3af1edab943f204d4110db97024c9d7b8c63" in reference
+    assert "ref: aaf32399ce415f351a1fb2617d5ea34810d6735a" in reference
     assert "path: .parity-mcp-python" in reference
     transcript = next(
         step
