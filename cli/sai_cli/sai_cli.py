@@ -568,8 +568,9 @@ def renew(ctx: click.Context, addr: str | None) -> None:
             raise SessionError("Stored session belongs to another Keeper endpoint")
         name = stored.get("keyName")
         if not name:
-            command = sessions.renewal_command(stored)
-            guidance = sessions.renewal_guidance(stored)
+            fields = sessions.renewal_fields(stored)
+            command = fields["renewalCommand"]
+            guidance = fields.get("renewalGuidance", "")
             if stored.get("source") == "imported":
                 message = (
                     f"This session was imported. Run `{command}` with a fresh token."
@@ -582,9 +583,11 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
-        guidance = sessions.renewal_guidance(stored)
+        fields = sessions.renewal_fields(stored)
+        command = fields["renewalCommand"]
+        guidance = fields.get("renewalGuidance", "")
         raise SaiError(
-            f"{exc} Run `{sessions.renewal_command(stored)}` in a terminal. {guidance}".rstrip(),
+            f"{exc} Run `{command}` in a terminal. {guidance}".rstrip(),
             Code.SESSION_UNAVAILABLE,
         ) from exc
 

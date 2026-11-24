@@ -93,6 +93,23 @@ class Env:
             timeout=30,
         )
 
+    def run_shell(
+        self, command: str, **overrides: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={
+                **self.vars(),
+                "PATH": f"{self.bin}{os.pathsep}{Path(sys.executable).parent}",
+                **overrides,
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+
     def run_tty(
         self, *args: str, typed: list[str | Callable[[], object]]
     ) -> tuple[int, str, str]:
@@ -822,10 +839,29 @@ def test_cli_status_and_list_report_expiry_warnings(env: Env):
     row = json.loads(result.stdout)["accounts"][0]
     assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
     renewal = row["renewalCommand"]
-    assert renewal.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert "auth import" in renewal
-    assert keeper.MAINNET_HTTP not in renewal
+    assert renewal == "sai auth import"
     assert status.stderr == result.stderr == ""
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_paste_renewal_command_with_the_configured_keeper(
+    env: Env, keeper_auth, configured: bool
+):
+    if configured:
+        endpoint = f"{keeper_auth['endpoint']}/private-path"
+        assert env.run("config", "set", "keeper.endpoint", endpoint).returncode == 0
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    report = json.loads(env.run("--json", "auth", "status").stdout)
+    assert report["renewalCommand"] == "sai auth import"
+    assert "renewalGuidance" not in report
+
+    env.clip.write_text(make_token())
+    renewed = env.run_shell(report["renewalCommand"])
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
+    assert env.run("--json", "auth", "status").returncode == 0
 
 
 @pytest.mark.parametrize("json_output", [False, True])
@@ -868,9 +904,7 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     else:
         assert len(error.splitlines()) == 1
         assert "expires in" in error
-        assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error
-        assert "auth import" in error
-        assert keeper.MAINNET_HTTP not in error
+        assert error.splitlines()[0].endswith("Run sai auth import")
 
 
 @pytest.mark.parametrize(

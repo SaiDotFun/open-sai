@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from . import log, storage
+from . import log, settings, storage
 from .errors import Code, SessionError
 
 EXPIRY_WARNING = timedelta(days=3)
@@ -22,35 +22,35 @@ def expiry_time(result: dict[str, str]) -> datetime:
     return expiry
 
 
-def renewal_command(result: dict[str, str]) -> str:
-    """Return a shell command scoped to the session's Keeper."""
+def renewal_fields(result: dict[str, str]) -> dict[str, str]:
+    """Return a shell command and any guidance needed to renew the session."""
     args = (
         ("auth", "renew", result["evmAddress"])
         if result.get("keyName")
         else ("auth", "import")
     )
     endpoint = result.get("endpoint")
-    if endpoint:
-        return storage.keeper_command_hint(endpoint, *args)
-    return shlex.join(("sai", *args))
-
-
-def renewal_guidance(result: dict[str, str]) -> str:
-    endpoint = result.get("endpoint")
-    origin = log.origin(endpoint) if endpoint else None
+    try:
+        configured_endpoint = settings.load().endpoint
+    except settings.SettingsError:
+        # A one-off flag can override an invalid configured endpoint.
+        configured_endpoint = None
+    command = shlex.join(("sai", *args))
     guidance = []
-    if not endpoint or endpoint != origin:
-        where = f" at {origin}" if origin not in (None, log.REDACTED_URL) else ""
-        guidance.append(f"Reuse the Keeper endpoint{where} used to sign in.")
+    if endpoint and endpoint != configured_endpoint:
+        command = storage.keeper_command_hint(endpoint, *args)
+        origin = log.origin(endpoint)
+        show_origin = origin != log.REDACTED_URL and log.redact(origin) == origin
+        if endpoint != origin or not show_origin:
+            where = f" at {origin}" if show_origin else ""
+            guidance.append(f"Reuse the Keeper endpoint{where} used to sign in.")
+    elif not endpoint:
+        guidance.append("Reuse the Keeper endpoint used to sign in.")
     if not result.get("keyName") and result.get("source") != "imported":
         guidance.append("You can also sign in again with your Foundry keystore.")
-    return " ".join(guidance)
-
-
-def renewal_fields(result: dict[str, str]) -> dict[str, str]:
-    fields = {"renewalCommand": renewal_command(result)}
-    if guidance := renewal_guidance(result):
-        fields["renewalGuidance"] = guidance
+    fields = {"renewalCommand": command}
+    if guidance:
+        fields["renewalGuidance"] = " ".join(guidance)
     return fields
 
 
@@ -115,13 +115,14 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
             addr=result.get("evmAddress"),
             expiresAt=result["expiresAt"],
         )
+        fields = renewal_fields(result)
         message = "Trading session expired; sign in again"
-        if guidance := renewal_guidance(result):
+        if guidance := fields.get("renewalGuidance"):
             message += f". {guidance}"
         raise SessionError(
             message,
             Code.SESSION_EXPIRED,
-            hint=renewal_command(result)
+            hint=fields["renewalCommand"]
             if result.get("keyName") or result.get("source") == "imported"
             else storage.keeper_command_hint(
                 endpoint, "auth", "login", "NAME", "--addr", result["evmAddress"]
