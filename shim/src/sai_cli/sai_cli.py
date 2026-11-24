@@ -287,6 +287,21 @@ def cache_lock(path: Path) -> Generator[None]:
         os.close(descriptor)
 
 
+def repair_digest_mode(folder: Path) -> None:
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        check_acl(fd)
+        info = os.fstat(fd)
+        if info.st_uid != os.getuid():
+            raise ShimError(
+                "The native archive digest directory must belong to the current user"
+            )
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            os.fchmod(fd, 0o700)
+    finally:
+        os.close(fd)
+
+
 def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
     receipt = cache / "verified"
     try:
@@ -303,13 +318,12 @@ def cached_binary(cache: Path) -> tuple[Path, BinaryIO] | None:
         archive_digest, binary_digest = (d.decode("ascii") for d in fields)
         folder = cache / archive_digest
         info = folder.lstat()
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or info.st_uid != os.getuid()
-            or info.st_mode & 0o077
-        ):
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             return None
-        check_directory_acl(folder)
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            repair_digest_mode(folder)
+        else:
+            check_directory_acl(folder)
         binary = folder / "sai"
         fd = os.open(binary, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         file = os.fdopen(fd, "rb")
@@ -352,7 +366,10 @@ def install_binary(cache: Path, url: str, name: str, base: str) -> None:
             staged = Path(staging)
             with (staged / "sai").open("wb") as file:
                 binary_digest = unpack(archive, file)
-                binary = private_directory(cache / digest) / "sai"
+                folder = cache / digest
+                folder.mkdir(mode=0o700, exist_ok=True)
+                repair_digest_mode(folder)
+                binary = folder / "sai"
                 publish(binary, file, 0o700)
             with (staged / "verified").open("wb") as file:
                 file.write(f"{digest} {binary_digest}\n".encode("ascii"))

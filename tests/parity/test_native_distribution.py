@@ -116,6 +116,30 @@ def test_native_archive_initializes_mcp(distribution: SimpleNamespace) -> None:
         verify_mcp_startup(d)
 
 
+def test_shim_repairs_digest_directory_permissions_offline(
+    distribution: SimpleNamespace,
+) -> None:
+    d = distribution
+    d.replay.add_release(d.wheel, d.version, d.archive)
+    with closing(socket.socket()) as proxy:
+        with d.rehearsal.keeper_server(d.replay.handler()) as base:
+            offline_env(d, base, proxy)
+            run(d.tool, "Install the shim wheel", d.tool.uv, "tool", "install", d.wheel)
+            d.tool.verify_version(d.version)
+        [binary] = list((d.tool.sai_home / "bin").rglob("sai"))
+        binary.parent.chmod(0o755)
+        assert (
+            run(
+                d.tool,
+                "Repair the verified cache without a download",
+                d.tool.sai,
+                "--version",
+            )
+            == f"sai {d.version}\n"
+        )
+        assert stat.S_IMODE(binary.parent.stat().st_mode) == 0o700
+
+
 def test_distributable_wheel_ignores_loopback_release_override(
     distribution: SimpleNamespace,
 ) -> None:
