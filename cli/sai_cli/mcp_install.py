@@ -89,14 +89,13 @@ class Registration:
     def shown(self, target: Target | None) -> dict[str, Any]:
         """Show the expected argv when the saved command matches.
 
-        Saved directories and args can contain private values. An unmatched
-        entry shows only the command's file name.
+        Saved launcher names, directories, and args can contain private values.
         """
         if target is not None and self.matches_command(target):
             return {"command": target.argv}
         if not self.argv:
             return {"command": []}
-        out: dict[str, Any] = {"command": [Path(self.argv[0]).name]}
+        out: dict[str, Any] = {"command": [HIDDEN]}
         if len(self.argv) > 1:
             out["args"] = HIDDEN
         return out

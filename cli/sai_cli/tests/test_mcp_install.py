@@ -1622,7 +1622,7 @@ def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
         invoke("mcp", "uninstall"),
     ]
     rows = {r["client"]: r for r in payload(outputs[0])["clients"]}
-    assert rows["claude"]["registeredCommand"] == [OLD_COMMAND]
+    assert rows["claude"]["registeredCommand"] == ["<hidden>"]
     assert rows["claude"]["current"] is False
     assert rows["claude"]["scope"] == "user"
     # The codex entry runs the right command but carries an extra env name.
@@ -1852,7 +1852,7 @@ def test_list_shows_every_scope_and_the_effective_one(env: Env):
     assert row["registrations"] == [
         {
             "scope": "project",
-            "command": [OLD_COMMAND],
+            "command": ["<hidden>"],
             "current": False,
             "effective": True,
         },
@@ -1945,8 +1945,12 @@ def test_cursor_gives_up_when_the_file_keeps_changing(env: Env, monkeypatch):
     assert [p.name for p in path.parent.iterdir()] == ["mcp.json"]
 
 
-def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: Env):
-    wrapper = ["/opt/bin/wrap", "--url", f"https://user:{SECRET}@host.example/mcp"]
+def test_registered_launcher_and_args_are_hidden_when_the_command_differs(env: Env):
+    wrapper = [
+        f"/opt/bin/wrap-{SECRET}",
+        "--url",
+        f"https://user:{SECRET}@host.example/mcp",
+    ]
     (env.home / ".claude.json").write_text(
         json.dumps({"mcpServers": {"sai": claude_entry(wrapper)}})
     )
@@ -1961,9 +1965,11 @@ def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: En
     )
     listed = invoke("mcp", "list")
     rows = {r["client"]: r for r in payload(listed)["clients"]}
-    assert rows["claude"]["registeredCommand"] == ["wrap"]
+    assert rows["claude"]["registeredCommand"] == ["<hidden>"]
     assert rows["claude"]["args"] == "<hidden>"
-    assert rows["claude"]["registrations"][0]["args"] == "<hidden>"
+    [registration] = rows["claude"]["registrations"]
+    assert registration["command"] == ["<hidden>"]
+    assert registration["args"] == "<hidden>"
     assert rows["codex"]["registeredCommand"] == serve(env)
     assert "args" not in rows["codex"]
     outputs = [
@@ -1975,7 +1981,7 @@ def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: En
     removed = payload(outputs[-1])["results"][0]
     assert (removed["action"], removed["command"], removed["args"]) == (
         "removed",
-        ["wrap"],
+        ["<hidden>"],
         "<hidden>",
     )
     for result in outputs:
@@ -2018,7 +2024,7 @@ def test_codex_project_override_is_effective_and_not_edited(env: Env):
     assert row["registrations"] == [
         {
             "scope": "project",
-            "command": ["old-wrapper"],
+            "command": ["<hidden>"],
             "args": "<hidden>",
             "current": False,
             "effective": True,
