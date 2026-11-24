@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,7 +16,7 @@ from urllib.parse import unquote, urlsplit
 import pytest
 from click.testing import CliRunner
 from mcp.types import TextContent
-from sai_cli.core import keeper, overview, settings, storage, stream
+from sai_cli.core import keeper, overview, reconcile, settings, storage, stream
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
 from websockets.sync.server import serve
@@ -26,6 +27,7 @@ ADDR = "0x" + "a" * 40
 OTHER = "0x" + "b" * 40
 BLOCK_TIME = "2026-05-21T12:05:00+00:00"
 RISK_BLOCK = 50_407_230
+MARK_BLOCK = RISK_BLOCK - 37
 RISK_TIME = "2026-11-23T12:00:00+00:00"
 MARK_TIME = "2026-11-23T11:59:43+00:00"
 CHAIN_ID = "fixture-1"
@@ -42,6 +44,7 @@ def replay():
             keeper.OVERVIEW_TRADES: recorded["trades"],
             keeper.PENDING_MARKET_ORDERS: recorded["marketOrders"],
             keeper.PRICES: quotes,
+            keeper.INTENTS: {"data": {"userIntents": []}},
             keeper.ROUTE: {
                 "data": {
                     "oneClickTrading": {
@@ -54,7 +57,9 @@ def replay():
         },
         "calls": [],
         "contractTrades": {},
-        "contractPrices": {},
+        "oracleRates": {},
+        "contractMarkets": {},
+        "expiration": 300,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -66,7 +71,10 @@ def replay():
             if served_at is not None:
                 self.send_header("grpc-metadata-x-cosmos-block-height", str(served_at))
             self.end_headers()
-            self.wfile.write(encoded)
+            try:
+                self.wfile.write(encoded)
+            except BrokenPipeError:
+                pass
 
         def do_POST(self):
             data = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
@@ -85,11 +93,29 @@ def replay():
                 if "get_trade" in message:
                     args = message["get_trade"]
                     assert args["trader"] == ADDR
+                    if args["index"] >= state.get("stallFromTrade", 10**9):
+                        time.sleep(2.5)
                     data = state["contractTrades"].get(args["index"])
+                elif "get_market" in message:
+                    data = state["contractMarkets"].get(message["get_market"]["index"])
+                elif "get_group" in message:
+                    data = {"stale_price_expiration_secs": state["expiration"]}
+                elif "get_oracle_address" in message:
+                    data = "nibi1oraclefixture"
+                elif "get_exchange_rate_stamped" in message:
+                    assert "/nibi1oraclefixture/" in path
+                    pair = message["get_exchange_rate_stamped"]
+                    data = state["oracleRates"].get((pair["base"], pair["quote"]))
+                elif "get_base_size_seed_status" in message:
+                    data = state.get("seed", "complete")
                 else:
-                    data = state["contractPrices"].get(
-                        message["get_perp_prices"]["market_index"]
-                    )
+                    cursor = message["live_trades_by_user"]["start_after"]
+                    ids = state.get("liveTradeIds", sorted(state["contractTrades"]))
+                    data = [
+                        {"trade_index": index}
+                        for index in ids
+                        if cursor is None or index > cursor
+                    ][:100]
                 if data is None:
                     self.answer({"message": "not found"}, status=404)
                 else:
@@ -237,15 +263,31 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
         == f"sai --endpoint {replay['config'].endpoint} auth renew {ADDR}"
     )
     assert session["sourceAgeSeconds"] == pytest.approx(28 * 86400, abs=5)
-    assert [args for query, args in replay["calls"] if query == "lcd"] == []
+    assert [args for query, args in replay["calls"] if query == "lcd"] == ["latest"]
     assert keeper.PRICES not in {query for query, _ in replay["calls"]}
     assert static_fields(decoded) == static_fields(mcp(replay))
     assert not (storage.home() / "intents.sqlite3").exists()
 
 
+def install_oracle_quote(replay, base, quote, *, mark, quote_usd=1):
+    mark_at = int(datetime.fromisoformat(MARK_TIME).timestamp())
+    replay["oracleRates"][base, quote] = {
+        "rate": {
+            "base_per_quote": str(mark),
+            "quote_price_usd": str(quote_usd),
+            "base_last_update_time": mark_at,
+            "quote_last_update_time": mark_at - 3,
+        },
+        "base": {"price_block": MARK_BLOCK, "price_block_time_ms": mark_at * 1000},
+        "quote": {
+            "price_block": MARK_BLOCK - 1,
+            "price_block_time_ms": (mark_at - 3) * 1000,
+        },
+    }
+
+
 def install_contract_trade(replay, trade, *, mark, liquidation, quote_usd=1):
     market = trade["perpBorrowing"]
-    mark_at = int(datetime.fromisoformat(MARK_TIME).timestamp())
     market_id = f"MarketIndex({market['marketId']})"
     replay["contractTrades"][trade["id"]] = {
         "trade": {
@@ -264,14 +306,13 @@ def install_contract_trade(replay, trade, *, mark, liquidation, quote_usd=1):
         },
         "liquidation_price": str(liquidation),
     }
-    replay["contractPrices"][market_id] = {
-        "market": {
-            "base_per_quote": str(mark),
-            "quote_price_usd": str(quote_usd),
-            "base_last_update_time": mark_at,
-            "quote_last_update_time": mark_at - 3,
-        }
+    base, quote = market["baseToken"]["id"], market["quoteToken"]["id"]
+    replay["contractMarkets"][market_id] = {
+        "base": f"TokenIndex({base})",
+        "quote": f"TokenIndex({quote})",
+        "group_index": "GroupIndex(0)",
     }
+    install_oracle_quote(replay, base, quote, mark=mark, quote_usd=quote_usd)
 
 
 def populate_trades(replay: dict[str, Any]):
@@ -364,6 +405,8 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
         assert row["riskSource"]["sourceBlock"] == RISK_BLOCK
         assert row["riskSource"]["sourceAt"] == RISK_TIME
         assert row["markSource"]["sourceAt"] == MARK_TIME
+        assert row["markSource"]["sourceBlock"] == MARK_BLOCK
+        assert row["markSource"]["queryBlock"] == RISK_BLOCK
         assert row["sourceAt"] != row["riskSource"]["sourceAt"]
         for field in ("riskSource", "markSource"):
             source = row[field]
@@ -461,7 +504,6 @@ def test_contract_threshold_reports_crossing_even_when_keeper_estimate_does_not(
         ("different_leverage", "inconsistent"),
         ("wrong_height", "unavailable"),
         ("no_oracle_time", "partial"),
-        ("after_hours", "unavailable"),
     ],
 )
 def test_unverified_risk_has_only_a_labeled_estimate(replay, failure, status):
@@ -470,12 +512,8 @@ def test_unverified_risk_has_only_a_labeled_estimate(replay, failure, status):
         replay["contractTrades"][0]["trade"]["leverage"] = "10"
     elif failure == "wrong_height":
         replay["servedAt"] = RISK_BLOCK - 1
-    elif failure == "after_hours":
-        replay["contractTrades"][0]["needs_after_hours_trigger"] = True
     else:
-        replay["contractPrices"]["MarketIndex(0)"]["market"][
-            "base_last_update_time"
-        ] = None
+        replay["oracleRates"][3, 0]["rate"]["base_last_update_time"] = None
     overview = mcp(replay, addr=ADDR)["positions"]["data"]
     position = overview["items"][0]
     assert position["riskStatus"] == status
@@ -628,3 +666,143 @@ def test_pagination_rechecks_membership_after_a_close_between_pages(replay, sett
     else:
         assert "may be incomplete" in pending["error"]["message"]
         assert result["positions"]["data"]["unrealizedPnlUsd"] is None
+
+
+@pytest.mark.parametrize(
+    ("expiration", "verified"), [(16, False), (17, True), (0, True)]
+)
+def test_oracle_expiration_uses_the_contract_boundary(replay, expiration, verified):
+    populate_trades(replay)
+    replay["expiration"] = expiration
+    row = mcp(replay, addr=ADDR)["positions"]["data"]["items"][0]
+    assert row["markSource"]["sourceBlock"] == MARK_BLOCK
+    assert row["markSource"]["queryBlock"] == RISK_BLOCK
+    assert row["markSource"]["sourceAt"] == MARK_TIME
+    if verified:
+        assert row["riskStatus"] == "verified"
+        assert row["liquidationDistancePercent"] == 50
+    else:
+        assert row["riskStatus"] == "partial"
+        assert "stale" in row["riskReason"]
+        assert row["liquidationPriceUsd"] == 50
+        assert row["liquidationDistancePercent"] is None
+        assert row["unrealizedPnlUsd"] is None
+
+
+def test_after_hours_adjustment_preserves_crossed_contract_threshold(replay):
+    long, _ = populate_trades(replay)
+    long.update(openPrice=100, leverage=10, state={"liquidationPrice": 92})
+    install_contract_trade(replay, long, mark="92.5", liquidation=93)
+    replay["contractTrades"][0]["needs_after_hours_trigger"] = True
+    row = mcp(replay, addr=ADDR)["positions"]["data"]["items"][0]
+    assert row["afterHoursLeverageAdjustmentPending"] is True
+    assert row["liquidationPriceUsd"] == 93
+    assert row["liquidationDistancePercent"] < 0
+    assert row["unrealizedPnlUsd"] is row["unrealizedPnlPercent"] is None
+    assert row["takeProfitDistancePercent"] is row["stopLossDistancePercent"] is None
+    assert "keeperLiquidationEstimatePriceQuote" not in row
+
+
+def test_legacy_collateral_uses_the_pinned_oracle_price_for_pnl(replay):
+    long, _ = populate_trades(replay)
+    long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+    install_oracle_quote(replay, 2, 0, mark="0.10")
+    quote = next(
+        row
+        for row in replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"]
+        if row["token"]["id"] == 2
+    )
+    quote["priceUsd"] = 0.20
+    row = mcp(replay, addr=ADDR)["positions"]["data"]["items"][0]
+    assert row["riskStatus"] == "verified"
+    assert row["unrealizedPnlUsd"] == row["collateralUsd"] == 1.2
+    assert row["sizeUsd"] == 4.8
+    assert row["collateralPriceSource"]["sourceBlock"] == MARK_BLOCK
+    assert row["collateralPriceSource"]["queryBlock"] == RISK_BLOCK
+
+
+@pytest.mark.parametrize("gap", ["keeper", "contract", "index_seeding"])
+def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
+    if gap == "keeper":
+        replay["http"][keeper.INTENTS] = {
+            "data": {
+                "userIntents": [
+                    {
+                        "intentKey": "open-awaiting-index",
+                        "kind": "OPEN_TRADE",
+                        "lifecycleStep": "exec_fail",
+                        "execActor": "server",
+                        "errorCode": reconcile.OUTCOME_NOT_INDEXED,
+                    }
+                ]
+            }
+        }
+    elif gap == "contract":
+        replay["liveTradeIds"] = [99]
+    else:
+        replay["seed"] = {"seeding": {"cursor": None}}
+    snapshot = mcp(replay, addr=ADDR)["positions"]
+    assert snapshot["data"]["items"] == []
+    assert snapshot["data"]["unrealizedPnlUsd"] is None
+    assert snapshot["error"]["code"] == "INCOMPLETE_DATA"
+
+
+def test_slow_lcd_stops_enrichment_and_keeps_completed_sections(replay):
+    _, template = populate_trades(replay)
+    rows = replay["http"][keeper.OVERVIEW_TRADES]["data"]["perp"]["trades"]
+    for index in range(4, 28):
+        trade = {**template, "id": index}
+        install_contract_trade(replay, trade, mark=10, liquidation=15)
+        rows.append(trade)
+    replay["stallFromTrade"] = 1
+    start = time.monotonic()
+    result = mcp(replay, addr=ADDR)
+    assert time.monotonic() - start < overview.LCD_BUDGET_SECONDS + 5
+    positions = result["positions"]
+    assert positions["data"]["items"][0]["riskStatus"] == "verified"
+    assert positions["data"]["items"][-1]["riskStatus"] == "unavailable"
+    assert "deadline" in positions["error"]["message"]
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    assert result["balances"]["data"]["balance"]["usd"] == 150.813685
+    assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
+
+
+def test_invalid_lcd_port_does_not_abort_other_reads(replay):
+    populate_trades(replay)
+    config = replay["config"]
+    replay["config"] = settings.load(
+        {
+            "keeper.endpoint": config.endpoint,
+            "keeper.ws_endpoint": config.ws_endpoint,
+            "lcd.endpoint": "https://lcd.example.invalid:bad",
+        }
+    )
+    result = mcp(replay, addr=ADDR)
+    assert result["balances"]["data"]["balance"]["usd"] == 150.813685
+    assert result["positions"]["error"]["code"] == "INCOMPLETE_DATA"
+    assert result["positions"]["data"]["items"][0]["riskStatus"] == "unavailable"
+    assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
+
+
+def test_balance_source_label_warns_about_an_independent_websocket(replay):
+    balances = mcp(replay, addr=ADDR)["balances"]
+    assert balances["source"] == {
+        "endpoint": settings.public_origin(replay["config"].ws_endpoint),
+        "matchesKeeper": False,
+    }
+    assert "different chain" in balances["warning"]
+    home = cli(replay, "account", "overview", "--as", ADDR)
+    assert home.exit_code == 0, home.output
+    assert "Balance WebSocket is independent" in home.stdout
+    assert balances["source"]["endpoint"] in home.stdout
+
+
+def test_next_oracle_pending_intent_remains_a_local_trade_blocker(replay):
+    endpoint = replay["config"].endpoint
+    storage.pending("pending-on-chain", endpoint, ADDR, "OPEN_TRADE", "")
+    storage.set_status("pending-on-chain", endpoint, ADDR, "pending")
+    result = mcp(replay, addr=ADDR)["blockingIntents"]
+    assert [(row["status"], row["scope"]) for row in result["data"]] == [
+        ("pending", "allTrades")
+    ]

@@ -514,7 +514,7 @@ def intent_is_recent(key: str, created: float | None, now: float, window: int) -
 
 
 def unresolved_intents(endpoint: str, account: str) -> list[dict[str, Any]]:
-    """Read unknown and accepted intents without creating or migrating a ledger."""
+    """Read unknown, accepted, and pending intents without migrating a ledger."""
     path = home() / "intents.sqlite3"
     try:
         path.stat()
@@ -529,9 +529,14 @@ def unresolved_intents(endpoint: str, account: str) -> list[dict[str, Any]]:
         if version > SCHEMA_VERSION:
             raise ValueError("Intent database was written by a newer sai version")
         created_column = "created_at" if version >= 1 else "NULL"
+        status = (
+            "COALESCE(keeper_status,status)"
+            if "keeper_status" in _intent_columns(connection)
+            else "status"
+        )
         rows = connection.execute(
-            f"SELECT id, kind, status, entity, {created_column} FROM intents"
-            " WHERE endpoint=? AND account=? AND status IN ('unknown', 'accepted')"
+            f"SELECT id, kind, {status}, entity, {created_column} FROM intents"
+            f" WHERE endpoint=? AND account=? AND {status} IN ('unknown', 'accepted', 'pending')"
             " ORDER BY rowid DESC",
             (endpoint, account.lower()),
         ).fetchall()

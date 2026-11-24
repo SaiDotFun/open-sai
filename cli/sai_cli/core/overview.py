@@ -4,18 +4,24 @@ from __future__ import annotations
 
 import math
 import sqlite3
+import time
 from collections.abc import Callable, Mapping
+from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, DecimalException
 from functools import cache
+from threading import BoundedSemaphore, Thread
 from typing import Any
 
-from . import keeper, margin, session, storage, stream
-from .settings import Settings
+from . import keeper, margin, reconcile, session, storage, stream
+from .settings import Settings, public_origin
 
 PAGE_SIZE = 100
 MAX_PAGES = 20
+LCD_BUDGET_SECONDS = 8.0
+LCD_REQUEST_SECONDS = 2.0
+_LCD_WORKERS = BoundedSemaphore(8)
 BALANCE_KEYS = {
     "USDC on Sai": "balance",
     "USDC Credits on Sai": "credits",
@@ -98,6 +104,34 @@ def _age(at: datetime | None, fetched: str) -> dict[str, Any]:
     }
 
 
+def _lcd_read(read: Callable[[float], Any], deadline: float) -> Any:
+    """Stop waiting at the shared deadline even if an HTTP response trickles."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError("LCD read deadline exceeded")
+    if not _LCD_WORKERS.acquire(blocking=False):
+        raise ValueError("LCD reads are busy")
+    result: Future[Any] = Future()
+
+    def run() -> None:
+        try:
+            result.set_result(read(min(remaining, LCD_REQUEST_SECONDS)))
+        except Exception as exc:  # noqa: BLE001 - forward the worker's exception
+            result.set_exception(exc)
+        finally:
+            _LCD_WORKERS.release()
+
+    try:
+        Thread(target=run, daemon=True).start()
+    except RuntimeError as exc:
+        _LCD_WORKERS.release()
+        raise ValueError("Could not start LCD read") from exc
+    try:
+        return result.result(timeout=max(0, deadline - time.monotonic()))
+    except TimeoutError as exc:
+        raise ValueError("LCD read deadline exceeded") from exc
+
+
 @dataclass(frozen=True)
 class ChainRead:
     lcd: str
@@ -105,22 +139,39 @@ class ChainRead:
     contract: str
     height: int
     time: datetime
+    deadline: float
 
-    def query(self, message: dict[str, Any]) -> dict[str, Any]:
-        return margin.smart(
-            self.lcd, self.contract, message, height=self.height, timeout=3
+    def query(self, message: dict[str, Any], *, contract: str | None = None) -> Any:
+        return _lcd_read(
+            lambda timeout: margin.smart_data(
+                self.lcd,
+                contract or self.contract,
+                message,
+                height=self.height,
+                timeout=timeout,
+            ),
+            self.deadline,
         )
 
     def block_time(self, height: int) -> datetime | None:
         if height == self.height:
             return self.time
         try:
-            header = margin.block_header(self.lcd, height)
+            header = _lcd_read(
+                lambda timeout: margin.block_header(self.lcd, height, timeout=timeout),
+                self.deadline,
+            )
             if header["chain_id"] == self.chain_id and int(header["height"]) == height:
                 return _instant(header["time"])
         except (KeyError, TypeError, ValueError):
             pass
         return None
+
+
+def _is_contract(address: Any) -> bool:
+    return (
+        isinstance(address, str) and address.startswith("nibi1") and address.isalnum()
+    )
 
 
 def _chain_read(settings: Settings) -> ChainRead | None:
@@ -133,7 +184,13 @@ def _chain_read(settings: Settings) -> ChainRead | None:
         route = keeper.request(settings.endpoint, keeper.ROUTE, timeout=3)[
             "oneClickTrading"
         ]
-        header = margin.block_header(settings.lcd_endpoint, "latest")
+        deadline = time.monotonic() + LCD_BUDGET_SECONDS
+        header = _lcd_read(
+            lambda timeout: margin.block_header(
+                settings.lcd_endpoint, "latest", timeout=timeout
+            ),
+            deadline,
+        )
         at = _instant(header["time"])
         height = int(header["height"])
         chain_id = route["chainId"]
@@ -144,11 +201,11 @@ def _chain_read(settings: Settings) -> ChainRead | None:
             and header["chain_id"] == chain_id
             and at is not None
             and height > 0
-            and isinstance(contract, str)
-            and contract.startswith("nibi1")
-            and contract.isalnum()
+            and _is_contract(contract)
         ):
-            return ChainRead(settings.lcd_endpoint, chain_id, contract, height, at)
+            return ChainRead(
+                settings.lcd_endpoint, chain_id, contract, height, at, deadline
+            )
     except (keeper.KeeperError, KeyError, TypeError, ValueError):
         pass
     return None
@@ -301,15 +358,82 @@ def _oracle_time(value: Any, chain: ChainRead) -> datetime | None:
     return at if at is not None and 0 < at.timestamp() and at <= chain.time else None
 
 
-def _contract_risk(
-    trade: dict[str, Any],
-    chain: ChainRead | None,
-    addr: str,
-    get_market_price: Callable[[int, int], tuple[dict[str, Any], str]],
-    conversion: Decimal | None,
+def _oracle_source(
+    stamp: dict[str, Any], published: datetime | None, chain: ChainRead, fetched: str
 ) -> dict[str, Any]:
-    if chain is None:
+    written_ms = stamp.get("price_block_time_ms")
+    written = (
+        _oracle_time(written_ms / 1000, chain) if isinstance(written_ms, int) else None
+    )
+    height = stamp.get("price_block")
+    return {
+        "sourceBlock": height
+        if isinstance(height, int) and 0 < height <= chain.height
+        else None,
+        **_age(written or published, fetched),
+    }
+
+
+class ContractReads:
+    """Cache verified calls for the lifetime of one pinned overview."""
+
+    def __init__(self, chain: ChainRead) -> None:
+        self.chain = chain
+        self.groups: dict[str, int | None] = {}
+        self.rates: dict[tuple[int, int], tuple[dict[str, Any], str] | None] = {}
+        self.markets: dict[int, dict[str, Any] | None] = {}
+        self.oracle: str | None = None
+
+    def group_expiration(self, index: str) -> int | None:
+        if index not in self.groups:
+            try:
+                value = self.chain.query({"get_group": {"index": index}})
+                expiration = value["stale_price_expiration_secs"]
+                self.groups[index] = (
+                    expiration
+                    if isinstance(expiration, int) and expiration >= 0
+                    else None
+                )
+            except (KeyError, TypeError, ValueError):
+                self.groups[index] = None
+        return self.groups[index]
+
+    def market(self, market_id: int) -> dict[str, Any] | None:
+        if market_id not in self.markets:
+            try:
+                self.markets[market_id] = self.chain.query(
+                    {"get_market": {"index": f"MarketIndex({market_id})"}}
+                )
+            except (TypeError, ValueError):
+                self.markets[market_id] = None
+        return self.markets[market_id]
+
+    def rate(self, base: int, quote: int) -> tuple[dict[str, Any], str] | None:
+        key = base, quote
+        if key not in self.rates:
+            try:
+                if self.oracle is None:
+                    address = self.chain.query({"get_oracle_address": {}})
+                    self.oracle = address if _is_contract(address) else ""
+                if not self.oracle:
+                    raise ValueError("Oracle contract is unavailable")
+                data = self.chain.query(
+                    {"get_exchange_rate_stamped": {"base": base, "quote": quote}},
+                    contract=self.oracle,
+                )
+                self.rates[key] = data, datetime.now(UTC).isoformat()
+            except (TypeError, ValueError):
+                self.oracle = self.oracle or ""
+                self.rates[key] = None
+        return self.rates[key]
+
+
+def _contract_risk(
+    trade: dict[str, Any], reads: ContractReads | None, addr: str
+) -> dict[str, Any]:
+    if reads is None:
         return {"riskStatus": "unavailable", "riskReason": "No matching LCD block"}
+    chain = reads.chain
     market = trade["perpBorrowing"]
     risk: dict[str, Any] = {"riskStatus": "unavailable"}
     try:
@@ -321,18 +445,15 @@ def _contract_risk(
                 "riskStatus": "inconsistent",
                 "riskReason": "Keeper and contract trade values differ",
             }
-        if result.get("needs_after_hours_trigger"):
-            return {
-                "riskStatus": "unavailable",
-                "riskReason": "The contract reports an after-hours leverage adjustment",
-            }
         liquidation = _decimal(result["liquidation_price"])
         entry = _decimal(raw["open_price"])
-        quote_id = market["quoteToken"]["id"]
+        base_id, quote_id = market["baseToken"]["id"], market["quoteToken"]["id"]
+        adjustment = bool(result.get("needs_after_hours_trigger"))
         if liquidation < 0 or entry <= 0:
             raise ValueError("Invalid contract trade price")
         risk = {
             "riskStatus": "partial",
+            "afterHoursLeverageAdjustmentPending": adjustment,
             "riskSource": {
                 "fetchedAt": fetched,
                 "sourceBlock": chain.height,
@@ -343,62 +464,131 @@ def _contract_risk(
             if quote_id == USD_TOKEN_ID
             else None,
         }
-        market_price, price_fetched = get_market_price(
-            market["marketId"], market["collateralToken"]["id"]
-        )
-        mark = _decimal(market_price["base_per_quote"])
-        quote_usd = _decimal(market_price["quote_price_usd"])
-        base_at = _oracle_time(market_price.get("base_last_update_time"), chain)
-        quote_at = _oracle_time(market_price.get("quote_last_update_time"), chain)
-        if min(mark, quote_usd) <= 0:
-            raise ValueError("Invalid contract oracle price")
-        if quote_id == USD_TOKEN_ID and quote_usd != 1:
+        contract_market = reads.market(market["marketId"])
+        if contract_market is None:
+            raise ValueError("Contract market is unavailable")
+        if (
+            contract_market["base"] != f"TokenIndex({base_id})"
+            or contract_market["quote"] != f"TokenIndex({quote_id})"
+        ):
             return {
                 "riskStatus": "inconsistent",
-                "riskReason": "Keeper and contract disagree on the market quote",
+                "riskReason": "Keeper and contract disagree on the market pair",
             }
+        stamped = reads.rate(base_id, quote_id)
+        if stamped is None:
+            raise ValueError("Contract oracle is unavailable")
+        oracle, price_fetched = stamped
+        rate = oracle["rate"]
+        mark, quote_usd = (
+            _decimal(rate["base_per_quote"]),
+            _decimal(rate["quote_price_usd"]),
+        )
+        if min(mark, quote_usd) <= 0 or (quote_id == USD_TOKEN_ID and quote_usd != 1):
+            raise ValueError("Invalid contract oracle price")
+        base_at = _oracle_time(rate.get("base_last_update_time"), chain)
+        quote_at = (
+            _oracle_time(rate.get("quote_last_update_time"), chain)
+            if quote_id != USD_TOKEN_ID
+            else None
+        )
+        base_source = _oracle_source(oracle["base"], base_at, chain, price_fetched)
+        quote_source = (
+            _oracle_source(oracle["quote"], quote_at, chain, price_fetched)
+            if quote_id != USD_TOKEN_ID
+            else None
+        )
+        if quote_source is not None and (
+            base_source["sourceAt"] is None or quote_source["sourceAt"] is None
+        ):
+            mark_source = {"sourceBlock": None, **_age(None, price_fetched)}
+        else:
+            mark_source = (
+                min((base_source, quote_source), key=lambda leg: leg["sourceAt"])
+                if quote_source is not None
+                else base_source
+            )
+        risk.update(
+            markSource={
+                **mark_source,
+                "queryBlock": chain.height,
+                "fetchedAt": price_fetched,
+                "base": base_source,
+                "quote": quote_source,
+            },
+            markPriceUsd=_usd(mark, quote_usd),
+            liquidationPriceUsd=_usd(liquidation, quote_usd),
+        )
+        expiration = reads.group_expiration(contract_market["group_index"])
+        if expiration is None:
+            return {**risk, "riskReason": "Contract oracle staleness limit is unknown"}
         if base_at is None or (quote_id != USD_TOKEN_ID and quote_at is None):
+            return {**risk, "riskReason": "Contract oracle publish time is unknown"}
+        oldest = min(base_at, quote_at) if quote_at is not None else base_at
+        if (
+            expiration
+            and int(chain.time.timestamp()) - int(oldest.timestamp()) > expiration
+        ):
+            return {**risk, "riskReason": "Contract oracle mark is stale"}
+        is_long = raw["long"]
+        tp, sl = _level(raw["tp"]), _level(raw["sl"])
+        risk.update(
+            entryPriceUsd=_usd(entry, quote_usd),
+            takeProfitPriceUsd=_usd(tp, quote_usd),
+            stopLossPriceUsd=_usd(sl, quote_usd),
+            liquidationDistancePercent=_distance(mark, liquidation, not is_long),
+            takeProfitDistancePercent=_distance(mark, tp, is_long),
+            stopLossDistancePercent=_distance(mark, sl, not is_long),
+        )
+        if adjustment:
             return {
                 **risk,
-                "riskReason": "Contract oracle source time is unknown",
+                "takeProfitDistancePercent": None,
+                "stopLossDistancePercent": None,
+                "riskReason": "Gross PnL and TP/SL distance are unavailable while the after-hours leverage adjustment is pending",
             }
-        is_long = raw["long"]
-        pnl = (
-            ((mark - entry) if is_long else (entry - mark))
-            / entry
-            * _decimal(raw["leverage"])
-        )
+
+        collateral = market["collateralToken"]
+        scale = COLLATERAL_SCALE.get(collateral["symbol"])
+        if collateral["symbol"] == "USDC":
+            conversion = Decimal(1) / COLLATERAL_SCALE["USDC"]
+        else:
+            pinned = reads.rate(collateral["id"], USD_TOKEN_ID) if scale else None
+            if pinned is None or scale is None:
+                return {
+                    **risk,
+                    "riskReason": "Pinned collateral USD price is unavailable",
+                }
+            collateral_oracle, collateral_fetched = pinned
+            collateral_rate = collateral_oracle["rate"]
+            price = _decimal(collateral_rate["base_per_quote"])
+            if price <= 0:
+                return {
+                    **risk,
+                    "riskReason": "Pinned collateral USD price is unavailable",
+                }
+            conversion = price / scale
+            risk["collateralPriceSource"] = {
+                "fetchedAt": collateral_fetched,
+                "queryBlock": chain.height,
+                **_oracle_source(
+                    collateral_oracle["base"],
+                    _oracle_time(collateral_rate.get("base_last_update_time"), chain),
+                    chain,
+                    collateral_fetched,
+                ),
+            }
+        leverage = _decimal(raw["leverage"])
+        amount = Decimal(raw["collateral_amount"])
+        pnl = ((mark - entry) if is_long else (entry - mark)) / entry * leverage
         pnl = max(Decimal(-1), min(MAX_GROSS_PNL, pnl))
-        tp, sl = _level(raw["tp"]), _level(raw["sl"])
         return {
             **risk,
             "riskStatus": "verified",
-            "markSource": {
-                "fetchedAt": price_fetched,
-                "sourceBlock": chain.height,
-                **_age(
-                    min(base_at, quote_at)
-                    if quote_at and quote_id != USD_TOKEN_ID
-                    else base_at,
-                    price_fetched,
-                ),
-                "base": _age(base_at, price_fetched),
-                "quote": _age(
-                    quote_at if quote_id != USD_TOKEN_ID else None, price_fetched
-                ),
-            },
-            "entryPriceUsd": _usd(entry, quote_usd),
-            "markPriceUsd": _usd(mark, quote_usd),
-            "takeProfitPriceUsd": _usd(tp, quote_usd),
-            "stopLossPriceUsd": _usd(sl, quote_usd),
-            "liquidationPriceUsd": _usd(liquidation, quote_usd),
-            "unrealizedPnlUsd": _usd(
-                pnl * Decimal(raw["collateral_amount"]), conversion
-            ),
+            "collateralUsd": _usd(amount, conversion),
+            "sizeUsd": _usd(amount * leverage, conversion),
+            "unrealizedPnlUsd": _usd(pnl * amount, conversion),
             "unrealizedPnlPercent": float(pnl * 100),
-            "liquidationDistancePercent": _distance(mark, liquidation, not is_long),
-            "takeProfitDistancePercent": _distance(mark, tp, is_long),
-            "stopLossDistancePercent": _distance(mark, sl, not is_long),
         }
     except (KeyError, TypeError, ValueError, OSError, OverflowError, DecimalException):
         return {
@@ -410,7 +600,7 @@ def _contract_risk(
 def _trade_row(
     trade: dict[str, Any],
     prices: Mapping[int, Any],
-    read_risk: Callable[[dict[str, Any], Decimal | None], dict[str, Any]],
+    read_risk: Callable[[dict[str, Any]], dict[str, Any]],
 ) -> dict[str, Any]:
     market = trade["perpBorrowing"]
     collateral, quote = market["collateralToken"], market["quoteToken"]
@@ -456,7 +646,7 @@ def _trade_row(
             "orderType": order_type,
             "triggerPriceUsd": _usd(entry, quote_usd),
         }
-    risk = read_risk(trade, conversion)
+    risk = read_risk(trade)
     fallback: dict[str, Any] = {}
     if "riskSource" not in risk and trade["state"] is not None:
         # Keeper does not expose when its independently indexed state was calculated.
@@ -493,6 +683,59 @@ def _mark_incomplete(section: dict[str, Any]) -> None:
     )
 
 
+def _live_trade_ids(chain: ChainRead | None, addr: str) -> set[int] | None:
+    if chain is None:
+        return None
+    try:
+        # This index can omit older live trades until the contract finishes seeding it.
+        if chain.query({"get_base_size_seed_status": {}}) != "complete":
+            return None
+        ids: set[int] = set()
+        last: int | None = None
+        for _ in range(MAX_PAGES):
+            page = chain.query(
+                {
+                    "live_trades_by_user": {
+                        "trader": addr,
+                        "start_after": last,
+                        "limit": PAGE_SIZE,
+                    }
+                }
+            )
+            if not isinstance(page, list):
+                return None
+            for row in page:
+                index = row["trade_index"]
+                if (
+                    not isinstance(index, int)
+                    or index < 0
+                    or (last is not None and index <= last)
+                ):
+                    return None
+                ids.add(index)
+                last = index
+            if len(page) < PAGE_SIZE:
+                return ids
+    except (KeyError, TypeError, ValueError):
+        pass
+    return None
+
+
+def _fill_awaits_indexing(endpoint: str, addr: str) -> bool:
+    """Read Keeper's provisional outcome without reconciling local intent state."""
+    try:
+        rows = keeper.request(endpoint, keeper.INTENTS, {"user": addr}, timeout=3)[
+            "userIntents"
+        ]
+        return any(
+            row.get("errorCode") == reconcile.OUTCOME_NOT_INDEXED
+            and reconcile.classify_outcome(row) == "pending"
+            for row in rows
+        )
+    except (keeper.KeeperError, KeyError, TypeError, AttributeError):
+        return False
+
+
 def _trade_sections(
     settings: Settings,
     addr: str,
@@ -503,33 +746,20 @@ def _trade_sections(
     if "error" in snapshot:
         return snapshot, snapshot.copy(), {"fetchedAt": None, "data": []}
     trades = snapshot["data"].rows
-    chain = (
-        get_chain() if any(trade["tradeType"] == "trade" for trade in trades) else None
-    )
+    unindexed_fill = _fill_awaits_indexing(settings.endpoint, addr)
     prices = (
         _read(lambda: _prices(settings.endpoint))
         if trades
         else {"fetchedAt": None, "data": {}}
     )
     quotes = prices.get("data", {})
+    chain = get_chain()
+    live_ids = _live_trade_ids(chain, addr)
+    indexed_ids = {trade["id"] for trade in trades if trade["tradeType"] == "trade"}
+    contract_reads = ContractReads(chain) if chain is not None else None
 
-    @cache
-    def get_market_price(
-        market_id: int, collateral_id: int
-    ) -> tuple[dict[str, Any], str]:
-        assert chain is not None
-        data = chain.query(
-            {
-                "get_perp_prices": {
-                    "market_index": f"MarketIndex({market_id})",
-                    "collateral_index": f"TokenIndex({collateral_id})",
-                }
-            }
-        )
-        return data["market"], datetime.now(UTC).isoformat()
-
-    def read_risk(trade: dict[str, Any], conversion: Decimal | None) -> dict[str, Any]:
-        return _contract_risk(trade, chain, addr, get_market_price, conversion)
+    def read_risk(trade: dict[str, Any]) -> dict[str, Any]:
+        return _contract_risk(trade, contract_reads, addr)
 
     def rows(opened: bool) -> list[dict[str, Any]]:
         return [
@@ -551,18 +781,37 @@ def _trade_sections(
                 _mark_incomplete(section)
     items = positions.get("data", [])
     if "data" in positions:
+        membership_complete = live_ids == indexed_ids and not unindexed_fill
+        if complete and not membership_complete:
+            message = (
+                "Keeper reports a fill awaiting indexing. Positions may be incomplete."
+                if unindexed_fill
+                else "The indexed positions could not be confirmed against the live contract list."
+            )
+            positions["error"] = _failure("INCOMPLETE_DATA", message, retryable=True)
+        elif (
+            "error" not in positions
+            and chain is not None
+            and time.monotonic() >= chain.deadline
+            and any(row["riskStatus"] != "verified" for row in items)
+        ):
+            positions["error"] = _failure(
+                "INCOMPLETE_DATA",
+                "The LCD deadline expired. Position risk is partial.",
+                retryable=True,
+            )
         pnls = [row["unrealizedPnlUsd"] for row in items]
         positions["data"] = {
             "items": items,
             "unrealizedPnlUsd": sum(pnls, 0.0)
-            if complete and None not in pnls
+            if complete and membership_complete and None not in pnls
             else None,
             "unrealizedPnlBasis": "grossBeforeFees",
         }
     if "data" in prices:
         used_ids = set()
         for row in [*items, *orders.get("data", [])]:
-            if row["collateralToken"] != "USDC":
+            if row["collateralToken"] != "USDC" and "collateralPriceSource" not in row:
                 used_ids.add(row["collateralTokenId"])
             if (
                 row["quoteTokenId"] != USD_TOKEN_ID
@@ -628,7 +877,7 @@ def _blocking_intents(endpoint: str, addr: str) -> list[dict[str, Any]]:
     now = datetime.now(UTC).timestamp()
     blocking = []
     for row in storage.unresolved_intents(endpoint, addr):
-        if row["status"] == "unknown":
+        if row["status"] in ("unknown", "pending"):
             scope = "allTrades"
         elif row["entity"]:
             scope = "sameTrade"
@@ -715,14 +964,20 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
         return chain.block_time(height) if chain is not None else None
 
     balances = _read(lambda: _balances(settings, addr))
+    same_keeper = settings.ws_endpoint == stream.derive_ws(settings.endpoint)
+    balances["source"] = {
+        "endpoint": public_origin(settings.ws_endpoint),
+        "matchesKeeper": same_keeper,
+    }
+    if not same_keeper:
+        balances["warning"] = (
+            "Balance WebSocket is independent. These funds may be on a different chain."
+        )
+    positions, orders, prices = _trade_sections(settings, addr, get_chain, lookup)
     if "data" in balances:
         rows = balances["data"]
         # An independent WebSocket override may be served by another chain.
-        balance_lookup = (
-            lookup
-            if settings.ws_endpoint == stream.derive_ws(settings.endpoint)
-            else None
-        )
+        balance_lookup = lookup if same_keeper else None
         if not rows:
             balances["error"] = _failure(
                 "INCOMPLETE_DATA",
@@ -737,7 +992,6 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
             }
             for key in BALANCE_KEYS.values()
         }
-    positions, orders, prices = _trade_sections(settings, addr, get_chain, lookup)
     queued = _queued_orders(settings.endpoint, addr, lookup)
     intents = _read(lambda: _blocking_intents(settings.endpoint, addr))
     for row in intents.get("data", []):

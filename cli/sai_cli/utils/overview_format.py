@@ -44,6 +44,10 @@ def show(result: dict[str, Any]) -> None:
         skin.section(title)
         if snapshot["fetchedAt"]:
             print(f"  Fetched at {snapshot['fetchedAt']}")
+        if source := snapshot.get("source"):
+            print(f"  Source {source['endpoint']}")
+        if warning := snapshot.get("warning"):
+            print(f"  {warning}")
         if error := snapshot.get("error"):
             print(f"  {error['message']} ({error['code']})")
         return snapshot.get("data")
@@ -130,13 +134,23 @@ def show(result: dict[str, Any]) -> None:
                             f"    Contract liquidation price {price} {row['quoteToken']}"
                         )
                 if mark := row.get("markSource"):
+                    block = (
+                        mark["sourceBlock"]
+                        if mark["sourceBlock"] is not None
+                        else UNKNOWN
+                    )
                     print(
-                        f"  Trade {row['id']} oracle mark {_source(mark)}. Fetched at {mark['fetchedAt']}"
+                        f"  Trade {row['id']} oracle mark {_source(mark)}. Publish block {block}. "
+                        f"Read at block {mark['queryBlock']}, fetched at {mark['fetchedAt']}"
                     )
                     if row["quoteTokenId"] != 0:
                         print(
                             f"    Base price {_source(mark['base'])}. Quote price {_source(mark['quote'])}"
                         )
+                if collateral := row.get("collateralPriceSource"):
+                    print(
+                        f"  Trade {row['id']} pinned collateral price {_source(collateral)}"
+                    )
                 if row["riskStatus"] != "verified":
                     print(
                         f"  Trade {row['id']} risk {row['riskStatus']}. {row['riskReason']}"

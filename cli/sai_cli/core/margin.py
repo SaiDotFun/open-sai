@@ -41,7 +41,7 @@ def _get_json(
         if not isinstance(result, dict):
             raise TypeError
         return result
-    except (httpx.HTTPError, ValueError, TypeError) as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
         raise ValueError("Unable to read contract state") from exc
 
 
@@ -62,18 +62,29 @@ def smart(
     height: int | None = None,
     timeout: float = 20,
 ) -> dict[str, Any]:
+    data = smart_data(lcd, contract, message, height=height, timeout=timeout)
+    if not isinstance(data, dict):
+        raise TypeError("Contract returned invalid state")
+    return data
+
+
+def smart_data(
+    lcd: str,
+    contract: str,
+    message: dict[str, Any],
+    *,
+    height: int | None = None,
+    timeout: float = 20,
+) -> Any:
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
-    data = _get_json(
+    return _get_json(
         f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}",
         timeout,
         height=height,
     ).get("data")
-    if not isinstance(data, dict):
-        raise TypeError("Contract returned invalid state")
-    return data
 
 
 def snapshot(

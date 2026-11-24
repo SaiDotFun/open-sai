@@ -65,8 +65,10 @@ returns the same fields as the CLI's JSON output.
   unknown. If Keeper returns no Sai funds rows, the section reports an error.
 - **Positions.** Size is collateral in USD multiplied by leverage. USDC
   collateral is valued at par. Gross unrealized PnL is before fees and uses
-  the contract's range of -100% to +900% of collateral. The total requires
-  a confirmed list and a USD PnL value for every position.
+  the contract's range of -100% to +900% of collateral. Legacy stNIBI PnL
+  uses the collateral price at the same pinned block. The total requires
+  agreement with the contract's live positions, a USD PnL value for every
+  position, and no fill that Keeper reports as awaiting indexing.
 - **Risk.** The liquidation threshold includes borrowing fees from the
   contract. Distances compare the same-block oracle mark and trigger levels
   in the pair's quote token. A zero or negative distance means the price
@@ -74,12 +76,15 @@ returns the same fields as the CLI's JSON output.
   use the oracle's quote-token conversion. If the contract threshold or
   matching trade state is unavailable, any Keeper liquidation figure is
   labeled as an estimate and has no distance. If only the oracle mark is
-  unavailable, the overview can still display the contract threshold.
+  unavailable or stale under the market's contract settings, the threshold
+  can still be shown. A pending after-hours leverage adjustment withholds
+  gross PnL and TP/SL distances and retains liquidation distance when the
+  mark is usable.
 - **Orders.** Pending limit and stop orders list their trigger prices.
   Queued market orders come from Keeper's `pending_exec` records. For a
   queued open, the trade ID is reserved. Collateral on a queued order, when
   present, is in base units.
-- **Local blockers.** An unknown intent blocks all trades for the account.
+- **Local blockers.** An unknown or pending intent blocks all trades for the account.
   An accepted intent for a position blocks requests on that position.
   A recent accepted open can block another MCP open.
 - **Session.** The overview shows the expiry of a stored session for the
@@ -88,16 +93,18 @@ returns the same fields as the CLI's JSON output.
 Each section's `fetchedAt` records when the client read it, in UTC. Source
 timestamps and `sourceAgeSeconds` describe the data at fetch time. A
 position's indexed trade record, contract threshold, and oracle mark carry
-separate source times. The estimate from Keeper has an unknown source time.
+separate source times. Oracle metadata shows the publish block separately
+from the LCD read block. The estimate from Keeper has an unknown source time.
 The LCD supplies missing block times after its chain matches Keeper's. A
 custom Keeper requires an explicit LCD for that chain. An independently
-overridden WebSocket can report balance block heights with unknown times.
+overridden WebSocket is labeled as a balance source on an unverified chain.
 Local intent age starts at reservation. Session age starts at token issuance
 when the stored token provides that claim.
 
 A failed read produces a section `error` with a code and message. Other
-sections still return their data. The overview flags a paginated list when
-it cannot confirm the list on a second scan.
+sections still return their data. An eight-second LCD deadline keeps already
+loaded rows when further chain reads stall. The overview flags a paginated
+list when it cannot confirm the list on a second scan.
 
 ## Updates
 
