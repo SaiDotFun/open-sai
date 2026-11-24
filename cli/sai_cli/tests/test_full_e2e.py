@@ -222,6 +222,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
                             "lifecycleStep": "exec_pass"
                             if history_visible
                             else "pending_exec",
+                            "txHash": "A" * 64,
                         }
                     ]
                 }
@@ -232,7 +233,8 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
                             [
                                 {
                                     "intentKey": recorded[0]["intentKey"],
-                                    "trade": {"id": 7},
+                                    "txHash": "A" * 64,
+                                    "trade": {"id": 7, "trader": addr},
                                 }
                             ]
                             if history_visible

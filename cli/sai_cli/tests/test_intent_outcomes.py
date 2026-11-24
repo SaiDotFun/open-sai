@@ -8,12 +8,14 @@ import threading
 import time
 from collections import deque
 from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from sai_cli.core import keeper, reconcile, settings, storage
 from sai_cli.mcp_server import server
@@ -27,23 +29,43 @@ FIXTURE = json.loads(
 ADDR = FIXTURE["address"]
 KEY = FIXTURE["key"]
 RESPONSES = {**FIXTURE["recorded"], **FIXTURE["replays"]}
+Reply = str | dict[str, Any]
 
 
 @pytest.fixture
-def keeper_replay() -> Iterator[tuple[str, deque[str]]]:
-    replies: deque[str] = deque()
+def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
+    replies: deque[Reply] = deque()
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-            reply = RESPONSES[replies.popleft()]
+            queued = replies.popleft()
+            if queued == "admission_ack":
+                assert request["query"] == keeper.SUBMIT
+                submitted = request["variables"]["input"]
+                assert submitted["intent"]["kind"] == "OPEN_TRADE"
+                assert submitted["intent"]["body"]["orderType"] == "market"
+                reply = {
+                    "data": {
+                        "recordUserIntent": {
+                            "intentKey": submitted["intentKey"],
+                            "evmAddress": ADDR,
+                            "lifecycleStep": "jwt_pass",
+                            "execActor": "server",
+                        }
+                    }
+                }
+            else:
+                reply = RESPONSES[queued] if isinstance(queued, str) else queued
             if "userIntents" in reply["data"]:
                 assert request["query"] == keeper.INTENTS
                 assert request["variables"]["user"] == ADDR
                 assert request["variables"]["key"] in (KEY, None)
-            else:
+            elif "tradeHistory" in reply["data"].get("perp", {}):
                 assert request["query"] == keeper.HISTORY
                 assert request["variables"] == {"trader": ADDR}
+            elif "borrowings" in reply["data"].get("perp", {}):
+                assert request["query"] == keeper.MARKETS
             body = json.dumps(reply).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -67,6 +89,15 @@ def keeper_replay() -> Iterator[tuple[str, deque[str]]]:
 
 def status(endpoint: str) -> str:
     return storage.list_pending(endpoint, ADDR)[0]["status"]
+
+
+def call_mcp(mcp: FastMCP, tool: str, args: dict[str, Any]) -> dict[str, Any]:
+    response = asyncio.run(mcp.call_tool(tool, args))
+    content = response[0] if isinstance(response, tuple) else response
+    assert isinstance(content, list)
+    block = content[0]
+    assert isinstance(block, TextContent)
+    return json.loads(block.text)
 
 
 def reserve(endpoint: str, *, expired: bool = False) -> None:
@@ -171,12 +202,7 @@ def test_unindexed_sweep_then_filled_through_cli_and_mcp(keeper_replay):
     assert "Do not resubmit" in result["hint"]
 
     replies.extend(("outcome_not_indexed", "not_yet_in_history", "not_yet_in_history"))
-    response = asyncio.run(mcp.call_tool("intent_status", {"addr": ADDR, "key": KEY}))
-    content = response[0] if isinstance(response, tuple) else response
-    assert isinstance(content, list)
-    block = content[0]
-    assert isinstance(block, TextContent)
-    result = json.loads(block.text)
+    result = call_mcp(mcp, "intent_status", {"addr": ADDR, "key": KEY})
     assert result["localStatus"] == result["outcome"] == "pending"
     assert "may have filled" in result["hint"]
     assert "Do not resubmit" in result["hint"]
@@ -214,14 +240,140 @@ def test_unindexed_sweep_can_be_resolved_by_matching_history(keeper_replay):
     assert status(endpoint) == "terminal"
 
 
-def test_unkeyed_status_reports_next_oracle_wait_without_writing(keeper_replay):
+@pytest.mark.parametrize("provisional", ["pending_exec", "outcome_not_indexed"])
+def test_unkeyed_cli_status_blocks_a_second_acknowledged_open(
+    keeper_replay, provisional
+):
+    endpoint, replies = keeper_replay
+    storage.save_session(
+        {
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "token": "fixture-token",
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    market = {
+        "data": {
+            "perp": {
+                "borrowings": [
+                    {
+                        "marketId": 0,
+                        "collateralToken": {"symbol": "USDC"},
+                        "isOpen": True,
+                        "price": 100,
+                    },
+                ]
+            }
+        }
+    }
+    trade = [
+        "trade",
+        "open",
+        "--market",
+        "0",
+        "--side",
+        "long",
+        "--type",
+        "market",
+        "--amount",
+        "10",
+        "--leverage",
+        "2",
+        "--slippage",
+        "1",
+    ]
+    cli = CliRunner()
+    options = ["--endpoint", endpoint, "--json"]
+    replies.extend((market, "admission_ack"))
+    submitted = cli.invoke(main, [*options, *trade])
+    assert submitted.exit_code == 0, submitted.output
+    key = json.loads(submitted.output)["intentKey"]
+    assert status(endpoint) == "accepted"
+
+    pending = RESPONSES[provisional]["data"]["userIntents"][0]
+    replies.append({"data": {"userIntents": [{**pending, "intentKey": key}]}})
+    result = cli.invoke(main, [*options, "intent", "status", ADDR])
+    assert result.exit_code == 0, result.output
+    row = json.loads(result.output)["userIntents"][0]
+    assert row["outcome"] == "pending"
+    assert "Do not resubmit" in row["hint"]
+    assert status(endpoint) == "pending"
+
+    replies.append(market)
+    blocked = cli.invoke(main, [*options, *trade])
+    assert blocked.exit_code != 0
+    assert f"Reconcile uncertain intent {key}" in blocked.output
+
+    with storage.db() as connection:
+        connection.execute("UPDATE intents SET created_at=0 WHERE id=?", (key,))
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+    replies.append(market)
+    preview = call_mcp(mcp, "preview_open", args)
+    args.update(
+        preview_digest=preview["previewDigest"],
+        reference_price=preview["referencePrice"],
+    )
+    for allow in (False, True):
+        replies.append(market)
+        result = call_mcp(mcp, "trade_open", {**args, "allow_concurrent_open": allow})
+        assert result["code"] == "RECENT_OPEN_PENDING"
+        assert result["intentKeys"] == [key]
+        assert "next oracle price" in result["error"]
+        assert "allow_concurrent_open" not in result["error"]
+
+
+@pytest.mark.parametrize(
+    "foreign_trader,foreign_hash", [(True, True), (True, False), (False, True)]
+)
+def test_misattributed_history_keeps_blocking(
+    keeper_replay, foreign_trader, foreign_hash
+):
     endpoint, replies = keeper_replay
     reserve(endpoint)
-    replies.append("pending_exec")
-    result = reconcile.reconcile(endpoint, ADDR)
-    assert result["userIntents"][0]["outcome"] == "pending"
-    assert "Do not resubmit" in result["userIntents"][0]["hint"]
-    assert status(endpoint) == "unknown"
+    fill = RESPONSES["filled_history"]["data"]["perp"]["tradeHistory"][0]
+    row = {
+        **fill,
+        "trade": {**fill["trade"], "trader": "0x" + "b" * 40}
+        if foreign_trader
+        else fill["trade"],
+        "txHash": "C" * 64 if foreign_hash else fill["txHash"],
+    }
+    history = {"data": {"perp": {"tradeHistory": [row]}}}
+    replies.extend(("outcome_not_indexed", history, history))
+    result = reconcile.reconcile(endpoint, ADDR, KEY)
+    assert result["matchedTradeHistory"] == []
+    assert status(endpoint) == "pending"
+    with pytest.raises(ValueError, match=KEY):
+        storage.pending("second", endpoint, ADDR, "OPEN_TRADE", "")
+
+
+@pytest.mark.parametrize("key", [KEY, None])
+def test_status_ignores_foreign_rows_and_finds_the_matching_intent(keeper_replay, key):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    other_addr = "0x" + "b" * 40
+    storage.pending("foreign", endpoint, other_addr, "OPEN_TRADE", "")
+    match = RESPONSES["pending_exec"]["data"]["userIntents"][0]
+    foreign = {
+        **match,
+        "evmAddress": other_addr,
+        "nibiAddress": None,
+        "intentKey": "foreign",
+    }
+    replies.append({"data": {"userIntents": [foreign, match]}})
+    rows = reconcile.reconcile(endpoint, ADDR, key)["userIntents"]
+    assert [row["intentKey"] for row in rows] == [KEY]
+    assert status(endpoint) == "pending"
+    assert storage.list_pending(endpoint, other_addr)[0]["status"] == "unknown"
 
 
 def test_terminal_ledger_ignores_late_admission_and_provisional_results():

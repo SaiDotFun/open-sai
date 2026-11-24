@@ -1,8 +1,9 @@
 # Keeper Intent Outcomes
 
-Use the latest `userIntents` record for the requested key. For a keyed
-reconciliation, require both `intentKey` and `evmAddress` to match the request.
-Compare the address without regard to case.
+Use the latest `userIntents` record for the requested key and account. Match
+the account against Keeper's `evmAddress` or `nibiAddress`, ignoring case.
+An unkeyed account list records pending results for local intents. It leaves
+history checks and terminal updates to keyed reconciliation.
 
 Python callers can import `classify_outcome(row)` and its return type
 `IntentOutcome` from `sai_cli.core.reconcile`. The classifier uses only the
@@ -16,7 +17,7 @@ Keeper row. Reconciliation applies the history and ledger rules below.
 | `exec_fail` | `server` | Any remaining code, including `chain_execution_failed` and `market_order_<reason>` | Terminal-failed. The request transaction failed or Keeper has a cancellation. |
 | `exec_req_fail` | `server` | Any remaining code, including `admission_expired`, `simulation_failed`, and `broadcast_rejected` | Terminal-failed. Admission expired, preflight failed, or the broadcast was rejected. |
 | `exec_pass` | `server` | null | Terminal-filled. Keeper observed the intent succeed. Trade history can arrive later or be unavailable for a fill recovered from chain state. |
-| `exec_finality_observed` | `user` or `server` | null | Pending for a Perp trade until history contains a row with the same `intentKey` and a `trade`. That row makes the intent terminal-filled. For other kinds, unknown. |
+| `exec_finality_observed` | `user` or `server` | null | Pending for a Perp trade until history matches the intent, trader, and request hash. That row makes the intent terminal-filled. For other kinds, unknown. |
 | `intent_start`, `jwt_failed`, `sign_reject`, `sign_failed` | Applicable actor | Any | Unknown. These lifecycle records give no authoritative execution outcome. |
 | `jwt_pass`, `exec_req_pass`, `exec_req_fail` | `user` | Any | Unknown. Browser handoffs and rejections carry no Keeper execution authority. |
 | Other step or actor | Any | Any | Unknown. Leave the ledger status alone. |
@@ -46,7 +47,8 @@ Perp kinds with trade history are `OPEN_TRADE`, `CLOSE_POSITION`,
 Both terminal outcomes store `terminal`. A row in `pending` blocks new
 trades for its account and Keeper endpoint. The SQLite row stores
 `status='unknown'` and `keeper_status='pending'` so the v0.1.0 trade guard
-also blocks it. A row in `unknown` blocks at the same scope. Admission
+blocks it until that version reconciles the intent using its own lifecycle
+rules. A row in `unknown` blocks at the same scope. Admission
 retains the existing `accepted` rule for a matching trade ID.
 
 An expired `unknown` can become `absent` on an empty Keeper read. A later
@@ -65,3 +67,8 @@ corroborate a fill or attach history to a canonical `exec_pass`. If the
 first read has no match, it tries once more after 250 ms with a two-second
 request timeout cap per read. It stops on a history request error. Later
 status checks can pick up history that arrives after both reads.
+
+A history row must have the same `intentKey`, a `trade.trader` matching one
+of the lifecycle record's addresses, and a request hash matching that
+record's `txHash`. Compare history's `txHash` and `evmTxHash` ignoring case
+and any `0x` prefix.

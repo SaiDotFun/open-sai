@@ -415,6 +415,8 @@ def set_status(
     Explicit evidence of a pending market order can repair a legacy terminal
     row whose outcome was never tracked by this version.
     """
+    if not (home() / "intents.sqlite3").exists():
+        return None
     with db() as connection:
         connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(

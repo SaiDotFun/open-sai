@@ -78,9 +78,24 @@ def _explicit_market_pending(row: dict[str, Any]) -> bool:
     )
 
 
+def _addresses(row: Mapping[str, Any]) -> set[str]:
+    """Use the EVM and Nibiru address pair Keeper resolved for the intent."""
+    return {
+        addr.lower() for addr in (row.get("evmAddress"), row.get("nibiAddress")) if addr
+    }
+
+
+def _hash(value: str | None) -> str:
+    return (value or "").lower().removeprefix("0x")
+
+
 def _read_history(
-    endpoint: str, addr: str, key: str, timeout: float
+    endpoint: str, addr: str, row: dict[str, Any], timeout: float
 ) -> list[dict[str, Any]]:
+    request_hash = _hash(row.get("txHash"))
+    if not request_hash:
+        return []
+    traders = _addresses(row)
     for attempt in range(HISTORY_READS):
         if attempt:
             time.sleep(HISTORY_RETRY_DELAY)
@@ -94,11 +109,29 @@ def _read_history(
         matches = [
             item
             for item in history["perp"]["tradeHistory"]
-            if item.get("intentKey") == key and item.get("trade")
+            if item.get("intentKey") == row["intentKey"]
+            and ((item.get("trade") or {}).get("trader") or "").lower() in traders
+            and request_hash
+            in (_hash(item.get("txHash")), _hash(item.get("evmTxHash")))
         ]
         if matches:
             return matches
     return []
+
+
+def _store_outcome(
+    endpoint: str, row: dict[str, Any], outcome: IntentOutcome, write: WriteGate
+) -> str | None:
+    status = "terminal" if outcome.startswith("terminal-") else outcome
+    with write():
+        return storage.set_status(
+            row["intentKey"],
+            endpoint,
+            row["evmAddress"],
+            status,
+            repair_legacy_terminal=outcome == "pending"
+            and _explicit_market_pending(row),
+        )
 
 
 def reconcile(
@@ -111,17 +144,30 @@ def reconcile(
 ) -> dict[str, Any]:
     """Read Keeper's latest intent records for ADDR.
 
-    With KEY, advance the local ledger from the matching Keeper record.
-    History can corroborate a fill and is read at most twice. Each ledger
-    write uses `with write():` so a caller can enforce its own deadline.
+    An account list records pending observations for local keys. With KEY,
+    advance that intent using the matching Keeper record and at most two
+    history reads. Each ledger write uses `with write():` so a caller can
+    enforce its own deadline.
     """
     data = keeper.request(
         endpoint, keeper.INTENTS, {"user": addr, "key": key}, timeout=timeout
     )
     rows = data.get("userIntents")
+    matching = [
+        row
+        for row in rows or []
+        if row.get("evmAddress")
+        and addr.lower() in _addresses(row)
+        and (key is None or row.get("intentKey") == key)
+    ]
+    if rows is not None:
+        data["userIntents"] = matching
     if key is None:
-        for row in rows or []:
-            if classify_outcome(row) == "pending" and _explicit_market_pending(row):
+        for row in matching:
+            if not row.get("intentKey") or classify_outcome(row) != "pending":
+                continue
+            local = _store_outcome(endpoint, row, "pending", write)
+            if local == "pending" or (local is None and _explicit_market_pending(row)):
                 row.update(outcome="pending", hint=_pending_hint(row))
         return data
 
@@ -143,10 +189,10 @@ def reconcile(
         if local == "pending":
             data.update(outcome="pending", hint=LOCAL_PENDING_HINT)
         return data
-    if not rows:
+    if not matching:
         return data
 
-    row = rows[0]
+    row = matching[0]
     step = row.get("lifecycleStep")
     log.event(
         "intent.keeper",
@@ -160,35 +206,19 @@ def reconcile(
         addr=addr,
         endpoint=log.endpoint(endpoint),
     )
-    if (
-        row.get("intentKey") != key
-        or str(row.get("evmAddress") or "").lower() != addr.lower()
-    ):
-        return data
-
     outcome = classify_outcome(row)
     if outcome == "unknown":
         return data
-    status = "terminal" if outcome.startswith("terminal-") else outcome
-    with write():
-        local = storage.set_status(
-            key,
-            endpoint,
-            addr,
-            status,
-            repair_legacy_terminal=outcome == "pending"
-            and _explicit_market_pending(row),
-        )
+    local = _store_outcome(endpoint, row, outcome, write)
     kind = row.get("kind")
     if (
         outcome == "terminal-filled" and (kind is None or kind in PERP_HISTORY_KINDS)
     ) or (outcome == "pending" and step != "pending_exec"):
-        matches = _read_history(endpoint, addr, key, min(timeout, HISTORY_TIMEOUT))
+        matches = _read_history(endpoint, addr, row, min(timeout, HISTORY_TIMEOUT))
         data["matchedTradeHistory"] = matches
         if matches and outcome == "pending":
-            with write():
-                local = storage.set_status(key, endpoint, addr, "terminal")
             outcome = "terminal-filled"
+            local = _store_outcome(endpoint, row, outcome, write)
             data["outcome"] = outcome
             if local is not None:
                 data["localStatus"] = local

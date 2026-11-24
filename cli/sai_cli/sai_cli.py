@@ -757,9 +757,9 @@ def intent() -> None:
 @click.option("--key", help="Specific intent key.")
 @click.pass_context
 def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
-    """Read Keeper's latest intent records and reconcile a known key.
+    """Read Keeper's latest intent records and record local pending fills.
 
-    For a pending outcome, follow the hint and check the same key again.
+    Use --key to check one intent for a final outcome.
     """
     try:
         emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
