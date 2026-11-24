@@ -7,16 +7,14 @@ use std::{
 use chrono::Utc;
 use clap::Subcommand;
 use sai_core::{
-    config::config_path,
     session::expired,
+    settings::{Environment, Flags},
     storage::{RemovedSession, SessionSummary, Storage},
 };
 use serde::Serialize;
 use serde_json::ser::{Formatter, PrettyFormatter};
-mod settings;
 
-pub use settings::SettingsFlags;
-use settings::keeper_endpoint;
+use crate::load_settings;
 
 #[derive(Subcommand)]
 pub enum AuthCommand {
@@ -63,19 +61,19 @@ struct Logout {
 pub fn auth(
     command: AuthCommand,
     as_addr: Option<&str>,
-    flags: SettingsFlags<'_>,
+    flags: &Flags,
+    env: &Environment,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let path = config_path()?;
-    let storage = Storage::new(path.parent().expect("config filename under Sai home"));
+    let storage = Storage::new(&env.home);
     match command {
         AuthCommand::Status => {
-            let endpoint = keeper_endpoint(&path, flags)?;
-            let session = storage.load_active_session(&endpoint, as_addr)?;
+            let settings = load_settings(flags, env)?;
+            let session = storage.load_active_session(settings.endpoint(), as_addr)?;
             emit(&session.summary()?, json)
         }
         AuthCommand::List => {
-            let endpoint = keeper_endpoint(&path, flags)?;
+            let settings = load_settings(flags, env)?;
             let accounts = storage.load_accounts()?;
             let now = Utc::now();
             let accounts = accounts
@@ -85,7 +83,7 @@ pub fn auth(
                         summary: session.summary()?,
                         active,
                         expired: Some(expired(session, now)?),
-                        endpoint_matches: Some(session.endpoint() == Some(&endpoint)),
+                        endpoint_matches: Some(session.endpoint() == Some(settings.endpoint())),
                     })
                 })
                 .collect::<Result<_, sai_core::storage::StorageError>>()?;
@@ -123,14 +121,16 @@ pub fn auth(
 
 pub fn intent(
     command: IntentCommand,
-    flags: SettingsFlags<'_>,
+    flags: &Flags,
+    env: &Environment,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    let path = config_path()?;
-    let storage = Storage::new(path.parent().expect("config filename under Sai home"));
-    let endpoint = keeper_endpoint(&path, flags)?;
+    let storage = Storage::new(&env.home);
+    let settings = load_settings(flags, env)?;
     match command {
-        IntentCommand::Local { addr } => emit(&storage.list_pending(&endpoint, &addr)?, json),
+        IntentCommand::Local { addr } => {
+            emit(&storage.list_pending(settings.endpoint(), &addr)?, json)
+        }
     }
 }
 

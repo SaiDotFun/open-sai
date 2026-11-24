@@ -9,15 +9,22 @@ publish = false
 
 [dependencies]
 aes = { version = "0.8", features = ["zeroize"] }
-aes-gcm = { version = "0.10", features = ["zeroize"] }
-base64 = "0.22"
-chrono = { version = "0.4", default-features = false, features = ["now", "std"] }
+aes-gcm = { workspace = true, features = ["zeroize"] }
+base64.workspace = true
+chrono.workspace = true
+num-bigint.workspace = true
+regex.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
-serde = { version = "1", features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
-sha2 = "0.10"
+sha2.workspace = true
 tempfile.workspace = true
 thiserror = "2"
 toml_edit.workspace = true
 toml_parser.workspace = true
+unicode-normalization.workspace = true
+uuid.workspace = true
 zeroize = "1"
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
