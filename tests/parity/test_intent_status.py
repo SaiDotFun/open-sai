@@ -180,10 +180,14 @@ def read_events(home: Path) -> list[dict[str, Any]]:
     for event in events:
         groups.setdefault(event["runId"], []).append(event["seq"])
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
+    return events
+
+
+def normalized_events(home: Path) -> list[dict[str, Any]]:
     normalize = Normalize(home)
     # The request and ledger assertions use this fixed fixture key.
     normalize.identity("intentKey", KEY)
-    return normalize.log_records(events)
+    return normalize.log_records(read_events(home))
 
 
 def test_log_events_detect_wrong_fixture_intent_key(tmp_path: Path) -> None:
@@ -198,13 +202,14 @@ def test_log_events_detect_wrong_fixture_intent_key(tmp_path: Path) -> None:
         "intentKey": KEY,
     }
     path.write_text(json.dumps(event) + "\n", encoding="utf-8")
-    reference = read_events(tmp_path)
+    assert read_events(tmp_path)[0]["intentKey"] == KEY
+    reference = normalized_events(tmp_path)
 
     path.write_text(
         json.dumps({**event, "intentKey": "20261120T154331123Z_" + "A" * 16}) + "\n",
         encoding="utf-8",
     )
-    assert read_events(tmp_path) != reference
+    assert normalized_events(tmp_path) != reference
 
 
 def read_state(home: Path) -> tuple[Any, ...]:
@@ -361,7 +366,7 @@ def compare(
                     }
                 )
                 replies.clear()
-            observed.append({"runs": runs, "logs": read_events(home)})
+            observed.append({"runs": runs, "logs": normalized_events(home)})
         assert_release_equal(*observed)
 
 
@@ -712,7 +717,7 @@ def test_intent_status_logs_only_public_graphql_codes(
                 assert document["outcome"] == "pending"
             [event] = [
                 event
-                for event in read_events(home)
+                for event in normalized_events(home)
                 if event["event"] == "keeper.request"
                 and event["operation"] == operation
             ]
@@ -749,7 +754,7 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert result.stderr == b""
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
-            outputs.append((result.stdout, read_events(home)))
+            outputs.append((result.stdout, normalized_events(home)))
         assert outputs[0] == outputs[1]
 
 
@@ -897,7 +902,7 @@ def test_expired_auth_status(
         assert payload["error"]["code"] == "SESSION_EXPIRED"
         login = origin_login_hint(origin if index == 1 else None)
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        observed.append({"stdout": payload, "logs": read_events(home)})
+        observed.append({"stdout": payload, "logs": normalized_events(home)})
     assert_release_equal(*observed)
 
 
@@ -1218,7 +1223,7 @@ def assert_watch_disconnect(
     )
     assert [
         (event["code"], event["errorType"])
-        for event in read_events(home)
+        for event in normalized_events(home)
         if event["event"] == "watch.disconnected"
     ] == [("STREAM_ERROR", error_type)]
 
