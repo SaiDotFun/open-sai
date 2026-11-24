@@ -396,8 +396,8 @@ WAIT_REASONS = {
     "cancel": "pull/122",
     "margin": "issues/174",
     "partial-close": "issues/174",
-    "tpsl": "issues/173",
-    "leverage": "issues/173",
+    "tpsl": "pull/197",
+    "leverage": "pull/197",
 }
 REPO_URL = "https://github.com/SaiDotFun/open-sai"
 
