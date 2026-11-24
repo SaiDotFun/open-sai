@@ -16,10 +16,7 @@ use super::{
     SessionError, Storage, StorageError, StorageEvent, endpoint_origin, private_file,
     remove_if_exists,
 };
-use crate::{
-    endpoint::Endpoint,
-    errors::{Code, SaiError},
-};
+use crate::errors::{Code, SaiError};
 
 const SESSIONS: &str = "sessions.json";
 const LEGACY_SESSION: &str = "session.json";
@@ -52,7 +49,7 @@ pub struct Session {
 pub struct SessionSummary<'a> {
     pub addr: &'a str,
     pub expires_at: &'a str,
-    pub endpoint: String,
+    pub endpoint: Option<String>,
 }
 
 impl Session {
@@ -109,29 +106,12 @@ impl Session {
             .insert("source".into(), Value::String("imported".into()));
     }
 
-    pub fn summary(&self) -> Result<SessionSummary<'_>, StorageError> {
-        let endpoint = self
-            .endpoint()
-            .ok_or_else(|| SessionError::new("Stored session is missing its Keeper endpoint"))?;
-        // Keep the configured path as Python currently does for plain URLs.
-        // Preserve the storage port's origin-only handling of credential-bearing URLs.
-        let endpoint = match Endpoint::split(endpoint) {
-            Some(url) if !url.authority.contains('@') && !endpoint.contains(['?', '#']) => {
-                endpoint.to_owned()
-            }
-            _ => endpoint_origin(endpoint),
-        };
-        Ok(SessionSummary {
+    pub fn summary(&self) -> SessionSummary<'_> {
+        SessionSummary {
             addr: self.addr(),
             expires_at: self.expires_at(),
-            endpoint,
-        })
-    }
-
-    pub fn origin_summary(&self) -> Result<SessionSummary<'_>, StorageError> {
-        let mut summary = self.summary()?;
-        summary.endpoint = endpoint_origin(&summary.endpoint);
-        Ok(summary)
+            endpoint: self.endpoint().map(endpoint_origin),
+        }
     }
 
     fn same_as(&self, previous: &Self) -> bool {

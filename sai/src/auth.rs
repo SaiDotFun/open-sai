@@ -102,7 +102,7 @@ pub fn dispatch(
                     let command = storage.keeper_command_hint(endpoint, &args);
                     unsupported(format!("{error} Run `{command}` in a terminal."), command)
                 })?;
-            let summary = session.summary()?;
+            let summary = session.summary();
             let summary = serde_json::to_value(summary).map_err(|_| SaiError::internal())?;
             storage.save_session(session)?;
             emit(&summary, json)
@@ -141,15 +141,15 @@ pub fn dispatch(
                         login_failure(error)
                     }
                 })?;
-            let summary = serde_json::to_value(session.origin_summary()?)
-                .map_err(|_| SaiError::internal())?;
+            let summary =
+                serde_json::to_value(session.summary()).map_err(|_| SaiError::internal())?;
             storage.replace_session(&stored, session)?;
             emit(&summary, json)
         }
         AuthCommand::Status => {
             let settings = load_settings(flags, env)?;
             let session = storage.load_active_session(settings.endpoint(), as_addr)?;
-            emit(&session.summary()?, json)
+            emit(&session.summary(), json)
         }
         AuthCommand::List => {
             let settings = load_settings(flags, env)?;
@@ -159,7 +159,7 @@ pub fn dispatch(
                 .iter()
                 .map(|(session, active)| {
                     Ok(AccountRow {
-                        summary: session.summary()?,
+                        summary: session.summary(),
                         active,
                         expired: Some(expired(session, now)?),
                         endpoint_matches: Some(session.endpoint() == Some(settings.endpoint())),
@@ -172,7 +172,7 @@ pub fn dispatch(
             let session = storage.use_session(&addr)?;
             emit(
                 &AccountRow {
-                    summary: session.summary()?,
+                    summary: session.summary(),
                     active: true,
                     expired: None,
                     endpoint_matches: None,
@@ -238,7 +238,7 @@ async fn import(
     let token = read_token().await?;
     let settings = load_settings(flags, env)?;
     let session = auth::import_session(token.clone(), settings.endpoint())?;
-    let summary = serde_json::to_value(session.summary()?).map_err(|_| SaiError::internal())?;
+    let summary = serde_json::to_value(session.summary()).map_err(|_| SaiError::internal())?;
     log::remember([token.to_string()]);
     storage.save_session(session)?;
     if let Some((copied, tool)) = Clipboard::read().await

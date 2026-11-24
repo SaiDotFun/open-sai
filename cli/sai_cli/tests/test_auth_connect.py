@@ -537,6 +537,7 @@ def keeper_auth():
         "token": make_token(),
         "expires_at": "2026-12-17T00:00:00+00:00",
         "requests": [],
+        "paths": [],
         "signatures": [],
     }
 
@@ -544,6 +545,7 @@ def keeper_auth():
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state["requests"].append(body)
+            state["paths"].append(self.path)
             if "createUserIntentAuthChallenge" in body["query"]:
                 data = {
                     "createUserIntentAuthChallenge": {

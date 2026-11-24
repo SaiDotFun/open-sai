@@ -7,7 +7,6 @@ import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 from typing import Any
 
@@ -32,15 +31,14 @@ CLI = tuple[str, ...]
 
 @pytest.fixture
 def auth_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
-    # Keeper's CI reference predates the current auth command help.
     path = os.environ.get("SAI_PARITY_AUTH_PYTHON")
-    executable = (
-        shutil.which(path)
-        if path is not None
-        else shutil.which("sai", path=str(Path(sys.executable).parent))
-    )
+    if path is None:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail("native parity CI must supply SAI_PARITY_AUTH_PYTHON")
+        pytest.skip("set SAI_PARITY_AUTH_PYTHON to the Python executable with PR 96")
+    executable = shutil.which(path)
     if executable is None:
-        pytest.fail("Install the Python CLI or set SAI_PARITY_AUTH_PYTHON")
+        pytest.fail("SAI_PARITY_AUTH_PYTHON must name an executable")
     return (executable,), cli_pair[1]
 
 
@@ -125,6 +123,11 @@ def test_auth_login(
     exchanges: int,
 ) -> None:
     python, rust = homes(tmp_path, auth_pair)
+    if case == "ud-locked":
+        # Use a path whose non-interactive recovery hint must keep the URL private.
+        keeper_auth["endpoint"] = keeper_auth["endpoint"].replace(
+            "/query", "/fixture-path-key/query"
+        )
     addr = OTHER if case == "wrong-session-address" else ADDR
     keeper_auth["typed"] = typed_data(message__account=addr)
     if case == "substituted":
@@ -182,6 +185,44 @@ def test_auth_login(
     if expected_code == 0:
         assert rust_state["sessions"][addr].pop("keyName") == "dev"
     assert python_state == rust_state
+
+
+def test_auth_summaries_hide_keeper_path(
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
+) -> None:
+    path = "/fixture-path-key/query"
+    origin = keeper_auth["endpoint"].removesuffix("/query")
+    endpoint = origin + path
+    results = []
+    for env in homes(tmp_path, auth_pair):
+        fake_cast(env)
+        keystore(env, addr=ADDR)
+        env.clipboard()
+        env.clip.write_text(fixture_token(OTHER))
+        keeper_auth["paths"].clear()
+        args = ("--json", "--endpoint", endpoint, "auth")
+        outputs = []
+        for command, operand in [
+            ("login", ("dev",)),
+            ("status", ()),
+            ("import", ()),
+            ("list", ()),
+            ("use", (ADDR,)),
+        ]:
+            result = env.run(*args, command, *operand)
+            assert result.returncode == 0
+            payload = json.loads(result.stdout)
+            summaries = payload["accounts"] if command == "list" else [payload]
+            assert all(summary["endpoint"] == origin for summary in summaries)
+            assert path not in result.stdout + result.stderr
+            outputs.append(observed(result))
+        assert keeper_auth["paths"] == [path, path]
+        assert all(
+            session["endpoint"] == endpoint
+            for session in session_state(env)["sessions"].values()
+        )
+        results.append(outputs)
+    assert results[0] == results[1]
 
 
 @pytest.mark.parametrize("entry", ["clipboard", "hidden", "enter", "changed"])
