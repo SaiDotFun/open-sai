@@ -9,6 +9,10 @@ install:
 test:
     uv run pytest
 
+# Compare the Python CLI with SAI_PARITY_BIN, or run the Python self-check
+parity:
+    @uv run python tests/parity/parity.py
+
 check:
     uv run ruff check .
     uv run ruff format --check .
@@ -33,3 +37,7 @@ release VERSION *FLAGS:
 # Copy the sai skill from jiyuu into skills/sai; dry run unless given --run
 sync-skill *FLAGS:
     uv run python scripts/sync_skill.py {{FLAGS}}
+
+# Generate the Markdown and JSON log event references
+log-events:
+    uv run python -m sai_cli.core.log_events
