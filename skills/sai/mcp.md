@@ -79,7 +79,8 @@ The server lists every tool whether or not anyone is signed in. Each
 `trade_*` call checks the session of the account it acts as.
 
 If `mcp_info.session.expiryWarning` is present, tell the person when the
-session expires and pass along the `renewalCommand` it reports.
+session expires and pass along the `renewalCommand` it reports. Pass along
+`renewalGuidance` separately if present.
 
 | `mcp_info.trading.reason` | A `trade_*` call returns | Meaning |
 | --- | --- | --- |

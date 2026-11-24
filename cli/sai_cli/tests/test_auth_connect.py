@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import pty
+import shlex
 import subprocess
 import sys
 import termios
@@ -888,10 +889,17 @@ def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
     status = env.run(*args, "status")
     row = json.loads(status.stdout)
     assert row["endpoint"] == origin
-    assert f"reuse the Keeper endpoint at {origin}" in row["renewalCommand"]
+    assert shlex.split(row["renewalCommand"]) == [
+        "sai",
+        "--endpoint",
+        "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}",
+        "auth",
+        "import",
+    ]
+    assert f"Reuse the Keeper endpoint at {origin}" in row["renewalGuidance"]
     refused = env.run(*args, "renew")
     assert refused.returncode == 1
-    assert "reuse the Keeper endpoint" in login_error(refused)
+    assert f"Reuse the Keeper endpoint at {origin}" in login_error(refused)
     assert (
         "synthetic-test-credential"
         not in status.stdout + refused.stdout + refused.stderr

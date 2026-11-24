@@ -1341,6 +1341,7 @@ def test_session_reports_never_include_the_token(mcp):
         "endpoint",
         "expiryWarning",
         "renewalCommand",
+        "renewalGuidance",
     }
     assert (status["addr"], status["endpoint"]) == (
         ADDR,
@@ -1351,6 +1352,7 @@ def test_session_reports_never_include_the_token(mcp):
     assert info["session"]["usable"] is True
     assert "expires in" in info["session"]["expiryWarning"]
     assert info["session"]["renewalCommand"] == status["renewalCommand"]
+    assert info["session"]["renewalGuidance"] == status["renewalGuidance"]
     assert "expiryWarning" in invoke(mcp, "auth_list")["accounts"][0]
     assert info["provenance"]["kind"] in ("source-checkout", "installed")
     assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"

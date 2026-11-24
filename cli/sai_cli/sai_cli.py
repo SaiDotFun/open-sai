@@ -406,7 +406,7 @@ def show_expiry_notice(ctx: click.Context, fields: Mapping[str, Any]) -> None:
         and sys.stdin.isatty()
         and sys.stderr.isatty()
     ):
-        warn(f"{fields['expiryWarning']} Run {fields['renewalCommand']}.")
+        warn(sessions.expiry_notice_text(fields))
 
 
 # Commands that never start or announce an automatic update. `mcp` serves
@@ -568,20 +568,23 @@ def renew(ctx: click.Context, addr: str | None) -> None:
             raise SessionError("Stored session belongs to another Keeper endpoint")
         name = stored.get("keyName")
         if not name:
+            command = sessions.renewal_command(stored)
+            guidance = sessions.renewal_guidance(stored)
             if stored.get("source") == "imported":
-                raise ValueError(
-                    f"This session was imported. Run {sessions.renewal_command(stored)} with a fresh token."
+                message = (
+                    f"This session was imported. Run `{command}` with a fresh token."
                 )
-            raise ValueError(
-                f"This session has no saved key name. Run {sessions.renewal_command(stored)}."
-            )
+            else:
+                message = f"This session has no saved key name. Run `{command}`."
+            raise ValueError(f"{message} {guidance}".rstrip())
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
+        guidance = sessions.renewal_guidance(stored)
         raise SaiError(
-            f"{exc} Run {sessions.renewal_command(stored)} in a terminal.",
+            f"{exc} Run `{sessions.renewal_command(stored)}` in a terminal. {guidance}".rstrip(),
             Code.SESSION_UNAVAILABLE,
         ) from exc
 

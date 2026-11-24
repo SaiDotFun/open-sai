@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import shlex
+from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -22,25 +23,44 @@ def expiry_time(result: dict[str, str]) -> datetime:
 
 
 def renewal_command(result: dict[str, str]) -> str:
-    """Return recovery instructions scoped to the session's Keeper."""
+    """Return a shell command scoped to the session's Keeper."""
+    args = (
+        ("auth", "renew", result["evmAddress"])
+        if result.get("keyName")
+        else ("auth", "import")
+    )
     endpoint = result.get("endpoint")
+    if endpoint:
+        return storage.keeper_command_hint(endpoint, *args)
+    return shlex.join(("sai", *args))
 
-    def command(*args: str) -> str:
-        if endpoint:
-            return storage.keeper_command_hint(endpoint, "auth", *args)
-        return shlex.join(["sai", "auth", *args])
 
+def renewal_guidance(result: dict[str, str]) -> str:
+    endpoint = result.get("endpoint")
     origin = log.origin(endpoint) if endpoint else None
-    suffix = ""
+    guidance = []
     if not endpoint or endpoint != origin:
         where = f" at {origin}" if origin not in (None, log.REDACTED_URL) else ""
-        suffix = f" (reuse the Keeper endpoint{where} configured when this session was stored)"
-    if result.get("keyName"):
-        return command("renew", result["evmAddress"]) + suffix
-    browser = command("import")
-    if result.get("source") == "imported":
-        return browser + suffix
-    return f"{command('login', 'NAME')} or {browser}{suffix}"
+        guidance.append(f"Reuse the Keeper endpoint{where} used to sign in.")
+    if not result.get("keyName") and result.get("source") != "imported":
+        guidance.append("You can also sign in again with your Foundry keystore.")
+    return " ".join(guidance)
+
+
+def renewal_fields(result: dict[str, str]) -> dict[str, str]:
+    fields = {"renewalCommand": renewal_command(result)}
+    if guidance := renewal_guidance(result):
+        fields["renewalGuidance"] = guidance
+    return fields
+
+
+def expiry_notice_text(fields: Mapping[str, str]) -> str:
+    parts = (
+        fields["expiryWarning"],
+        fields.get("renewalGuidance"),
+        f"Run {fields['renewalCommand']}",
+    )
+    return " ".join(part for part in parts if part)
 
 
 def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
@@ -95,8 +115,11 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
             addr=result.get("evmAddress"),
             expiresAt=result["expiresAt"],
         )
+        message = "Trading session expired; sign in again"
+        if guidance := renewal_guidance(result):
+            message += f". {guidance}"
         raise SessionError(
-            "Trading session expired; sign in again",
+            message,
             Code.SESSION_EXPIRED,
             hint=renewal_command(result)
             if result.get("keyName") or result.get("source") == "imported"
@@ -159,4 +182,4 @@ def expiry_fields(
     warning = expiry_warning(result, now or datetime.now(UTC))
     if warning is None:
         return {}
-    return {"expiryWarning": warning, "renewalCommand": renewal_command(result)}
+    return {"expiryWarning": warning, **renewal_fields(result)}
