@@ -624,7 +624,7 @@ def test_margin_dry_run_and_recheck(session, monkeypatch):
     monkeypatch.setattr(
         margin,
         "snapshot",
-        lambda *args: margin.PositionSnapshot(
+        lambda *args, **kwargs: margin.PositionSnapshot(
             raw,
             funds,
             market,
@@ -635,6 +635,8 @@ def test_margin_dry_run_and_recheck(session, monkeypatch):
         main,
         [
             "--json",
+            "--lcd-endpoint",
+            "http://127.0.0.1:1",
             "trade",
             "margin",
             "7",
@@ -676,7 +678,7 @@ def test_margin_refuses_changed_position(session, monkeypatch):
         ]
     )
     monkeypatch.setattr("sai_cli.sai_cli.session", lambda ctx: session)
-    monkeypatch.setattr(margin, "snapshot", lambda *args: next(items))
+    monkeypatch.setattr(margin, "snapshot", lambda *args, **kwargs: next(items))
     monkeypatch.setattr(margin, "_latest_position", lambda *args: (newer, "120"))
     monkeypatch.setattr(
         margin,

@@ -52,16 +52,16 @@ signed in for this server's endpoint.
 trade_* call while signed out returns SIGNED_OUT (or SESSION_EXPIRED, or \
 SESSION_UNAVAILABLE for another endpoint) and submits nothing: ask the user \
 to run `sai auth login NAME` or `sai auth import` in a terminal, then retry.
-- Before any trade, call the matching preview_* tool, show the user the \
-preview and the account it names, and get their explicit confirmation. Only then call the trade_* \
-tool with the same arguments plus the preview's previewDigest, and for a \
-market open also its referencePrice.
+- Before any trade, call the matching preview_* tool. If \
+estimates.execution.status is would_be_rejected, report its reason and stop. \
+Otherwise, show the user the preview and the account it names. Get explicit \
+confirmation, then call the trade_* tool with the same arguments and the \
+previewDigest. For a market open, also send its referencePrice.
 - If a position preview reports positionOwnerVerified as false, request a \
 new preview when the contract position can be read.
 - If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was \
-submitted. If the result includes a new preview, show it to the user and get \
-confirmation before using its previewDigest (and referencePrice). Otherwise \
-follow the error's instructions and request a new preview.
+submitted. Show the user any replacement preview. If it has a previewDigest, \
+get confirmation again before retrying. Otherwise follow the error's instructions.
 - "accepted" means Keeper admitted the intent. Use intent_wait with its key \
 to check for a final outcome.
 - If a trade returns code OUTCOME_UNKNOWN, call intent_wait with its \
