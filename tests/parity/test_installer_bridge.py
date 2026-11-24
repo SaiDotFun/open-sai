@@ -57,12 +57,19 @@ class Replay:
         self.latest = "0.2.0"
         self.requests: list[str] = []
         self.assets: dict[str, bytes] = {}
+        self.redirects: dict[str, str] = {}
         replay = self
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self) -> None:
                 path = unquote(self.path.split("?", 1)[0])
                 replay.requests.append(path)
+                if location := replay.redirects.get(path):
+                    self.send_response(302)
+                    self.send_header("Location", location)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
                 if path == f"/repos{REPO}/releases":
                     body = json.dumps(
                         [
@@ -497,6 +504,22 @@ def pre_bridge_files() -> tuple[Path, Path]:
     baseline = artifact("PRE_BRIDGE")
     assert (baseline / "commit").read_text().strip() == PRE_BRIDGE_COMMIT
     return baseline / f"sai_cli-{PRE_BRIDGE}-py3-none-any.whl", baseline / "install.py"
+
+
+def test_python_bridge_rejects_cross_origin_manifest_redirect(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = artifact("BRIDGE")
+    wheel = artifact("SHIM")
+    prepare_uv(install, python_wheel, replay)
+    version = add_shim(replay, wheel)
+    manifest = f"{REPO}/releases/download/sai-cli/v{version}/SHA256SUMS"
+    with ThreadingHTTPServer(("127.0.0.1", 0), BaseHTTPRequestHandler) as other:
+        replay.redirects[manifest] = f"http://127.0.0.1:{other.server_port}/SHA256SUMS"
+        result = install.update(replay)
+    assert result.returncode == 1
+    assert "redirected outside its download hosts" in result.stderr
+    install.pin(wheel_version(python_wheel))
 
 
 @pytest.mark.skipif(WINDOWS, reason="Windows has a separate compatibility rehearsal")

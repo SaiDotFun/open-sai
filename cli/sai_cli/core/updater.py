@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -57,6 +58,11 @@ EXIT_UNSUPPORTED = ExitCode.UNSUPPORTED
 
 MAX_WHEEL = 64 << 20
 MAX_SUMS = 1 << 16
+DOWNLOAD_HOSTS = {
+    "github.com",
+    "release-assets.githubusercontent.com",
+    "objects.githubusercontent.com",
+}
 DOWNLOAD_TIMEOUT = 120.0
 UV_TIMEOUT = 600.0
 VERIFY_TIMEOUT = 60.0
@@ -200,30 +206,73 @@ def locked(path: Path | None = None, wait: float = 0.0) -> Generator[bool]:
 # Download and verify
 
 
+def _loopback(host: str) -> bool:
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host == "localhost"
+
+
+def _release_host(url: httpx.URL) -> bool:
+    return (
+        url.scheme == "https"
+        and url.host in DOWNLOAD_HOSTS
+        and url.port in (None, 443)
+        and not url.userinfo
+    )
+
+
 def _download(
     client: httpx.Client, url: str, target: Path, limit: int, deadline: float
 ) -> None:
-    name = url.rsplit("/", 1)[-1]
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise UpdateFailed(f"timed out downloading {name}")
-    timeout = httpx.Timeout(min(remaining, 30.0))
-    size = 0
-    with client.stream("GET", url, timeout=timeout) as response:
-        if response.status_code == 404:
-            raise UpdateFailed(f"the release has no file {name}")
-        if response.status_code != 200:
-            raise UpdateFailed(
-                f"downloading {name} answered HTTP {response.status_code}"
-            )
-        with target.open("wb") as handle:
-            for chunk in response.iter_bytes():
-                size += len(chunk)
-                if size > limit:
-                    raise UpdateFailed(f"{name} is larger than expected")
-                if time.monotonic() > deadline:
-                    raise UpdateFailed(f"timed out downloading {name}")
-                handle.write(chunk)
+    origin = address = httpx.URL(url)
+    name = target.name
+    official = origin.host == "github.com" and _release_host(origin)
+    if not official and (
+        origin.scheme not in ("http", "https")
+        or origin.userinfo
+        or not _loopback(origin.host)
+    ):
+        raise UpdateFailed("release downloads require official or loopback URLs")
+    for _ in range(5):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise UpdateFailed(f"timed out downloading {name}")
+        timeout = httpx.Timeout(min(remaining, 30.0))
+        with client.stream("GET", address, timeout=timeout) as response:
+            if response.has_redirect_location:
+                address = address.join(response.headers["location"])
+                valid = (
+                    _release_host(address)
+                    if official
+                    else (
+                        address.scheme == origin.scheme
+                        and address.netloc == origin.netloc
+                        and not address.userinfo
+                    )
+                )
+                if not valid:
+                    raise UpdateFailed(
+                        "the release redirected outside its download hosts"
+                    )
+                continue
+            if response.status_code == 404:
+                raise UpdateFailed(f"the release has no file {name}")
+            if response.status_code != 200:
+                raise UpdateFailed(
+                    f"downloading {name} answered HTTP {response.status_code}"
+                )
+            size = 0
+            with target.open("wb") as handle:
+                for chunk in response.iter_bytes():
+                    size += len(chunk)
+                    if size > limit:
+                        raise UpdateFailed(f"{name} is larger than expected")
+                    if time.monotonic() > deadline:
+                        raise UpdateFailed(f"timed out downloading {name}")
+                    handle.write(chunk)
+            return
+    raise UpdateFailed("the release redirected too many times")
 
 
 def expected_hash(sums: str, name: str) -> str | None:
@@ -268,7 +317,7 @@ def fetch_wheel(
     def work() -> None:
         try:
             headers = {"User-Agent": "sai-cli"}
-            with httpx.Client(headers=headers, follow_redirects=True) as client:
+            with httpx.Client(headers=headers) as client:
                 _download(client, release.sums_url, sums, MAX_SUMS, deadline)
                 _download(client, release.wheel_url, wheel, MAX_WHEEL, deadline)
         except Exception as exc:  # noqa: BLE001 - re-raised in the caller
