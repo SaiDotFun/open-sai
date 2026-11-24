@@ -117,6 +117,7 @@ class Registration:
             self.argv
             and target.argv
             and self.argv[1:] == target.argv[1:]
+            and shutil.which(self.argv[0]) is not None
             and normalize_launcher(self.argv[0]) == normalize_launcher(target.argv[0])
         )
 
@@ -560,13 +561,14 @@ class Claude(Client):
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
         projects = (data or {}).get("projects")
-        project = (
-            projects.get(str(self.cwd))
-            if self.cwd is not None and isinstance(projects, dict)
-            else None
+        projects = projects if isinstance(projects, dict) else {}
+        project = projects.get(str(self.cwd)) if self.cwd is not None else None
+        project = project if isinstance(project, dict) else {}
+        toggle_project = (
+            projects.get(str(self.main_checkout() or self.cwd)) if projects else None
         )
-        project = project if isinstance(project, dict) else None
-        toggled_off = (project or {}).get("disabledMcpServers")
+        toggle_project = toggle_project if isinstance(toggle_project, dict) else {}
+        toggled_off = toggle_project.get("disabledMcpServers")
         disabled = isinstance(toggled_off, list) and name in toggled_off
         found = []
         user = servers(data).get(name)

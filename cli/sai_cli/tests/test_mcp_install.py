@@ -919,6 +919,24 @@ def test_doctor_repairs_codex_with_a_normalized_stable_launcher(
         assert mcp_checks(invoke("doctor", "--offline"))["codex"]["status"] == "pass"
 
 
+def test_codex_install_replaces_launcher_with_a_missing_path_component(env: Env):
+    missing = env.root / "removed-directory"
+    launcher = missing / ".." / "bin" / "sai"
+    env.write_codex({"sai": claude_entry([str(launcher), *serve(env)[1:]])})
+
+    listed = invoke("mcp", "list")
+    assert listed.exit_code == 0, listed.output
+    codex = next(row for row in payload(listed)["clients"] if row["client"] == "codex")
+    assert codex["registered"] and not codex["current"]
+    assert not codex["registrations"][0]["current"]
+
+    installed = invoke("mcp", "install", "codex")
+    assert installed.exit_code == 0, installed.output
+    assert actions(installed) == {"codex": "replaced"}
+    entry = tomlkit.parse(env.codex_path().read_text())["mcp_servers"]["sai"]
+    assert entry["command"] == str(env.sai)
+
+
 def test_install_uses_each_clients_registration_backend(env: Env):
     result = invoke("mcp", "install", "claude", "codex", "cursor")
     assert result.exit_code == 0, result.output
@@ -1103,9 +1121,12 @@ def test_claude_install_leaves_a_disabled_canonical_project_entry_in_place(
 @pytest.mark.skipif(
     os.name == "nt", reason="Claude uses worktree-local settings on Windows"
 )
-@pytest.mark.parametrize("name", [OLD_COMMAND, "sai"])
+@pytest.mark.parametrize(
+    ("name", "entry_scope"),
+    [(OLD_COMMAND, "project"), ("sai", "project"), (OLD_COMMAND, "user")],
+)
 def test_claude_install_honors_settings_from_the_main_checkout(
-    env: Env, monkeypatch: pytest.MonkeyPatch, name: str
+    env: Env, monkeypatch: pytest.MonkeyPatch, name: str, entry_scope: str
 ):
     git = shutil.which("git", path=os.defpath)
     assert git is not None
@@ -1130,22 +1151,40 @@ def test_claude_install_honors_settings_from_the_main_checkout(
         subprocess.run(
             [git, "-C", str(env.project), *args], check=True, capture_output=True
         )
-    policy = env.project / ".claude" / "settings.local.json"
-    policy.parent.mkdir()
-    policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
-    config = linked / ".mcp.json"
-    config.write_text(json.dumps({"mcpServers": {name: claude_entry(serve(env))}}))
-    before = config.read_bytes(), policy.read_bytes()
+    data: dict[str, Any] = {"mcpServers": {name: claude_entry(serve(env))}}
+    if entry_scope == "user":
+        config = env.home / ".claude.json"
+        data["projects"] = {
+            str(env.project): {"disabledMcpServers": [name]},
+            str(linked): {"disabledMcpServers": []},
+        }
+        paths = [config]
+    else:
+        config = linked / ".mcp.json"
+        policy = env.project / ".claude" / "settings.local.json"
+        policy.parent.mkdir()
+        policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
+        paths = [config, policy]
+    config.write_text(json.dumps(data))
+    before = [path.read_bytes() for path in paths]
     monkeypatch.chdir(linked)
     scope = "user" if name == OLD_COMMAND else "project"
+
+    listed = invoke("mcp", "list")
+    assert listed.exit_code == 0, listed.output
+    claude = next(
+        row for row in payload(listed)["clients"] if row["client"] == "claude"
+    )
+    assert claude["disabled"] and not claude["current"]
+    assert claude["registrations"][0]["disabled"]
+    env.clear()
 
     result = invoke("mcp", "install", "claude", "--scope", scope)
 
     message = failure(result)
-    assert "claude (project): failed" in message and "disabled" in message
+    assert f"claude ({entry_scope}): failed" in message and "disabled" in message
     assert name in message and "Review MCP approvals" in message
-    assert (config.read_bytes(), policy.read_bytes()) == before
-    assert not (env.home / ".claude.json").exists()
+    assert [path.read_bytes() for path in paths] == before
     assert not env.calls()
 
 
