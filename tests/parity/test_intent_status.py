@@ -1105,7 +1105,19 @@ def test_expired_auth_status(
                 'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
             )
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        observed.append((payload, read_events(home)))
+        events = read_events(home)
+        [start] = [event for event in events if event["event"] == "command.start"]
+        command_words = ["auth", "status"]
+        # The C4 reference predates auth argument privacy. Assert each form
+        # before comparing the remaining fields and expiry events.
+        expected_argv = (
+            ["--json", "--endpoint", origin, *command_words]
+            if index == 0
+            else command_words
+        )
+        assert start["argv"] == expected_argv
+        start["argv"] = command_words
+        observed.append((payload, events))
     assert observed[0] == observed[1]
 
 
