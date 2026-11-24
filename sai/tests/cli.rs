@@ -51,8 +51,10 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     let path = root.path().join("config.toml");
     let contents = "[keeper]\nendpoint = \"https://who:fixture@EXAMPLE.invalid:443/query?token=fixture\"\nfuture_setting = 1\n[update]\nauto = false\n";
     fs::write(&path, contents).unwrap();
+    let lcd_origin = "https://lcd.example:8443";
+    let lcd = format!("{lcd_origin}/fixture-lcd-path?key=fixture-lcd-query");
     let output = sai(root.path())
-        .args(["--json", "config", "list"])
+        .args(["--lcd-endpoint", &lcd, "--json", "config", "list"])
         .output()
         .unwrap();
     let result = read_json(&output);
@@ -60,15 +62,15 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     assert_eq!(
         result["settings"]["keeper.endpoint"],
         json!({
-            "value": "https://example.invalid:443/query",
+            "value": "https://example.invalid:443",
             "source": "file",
             "env": "SAI_ENDPOINT",
-            "default": "https://sai-keeper.nibiru.fi/query",
+            "default": "https://sai-keeper.nibiru.fi",
         })
     );
     assert_eq!(
         result["settings"]["keeper.ws_endpoint"]["value"],
-        "wss://example.invalid:443/query"
+        "wss://example.invalid:443"
     );
     assert_eq!(
         result["settings"]["keeper.ws_endpoint"]["source"],
@@ -76,11 +78,35 @@ fn lists_values_and_sources_with_redacted_urls_and_unknown_key_warnings() {
     );
     assert_eq!(result["settings"]["update.auto"]["value"], false);
     assert_eq!(result["settings"]["logs.keep_days"]["value"], 14);
+    assert_eq!(result["settings"]["lcd.endpoint"]["value"], lcd_origin);
+    assert_eq!(result["settings"]["lcd.endpoint"]["source"], "flag");
     assert!(
         String::from_utf8_lossy(&output.stderr)
             .contains("ignoring unknown setting 'keeper.future_setting'")
     );
     assert_eq!(fs::read_to_string(path).unwrap(), contents);
+
+    let logs: String = fs::read_dir(root.path().join("logs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .map(|path| fs::read_to_string(path).unwrap())
+        .collect();
+    assert!(logs.contains(lcd_origin));
+    for secret in ["fixture-lcd-path", "fixture-lcd-query"] {
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+        assert!(!logs.contains(secret));
+    }
+    let exact = sai(root.path())
+        .args(["--lcd-endpoint", &lcd, "config", "get", "lcd.endpoint"])
+        .output()
+        .unwrap();
+    assert!(exact.status.success());
+    assert_eq!(String::from_utf8(exact.stdout).unwrap(), format!("{lcd}\n"));
 }
 
 #[test]
