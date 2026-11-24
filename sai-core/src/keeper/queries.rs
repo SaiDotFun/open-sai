@@ -1,4 +1,4 @@
-//! GraphQL documents shared with the Python CLI at 5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf.
+//! GraphQL documents for Keeper requests.
 
 pub const MARKETS: &str = "query { perp { borrowings { marketId price isOpen visible minLeverage maxLeverage minPositionSizeUSD openFeePct closeFeePct baseToken { id symbol name } quoteToken { symbol } collateralToken { id symbol } } } }";
 pub const MARKET: &str = "query($market:Int!, $collateral:Int!) { perp { borrowing(marketId:$market,collateralId:$collateral) { marketId isOpen minLeverage maxLeverage collateralToken { id symbol } } } }";

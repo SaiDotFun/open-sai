@@ -33,8 +33,7 @@ return the usual session refusal when it cannot trade.
 
 ## Port Order
 
-C2 and C3 started against Python tag `sai-cli/v0.1.1`. C4 started against
-Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf`. Rust CI checks C4
+C2 and C3 started against Python tag `sai-cli/v0.1.1`. Rust CI checks C4
 against the published Python tag `sai-cli/v0.1.2` at commit
 `8557a7e13dceab0accc369191182c8e01423c91b`. That release shipped logging
 schema v2 and intent wait. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
