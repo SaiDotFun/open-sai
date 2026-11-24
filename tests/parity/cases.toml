@@ -776,8 +776,8 @@ name = "mcp-auth-use"
 args = ["mcp","serve"]
 mode = "mcp"
 mcp_profile = "auth-use"
-seed = "accounts"
-state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
+seed = "mcp-auth-switch"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222", "trader/sessions.lock#@mode" = 0o600 }
 
 [[case]]
 name = "mcp-overview-validation"

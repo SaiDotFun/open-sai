@@ -192,13 +192,14 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         "doctor-near-expiry",
         "doctor-ledger-session",
         "history-token",
+        "mcp-auth-switch",
     }:
         sessions.append(session_fixture(endpoints, "session"))
         if seed == "doctor-near-expiry":
             sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
-        if seed == "accounts":
+        if seed in {"accounts", "mcp-auth-switch"}:
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
     if seed == "doctor-ledger-session":
         config = sai_home / "config.toml"
@@ -211,6 +212,8 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         ledger=seed in {"ledger", "doctor-ledger-session"},
         disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
     )
+    if seed == "mcp-auth-switch":
+        (sai_home / "trader" / "sessions.lock").chmod(0o600)
 
 
 def session_fixture(endpoints: Endpoints, state: str) -> dict[str, Any]:
