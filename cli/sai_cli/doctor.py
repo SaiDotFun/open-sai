@@ -3,8 +3,8 @@ fix the rest.
 
 Each check returns pass, warn, fail, skipped, or fixed. A fixed check lists
 what it changed in `changes`. Doctor fixes only what it can from inspection:
-it creates `$SAI_HOME/trader`, tightens file modes there and under
-`$SAI_HOME/logs`, repairs stale MCP registrations, migrates the intent ledger,
+it creates private Sai directories, tightens modes on dedicated profiles and
+managed files, repairs stale MCP registrations, migrates the intent ledger,
 and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
@@ -41,6 +41,7 @@ from .core import (
     keeper,
     log,
     margin,
+    paths,
     reconcile,
     settings,
     storage,
@@ -60,7 +61,7 @@ EXPIRY_WARNING = timedelta(hours=24)
 STATUSES = ("pass", "fixed", "warn", "fail", "skipped")
 SIGN_IN = "sai auth login NAME, or sai auth import"
 REINSTALL = update.INSTALL_COMMAND
-DIR_MODE, FILE_MODE = 0o700, 0o600
+FILE_MODE = 0o600
 
 
 @dataclass
@@ -360,17 +361,39 @@ MANAGED = (
     "intents.sqlite3-journal",
     "history",
 )
+PROFILE_FILES = {
+    "": (
+        settings.FILE_NAME,
+        settings.LOCK_NAME,
+        "update.json",
+        "update.lock",
+        "update-cache.lock",
+    ),
+    "trader": (*MANAGED, "sessions.lock"),
+    "logs": (log.PRUNE_MARKER, log.ENDPOINT_KEY, log.ENDPOINT_KEY_LOCK),
+}
+PROFILE_DIRS = {"": ("trader", "logs", "cache"), "cache": ("wheels",)}
+PROFILE_SHARED_MODE = stat.S_ISGID | stat.S_ISVTX | 0o022
 SYMLINK_FIX = "Replace the symlink with a real file or directory by hand"
+SAI_HOME_MODE_FIX = (
+    "This Sai home may be shared. Stop all Sai CLI and MCP processes before moving"
+    " the profile to a dedicated directory. Keep the trader data, including the intent"
+    " ledger. Set SAI_HOME to the new directory for the CLI and in every MCP client"
+    " configuration before restarting clients or resuming trading."
+)
 
 
 def symlinks(names: Sequence[str] = MANAGED) -> list[Path]:
-    """Return `$SAI_HOME/trader`, or any of NAMES in it, that is a symlink.
+    """Return symlinks in the path to the trader directory or its named files.
 
     Doctor never writes through one: a chmod, migration, or status update
     would land wherever the link points.
     """
     root = storage.home()
-    return [path for path in [root, *(root / n for n in names)] if path.is_symlink()]
+    for directory in (root.parent, root):
+        if directory.is_symlink():
+            return [directory]
+    return [root / name for name in names if (root / name).is_symlink()]
 
 
 def loose_modes(paths: Sequence[Path]) -> list[tuple[Path, int, int]]:
@@ -423,6 +446,13 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
                 continue
             try:
                 info_ = os.fstat(fd)
+                if (
+                    name is None
+                    and hasattr(os, "getuid")
+                    and info_.st_uid != os.getuid()
+                ):
+                    failed.append(f"{path} belongs to another user; fix by hand")
+                    break
                 if name is not None and info_.st_nlink > 1:
                     failed.append(f"{path} has other hard links; fix by hand")
                     continue
@@ -440,73 +470,148 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
     return changes, failed
 
 
+def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
+    """Check for Sai data. Return None if the layout contains an unfamiliar entry."""
+    has_data = False
+    for name in os.listdir(fd):
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if info.st_uid != owner:
+            return None
+        if name in PROFILE_DIRS.get(directory, ()) and stat.S_ISDIR(info.st_mode):
+            if info.st_mode & PROFILE_SHARED_MODE:
+                return None
+            child = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+            )
+            try:
+                relative = f"{directory}/{name}" if directory else name
+                if not os.path.samestat(info, os.fstat(child)):
+                    return None
+                child_has_data = profile_has_data(child, owner, relative)
+                if child_has_data is None:
+                    return None
+                has_data |= child_has_data
+            finally:
+                os.close(child)
+        elif not stat.S_ISREG(info.st_mode) or not (
+            name in PROFILE_FILES.get(directory, ())
+            or (directory == "logs" and log.parse_name(name) is not None)
+            or (directory == "cache/wheels" and update.is_wheel_name(name))
+        ):
+            return None
+        elif directory != "logs":
+            # Doctor creates diagnostics when it runs. Those alone do not
+            # establish that the user had a Sai profile here.
+            has_data = True
+    return has_data
+
+
+def tighten_profile_root(path: Path) -> str | None:
+    """Repair a dedicated, user-owned profile during an explicit doctor fix."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            mode = stat.S_IMODE(info.st_mode)
+            if (
+                info.st_uid != os.getuid()
+                or mode & PROFILE_SHARED_MODE
+                or not mode & 0o077
+                or not profile_has_data(fd, info.st_uid)
+                or os.fstat(fd).st_mode != info.st_mode
+            ):
+                return None
+            private_mode = mode & ~0o077
+            os.fchmod(fd, private_mode)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    return f"chmod {path} {mode:o} -> {private_mode:o}"
+
+
 def check_home(ctx: Context) -> Check:
-    """`$SAI_HOME/trader` exists, and only its owner can read it or the
-    files sai keeps there."""
+    """Check the modes on `$SAI_HOME`, `trader`, and its managed files."""
     root = storage.home()
+    sai_home = root.parent
+    details: dict[str, Any] = {"path": str(root), "saiHome": str(sai_home)}
     links = symlinks()
+    home_loose = [] if sai_home in links else loose_modes([sai_home])
+    trader_loose = (
+        [] if links else loose_modes([root, *(root / name for name in MANAGED)])
+    )
+    loose = home_loose + trader_loose
+    details["looseModes"] = [
+        {"path": str(path), "mode": f"{mode:o}"} for path, mode, _ in loose
+    ]
+    home_fix = SAI_HOME_MODE_FIX if home_loose else ""
     if links:
         return Check(
             "home",
             "fail",
-            f"{', '.join(map(str, links))}: trader path is a symlink; doctor"
-            " changes nothing there",
-            SYMLINK_FIX,
-            {"path": str(root), "symlinks": [str(path) for path in links]},
+            f"{', '.join(map(str, links))}: profile path is a symlink",
+            f"{SYMLINK_FIX}. {home_fix}" if home_fix else SYMLINK_FIX,
+            {**details, "symlinks": [str(path) for path in links]},
         )
-    if not root.is_dir():
-        if not ctx.fix:
-            return Check(
-                "home",
-                "pass",
-                f"{root} does not exist yet; sai creates it on first use",
-                None,
-                {"path": str(root)},
-            )
-        storage.directory()
-        return Check(
-            "home",
-            "fixed",
-            f"Created {root}",
-            None,
-            {"path": str(root)},
-            changes=[f"created {root} with mode {DIR_MODE:o}"],
-        )
-    paths = [root, *(root / name for name in MANAGED if (root / name).exists())]
-    loose = loose_modes(paths)
-    details: dict[str, Any] = {
-        "path": str(root),
-        "looseModes": [
-            {"path": str(path), "mode": f"{mode:o}"} for path, mode, _ in loose
-        ],
-    }
-    if not loose:
-        return Check("home", "pass", f"{root} is private", None, details)
-    commands = "; ".join(f"chmod go-rwx {path}" for path, _, _ in loose)
-    if not ctx.fix:
+    trader_exists = root.is_dir()
+    if loose and not ctx.fix:
+        trader_fix = "; ".join(f"chmod go-rwx {path}" for path, _, _ in trader_loose)
         return Check(
             "home",
             "warn",
-            f"{plural(len(loose), 'path')} under {root} readable by other users",
-            commands,
+            f"{plural(len(loose), 'path')} in {sai_home} accessible by other users",
+            f"{home_fix} {trader_fix}".strip(),
             details,
         )
-    changes, failed = tighten(root, MANAGED)
+    if not trader_exists and not ctx.fix:
+        return Check(
+            "home",
+            "pass",
+            f"{root} does not exist yet; sai creates it on first use",
+            None,
+            details,
+        )
+    changes: list[str] = []
+    failed: list[str] = []
+    if trader_exists and trader_loose:
+        changes, failed = tighten(root, MANAGED)
+    if home_loose and not failed:
+        change = tighten_profile_root(sai_home)
+        if change is not None:
+            changes.append(change)
+            home_fix = ""
+    if not trader_exists:
+        home_exists = sai_home.is_dir()
+        storage.directory()
+        if not home_exists:
+            changes.append(f"created {sai_home} with mode {paths.PRIVATE_MODE:o}")
+        changes.append(f"created {root} with mode {paths.PRIVATE_MODE:o}")
     if failed:
         return Check(
             "home",
             "fail",
             f"Could not make {plural(len(failed), 'path')} private",
-            "; ".join(failed),
+            f"{home_fix} {'; '.join(failed)}".strip(),
+            details,
+            changes=changes,
+        )
+    if home_fix:
+        return Check(
+            "home",
+            "warn",
+            f"{sai_home} is accessible by other users",
+            home_fix,
             details,
             changes=changes,
         )
     if not changes:
-        return Check("home", "pass", f"{root} is private", None, details)
+        return Check(
+            "home", "pass", f"{sai_home} and {root} are private", None, details
+        )
     return Check(
         "home",
         "fixed",
-        f"Made {plural(len(changes), 'path')} under {root} private",
+        f"Made {plural(len(changes), 'path')} in {sai_home} private",
         None,
         details,
         changes=changes,
@@ -517,6 +622,14 @@ def check_logs(ctx: Context) -> Check:
     """Only the owner can read `$SAI_HOME/logs` and the log files in it."""
     log.flush(1.0)
     root = log.directory()
+    if root.parent.is_symlink():
+        return Check(
+            "logs",
+            "fail",
+            f"{root.parent}: Sai home is a symlink",
+            SYMLINK_FIX,
+            {"path": str(root), "symlinks": [str(root.parent)]},
+        )
     on, keep_days = log.config()
     names = [path.name for _day, _surface, path in log.log_files(root)]
     names += [log.PRUNE_MARKER] if (root / log.PRUNE_MARKER).exists() else []
@@ -1212,7 +1325,9 @@ def run_network(ctx: Context, deadline: float) -> list[Check]:
     return checks
 
 
-def run_checks(ctx: Context) -> list[Check]:
+def run_checks(
+    ctx: Context, *, after_home: Callable[[], None] | None = None
+) -> list[Check]:
     """Run local checks in order, then network checks in parallel."""
     checks: list[Check] = []
     for name, fn in LOCAL_CHECKS:
@@ -1220,6 +1335,8 @@ def run_checks(ctx: Context) -> list[Check]:
             checks.append(Check(name, "skipped", "Settings could not be loaded"))
         else:
             checks.extend(timed(name, fn, ctx))
+        if name == "home" and after_home is not None:
+            after_home()
     if ctx.offline:
         checks.extend(
             Check(name, "skipped", "Skipped with --offline")

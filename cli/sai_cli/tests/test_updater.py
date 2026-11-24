@@ -1075,11 +1075,22 @@ def test_the_wheel_cache_must_be_private_and_ours(tmp_path, sai_home, monkeypatc
     wheel. Ours is tightened; someone else's is refused."""
     wheels = sai_home / "cache" / "wheels"
     wheels.mkdir(parents=True)
-    for directory in (sai_home, sai_home / "cache", wheels):
-        directory.chmod(0o777)
+    wheels.parent.chmod(0o777)
+    wheels.chmod(0o777)
+    sai_home.chmod(0o2770)
+    with pytest.raises(updater.UpdateFailed, match="writable by other users"):
+        updater.private_cache()
+    assert sai_home.stat().st_mode & 0o7777 == 0o2770
+
+    sai_home.chmod(0o700)
+    with pytest.raises(updater.UpdateFailed, match="writable by other users"):
+        updater.private_cache()
+    assert wheels.parent.stat().st_mode & 0o777 == 0o777
+
+    wheels.parent.chmod(0o755)
     assert updater.private_cache() == wheels
-    for directory in (sai_home, sai_home / "cache", wheels):
-        assert directory.stat().st_mode & 0o777 == 0o700, directory
+    assert wheels.parent.stat().st_mode & 0o777 == 0o755
+    assert wheels.stat().st_mode & 0o777 == 0o700
 
     other = os.getuid() + 1
     monkeypatch.setattr(updater.os, "getuid", lambda: other)

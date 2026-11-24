@@ -31,7 +31,7 @@ from tomlkit.items import Comment, Null, Table, Trivia
 from websockets.exceptions import InvalidURI
 from websockets.uri import parse_uri
 
-from . import keeper, margin, stream
+from . import keeper, margin, paths, stream
 
 FILE_NAME = "config.toml"
 LOCK_NAME = ".config.lock"
@@ -279,7 +279,7 @@ def check_value(key: str, value: Any) -> str | bool | int:
 
 def sai_home(env: Mapping[str, str]) -> Path:
     """The Sai home directory, as core.storage finds it."""
-    return Path(env.get("SAI_HOME", Path.home() / ".sai"))
+    return paths.sai_home(env)
 
 
 def config_path(env: Mapping[str, str]) -> Path:
@@ -664,8 +664,7 @@ def unset_value(
 
 def write_file(path: Path, text: str) -> None:
     """Write TEXT to PATH atomically, mode 0600 in a 0700 directory."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    paths.private_directory(path.parent, profile_root=True)
     # mkstemp creates the file with mode 0600.
     fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".config-")
     try:
@@ -680,8 +679,7 @@ def write_file(path: Path, text: str) -> None:
 def _locked(path: Path) -> Generator[None]:
     """Hold an exclusive lock on PATH's sibling `.config.lock` file, so
     concurrent edits run one after another instead of losing changes."""
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.parent.chmod(0o700)
+    paths.private_directory(path.parent, profile_root=True)
     fd = os.open(path.parent / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         if sys.platform == "win32":

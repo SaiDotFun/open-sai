@@ -30,6 +30,7 @@ import os
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -323,40 +324,42 @@ def wheel_cache() -> Path:
     return Path(os.path.abspath(home)) / "cache" / "wheels"
 
 
-def private_dir(path: Path, exact: bool) -> None:
-    """Make sure directory PATH is the current user's and that no one else
-    can write to it, creating it if needed.
-
-    A directory another user can write to would let them swap the verified
-    wheel before uv opens it. One of ours with loose modes is tightened to
-    0700; EXACT makes it 0700 in any case. One that is a symlink, belongs to
-    someone else, or cannot be tightened is refused.
-    """
+def private_dir(path: Path, *, preserve_mode: bool = False) -> None:
+    """Create a private cache directory or check a parent without changing it."""
     if path.is_symlink():
         raise LookupFailed(f"{path} is a symlink; not keeping a wheel under it")
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        path.mkdir(mode=0o700, parents=True)
+        created = True
+    except FileExistsError:
+        created = False
     status = path.stat()
+    if not stat.S_ISDIR(status.st_mode):
+        raise NotADirectoryError(f"{path} is not a directory")
     if hasattr(os, "getuid") and status.st_uid != os.getuid():
         raise LookupFailed(f"{path} belongs to another user; not keeping a wheel there")
     if os.name == "nt":
         return
-    mode = status.st_mode & 0o777
-    if mode & 0o022 or (exact and mode != 0o700):
-        try:
-            path.chmod(0o700)
-        except OSError as error:
+    mode = stat.S_IMODE(status.st_mode)
+    if preserve_mode and not created:
+        if mode & 0o022:
             raise LookupFailed(
-                f"{path} is writable by other users and could not be made private"
-            ) from error
+                f"{path} is writable by other users; choose a private SAI_HOME"
+            )
+        return
+    if mode != 0o700:
+        try:
+            path.chmod(0o700, follow_symlinks=False)
+        except OSError as error:
+            raise LookupFailed(f"{path} could not be made private") from error
 
 
 def private_cache() -> Path:
-    """Return the wheel cache after making $SAI_HOME, `cache`, and
-    `cache/wheels` private to the current user."""
+    """Return the private wheel cache beneath user-owned, non-writable parents."""
     cache = wheel_cache()
-    private_dir(cache.parent.parent, exact=False)
-    private_dir(cache.parent, exact=True)
-    private_dir(cache, exact=True)
+    private_dir(cache.parent.parent, preserve_mode=True)
+    private_dir(cache.parent, preserve_mode=True)
+    private_dir(cache)
     return cache
 
 

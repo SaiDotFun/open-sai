@@ -234,13 +234,28 @@ class LoggedGroup(SaiGroup):
         started = time.monotonic()
         exit_code: int = ExitCode.OK
         failure: SaiError | None = None
+        start_logged = False
+
+        def log_start() -> None:
+            nonlocal start_logged
+            if not quiet and not start_logged:
+                log.event("command.start", argv=log.argv(argv[:64]))
+                start_logged = True
+
         with (
             log.silenced()
             if quiet
             else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
         ):
-            if not quiet:
-                log.event("command.start", argv=log.argv(argv[:64]))
+            if command == "doctor" and not quiet:
+                # Let doctor report directory creation before logging creates
+                # the profile to record its first event.
+                extra["obj"] = {
+                    **(extra.get("obj") or {}),
+                    "doctor_log_start": log_start,
+                }
+            else:
+                log_start()
             try:
                 result = super().main(
                     args,
@@ -264,6 +279,7 @@ class LoggedGroup(SaiGroup):
                     return result
             finally:
                 if not quiet:
+                    log_start()
                     log.event(
                         "command.end",
                         "info" if exit_code == ExitCode.OK else "warn",
@@ -1133,7 +1149,8 @@ def doctor_command(
     """Check the install, config, MCP registrations, session, intent ledger,
     and endpoints.
 
-    With fixes enabled, doctor makes trader and log files private, repairs
+    With fixes enabled, doctor creates private Sai directories, tightens
+    permissions on managed files, repairs
     stale Codex and Cursor MCP registrations, migrates the intent ledger,
     and reconciles unknown intents for the signed-in account with Keeper.
     It reports stale Claude Code registrations with a command to repair
@@ -1153,7 +1170,10 @@ def doctor_command(
     config_check, config = doctor.check_config(flags)
     checks = [
         config_check,
-        *doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline)),
+        *doctor.run_checks(
+            doctor.context(config, fix=not no_fix, offline=offline),
+            after_home=ctx.obj.get("doctor_log_start"),
+        ),
     ]
     overall = doctor.overall(checks)
     code = (
