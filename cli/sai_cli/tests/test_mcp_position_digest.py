@@ -2428,6 +2428,34 @@ def test_open_previews_follow_perp_market_state(position_service, order_type):
     asyncio.run(scenario())
 
 
+def test_signed_out_open_reports_rejection_without_connect_action(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.market_trading_state = "close_only"
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            assert storage.delete_session(ADDR) == ADDR
+            preview = await call(client, "preview_open", args)
+            assert preview["addr"] is None
+            assert preview["confirmationStatus"] == "informational"
+            assert_rejected_preview(preview, "MarketClosed", "close-only")
+            assert "recovery" not in preview
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
 def assert_rejected_preview(quote: dict[str, Any], code: str, reason: str) -> None:
     assert "quote" not in quote
     assert "previewDigest" not in quote
