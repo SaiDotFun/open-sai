@@ -87,6 +87,7 @@ impl ServeArgs {
             install: install::Installation::detect(),
             local_ledger_slots: Arc::new(Semaphore::new(2)),
             reconcile_slots: Arc::new(Semaphore::new(8)),
+            wait_slots: Arc::new(Semaphore::new(stdio::MAX_IN_FLIGHT)),
         };
         server.events().event(
             "mcp.server_start",
@@ -121,6 +122,7 @@ struct SaiMcp {
     install: install::Installation,
     local_ledger_slots: Arc<Semaphore>,
     reconcile_slots: Arc<Semaphore>,
+    wait_slots: Arc<Semaphore>,
 }
 
 impl SaiMcp {
@@ -322,13 +324,28 @@ impl SaiMcp {
             .ok_or_else(SaiError::internal)?
             .to_owned();
         let addr = args.get("addr").and_then(Value::as_str).map(str::to_owned);
+        // Waits hold their worker between polls. Size their pool to stdio admission
+        // so a long wait cannot delay a short one or take an intent_status worker.
+        let remaining = timeout.saturating_sub(started.elapsed());
+        let slot =
+            match tokio::time::timeout(remaining, self.wait_slots.clone().acquire_owned()).await {
+                Ok(slot) => slot.map_err(|_| SaiError::internal())?,
+                Err(_) => {
+                    let mut receipt = wait::unknown_result(&key);
+                    if let Some(addr) = addr {
+                        receipt.body["addr"] = json!(addr);
+                    }
+                    return Ok(wait_result(Map::new(), receipt));
+                }
+            };
         let home = self.env.home.clone();
         let endpoint = self.settings.endpoint().to_owned();
         let writer = self.writer.clone();
         let call_id = call_id.to_owned();
         let runtime = tokio::runtime::Handle::current();
         let (_cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
-        Self::blocking_work(&self.reconcile_slots, move || {
+        tokio::task::spawn_blocking(move || {
+            let _slot = slot;
             let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
                 .with_tool("intent_wait", &call_id);
             let log_storage = |event: StorageEvent<'_>| {
@@ -371,6 +388,7 @@ impl SaiMcp {
             })
         })
         .await
+        .map_err(|_| SaiError::internal())?
     }
 
     async fn info(&self, storage: &Storage<'_>) -> Result<Value, SaiError> {

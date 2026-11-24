@@ -18,7 +18,7 @@ use tokio::{
 };
 
 // A slot covers an admitted request through the flush of its reply.
-const MAX_IN_FLIGHT: usize = 64;
+pub(super) const MAX_IN_FLIGHT: usize = 64;
 type Outbound = (ServerJsonRpcMessage, Option<OwnedSemaphorePermit>);
 
 pub(super) struct Stdio {

@@ -177,6 +177,44 @@ def test_cancelling_read_closes_keeper_connection(
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
 
 
+def test_short_intent_wait_polls_while_eight_long_waits_are_pending(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("interrupt-http") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="ledger") as stdio,
+    ):
+        try:
+            for id_ in range(2, 10):
+                stdio.send(
+                    "tools/call",
+                    id_=id_,
+                    name="intent_wait",
+                    arguments={"addr": ADDRESS, "key": INTENT, "timeout": 10},
+                )
+            deadline = time.monotonic() + 3
+            while len(endpoints.wire) < 8:
+                assert time.monotonic() < deadline, "Keeper did not receive eight waits"
+                time.sleep(0.01)
+            stdio.send(
+                "tools/call",
+                id_=10,
+                name="intent_wait",
+                arguments={"addr": ADDRESS, "key": INTENT, "timeout": 0.25},
+            )
+            response = stdio.receive(timeout=1.5)
+            assert response["id"] == 10
+            body = json.loads(response["result"]["content"][0]["text"])
+            assert body["code"] == "OUTCOME_UNKNOWN"
+            assert body["intentKey"] == INTENT
+            assert body["addr"] == ADDRESS
+            assert [request.label for request in endpoints.wire] == [
+                "waitUserIntents"
+            ] * 9
+        finally:
+            endpoints.interrupt_closed.set()
+
+
 def test_cancellation_is_admitted_while_request_slots_are_full(
     native: Path, tmp_path: Path
 ) -> None:
