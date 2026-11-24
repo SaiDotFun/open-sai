@@ -245,7 +245,7 @@ impl Overview<'_> {
                 variables(json!({"trader": self.addr, "limit": PAGE_SIZE, "offset": rows.len()}));
             let result = self
                 .keeper
-                .request(query, vars, None, keeper::TIMEOUT)
+                .read_until(query, vars, keeper::TIMEOUT, std::future::pending())
                 .await
                 .and_then(|data| {
                     data.get("perp")

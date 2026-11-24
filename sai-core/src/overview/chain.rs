@@ -39,11 +39,11 @@ impl<'a> Chain<'a> {
             return None;
         }
         let route = keeper
-            .request(
+            .read_until(
                 keeper::ROUTE,
                 variables(json!({})),
-                None,
                 Duration::from_secs(3),
+                std::future::pending(),
             )
             .await
             .ok()?;

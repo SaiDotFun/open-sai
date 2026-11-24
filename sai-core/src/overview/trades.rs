@@ -77,7 +77,12 @@ pub(super) async fn read(view: &Overview<'_>) -> TradeSections {
         Ok((Prices::new(), None))
     } else {
         view.keeper
-            .request(keeper::PRICES, Object::new(), None, keeper::TIMEOUT)
+            .read_until(
+                keeper::PRICES,
+                Object::new(),
+                keeper::TIMEOUT,
+                std::future::pending(),
+            )
             .await
             .and_then(|data| Ok((parse_prices(&data).ok_or_else(invalid)?, Some(now()))))
     };
@@ -171,11 +176,11 @@ fn total_pnl(rows: &[Value]) -> Option<f64> {
 
 async fn fill_awaits_indexing(view: &Overview<'_>) -> bool {
     view.keeper
-        .request(
+        .read_until(
             keeper::INTENTS,
             variables(json!({"user": view.addr})),
-            None,
             Duration::from_secs(3),
+            std::future::pending(),
         )
         .await
         .ok()

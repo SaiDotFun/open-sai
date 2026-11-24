@@ -659,7 +659,14 @@ def loopback(
                         self.reject(str(exc))
                         return
                     if response is not None:
-                        self.reply(response)
+                        if (
+                            scenario == "overview-interrupt-http"
+                            and name == "overviewTrades"
+                        ):
+                            interrupt_ready.set()
+                            interrupt_closed.wait(8)
+                        else:
+                            self.reply(response)
                         return
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
                     self.admit_trade(request.variables)

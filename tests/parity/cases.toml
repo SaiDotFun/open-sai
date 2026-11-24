@@ -155,6 +155,19 @@ mode = "text"
 expect = 2
 
 [[case]]
+name = "account-overview-interrupt-http"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+server = "overview-interrupt-http"
+interrupt_on_request = true
+expect = 1
+wire = ["ws:init", "ws:userBalancesWithBlock", "overviewTrades"]
+[case.state]
+"logs/cli.jsonl#1.event" = "keeper.request"
+"logs/cli.jsonl#1.operation" = "overview_trades"
+"logs/cli.jsonl#1.status" = "error"
+"logs/cli.jsonl#1.code" = "INTERNAL_ERROR"
+
+[[case]]
 name = "account-overview-help"
 args = ["account", "overview", "--help"]
 mode = "text"

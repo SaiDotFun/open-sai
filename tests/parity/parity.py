@@ -408,9 +408,10 @@ def observe(
             result = interrupt_command(
                 binary, args, home, env, ready=endpoints.interrupt_ready
             )
-            if case.server != "interrupt-http" and not endpoints.interrupt_closed.wait(
-                4
-            ):
+            if case.server not in {
+                "interrupt-http",
+                "overview-interrupt-http",
+            } and not endpoints.interrupt_closed.wait(4):
                 raise ValueError("WebSocket did not close after SIGINT")
         finally:
             endpoints.interrupt_closed.set()

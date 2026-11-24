@@ -40,6 +40,55 @@ struct ResponseLog {
     error_count: Option<usize>,
 }
 
+type RequestOutcome<'a> = (&'static str, Level, Option<Code>, Option<&'a str>);
+const INTERRUPTED_READ: RequestOutcome<'static> =
+    ("error", Level::Warn, Some(Code::InternalError), None);
+
+struct RequestEvent<'a> {
+    endpoint: &'a str,
+    events: EventContext<'a>,
+    operation: &'static str,
+    addr: Option<&'a str>,
+    authenticated: bool,
+    started: Instant,
+    log_cancelled: bool,
+}
+
+impl RequestEvent<'_> {
+    fn emit(&self, (status, level, code, error): RequestOutcome<'_>, response: ResponseLog) {
+        let duration = (self.started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
+        self.events.event(
+            "keeper.request",
+            level,
+            [
+                ("operation", json!(self.operation).into()),
+                ("endpoint", Field::Endpoint(self.endpoint.into())),
+                ("endpointId", Field::endpoint_identity(self.endpoint)),
+                ("addr", json!(self.addr).into()),
+                ("authenticated", json!(self.authenticated).into()),
+                ("durationMs", json!(duration).into()),
+                ("status", json!(status).into()),
+                ("code", json!(code).into()),
+                ("error", json!(error).into()),
+                ("httpStatus", json!(response.http_status).into()),
+                (
+                    "keeperErrors",
+                    response.errors.unwrap_or(Field::Scalar(Value::Null)),
+                ),
+                ("keeperErrorCount", json!(response.error_count).into()),
+            ],
+        );
+    }
+}
+
+impl Drop for RequestEvent<'_> {
+    fn drop(&mut self) {
+        if self.log_cancelled {
+            self.emit(INTERRUPTED_READ, ResponseLog::default());
+        }
+    }
+}
+
 impl<'a> Keeper<'a> {
     pub fn new(endpoint: &'a str, events: EventContext<'a>) -> Self {
         Self { endpoint, events }
@@ -57,11 +106,18 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, token, timeout, std::future::pending())
-            .await
+        self.request_with(
+            query,
+            variables,
+            token,
+            timeout,
+            std::future::pending(),
+            false,
+        )
+        .await
     }
 
-    /// Make an interruptible public read.
+    /// Make a public read and log an interruption if its caller drops the pending future.
     pub async fn read_until(
         &self,
         query: &str,
@@ -69,7 +125,7 @@ impl<'a> Keeper<'a> {
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, None, timeout, interrupt)
+        self.request_with(query, variables, None, timeout, interrupt, true)
             .await
     }
 
@@ -80,6 +136,7 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
+        log_cancelled: bool,
     ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
@@ -90,15 +147,23 @@ impl<'a> Keeper<'a> {
             .into_iter()
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
+        let mut event = RequestEvent {
+            endpoint: self.endpoint,
+            events: self.events,
+            operation: queries::operation(query),
+            addr,
+            authenticated: token.is_some(),
+            started,
+            log_cancelled,
+        };
         let mut response = ResponseLog::default();
         let (result, interrupted) = tokio::select! {
             biased;
             error = interrupt => (Err(error), true),
             result = self.post(query, &variables, token, timeout, &mut response) => (result, false),
         };
-        let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
-            Err(_) if interrupted => ("error", Level::Warn, Some(Code::InternalError), None),
+            Err(_) if interrupted => INTERRUPTED_READ,
             Ok(_) => ("ok", Level::Info, None, None),
             Err(error) => match error.code {
                 Code::NotSent => ("not_sent", Level::Warn, Some(error.code), None),
@@ -111,31 +176,12 @@ impl<'a> Keeper<'a> {
                     } else {
                         code
                     }),
-                    Some(error.message.clone()),
+                    Some(error.message.as_str()),
                 ),
             },
         };
-        self.events.event(
-            "keeper.request",
-            level,
-            [
-                ("operation", json!(queries::operation(query)).into()),
-                ("endpoint", Field::Endpoint(self.endpoint.into())),
-                ("endpointId", Field::endpoint_identity(self.endpoint)),
-                ("addr", json!(addr).into()),
-                ("authenticated", json!(token.is_some()).into()),
-                ("durationMs", json!(duration).into()),
-                ("status", json!(status).into()),
-                ("code", json!(code).into()),
-                ("error", json!(error).into()),
-                ("httpStatus", json!(response.http_status).into()),
-                (
-                    "keeperErrors",
-                    response.errors.unwrap_or(Field::Scalar(Value::Null)),
-                ),
-                ("keeperErrorCount", json!(response.error_count).into()),
-            ],
-        );
+        event.log_cancelled = false;
+        event.emit((status, level, code, error), response);
         result
     }
 
