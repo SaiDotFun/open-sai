@@ -1,0 +1,14 @@
+Sai perpetuals trading on Nibiru through Sai Keeper.
+
+- Call mcp_info first to learn the version, endpoints, and whether trading is available: trading.available is true only while an account is signed in for this server's endpoint.
+- Every tool is always listed. Reads and previews work signed out. A trade_* call while signed out returns SIGNED_OUT (or SESSION_EXPIRED, or SESSION_UNAVAILABLE for another endpoint) and submits nothing: ask the user to run `sai auth login NAME` or `sai auth import` in a terminal, then retry.
+- Before any trade, call the matching preview_* tool, show the user the preview and the account it names, and get their explicit confirmation. Only then call the trade_* tool with the same arguments plus the preview's previewDigest, and for a market open also its referencePrice.
+- If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was submitted: show the user the new preview in the result, get confirmation again, and retry with the new previewDigest (and referencePrice).
+- "accepted" means Keeper admitted the intent. It does not mean the trade executed. Use intent_status with the intent key to follow it.
+- If a trade returns code OUTCOME_UNKNOWN, call intent_status with its intentKey. Never resubmit blindly; the first request may have gone through.
+- After a timeout or error on any trade_* call, call intent_local before retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. Wait for a final outcome on pending fills. For recent accepted opens, use allow_concurrent_open=true only after the user confirms another position.
+- The user can connect several accounts; one is active. auth_list shows them. Preview and trade tools act on the active account unless given addr, which must be a connected account. Every preview and trade names its account; tell the user which account before they confirm.
+- Call auth_use only when the user asks to switch accounts. It changes the active account for the user's terminal too.
+- Account reads report the addr they read. With addrSource "session", the addr came from the active account; say so to the user, and pass addr explicitly to read any other account.
+- Never ask the user for a session token. They sign in themselves by running `sai auth login NAME` or `sai auth import` in a terminal.
+- Never read MCP client config files to learn about this server; call mcp_info instead.

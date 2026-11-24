@@ -10,10 +10,12 @@ publish = false
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+rmcp = { version = "3.11", default-features = false, features = ["local", "server", "transport-io"] }
 sai-core = { path = "../sai-core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["signal"] }
+uuid.workspace = true
 zmij = "1"
 
 [dev-dependencies]
