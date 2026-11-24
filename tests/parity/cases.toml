@@ -171,7 +171,7 @@ state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.inte
 name = "intent-status"
 args = ["--json","intent","status","{addr}","--key","{intent}"]
 seed = "ledger"
-wire = ["userIntents","tradeHistory"]
+wire = ["userIntents","intentTradeHistory"]
 state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
 
 [[case]]
@@ -181,6 +181,13 @@ seed = "ledger"
 server = "absent"
 wire = ["userIntents"]
 state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "absent" }
+
+[[case]]
+name = "intent-wait"
+args = ["--json","intent","wait","{intent}","--timeout","5"]
+seed = "ledger"
+wire = ["waitUserIntents","intentTradeHistory"]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
 
 [[case]]
 name = "doctor-offline"

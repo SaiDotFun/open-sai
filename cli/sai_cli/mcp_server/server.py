@@ -32,7 +32,7 @@ from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import ConfigDict, ValidationError
 
 from ..core import log as sai_log
-from ..core import log_queries
+from ..core import log_queries, wait
 from ..core import settings as sai_settings
 from ..core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from ..core.settings import Settings
@@ -58,9 +58,9 @@ market open also its referencePrice.
 - If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was \
 submitted: show the user the new preview in the result, get confirmation \
 again, and retry with the new previewDigest (and referencePrice).
-- "accepted" means Keeper admitted the intent. It does not mean the trade \
-executed. Use intent_status with the intent key to follow it.
-- If a trade returns code OUTCOME_UNKNOWN, call intent_status with its \
+- "accepted" means Keeper admitted the intent. Use intent_wait with its key \
+to check for a final outcome.
+- If a trade returns code OUTCOME_UNKNOWN, call intent_wait with its \
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
 retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
@@ -287,6 +287,32 @@ async def logs_intent(
         raise
     future.add_done_callback(lambda _future: _log_slots.release())
     return await asyncio.wrap_future(future)
+
+
+async def intent_wait(
+    key: str, addr: str | None = None, timeout: float = wait.MCP_MAX_TIMEOUT
+) -> str:
+    """Wait up to 10 seconds for a final outcome and return an intent receipt.
+
+    If the outcome is unknown, call this tool again with the same key and
+    address. Keep using the original key for follow-up.
+
+    Args:
+        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
+        addr: EVM or Nibiru address. Defaults to the local intent account, then the active account.
+        timeout: Wait in seconds, capped at 10.
+    """
+    started = time.monotonic()
+    try:
+        config = server_settings()
+    except sai_settings.SettingsError as exc:
+        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+    try:
+        result = await tools.intent_wait(config, key, addr, timeout, started)
+    except Exception as exc:  # noqa: BLE001 - tools return structured errors
+        result = tools.describe(exc)
+        result["error"] = sai_log.redact(result["error"])
+    return json.dumps(result, default=str)
 
 
 # Previews and trades share one implementation per action.
@@ -715,6 +741,7 @@ READ_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
     (preview_partial_close, read_only("Preview Partial Close")),
     (logs_intent, read_only("Intent Log Trail")),
     (account_overview, read_only("Account Overview")),
+    (intent_wait, read_only("Wait for Intent")),
 )
 
 TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (

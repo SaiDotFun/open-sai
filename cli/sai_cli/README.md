@@ -378,7 +378,7 @@ requested target leverage.
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
 `account balances ADDR`, `account history ADDR`, `trade open`, `trade
-close`, `trade partial-close`, `trade tpsl`, `intent status ADDR --key KEY`,
+close`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
 and live `watch` streams. Run any command with `--help` for details. Trading
 requires a funded account; funding is performed separately. Trade commands
 support `--dry-run` to inspect the local semantic request.
@@ -391,10 +391,9 @@ It quotes the requested slice in fields `quote.closedNotionalUsdc` and
 oracle price, and Perp's rounding. A missing sizing input sets
 `quote.closedNotionalIsEstimate` to true. If the collateral price is
 unavailable, the USD field is null.
-The CLI refuses when Keeper's index disagrees with the contract and rechecks
-the position before submission. Partial close accepts `--lcd-endpoint` like
-`trade margin`. Market schedule and other Keeper admission checks remain
-authoritative.
+The CLI rechecks the position before submission. Partial close accepts
+`--lcd-endpoint` like `trade margin`. Market schedule and other Keeper
+admission checks remain authoritative.
 
 `trade leverage TRADE_ID --leverage VALUE` sets a target leverage.
 `trade margin TRADE_ID --direction add|remove --amount USDC` reads the
@@ -407,17 +406,63 @@ effective leverage at execution to determine the direction and amount.
 `--dry-run` reads live state and prints the quote without submitting an
 intent. Use `--lcd-endpoint` to select the matching network's
 Nibiru REST service; the CLI checks that its chain matches Keeper.
-The CLI refuses the quote if the indexed position and contract disagree. Wait
-for the index to synchronize and retry; no margin intent has been submitted.
+Margin changes and partial closes briefly re-read Keeper and the contract if
+their position data disagree. If the mismatch persists, the command stops
+before submitting and asks you to retry after Keeper synchronizes.
 
 The CLI persists non-secret request identities under `$SAI_HOME/trader` or
 `~/.sai/trader`. A network error after submission leaves the outcome unknown,
 and an unknown intent blocks new trades on the account. Reconcile it with
-`intent status ADDR --key KEY`. If Keeper has no record of the key five
+`sai intent wait KEY` or inspect the latest record with
+`sai intent status ADDR --key KEY`. If Keeper has no record of the key five
 minutes after submission, past Keeper's two-minute admission expiry, the CLI
 marks it `absent` and trading resumes. A connection that fails before the
 request is sent marks the intent `not_sent`, which does not block. Keeper
 admission does not establish execution or finality.
+
+### Wait for an Intent
+
+```bash
+sai --json intent wait INTENT_KEY --timeout 30
+```
+
+The command uses the account recorded for the key on the configured Keeper
+endpoint, then the active account on that endpoint. Pass `--addr ADDR` to
+look up an intent from another machine or account. Add `--wait` to a live
+trade command to submit once and wait up to 30 seconds for that key. With
+MCP, call `intent_wait` after the trade returns its key. The tool caps each
+call at 10 seconds.
+
+The result contains an `outcome` and a `receipt`. An unresolved timeout
+returns `unknown` with code `OUTCOME_UNKNOWN` and exits 5 in the CLI. Call
+wait again with the same key and account. If reconciliation releases the
+local block after the admission grace period, the wait returns `absent`
+and exits 1. A delayed admission can still appear.
+If the ledger already has a final outcome and Keeper is unavailable, the
+wait returns `terminal` and exits 1 with the execution details unavailable.
+
+A confirmed failure exits 1, and an admission rejection exits 4. The
+outcomes `filled`, `placed`, and `succeeded` exit 0. A limit or stop
+order can return `placed` before its trigger. The receipt's `action`
+identifies the intent kind and order type when available.
+Keeper can confirm execution while the matching history is still unavailable.
+In that case the wait returns `succeeded` for a market intent.
+If matched history records liquidation or another effect that differs from
+the request, the CLI exits 1. The receipt reports the observed
+`execution.tradeChangeType` and the outcome is `liquidated` or `unexpected`.
+An after-hours risk adjustment alongside the recorded action appears in
+`execution.extraEffects`.
+
+The receipt's `requestTxHash` identifies the transaction that submitted
+the request. For a next-oracle fill, `execution.block` is the later block
+that filled it. When history is available, `execution.historyId` identifies
+the matching row. `positionNow` shows Keeper's latest state for that trade,
+and `positionFeesUsd` gives cumulative fees. The fill can include an oracle
+quote and the escrowed collateral in base units from the matching market
+order. Actual fill price and size remain null when Keeper exposes only the
+current position.
+
+### Doctor
 
 `sai doctor` checks the install, the version, config, MCP registrations,
 `$SAI_HOME/trader`, `$SAI_HOME/logs`, the session, the intent ledger, and
