@@ -197,12 +197,14 @@ state = { "trader" = "<absent>" }
 [[case]]
 name = "doctor-network"
 args = ["--json","doctor","--no-fix"]
+accepted_divergence = "lcd-origin-only"
 seed = "session"
 wire = ["oneClickTrading","ws:init","node_info"]
 
 [[case]]
 name = "doctor-ws-timeout"
 args = ["--json", "doctor", "--no-fix"]
+accepted_divergence = "lcd-origin-only"
 server = "doctor-ws-timeout"
 expect = 1
 wire = ["oneClickTrading", "ws:init", "node_info"]
@@ -216,9 +218,18 @@ state = { "trader" = "directory" }
 [[case]]
 name = "doctor-network-with-logging"
 args = ["--json", "doctor"]
+accepted_divergence = "lcd-origin-only"
 seed = "session"
 wire = ["oneClickTrading", "ws:init", "node_info"]
 state = { "logs/.endpoint-key#@mode" = 384 }
+
+[[case]]
+name = "doctor-lcd-unreachable"
+args = ["--json", "doctor", "--no-fix", "--lcd-endpoint", "{http}/private-fixture-credential"]
+accepted_divergence = "lcd-origin-only"
+server = "doctor-lcd-unreachable"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
 
 [[case]]
 name = "doctor-invalid-endpoint"
@@ -248,6 +259,7 @@ state = { "trader/intents.sqlite3#user_version" = 1 }
 [[case]]
 name = "doctor-reconcile-absent-intent"
 args = ["--json", "doctor"]
+accepted_divergence = "lcd-origin-only"
 seed = "doctor-ledger-session"
 server = "absent"
 wire = ["userIntents", "oneClickTrading", "ws:init", "node_info"]

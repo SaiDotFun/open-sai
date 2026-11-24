@@ -416,6 +416,13 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             path = urlsplit(self.path).path
             if path.startswith(scope):
                 path = path.removeprefix(scope)
+                if (
+                    scenario == "doctor-lcd-unreachable"
+                    and path == "/private-fixture-credential" + NODE_INFO
+                ):
+                    wire.append(WireRequest("node_info"))
+                    self.reply({}, 503)
+                    return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
                     self.reply({"default_node_info": {"network": "cataclysm-1"}})

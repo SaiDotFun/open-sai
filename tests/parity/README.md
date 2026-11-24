@@ -135,3 +135,7 @@ In `doctor-mcp-verification-failure`, Rust restores the Codex config when
 verification rejects the repaired entry. The case checks that Rust keeps the
 original bytes and mode. The pinned Python reference leaves the replacement
 on disk.
+
+The `lcd-origin-only` cases project the LCD endpoint in Python's report to
+its origin before comparing it with Rust. They cover successful probes and
+an unavailable LCD with a private path. Rust output is compared as emitted.

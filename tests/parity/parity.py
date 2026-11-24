@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
 from compare import (
@@ -406,6 +407,23 @@ def safe_observe(
     return result
 
 
+def project_reference_lcd_origin(output: dict[str, Any]) -> None:
+    """The pinned Python reference still displays the LCD URL path."""
+    error = output.get("error")
+    report = error["details"] if error is not None else output
+    lcd = next(check for check in report["checks"] if check["id"] == "lcd")
+    endpoint = lcd["details"]["endpoint"]
+    parts = urlsplit(endpoint)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    original_summary = lcd["summary"]
+    lcd["details"]["endpoint"] = origin
+    lcd["summary"] = original_summary.replace(endpoint, origin, 1)
+    if error is not None:
+        error["message"] = error["message"].replace(
+            f"lcd: {original_summary}", f"lcd: {lcd['summary']}", 1
+        )
+
+
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
 ) -> tuple[list[str], dict[str, str]]:
@@ -452,6 +470,8 @@ def run_case(
             observation.files[filename] = replace(
                 observation.files[filename], data=None
             )
+    if candidate != reference and case.accepted_divergence == "lcd-origin-only":
+        project_reference_lcd_origin(left.output)
     diffs = differences(left, right)
     if left.exit_code != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -296,3 +297,33 @@ def test_doctor_respects_read_only_cursor_config(
     assert cursor["status"] == "fail"
     assert "read-only" in cursor["summary"]
     assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444
+
+
+def test_doctor_shows_only_origin_for_an_unreachable_lcd(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    # Reserve a local port without listening so the connection is refused.
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        origin = f"http://127.0.0.1:{s.getsockname()[1]}"
+        fixture_env |= {
+            "SAI_ENDPOINT": origin,
+            "SAI_WS_ENDPOINT": origin.replace("http:", "ws:"),
+            "SAI_LCD_ENDPOINT": f"{origin}/private-fixture-credential",
+        }
+        machine = invoke(candidate, tmp_path, fixture_env, "doctor", "--no-fix")
+        human = subprocess.run(
+            [candidate, "doctor", "--no-fix"],
+            cwd=tmp_path,
+            env=fixture_env,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+    lcd = checks(machine)["lcd"]
+    assert lcd["status"] == "fail" and lcd["details"]["endpoint"] == origin
+    assert "private-fixture-credential" not in (
+        machine.stdout + machine.stderr + human.stdout + human.stderr
+    )

@@ -14,7 +14,7 @@ use sai_core::{
     keeper,
     log::{self, EventContext, Field, Level},
     session::parse_expiry,
-    settings::{Environment, Flags, KEYS, Key, Settings, Source, doctor_log_settings},
+    settings::{Environment, Flags, KEYS, Settings, Source, doctor_log_settings},
     storage::{Session, Storage},
 };
 use serde::Serialize;
@@ -794,11 +794,7 @@ async fn ws_check(settings: &Settings) -> Check {
 async fn lcd_check(settings: &Settings) -> Check {
     let start = Instant::now();
     let endpoint = settings.lcd_endpoint();
-    let display = Key::LcdEndpoint
-        .public_value(&json!(endpoint))
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    let display = log::origin(endpoint);
     let mut details = json!({"endpoint": display});
     let check = match keeper::lcd_network(endpoint, TIMEOUT).await {
         Ok(Some(network)) => {
