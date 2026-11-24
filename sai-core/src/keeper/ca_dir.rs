@@ -20,21 +20,20 @@ pub(super) fn add_roots(store: &mut CaStore, dir: &Path) {
     }
     for (hash, entries) in groups {
         for (expected, (index, path)) in entries.into_iter().enumerate() {
-            if expected != index || !path.is_file() {
+            if expected != index {
                 break;
             }
+            // OpenSSL 3.5 stops at an absent index and skips entries it cannot load.
+            if !path.is_file() {
+                continue;
+            }
             let Ok(certs) = ca_pem::certificates(&path) else {
-                break;
+                continue;
             };
-            let mut loaded = false;
             for cert in certs.flatten() {
-                loaded = true;
                 if subject_hash(&cert.der) == Some(hash) {
                     let _ = store.add(cert);
                 }
-            }
-            if !loaded {
-                break;
             }
         }
     }

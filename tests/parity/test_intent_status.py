@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import gzip
 import json
 import os
@@ -1130,6 +1131,45 @@ def test_local_neutral_intermediate_completes_leaf_only_chain(
         tmp_path, store, certs / "other-ca.pem", tmp_path / "neutral.pem"
     )
     assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
+
+
+def write_trusted_pem(path: Path, certificate: Path, aux: bytes) -> None:
+    der = ssl.PEM_cert_to_DER_cert(certificate.read_text(encoding="ascii"))
+    path.write_bytes(
+        b"-----BEGIN TRUSTED CERTIFICATE-----\n"
+        + base64.encodebytes(der + aux)
+        + b"-----END TRUSTED CERTIFICATE-----\n"
+    )
+
+
+@pytest.mark.skipif(
+    ssl.OPENSSL_VERSION_INFO < (3, 5),
+    reason="OpenSSL 3.5 skips unreadable entries in a hashed CA directory",
+)
+def test_hashed_store_continues_after_malformed_aux(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+) -> None:
+    context, certs = keeper_certificate
+    root = certs / "keeper-ca.pem"
+    subject_hash = openssl_in(
+        tmp_path, "x509", "-in", str(root), "-noout", "-subject_hash"
+    ).strip()
+    write_trusted_pem(tmp_path / f"{subject_hash}.0", root, b"\x30\x01")
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        str(root),
+        "-addtrust",
+        "serverAuth",
+        "-out",
+        f"{subject_hash}.1",
+    )
+    assert_keeper_tls_trust(
+        cli_pair, tmp_path, context, {"SSL_CERT_DIR": str(tmp_path)}, True
+    )
 
 
 def assert_keeper_tls_trust(
