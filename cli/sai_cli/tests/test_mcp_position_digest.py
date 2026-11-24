@@ -1033,8 +1033,20 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
                 None,
                 "121" if reported_height is not None else None,
                 None,
+                "121" if reported_height is not None else None,
             ]
-            fresh = result["preview"]
+            if reported_height is None:
+                assert result["quoteStatus"] == "unavailable"
+                assert result["recovery"]["action"] == "request_preview"
+                assert "reports the contract query height" in result["error"]
+                assert "preview" not in result
+                assert "previewDigest" not in result
+                position.reported_height = 121
+                fresh = await call(client, f"preview_{tool}", args)
+            else:
+                assert result["quoteStatus"] == "available"
+                assert result["recovery"]["action"] == "confirm_preview"
+                fresh = result["preview"]
             assert fresh["previewDigest"] != preview["previewDigest"]
             assert (
                 fresh["quote"]["effectiveLeverage"]
@@ -1054,13 +1066,8 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
                 f"trade_{tool}",
                 {**args, "preview_digest": fresh["previewDigest"]},
             )
-            if reported_height is None:
-                assert accepted.get("code") == "INVALID_REQUEST", accepted
-                assert "same block" in accepted["error"]
-                assert position.submitted == []
-            else:
-                assert accepted["status"] == "accepted"
-                assert len(position.submitted) == 1
+            assert accepted["status"] == "accepted"
+            assert len(position.submitted) == 1
 
     asyncio.run(scenario())
 
@@ -1121,7 +1128,14 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             )
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
-            assert position.price_query_heights == [None, None, None, "121", None]
+            assert position.price_query_heights == [
+                None,
+                None,
+                None,
+                "121",
+                None,
+                "121",
+            ]
             fresh = result["preview"]
             assert fresh["quote"]["collateralPriceUsd"] == "0.98"
             assert fresh["quote"]["closedNotionalUsd"] == "245"
