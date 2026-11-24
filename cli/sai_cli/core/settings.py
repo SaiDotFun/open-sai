@@ -362,8 +362,8 @@ def resolve(
 
     A bad `logs.*` value never fails: its source becomes `invalid` and
     logging resolves to off, so a typo in a logging setting cannot stop a
-    command or the MCP server from starting. With logging already turned
-    off, `logs.keep_days` is not validated at all.
+    command or the MCP server from starting. Invalid retention is reported
+    even when logging is already off.
     """
     values: dict[str, str | bool | int | None] = {}
     sources: dict[str, str] = {}
@@ -392,12 +392,8 @@ def resolve(
                 values[spec.key], sources[spec.key] = spec.default, "default"
         except InvalidSetting:
             if spec.section in LENIENT_SECTIONS:
-                # With logging turned off by a valid setting, the other
-                # logs values are not validated: they change nothing.
-                off = values.get("logs.enabled") is False
-                layer = "env" if raw_env.strip() else "file"
                 values[spec.key] = spec.default
-                sources[spec.key] = layer if off else "invalid"
+                sources[spec.key] = "invalid"
                 continue
             raise
     logs_valid = "invalid" not in (sources["logs.enabled"], sources["logs.keep_days"])

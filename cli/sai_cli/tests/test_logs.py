@@ -1483,14 +1483,13 @@ def test_invalid_logs_settings_never_stop_a_command_or_the_server(
             monkeypatch.setenv("SAI_LOG", on)
         resolved = settings.load({"keeper.endpoint": base})
         assert resolved.logs_enabled is False and resolved.endpoint == base
-        assert resolved.sources["logs.keep_days"] == ("env" if on == "0" else "invalid")
+        assert resolved.sources["logs.keep_days"] == "invalid"
         result = CliRunner().invoke(
             main, ["--endpoint", base, "--json", "market", "prices"]
         )
         assert result.exit_code == 0
         assert json.loads(result.stdout) == {"oracle": {"tokenPricesUsd": []}}
-        # Off by choice: the other value is not looked at, so no warning.
-        assert ("logging is off" in result.stderr) == (on != "0")
+        assert "SAI_LOG_KEEP_DAYS: invalid value for logs.keep_days" in result.stderr
         assert bad_retention not in result.stderr
         mcp = server.create_server(resolved)
         assert "oracle" in call(mcp, "market_prices")

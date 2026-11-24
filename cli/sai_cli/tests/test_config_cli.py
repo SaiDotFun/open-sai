@@ -478,6 +478,31 @@ def test_invalid_update_override_exits_2(
     assert value not in result.output
 
 
+@pytest.mark.parametrize("source", ["env", "file"])
+def test_config_list_reports_invalid_retention_when_logging_is_off(
+    tmp_path, monkeypatch, source
+):
+    monkeypatch.setenv("SAI_LOG", "false")
+    value = "fixture-invalid-retention"
+    if source == "env":
+        origin = "SAI_LOG_KEEP_DAYS"
+        monkeypatch.setenv(origin, value)
+    else:
+        path = tmp_path / "config.toml"
+        path.write_text(f'[logs]\nkeep_days = "{value}"\n')
+        origin = str(path)
+
+    result = sai("--json", "config", "list")
+
+    assert result.exit_code == 0
+    shown = json.loads(result.stdout)["settings"]
+    assert shown["logs.enabled"]["value"] is False
+    assert shown["logs.keep_days"]["source"] == "invalid"
+    assert shown["logs.keep_days"]["value"] == 14
+    assert origin in result.stderr and "logs.keep_days" in result.stderr
+    assert value not in result.output
+
+
 @pytest.mark.parametrize(
     ("args", "key", "flag"),
     [

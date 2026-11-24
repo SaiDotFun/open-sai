@@ -212,6 +212,19 @@ def test_config_warns_about_invalid_logging_override(monkeypatch):
     assert "private-invalid-boolean" not in output
 
 
+def test_config_warns_about_invalid_retention_when_logging_is_off(monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "false")
+    monkeypatch.setenv("SAI_LOG_KEEP_DAYS", "fixture-invalid-retention")
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 0
+    config = next(c for c in json.loads(output)["checks"] if c["id"] == "config")
+    assert config["status"] == "warn"
+    assert "SAI_LOG_KEEP_DAYS (logs.keep_days)" in config["summary"]
+    assert "fixture-invalid-retention" not in output
+
+
 # Session
 
 
