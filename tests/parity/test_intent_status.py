@@ -1202,6 +1202,99 @@ def test_matching_local_issuer_works_in_any_order(
     assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
 
 
+@pytest.fixture(scope="module")
+def keeper_three_ca_chain(
+    tmp_path_factory: pytest.TempPathFactory,
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+) -> tuple[Path, Path]:
+    _, certs = keeper_cross_signed_ca
+    chain = tmp_path_factory.mktemp("three-ca-chain")
+    openssl_in(
+        chain,
+        "req",
+        "-x509",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+        "-subj",
+        "/CN=Chain Root",
+        "-keyout",
+        "root.key",
+        "-out",
+        "root.pem",
+        "-days",
+        "2",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+        "-addext",
+        "keyUsage=critical,keyCertSign,cRLSign",
+    )
+    openssl_in(
+        chain,
+        "x509",
+        "-x509toreq",
+        "-in",
+        str(certs / "other-ca.pem"),
+        "-signkey",
+        str(certs / "other-ca.key"),
+        "-out",
+        "upper.csr",
+    )
+    openssl_in(
+        chain,
+        "x509",
+        "-req",
+        "-in",
+        "upper.csr",
+        "-CA",
+        "root.pem",
+        "-CAkey",
+        "root.key",
+        "-set_serial",
+        "2",
+        "-days",
+        "2",
+        "-extfile",
+        str(certs / "cross-signed.ext"),
+        "-out",
+        "upper.pem",
+    )
+    return certs, chain
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("local_chain", ["root", "missing-upper", "complete"])
+def test_chain_uses_only_local_issuers_after_entering_store(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_three_ca_chain: tuple[Path, Path],
+    store: str,
+    local_chain: str,
+) -> None:
+    certs, chain = keeper_three_ca_chain
+    lower = certs / "cross-signed.pem"
+    upper = chain / "upper.pem"
+    local = [chain / "root.pem"]
+    peer = [certs / "server.pem", upper]
+    if local_chain == "root":
+        peer.insert(1, lower)
+    else:
+        local.append(lower)
+        if local_chain == "complete":
+            local.append(upper)
+
+    certificate_chain = tmp_path / "peer.pem"
+    certificate_chain.write_bytes(b"".join(cert.read_bytes() for cert in peer))
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certificate_chain, certs / "server.key")
+    trust = ca_store_overrides(tmp_path, store, *local)
+    assert_keeper_tls_trust(
+        cli_pair, tmp_path, context, trust, local_chain != "missing-upper"
+    )
+
+
 def write_trusted_pem(path: Path, certificate: Path, aux: bytes) -> None:
     der = ssl.PEM_cert_to_DER_cert(certificate.read_text(encoding="ascii"))
     path.write_bytes(

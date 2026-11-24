@@ -8,28 +8,27 @@ use std::{
 use der::{Decode, asn1::OctetString};
 
 use rustls::{
-    CertificateError, ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
-    client::{
-        WebPkiServerVerifier,
-        danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
-    },
-    crypto::CryptoProvider,
+    CertificateError, ClientConfig, DigitallySignedStruct, Error, OtherError, RootCertStore,
+    SignatureScheme,
+    client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier},
+    crypto::{CryptoProvider, verify_tls12_signature, verify_tls13_signature},
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
+use webpki::{EndEntityCert, KeyUsage, VerifiedPath};
 use x509_cert::{
-    Certificate,
+    Certificate, TbsCertificate,
     ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier},
     time::Validity,
 };
 
-use super::ca_pem::{CaCertificate, ServerTrust};
+use super::ca_pem::{CaCertificate, ServerTrust, can_issue};
 
 pub(super) struct CaStore {
     pub roots: RootCertStore,
     seen: HashSet<CertificateDer<'static>>,
     rejected: HashSet<CertificateDer<'static>>,
     rejected_anchors: RootCertStore,
-    intermediates: Vec<CertificateDer<'static>>,
+    intermediates: Vec<LocalIntermediate>,
     dated_anchors: Vec<(usize, Validity)>,
 }
 
@@ -62,7 +61,10 @@ impl CaStore {
                 self.rejected_anchors.add(cert.der.clone())?;
                 self.rejected.insert(cert.der.clone());
             }
-            ServerTrust::Untrusted => self.intermediates.push(cert.der.clone()),
+            ServerTrust::Untrusted => self.intermediates.push(LocalIntermediate {
+                der: cert.der.clone(),
+                tbs: cert.tbs,
+            }),
         }
         self.seen.insert(cert.der);
         Ok(())
@@ -89,20 +91,12 @@ impl CaStore {
         {
             builder.with_root_certificates(self.roots)
         } else {
-            let roots = Arc::new(self.roots);
-            let verifier = WebPkiServerVerifier::builder_with_provider(
-                Arc::clone(&roots),
-                Arc::clone(&provider),
-            )
-            .build()
-            .expect("nonempty root store and no CRLs");
             builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(StoreVerifier {
-                    verifier,
                     rejected: self.rejected,
                     intermediates: self.intermediates,
-                    roots,
+                    roots: self.roots,
                     provider,
                     dated_anchors: self.dated_anchors,
                 }))
@@ -114,42 +108,59 @@ impl CaStore {
 }
 
 #[derive(Debug)]
+struct LocalIntermediate {
+    der: CertificateDer<'static>,
+    tbs: TbsCertificate,
+}
+
+#[derive(Debug)]
 struct StoreVerifier {
-    verifier: Arc<WebPkiServerVerifier>,
     rejected: HashSet<CertificateDer<'static>>,
-    intermediates: Vec<CertificateDer<'static>>,
-    roots: Arc<RootCertStore>,
+    intermediates: Vec<LocalIntermediate>,
+    roots: RootCertStore,
     provider: Arc<CryptoProvider>,
     dated_anchors: Vec<(usize, Validity)>,
 }
 
 impl StoreVerifier {
-    fn verifier_at(&self, now: UnixTime) -> Result<Arc<WebPkiServerVerifier>, Error> {
-        // WebPKI anchors omit validity. Use each certificate's position in the
-        // root store so a different certificate with the same key stays eligible.
-        let invalid: HashSet<_> = self
-            .dated_anchors
-            .iter()
-            .filter_map(|(index, validity)| {
+    fn verify_path(&self, path: &VerifiedPath<'_>, now: UnixTime) -> Result<(), webpki::Error> {
+        for (index, validity) in &self.dated_anchors {
+            if std::ptr::eq(path.anchor(), &self.roots.roots[*index]) {
                 let start = validity.not_before.to_unix_duration().as_secs();
                 let end = validity.not_after.to_unix_duration().as_secs();
-                (!(start..end).contains(&now.as_secs())).then_some(*index)
-            })
-            .collect();
-        if invalid.is_empty() {
-            return Ok(Arc::clone(&self.verifier));
+                if !(start..end).contains(&now.as_secs()) {
+                    return Err(webpki::Error::UnknownIssuer);
+                }
+            }
         }
-        let roots = RootCertStore::from_iter(
-            self.roots
-                .roots
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !invalid.contains(index))
-                .map(|(_, root)| root.clone()),
-        );
-        WebPkiServerVerifier::builder_with_provider(roots.into(), Arc::clone(&self.provider))
-            .build()
-            .map_err(|_| CertificateError::UnknownIssuer.into())
+        if self.intermediates.is_empty() {
+            return Ok(());
+        }
+        let mut local_only = false;
+        let mut child = path.end_entity().der();
+        for issuer in path.intermediate_certificates() {
+            let issuer = issuer.der();
+            let child_tbs = Certificate::from_der(&child)
+                .map_err(|_| webpki::Error::BadDer)?
+                .tbs_certificate;
+            if let Some(local) = self.intermediates.iter().find(|local| local.der == issuer) {
+                if !can_issue(&local.tbs, &child_tbs).unwrap_or(false) {
+                    return Err(webpki::Error::UnknownIssuer);
+                }
+                local_only = true;
+            } else if local_only
+                || self
+                    .intermediates
+                    .iter()
+                    .any(|local| can_issue(&local.tbs, &child_tbs).unwrap_or(false))
+            {
+                // OpenSSL prefers a store issuer and keeps looking in the store
+                // after selecting one. A peer certificate cannot fill a gap above it.
+                return Err(webpki::Error::UnknownIssuer);
+            }
+            child = issuer;
+        }
+        Ok(())
     }
 }
 
@@ -207,7 +218,7 @@ impl ServerCertVerifier for StoreVerifier {
         end_entity: &CertificateDer<'_>,
         intermediates: &[CertificateDer<'_>],
         server_name: &ServerName<'_>,
-        ocsp_response: &[u8],
+        _ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
         if self.rejected.contains(end_entity) {
@@ -216,19 +227,31 @@ impl ServerCertVerifier for StoreVerifier {
         // A peer may send a rejected CA as an intermediate under a trusted root.
         let intermediates = prioritize_issuers(
             end_entity,
-            intermediates
+            self.intermediates
                 .iter()
-                .filter(|cert| !self.rejected.contains(*cert))
-                .chain(&self.intermediates)
-                .cloned(),
+                .map(|cert| cert.der.clone())
+                .chain(
+                    intermediates
+                        .iter()
+                        .filter(|cert| !self.rejected.contains(*cert))
+                        .cloned(),
+                ),
         );
-        self.verifier_at(now)?.verify_server_cert(
-            end_entity,
+        let as_certificate_error = |err| CertificateError::Other(OtherError(Arc::new(err)));
+        let leaf = EndEntityCert::try_from(end_entity).map_err(as_certificate_error)?;
+        leaf.verify_for_usage(
+            self.provider.signature_verification_algorithms.all,
+            &self.roots.roots,
             &intermediates,
-            server_name,
-            ocsp_response,
             now,
+            KeyUsage::server_auth(),
+            None,
+            Some(&|path| self.verify_path(path, now)),
         )
+        .map_err(as_certificate_error)?;
+        leaf.verify_is_valid_for_subject_name(server_name)
+            .map_err(as_certificate_error)?;
+        Ok(ServerCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
@@ -237,7 +260,12 @@ impl ServerCertVerifier for StoreVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        self.verifier.verify_tls12_signature(message, cert, dss)
+        verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -246,10 +274,17 @@ impl ServerCertVerifier for StoreVerifier {
         cert: &CertificateDer<'_>,
         dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, Error> {
-        self.verifier.verify_tls13_signature(message, cert, dss)
+        verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.provider.signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        self.verifier.supported_verify_schemes()
+        self.provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }

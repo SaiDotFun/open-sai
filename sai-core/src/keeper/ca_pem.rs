@@ -17,8 +17,8 @@ use der::{
 };
 use rustls::pki_types::CertificateDer;
 use x509_cert::{
-    Certificate,
-    ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier, name::GeneralName},
+    Certificate, TbsCertificate,
+    ext::pkix::{AuthorityKeyIdentifier, KeyUsage, SubjectKeyIdentifier, name::GeneralName},
     name::Name,
     spki::AlgorithmIdentifierOwned,
     time::Validity,
@@ -31,6 +31,7 @@ const ANY_EXTENDED_KEY_USAGE: ObjectIdentifier = ObjectIdentifier::new_unwrap("2
 
 pub(super) struct CaCertificate {
     pub der: CertificateDer<'static>,
+    pub tbs: TbsCertificate,
     pub trust: ServerTrust,
     pub trusted_pem_validity: Option<Validity>,
 }
@@ -140,20 +141,34 @@ fn certificate_entry(mut der: Vec<u8>, trusted: bool) -> der::Result<CaCertifica
     der.truncate(certificate_len);
     Ok(CaCertificate {
         der: der.into(),
+        tbs: certificate.tbs_certificate,
         trust,
         trusted_pem_validity,
     })
 }
 
 fn eligible_for_default_trust(cert: &Certificate) -> der::Result<bool> {
-    let tbs = &cert.tbs_certificate;
-    if !same_name(&tbs.subject, &tbs.issuer)
-        || !signature_matches_key(tbs.signature.oid, tbs.subject_public_key_info.algorithm.oid)
+    likely_issuer(&cert.tbs_certificate, &cert.tbs_certificate)
+}
+
+pub(super) fn can_issue(issuer: &TbsCertificate, child: &TbsCertificate) -> der::Result<bool> {
+    Ok(likely_issuer(issuer, child)?
+        && issuer
+            .get::<KeyUsage>()?
+            .is_none_or(|(_, usage)| usage.key_cert_sign()))
+}
+
+fn likely_issuer(issuer: &TbsCertificate, child: &TbsCertificate) -> der::Result<bool> {
+    if !same_name(&issuer.subject, &child.issuer)
+        || !signature_matches_key(
+            child.signature.oid,
+            issuer.subject_public_key_info.algorithm.oid,
+        )
     {
         return Ok(false);
     }
-    let subject_key = tbs.get::<SubjectKeyIdentifier>()?.map(|(_, id)| id.0);
-    let Some((_, authority)) = tbs.get::<AuthorityKeyIdentifier>()? else {
+    let subject_key = issuer.get::<SubjectKeyIdentifier>()?.map(|(_, id)| id.0);
+    let Some((_, authority)) = child.get::<AuthorityKeyIdentifier>()? else {
         return Ok(true);
     };
     let issuer_name = authority
@@ -167,15 +182,14 @@ fn eligible_for_default_trust(cert: &Certificate) -> der::Result<bool> {
                 None
             }
         });
-    // OpenSSL checks key identifiers, authority serial, and the first directory name
-    // when it decides whether a self-issued certificate is eligible for default trust.
+    // OpenSSL compares the authority serial and first directory name when present.
     Ok(
         !matches!((&authority.key_identifier, &subject_key), (Some(a), Some(b)) if a != b)
             && authority
                 .authority_cert_serial_number
                 .as_ref()
-                .is_none_or(|serial| serial == &tbs.serial_number)
-            && issuer_name.is_none_or(|name| same_name(name, &tbs.issuer)),
+                .is_none_or(|serial| serial == &issuer.serial_number)
+            && issuer_name.is_none_or(|name| same_name(name, &issuer.issuer)),
     )
 }
 

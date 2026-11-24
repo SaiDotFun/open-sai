@@ -26,6 +26,7 @@ rustls.workspace = true
 ring.workspace = true
 rustls-native-certs.workspace = true
 url.workspace = true
+webpki.workspace = true
 webpki-roots.workspace = true
 x509-cert.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
