@@ -52,6 +52,19 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
+        self.request_until(query, variables, token, timeout, std::future::pending())
+            .await
+    }
+
+    /// A cancelled HTTP request still emits its Keeper event before returning.
+    pub async fn request_until(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        token: Option<&str>,
+        timeout: Duration,
+        interrupt: impl Future<Output = SaiError>,
+    ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
         if let Some(token) = token {
@@ -62,11 +75,14 @@ impl<'a> Keeper<'a> {
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
         let mut response = ResponseLog::default();
-        let result = self
-            .post(query, &variables, token, timeout, &mut response)
-            .await;
+        let (result, interrupted) = tokio::select! {
+            biased;
+            error = interrupt => (Err(error), true),
+            result = self.post(query, &variables, token, timeout, &mut response) => (result, false),
+        };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
+            Err(_) if interrupted => ("error", Level::Warn, Some(Code::InternalError), None),
             Ok(_) => ("ok", Level::Info, None, None),
             Err(error) => match error.code {
                 Code::NotSent => ("not_sent", Level::Warn, Some(error.code), None),

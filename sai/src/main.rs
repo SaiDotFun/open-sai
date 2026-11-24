@@ -8,7 +8,7 @@ use clap::{
     Parser, Subcommand,
     error::{ContextKind, ContextValue, ErrorKind},
 };
-use sai_core::errors::{ExitCode, SaiError};
+use sai_core::errors::{Code, ExitCode, SaiError};
 use sai_core::log::{self, EXIT_FLUSH, EventContext, Field, Level, LogWriter, Surface};
 use sai_core::settings::{Environment, Flags, Settings, SettingsError, repr};
 use serde_json::{Value, json};
@@ -221,7 +221,7 @@ fn complete(
     };
     let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
     let message = redact(&error.message);
-    let interrupted = command.starts_with("watch ") && error.message == "Aborted";
+    let interrupted = error.code == Code::InvalidRequest && error.message == "Aborted";
     if interrupted {
         eprintln!();
     }

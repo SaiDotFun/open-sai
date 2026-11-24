@@ -126,6 +126,7 @@ impl AccountCommand {
                     &endpoint,
                     &Subscription::Balances(addr),
                     || eprintln!("{}", stream::CONNECTED),
+                    interrupted(),
                 ))?;
                 return output::read(&payload, json);
             }
@@ -153,7 +154,13 @@ fn read(
     let keeper = Keeper::new(settings.endpoint(), events);
     // Python exposes Keeper's data object directly, with its original units
     // and nullability. The intent-status projection applies to reconciled rows.
-    let data = runtime()?.block_on(keeper.request(query, variables, None, keeper::TIMEOUT))?;
+    let data = runtime()?.block_on(keeper.request_until(
+        query,
+        variables,
+        None,
+        keeper::TIMEOUT,
+        interrupted(),
+    ))?;
     output::read(&data, json)
 }
 
@@ -246,35 +253,39 @@ fn runtime() -> Result<tokio::runtime::Runtime, SaiError> {
         .map_err(|_| SaiError::internal())
 }
 
+async fn interrupted() -> SaiError {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => SaiError::new(Code::InvalidRequest, "Aborted"),
+        Err(_) => SaiError::internal(),
+    }
+}
+
 async fn watch(
     endpoint: &str,
     subscribe: &Subscription,
     events: EventContext<'_>,
 ) -> Result<(), SaiError> {
-    async fn interrupted() -> SaiError {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => SaiError::new(Code::InvalidRequest, "Aborted"),
-            Err(_) => SaiError::internal(),
-        }
-    }
     let signal = interrupted();
     tokio::pin!(signal);
     loop {
-        let attempt = tokio::select! {
-            biased;
-            error = &mut signal => return Err(error),
-            attempt = Connection::open(endpoint, subscribe) => attempt,
-        };
+        let attempt = Connection::open(endpoint, subscribe, signal.as_mut()).await;
         let failure = match attempt {
             Err(failure) => failure,
             Ok(mut connection) => {
                 eprintln!("{}", stream::CONNECTED);
                 let result = tokio::select! {
                     biased;
-                    error = &mut signal => Err(error),
+                    error = &mut signal => {
+                        connection.close().await;
+                        return Err(error);
+                    }
                     result = print_snapshots(&mut connection) => result,
                 };
-                connection.close().await;
+                tokio::select! {
+                    biased;
+                    () = connection.close() => {}
+                    error = &mut signal => return Err(error),
+                }
                 result?
             }
         };

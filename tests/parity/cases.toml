@@ -118,6 +118,14 @@ expect = 1
 wire = ["tokenPricesUsd"]
 
 [[case]]
+name = "market-prices-interrupt"
+args = ["--json","market","prices"]
+server = "interrupt-http"
+expect = 1
+interrupt_on_request = true
+wire = ["tokenPricesUsd"]
+
+[[case]]
 name = "market-prices-partial-error"
 args = ["--json","market","prices"]
 server = "read-partial-error"
@@ -175,6 +183,22 @@ args = ["--json","account","balances","{addr}"]
 server = "ws-redirect-limit"
 expect = 1
 wire = ["ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect"]
+
+[[case]]
+name = "account-balances-interrupt"
+args = ["--json","account","balances","{addr}"]
+server = "interrupt-balance"
+expect = 1
+interrupt_on_request = true
+wire = ["ws:init","ws:userBalances","ws:close"]
+
+[[case]]
+name = "account-balances-interrupt-close"
+args = ["--json","account","balances","{addr}"]
+server = "interrupt-balance-close"
+expect = 1
+interrupt_on_request = true
+wire = ["ws:init","ws:userBalances","ws:close"]
 
 [[case]]
 name = "account-balances-partial-error"
@@ -317,6 +341,15 @@ mode = "jsonl"
 server = "watch"
 expect = 1
 wire = ["ws:init","ws:perpTrades"]
+
+[[case]]
+name = "watch-balances-interrupt-handshake"
+args = ["--json","watch","balances","{addr}"]
+mode = "jsonl"
+server = "interrupt-handshake"
+expect = 1
+interrupt_on_request = true
+wire = ["ws:init","ws:close"]
 
 [[case]]
 name = "watch-balances-reconnect-interrupt"

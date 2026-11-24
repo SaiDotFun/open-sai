@@ -1,6 +1,6 @@
 //! Keeper snapshots over graphql-transport-ws.
 
-use std::{env, io, time::Duration};
+use std::{env, io, pin::Pin, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Number, Value, json};
@@ -11,7 +11,7 @@ use tokio_tungstenite::{
         Error as WsError, Message,
         client::IntoClientRequest,
         http::header::{LOCATION, SEC_WEBSOCKET_PROTOCOL},
-        protocol::{WebSocketConfig, frame::coding::CloseCode},
+        protocol::{CloseFrame, WebSocketConfig, frame::coding::CloseCode},
     },
 };
 use url::Url;
@@ -116,18 +116,27 @@ pub async fn snapshot(
     endpoint: &str,
     subscribe: &Subscription,
     notify: impl Fn(),
+    interrupt: impl Future<Output = SaiError>,
 ) -> Result<Value, SaiError> {
     check_endpoint(endpoint)?;
-    let mut connection = Connection::open(endpoint, subscribe)
+    tokio::pin!(interrupt);
+    let mut connection = Connection::open(endpoint, subscribe, interrupt.as_mut())
         .await
         .map_err(balance_error)?;
     notify();
-    let result = connection
-        .next(Some(SNAPSHOT_TIMEOUT))
-        .await
-        .map_err(balance_error);
-    connection.close().await;
-    result
+    let result = tokio::select! {
+        biased;
+        error = &mut interrupt => {
+            connection.close().await;
+            return Err(error);
+        }
+        result = connection.next(Some(SNAPSHOT_TIMEOUT)) => result.map_err(balance_error),
+    };
+    tokio::select! {
+        biased;
+        () = connection.close() => result,
+        error = &mut interrupt => Err(error),
+    }
 }
 
 pub struct Connection {
@@ -141,36 +150,57 @@ pub struct Connection {
 impl Connection {
     /// Open the connection, wait for the acknowledgement, then subscribe once.
     /// The upgrade and acknowledgement share one deadline.
-    pub async fn open(endpoint: &str, subscribe: &Subscription) -> Result<Self, Failure> {
+    pub async fn open(
+        endpoint: &str,
+        subscribe: &Subscription,
+        mut interrupt: Pin<&mut impl Future<Output = SaiError>>,
+    ) -> Result<Self, Failure> {
         let deadline = Instant::now() + OPEN_TIMEOUT;
         let (query, field, variables) = subscribe.parameters();
-        let mut connection = time::timeout_at(deadline, Self::upgrade(endpoint, field))
-            .await
-            .map_err(|_| Failure::Disconnected("TimeoutError"))??;
-        let ack = time::timeout_at(deadline, async {
-            connection.send(json!({"type": "connection_init"})).await?;
-            let message = connection.receive(None).await?;
-            if message["type"] != "connection_ack" {
-                return Err(protocol("Keeper did not acknowledge WebSocket connection"));
+        let mut connection = tokio::select! {
+            biased;
+            error = &mut interrupt => return Err(Failure::Protocol(error)),
+            upgraded = time::timeout_at(deadline, Self::upgrade(endpoint, field)) => {
+                upgraded.map_err(|_| Failure::Disconnected("TimeoutError"))??
             }
-            Ok(())
-        })
-        .await
-        .unwrap_or(Err(Failure::Disconnected("TimeoutError")));
-        if let Err(error) = ack {
+        };
+        let handshake = tokio::select! {
+            biased;
+            error = &mut interrupt => Err(Failure::Protocol(error)),
+            result = time::timeout_at(deadline, connection.acknowledge()) => {
+                result.unwrap_or(Err(Failure::Disconnected("TimeoutError")))
+            }
+        };
+        if let Err(error) = handshake {
             connection
                 .close_by(deadline.min(Instant::now() + CLOSE_TIMEOUT))
                 .await;
             return Err(error);
         }
-        connection
-            .send(json!({
-                "id": "1",
-                "type": "subscribe",
-                "payload": {"query": query, "variables": variables},
-            }))
-            .await?;
+        let request = json!({
+            "id": "1",
+            "type": "subscribe",
+            "payload": {"query": query, "variables": variables},
+        });
+        let subscribed = tokio::select! {
+            biased;
+            error = &mut interrupt => Err(Failure::Protocol(error)),
+            result = connection.send(request) => result,
+        };
+        if let Err(error) = subscribed {
+            connection.close().await;
+            return Err(error);
+        }
         Ok(connection)
+    }
+
+    async fn acknowledge(&mut self) -> Result<(), Failure> {
+        self.send(json!({"type": "connection_init"})).await?;
+        let message = self.receive(None).await?;
+        if message["type"] != "connection_ack" {
+            return Err(protocol("Keeper did not acknowledge WebSocket connection"));
+        }
+        Ok(())
     }
 
     async fn upgrade(endpoint: &str, field: &'static str) -> Result<Self, Failure> {
@@ -305,7 +335,13 @@ impl Connection {
 
     async fn close_by(&mut self, deadline: Instant) {
         let _ = time::timeout_at(deadline, async {
-            if self.socket.close(None).await.is_ok() {
+            // Python exits the socket context through a subscription exception
+            // or GeneratorExit after consuming the first snapshot.
+            let frame = CloseFrame {
+                code: CloseCode::Error,
+                reason: "".into(),
+            };
+            if self.socket.close(Some(frame)).await.is_ok() {
                 while let Some(Ok(message)) = self.socket.next().await {
                     if message.is_close() {
                         break;

@@ -82,6 +82,7 @@ class Case:
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
     interrupt_after: int | None = None
+    interrupt_on_request: bool = False
 
     @property
     def command(self) -> str:
@@ -124,10 +125,16 @@ def check_sandbox_exit(exit_code: int) -> None:
         raise ValueError("attempted a blocked host socket")
 
 
-def interrupt_watch(
-    binary: list[str], args: list[str], home: Path, env: dict[str, str], snapshots: int
+def interrupt_command(
+    binary: list[str],
+    args: list[str],
+    home: Path,
+    env: dict[str, str],
+    *,
+    snapshots: int = 0,
+    ready: threading.Event | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Interrupt the foreground session after the requested snapshots."""
+    """Interrupt after a fixture sees the request or after the requested snapshots."""
     with subprocess.Popen(
         restricted([*binary, *args]),
         cwd=home,
@@ -143,6 +150,10 @@ def interrupt_watch(
         seen = bytearray()
         received = 0
         try:
+            if ready is not None and not ready.wait(8):
+                raise ValueError(
+                    "Timed out waiting for the interrupted command's request"
+                )
             while received < snapshots:
                 remaining = max(0, deadline - time.monotonic())
                 if not select.select([proc.stdout], [], [], remaining)[0]:
@@ -312,8 +323,21 @@ def observe(
             finally:
                 admission.release.set()
             result = first.result()
+    elif case.interrupt_on_request:
+        try:
+            result = interrupt_command(
+                binary, args, home, env, ready=endpoints.interrupt_ready
+            )
+            if case.server != "interrupt-http" and not endpoints.interrupt_closed.wait(
+                4
+            ):
+                raise ValueError("WebSocket did not close after SIGINT")
+        finally:
+            endpoints.interrupt_closed.set()
     elif case.interrupt_after is not None:
-        result = interrupt_watch(binary, args, home, env, case.interrupt_after)
+        result = interrupt_command(
+            binary, args, home, env, snapshots=case.interrupt_after
+        )
     else:
         result = run(binary, args, home, env)
     ended_at = time.time()
@@ -420,6 +444,8 @@ def safe_observe(
     endpoints: Endpoints,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
+    endpoints.interrupt_ready.clear()
+    endpoints.interrupt_closed.clear()
     endpoints.wire.clear()
     endpoints.admission.arrived.clear()
     endpoints.admission.release.clear()

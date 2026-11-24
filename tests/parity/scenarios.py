@@ -74,6 +74,8 @@ class Endpoints:
     errors: list[str] = field(default_factory=list)
     wire: list[WireRequest] = field(default_factory=list)
     admission: Admission = field(default_factory=Admission)
+    interrupt_ready: threading.Event = field(default_factory=threading.Event)
+    interrupt_closed: threading.Event = field(default_factory=threading.Event)
 
     @property
     def keeper(self) -> str:
@@ -164,6 +166,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
     admission = Admission()
+    interrupt_ready, interrupt_closed = threading.Event(), threading.Event()
     scope = f"/parity/{uuid.uuid4().hex}"
     markets = fixture("mainnet_markets_http.json")
     prices = fixture("mainnet_prices_http.json")
@@ -319,6 +322,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):
                         self.reject(f"Wrong Keeper variables for {name}")
+                    elif scenario == "interrupt-http":
+                        interrupt_ready.set()
+                        interrupt_closed.wait(8)
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
                     elif (
@@ -414,6 +420,15 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         response.headers["Location"] = location
         return response
 
+    class StalledClose(ServerConnection):
+        def send_data(self) -> None:
+            if self.protocol.close_rcvd is None:
+                super().send_data()
+            else:
+                # Keep the socket open without acknowledging the client's close.
+                self.protocol.data_to_send()
+                interrupt_ready.set()
+
     disconnected_at = 0.0
 
     def websocket(connection: ServerConnection) -> None:
@@ -430,6 +445,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 errors.append("Expected WebSocket connection_init")
                 return
             wire.append(WireRequest("ws:init"))
+            if scenario == "interrupt-handshake":
+                interrupt_ready.set()
+                connection.recv(timeout=8)
+                errors.append("Watch continued the handshake after SIGINT")
+                return
             if scenario == "ws-no-ack":
                 connection.send(json.dumps({"type": "connection_error"}))
                 return
@@ -458,6 +478,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     )
                 )
                 return
+            if scenario == "interrupt-balance":
+                interrupt_ready.set()
+                connection.recv(timeout=8)
+                errors.append("Balance read continued the subscription after SIGINT")
+                return
             payload = queue_payloads[name]
             if scenario == "ws-partial":
                 connection.send(json.dumps({"type": "ping"}))
@@ -484,18 +509,33 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             if scenario == "watch-reconnect" and count == 1:
                 disconnected_at = time.monotonic()
                 connection.close()
-            if scenario in {"watch-idle", "watch-reconnect"}:
+            if scenario in {"watch-idle", "watch-reconnect", "interrupt-balance-close"}:
                 # Wait for the interrupted client to close the connection.
                 connection.recv(timeout=10)
-        except ConnectionClosed:
+        except ConnectionClosed as exc:
+            if scenario in {
+                "interrupt-handshake",
+                "interrupt-balance",
+                "interrupt-balance-close",
+            }:
+                if exc.rcvd is None or exc.rcvd.code != 1011:
+                    errors.append("Expected WebSocket close code 1011 after SIGINT")
+                else:
+                    wire.append(WireRequest("ws:close"))
+                interrupt_closed.set()
             # Doctor only needs the handshake, and balances closes after its snapshot.
-            pass
         except (ValueError, KeyError, StopIteration, TimeoutError, TypeError):
             errors.append("Unsupported Keeper WebSocket exchange")
 
     with (
         http_server(Handler) as http,
-        graphql_ws(websocket, process_request=websocket_redirect) as ws,
+        graphql_ws(
+            websocket,
+            process_request=websocket_redirect,
+            create_connection=StalledClose
+            if scenario == "interrupt-balance-close"
+            else None,
+        ) as ws,
     ):
         yield Endpoints(
             http + scope,
@@ -503,4 +543,6 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             errors,
             wire,
             admission,
+            interrupt_ready,
+            interrupt_closed,
         )
