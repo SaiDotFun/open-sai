@@ -37,9 +37,11 @@ def fixture_env(tmp_path: Path) -> dict[str, str]:
 def invoke(
     candidate: str, home: Path, env: dict[str, str], *args: str
 ) -> subprocess.CompletedProcess[str]:
+    project = home / "project"
+    project.mkdir(exist_ok=True)
     return subprocess.run(
         [candidate, "--json", *args],
-        cwd=home,
+        cwd=project,
         env=env,
         capture_output=True,
         text=True,
@@ -137,3 +139,21 @@ def test_doctor_rejects_unsafe_transport_before_connecting(
     assert lcd_error in report["lcd"]["summary"]
     assert report["websocket"]["summary"].endswith("StreamError")
     assert "fixture-password" not in result.stdout + result.stderr
+
+
+def test_doctor_restores_codex_config_when_verification_fails(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    seed_clients(tmp_path, fixture_env, "partial")
+    codex = tmp_path / ".codex/config.toml"
+    cursor = tmp_path / ".cursor/mcp.json"
+    before = codex.read_bytes()
+    result = invoke(candidate, tmp_path, fixture_env, "doctor", "--offline")
+    report = checks(result)
+    assert report["mcp.codex"]["status"] == "fail"
+    assert report["mcp.cursor"]["status"] == "fixed"
+    assert codex.read_bytes() == before
+    assert stat.S_IMODE(codex.stat().st_mode) == 0o640
+    assert json.loads(cursor.read_text())["mcpServers"]["sai"]["command"] == str(
+        tmp_path / "bin/sai"
+    )

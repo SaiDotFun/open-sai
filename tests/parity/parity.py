@@ -18,7 +18,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -82,6 +82,7 @@ class Case:
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
     client_seed: str | None = None
+    accepted_divergence: str | None = None
 
     @property
     def command(self) -> str:
@@ -222,7 +223,12 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
 
 
 def observe(
-    case: Case, binary: list[str], home: Path, endpoints: Endpoints
+    case: Case,
+    binary: list[str],
+    home: Path,
+    endpoints: Endpoints,
+    *,
+    candidate: bool = False,
 ) -> Observation:
     started_at = time.time()
     seed_home(home, endpoints, case.seed)
@@ -298,7 +304,10 @@ def observe(
         if SECRET in result.stdout or SECRET in result.stderr:
             raise ValueError("Client config value escaped into CLI output")
         files.update(client_state(home, client_before, normalize))
-    check_state(case.state or {}, files)
+    state = dict(case.state or {})
+    if candidate and case.accepted_divergence == "codex-repair-rollback":
+        state["clients/.codex/config.toml#changed"] = False
+    check_state(state, files)
     try:
         output = stdout(result.stdout, case.mode, case.command, normalize)
         if contender:
@@ -370,6 +379,8 @@ def safe_observe(
     binary: list[str],
     home: Path,
     endpoints: Endpoints,
+    *,
+    candidate: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
     endpoints.wire.clear()
@@ -379,7 +390,7 @@ def safe_observe(
     outbound = unroutable_packets()
     try:
         result: tuple[Observation | None, str] = (
-            observe(case, binary, home, endpoints),
+            observe(case, binary, home, endpoints, candidate=candidate),
             "",
         )
     except subprocess.TimeoutExpired:
@@ -406,7 +417,11 @@ def run_case(
             case, reference, Path(temp) / "reference", endpoints
         )
         right, right_error = safe_observe(
-            case, candidate, Path(temp) / "candidate", endpoints
+            case,
+            candidate,
+            Path(temp) / "candidate",
+            endpoints,
+            candidate=candidate != reference,
         )
     tools = {}
     if case.mode == "mcp" and left is not None:
@@ -429,6 +444,14 @@ def run_case(
             for side, error in (("reference", left_error), ("candidate", right_error))
             if error
         ], tools
+    if candidate != reference and case.accepted_divergence == "codex-repair-rollback":
+        # Both observations checked their expected change flag. Compare the
+        # saved file's existence and mode while allowing its contents to differ.
+        filename = "clients/.codex/config.toml"
+        for observation in (left, right):
+            observation.files[filename] = replace(
+                observation.files[filename], data=None
+            )
     diffs = differences(left, right)
     if left.exit_code != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
@@ -529,7 +552,12 @@ def main() -> int:
         row(
             f"`sai {shlex.join(case.args)}` ({case.name})",
             "DIFF" if diffs else "PASS",
-            ", ".join(diffs),
+            ", ".join(diffs)
+            or (
+                f"Accepted divergence ({case.accepted_divergence})"
+                if candidate is not reference and case.accepted_divergence
+                else ""
+            ),
         )
     if not args.case:
         for name, reason in sorted(deferred.items()):

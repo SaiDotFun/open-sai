@@ -130,3 +130,8 @@ configs. The runner uses fixture programs for client subprocesses and
 compares their arguments, file modes, config values, Codex comments, and
 which files changed. It also checks that stdout and stderr omit the
 fixture credential.
+
+In `doctor-mcp-verification-failure`, Rust restores the Codex config when
+verification rejects the repaired entry. The case checks that Rust keeps the
+original bytes and mode. The pinned Python reference leaves the replacement
+on disk.

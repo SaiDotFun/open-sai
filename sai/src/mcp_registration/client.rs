@@ -1,7 +1,8 @@
 use std::{
     env,
-    fs::{self, File},
+    fs::{self, File, Metadata},
     io::{self, Read, Seek, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Stdio},
     thread,
@@ -124,10 +125,39 @@ impl Client {
     ) -> Result<()> {
         let path = self.path(scope, home, cwd);
         if self == Self::Codex {
-            return edit(&path, true, |source| edit_codex(source, name, target, old));
+            return edit(&path, true, |source| edit_codex(source, name, target, old)).map(|_| ());
         }
         let update = old.map_or(JsonUpdate::Install(None), JsonUpdate::Repair);
         self.write_json(&path, cwd, scope, name, target, update)
+    }
+
+    pub(super) fn repair_codex(
+        home: &Path,
+        cwd: &Path,
+        name: &str,
+        target: &Target,
+        old: &Registration,
+        deadline: Instant,
+    ) -> Result<()> {
+        let client = Self::Codex;
+        let path = client.path(Scope::User, home, cwd);
+        let published = edit(&path, true, |source| {
+            edit_codex(source, name, target, Some(old))
+        })?;
+        let verification = codex_get(&client.codex_neutral(home), Scope::User, name, deadline)
+            .and_then(|entry| {
+                if entry.is_some_and(|entry| entry.matches_command(target)) {
+                    Ok(())
+                } else {
+                    Err("Codex did not load the repaired Sai registration".into())
+                }
+            });
+        if verification.is_err()
+            && let Some(published) = published
+        {
+            published.restore(&path)?;
+        }
+        verification
     }
 
     pub(super) fn replace_claude(
@@ -220,6 +250,7 @@ impl Client {
                 serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
             Ok(format!("{}\n", crate::local::ascii_json(&rendered)))
         })
+        .map(|_| ())
     }
 }
 
@@ -522,8 +553,42 @@ fn read_json(path: &Path) -> Result<Value> {
     }
 }
 
-fn edit(path: &Path, retry: bool, render: impl Fn(&[u8]) -> Result<String>) -> Result<()> {
-    let write = || -> Result<bool> {
+struct PublishedConfig {
+    destination: PathBuf,
+    original: Option<Vec<u8>>,
+    replacement: String,
+    metadata: Metadata,
+}
+
+impl PublishedConfig {
+    fn restore(self, path: &Path) -> Result<()> {
+        // A concurrent edit belongs to the client or user. Restore only the
+        // file this repair published, even if a newer file has identical text.
+        let original = self
+            .original
+            .ok_or("The original Codex config is unavailable")?;
+        let restored = replace_if_current(
+            path,
+            &self.destination,
+            Some(self.replacement.as_bytes()),
+            &original,
+            Some(&self.metadata),
+        )?;
+        if restored.is_some() {
+            Ok(())
+        } else {
+            Err("Codex config.toml changed before Sai could restore it".into())
+        }
+    }
+}
+
+fn edit(
+    path: &Path,
+    retry: bool,
+    render: impl Fn(&[u8]) -> Result<String>,
+) -> Result<Option<PublishedConfig>> {
+    let attempts = if retry { 2 } else { 1 };
+    for _ in 0..attempts {
         let destination = resolved(path);
         let seen = read(&destination).map_err(io_kind)?;
         let rendered = render(seen.as_deref().unwrap_or(
@@ -534,33 +599,33 @@ fn edit(path: &Path, retry: bool, render: impl Fn(&[u8]) -> Result<String>) -> R
             },
         ))?;
         if seen.as_deref() == Some(rendered.as_bytes()) {
-            return Ok(true);
+            return Ok(None);
         }
-        let parent = destination.parent().ok_or("Missing config directory")?;
-        fs::create_dir_all(parent).map_err(io_kind)?;
-        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(io_kind)?;
-        temp.write_all(rendered.as_bytes()).map_err(io_kind)?;
-        if seen.is_some() {
-            let meta = match destination.metadata() {
+        let original_metadata = if seen.is_some() {
+            Some(match destination.metadata() {
                 Ok(meta) => meta,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(false);
+                    continue;
                 }
                 Err(error) => return Err(io_kind(error)),
-            };
-            temp.as_file()
-                .set_permissions(meta.permissions())
-                .map_err(io_kind)?;
+            })
+        } else {
+            None
+        };
+        if let Some(metadata) = replace_if_current(
+            path,
+            &destination,
+            seen.as_deref(),
+            rendered.as_bytes(),
+            original_metadata.as_ref(),
+        )? {
+            return Ok(Some(PublishedConfig {
+                destination,
+                original: seen,
+                replacement: rendered,
+                metadata,
+            }));
         }
-        if resolved(path) != destination || read(&destination).map_err(io_kind)? != seen {
-            return Ok(false);
-        }
-        temp.persist(destination)
-            .map_err(|error| io_kind(error.error))?;
-        Ok(true)
-    };
-    if write()? || (retry && write()?) {
-        return Ok(());
     }
     if !retry {
         Err("The Sai registration changed concurrently".into())
@@ -572,6 +637,42 @@ fn edit(path: &Path, retry: bool, render: impl Fn(&[u8]) -> Result<String>) -> R
             path.display()
         ))
     }
+}
+
+fn replace_if_current(
+    path: &Path,
+    destination: &Path,
+    seen: Option<&[u8]>,
+    replacement: &[u8],
+    original_metadata: Option<&Metadata>,
+) -> Result<Option<Metadata>> {
+    let parent = destination.parent().ok_or("Missing config directory")?;
+    fs::create_dir_all(parent).map_err(io_kind)?;
+    let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(io_kind)?;
+    temp.write_all(replacement).map_err(io_kind)?;
+    if let Some(meta) = original_metadata {
+        temp.as_file()
+            .set_permissions(meta.permissions())
+            .map_err(io_kind)?;
+    }
+    let published_metadata = temp.as_file().metadata().map_err(io_kind)?;
+    if resolved(path) != destination || read(destination).map_err(io_kind)?.as_deref() != seen {
+        return Ok(None);
+    }
+    if let Some(expected) = original_metadata
+        && !destination.metadata().is_ok_and(|actual| {
+            actual.dev() == expected.dev()
+                && actual.ino() == expected.ino()
+                && actual.mode() == expected.mode()
+                && actual.uid() == expected.uid()
+                && actual.gid() == expected.gid()
+        })
+    {
+        return Ok(None);
+    }
+    temp.persist(destination)
+        .map_err(|error| io_kind(error.error))?;
+    Ok(Some(published_metadata))
 }
 
 fn edit_codex(

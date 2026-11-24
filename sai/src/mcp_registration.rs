@@ -751,8 +751,10 @@ impl Clients {
                 "Check this client's Sai registration and rerun `sai doctor`",
             )
         };
-        client
-            .write(
+        if client == Client::Codex {
+            Client::repair_codex(&self.home, &self.cwd, name, &target, entry, deadline)
+        } else {
+            client.write(
                 entry.scope,
                 &self.home,
                 &self.cwd,
@@ -760,18 +762,8 @@ impl Clients {
                 &target,
                 Some(entry),
             )
-            .map_err(problem)?;
-        if client == Client::Codex {
-            let neutral = client.codex_neutral(&self.home);
-            let actual =
-                client::codex_get(&neutral, Scope::User, name, deadline).map_err(problem)?;
-            if !actual.is_some_and(|entry| entry.matches_command(&target)) {
-                return Err(problem(
-                    "Codex did not load the repaired Sai registration".into(),
-                ));
-            }
         }
-        Ok(())
+        .map_err(problem)
     }
 }
 
