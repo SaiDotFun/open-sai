@@ -68,7 +68,7 @@ class Registration:
     """The `sai` entry found in a client.
 
     Keeps argv, the SAI_HOME value (a path), and only the names of any other
-    environment settings, which `install` does not carry and so replaces.
+    environment settings. Install writes only SAI_HOME to canonical entries.
     """
 
     argv: list[str]
@@ -788,10 +788,10 @@ def list_clients(
 
 
 def replacement_steps(
-    client: Client, scope: str, target: Target, name: str, exists: bool
+    client: Client, scope: str, target: Target, exists: bool
 ) -> list[list[str]]:
-    remove = client.remove_steps(scope, name) if exists else []
-    return [*remove, *client.add_steps(scope, target, name)]
+    remove = client.remove_steps(scope) if exists else []
+    return [*remove, *client.add_steps(scope, target)]
 
 
 def report_legacy_install(client: Client, reg: Registration, target: Target) -> Result:
@@ -824,16 +824,10 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             client.require_exe()
         found = client.registrations()
         existing = next((r for r in found if r.scope == scope), None)
-        name = NAME
-        if existing is None and isinstance(client, (Codex, Cursor)):
+        if existing is None:
             legacy = client.effective(client.registrations(RETIRED_NAME))
             if legacy is not None:
                 return report_legacy_install(client, legacy, target)
-        if existing is None and isinstance(client, Claude):
-            existing = client.registration(scope, RETIRED_NAME)
-            if existing is not None:
-                name = RETIRED_NAME
-                result.name = name
         winner = client.effective(found)
         if (
             winner is not None
@@ -851,7 +845,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = replacement_steps(client, scope, target, name, existing is not None)
+            steps = replacement_steps(client, scope, target, existing is not None)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", action
@@ -865,7 +859,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
                 # changed the client.
                 result.changed = True
         result.changed = True
-        client.verify(scope, target, name=name)
+        client.verify(scope, target)
         result.action = action
     except (ClientError, OSError) as exc:
         result.action, result.error = "failed", str(exc)

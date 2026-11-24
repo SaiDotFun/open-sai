@@ -934,24 +934,49 @@ def test_user_install_reports_the_cursor_project_alias(env: Env):
     assert not env.cursor_path().exists()
 
 
-def test_explicit_claude_install_keeps_the_existing_legacy_name(env: Env):
+@pytest.mark.parametrize("stale", [False, True])
+def test_ordinary_claude_install_preserves_the_legacy_entry(env: Env, stale: bool):
     config = env.home / ".claude.json"
+    routing = ["--endpoint", f"https://private.example/{SECRET}"]
+    argv = [OLD_COMMAND, *routing] if stale else [*serve(env), *routing]
+    overrides = {"SAI_HOME": str(env.root / "other-profile"), "CUSTOM": SECRET}
     config.write_text(
-        json.dumps({"mcpServers": {OLD_COMMAND: claude_entry([OLD_COMMAND])}})
+        json.dumps({"mcpServers": {OLD_COMMAND: claude_entry(argv, overrides)}})
     )
+    original = config.read_bytes()
+    fails_add = FAKE_CLAUDE.replace(
+        "args = sys.argv[1:]\n",
+        "args = sys.argv[1:]\nif args[1] == 'add':\n    sys.exit(3)\n",
+    )
+    write_exe(env.bin / "claude", fails_add)
 
     result = invoke("mcp", "install", "--client", "claude")
-    assert result.exit_code == 0, result.output
-    assert actions(result) == {"claude": "replaced"}
-    assert env.claude_json()["mcpServers"] == {
-        OLD_COMMAND: claude_entry(serve(env), {})
-    }
-    again = invoke("mcp", "install", "--client", "claude")
-    assert actions(again) == {"claude": "unchanged"}
-    assert env.calls() == [
-        ["mcp", "remove", "--scope", "user", OLD_COMMAND],
-        ["mcp", "add", "--scope", "user", OLD_COMMAND, "--", *serve(env)],
-    ]
+
+    if stale:
+        assert "Run `sai doctor` for repair instructions" in failure(result)
+        summary = payload(result)["error"]["details"]
+    else:
+        assert result.exit_code == 0, result.output
+        summary = payload(result)
+    [row] = summary["results"]
+    assert row["name"] == OLD_COMMAND and row["scope"] == "user"
+    assert row["action"] == ("failed" if stale else "unchanged")
+    assert not summary["reconnectNeeded"]
+    assert SECRET not in result.output
+    assert config.read_bytes() == original
+    assert env.calls() == []
+
+    if stale:
+        repaired = invoke(
+            "mcp", "install", "--client", "claude", "--repair-existing", OLD_COMMAND
+        )
+        assert repaired.exit_code == 0, repaired.output
+        assert env.claude_json()["mcpServers"] == {
+            OLD_COMMAND: claude_entry([*serve(env), *routing], overrides)
+        }
+        again = invoke("mcp", "install", "--client", "claude")
+        assert actions(again) == {"claude": "unchanged"}
+        assert env.calls() == []
 
 
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):
