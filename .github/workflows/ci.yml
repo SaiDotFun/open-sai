@@ -1,8 +1,9 @@
 name: "CI"
 
-# No paths filter: the required checks must report on every pull request.
+# Keep the required jobs present on every PR and filter their steps by project.
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: ["main"]
 
@@ -19,46 +20,113 @@ concurrency:
 # The job names are the required check names on main. Rename them together
 # with the "Required checks" ruleset.
 jobs:
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      python: ${{ github.event_name != 'pull_request' || steps.paths.outputs.python != 'false' }}
+      rust: ${{ github.event_name != 'pull_request' || steps.paths.outputs.rust != 'false' }}
+    steps:
+      - name: Detect changed projects
+        id: paths
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            python:
+              - 'cli/**'
+              - 'skills/**'
+              - 'scripts/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'setup.py'
+              - 'justfile'
+              - '.github/workflows/ci.yml'
+            rust:
+              - 'sai-core/**'
+              - 'sai/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - '.cargo/**'
+              - '.github/workflows/ci.yml'
+
+  # Omit a project's steps only when detection succeeds and reports 'false'.
   test:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # The suite takes under a minute; a hung test must not hold a required
     # check for GitHub's six-hour default.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         with:
           persist-credentials: false
 
       # 3.11 is the minimum version in pyproject's requires-python.
       - name: Install uv and Python
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.11"
 
       - name: Install dependencies from uv.lock
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         run: uv sync --locked --all-groups
 
       - run: uv run pytest
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
 
   check:
+    needs: changes
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # The suite takes under a minute; a hung test must not hold a required
     # check for GitHub's six-hour default.
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         with:
           persist-credentials: false
 
       - name: Install uv and Python
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.11"
 
       - name: Install dependencies from uv.lock
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
         run: uv sync --locked --all-groups
 
       # Same commands as "just check".
       - run: uv run ruff check .
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
       - run: uv run ruff format --check .
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
       - run: uv run ty check cli/sai_cli
+        if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
+
+  rust:
+    needs: changes
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'
+        with:
+          persist-credentials: false
+
+      - run: cargo fmt --all --check
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'
+      - run: cargo test --locked --workspace
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false'

@@ -58,9 +58,9 @@ executed. Use intent_status with the intent key to follow it.
 - If a trade returns code OUTCOME_UNKNOWN, call intent_status with its \
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
-retrying. trade_open refuses with RECENT_OPEN_PENDING while a recent open \
-is unknown or accepted; check those intents with intent_status, and pass \
-allow_concurrent_open=true only if the user wants another open position.
+retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
+Wait for a final outcome on pending fills. For recent accepted opens, use \
+allow_concurrent_open=true only after the user confirms another position.
 - The user can connect several accounts; one is active. auth_list shows \
 them. Preview and trade tools act on the active account unless given \
 addr, which must be a connected account. Every preview and trade names \
@@ -205,7 +205,8 @@ async def account_balances(addr: str | None = None) -> str:
 async def intent_local(addr: str | None = None) -> str:
     """List intents this machine recorded, with their local status.
 
-    Status `unknown` blocks new trades until intent_status reconciles it.
+    Statuses `unknown` and `pending` block new trades until intent_status
+    reconciles them.
     The result names the `addr` read and its `addrSource`.
 
     Args:
@@ -218,11 +219,9 @@ async def intent_local(addr: str | None = None) -> str:
 async def intent_status(addr: str | None = None, key: str | None = None) -> str:
     """Read Keeper's latest intent records; with KEY, reconcile that intent.
 
-    With KEY this also writes: it updates this machine's local intent cache,
-    the record intent_local lists and trades check. It never changes
-    anything on Keeper. Reconciling updates only the local record: a server failure or matched
-    trade history is final, a server acceptance is accepted, and a key
-    Keeper never recorded past its admission window stops blocking trades.
+    The account list records pending observations in the local ledger.
+    With KEY this also checks for a final outcome. If the result includes
+    outcome `pending`, follow its hint and check the same key again.
 
     Args:
         addr: EVM addr (0x...). Defaults to the signed-in account,
@@ -308,9 +307,8 @@ async def trade_open(
     from the confirmed preview, and, for a market order, PRICE_MOVED when
     Keeper's current price moved from reference_price by more than the
     slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an open for this account from the last few
-    minutes is still unknown or accepted: call intent_local and
-    intent_status before retrying.
+    RECENT_OPEN_PENDING when an open is pending, or a recent open is still
+    unknown or accepted. Check its key with intent_status before retrying.
 
     Args:
         market_id: Market id from market_list.
@@ -326,10 +324,9 @@ async def trade_open(
         preview_digest: previewDigest from the confirmed preview_open.
         reference_price: referencePrice from the confirmed preview_open;
             required for market orders only.
-        allow_concurrent_open: True to submit despite a recent pending
-            open, only after intent_status shows it and the user confirms
-            they want another position. An intent still `unknown` blocks
-            every trade until intent_status reconciles it.
+        allow_concurrent_open: True to submit with a recent accepted open,
+            after checking its status and getting confirmation for another
+            position. Unknown outcomes and pending fills still block trades.
         addr: Connected account to act as (0x...). Defaults to the
             active account.
     """

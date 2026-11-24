@@ -14,6 +14,14 @@ check:
     uv run ruff format --check .
     uv run ty check cli/sai_cli
 
+# Build the Rust workspace in debug mode
+rust-build:
+    cargo build --locked --workspace
+
+# Run the Rust workspace tests
+rust-test:
+    cargo test --locked --workspace
+
 # Build the wheel and sdist and check that both ship the real skill directory
 build-check:
     uv run python scripts/check_dist.py
