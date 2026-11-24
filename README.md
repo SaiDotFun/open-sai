@@ -109,7 +109,7 @@ one, `sai --as ADDR ...` runs one command as another, and `sai auth logout
 
 Run `sai auth renew [ADDR]` to sign a fresh session with the key saved by
 `sai auth login NAME`. Renewal keeps the active account selected. For a
-browser session, copy a fresh Sai Web token and run `sai auth import`.
+browser session, copy a fresh Sai Web token and run the reported `auth import --addr` command.
 `sai auth status`, `sai auth list`, `sai doctor`, and the MCP tool
 `mcp_info` warn when a session has less than three days left.
 

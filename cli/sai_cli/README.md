@@ -234,8 +234,8 @@ explicit address renews that account and keeps the active selection. If a
 keystore session predates the saved key name, run `sai auth login NAME` once
 or use the reported `sai auth import --addr ADDR` command with a fresh Sai Web
 token for that address.
-For a session copied from Sai Web, copy a fresh token and run `sai auth
-import`.
+For a session copied from Sai Web, copy a fresh token for the same account
+and run the reported `auth import --addr` command.
 
 Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
 warning when a session has less than three days left. Interactive commands

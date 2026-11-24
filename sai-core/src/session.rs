@@ -265,8 +265,6 @@ impl Storage<'_> {
     pub fn renewal_fields(&self, session: &Session) -> (String, Option<String>) {
         let args: &[&str] = if session.key_name().is_some() {
             &["auth", "renew", session.addr()]
-        } else if session.is_imported() {
-            &["auth", "import"]
         } else {
             &["auth", "import", "--addr", session.addr()]
         };
