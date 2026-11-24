@@ -1,7 +1,7 @@
 # List uncovered commands explicitly so adding a command requires a decision.
 [deferred]
 "account overview" = "Requires pinned LCD and trade replay fixtures."
-"auth import" = "Compared with a fixture clipboard and PTY in test_auth.py."
+"auth import" = "Successful imports are compared with a fixture clipboard and PTY in test_auth.py."
 "auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
 "auth renew" = "Compared with Python main in test_auth.py."
 "mcp uninstall" = "Requires a client registration fixture."
@@ -277,6 +277,19 @@ expect = 1
 wire = ["ws:init"]
 
 [[case]]
+name = "auth-import-rejected-operand-text"
+args = ["auth","import","synthetic-import-credential-marker"]
+mode = "text"
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
+name = "auth-import-rejected-operand-json"
+args = ["--json","auth","import","synthetic-import-credential-marker"]
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
 name = "auth-status-signed-out"
 args = ["--json","auth","status"]
 expect = 6
@@ -306,9 +319,19 @@ seed = "accounts"
 state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
 
 [[case]]
-name = "auth-use-missing"
+name = "auth-use-invalid-expiry-text"
+args = ["auth","use","{addr}"]
+mode = "text"
+expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
+
+[[case]]
+name = "auth-use-invalid-expiry-json"
 args = ["--json","auth","use","{addr}"]
 expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
 
 [[case]]
 name = "auth-logout"
@@ -853,7 +876,7 @@ args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
 seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market",
     "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
     "is_after_hours_market", "get_market", "get_fees",
 ]
