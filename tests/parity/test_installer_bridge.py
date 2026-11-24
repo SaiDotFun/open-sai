@@ -587,6 +587,37 @@ def test_standalone_reinstall_repairs_cursor(install: Install, replay: Replay) -
     assert not install.profile.exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize(
+    ("scope", "filename"), [("user", ".claude/.claude.json"), ("project", ".mcp.json")]
+)
+def test_standalone_reinstall_prints_claude_repair_scopes(
+    install: Install, replay: Replay, scope: str, filename: str
+) -> None:
+    version = native_artifact(replay)
+    ok(install.install(replay, "--native"))
+    (install.launcher.parent / "claude").symlink_to("/bin/false")
+    original = json.dumps(
+        {
+            "mcpServers": {
+                "sai": {"type": "stdio", "command": OLD_MCP_COMMAND, "args": []}
+            }
+        }
+    )
+    config = install.home / filename
+    config.parent.mkdir(exist_ok=True)
+    config.write_text(original)
+    result = install.install(replay, "--native")
+    ok(result)
+    assert (
+        f"sai mcp install --client claude --scope {scope} --repair-existing sai"
+        in result.stderr
+    )
+    assert config.read_text() == original
+    assert not pending(install).exists()
+    install.pin(version)
+
+
 def add_shim(replay: Replay, wheel: Path, binary: Path | None = None) -> str:
     version = wheel_version(wheel)
     files = {wheel.name: wheel.read_bytes()}

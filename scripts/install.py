@@ -881,6 +881,36 @@ def native_release(args: argparse.Namespace) -> tuple[str, str, str]:
     return tag, version, native_asset(version)
 
 
+def repair_mcp(launcher: Path, profile: str) -> None:
+    # Doctor reads registrations from HOME and the caller's working directory.
+    try:
+        result = subprocess.run(
+            [launcher, "--json", "doctor", "--offline"],
+            env={**os.environ, "SAI_HOME": profile, "SAI_LOG": "false", "CI": "1"},
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=VERIFY_TIMEOUT,
+            check=False,
+        )
+        report = json.loads(result.stdout)
+        if "error" in report:
+            report = report["error"]["details"]
+        checks = [check for check in report["checks"] if check["id"].startswith("mcp")]
+        for check in checks:
+            if check["status"] in ("warn", "fail"):
+                hint = check.get("fix")
+                print(f"{check['id']}: {check['summary']}", file=sys.stderr)
+                if hint:
+                    print(hint, file=sys.stderr)
+        if checks or result.returncode == 0:
+            return
+    except (OSError, subprocess.TimeoutExpired, ValueError, TypeError, KeyError):
+        pass
+    print(
+        "Could not finish MCP registration repair. Run `sai doctor`.", file=sys.stderr
+    )
+
+
 def install_native(args: argparse.Namespace) -> int:
     # Validate the platform before looking up a release or creating directories.
     native_asset("")
@@ -978,30 +1008,7 @@ def install_native(args: argparse.Namespace) -> int:
             pending.unlink()
             sync_dir(root)
             if old is not None:
-                # Doctor's MCP checks use HOME and the caller's working directory.
-                # Keep its profile checks in the same disposable home as smoke.
-                try:
-                    repair = subprocess.run(
-                        [launcher, "doctor", "--offline"],
-                        env={
-                            **os.environ,
-                            "SAI_HOME": profile,
-                            "SAI_LOG": "false",
-                            "CI": "1",
-                        },
-                        stdin=subprocess.DEVNULL,
-                        capture_output=True,
-                        timeout=VERIFY_TIMEOUT,
-                        check=False,
-                    )
-                    repaired = repair.returncode == 0
-                except (OSError, subprocess.TimeoutExpired):
-                    repaired = False
-                if not repaired:
-                    print(
-                        "Could not finish MCP registration repair. Run `sai doctor`.",
-                        file=sys.stderr,
-                    )
+                repair_mcp(launcher, profile)
     print(f"Installed sai {version} at {launcher}.")
     return 0
 
