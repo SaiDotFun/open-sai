@@ -1,10 +1,10 @@
-use std::str::FromStr;
+use std::{fs, os::unix::fs::PermissionsExt, str::FromStr};
 
 use chrono::{NaiveDateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
 use serde::Serialize;
 
-use super::{Storage, StorageError, StorageEvent, private_file};
+use super::{Storage, StorageError, StorageEvent, endpoint_origin};
 
 const SCHEMA_VERSION: i64 = 1;
 const CREATE_INTENTS: &str = "CREATE TABLE IF NOT EXISTS intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, entity TEXT NOT NULL DEFAULT '', created_at REAL)";
@@ -92,8 +92,10 @@ impl Storage<'_> {
     /// Open and migrate the ledger.
     pub fn open_ledger(&self) -> Result<Connection, StorageError> {
         let path = self.directory()?.join("intents.sqlite3");
-        private_file(&path)?;
-        let mut connection = Connection::open(path)?;
+        // Closing a separate descriptor would release this process's SQLite
+        // POSIX locks. The enclosing directory is private even on first open.
+        let mut connection = Connection::open(&path)?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         connection.busy_timeout(self.busy_timeout)?;
         migrate(&mut connection)?;
         Ok(connection)
@@ -147,7 +149,7 @@ impl Storage<'_> {
             kind,
             addr: account,
             entity,
-            endpoint,
+            endpoint: &endpoint_origin(endpoint),
         });
         Ok(())
     }
@@ -183,7 +185,7 @@ impl Storage<'_> {
                 previous: &previous,
                 status,
                 addr: account,
-                endpoint,
+                endpoint: &endpoint_origin(endpoint),
             });
         }
         Ok(())
@@ -232,7 +234,7 @@ impl Storage<'_> {
             previous: &previous,
             status,
             addr: account,
-            endpoint,
+            endpoint: &endpoint_origin(endpoint),
         });
         Ok(Some(status.as_str().into()))
     }

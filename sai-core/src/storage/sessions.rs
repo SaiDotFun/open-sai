@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 use tempfile::Builder;
 use zeroize::Zeroizing;
 
-use super::{SessionError, Storage, StorageError, StorageEvent, private_file, remove_if_exists};
+use super::{
+    SessionError, Storage, StorageError, StorageEvent, endpoint_origin, private_file,
+    remove_if_exists,
+};
 
 const SESSIONS: &str = "sessions.json";
 const LEGACY_SESSION: &str = "session.json";
@@ -45,7 +48,7 @@ pub struct Session {
 pub struct SessionSummary<'a> {
     pub addr: &'a str,
     pub expires_at: &'a str,
-    pub endpoint: &'a str,
+    pub endpoint: String,
 }
 
 impl Session {
@@ -80,12 +83,13 @@ impl Session {
     }
 
     pub fn summary(&self) -> Result<SessionSummary<'_>, StorageError> {
+        let endpoint = self
+            .endpoint()
+            .ok_or_else(|| SessionError::new("Stored session is missing its Keeper endpoint"))?;
         Ok(SessionSummary {
             addr: self.addr(),
             expires_at: self.expires_at(),
-            endpoint: self.endpoint().ok_or_else(|| {
-                SessionError::new("Stored session is missing its Keeper endpoint")
-            })?,
+            endpoint: endpoint_origin(endpoint),
         })
     }
 }
@@ -277,7 +281,7 @@ impl Storage<'_> {
         self.emit(StorageEvent::SessionSaved {
             addr: session.addr(),
             expires_at: session.expires_at(),
-            endpoint: session.endpoint(),
+            endpoint: session.endpoint().map(endpoint_origin).as_deref(),
             connected_accounts: accounts.sessions.len(),
         });
         Ok(())

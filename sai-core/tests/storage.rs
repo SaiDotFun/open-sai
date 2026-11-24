@@ -278,3 +278,58 @@ fn killing_the_writer_after_reservation_leaves_the_trade_guard_in_place() {
         matches!(storage.pending("second", ENDPOINT, ADDR, KIND, "8"), Err(StorageError::UncertainIntent(key)) if key == "first")
     );
 }
+
+#[test]
+fn storage_events_carry_only_keeper_origins() {
+    use std::sync::Mutex;
+
+    let home = tempdir().unwrap();
+    let endpoint =
+        "HTTPS://fixture-user:fixture-password@KEEPER.invalid:0443/private?key=fixture#secret";
+    let seen = Mutex::new(Vec::new());
+    let sink = |event: StorageEvent<'_>| {
+        let found = match event {
+            StorageEvent::SessionSaved { endpoint, .. } => endpoint.unwrap(),
+            StorageEvent::IntentReserved { endpoint, .. }
+            | StorageEvent::IntentStatus { endpoint, .. } => endpoint,
+            _ => panic!("unexpected storage event"),
+        };
+        assert!(found == "https://keeper.invalid:443");
+        seen.lock().unwrap().push(());
+    };
+    let storage = Storage::new(home.path()).with_event_sink(&sink);
+    storage
+        .save_session(Session::new(
+            Zeroizing::new("synthetic-session".into()),
+            ADDR.into(),
+            "2099-01-01T00:00:00Z".into(),
+            endpoint.into(),
+        ))
+        .unwrap();
+    let stored = storage.load_active_session(endpoint, None).unwrap();
+    assert!(stored.endpoint() == Some(endpoint));
+    storage
+        .pending("set-status", endpoint, ADDR, KIND, "7")
+        .unwrap();
+    storage
+        .set_status("set-status", endpoint, ADDR, IntentStatus::Terminal)
+        .unwrap();
+    storage
+        .pending("mark-absent", endpoint, ADDR, KIND, "7")
+        .unwrap();
+    assert_eq!(
+        storage
+            .mark_absent("mark-absent", endpoint, ADDR, 0.0, Some(f64::MAX))
+            .unwrap()
+            .as_deref(),
+        Some("absent")
+    );
+    assert_eq!(seen.lock().unwrap().len(), 5);
+    assert_eq!(storage.list_pending(endpoint, ADDR).unwrap().len(), 2);
+    assert!(
+        storage
+            .list_pending("https://keeper.invalid:443", ADDR)
+            .unwrap()
+            .is_empty()
+    );
+}

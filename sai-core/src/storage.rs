@@ -1,6 +1,7 @@
 use std::{
     fs::{self, DirBuilder, File, OpenOptions},
     io,
+    net::Ipv6Addr,
     os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::Duration,
@@ -46,7 +47,7 @@ pub struct Storage<'a> {
 }
 
 /// State changes to pass to the shared log writer. The event sink runs only
-/// after the operation has committed, and receives no session token.
+/// after the operation has committed. Endpoints contain only the URL origin.
 pub enum StorageEvent<'a> {
     SessionSaved {
         addr: &'a str,
@@ -81,6 +82,58 @@ pub enum StorageEvent<'a> {
         addr: &'a str,
         endpoint: &'a str,
     },
+}
+
+/// Project a stored endpoint onto the same fields as Python's log.origin.
+fn endpoint_origin(endpoint: &str) -> String {
+    fn origin(endpoint: &str) -> Option<String> {
+        let normalized = endpoint.trim().replace(['\t', '\n', '\r'], "");
+        let (scheme, rest) = normalized.split_once("://")?;
+        let mut chars = scheme.bytes();
+        if !chars.next()?.is_ascii_alphabetic()
+            || !chars.all(|c| c.is_ascii_alphanumeric() || b"+.-".contains(&c))
+        {
+            return None;
+        }
+        let authority = rest.split(['/', '?', '#']).next()?;
+        let (_, host_port) = authority.rsplit_once('@').unwrap_or(("", authority));
+        let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
+            let (address, suffix) = bracketed.split_once(']')?;
+            address.parse::<Ipv6Addr>().ok()?;
+            let host = &host_port[..address.len() + 2];
+            (
+                host,
+                suffix
+                    .strip_prefix(':')
+                    .or_else(|| suffix.is_empty().then_some(""))?,
+            )
+        } else {
+            let (host, port) = host_port.split_once(':').unwrap_or((host_port, ""));
+            if host.is_empty()
+                || !host
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || b".-".contains(&c))
+            {
+                return None;
+            }
+            (host, port)
+        };
+        let mut origin = format!(
+            "{}://{}",
+            scheme.to_ascii_lowercase(),
+            host.to_ascii_lowercase()
+        );
+        if !port.is_empty() {
+            if !port.bytes().all(|c| c.is_ascii_digit()) {
+                return None;
+            }
+            let port = port.parse::<u16>().ok()?;
+            origin.push_str(&format!(":{port}"));
+        }
+        Some(origin)
+    }
+
+    origin(endpoint).unwrap_or_else(|| "[redacted url]".into())
 }
 
 impl<'a> Storage<'a> {

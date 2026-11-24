@@ -7,6 +7,8 @@ The scaffold exposes `sai --version` and a read-only `sai config list --json`
 that reports the config path and which recognized keys are present.
 The local commands `sai auth status`, `list`, `use`, and `logout`, and
 `sai intent local ADDR`, share Python's session files and intent database.
+Rust auth output displays only the Keeper URL's scheme, host, and port.
+Session binding and ledger lookups use the full endpoint.
 
 ## Port Order
 

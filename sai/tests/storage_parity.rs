@@ -10,8 +10,8 @@ use sai_core::storage::{IntentStatus, Session, Storage, StorageError};
 use serde_json::Value;
 use tempfile::tempdir;
 
-const ENDPOINT: &str = "http://127.0.0.1:9345/query";
-const OTHER_ENDPOINT: &str = "http://127.0.0.1:9346/query";
+const ENDPOINT: &str = "http://127.0.0.1:9345";
+const OTHER_ENDPOINT: &str = "http://127.0.0.1:9346";
 const ADDR: &str = "0xAA00000000000000000000000000000000000001";
 const SECOND: &str = "0xbb00000000000000000000000000000000000002";
 
@@ -92,6 +92,52 @@ fn missing_home_status_and_list_have_no_side_effects() {
         b"Error: No Sai session; run `sai auth import` or `sai auth login NAME`\n"
     );
     assert!(!home.exists());
+}
+
+#[test]
+fn auth_output_shows_only_the_origin_but_checks_the_full_endpoint() {
+    let home = tempdir().unwrap();
+    let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture#secret";
+    Storage::new(home.path())
+        .save_session(Session::new(
+            String::from("synthetic-session").into(),
+            ADDR.into(),
+            "2099-01-01T00:00:00+0000".into(),
+            endpoint.into(),
+        ))
+        .unwrap();
+    for args in [
+        &["auth", "status"][..],
+        &["auth", "list"][..],
+        &["auth", "use", ADDR][..],
+    ] {
+        let output = rust(home.path())
+            .env("SAI_ENDPOINT", endpoint)
+            .arg("--json")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{args:?} failed");
+        assert!(output.stderr.is_empty());
+        let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let summary = if args[1] == "list" {
+            &value["accounts"][0]
+        } else {
+            &value
+        };
+        assert!(summary["endpoint"] == "http://[::1]:9345");
+        assert_eq!(summary["expiresAt"], "2099-01-01T00:00:00+0000");
+    }
+    let output = rust(home.path())
+        .args(["--endpoint", "http://[::1]:9345", "auth", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"Error: Stored session belongs to another Keeper endpoint\n"
+    );
 }
 
 #[test]
@@ -256,7 +302,7 @@ nonce = os.urandom(12)
 session = {
     "token": "synthetic-v2-fixture",
     "evmAddress": addr,
-    "expiresAt": "2099-01-01T00:00:00+00:00",
+    "expiresAt": "2099-01-01T00:00:00+0000",
     "endpoint": endpoint,
     "extra": "preserve this field",
 }
@@ -417,4 +463,73 @@ except ValueError as error:
         Err(error) => panic!("Rust reservation failed: {error}"),
     }
     assert_eq!(storage.list_pending(ENDPOINT, ADDR).unwrap().len(), 1);
+}
+
+#[test]
+#[ignore = "requires uv and a Python reference checkout"]
+fn opening_a_second_rust_connection_keeps_the_reservation_locked() {
+    let home = tempdir().unwrap();
+    let storage = Storage::new(home.path());
+    let writer = storage.open_ledger().unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let count: i64 = writer
+        .query_row("SELECT count(*) FROM intents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // Use the ordinary ledger-open path while the first connection is still
+    // in the reservation transaction and holds SQLite's writer lock.
+    let reader = storage.open_ledger().unwrap();
+    let reader_count: i64 = reader
+        .query_row("SELECT count(*) FROM intents", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(reader_count, 0);
+    write_cli_fixture(
+        home.path(),
+        r#"
+import sqlite3
+import sys
+from sai_cli.core import storage
+
+endpoint, addr = sys.argv[1:]
+with storage.busy_timeout(0):
+    try:
+        storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
+    except sqlite3.OperationalError as error:
+        assert error.sqlite_errorcode == sqlite3.SQLITE_BUSY
+    else:
+        raise AssertionError("Python acquired the writer lock during the Rust reservation")
+"#,
+        &[ENDPOINT, ADDR],
+    );
+    drop(reader);
+
+    let account = ADDR.to_lowercase();
+    writer
+        .execute(
+            "INSERT INTO intents (id, endpoint, account, kind, status)
+         VALUES ('rust', ?1, ?2, 'OPEN_TRADE', 'unknown')",
+            [ENDPOINT, &account],
+        )
+        .unwrap();
+    writer.execute_batch("COMMIT").unwrap();
+    write_cli_fixture(
+        home.path(),
+        r#"
+import sys
+from sai_cli.core import storage
+
+endpoint, addr = sys.argv[1:]
+try:
+    storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
+except ValueError as error:
+    assert "Reconcile uncertain intent rust " in str(error)
+else:
+    raise AssertionError("Python reserved a second intent")
+"#,
+        &[ENDPOINT, ADDR],
+    );
+    let rows = storage.list_pending(ENDPOINT, ADDR).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].key, "rust");
 }
