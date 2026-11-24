@@ -1841,7 +1841,7 @@ def print_log_limit(report: dict[str, Any]) -> None:
     if report.get("truncated"):
         click.echo("Report truncated. " + report["more"])
         if before := report.get("nextBefore"):
-            click.echo(f"Earlier timestamps  --before {before}")
+            click.echo(f"Continue with --before {before}")
 
 
 @logs_group.command("intent")
@@ -1874,7 +1874,7 @@ def logs_intent(
 
 @logs_group.command("run")
 @click.argument("id")
-@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
     """Show one process run or one MCP call by ID."""
@@ -1885,7 +1885,7 @@ def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
 @click.option(
     "--since", metavar="DURATION", help="Look back by a duration such as 24h."
 )
-@click.option("--before", help="Use events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_stats(ctx: click.Context, since: str | None, before: str | None) -> None:
     """Summarize Keeper latency and error codes in the retained logs."""
