@@ -161,6 +161,7 @@ def _record_submission_status(
             intentKey=key,
             addr=account,
             endpoint=log.endpoint(endpoint),
+            endpointId=log.endpoint_id(endpoint),
             status=status,
             errorType=type(exc).__name__,
         )
@@ -226,14 +227,16 @@ def submit(
             key,
             hint=storage.intent_status_hint(endpoint, account, key),
         ) from exc
-    tx_hash = ack.get("txHash")
+    tx_hash, invalid_hash = keeper.request_hash(ack.get("txHash"))
     log.event(
         "intent.submitted",
         intentKey=key,
         kind=intent["kind"],
         addr=account,
         endpoint=log.endpoint(endpoint),
-        txHash=log.Arg(tx_hash) if isinstance(tx_hash, str) and tx_hash else None,
+        endpointId=log.endpoint_id(endpoint),
+        txHash=tx_hash,
+        txHashInvalid=invalid_hash,
     )
     if failure := _record_submission_status(key, endpoint, account, "accepted"):
         raise keeper.OutcomeUnknown(

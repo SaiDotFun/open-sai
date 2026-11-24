@@ -9,11 +9,12 @@ The machine-readable registry is [log-events.json](log-events.json).
 | Presence | Fields |
 | --- | --- |
 | Required | `schema` (integer), `ts` (string), `level` (string), `event` (string), `surface` (string), `pid` (integer), `version` (string), `runId` (string), `seq` (integer) |
-| Optional | `command` (string), `tool` (string), `callId` (string), `truncated` (string[]) |
+| Optional | `command` (string), `tool` (string), `callId` (string), `commandId` (string), `truncated` (string[]) |
 
 `ts` is a UTC timestamp with millisecond precision. The integer `seq` orders events
 within a process. The field `surface` is `cli`, `mcp`, or `update`.
-Events inside a CLI command may carry `command`. Events inside an MCP call carry
+CLI invocations carry a distinct `commandId` within the process `runId`.
+Events inside an MCP call carry
 `tool` and `callId`, except that a drop notice covers the process as a whole.
 When a line exceeds the byte limit, its common required fields survive and
 `truncated` lists the remaining field names.
@@ -23,12 +24,16 @@ When a line exceeds the byte limit, its common required fields survive and
 The following fields contain volatile values. Preserve field presence and type.
 Map IDs consistently across events so a broken correlation still fails parity.
 
-`ts`, `pid`, `runId`, `callId`, `durationMs`, `version`.
+`ts`, `pid`, `runId`, `callId`, `durationMs`, `version`, `commandId`.
 
 ## Events
 
 The logger omits fields whose value is null. A failure carries a Sai error
 code in `code`. A Keeper lifecycle code, when present, goes in `errorCode`.
+MCP tool results carry the symbolic `code`. Numeric `exitCode` belongs to the CLI process.
+The field `endpointId` hashes the endpoint origin and path. Query strings and credentials
+are excluded. The field `endpoint` shows the origin.
+A malformed request hash is omitted and sets `txHashInvalid`.
 The field `txHash` on `intent.submitted` is the request transaction hash when
 Keeper includes it in the admission response. It may appear first on `intent.keeper`.
 The wait entries reserve fields for the intent wait implementation.
@@ -38,13 +43,14 @@ The wait entries reserve fields for the intent wait implementation.
 | `command.start` | `sai_cli.LoggedGroup.main` | `info` | `argv` (string[]) | None |
 | `command.end` | `sai_cli.LoggedGroup.main` | `info`, `warn` | `exitCode` (integer), `durationMs` (integer) | `code` (string), `error` (string), `intentKey` (string) |
 | `doctor.result` | `sai_cli.doctor_command` | `info`, `warn` | `overall` (string), `fix` (boolean), `offline` (boolean), `checks` (object[]) | `code` (string) |
-| `intent.keeper` | `core.reconcile.reconcile` | `info` | `intentKey` (string), `addr` (string), `endpoint` (string) | `kind` (string), `lifecycleStep` (string), `execActor` (string), `errorCode` (string), `errorMsg` (string), `txHash` (string), `found` (boolean), `code` (string) |
-| `intent.reserved` | `core.storage.pending` | `info` | `intentKey` (string), `kind` (string), `status` (string), `addr` (string), `endpoint` (string) | `tradeId` (string) |
-| `intent.status` | `core.storage._log_status` | `info` | `intentKey` (string), `kind` (string), `previous` (string), `status` (string), `addr` (string), `endpoint` (string) | `code` (string) |
-| `intent.submitted` | `core.intents.submit` | `info` | `intentKey` (string), `kind` (string), `addr` (string), `endpoint` (string) | `txHash` (string) |
-| `intent.wait.start` | `core intent wait (lane A4)` | `info` | `intentKey` (string) | `addr` (string), `endpoint` (string), `timeoutMs` (integer) |
-| `intent.wait.end` | `core intent wait (lane A4)` | `info`, `warn`, `error` | `intentKey` (string), `status` (string), `durationMs` (integer) | `addr` (string), `endpoint` (string), `txHash` (string), `fillBlock` (integer), `code` (string), `error` (string) |
-| `keeper.request` | `core.keeper._log_request` | `info`, `warn` | `operation` (string), `endpoint` (string), `authenticated` (boolean), `durationMs` (integer), `status` (string) | `addr` (string), `intentKey` (string), `code` (string), `error` (string), `httpStatus` (integer), `keeperErrors` (object[]) |
+| `intent.keeper` | `core.reconcile.reconcile` | `info` | `intentKey` (string), `addr` (string), `endpoint` (string), `endpointId` (string) | `kind` (string), `lifecycleStep` (string), `execActor` (string), `errorCode` (string), `txHash` (string), `txHashInvalid` (boolean), `found` (boolean), `code` (string) |
+| `intent.reserved` | `core.storage.pending` | `info` | `intentKey` (string), `kind` (string), `status` (string), `addr` (string), `endpoint` (string) | `tradeId` (string), `endpointId` (string) |
+| `intent.status` | `core.storage._log_status` | `info` | `intentKey` (string), `kind` (string), `previous` (string), `status` (string), `addr` (string), `endpoint` (string) | `code` (string), `endpointId` (string) |
+| `intent.submitted` | `core.intents.submit` | `info` | `intentKey` (string), `kind` (string), `addr` (string), `endpoint` (string) | `txHash` (string), `txHashInvalid` (boolean), `endpointId` (string) |
+| `intent.status_write_failed` | `core.intents._record_submission_status` | `warn` | `intentKey` (string), `addr` (string), `endpoint` (string), `endpointId` (string), `status` (string), `errorType` (string), `code` (string) | None |
+| `intent.wait.start` | `core intent wait (lane A4)` | `info` | `intentKey` (string) | `addr` (string), `endpoint` (string), `endpointId` (string), `timeoutMs` (integer) |
+| `intent.wait.end` | `core intent wait (lane A4)` | `info`, `warn`, `error` | `intentKey` (string), `status` (string), `durationMs` (integer) | `addr` (string), `endpoint` (string), `endpointId` (string), `txHash` (string), `txHashInvalid` (boolean), `fillBlock` (integer), `code` (string), `error` (string) |
+| `keeper.request` | `core.keeper._log_request` | `info`, `warn` | `operation` (string), `endpoint` (string), `authenticated` (boolean), `durationMs` (integer), `status` (string) | `addr` (string), `intentKey` (string), `endpointId` (string), `code` (string), `error` (string), `httpStatus` (integer), `keeperErrors` (object[]) |
 | `log.dropped` | `core.log._write` | `warn` | `count` (integer) | None |
 | `mcp.server_start` | `mcp_server.server.serve` | `info` | `keeper` (string), `websocket` (string), `lcd` (string) | None |
 | `mcp.tool_call` | `mcp_server.server.SaiMCP.call_tool` | `info` | `tool` (string), `callId` (string), `arguments` (object) | `unknownArguments` (integer) |

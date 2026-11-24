@@ -29,9 +29,9 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 from sai_cli import doctor
-from sai_cli.core import keeper, log, reconcile, settings, storage
+from sai_cli.core import keeper, log, log_queries, reconcile, settings, storage
 from sai_cli.core import session as sessions
-from sai_cli.core.log_events import SCHEMA_VERSION, VOLATILE_FIELDS
+from sai_cli.core.log_events import SCHEMA_VERSION, VOLATILE_FIELDS, valid_event
 from sai_cli.mcp_server import server
 from sai_cli.sai_cli import command_path, main
 
@@ -104,10 +104,12 @@ def assert_log_golden(
     """Keep the shape, sequence, and ID relationships of captured lines."""
     runs: dict[str, str] = {}
     calls: dict[str, str] = {}
+    commands: dict[str, str] = {}
     pids: dict[int, int] = {}
     rows = []
     for index, line in enumerate(lines, 1):
         assert line["schema"] == SCHEMA_VERSION
+        assert valid_event(line), line
         values = dict(line)
         for field in VOLATILE_FIELDS:
             if field not in line:
@@ -122,6 +124,10 @@ def assert_log_golden(
                     values[field] = runs.setdefault(value, f"{len(runs) + 1:032x}")
                 case "callId":
                     values[field] = calls.setdefault(value, f"{len(calls) + 1:012x}")
+                case "commandId":
+                    values[field] = commands.setdefault(
+                        value, f"{len(commands) + 1:032x}"
+                    )
                 case "durationMs":
                     values[field] = 0
                 case "version":
@@ -146,9 +152,11 @@ class Keeper:
 
     def __init__(self) -> None:
         self.intents: list[dict[str, Any]] = []
+        self.history: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] | None = None
         self.status = 200
-        self.ack_tx_hash: str | None = None
+        self.ack_tx_hash: Any = None
+        self.intents_block: threading.Event | None = None
         self.requests: list[dict[str, Any]] = []
         self.paths: list[str] = []
         self.authorizations: list[str | None] = []
@@ -183,11 +191,13 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
                     }
                 }
             elif "userIntents" in query:
+                if state.intents_block is not None:
+                    assert state.intents_block.wait(15)
                 value = {"data": {"userIntents": state.intents}}
             elif "tokenPricesUsd" in query:
                 value = {"data": {"oracle": {"tokenPricesUsd": []}}}
             elif "tradeHistory" in query:
-                value = {"data": {"perp": {"tradeHistory": []}}}
+                value = {"data": {"perp": {"tradeHistory": state.history}}}
             else:
                 value = {"data": {"perp": {"borrowings": [], "trades": []}}}
             data = json.dumps(value).encode()
@@ -242,14 +252,34 @@ def call(mcp: Any, name: str, arguments: dict[str, Any] | None = None) -> Any:
 # Line format
 
 
+def sample_request(
+    operation: str, level: str = "info", *, duration: int = 12, status: str = "ok"
+) -> None:
+    log.event(
+        "keeper.request",
+        level,
+        operation=operation,
+        durationMs=duration,
+        endpoint="https://example.test",
+        authenticated=False,
+        status=status,
+    )
+
+
 def test_event_writes_one_json_line_with_the_common_fields(home):
-    log.event("keeper.request", operation="prices", durationMs=12, skipped=None)
+    sample_request("prices")
     assert log.flush(60)
     path = log.file_path("cli", datetime.now(UTC).date(), home / "logs")
     raw = path.read_text()
     assert raw.endswith("\n") and raw.count("\n") == 1
     line = json.loads(raw)
-    assert set(line) == COMMON | {"operation", "durationMs"}
+    assert set(line) == COMMON | {
+        "operation",
+        "durationMs",
+        "endpoint",
+        "authenticated",
+        "status",
+    }
     assert line["event"] == "keeper.request" and line["level"] == "info"
     assert line["schema"] == SCHEMA_VERSION
     assert line["surface"] == "cli" and line["pid"] == os.getpid()
@@ -263,7 +293,7 @@ def test_event_writes_one_json_line_with_the_common_fields(home):
 @posix_only
 def test_directory_and_files_are_private(home):
     with log.bind(surface="mcp"):
-        log.event("mcp.tool_call", tool="market_prices")
+        log.event("mcp.tool_call", tool="market_prices", callId="test", arguments={})
     assert log.flush(60)
     root = home / "logs"
     assert stat.S_IMODE(root.stat().st_mode) == 0o700
@@ -275,10 +305,10 @@ def test_directory_and_files_are_private(home):
 
 def test_bound_fields_reach_every_event_and_pick_the_surface(home):
     with log.bind(surface="mcp", tool="trade_open", callId="abc"):
-        log.event("keeper.request", operation="submit")
+        sample_request("submit")
         with log.bind(surface="update"):
             log.event("update.check", ok=True)
-    log.event("command.start")
+    log.event("command.start", argv=[])
     assert [(line["surface"], line["event"]) for line in read_logs(home)] == [
         ("cli", "command.start"),
         ("mcp", "keeper.request"),
@@ -740,7 +770,7 @@ def test_intent_lifecycle_is_logged_from_reservation_to_terminal(home, keeper_st
     reserved, _, accepted, _, failed, terminal = trail
     assert reserved["kind"] == "CLOSE_POSITION" and reserved["tradeId"] == "7"
     assert (accepted["previous"], accepted["kind"]) == ("unknown", "CLOSE_POSITION")
-    assert (failed["errorCode"], failed["errorMsg"]) == ("SLIPPAGE", "price moved")
+    assert failed["errorCode"] == "SLIPPAGE" and "errorMsg" not in failed
     assert failed["code"] == "KEEPER_ERROR"
     assert terminal["previous"] == "accepted"
 
@@ -1389,7 +1419,7 @@ def test_making_an_event_never_reads_the_session_store(home, monkeypatch, keeper
     with log._io_lock:
         for index in range(50):
             log.event("probe", index=index, error="text with nothing in it")
-        with log.bind(surface="mcp", tool="market_prices"):
+        with log.bind(surface="mcp", tool="market_prices", callId="test"):
             log.event("mcp.tool_call", arguments={"addr": ADDR})
         assert keeper.request(base, keeper.PRICES) == {"oracle": {"tokenPricesUsd": []}}
         assert readers == []
@@ -1634,6 +1664,9 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
         {
             key: "20260101T000000000Z_0123456789ABCDEF",
             endpoint.removesuffix("/query"): "http://127.0.0.1:43210",
+            str(log.endpoint_id(endpoint)): str(
+                log.endpoint_id("http://127.0.0.1:43210/query")
+            ),
         },
     )
     assert state.authorizations == [f"Bearer {token}"]
@@ -1660,7 +1693,11 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
     trail = json.loads(output)
     assert trail["keeper"] is None and trail["gaps"] == []
     assert trail["txHash"] == request_hash
-    assert trail["events"][: len(submitted_lines)] == submitted_lines
+    safe_submission = [
+        {key: value for key, value in line.items() if key != "argv"}
+        for line in submitted_lines
+    ]
+    assert trail["events"][: len(submitted_lines)] == safe_submission
     mcp_lines = trail["events"][len(submitted_lines) :]
     assert {line["tool"] for line in mcp_lines} == {"intent_status"}
     assert [line["event"] for line in mcp_lines] == [
@@ -1672,7 +1709,7 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
     assert len({line["runId"] for line in trail["events"]}) == 2
 
     for identifier, expected in (
-        (submitted_lines[0]["runId"], submitted_lines),
+        (submitted_lines[0]["runId"], safe_submission),
         (mcp_lines[0]["callId"], mcp_lines),
     ):
         code, output = run_cli("--json", "logs", "run", identifier)
@@ -1686,13 +1723,14 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
         {
             **record,
             "lifecycleStep": "exec_fail",
-            "errorMsg": f"echo {token} {SIGNATURE}",
+            "errorMsg": f"echo {token} {SIGNATURE} opaque-credential-from-upstream",
             "extra": token,
         },
     ]
     cli_args = ("--json", "--endpoint", endpoint, "logs", "intent", key)
     code, output = run_cli(*cli_args)
     assert code == 0 and token not in output and SIGNATURE not in output
+    assert "opaque-credential-from-upstream" not in output
     current = json.loads(output)
     assert current["keeper"]["lifecycleStep"] == "exec_fail"
     assert current["keeper"]["evmAddress"] == ADDR
@@ -1726,6 +1764,8 @@ def test_log_queries_report_process_gaps_and_order_legacy_events(home):
         **identity,
         "event": "intent.keeper",
         "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": log.endpoint_id("http://localhost/query"),
         "callId": "first",
         "seq": 2,
     }
@@ -1768,6 +1808,295 @@ def test_logs_intent_keeps_failed_status_calls_in_the_trail(keeper_stub):
         "mcp.tool_result",
     ]
     assert trail["events"][1]["intentKey"] == "KEY"
+
+
+def test_intent_scope_separates_accounts_paths_and_repl_invocations(home, keeper_stub):
+    endpoint, state = keeper_stub
+    key = "KEY"
+    hash_a, hash_b, hash_path = ("0x" + char * 64 for char in ("a", "b", "c"))
+    base = {
+        "intentKey": key,
+        "evmAddress": ADDR,
+        "kind": "CLOSE_POSITION",
+        "lifecycleStep": "exec_req_pass",
+        "execActor": "server",
+    }
+
+    def status(url, addr, key):
+        return run_cli(
+            "--json", "--endpoint", url, "intent", "status", addr, "--key", key
+        )
+
+    state.intents = [
+        {**base, "evmAddress": OTHER, "txHash": hash_b},
+        {**base, "txHash": hash_a},
+    ]
+    assert status(endpoint, ADDR, key)[0] == 0
+    state.intents = []
+    assert status(endpoint, OTHER, key)[0] == 0
+    assert status(endpoint, ADDR, "UNRELATED")[0] == 0
+
+    trail = json.loads(run_cli("--json", "logs", "intent", key, "--offline")[1])
+    assert trail["txHash"] == hash_a
+    assert len({line["commandId"] for line in trail["events"]}) == 1
+    assert {line.get("addr") for line in trail["events"]} == {None, ADDR}
+    assert not any(line.get("intentKey") == "UNRELATED" for line in trail["events"])
+    assert [
+        line["txHash"] for line in events(home, "intent.keeper") if "txHash" in line
+    ] == [hash_a]
+
+    state.intents = [{**base, "evmAddress": OTHER, "txHash": hash_b}]
+    other = json.loads(
+        run_cli(
+            "--json", "--endpoint", endpoint, "logs", "intent", key, "--addr", OTHER
+        )[1]
+    )
+    assert other["keeper"]["evmAddress"] == OTHER and other["txHash"] == hash_b
+    assert all(line.get("addr") != ADDR for line in other["events"])
+
+    other_endpoint = endpoint + "/opaque-path-secret?secret=opaque-query-secret"
+    state.intents = [{**base, "txHash": hash_path}]
+    assert status(other_endpoint, ADDR, key)[0] == 0
+    assert log.origin(other_endpoint) == log.origin(endpoint)
+    assert log.endpoint_id(other_endpoint) != log.endpoint_id(endpoint)
+    assert log.endpoint_id(other_endpoint) == log.endpoint_id(
+        other_endpoint.partition("?")[0]
+    )
+    result = json.loads(run_cli("--json", "logs", "intent", key, "--offline")[1])
+    assert (
+        result["events"] == [] and result["txHash"] is None and "scopeWarning" in result
+    )
+    result = json.loads(
+        run_cli(
+            "--json", "--endpoint", other_endpoint, "logs", "intent", key, "--offline"
+        )[1]
+    )
+    assert result["txHash"] == hash_path
+    assert "opaque-path-secret" not in raw_logs(home)
+    assert "opaque-query-secret" not in raw_logs(home)
+
+
+def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keeper_stub):
+    endpoint, state = keeper_stub
+    save_session(endpoint)
+    secret = "some-opaque-credential-unrelated-to-the-active-session"
+    state.ack_tx_hash = secret
+    code, output = run_cli("--json", "--endpoint", endpoint, "trade", "close", "7")
+    assert code == 0
+    key = json.loads(output)["intentKey"]
+    submitted = events(home, "intent.submitted")[0]
+    assert submitted["txHashInvalid"] is True and "txHash" not in submitted
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "txHash": 123,
+            "kind": secret,
+            "execActor": secret,
+            "lifecycleStep": "exec_fail",
+            "errorCode": secret,
+            "errorMsg": secret,
+        }
+    ]
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
+    assert status["userIntents"][0]["txHashInvalid"] is True
+    assert status["userIntents"][0]["errorCode"] == "KEEPER_ERROR"
+    assert secret not in json.dumps(status)
+    assert events(home, "intent.keeper")[0]["txHashInvalid"] is True
+    trail = call(mcp, "logs_intent", {"addr": ADDR, "key": key})
+    assert secret not in json.dumps(trail) and trail["txHash"] is None
+    assert trail["keeper"]["errorMsg"] == "Keeper reported an intent error."
+    assert secret not in raw_logs(home)
+    state.errors = [{"message": secret, "extensions": {"code": secret}}]
+    missing = call(mcp, "logs_intent", {"key": secret, "addr": ADDR})
+    assert missing["intentKey"] is None and secret not in json.dumps(missing)
+    assert secret not in raw_logs(home)
+    assert missing["keeperError"]["code"] == "KEEPER_ERROR"
+    state.errors = None
+    invalid = call(mcp, "logs_intent", {"key": "https://host/?token=" + secret})
+    assert invalid["code"] == "INVALID_REQUEST" and secret not in json.dumps(invalid)
+    state.intents = [
+        {**state.intents[0], "lifecycleStep": "exec_pass", "execActor": "server"}
+    ]
+    state.history = [
+        {
+            "intentKey": key,
+            "trade": {"id": 7, "extra": secret},
+            "txHash": secret,
+            "tradeChangeType": secret,
+        }
+    ]
+    status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
+    assert status["matchedTradeHistory"] == [
+        {"intentKey": key, "trade": {"id": 7}, "txHashInvalid": True}
+    ]
+    assert secret not in json.dumps(status)
+
+
+def test_intent_reports_unattributed_gaps_and_skips_nonfinite_rows(home):
+    root = home / "logs"
+    root.mkdir()
+    path = log.file_path("cli", log.now().date(), root)
+    scope = {"addr": ADDR, "endpointId": log.endpoint_id("http://localhost/query")}
+    row = {
+        **scope,
+        "ts": log.stamp(log.now()),
+        "runId": "process",
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "seq": 1,
+    }
+    gap = {
+        "event": "log.dropped",
+        "count": 5,
+        "ts": row["ts"],
+        "runId": "process",
+        "seq": 2,
+    }
+    prefix = json.dumps(row).encode()[:-1]
+    path.write_bytes(
+        b"".join(
+            prefix + b', "durationMs": ' + value + b"}\n"
+            for value in (b"NaN", b"Infinity", b"-Infinity", b"1e999")
+        )
+        + log.encode(gap)
+    )
+    result = json.loads(run_cli("--json", "logs", "intent", "KEY", "--offline")[1])
+    assert result["events"] == []
+    assert result["unattributedGaps"] == [gap]
+    assert "Unattributed gap" in run_cli("logs", "intent", "KEY", "--offline")[1]
+    assert json.loads(run_cli("--json", "logs", "run", "process")[1])["events"] == []
+
+
+def test_log_reports_cap_rows_and_bytes_and_offer_earlier_timestamps(home):
+    root = home / "logs"
+    root.mkdir()
+    day = log.now()
+    rows = [
+        {
+            "event": "command.start",
+            "runId": "process",
+            "seq": i,
+            "ts": log.stamp(day.replace(microsecond=0) + timedelta(milliseconds=i)),
+            "command": "z" * 1900,
+        }
+        for i in range(log_queries.MAX_REPORT_ROWS + 30)
+    ]
+    log.file_path("cli", day.date(), root).write_bytes(
+        b"".join(log.encode(row) for row in rows)
+    )
+    code, output = run_cli("--json", "logs", "run", "process")
+    assert code == 0 and len(output.encode()) < log_queries.MAX_REPORT_BYTES
+    first = json.loads(output)
+    assert first["truncated"] and len(first["events"]) < log_queries.MAX_REPORT_ROWS
+    code, output = run_cli(
+        "--json", "logs", "run", "process", "--before", first["nextBefore"]
+    )
+    assert code == 0
+    earlier = json.loads(output)
+    assert earlier["events"][-1]["seq"] + 1 == first["events"][0]["seq"]
+    for row in rows:
+        row.pop("command")
+    log.file_path("cli", day.date(), root).write_bytes(
+        b"".join(log.encode(row) for row in rows)
+    )
+    assert len(log_queries.run("process")["events"]) == log_queries.MAX_REPORT_ROWS
+
+
+def test_earlier_intent_page_keeps_same_day_invocation_anchor(home, keeper_stub):
+    endpoint, state = keeper_stub
+    state.intents = [
+        {
+            "intentKey": "KEY",
+            "evmAddress": ADDR,
+            "lifecycleStep": "exec_req_pass",
+            "execActor": "server",
+        }
+    ]
+    assert (
+        run_cli("--endpoint", endpoint, "intent", "status", ADDR, "--key", "KEY")[0]
+        == 0
+    )
+    status = events(home, "intent.keeper")[0]
+    path = log.file_path("cli", log.now().date(), home / "logs")
+    earlier = {
+        "event": "command.start",
+        "runId": status["runId"],
+        "commandId": status["commandId"],
+        "ts": "2000-01-01T00:00:00.000Z",
+        "seq": 0,
+    }
+    with path.open("ab") as stream:
+        stream.write(log.encode(earlier))
+    report = log_queries.intent("KEY", before=status["ts"])
+    assert earlier in report["events"]
+
+
+def test_stats_caps_the_number_of_scanned_rows(home):
+    root = home / "logs"
+    root.mkdir()
+    row = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "ts": log.stamp(log.now()),
+    }
+    path = log.file_path("cli", log.now().date(), root)
+    path.write_bytes(log.encode(row) * (log.MAX_SCAN_ROWS + 1))
+    report = log_queries.stats()
+    assert (
+        report["truncated"] and report["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+    )
+
+
+def test_mcp_log_concurrency_leaves_normal_tools_available(keeper_stub):
+    endpoint, state = keeper_stub
+    state.intents_block = threading.Event()
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+
+    async def run():
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            args = {"key": "KEY", "addr": ADDR}
+            running = [
+                asyncio.create_task(client.call_tool("logs_intent", args))
+                for _ in range(server.LOG_WORKERS)
+            ]
+            try:
+                async with asyncio.timeout(5):
+                    while len(state.requests) < server.LOG_WORKERS:
+                        await asyncio.sleep(0.01)
+                    busy = await client.call_tool("logs_intent", args)
+                    assert isinstance(busy.content[0], TextContent)
+                    assert "busy" in busy.content[0].text
+                    other = await client.call_tool("market_prices", {})
+                    assert isinstance(other.content[0], TextContent)
+                    assert json.loads(other.content[0].text) == {
+                        "oracle": {"tokenPricesUsd": []}
+                    }
+            finally:
+                state.intents_block.set()
+                await asyncio.gather(*running)
+
+    asyncio.run(run())
+
+
+def test_invalid_emitted_type_is_dropped_and_writer_gap_matches_schema(home):
+    log.event(
+        "keeper.request",
+        operation="prices",
+        durationMs="12",
+        endpoint="https://example.test",
+        authenticated=False,
+        status="ok",
+    )
+    sample_request("prices")
+    lines = read_logs(home)
+    assert [line["event"] for line in lines] == ["keeper.request", "log.dropped"]
+    assert all(valid_event(line) for line in lines)
+    assert lines[1]["count"] == 1
 
 
 def test_logs_stats_counts_errors_and_nearest_rank_percentiles(home):
@@ -1851,11 +2180,11 @@ def test_logs_tail_filters_by_count_surface_and_event(home):
         '"surface":"cli","pid":1,"version":"0","runId":"r"}\nnot json\n'
     )
     log.event("command.start", command="market prices", argv=["market", "prices"])
-    with log.bind(surface="mcp", tool="market_prices"):
+    with log.bind(surface="mcp", tool="market_prices", callId="test"):
         log.event("mcp.tool_call", arguments={"addr": ADDR})
-        log.event("keeper.request", "warn", operation="prices", status="not_sent")
-    log.event("intent.reserved", intentKey="KEY1")
-    log.event("intent.status", intentKey="KEY1", status="accepted")
+        sample_request("prices", "warn", status="not_sent")
+    storage.pending("KEY1", "https://example.test", ADDR, "CLOSE_POSITION", "7")
+    storage.set_status("KEY1", "https://example.test", ADDR, "accepted")
     before = raw_logs(home)
 
     def names(*args: str) -> list[str]:
@@ -1997,23 +2326,29 @@ def test_logs_tail_reads_only_the_end_of_a_file(home, monkeypatch):
 
 
 def test_logs_tail_plain_output_is_one_line_per_event(home):
-    with log.bind(surface="mcp", tool="market_prices"):
+    with log.bind(surface="mcp", tool="market_prices", callId="test"):
         log.event("mcp.tool_call", arguments={"addr": ADDR})
-    log.event("keeper.request", "warn", operation="prices", ok=False, durationMs=7)
+    sample_request("prices", "warn", duration=7, status="not_sent")
     code, output = run_cli("logs", "tail")
     assert code == 0
     first, second = output.splitlines()
     stamp, surface, level, name, *fields = first.split(" ")
     assert datetime.fromisoformat(stamp) and (surface, level) == ("mcp", "info")
     assert name == "mcp.tool_call"
-    assert fields == ["tool=market_prices", f'arguments={{"addr":"{ADDR}"}}']
+    assert fields == [
+        "tool=market_prices",
+        "callId=test",
+        f'arguments={{"addr":"{ADDR}"}}',
+    ]
     assert second.split(" ")[1:] == [
         "cli",
         "warn",
         "keeper.request",
         "operation=prices",
-        "ok=false",
         "durationMs=7",
+        "endpoint=https://example.test",
+        "authenticated=false",
+        "status=not_sent",
     ]
 
 

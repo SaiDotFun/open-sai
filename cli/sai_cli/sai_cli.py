@@ -9,6 +9,7 @@ import os
 import shlex
 import sys
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -211,7 +212,11 @@ class LoggedGroup(click.Group):
         started = time.monotonic()
         exit_code = ExitCode.OK
         failure: SaiError | None = None
-        with log.silenced() if quiet else log.bind(surface=surface, command=command):
+        with (
+            log.silenced()
+            if quiet
+            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
+        ):
             if not quiet:
                 log.event("command.start", argv=log.argv(argv[:64]))
             try:
@@ -1730,17 +1735,38 @@ def print_log_trail(ctx: click.Context, report: dict[str, Any]) -> None:
     for line in lines:
         prefix = "Gap  " if line.get("event") == "log.dropped" else ""
         click.echo(prefix + log.render(line))
+    if warning := report.get("scopeWarning"):
+        click.echo(warning)
+    for line in report.get("unattributedGaps", ()):
+        click.echo("Unattributed gap  " + log.render(line))
+    if (count := report.get("unattributedGapCount", 0)) > len(
+        report.get("unattributedGaps", ())
+    ):
+        click.echo(f"Unattributed drop notices in scan  {count}")
+    print_log_limit(report)
+
+
+def print_log_limit(report: dict[str, Any]) -> None:
+    if report.get("truncated"):
+        click.echo("Report truncated. " + report["more"])
+        if before := report.get("nextBefore"):
+            click.echo(f"Earlier timestamps  --before {before}")
 
 
 @logs_group.command("intent")
 @click.argument("key")
 @click.option("--offline", is_flag=True, help="Read local logs only.")
 @click.option("--addr", help="EVM address to use for the Keeper lookup.")
+@click.option("--before", help="Read earlier events before this UTC timestamp.")
 @click.pass_context
-def logs_intent(ctx: click.Context, key: str, offline: bool, addr: str | None) -> None:
+def logs_intent(
+    ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None
+) -> None:
     """Show an intent's CLI and MCP trail and its current Keeper record."""
-    endpoint = None if offline else keeper_url(ctx)
-    report = log_queries.intent(key, endpoint=endpoint, addr=addr)
+    endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
+    report = log_queries.intent(
+        key, endpoint=endpoint, addr=addr, offline=offline, before=before
+    )
     print_log_trail(ctx, report)
     if ctx.obj["json"]:
         return
@@ -1756,20 +1782,22 @@ def logs_intent(ctx: click.Context, key: str, offline: bool, addr: str | None) -
 
 @logs_group.command("run")
 @click.argument("id")
+@click.option("--before", help="Read earlier events before this UTC timestamp.")
 @click.pass_context
-def logs_run(ctx: click.Context, id: str) -> None:
+def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
     """Show one process run or one MCP call by ID."""
-    print_log_trail(ctx, log_queries.run(id))
+    print_log_trail(ctx, log_queries.run(id, before=before))
 
 
 @logs_group.command("stats")
 @click.option(
     "--since", metavar="DURATION", help="Look back by a duration such as 24h."
 )
+@click.option("--before", help="Use events before this UTC timestamp.")
 @click.pass_context
-def logs_stats(ctx: click.Context, since: str | None) -> None:
+def logs_stats(ctx: click.Context, since: str | None, before: str | None) -> None:
     """Summarize Keeper latency and error codes in the retained logs."""
-    report = log_queries.stats(since)
+    report = log_queries.stats(since, before=before)
     if ctx.obj["json"]:
         emit(ctx, report)
         return
@@ -1786,6 +1814,7 @@ def logs_stats(ctx: click.Context, since: str | None) -> None:
         click.echo(f"{code}  {count}")
     for line in report["gaps"]:
         click.echo("Gap  " + log.render(line))
+    print_log_limit(report)
 
 
 # Exit code for an install `sai update` cannot change in place.

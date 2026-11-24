@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 SCHEMA_VERSION = 2
-VOLATILE_FIELDS = ("ts", "pid", "runId", "callId", "durationMs", "version")
+VOLATILE_FIELDS = ("ts", "pid", "runId", "callId", "durationMs", "version", "commandId")
 
 COMMON_REQUIRED = {
     "schema": "integer",
@@ -24,6 +25,7 @@ COMMON_OPTIONAL = {
     "command": "string",
     "tool": "string",
     "callId": "string",
+    "commandId": "string",
     "truncated": "string[]",
 }
 
@@ -58,14 +60,19 @@ EVENTS = {
     "intent.keeper": Event(
         "core.reconcile.reconcile",
         ("info",),
-        {"intentKey": "string", "addr": "string", "endpoint": "string"},
+        {
+            "intentKey": "string",
+            "addr": "string",
+            "endpoint": "string",
+            "endpointId": "string",
+        },
         {
             "kind": "string",
             "lifecycleStep": "string",
             "execActor": "string",
             "errorCode": "string",
-            "errorMsg": "string",
             "txHash": "string",
+            "txHashInvalid": "boolean",
             "found": "boolean",
             "code": "string",
         },
@@ -80,7 +87,7 @@ EVENTS = {
             "addr": "string",
             "endpoint": "string",
         },
-        {"tradeId": "string"},
+        {"tradeId": "string", "endpointId": "string"},
     ),
     "intent.status": Event(
         "core.storage._log_status",
@@ -93,7 +100,7 @@ EVENTS = {
             "addr": "string",
             "endpoint": "string",
         },
-        {"code": "string"},
+        {"code": "string", "endpointId": "string"},
     ),
     "intent.submitted": Event(
         "core.intents.submit",
@@ -104,13 +111,31 @@ EVENTS = {
             "addr": "string",
             "endpoint": "string",
         },
-        {"txHash": "string"},
+        {"txHash": "string", "txHashInvalid": "boolean", "endpointId": "string"},
+    ),
+    "intent.status_write_failed": Event(
+        "core.intents._record_submission_status",
+        ("warn",),
+        {
+            "intentKey": "string",
+            "addr": "string",
+            "endpoint": "string",
+            "endpointId": "string",
+            "status": "string",
+            "errorType": "string",
+            "code": "string",
+        },
     ),
     "intent.wait.start": Event(
         "core intent wait (lane A4)",
         ("info",),
         {"intentKey": "string"},
-        {"addr": "string", "endpoint": "string", "timeoutMs": "integer"},
+        {
+            "addr": "string",
+            "endpoint": "string",
+            "endpointId": "string",
+            "timeoutMs": "integer",
+        },
     ),
     "intent.wait.end": Event(
         "core intent wait (lane A4)",
@@ -119,7 +144,9 @@ EVENTS = {
         {
             "addr": "string",
             "endpoint": "string",
+            "endpointId": "string",
             "txHash": "string",
+            "txHashInvalid": "boolean",
             "fillBlock": "integer",
             "code": "string",
             "error": "string",
@@ -138,6 +165,7 @@ EVENTS = {
         {
             "addr": "string",
             "intentKey": "string",
+            "endpointId": "string",
             "code": "string",
             "error": "string",
             "httpStatus": "integer",
@@ -231,6 +259,34 @@ EVENTS = {
 }
 
 
+def _matches_type(value: object, kind: str) -> bool:
+    if kind.endswith("[]"):
+        return isinstance(value, list) and all(
+            _matches_type(item, kind[:-2]) for item in value
+        )
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    return isinstance(value, dict) and kind == "object"
+
+
+def valid_event(line: Mapping[str, object]) -> bool:
+    """Check a registered event, including context and writer fields."""
+    name = line.get("event")
+    spec = EVENTS.get(name) if isinstance(name, str) else None
+    if spec is None or line.get("level") not in spec.levels:
+        return False
+    required = COMMON_REQUIRED | ({} if "truncated" in line else spec.required)
+    fields = COMMON_OPTIONAL | spec.optional | spec.required | required
+    return required.keys() <= line.keys() and all(
+        key in fields and _matches_type(value, fields[key])
+        for key, value in line.items()
+    )
+
+
 def render_json() -> str:
     return (
         json.dumps(
@@ -267,7 +323,8 @@ def render_markdown() -> str:
         "",
         "`ts` is a UTC timestamp with millisecond precision. The integer `seq` orders events",
         "within a process. The field `surface` is `cli`, `mcp`, or `update`.",
-        "Events inside a CLI command may carry `command`. Events inside an MCP call carry",
+        "CLI invocations carry a distinct `commandId` within the process `runId`.",
+        "Events inside an MCP call carry",
         "`tool` and `callId`, except that a drop notice covers the process as a whole.",
         "When a line exceeds the byte limit, its common required fields survive and",
         "`truncated` lists the remaining field names.",
@@ -283,6 +340,10 @@ def render_markdown() -> str:
         "",
         "The logger omits fields whose value is null. A failure carries a Sai error",
         "code in `code`. A Keeper lifecycle code, when present, goes in `errorCode`.",
+        "MCP tool results carry the symbolic `code`. Numeric `exitCode` belongs to the CLI process.",
+        "The field `endpointId` hashes the endpoint origin and path. Query strings and credentials",
+        "are excluded. The field `endpoint` shows the origin.",
+        "A malformed request hash is omitted and sets `txHashInvalid`.",
         "The field `txHash` on `intent.submitted` is the request transaction hash when",
         "Keeper includes it in the admission response. It may appear first on `intent.keeper`.",
         "The wait entries reserve fields for the intent wait implementation.",

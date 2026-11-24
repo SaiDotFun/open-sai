@@ -52,8 +52,10 @@ what the person chose. Old files are deleted once per UTC day.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import itertools
 import json
+import math
 import os
 import queue
 import re
@@ -64,6 +66,7 @@ import uuid
 from collections.abc import Generator, Iterator, Mapping
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from importlib import metadata
 from pathlib import Path
@@ -71,7 +74,7 @@ from types import MappingProxyType
 from typing import Any, Self
 from urllib.parse import urlsplit
 
-from .log_events import COMMON_REQUIRED, SCHEMA_VERSION
+from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
 
 DIR_NAME = "logs"
 SURFACES = ("cli", "mcp", "update")
@@ -304,6 +307,15 @@ def origin(value: str) -> str:
         return REDACTED_URL
 
 
+def endpoint_id(value: str) -> str | None:
+    """Identify the origin and path without writing path text or credentials."""
+    site = origin(value)
+    if site == REDACTED_URL:
+        return None
+    path = urlsplit(value.strip()).path or "/"
+    return hashlib.sha256((site + path).encode()).hexdigest()
+
+
 # Session tokens this process has seen. Tokens are only added: one that was
 # signed out or replaced may still sit in an event waiting to be written,
 # and Keeper keeps honoring it until it expires.
@@ -427,8 +439,10 @@ def _snapshot(
     budget[1] -= 1
     if budget[0] < 0 or budget[1] < 0:
         return CUT
-    if value is None or isinstance(value, (bool, float)):
+    if value is None or isinstance(value, bool):
         return value
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
     if isinstance(value, int):
         # An integer of any size is legal JSON; one this long is not a count.
         return value if value.bit_length() <= 64 else CUT
@@ -829,6 +843,9 @@ def _write(item: _Item) -> None:
             day = date.fromisoformat(str(line["ts"])[:10])
         except ValueError:
             day = today
+        if line["event"] in EVENTS and not valid_event(line):
+            _dropped += 1
+            return
         data = encode(line)
         if _dropped:
             lost, _dropped = _dropped, 0
@@ -982,22 +999,40 @@ def reset() -> None:
 # Reading
 
 
-def _last_lines(fd: int, chunk: int) -> Iterator[bytes]:
+def _last_lines(
+    fd: int,
+    chunk: int,
+    *,
+    end: int | None = None,
+    start: int = 0,
+    max_line: int | None = None,
+    complete_end: bool = True,
+) -> Iterator[bytes]:
     """The lines of the file at FD, last first, read backwards CHUNK bytes
     at a time."""
-    position = os.fstat(fd).st_size
-    rest = b""
-    while position > 0:
-        size = min(chunk, position)
+    position = os.fstat(fd).st_size if end is None else end
+    rest: bytes | None = b"" if complete_end else None
+    while position > start:
+        size = min(chunk, position - start)
         position -= size
         os.lseek(fd, position, os.SEEK_SET)
-        data = os.read(fd, size) + rest
-        pieces = data.split(b"\n")
-        rest = pieces[0]
-        for piece in reversed(pieces[1:]):
-            if piece:
+        pieces = os.read(fd, size).split(b"\n")
+        if len(pieces) == 1:
+            if rest is not None:
+                combined = pieces[0] + rest
+                rest = (
+                    combined if max_line is None or len(combined) <= max_line else None
+                )
+            continue
+        if rest is not None:
+            combined = pieces[-1] + rest
+            if combined and (max_line is None or len(combined) <= max_line):
+                yield combined
+        rest = pieces[0] if max_line is None or len(pieces[0]) <= max_line else None
+        for piece in reversed(pieces[1:-1]):
+            if piece and (max_line is None or len(piece) <= max_line):
                 yield piece
-    if rest:
+    if rest and start == 0:
         yield rest
 
 
@@ -1021,8 +1056,8 @@ def _file_tail(
     try:
         for raw in _last_lines(fd, chunk):
             try:
-                line = json.loads(raw)
-            except ValueError:
+                line = decode_row(raw)
+            except (ValueError, RecursionError):
                 continue
             if isinstance(line, dict) and matches(line, name):
                 found.append(line)
@@ -1043,33 +1078,90 @@ def event_order(line: Mapping[str, Any]) -> tuple[str, int]:
     return str(line.get("ts", "")), _number(line.get("seq"))
 
 
-def read_events(
-    root: Path | None = None, *, first_day: date | None = None
-) -> Iterator[dict[str, Any]]:
-    """Stream complete JSON objects from retained log files."""
-    opened = LogDir.open(root or directory())
-    if opened is None:
-        return
-    with opened:
-        for day, _surface, name in opened.files():
-            if first_day is not None and day < first_day:
-                continue
-            try:
-                with os.fdopen(opened.read_fd(name), "rb") as source:
-                    while raw := source.readline(MAX_LINE + 1):
-                        if not raw.endswith(b"\n"):
-                            # Skip a partial last line or the rest of an oversized line.
-                            while raw and not raw.endswith(b"\n"):
-                                raw = source.readline(MAX_LINE + 1)
-                            continue
+def _finite_number(text: str) -> float:
+    value = float(text)
+    if not math.isfinite(value):
+        raise ValueError("Non-finite JSON number")
+    return value
+
+
+def _invalid_constant(_text: str) -> Any:
+    raise ValueError("Invalid JSON constant")
+
+
+def decode_row(raw: bytes) -> Any:
+    return json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
+
+
+MAX_SCAN_BYTES = 16 * 1024 * 1024
+MAX_SCAN_ROWS = 20_000
+MAX_SCAN_FILES = 128
+
+
+@dataclass
+class LogScan:
+    truncated: bool = False
+
+    def rows(
+        self,
+        root: Path | None = None,
+        *,
+        first_day: date | None = None,
+        last_day: date | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        """Read a bounded snapshot from the retained files, newest files first."""
+        opened = LogDir.open(root or directory())
+        if opened is None:
+            return
+        remaining_bytes, remaining_rows = MAX_SCAN_BYTES, MAX_SCAN_ROWS
+        with opened:
+            files = [
+                name
+                for day, _, name in reversed(opened.files())
+                if (first_day is None or day >= first_day)
+                and (last_day is None or day <= last_day)
+            ]
+            self.truncated = len(files) > MAX_SCAN_FILES
+            for name in files[:MAX_SCAN_FILES]:
+                if remaining_bytes <= 0:
+                    self.truncated = True
+                    return
+                try:
+                    fd = opened.read_fd(name)
+                except OSError:
+                    continue
+                try:
+                    size = os.fstat(fd).st_size
+                    if size == 0:
+                        continue
+                    start = max(0, size - remaining_bytes)
+                    if start:
+                        self.truncated = True
+                    remaining_bytes -= size - start
+                    os.lseek(fd, size - 1, os.SEEK_SET)
+                    complete = os.read(fd, 1) == b"\n"
+                    for raw in _last_lines(
+                        fd,
+                        TAIL_CHUNK,
+                        end=size,
+                        start=start,
+                        max_line=MAX_LINE,
+                        complete_end=complete,
+                    ):
+                        remaining_rows -= 1
+                        if remaining_rows < 0:
+                            self.truncated = True
+                            return
                         try:
-                            line = json.loads(raw)
+                            line = decode_row(raw)
                         except (ValueError, RecursionError):
                             continue
                         if isinstance(line, dict):
                             yield line
-            except OSError:
-                continue
+                except OSError:
+                    continue
+                finally:
+                    os.close(fd)
 
 
 def tail(

@@ -19,7 +19,10 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from functools import partial
+from threading import BoundedSemaphore
 from typing import Any, Literal
 
 from anyio import BrokenResourceError
@@ -233,20 +236,47 @@ async def intent_status(addr: str | None = None, key: str | None = None) -> str:
     return await call(tools.intent_status, addr, key)
 
 
-async def logs_intent(key: str, offline: bool = False, addr: str | None = None) -> str:
+LOG_WORKERS = 2
+_log_slots = BoundedSemaphore(LOG_WORKERS)
+_log_executor = ThreadPoolExecutor(
+    max_workers=LOG_WORKERS, thread_name_prefix="sai-logs"
+)
+
+
+async def logs_intent(
+    key: str, offline: bool = False, addr: str | None = None, before: str | None = None
+) -> str:
     """Read one intent's local log trail and current Keeper record.
 
     Args:
         key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
         offline: Read local logs only.
-        addr: EVM address for Keeper. Defaults to the account in the trail
-            or the active account for this server's endpoint.
+        addr: EVM address to select if the trail has several accounts.
+        before: UTC timestamp from a truncated report's nextBefore field.
     """
-    if offline:
-        return await asyncio.to_thread(tools.run, partial(log_queries.intent, key))
-    return await call(
-        lambda config: log_queries.intent(key, endpoint=config.endpoint, addr=addr)
+    try:
+        endpoint = None if offline else server_settings().endpoint
+    except sai_settings.SettingsError:
+        return json.dumps(tools.error("Could not read Sai settings.", BAD_SETTINGS))
+    if not _log_slots.acquire(blocking=False):
+        return json.dumps(
+            tools.error("Log queries are busy. Retry shortly.", Code.INTERNAL_ERROR)
+        )
+    action = partial(
+        log_queries.intent, key, endpoint=endpoint, addr=addr, before=before
     )
+    context = copy_context()
+
+    def execute() -> str:
+        return context.run(tools.run, action)
+
+    try:
+        future = _log_executor.submit(execute)
+    except RuntimeError:
+        _log_slots.release()
+        raise
+    future.add_done_callback(lambda _future: _log_slots.release())
+    return await asyncio.wrap_future(future)
 
 
 # Previews and trades share one implementation per action.
@@ -763,8 +793,13 @@ class SaiMCP(FastMCP):
             if tool is None:
                 return None, len(given)
             names = tool.parameters.get("properties", {})
-            known = {key: loggable_value(given[key]) for key in names if key in given}
-            return known, len(given) - len(known)
+            known = {
+                key: loggable_value(given[key])
+                for key in names
+                if key in given and (name != "logs_intent" or key != "key")
+            }
+            omitted_key = int(name == "logs_intent" and "key" in given)
+            return known, len(given) - len(known) - omitted_key
         except Exception:  # noqa: BLE001 - logging must not fail a call
             return None, 0
 

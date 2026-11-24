@@ -390,10 +390,17 @@ def intent_status(
     settings: Settings, addr: str | None, key: str | None
 ) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
-    return {
-        **account,
-        **reconcile.reconcile(settings.endpoint, account["addr"], key),
-    }
+    data = reconcile.reconcile(settings.endpoint, account["addr"], key)
+    report: dict[str, Any] = dict(account)
+    for name, sanitize in (
+        ("userIntents", keeper.safe_intent_record),
+        ("matchedTradeHistory", keeper.safe_intent_history),
+    ):
+        if isinstance(rows := data.get(name), list):
+            report[name] = [sanitize(row) for row in rows if isinstance(row, dict)]
+    if data.get("localStatus") == "absent":
+        report["localStatus"] = "absent"
+    return report
 
 
 # Preview binding

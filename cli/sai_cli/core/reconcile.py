@@ -38,46 +38,60 @@ def reconcile(
     data = keeper.request(
         endpoint, keeper.INTENTS, {"user": addr, "key": key}, timeout=timeout
     )
-    if key and data.get("userIntents"):
-        row = data["userIntents"][0]
+    rows = data.get("userIntents")
+    row = (
+        next(
+            (
+                item
+                for item in rows
+                if isinstance(item, dict)
+                and item.get("intentKey") == key
+                and isinstance(item.get("evmAddress"), str)
+                and item["evmAddress"].lower() == addr.lower()
+            ),
+            None,
+        )
+        if key and isinstance(rows, list)
+        else None
+    )
+    if row is not None and key:
         step = row.get("lifecycleStep")
+        tx_hash, invalid_hash = keeper.request_hash(row.get("txHash"))
+        error_code = keeper.intent_error_code(row)
         log.event(
             "intent.keeper",
             intentKey=key,
-            kind=row.get("kind"),
-            lifecycleStep=step,
-            execActor=row.get("execActor"),
-            errorCode=row.get("errorCode"),
-            errorMsg=log.untrusted(row.get("errorMsg")),
-            txHash=row.get("txHash"),
+            kind=keeper.known_text(row.get("kind"), keeper.INTENT_KINDS),
+            lifecycleStep=keeper.known_text(step, keeper.INTENT_STEPS),
+            execActor=keeper.known_text(row.get("execActor"), keeper.INTENT_ACTORS),
+            errorCode=error_code,
+            txHash=tx_hash,
+            txHashInvalid=invalid_hash,
             addr=addr,
             endpoint=log.endpoint(endpoint),
-            code=Code.KEEPER_ERROR if step in FAILED_STEPS else None,
+            endpointId=log.endpoint_id(endpoint),
+            code=Code.KEEPER_ERROR if error_code else None,
         )
-        if (
-            row.get("intentKey") == key
-            and str(row.get("evmAddress") or "").lower() == addr.lower()
-        ):
-            server = row.get("execActor") == "server"
-            if server and step in FAILED_STEPS:
+        server = row.get("execActor") == "server"
+        if server and step in FAILED_STEPS:
+            with write():
+                storage.set_status(key, endpoint, addr, "terminal")
+        elif server and step in ACCEPTED_STEPS:
+            with write():
+                storage.set_status(key, endpoint, addr, "accepted")
+        if (step == "exec_pass" and server) or step == "exec_finality_observed":
+            history_data = keeper.request(
+                endpoint, keeper.HISTORY, {"trader": addr}, timeout=timeout
+            )
+            matches = [
+                item
+                for item in history_data["perp"]["tradeHistory"]
+                if item.get("intentKey") == key and item.get("trade")
+            ]
+            data["matchedTradeHistory"] = matches
+            if matches:
                 with write():
                     storage.set_status(key, endpoint, addr, "terminal")
-            elif server and step in ACCEPTED_STEPS:
-                with write():
-                    storage.set_status(key, endpoint, addr, "accepted")
-            if (step == "exec_pass" and server) or step == "exec_finality_observed":
-                history_data = keeper.request(
-                    endpoint, keeper.HISTORY, {"trader": addr}, timeout=timeout
-                )
-                matches = [
-                    item
-                    for item in history_data["perp"]["tradeHistory"]
-                    if item.get("intentKey") == key and item.get("trade")
-                ]
-                data["matchedTradeHistory"] = matches
-                if matches:
-                    with write():
-                        storage.set_status(key, endpoint, addr, "terminal")
     elif key and data.get("userIntents") == []:
         log.event(
             "intent.keeper",
@@ -85,6 +99,7 @@ def reconcile(
             found=False,
             addr=addr,
             endpoint=log.endpoint(endpoint),
+            endpointId=log.endpoint_id(endpoint),
         )
         # Keeper has no record. Past its admission expiry it never will,
         # so the key no longer blocks new trades.

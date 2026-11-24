@@ -6,7 +6,8 @@
     "runId",
     "callId",
     "durationMs",
-    "version"
+    "version",
+    "commandId"
   ],
   "common": {
     "required": {
@@ -24,6 +25,7 @@
       "command": "string",
       "tool": "string",
       "callId": "string",
+      "commandId": "string",
       "truncated": "string[]"
     }
   },
@@ -78,15 +80,16 @@
       "required": {
         "intentKey": "string",
         "addr": "string",
-        "endpoint": "string"
+        "endpoint": "string",
+        "endpointId": "string"
       },
       "optional": {
         "kind": "string",
         "lifecycleStep": "string",
         "execActor": "string",
         "errorCode": "string",
-        "errorMsg": "string",
         "txHash": "string",
+        "txHashInvalid": "boolean",
         "found": "boolean",
         "code": "string"
       }
@@ -104,7 +107,8 @@
         "endpoint": "string"
       },
       "optional": {
-        "tradeId": "string"
+        "tradeId": "string",
+        "endpointId": "string"
       }
     },
     "intent.status": {
@@ -121,7 +125,8 @@
         "endpoint": "string"
       },
       "optional": {
-        "code": "string"
+        "code": "string",
+        "endpointId": "string"
       }
     },
     "intent.submitted": {
@@ -136,8 +141,26 @@
         "endpoint": "string"
       },
       "optional": {
-        "txHash": "string"
+        "txHash": "string",
+        "txHashInvalid": "boolean",
+        "endpointId": "string"
       }
+    },
+    "intent.status_write_failed": {
+      "emitter": "core.intents._record_submission_status",
+      "levels": [
+        "warn"
+      ],
+      "required": {
+        "intentKey": "string",
+        "addr": "string",
+        "endpoint": "string",
+        "endpointId": "string",
+        "status": "string",
+        "errorType": "string",
+        "code": "string"
+      },
+      "optional": {}
     },
     "intent.wait.start": {
       "emitter": "core intent wait (lane A4)",
@@ -150,6 +173,7 @@
       "optional": {
         "addr": "string",
         "endpoint": "string",
+        "endpointId": "string",
         "timeoutMs": "integer"
       }
     },
@@ -168,7 +192,9 @@
       "optional": {
         "addr": "string",
         "endpoint": "string",
+        "endpointId": "string",
         "txHash": "string",
+        "txHashInvalid": "boolean",
         "fillBlock": "integer",
         "code": "string",
         "error": "string"
@@ -190,6 +216,7 @@
       "optional": {
         "addr": "string",
         "intentKey": "string",
+        "endpointId": "string",
         "code": "string",
         "error": "string",
         "httpStatus": "integer",

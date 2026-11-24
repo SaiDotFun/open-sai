@@ -363,8 +363,9 @@ session the command could not use, for example one for another Keeper
 endpoint.
 
 The CLI, MCP tools, and failure logs share codes. MCP tool errors have
-top-level `error` and `code` fields. Logs use `code` for the Sai failure
-and retain Keeper's own diagnostic fields where available.
+top-level `error` and `code` fields. The `command.end` event includes the
+CLI process's numeric `exitCode`. The `mcp.tool_result` event carries the
+symbolic `code` on failures. Each MCP call returns within the same process.
 
 ## Agent Skill
 
@@ -421,36 +422,53 @@ sai logs stats --since 24h
 sai --json logs intent KEY
 ```
 
-The `intent` command joins events with the requested `intentKey` to other
-events in the same CLI runs and MCP calls. The `run` command accepts a
-process `runId` or a single MCP `callId`. Both show events in timestamp and
-sequence order and report `log.dropped` notices for the matching processes.
-A drop notice counts lost events for the process as a whole.
+The `intent` command joins a key's events for one EVM account and Keeper
+endpoint to other events from the same CLI invocation or MCP call. A REPL
+process gives each command its own `commandId`. The `run` command accepts
+a process `runId` or a single MCP `callId`. Both order events by timestamp
+and sequence. They report `log.dropped` notices separately because those
+notices cover whole processes. An intent report also includes an
+`unattributedGapCount` and up to eight `unattributedGaps` where a notice
+cannot be tied to the key. Lost events can include the original match.
 
-The `intent` command reads Keeper's current record and reports the request
-transaction hash when it has one. Keeper uses the configured endpoint and
-the address from the intent's log entries or the active account for that
-endpoint. Use `--addr` to specify an address or `--offline` to skip Keeper.
-The MCP tool `logs_intent` returns the same report and accepts `offline`
-and `addr` arguments. The read leaves the local intent ledger unchanged.
+The `intent` command reads Keeper's current record and returns the request
+transaction hash when available. The configured Keeper endpoint selects the
+trail. The endpoint identity includes the path in a hash. The printed
+`endpoint` field shows just the origin. Use `--addr` to select an account
+or `--offline` to skip Keeper. If the local trail has several endpoint
+identities, pass a root `--endpoint` flag to select one offline. The report
+warns when the scope is ambiguous or an older line lacks enough information
+to assign it. The read leaves the local intent ledger untouched.
 
-The `stats` command uses all retained logs by default. Pass a positive
-whole number followed by `s`, `m`, `h`, `d`, or `w` to limit the time
-range. The p50 and p95 use the nearest rank across all timed requests for
-each Keeper operation. The error counts count each event with a `code`
-field, so the same failure may count at the request and command levels.
+The read-only MCP tool `logs_intent` accepts `offline`, `addr`, and
+`before`. It handles up to two log queries at a time and returns a busy
+error when both slots are occupied. Log reports omit stored arguments and
+free-text diagnostics. Keeper failures return a recognized code and a
+short Sai message. A malformed request transaction hash is omitted and
+sets `txHashInvalid` in the corresponding record or event.
 
-Use the root flag `sai --json logs ...` for machine-readable output.
-The `intent` and `run` reports return arrays `events` and `gaps`. The
-intent report also returns `intentKey`, `keeper`, and `txHash`. If Keeper
-cannot be read, `keeperError` describes the failure alongside the local
-trail. The `stats` report maps operations to `count`, `p50Ms`, and
-`p95Ms` under `keeper`, with counts by code under `errors`. It also
-returns `gaps` and the UTC cutoff `since`, if set. The `tail` command
-prints the stored JSON objects one per line.
+The `stats` command uses the retained scan window by default. Pass a positive
+whole number followed by `s`, `m`, `h`, `d`, or `w` to limit the lookback.
+The p50 and p95 use the nearest rank for each Keeper operation. Error totals
+count each coded event, so a failure can count at more than one level.
+
+Queries scan up to 128 files, 16 MiB, and 20,000 rows. A report contains
+up to 128 event or gap rows and uses a 96 KiB response budget. When
+`truncated` is true, use `nextBefore` with `--before` or the MCP `before`
+argument for earlier timestamps within the scan window. Use the files
+listed by `sai logs path` when the scan limit prevents reaching older rows
+or when events share the cutoff timestamp.
+
+Use `sai --json logs ...` for machine-readable output. The `intent` and
+`run` reports return arrays `events` and `gaps`. The intent report also
+returns `intentKey`, `keeper`, and `txHash`. A failed Keeper read adds
+`keeperError` alongside the local trail. The `stats` report maps operations
+to `count`, `p50Ms`, and `p95Ms` under `keeper`, with counts by code under
+`errors`. It also returns `gaps` and the UTC cutoff `since`, if set.
+The `tail` command prints stored JSON objects one per line.
 
 See the [log event schema](../../docs/log-events.md) for event names and
-field types. Queries accept logs written before the versioned schema.
+field types. The `run` query and statistics also read older logs.
 
 Sai logs allowlisted fields such as the account, intent key, and request
 transaction hash. It omits session tokens, signatures, clipboard text, and

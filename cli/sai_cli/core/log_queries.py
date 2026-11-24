@@ -1,30 +1,51 @@
-"""Read and join retained JSONL events for the CLI and MCP server."""
+"""Read bounded, scrubbed reports from retained logs and Keeper."""
 
 from __future__ import annotations
 
+import json
 import re
 from collections import Counter, defaultdict
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from . import keeper, log, storage
 from .errors import Code, ExitCode, SaiError
+from .log_events import COMMON_OPTIONAL, COMMON_REQUIRED, EVENTS
 
 LogLine = dict[str, Any]
-KEEPER_FIELDS = (
-    "intentKey",
-    "kind",
-    "lifecycleStep",
-    "execActor",
-    "evmAddress",
-    "txHash",
-    "execBlock",
-    "execBlockTs",
-    "errorCode",
-    "errorMsg",
+Scope = tuple[str, str]
+TOKEN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+ENDPOINT_ID = re.compile(r"[a-f0-9]{64}")
+MCP_STATUSES = frozenset(
+    {"accepted", "rejected", "not_sent", "unknown", "terminal", "absent"}
+)
+TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
 SECONDS = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}
+MAX_REPORT_ROWS = 128
+MAX_REPORT_BYTES = 96 * 1024
+CODES = frozenset(Code)
+OPERATIONS = frozenset(keeper.OPERATIONS.values()) | {"custom"}
+FREE_TEXT = {
+    "argv",
+    "arguments",
+    "error",
+    "errorMsg",
+    "keeperErrors",
+    "checks",
+    "message",
+    "reason",
+}
+INTENT_EVIDENCE = {
+    "intent.reserved",
+    "intent.status",
+    "intent.submitted",
+    "intent.keeper",
+    "intent.wait.end",
+    "intent.status_write_failed",
+}
 
 
 def _id(line: LogLine, field: str) -> str | None:
@@ -32,8 +53,38 @@ def _id(line: LogLine, field: str) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def _lookup_intent(endpoint: str, key: str, addr: str) -> dict[str, Any] | None:
-    data = keeper.request(endpoint, keeper.INTENTS, {"user": addr, "key": key})
+def _timestamp(line: LogLine) -> str | None:
+    ts = _id(line, "ts")
+    return ts if ts and TIMESTAMP.fullmatch(ts) else None
+
+
+def _address(line: LogLine) -> str | None:
+    address = _id(line, "addr") or _id(line, "account")
+    return address.lower() if address and keeper.is_address(address) else None
+
+
+def _scope(line: LogLine) -> Scope | None:
+    account, identity = _address(line), _id(line, "endpointId")
+    if account and identity and ENDPOINT_ID.fullmatch(identity):
+        return account, identity
+    return None
+
+
+def _invocation(line: LogLine) -> tuple[str, str, str] | None:
+    run_id = _id(line, "runId")
+    call_id = _id(line, "callId")
+    command_id = _id(line, "commandId")
+    if run_id and call_id:
+        return run_id, "call", call_id
+    if run_id and command_id and line.get("surface") != "mcp":
+        return run_id, "command", command_id
+    return None
+
+
+def _lookup_intent(endpoint: str, key: str, addr: str) -> LogLine | None:
+    data = keeper.request(
+        endpoint, keeper.INTENTS, {"user": addr, "key": key}, trace_intent=False
+    )
     rows = data.get("userIntents")
     if not isinstance(rows, list):
         raise SaiError("Keeper did not return intent records", Code.INCOMPLETE_DATA)
@@ -41,53 +92,165 @@ def _lookup_intent(endpoint: str, key: str, addr: str) -> dict[str, Any] | None:
         if not isinstance(row, dict) or row.get("intentKey") != key:
             continue
         address = row.get("evmAddress")
-        if not isinstance(address, str) or address.lower() != addr.lower():
-            continue
-        record = {
-            field: row[field]
-            for field in KEEPER_FIELDS
-            if field in row
-            and (row[field] is None or isinstance(row[field], (str, int)))
-        }
-        for field in ("errorCode", "errorMsg"):
-            if isinstance(record.get(field), str):
-                record[field] = log.untrusted(record[field])
-        return log.clean(record)
+        if isinstance(address, str) and address.lower() == addr.lower():
+            return keeper.safe_intent_record(row)
     return None
 
 
-def _intent_address(anchors: list[LogLine], endpoint: str, addr: str | None) -> str:
-    if addr is not None:
-        if keeper.is_address(addr):
-            return addr
-        raise SaiError("Pass a 0x-prefixed EVM address", Code.INVALID_REQUEST)
-    origin = log.origin(endpoint)
-    for line in reversed(anchors):
-        if line.get("endpoint", origin) != origin:
+def _has_intent(line: LogLine, key: str) -> bool:
+    return line.get("intentKey") == key and line.get("tool") != "logs_intent"
+
+
+def _select_scope(
+    anchors: list[LogLine], addr: str | None, identity: str | None
+) -> tuple[Scope | None, bool]:
+    candidates: set[Scope] = set()
+    evidence: set[Scope] = set()
+    for line in anchors:
+        scope = _scope(line)
+        if (
+            not scope
+            or (addr and scope[0] != addr)
+            or (identity and scope[1] != identity)
+        ):
             continue
-        account = _id(line, "addr") or _id(line, "account")
-        if account is not None and keeper.is_address(account):
-            return account
+        candidates.add(scope)
+        if line.get("event") in INTENT_EVIDENCE and line.get("found") is not False:
+            evidence.add(scope)
+    scopes = evidence or candidates
+    if len(scopes) == 1:
+        return next(iter(scopes)), False
+    return None, bool(scopes)
+
+
+def _active_address(endpoint: str) -> str | None:
     try:
         active = storage.load_session()
     except (ValueError, OSError):
-        active = {}
-    account = active.get("evmAddress")
-    if (
-        account is not None
-        and keeper.is_address(account)
-        and active.get("endpoint") == endpoint
-    ):
-        return account
+        return None
+    if active.get("endpoint") == endpoint:
+        return _address({"addr": active.get("evmAddress")})
+    return None
+
+
+def _before(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        instant = datetime.fromisoformat(value)
+        if instant.utcoffset() == timedelta(0):
+            return instant
+    except ValueError:
+        pass
     raise SaiError(
-        "No account found for the Keeper lookup. Pass an address or use offline mode.",
+        "Pass a UTC timestamp to --before.",
         Code.INVALID_REQUEST,
+        exit_code=ExitCode.USAGE,
     )
 
 
-def _has_intent(line: LogLine, key: str) -> bool:
-    # An earlier audit of this intent does not add new evidence to its trail.
-    return line.get("intentKey") == key and line.get("tool") != "logs_intent"
+def _scan(
+    root: Path | None, before: str | None = None
+) -> tuple[list[LogLine], bool, str | None]:
+    instant = _before(before)
+    cutoff = log.stamp(instant) if instant else None
+    scan = log.LogScan()
+    log.flush(1.0)
+    rows = sorted(
+        (
+            line
+            for line in scan.rows(root, last_day=instant.date() if instant else None)
+            if _timestamp(line)
+        ),
+        key=log.event_order,
+    )
+    return rows, scan.truncated, cutoff
+
+
+def _in_window(line: LogLine, cutoff: str | None) -> bool:
+    return cutoff is None or (ts := _id(line, "ts")) is not None and ts < cutoff
+
+
+def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
+    name = _id(line, "event")
+    spec = EVENTS.get(name) if name else None
+    fields = COMMON_REQUIRED.keys() | COMMON_OPTIONAL.keys()
+    if spec:
+        fields |= spec.required.keys() | spec.optional.keys()
+    safe: LogLine = {
+        field: value
+        for field, value in line.items()
+        if field in fields
+        and field not in FREE_TEXT
+        and isinstance(value, (str, int, bool))
+    }
+    for field, allowed in (
+        ("kind", keeper.INTENT_KINDS),
+        ("lifecycleStep", keeper.INTENT_STEPS),
+        ("execActor", keeper.INTENT_ACTORS),
+        ("errorCode", keeper.INTENT_ERROR_CODES | {Code.KEEPER_ERROR}),
+        ("code", CODES),
+    ):
+        if field in safe and keeper.known_text(safe[field], allowed) is None:
+            del safe[field]
+    if safe.get("code") and ("error" in line or "errorMsg" in line):
+        safe["error"] = log.untrusted("Sai recorded a failure. See the error code.")
+    for field in ("addr", "account"):
+        if field in safe and not keeper.is_address(safe[field]):
+            del safe[field]
+    if "operation" in safe and safe["operation"] not in OPERATIONS:
+        del safe["operation"]
+    if name == "mcp.tool_result":
+        if "status" in safe and safe["status"] not in MCP_STATUSES:
+            del safe["status"]
+        if "previewDigest" in safe and not ENDPOINT_ID.fullmatch(
+            str(safe["previewDigest"])
+        ):
+            del safe["previewDigest"]
+    for name in ("intentKey", "runId", "callId", "commandId"):
+        if name in safe and not TOKEN.fullmatch(str(safe[name])):
+            del safe[name]
+    if "endpoint" in safe:
+        safe["endpoint"] = log.origin(str(safe["endpoint"]))
+    tx_hash, invalid = keeper.request_hash(line.get("txHash"))
+    safe.pop("txHash", None)
+    if tx_hash:
+        safe["txHash"] = tx_hash
+    if invalid:
+        safe["txHashInvalid"] = True
+    return log.clean(safe, tokens)
+
+
+def _limit(
+    report: LogLine,
+    entries: list[tuple[str, LogLine]],
+    scan_truncated: bool,
+    oldest_scanned: str | None,
+) -> LogLine:
+    tokens = log.known_tokens(check=True)
+    bytes_left = MAX_REPORT_BYTES - 8192
+    next_before = oldest_scanned
+    for rows, (field, line) in enumerate(reversed(entries)):
+        safe = _export(line, tokens)
+        size = len(json.dumps(safe, allow_nan=False).encode()) + 2
+        if rows == MAX_REPORT_ROWS or size > bytes_left:
+            scan_truncated = True
+            break
+        report[field].append(safe)
+        if field != "unattributedGaps":
+            next_before = _timestamp(line)
+        bytes_left -= size
+    for field in {field for field, _line in entries}:
+        report[field].reverse()
+    if scan_truncated:
+        report["truncated"] = True
+        if next_before:
+            report["nextBefore"] = next_before
+        report["more"] = (
+            "Use --before for earlier timestamps in the scan window. "
+            "To read past the scan limit, inspect files from sai logs path."
+        )
+    return report
 
 
 def intent(
@@ -95,96 +258,144 @@ def intent(
     *,
     endpoint: str | None = None,
     addr: str | None = None,
+    offline: bool = False,
+    before: str | None = None,
     root: Path | None = None,
-) -> dict[str, Any]:
-    """Join direct intent events to CLI runs and individual MCP calls.
-
-    With ENDPOINT, add a read-only Keeper lookup. A failed lookup leaves
-    the trail available with a structured error.
-    """
-    log.flush(1.0)
-    anchors = sorted(
-        (line for line in log.read_events(root) if _has_intent(line, key)),
-        key=log.event_order,
-    )
-    # MCP run IDs identify server processes. Require a matching call ID
-    # for their sibling events. Drop notices carry only the run ID.
-    calls: set[tuple[str | None, str]] = set()
-    runs: set[str] = set()
-    gap_runs: set[str] = set()
-    for line in anchors:
-        run_id, call_id = _id(line, "runId"), _id(line, "callId")
-        if run_id:
-            gap_runs.add(run_id)
-        if call_id:
-            calls.add((run_id, call_id))
-        elif run_id and line.get("surface") != "mcp":
-            runs.add(run_id)
-
-    events = anchors.copy()
-    gaps: list[LogLine] = []
-    if anchors:
-        for line in log.read_events(root):
-            run_id, call_id = _id(line, "runId"), _id(line, "callId")
-            if line.get("event") == "log.dropped":
-                if run_id in gap_runs:
-                    gaps.append(line)
-            elif not _has_intent(line, key) and (
-                run_id in runs or (run_id, call_id) in calls
+) -> LogLine:
+    """Join the evidence for one account and endpoint, with optional Keeper state."""
+    if keeper.INTENT_KEY.fullmatch(key) is None:
+        raise SaiError("Invalid intent key.", Code.INVALID_REQUEST)
+    if addr is not None and not keeper.is_address(addr):
+        raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
+    chosen_addr = addr.lower() if addr else None
+    identity = log.endpoint_id(endpoint) if endpoint else None
+    rows, scan_truncated, cutoff = _scan(root, before)
+    anchors = [line for line in rows if _has_intent(line, key)]
+    scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
+    events: list[LogLine] = []
+    if scope is not None:
+        direct = [line for line in anchors if _scope(line) == scope]
+        invocations = {match for line in direct if (match := _invocation(line))}
+        conflicting = {
+            match
+            for line in anchors
+            if _scope(line) not in (None, scope)
+            and (match := _invocation(line)) in invocations
+        }
+        for line in rows:
+            if not _in_window(line, cutoff) or line.get("event") == "log.dropped":
+                continue
+            if _has_intent(line, key) and _scope(line) == scope:
+                events.append(line)
+                continue
+            match = _invocation(line)
+            if (
+                match in invocations
+                and match not in conflicting
+                and line.get("intentKey") in (None, key)
+                and _address(line) in (None, scope[0])
+                and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
+                and line.get("endpointId") in (None, scope[1])
             ):
                 events.append(line)
+    else:
+        direct = []
 
-    result: dict[str, Any] = {
-        "intentKey": key,
-        "events": sorted(events, key=log.event_order),
-        "gaps": sorted(gaps, key=log.event_order),
+    report: LogLine = {
+        "intentKey": key if scope else None,
+        "events": [],
+        "gaps": [],
         "keeper": None,
+        "txHash": None,
     }
-    if endpoint is not None:
-        try:
-            result["keeper"] = _lookup_intent(
-                endpoint, key, _intent_address(anchors, endpoint, addr)
-            )
-        except SaiError as exc:
-            error = exc.as_dict()
-            error["message"] = log.clean(log.untrusted(exc.message))
-            result["keeperError"] = error
-    current = result["keeper"] or {}
-    logged_hash = next(
+    if ambiguous or any(
+        _scope(line) is None
+        and (line.get("endpoint") is not None or line.get("event") in INTENT_EVIDENCE)
+        for line in anchors
+    ):
+        report["scopeWarning"] = (
+            "Intent events have ambiguous account or endpoint attribution."
+            if ambiguous
+            else "Older events without sufficient attribution were omitted."
+        )
+    if endpoint is not None and not offline and not ambiguous:
+        account = scope[0] if scope else chosen_addr or _active_address(endpoint)
+        if account is None:
+            report["keeperError"] = {
+                "code": Code.INVALID_REQUEST,
+                "message": "Pass an address for the Keeper lookup or use offline mode.",
+            }
+        else:
+            try:
+                report["keeper"] = _lookup_intent(endpoint, key, account)
+            except SaiError as exc:
+                report["keeperError"] = {
+                    "code": exc.code,
+                    "message": log.clean(log.untrusted("Keeper intent lookup failed.")),
+                }
+
+    current = report["keeper"] or {}
+    if current:
+        report["intentKey"] = current.get("intentKey", report["intentKey"])
+    request_hash = next(
         (
-            value
+            tx_hash
             for event in ("intent.submitted", "intent.wait.end", "intent.keeper")
-            for line in reversed(anchors)
-            if line.get("event") == event and (value := _id(line, "txHash"))
+            for line in reversed(direct)
+            if line.get("event") == event
+            and (tx_hash := keeper.request_hash(line.get("txHash"))[0])
         ),
-        None,
+        current.get("txHash"),
     )
-    result["txHash"] = logged_hash or _id(current, "txHash")
-    return result
+    report["txHash"] = keeper.request_hash(log.clean(request_hash))[0]
+    matched_runs = {_id(line, "runId") for line in direct} - {None}
+    entries = [("events", line) for line in events]
+    unattributed = []
+    for line in rows:
+        if _in_window(line, cutoff) and line.get("event") == "log.dropped":
+            if _id(line, "runId") in matched_runs:
+                entries.append(("gaps", line))
+            else:
+                unattributed.append(line)
+    entries.sort(key=lambda entry: log.event_order(entry[1]))
+    if unattributed:
+        report["unattributedGapCount"] = len(unattributed)
+        report["unattributedGaps"] = []
+        entries = [("unattributedGaps", line) for line in unattributed[-8:]] + entries
+        scan_truncated |= len(unattributed) > 8
+    oldest = next((_id(line, "ts") for line in rows if _in_window(line, cutoff)), None)
+    return _limit(report, entries, scan_truncated, oldest)
 
 
-def run(identifier: str, *, root: Path | None = None) -> dict[str, Any]:
-    """Read a process run ID or one MCP call ID, including relevant gaps."""
-    log.flush(1.0)
-    events: list[LogLine] = []
-    notices: list[LogLine] = []
-    gap_runs = {identifier}
-    for line in log.read_events(root):
-        run_id, call_id = _id(line, "runId"), _id(line, "callId")
-        if line.get("event") == "log.dropped":
-            notices.append(line)
-        elif identifier in (run_id, call_id):
-            events.append(line)
-            if run_id:
-                gap_runs.add(run_id)
-    return {
-        "id": identifier,
-        "events": sorted(events, key=log.event_order),
-        "gaps": sorted(
-            (line for line in notices if _id(line, "runId") in gap_runs),
-            key=log.event_order,
-        ),
-    }
+def run(
+    identifier: str, *, before: str | None = None, root: Path | None = None
+) -> LogLine:
+    """Read a process run ID or one MCP call ID."""
+    if TOKEN.fullmatch(identifier) is None:
+        raise SaiError("Invalid log run or call ID.", Code.INVALID_REQUEST)
+    rows, scan_truncated, cutoff = _scan(root, before)
+    events = [
+        line
+        for line in rows
+        if line.get("event") != "log.dropped"
+        and identifier in (_id(line, "runId"), _id(line, "callId"))
+    ]
+    runs = {identifier} | {_id(line, "runId") for line in events} - {None}
+    entries = [("events", line) for line in events if _in_window(line, cutoff)]
+    entries.extend(
+        ("gaps", line)
+        for line in rows
+        if line.get("event") == "log.dropped"
+        and _id(line, "runId") in runs
+        and _in_window(line, cutoff)
+    )
+    entries.sort(key=lambda entry: log.event_order(entry[1]))
+    return _limit(
+        {"id": identifier, "events": [], "gaps": []},
+        entries,
+        scan_truncated,
+        next((_id(line, "ts") for line in rows if _in_window(line, cutoff)), None),
+    )
 
 
 def _seconds(duration: str) -> int:
@@ -203,50 +414,67 @@ def _seconds(duration: str) -> int:
     )
 
 
-def stats(since: str | None = None, *, root: Path | None = None) -> dict[str, Any]:
-    """Summarize recorded Keeper requests and count each event with a code."""
+def stats(
+    since: str | None = None, *, before: str | None = None, root: Path | None = None
+) -> LogLine:
+    """Summarize the timed samples and coded failures within the scan budget."""
+    instant = _before(before)
+    upper = log.stamp(instant) if instant else None
     first_day = None
     cutoff = None
     if since is not None:
         seconds = _seconds(since)
         now = log.now()
-        # Clamp a very large lookback to the earliest representable date.
         start = now - timedelta(
             seconds=min(seconds, (now.date().toordinal() - 1) * 86400)
         )
-        first_day = start.date()
-        cutoff = log.stamp(start)
+        first_day, cutoff = start.date(), log.stamp(start)
 
     log.flush(1.0)
+    scan = log.LogScan()
     durations: defaultdict[str, list[int]] = defaultdict(list)
     codes: Counter[str] = Counter()
-    gaps: list[LogLine] = []
-    for line in log.read_events(root, first_day=first_day):
-        ts = _id(line, "ts")
-        if cutoff is not None and (ts is None or ts < cutoff):
+    gaps: list[tuple[str, LogLine]] = []
+    oldest = None
+    for line in scan.rows(
+        root, first_day=first_day, last_day=instant.date() if instant else None
+    ):
+        ts = _timestamp(line)
+        if ts is None or (cutoff and ts < cutoff) or (upper and ts >= upper):
             continue
+        oldest = min(oldest, ts) if oldest else ts
         if line.get("event") == "log.dropped":
-            gaps.append(line)
+            gaps.append(("gaps", line))
             continue
-        if code := _id(line, "code"):
+        if (code := _id(line, "code")) and code in CODES:
             codes[code] += 1
         if line.get("event") == "keeper.request":
             operation, duration = _id(line, "operation"), line.get("durationMs")
-            if operation and type(duration) is int and duration >= 0:
+            if (
+                operation
+                and operation in OPERATIONS
+                and type(duration) is int
+                and duration >= 0
+            ):
                 durations[operation].append(duration)
     operations = {}
     for name, samples in sorted(durations.items()):
         samples.sort()
         count = len(samples)
-        # Nearest rank, with one-based ranks and integer ceiling division.
         operations[name] = {
             "count": count,
             "p50Ms": samples[(count * 50 + 99) // 100 - 1],
             "p95Ms": samples[(count * 95 + 99) // 100 - 1],
         }
-    return {
-        "since": cutoff,
-        "keeper": operations,
-        "errors": dict(sorted(codes.items())),
-        "gaps": sorted(gaps, key=log.event_order),
-    }
+    gaps.sort(key=lambda entry: log.event_order(entry[1]))
+    return _limit(
+        {
+            "since": cutoff,
+            "keeper": operations,
+            "errors": dict(sorted(codes.items())),
+            "gaps": [],
+        },
+        gaps,
+        scan.truncated,
+        oldest,
+    )

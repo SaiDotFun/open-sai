@@ -37,9 +37,9 @@ The JSONL files in `logs/` come from real subprocesses with temporary
   `mcp_info` in one stdio server session. The Keeper URL has no listener,
   so the request and tool result carry `NOT_SENT`.
 
-The capture replaces volatile values, the loopback port for the trade, and
-the generated intent key. It preserves field types, sequence numbers, and
-the relationships among IDs. Regenerate both files with this command.
+The capture checks field types against the registry before replacing
+volatile values, the loopback port and its endpoint identity, and the
+generated intent key. It preserves sequence numbers and ID relationships. Regenerate both files with this command.
 
 ```sh
 SAI_REGENERATE_LOG_GOLDENS=1 uv run pytest cli/sai_cli/tests/test_logs.py \
