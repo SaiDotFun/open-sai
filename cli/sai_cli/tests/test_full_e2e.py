@@ -341,7 +341,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         assert duplicate.returncode == 1
         blocked = json.loads(duplicate.stdout)["error"]
         assert blocked["intentKey"] == key and blocked["retryable"] is False
-        assert blocked["hint"] == error["hint"]
+        assert blocked["hint"] == hint
         assert "Reconcile" in blocked["message"]
         assert len(recorded) == 1
 
