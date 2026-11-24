@@ -145,6 +145,7 @@ class NetworkTest(unittest.TestCase):
                 timeout=5,
                 capture_output=True,
                 text=True,
+                check=False,
             )
             self.assertEqual(result.returncode, 1)
             self.assertIn(
