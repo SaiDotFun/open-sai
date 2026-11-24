@@ -1,9 +1,11 @@
 use std::{fmt::Write as _, io, path::Path};
 
 use clap::Subcommand;
-use sai_core::settings::{self, Environment, Flags, KEYS, Key, Settings, SettingsError};
+use sai_core::settings::{self, Environment, Flags, KEYS, Key, SettingsError};
 use serde::Serialize;
 use serde_json::{Map, Value, json, ser::Formatter};
+
+use crate::load_settings;
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -24,7 +26,7 @@ impl ConfigCommand {
         let json_path = json.then(|| format_path_json(path));
         match self {
             Self::List => {
-                let resolved = load(flags, env)?;
+                let resolved = load_settings(flags, env).map_err(Error::settings)?;
                 if let Some(path) = json_path {
                     let entries: Map<String, Value> = KEYS
                         .into_iter()
@@ -57,7 +59,7 @@ impl ConfigCommand {
             }
             Self::Get { key } => {
                 let key = parse_key(&key)?;
-                let resolved = load(flags, env)?;
+                let resolved = load_settings(flags, env).map_err(Error::settings)?;
                 let value = resolved.value(key);
                 if json {
                     println!(
@@ -112,14 +114,6 @@ impl ConfigCommand {
 
 fn parse_key(name: &str) -> Result<Key, Error> {
     Key::parse(name).map_err(|error| Error::usage(error.to_string()))
-}
-
-fn load(flags: &Flags, env: &Environment) -> Result<Settings, Error> {
-    let settings = Settings::load(flags, env).map_err(Error::settings)?;
-    for warning in &settings.warnings {
-        eprintln!("{warning}");
-    }
-    Ok(settings)
 }
 
 fn warn_override(env: &Environment, key: Key) {

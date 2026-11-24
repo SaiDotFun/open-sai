@@ -1,4 +1,5 @@
 mod config;
+mod local;
 
 use std::{env, process::ExitCode, time::Instant};
 
@@ -7,10 +8,11 @@ use clap::{
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use sai_core::log::{EXIT_FLUSH, Field, Level, LogWriter, Surface};
-use sai_core::settings::{Environment, Flags, repr};
+use sai_core::settings::{Environment, Flags, Settings, SettingsError, repr};
 use serde_json::{Value, json};
 
 use config::{ConfigCommand, Error};
+use local::{AuthCommand, IntentCommand};
 
 #[derive(Parser)]
 #[command(
@@ -41,6 +43,20 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Manage local Sai sessions.
+    Auth {
+        #[arg(long, global = true, help = "Print machine-readable JSON")]
+        json: bool,
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Inspect trading request outcomes.
+    Intent {
+        #[arg(long, global = true, help = "Print machine-readable JSON")]
+        json: bool,
+        #[command(subcommand)]
+        command: IntentCommand,
+    },
     /// Show and change settings in $SAI_HOME/config.toml.
     Config {
         #[command(subcommand)]
@@ -55,7 +71,7 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let (command, operands) = config_command(&argv);
+    let (command, operands) = command_path(&argv);
     let environment = Environment::from_process();
     let started = Instant::now();
     let writer = if command == "logs"
@@ -107,9 +123,23 @@ fn main() -> ExitCode {
                     ws_endpoint: cli.ws_endpoint,
                     lcd_endpoint: cli.lcd_endpoint,
                 };
-                match cli.command {
-                    Command::Config { command } => command.run(&flags, env, cli.json),
-                }
+                let result = match cli.command {
+                    Command::Auth { command, json } => local::auth(
+                        command,
+                        cli.account.as_deref(),
+                        &flags,
+                        env,
+                        cli.json || json,
+                    ),
+                    Command::Intent { command, json } => {
+                        local::intent(command, &flags, env, cli.json || json)
+                    }
+                    Command::Config { command } => return command.run(&flags, env, cli.json),
+                };
+                result.map_err(|error| Error {
+                    code: 1,
+                    message: error.to_string(),
+                })
             }),
         Err(error) => {
             let context = if command == "logs" { "" } else { command };
@@ -122,6 +152,14 @@ fn main() -> ExitCode {
         }
     };
     finish(writer, command_field(), started, complete(result, command))
+}
+
+fn load_settings(flags: &Flags, env: &Environment) -> Result<Settings, SettingsError> {
+    let settings = Settings::load(flags, env)?;
+    for warning in &settings.warnings {
+        eprintln!("{warning}");
+    }
+    Ok(settings)
 }
 
 fn complete(result: Result<(), Error>, command: &str) -> (u8, Option<String>) {
@@ -157,7 +195,7 @@ fn finish(
     code.into()
 }
 
-fn config_command(args: &[String]) -> (&'static str, &[String]) {
+fn command_path(args: &[String]) -> (&'static str, &[String]) {
     let mut skip = false;
     for (index, arg) in args.iter().enumerate() {
         if skip {
@@ -167,21 +205,31 @@ fn config_command(args: &[String]) -> (&'static str, &[String]) {
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return ("logs", &[]),
-            "config" => {
+            "config" | "auth" | "intent" => {
+                let group = match arg.as_str() {
+                    "auth" => "auth",
+                    "intent" => "intent",
+                    _ => "config",
+                };
                 let Some((index, leaf)) = args
                     .iter()
                     .enumerate()
                     .skip(index + 1)
                     .find(|(_, arg)| !arg.starts_with('-'))
                 else {
-                    return ("config", &[]);
+                    return (group, &[]);
                 };
-                let path = match leaf.as_str() {
-                    "get" => "config get",
-                    "list" => "config list",
-                    "set" => "config set",
-                    "unset" => "config unset",
-                    _ => "config",
+                let path = match (group, leaf.as_str()) {
+                    ("config", "get") => "config get",
+                    ("config", "list") => "config list",
+                    ("config", "set") => "config set",
+                    ("config", "unset") => "config unset",
+                    ("auth", "status") => "auth status",
+                    ("auth", "list") => "auth list",
+                    ("auth", "use") => "auth use",
+                    ("auth", "logout") => "auth logout",
+                    ("intent", "local") => "intent local",
+                    _ => group,
                 };
                 return (path, &args[index + 1..]);
             }
@@ -254,6 +302,10 @@ fn print_parse_error(
     command: &str,
     operands: &[String],
 ) -> (u8, Option<String>) {
+    if matches!(command.split_whitespace().next(), Some("auth" | "intent")) {
+        let _ = error.print();
+        return (error.exit_code() as u8, None);
+    }
     match error.kind() {
         ErrorKind::DisplayHelp if config::print_help(command, false) => (0, None),
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand

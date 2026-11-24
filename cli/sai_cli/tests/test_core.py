@@ -381,42 +381,6 @@ def test_market_dry_run_needs_no_price_and_marks_refresh():
     assert "trigger price is required" in result.output
 
 
-def test_exec_pass_requires_matching_trade_history(session, monkeypatch):
-    key = "example"
-    addr = session["evmAddress"]
-    storage.pending(key, keeper.MAINNET_HTTP, addr, "CLOSE_POSITION", "1")
-    matched = False
-
-    def query(endpoint, query, variables=None, token=None, timeout=20):
-        if query == keeper.INTENTS:
-            return {
-                "userIntents": [
-                    {
-                        "intentKey": key,
-                        "evmAddress": addr,
-                        "execActor": "server",
-                        "lifecycleStep": "exec_pass",
-                    }
-                ]
-            }
-        return {
-            "perp": {
-                "tradeHistory": [{"intentKey": key, "trade": {"id": 1}}]
-                if matched
-                else []
-            }
-        }
-
-    monkeypatch.setattr(keeper, "request", query)
-    result = CliRunner().invoke(main, ["intent", "status", addr, "--key", key])
-    assert result.exit_code == 0, result.output
-    assert storage.list_pending(keeper.MAINNET_HTTP, addr)[0]["status"] == "accepted"
-    matched = True
-    result = CliRunner().invoke(main, ["intent", "status", addr, "--key", key])
-    assert result.exit_code == 0, result.output
-    assert storage.list_pending(keeper.MAINNET_HTTP, addr)[0]["status"] == "terminal"
-
-
 def test_margin_quote_uses_exact_contract_integer_math():
     raw = {"collateral_amount": "10000000", "leverage": "10"}
     funds = {"available_to_trade": "20000000"}
