@@ -136,7 +136,8 @@ ownership requirements from PR #148 at commit
 preview or intent against a fixture after validating dynamic values such
 as the oracle observation timestamp and intent key.
 
-To compare both implementations, set `SAI_PARITY_BIN` to the Rust binary,
+CI installs both pinned Python launchers. For a local run, set
+`SAI_PARITY_BIN` to the Rust binary,
 `SAI_PARITY_POSITION_V012_PYTHON` to the v0.1.2 launcher, and
 `SAI_PARITY_POSITION_OWNER_PYTHON` to the PR #148 launcher. Run
 `uv run --locked pytest tests/parity/test_position_update.py`.

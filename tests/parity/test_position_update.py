@@ -31,6 +31,9 @@ from scenarios import (
 from test_trade import CLI, rows, run
 
 TPSL = ("trade", "tpsl", "7", "--take-profit", "110.0100", "--clear-stop-loss")
+CLEAR_TP = ("trade", "tpsl", "7", "--clear-take-profit")
+CLEAR_SL = ("trade", "tpsl", "7", "--clear-stop-loss")
+SET_BOTH = ("trade", "tpsl", "7", "--take-profit", "110.0100", "--stop-loss", "90.0100")
 LEVERAGE = ("trade", "leverage", "7", "--leverage", "10.00")
 UPDATE_WIRE = ["trade", "oneClickTrading", "node_info", "get_trade_raw"]
 QUOTE_WIRE = [
@@ -48,6 +51,7 @@ ORACLE_WIRE = ["get_fees", "get_perp_prices"]
 CHAIN = "cataclysm-1"
 HEIGHT = "120"
 ENTRY = "100.000000000000000000"
+SHORT_ENTRY = "100.000000000000000001"
 OUTSIDE = "The leverage request is outside the market's collateral or leverage limits."
 GUARDED = "The after-hours guard can change or close this position."
 UNKNOWN = "Cannot verify that the Perp after-hours guard is inactive."
@@ -69,6 +73,11 @@ QUOTED_LIQUIDATION = {
     "excludesBorrowingFees": True,
     "assumption": "The target leverage takes effect if Perp's borrowing-inclusive liquidation check passes.",
 }
+SHORT_LIQUIDATION = {
+    **QUOTED_LIQUIDATION,
+    "price": "108.000000000000000001",
+    "entry": {**QUOTED_LIQUIDATION["entry"], "price": SHORT_ENTRY},
+}
 
 
 def unavailable(reason: str) -> dict[str, Any]:
@@ -76,16 +85,17 @@ def unavailable(reason: str) -> dict[str, Any]:
 
 
 def body(command: CLI) -> dict[str, Any]:
-    if command == TPSL:
-        return {
-            "takeProfit": {"operation": "set", "value": "110.0100"},
-            "stopLoss": {"operation": "clear"},
-        }
+    keep = {"operation": "keep"}
+    clear = {"operation": "clear"}
+    take_profit = {"operation": "set", "value": "110.0100"}
+    stop_loss = {"operation": "set", "value": "90.0100"}
     return {
-        "takeProfit": {"operation": "keep"},
-        "stopLoss": {"operation": "keep"},
-        "requestedLeverage": "10.00",
-    }
+        TPSL: {"takeProfit": take_profit, "stopLoss": clear},
+        CLEAR_TP: {"takeProfit": clear, "stopLoss": keep},
+        CLEAR_SL: {"takeProfit": keep, "stopLoss": clear},
+        SET_BOTH: {"takeProfit": take_profit, "stopLoss": stop_loss},
+        LEVERAGE: {"takeProfit": keep, "stopLoss": keep, "requestedLeverage": "10.00"},
+    }[command]
 
 
 def intent(command: CLI) -> dict[str, Any]:
@@ -107,11 +117,17 @@ def estimates(liquidation_price: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+TRIGGER_ESTIMATES = estimates(
+    {"status": "unchanged", "reason": "This action changes only TP/SL triggers."}
+)
+
+
 @contextmanager
 def update_loopback(mode: str) -> Generator[Endpoints]:
     wire: list[WireRequest] = []
     errors: list[str] = []
     submitted: list[str] = []
+    short = mode in {"short", "short-liquidation"}
     token = PROTOCOL["session_response"]["data"]["createUserIntentSession"]["token"]
     borrowing = {"marketId": 3, "collateralToken": {"id": 0, "symbol": "USDC"}}
     position = {
@@ -132,8 +148,8 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         "trade_type": "trade",
         "collateral_amount": "20000000",
         "leverage": "5",
-        "open_price": ENTRY,
-        "long": True,
+        "open_price": SHORT_ENTRY if short else ENTRY,
+        "long": not short,
     }
     keeper_replies = {
         "trade": {"perp": {"trade": position}},
@@ -171,9 +187,12 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         "get_fees": {"open_fee_p": "0.001"},
         "get_perp_prices": {
             "market": {
-                "base_per_quote": "85"
-                if mode in {"queued", "stale", "liquidation"}
-                else "99",
+                "base_per_quote": {
+                    "queued": "85",
+                    "stale": "85",
+                    "liquidation": "85",
+                    "short-liquidation": "110",
+                }.get(mode, "99"),
                 "base_last_update_time": 995,
                 "quote_last_update_time": 980 if mode == "stale" else 995,
             }
@@ -352,15 +371,15 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
 def runners(
     cli_pair: tuple[CLI, CLI], *, released: bool = False
 ) -> list[tuple[str, CLI]]:
-    reference = os.environ.get(
+    pin = (
         "SAI_PARITY_POSITION_V012_PYTHON"
         if released
         else "SAI_PARITY_POSITION_OWNER_PYTHON"
     )
-    rust = ("rust", cli_pair[1])
-    # The expected output below was checked against the pinned reference.
-    # Compare the reference subprocess too when its launcher is available.
-    return [("python", (reference,)), rust] if reference else [rust]
+    reference = os.environ.get(pin)
+    if reference is None or not Path(reference).is_file():
+        pytest.fail(f"Set {pin} to the installed pinned Python sai launcher")
+    return [("python", (reference,)), ("rust", cli_pair[1])]
 
 
 def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> bytes:
@@ -387,17 +406,10 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
 @pytest.mark.parametrize(
     ("command", "mode", "suffix", "expected"),
     [
-        (
-            TPSL,
-            "default",
-            [],
-            estimates(
-                {
-                    "status": "unchanged",
-                    "reason": "This action changes only TP/SL triggers.",
-                }
-            ),
-        ),
+        (TPSL, "default", [], TRIGGER_ESTIMATES),
+        (CLEAR_TP, "default", [], TRIGGER_ESTIMATES),
+        (CLEAR_SL, "default", [], TRIGGER_ESTIMATES),
+        (SET_BOTH, "default", [], TRIGGER_ESTIMATES),
         (
             TPSL,
             "after-hours",
@@ -464,9 +476,26 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
                 },
             },
         ),
+        (LEVERAGE, "short", LEVERAGE_WIRE + ORACLE_WIRE, estimates(SHORT_LIQUIDATION)),
+        (
+            LEVERAGE,
+            "short-liquidation",
+            LEVERAGE_WIRE + ORACLE_WIRE + ["market_order_config", "get_group", "block"],
+            {
+                **estimates(unavailable(LIQUIDATION)),
+                "execution": {
+                    "status": "would_be_rejected",
+                    "code": "LiquidationReached",
+                    "reason": LIQUIDATION,
+                },
+            },
+        ),
     ],
     ids=[
         "tpsl",
+        "clear-tp",
+        "clear-sl",
+        "set-both",
         "after-hours",
         "wrong-height",
         "group-fallback",
@@ -475,6 +504,8 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         "queued",
         "stale",
         "liquidation",
+        "short",
+        "short-liquidation",
     ],
 )
 def test_position_update_dry_run(
@@ -521,7 +552,9 @@ def test_pair_cap_fallback_requires_the_pinned_height(
         assert output["estimates"] == estimates(
             unavailable("Position entry price or projected collateral is unavailable.")
         )
-        assert [request.label for request in endpoints.wire] == QUOTE_WIRE + LEVERAGE_WIRE
+        assert [
+            request.label for request in endpoints.wire
+        ] == QUOTE_WIRE + LEVERAGE_WIRE
         assert not endpoints.errors
         assert not (tmp_path / "rust/sai/trader/intents.sqlite3").exists()
 
