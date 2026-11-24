@@ -532,6 +532,13 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
                 )[0]
                 == 0
             )
+            # The valid Rust dry run reads estimates. The rejected request
+            # below must still stop before any Keeper or LCD reads.
+            reads = endpoints.wire.copy()
+            if index == 0:
+                assert not reads
+            else:
+                assert reads and reads[0].label == "borrowings"
             code, result, stderr = run(
                 cli, home, endpoints, (*OPEN, *args, "--dry-run"), python=index == 0
             )
@@ -540,7 +547,7 @@ def test_exact_decimal_checks_intentionally_differ_from_python(
                 assert code == 0 and result["dryRun"]
             else:
                 assert code == 1 and result["error"]["message"] == message
-            assert not endpoints.wire
+            assert endpoints.wire == reads
             assert not rows(home)
 
 
