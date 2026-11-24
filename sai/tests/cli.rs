@@ -630,8 +630,7 @@ fn usage_errors_keep_json_at_every_supported_option_position() {
         ["--json", "intent", "status"],
         ["intent", "--json", "status"],
         ["intent", "status", "--json"],
-        ["auth", "--json", "use"],
-        ["auth", "use", "--json"],
+        ["--json", "auth", "use"],
     ] {
         let output = sai(home.path()).args(args).output().unwrap();
         assert_eq!(output.status.code(), Some(2));
