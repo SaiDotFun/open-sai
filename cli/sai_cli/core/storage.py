@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shlex
 import sqlite3
 import sys
@@ -19,13 +20,16 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import log
 from .errors import Code, SaiError, SessionError
+
+PLAIN_KEEPER_URL = re.compile(
+    r"https?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query"
+)
 
 
 class UnresolvedIntent(SaiError, ValueError):
@@ -248,11 +252,7 @@ def load_session(addr: str | None = None) -> dict[str, str]:
         try:
             key = _find(accounts, addr)
         except ValueError as exc:
-            raise SessionError(
-                str(exc),
-                Code.SIGNED_OUT,
-                hint=shlex.join(["sai", "auth", "login", "NAME", "--addr", addr]),
-            ) from exc
+            raise SessionError(str(exc), Code.SIGNED_OUT) from exc
         return accounts["sessions"][key]
     if accounts["active"] is None:
         if accounts["sessions"]:
@@ -386,23 +386,24 @@ def db() -> sqlite3.Connection:
     return connection
 
 
-def intent_status_hint(endpoint: str, account: str, key: str) -> str:
-    """Build the reconciliation command without echoing URL credentials."""
-    args = shlex.join(["intent", "status", account, "--key", key])
-    parts = urlsplit(endpoint)
-    if (
-        parts.username is not None
-        or parts.password is not None
-        or parts.query
-        or parts.fragment
-        or log.redact(endpoint) != endpoint
-    ):
-        return (
-            'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-            'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" '
-            f"{args}"
+def keeper_command_hint(endpoint: str, *args: str) -> str:
+    """Pin the selected Keeper in a recovery command.
+
+    Only the standard /query path is safe to echo. Custom gateway paths
+    can carry credentials.
+    """
+    if PLAIN_KEEPER_URL.fullmatch(endpoint) and log.redact(endpoint) == endpoint:
+        flag = shlex.quote(endpoint)
+    else:
+        flag = (
+            '"${SAI_RECONCILE_ENDPOINT:?'
+            'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
         )
-    return f"sai --endpoint {shlex.quote(endpoint)} {args}"
+    return f"sai --endpoint {flag} {shlex.join(args)}"
+
+
+def intent_status_hint(endpoint: str, account: str, key: str) -> str:
+    return keeper_command_hint(endpoint, "intent", "status", account, "--key", key)
 
 
 def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> None:

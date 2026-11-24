@@ -221,6 +221,7 @@ def reconcile(
     step = row.get("lifecycleStep")
     tx_hash, invalid_hash = keeper.request_hash(row.get("txHash"))
     error_code = keeper.intent_error_code(row)
+    outcome = classify_outcome(row)
     log.event(
         "intent.keeper",
         intentKey=key,
@@ -233,9 +234,8 @@ def reconcile(
         addr=account,
         endpoint=log.endpoint(endpoint),
         endpointId=log.endpoint_id(endpoint),
-        code=Code.KEEPER_ERROR if error_code else None,
+        code=Code.KEEPER_ERROR if outcome == "terminal-failed" else None,
     )
-    outcome = classify_outcome(row)
     if outcome == "unknown":
         return data
     local = _store_outcome(endpoint, account, row, outcome, write)

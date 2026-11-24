@@ -355,9 +355,10 @@ starts the stdio transport, stdout carries MCP protocol traffic. Without
 
 `ADMISSION_REJECTED` and `NOT_SENT` have exit 4 and `retryable: true`.
 `OUTCOME_UNKNOWN` has exit 5 and `retryable: false`. The reconciliation
-hint pins the original Keeper endpoint and account. If the URL may contain
-credentials, set `SAI_RECONCILE_ENDPOINT` to the original URL before running
-the hint. Exit 6 covers `SIGNED_OUT` and
+and sign-in hints pin the original Keeper endpoint. For URLs that may
+contain credentials, including custom gateway paths, set
+`SAI_RECONCILE_ENDPOINT` to the original URL before running the hint.
+Exit 6 covers `SIGNED_OUT` and
 `SESSION_EXPIRED`. `SESSION_UNAVAILABLE` has exit 1 and describes a local
 session the command could not use, for example one for another Keeper
 endpoint.

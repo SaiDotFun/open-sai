@@ -565,7 +565,7 @@ def no_recent_open(
         opens = recent_opens(settings.endpoint, account)
         pending = [row["intentKey"] for row in opens if row["status"] == "pending"]
         if pending:
-            raise Refused(PENDING_OPEN, "RECENT_OPEN_PENDING", intentKeys=pending)
+            raise Refused(PENDING_OPEN, Code.RECENT_OPEN_PENDING, intentKeys=pending)
         if opens and not allow_concurrent_open:
             statuses = " or ".join(sorted({row["status"] for row in opens}))
             raise Refused(
