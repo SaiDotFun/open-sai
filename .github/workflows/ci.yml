@@ -279,6 +279,7 @@ jobs:
           SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
           SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
+          SAI_PARITY_ESTIMATES_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
         run: uv run --locked pytest tests/parity --ignore=tests/parity/test_trade_shared_state.py
 
       - name: Check out the shared-state Python reference
