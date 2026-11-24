@@ -211,6 +211,9 @@ def ok(result: subprocess.CompletedProcess[str]) -> str:
 def artifact(name: str) -> Path:
     value = os.environ.get(f"SAI_C10B_{name}")
     if value is None:
+        assert not os.environ.get("SAI_C10B_REQUIRED"), (
+            f"the rehearsal requires SAI_C10B_{name}"
+        )
         pytest.skip(f"set SAI_C10B_{name} to the locally built release artifact")
     return Path(value).resolve(strict=True)
 
@@ -294,7 +297,8 @@ def native_artifact(replay: Replay, name: str = "RUST") -> str:
 
 def pre_mcp_xfail(result: subprocess.CompletedProcess[str]) -> None:
     if (
-        not (ROOT / "sai/src/mcp.rs").is_file()
+        not os.environ.get("SAI_C10B_REQUIRED")
+        and not (ROOT / "sai/src/mcp.rs").is_file()
         and "No such command 'mcp'" in result.stderr
     ):
         pytest.xfail("Native MCP startup requires PR #120")
@@ -479,16 +483,50 @@ def test_native_rolls_back_failed_installed_mcp(
     assert config.read_bytes() == content
 
 
+def interrupt_install(install: Install, replay: Replay, boundary: str) -> None:
+    probe = """
+import os, runpy, signal, sys
+script, launcher, record, boundary, *args = sys.argv[1:]
+def interrupt(event, values):
+    if (
+        (boundary == 'record' and event == 'os.rename' and os.fsdecode(values[1]) == record)
+        or (boundary == 'link' and event == 'os.symlink' and os.fsdecode(values[1]) == launcher)
+        or (boundary == 'smoke' and event == 'subprocess.Popen'
+            and [os.fsdecode(value) for value in values[1]] == [launcher, '--version'])
+        or (boundary == 'commit' and event == 'os.remove' and os.fsdecode(values[0]) == record)
+    ):
+        os.kill(os.getpid(), signal.SIGKILL)
+sys.addaudithook(interrupt)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        pending(install),
+        boundary,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    pre_mcp_xfail(result)
+    assert result.returncode == -9, (result.stdout, result.stderr)
+
+
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("boundary", ["record", "link", "smoke", "commit"])
 def test_standalone_recovers_an_interrupted_first_switch(
-    install: Install, replay: Replay
+    install: Install, replay: Replay, boundary: str
 ) -> None:
     native_artifact(replay)
-    result = install.install(replay, "--native")
-    pre_mcp_xfail(result)
-    ok(result)
-    directory = install.launcher.readlink().parts[1]
-    pending(install).write_text(json.dumps({"old": None, "new": directory}))
+    interrupt_install(install, replay, boundary)
+    assert pending(install).exists() == (boundary != "record")
+    assert install.launcher.is_symlink() == (boundary in ("smoke", "commit"))
     replay.redirects[f"/repos{REPO}/releases"] = "/unavailable"
     result = install.install(replay, "--native")
     assert result.returncode == 1 and "HTTP 302" in result.stderr
@@ -501,31 +539,7 @@ def test_native_updater_recovers_an_interrupted_first_install(
     install: Install, replay: Replay
 ) -> None:
     native_artifact(replay, "RECOVERY_RUST")
-    probe = """
-import os, runpy, signal, sys
-script, launcher, *args = sys.argv[1:]
-def interrupt(event, values):
-    if (event == 'subprocess.Popen'
-        and [os.fsdecode(value) for value in values[1]] == [launcher, '--version']):
-        os.kill(os.getpid(), signal.SIGKILL)
-sys.addaudithook(interrupt)
-sys.argv = [script, *args]
-runpy.run_path(script, run_name='__main__')
-"""
-    result = install.run(
-        sys.executable,
-        "-c",
-        probe,
-        INSTALLER,
-        install.launcher,
-        "--native",
-        "--api-base",
-        replay.base,
-        "--web-base",
-        replay.base,
-    )
-    pre_mcp_xfail(result)
-    assert result.returncode == -9, (result.stdout, result.stderr)
+    interrupt_install(install, replay, "smoke")
     assert json.loads(pending(install).read_text())["old"] is None
     result = install.run(
         install.launcher, "update", "--api-base", replay.base, "--web-base", replay.base
