@@ -454,3 +454,41 @@ fn migrates_old_v1_and_distinguishes_legacy_from_verified_terminal() {
         .unwrap();
     assert_eq!(marker, "terminal");
 }
+#[test]
+fn accepted_open_blocks_until_terminal_unless_explicitly_overridden() {
+    let home = tempdir().unwrap();
+    let storage = Storage::new(home.path());
+    let opening = "OPEN_TRADE";
+    storage
+        .pending("open", ENDPOINT, ADDR, opening, "")
+        .unwrap();
+    storage
+        .set_status("open", ENDPOINT, ADDR, IntentStatus::Accepted)
+        .unwrap();
+
+    assert!(matches!(
+        storage.pending("blocked", ENDPOINT, ADDR, opening, ""),
+        Err(StorageError::RecentOpenPending { key, .. }) if key == "open"
+    ));
+    storage
+        .reserve("override", ENDPOINT, ADDR, opening, "", true)
+        .unwrap();
+    storage
+        .reserve("third", ENDPOINT, ADDR, opening, "", true)
+        .unwrap();
+    storage
+        .set_status("override", ENDPOINT, ADDR, IntentStatus::Pending)
+        .unwrap();
+    assert!(matches!(
+        storage.reserve("blocked", ENDPOINT, ADDR, opening, "", true),
+        Err(StorageError::RecentOpenPending { key, .. }) if key == "override"
+    ));
+    for key in ["open", "override", "third"] {
+        storage
+            .set_status(key, ENDPOINT, ADDR, IntentStatus::Terminal)
+            .unwrap();
+    }
+    storage
+        .pending("next", ENDPOINT, ADDR, opening, "")
+        .unwrap();
+}
