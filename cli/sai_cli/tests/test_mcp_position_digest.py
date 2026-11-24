@@ -1472,7 +1472,7 @@ def test_open_checks_slippage_before_preview(
             preview = await call(client, "preview_open", args)
             if accepted:
                 assert cli.exit_code == 0, cli.output
-                assert json.loads(cli.output)["intent"]["body"]["maxSlippagePct"] == (
+                assert json.loads(cli.stdout)["intent"]["body"]["maxSlippagePct"] == (
                     slippage
                 )
                 assert preview["intent"]["body"]["maxSlippagePct"] == slippage
@@ -1480,7 +1480,7 @@ def test_open_checks_slippage_before_preview(
                     assert preview["referencePrice"] == "100.5"
             else:
                 assert cli.exit_code == 2, cli.output
-                error = json.loads(cli.output)["error"]
+                error = json.loads(cli.stdout)["error"]
                 assert error["code"] == "INVALID_REQUEST"
                 assert "Slippage" in error["message"]
                 assert preview["code"] == "INVALID_REQUEST"
