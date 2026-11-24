@@ -1334,6 +1334,42 @@ def test_client_failure_keeps_config_values_out_of_output(
     assert SECRET not in result.output and OTHER not in result.output
 
 
+@pytest.mark.parametrize(
+    ("exit_code", "stdout", "stderr"),
+    [
+        (7, "", f"Config I/O error: no MCP server could be read. TOKEN={SECRET}"),
+        (1, "", "Error: No MCP server named 'sai' found."),
+        (7, "", f"Error: No MCP server named '{OLD_COMMAND}' found."),
+        (1, "Config I/O error", f"Error: No MCP server named '{OLD_COMMAND}' found."),
+        (0, "{}", ""),
+    ],
+)
+def test_codex_install_refuses_to_write_after_an_uncertain_alias_lookup(
+    env: Env, exit_code: int, stdout: str, stderr: str
+):
+    env.write_codex({OLD_COMMAND: claude_entry(serve(env))})
+    original = env.codex_path().read_bytes()
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "name = args[2]\n",
+            f"name = args[2]\nif name == {OLD_COMMAND!r}:\n"
+            f"    print({stdout!r})\n    print({stderr!r}, file=sys.stderr)\n"
+            f"    sys.exit({exit_code})\n",
+        ),
+    )
+
+    result = invoke("mcp", "install", "codex")
+
+    diagnostic = (
+        f"exited {exit_code}" if exit_code else "returned an invalid registration"
+    )
+    assert f"`codex mcp get {OLD_COMMAND} --json` {diagnostic}" in failure(result)
+    assert SECRET not in result.output
+    assert env.codex_path().read_bytes() == original
+    assert env.calls() == GETS + LEGACY_GETS[:1]
+
+
 def claude_entry(argv: list[str], env: dict[str, str] | None = None) -> dict:
     return {"type": "stdio", "command": argv[0], "args": argv[1:], "env": env or {}}
 

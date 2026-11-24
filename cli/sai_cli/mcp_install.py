@@ -621,7 +621,11 @@ class Codex(Client):
                 f"`{command}` did not run: {type(exc).__name__}"
             ) from None
         if done.returncode != 0:
-            if "no mcp server" in (done.stderr + done.stdout).lower():
+            if (
+                done.returncode == 1
+                and not done.stdout.strip()
+                and done.stderr.strip() == f"Error: No MCP server named '{name}' found."
+            ):
                 return None
             raise ClientError(
                 f"`{command}` exited {done.returncode}. Run the client command directly for details."
@@ -630,7 +634,8 @@ class Codex(Client):
             data = json.loads(done.stdout)
         except ValueError:
             raise ClientError("`codex mcp get` printed something other than JSON")
-        data = data if isinstance(data, dict) else {}
+        if not isinstance(data, dict) or not isinstance(data.get("transport"), dict):
+            raise ClientError(f"`{command}` returned an invalid registration")
         disabled = data.get("enabled") is False
         extras = tuple(k for k in CODEX_TOOL_FILTERS if data.get(k) is not None)
         return entry_registration(
