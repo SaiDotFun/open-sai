@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from secrets import token_hex
 from typing import Any
@@ -18,6 +20,7 @@ from .errors import Code, SaiError
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
+BLOCK_PATH = "/cosmos/base/tendermint/v1beta1/blocks/"
 
 
 class QueryHeightMismatch(SaiError, ValueError):
@@ -31,7 +34,12 @@ def _get_json(url: str, timeout: float = 20, *, fresh: bool = False) -> dict[str
 
 
 def _get_json_at_height(
-    url: str, timeout: float = 20, *, height: str | None = None, fresh: bool = False
+    url: str,
+    timeout: float = 20,
+    *,
+    height: str | None = None,
+    fresh: bool = False,
+    allow_unprefixed_height: bool = False,
 ) -> tuple[dict[str, Any], str | None]:
     keeper.check_url(url, "LCD")
     try:
@@ -44,7 +52,7 @@ def _get_json_at_height(
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
-    except (httpx.HTTPError, ValueError, TypeError) as exc:
+    except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
         if height is not None or fresh:
             raise QueryHeightMismatch(
                 "Unable to verify contract state during confirmation."
@@ -52,6 +60,8 @@ def _get_json_at_height(
             ) from exc
         raise ValueError("Unable to read contract state") from exc
     query_height = response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}")
+    if query_height is None and allow_unprefixed_height:
+        query_height = response.headers.get(BLOCK_HEIGHT_HEADER)
     if height is not None and query_height != height:
         raise QueryHeightMismatch(
             "LCD did not serve the requested contract query height."
@@ -84,11 +94,82 @@ def smart_value(
     return _get_json_at_height(url, height=height)[0].get("data")
 
 
+def block_header(lcd: str, height: int | str, *, timeout: float = 3) -> dict[str, Any]:
+    data = _get_json(
+        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}", timeout, fresh=height == "latest"
+    )["block"]["header"]
+    if not isinstance(data, dict):
+        raise TypeError("Invalid LCD block header")
+    return data
+
+
+def smart_data(
+    lcd: str,
+    contract: str,
+    message: dict[str, Any],
+    *,
+    height: int,
+    timeout: float,
+) -> Any:
+    """Read overview state at the chosen block, within its request timeout."""
+    data, _ = _get_json_at_height(
+        _smart_url(lcd, contract, message),
+        timeout,
+        height=str(height),
+        allow_unprefixed_height=True,
+    )
+    return data.get("data")
+
+
 def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
     data = smart_value(lcd, contract, message)
     if not isinstance(data, dict):
         raise TypeError("Contract returned invalid state")
     return data
+
+
+def pair_leverage_cap(
+    lcd: str, contract: str, market_id: int, *, height: str | None = None
+) -> Decimal:
+    """Read Perp's custom cap, where an absent map entry means no override."""
+    try:
+        value = smart_value(
+            lcd,
+            contract,
+            {"get_pair_custom_max_leverage": {"index": market_id}},
+            height=height,
+        )
+    except ValueError as exc:
+        failure = exc.__cause__
+        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+            r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found",
+            failure.response.text,
+        ):
+            return Decimal(0)
+        raise
+    return contract_decimal(value)
+
+
+def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> Any:
+    """Read the live order and distinguish Perp's missing-target error from a quote mismatch."""
+    try:
+        return smart_value(
+            lcd,
+            contract,
+            {"get_trade_raw": {"trader": trader, "index": trade_id}},
+            fresh=True,
+        )
+    except QueryHeightMismatch as exc:
+        failure = exc.__cause__
+        # The wasm gRPC gateway can wrap Perp query errors in HTTP 500.
+        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+            rf"Trade not found for trader \S+ with index {trade_id}\b",
+            failure.response.text,
+        ):
+            raise ValueError(
+                f"Trade {trade_id} was not found for this account."
+            ) from exc
+        raise ValueError(f"Unable to read pending order {trade_id} from Perp.") from exc
 
 
 @dataclass(frozen=True)
@@ -97,6 +178,7 @@ class PositionSnapshot:
     funds: dict[str, Any]
     market: dict[str, Any]
     contract: str
+    observed_at: str | None = None
 
 
 def _read_position(
@@ -141,6 +223,18 @@ def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
     return all(latest.get(key) == prior[key] for key in fields)
 
 
+def verified_position_height(lcd: str, state: PositionSnapshot, trade_id: int) -> str:
+    latest, height = _latest_position(lcd, state, trade_id)
+    if (
+        height is None
+        or not _same_position(state.raw, latest)
+        or latest.get("long") is not state.raw.get("long")
+        or latest.get("open_price") != state.raw.get("open_price")
+    ):
+        raise ValueError("Cannot verify the quoted position at the LCD query height")
+    return height
+
+
 def position_unchanged(
     lcd: str, state: PositionSnapshot, trade_id: int, quoted_inputs: dict[str, Any]
 ) -> bool:
@@ -169,14 +263,36 @@ def position_unchanged(
     )
 
 
-def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
+def block_timestamp(lcd: str, height: str) -> int:
+    """Read the UTC timestamp of a specific LCD block."""
+    result = _get_json(
+        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/blocks/{height}"
+    )
+    block = result.get("sdk_block") or result.get("block")
+    if not isinstance(block, dict):
+        raise TypeError("LCD block header is unavailable")
+    header = block["header"]
+    time = datetime.fromisoformat(header["time"])
+    if header["height"] != height or time.tzinfo is None:
+        raise ValueError("Cannot verify the timestamp of the quoted LCD block")
+    return int(time.timestamp())
+
+
+def trading_contract(endpoint: str, lcd: str) -> str:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
     node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
+    info = node.get("default_node_info")
     if (
         not route["enabled"]
-        or node.get("default_node_info", {}).get("network") != route["chainId"]
+        or not isinstance(info, dict)
+        or info.get("network") != route["chainId"]
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
+    return route["contractAddress"]
+
+
+def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
+    contract = trading_contract(endpoint, lcd)
     position = keeper.request(
         endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}
     )["perp"]["trade"]
@@ -200,8 +316,8 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         raise ValueError("Open market data is unavailable")
     trader = position["trader"]
     token = f"TokenIndex({collateral['id']})"
-    contract = route["contractAddress"]
     raw = _read_position(lcd, contract, trader, trade_id)
+    observed_at = intents.now()
     funds = smart(
         lcd,
         contract,
@@ -223,7 +339,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         raise ValueError(
             "Indexed position differs from contract state; wait for synchronization and retry"
         )
-    return PositionSnapshot(raw, funds, market, contract)
+    return PositionSnapshot(raw, funds, market, contract, observed_at)
 
 
 def contract_decimal(value: Any) -> Decimal:

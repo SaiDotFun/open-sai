@@ -4,10 +4,58 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import UTC, datetime
+import shlex
+from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from . import log, storage
 from .errors import Code, SessionError
+
+EXPIRY_WARNING = timedelta(days=3)
+
+
+def expiry_time(result: dict[str, str]) -> datetime:
+    expiry = datetime.fromisoformat(result["expiresAt"])
+    if expiry.tzinfo is None:
+        raise ValueError("Stored session is invalid: expiry has no time zone")
+    return expiry
+
+
+def renewal_command(result: dict[str, str]) -> str:
+    """Return recovery instructions scoped to the session's Keeper."""
+    endpoint = result.get("endpoint")
+
+    def command(*args: str) -> str:
+        if endpoint:
+            return storage.keeper_command_hint(endpoint, "auth", *args)
+        return shlex.join(["sai", "auth", *args])
+
+    origin = log.origin(endpoint) if endpoint else None
+    suffix = ""
+    if not endpoint or endpoint != origin:
+        where = f" at {origin}" if origin not in (None, log.REDACTED_URL) else ""
+        suffix = f" (reuse the Keeper endpoint{where} configured when this session was stored)"
+    if result.get("keyName"):
+        return command("renew", result["evmAddress"]) + suffix
+    browser = command("import")
+    if result.get("source") == "imported":
+        return browser + suffix
+    return f"{command('login', 'NAME')} or {browser}{suffix}"
+
+
+def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
+    left = expiry_time(result) - now
+    if not timedelta(0) < left < EXPIRY_WARNING:
+        return None
+    minutes = int(left.total_seconds() // 60)
+    when = (
+        "under 1 min"
+        if minutes == 0
+        else f"{minutes} min"
+        if minutes < 120
+        else f"{minutes // 60} h"
+    )
+    return f"Sai session for {result['evmAddress']} expires in {when}."
 
 
 def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str]:
@@ -34,9 +82,7 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
     if result.get("endpoint") != endpoint:
         raise SessionError("Stored session belongs to another Keeper endpoint")
     try:
-        expiry = datetime.fromisoformat(result["expiresAt"])
-        if expiry.tzinfo is None:
-            raise ValueError("Expiry has no time zone")
+        expiry = expiry_time(result)
     except (KeyError, ValueError) as exc:
         raise SessionError(
             f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
@@ -52,18 +98,28 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
         raise SessionError(
             "Trading session expired; sign in again",
             Code.SESSION_EXPIRED,
-            hint=storage.keeper_command_hint(
+            hint=renewal_command(result)
+            if result.get("keyName") or result.get("source") == "imported"
+            else storage.keeper_command_hint(
                 endpoint, "auth", "login", "NAME", "--addr", result["evmAddress"]
             ),
         )
     return result
 
 
+def token_claims(token: str) -> dict[str, Any]:
+    """Decode the public claims without verifying the token's signature."""
+    payload = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    if not isinstance(claims, dict):
+        raise TypeError("Expected session claims")
+    return claims
+
+
 def import_session(token: str, endpoint: str) -> dict[str, str]:
     """Validate a Sai Web session TOKEN and build the session to store."""
     try:
-        payload = token.split(".")[1]
-        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        data = token_claims(token)
         addr = data["sub"]
         expires = datetime.fromtimestamp(data["exp"], UTC)
         if (
@@ -82,6 +138,7 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
         "evmAddress": addr,
         "expiresAt": expires.isoformat(),
         "endpoint": endpoint,
+        "source": "imported",
     }
 
 
@@ -93,3 +150,13 @@ def summary(result: dict[str, str]) -> dict[str, str | None]:
         "expiresAt": result["expiresAt"],
         "endpoint": log.origin(endpoint) if endpoint is not None else None,
     }
+
+
+def expiry_fields(
+    result: dict[str, str], now: datetime | None = None
+) -> dict[str, str]:
+    """Report a near-expiry warning without exposing the stored signer."""
+    warning = expiry_warning(result, now or datetime.now(UTC))
+    if warning is None:
+        return {}
+    return {"expiryWarning": warning, "renewalCommand": renewal_command(result)}

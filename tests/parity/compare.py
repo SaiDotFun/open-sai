@@ -345,6 +345,21 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
                 error["message"] = DURATION.sub("<durationMs>", error["message"])
         else:
             doctor_report(value)
+    if (
+        command.startswith("trade ")
+        and isinstance(value, dict)
+        and isinstance(estimates := value.get("estimates"), dict)
+    ):
+        for field, price in (
+            ("fees", "collateralPriceUsd"),
+            ("liquidationPrice", "entry"),
+            ("worstCaseFill", "reference"),
+        ):
+            estimate = estimates.get(field)
+            if isinstance(estimate, dict) and isinstance(
+                source := estimate.get(price), dict
+            ):
+                replace_if(source, "observedAt", timestamp)
     if command == "skill source" and isinstance(value, dict):
         replace_if(value, "cliVersion", is_version)
     if (
