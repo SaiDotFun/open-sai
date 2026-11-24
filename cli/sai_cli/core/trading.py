@@ -88,9 +88,9 @@ def preview_or_submit(
 
 
 def open_usdc_market(
-    endpoint: str, market_id: int, *, timeout: float = 20
+    endpoint: str, market_id: int, *, timeout: float = 20, require_open: bool = True
 ) -> dict[str, Any]:
-    """Return Keeper's open USDC borrowing row for MARKET_ID."""
+    """Return Keeper's USDC borrowing row for MARKET_ID."""
     markets = keeper.request(endpoint, keeper.MARKETS, timeout=timeout)["perp"][
         "borrowings"
     ]
@@ -99,7 +99,7 @@ def open_usdc_market(
         for item in markets
         if item["marketId"] == market_id
         and item["collateralToken"]["symbol"] == "USDC"
-        and item["isOpen"]
+        and (not require_open or item["isOpen"])
     ]
     if len(candidates) != 1:
         raise ValueError("Current open USDC market data is unavailable")
@@ -148,7 +148,9 @@ def open_trade(
 
     def read_market(timeout: float = 20) -> None:
         nonlocal row, reference
-        row = open_usdc_market(endpoint, market_id, timeout=timeout)
+        row = open_usdc_market(
+            endpoint, market_id, timeout=timeout, require_open=order_type == "market"
+        )
         reference = estimates.price_input(
             estimates.market_price(row), "Sai Keeper market price", intents.now()
         )

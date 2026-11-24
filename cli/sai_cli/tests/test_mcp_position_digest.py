@@ -35,6 +35,8 @@ TRADER = "nibi1trader"
 class Position:
     collateral: int = 4_000_000
     trade_type: str = "trade"
+    keeper_market_open: bool = True
+    market_trading_state: str = "open"
     logout_on_position_read: bool = False
     missing_trade_status: int = 400
     leverage: str = "2"
@@ -108,6 +110,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     market_row = {
                         **market,
                         "price": position.price,
+                        "isOpen": position.keeper_market_open,
                         "maxLeverage": position.max_leverage
                         if position.quoted_max_leverage is None
                         else position.quoted_max_leverage,
@@ -271,6 +274,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     "block_last_closed": 100,
                     "fee_index": "FeeIndex(0)",
                     "group_index": "GroupIndex(0)",
+                    "market_trading_state": position.market_trading_state,
                 }
             elif "get_group" in message:
                 assert message["get_group"] == {"index": "GroupIndex(0)"}
@@ -1514,5 +1518,37 @@ def test_stale_prices_are_unavailable_for_queued_closes(position_service):
                 assert result["execution"]["status"] == "unavailable"
                 assert "fresh oracle update" in result["execution"]["reason"]
                 assert result["fees"]["status"] == "unavailable"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("order_type", ["limit", "stop"])
+def test_pending_open_estimates_follow_perp_market_state(position_service, order_type):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.keeper_market_open = False
+    position.market_trading_state = "closed"
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": order_type,
+        "price": "100",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, "preview_open", args)
+            assert quote["estimates"]["fees"]["status"] == "estimate"
+            assert quote["estimates"]["worstCaseFill"]["status"] == "bound"
+            position.keeper_market_open = True
+            position.market_trading_state = "close_only"
+            quote = await call(client, "preview_open", args)
+            for field in ("fees", "liquidationPrice", "worstCaseFill"):
+                item = quote["estimates"][field]
+                assert item["status"] == "unavailable"
+                assert "close-only" in item["reason"]
 
     asyncio.run(scenario())

@@ -249,6 +249,16 @@ def open_estimates(
             token_id = row["collateralToken"]["id"]
             contract = margin.trading_contract(endpoint, lcd)
             pair = contract_market(lcd, contract, body["market"]["marketIndex"])
+            if (
+                order_type != "market"
+                and pair.get("market_trading_state") == "close_only"
+            ):
+                rejected = unavailable(
+                    "Perp rejects pending opens while the market is close-only."
+                )
+                return dict.fromkeys(
+                    ("fees", "liquidationPrice", "worstCaseFill"), rejected
+                )
             leverage = Decimal(body["leverage"])
             within_leverage = leverage_allowed(
                 lcd, contract, pair, row["marketId"], leverage
