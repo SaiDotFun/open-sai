@@ -395,11 +395,15 @@ def busy_timeout(seconds: float) -> Generator[None]:
 
 def db() -> sqlite3.Connection:
     path = directory() / "intents.sqlite3"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    os.close(fd)
-    path.chmod(0o600)
     connection = sqlite3.connect(path, timeout=_BUSY_TIMEOUT.get())
-    _migrate(connection)
+    try:
+        # Closing a separate file descriptor would release any POSIX locks
+        # that another connection in this process holds on the ledger.
+        path.chmod(0o600)
+        _migrate(connection)
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 
