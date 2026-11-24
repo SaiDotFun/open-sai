@@ -8,6 +8,7 @@ import contextlib
 import hashlib
 import json
 import os
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -23,6 +24,13 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import log
+from .errors import Code, SaiError, SessionError
+
+
+class UnresolvedIntent(SaiError, ValueError):
+    """The intent ledger already blocks a submission for this account."""
+
+    code = Code.INVALID_REQUEST
 
 
 def home() -> Path:
@@ -239,11 +247,12 @@ def load_session(addr: str | None = None) -> dict[str, str]:
         return accounts["sessions"][_find(accounts, addr)]
     if accounts["active"] is None:
         if accounts["sessions"]:
-            raise ValueError(
+            raise SessionError(
                 "No active Sai account; run `sai auth use ADDR` with an"
-                " addr from `sai auth list`"
+                " addr from `sai auth list`",
+                hint="sai auth list",
             )
-        raise ValueError(NO_SESSION)
+        raise SessionError(NO_SESSION, Code.SIGNED_OUT)
     return accounts["sessions"][accounts["active"]]
 
 
@@ -280,7 +289,12 @@ def delete_session(addr: str | None = None) -> str | None:
             if addr is not None:
                 raise
             _remove_files()
-            log.event("session.removed", "warn", reason="unreadable session file")
+            log.event(
+                "session.removed",
+                "warn",
+                code=Code.SESSION_UNAVAILABLE,
+                reason="unreadable session file",
+            )
             return UNREADABLE_REMOVED
         if addr is None:
             key = accounts["active"]
@@ -366,8 +380,13 @@ def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> No
             (endpoint, account.lower(), entity),
         ).fetchone()
         if unresolved:
-            raise ValueError(
-                f"Reconcile uncertain intent {unresolved[0]} before submitting another trade"
+            blocked_key = unresolved[0]
+            raise UnresolvedIntent(
+                f"Reconcile uncertain intent {blocked_key} before submitting another trade",
+                intent_key=blocked_key,
+                hint=shlex.join(
+                    ["sai", "intent", "status", account, "--key", blocked_key]
+                ),
             )
         connection.execute(
             "INSERT INTO intents (id, endpoint, account, kind, status, entity, created_at) VALUES (?, ?, ?, ?, 'unknown', ?, ?)",
@@ -402,6 +421,7 @@ def set_status(key: str, endpoint: str, account: str, status: str) -> None:
 def _log_status(
     key: str, endpoint: str, account: str, kind: str, previous: str, status: str
 ) -> None:
+    code = {"rejected": Code.ADMISSION_REJECTED, "not_sent": Code.NOT_SENT}.get(status)
     log.event(
         "intent.status",
         intentKey=key,
@@ -410,6 +430,7 @@ def _log_status(
         status=status,
         addr=account,
         endpoint=log.endpoint(endpoint),
+        **({"code": code} if code is not None else {}),
     )
 
 

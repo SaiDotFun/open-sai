@@ -7,6 +7,7 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any
 
 from . import keeper, log, storage
+from .errors import Code
 
 WriteGate = Callable[[], AbstractContextManager[object]]
 
@@ -51,6 +52,7 @@ def reconcile(
             txHash=row.get("txHash"),
             addr=addr,
             endpoint=log.endpoint(endpoint),
+            **({"code": Code.KEEPER_ERROR} if step in FAILED_STEPS else {}),
         )
         if (
             row.get("intentKey") == key

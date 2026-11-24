@@ -1095,7 +1095,9 @@ def test_sai_update_from_a_checkout_exits_3_with_a_note(sai_home):
     assert "only updates an official uv tool install" in result.stderr
     data = CliRunner().invoke(main, ["--json", "update"])
     assert data.exit_code == EXIT_UNSUPPORTED
-    assert json.loads(data.stdout)["status"] == updater.UNSUPPORTED
+    error = json.loads(data.stdout)["error"]
+    assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
+    assert error["hint"] == update.INSTALL_COMMAND
 
 
 def test_check_takes_no_install_options(sai_home):

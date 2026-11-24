@@ -1,5 +1,6 @@
 """Check help for commands with required Click parameters."""
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -29,9 +30,11 @@ def test_bare_command_matches_full_help(path: tuple[str, ...], tmp_path: Path) -
 
     assert help_result.exit_code == 0
     assert bare.exit_code == machine.exit_code == 2
-    assert bare.stdout == machine.stdout == ""
+    assert bare.stdout == machine.stderr == ""
     assert bare.stderr == help_result.stdout
-    assert "Error: Missing " in machine.stderr
+    error = json.loads(machine.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert error["message"].startswith("Missing ")
 
 
 @pytest.mark.parametrize(
@@ -56,18 +59,22 @@ def test_repl_bare_command_and_partial_command(
     json_output: bool, tmp_path: Path
 ) -> None:
     runner = CliRunner(env={"SAI_HOME": str(tmp_path)})
-    args = ["--json"] if json_output else []
+    command = "--json trade open" if json_output else "trade open"
     result = runner.invoke(
-        main, args, input="trade open\nconfig set update.auto\nhelp config\nexit\n"
+        main, input=f"{command}\nconfig set update.auto\nhelp config\nexit\n"
     )
 
     assert result.exit_code == 0
     assert "Usage: sai config" in result.stdout
-    assert "Missing parameter: value" in result.stderr
+    assert "Missing argument 'VALUE'" in result.stderr
     if json_output:
-        assert "Missing parameter: market_id" in result.stderr
-        assert "Options:" not in result.stderr
+        _, start, payload = result.stdout.partition('{"error":')
+        assert start
+        error = json.loads(start + payload.splitlines()[0])["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert "Missing option '--market'" in error["message"]
+        assert "Usage: sai trade open" not in result.stderr
     else:
         help_result = runner.invoke(main, ["trade", "open", "--help"], prog_name="sai")
         assert help_result.stdout in result.stderr
-        assert "Missing parameter: market_id" not in result.stderr
+        assert "Missing option '--market'" not in result.stderr
