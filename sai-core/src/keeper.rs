@@ -23,7 +23,10 @@ use crate::{
 };
 
 pub use diagnostics::{lcd_network, websocket_handshake};
-pub(crate) use public::{intent_history, intent_record, request_hash, wait_error_code};
+pub(crate) use public::{
+    intent_history, intent_log_fields, intent_record, request_hash,
+    wait_error_code,
+};
 pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
 pub(crate) use transport::get as lcd_get;
@@ -34,6 +37,12 @@ pub const ABSENT_AFTER_SECONDS: f64 = 300.0;
 pub struct Keeper<'a> {
     endpoint: &'a str,
     events: EventContext<'a>,
+}
+
+enum RequestMode {
+    Standard,
+    Interruptible,
+    Bounded,
 }
 
 #[derive(Default)]
@@ -59,8 +68,13 @@ struct RequestEvent<'a> {
 }
 
 impl RequestEvent<'_> {
-    fn emit(&self, (status, level, code, error): RequestOutcome<'_>, response: ResponseLog) {
-        let duration = (self.started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
+    fn emit(
+        &self,
+        (status, level, code, error): RequestOutcome<'_>,
+        response: ResponseLog,
+    ) {
+        let duration = (self.started.elapsed().as_secs_f64() * 1_000.0)
+            .round_ties_even() as u64;
         self.events.event(
             "keeper.request",
             level,
@@ -117,7 +131,7 @@ impl<'a> Keeper<'a> {
             token,
             timeout,
             std::future::pending(),
-            false,
+            RequestMode::Standard,
         )
         .await
     }
@@ -130,8 +144,33 @@ impl<'a> Keeper<'a> {
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, None, timeout, interrupt, true)
-            .await
+        self.request_with(
+            query,
+            variables,
+            None,
+            timeout,
+            interrupt,
+            RequestMode::Interruptible,
+        )
+        .await
+    }
+
+    /// Bound the entire request for an intent wait. Status reads use socket inactivity timeouts.
+    pub(crate) async fn wait_request(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        timeout: Duration,
+    ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(
+            query,
+            variables,
+            None,
+            timeout,
+            std::future::pending(),
+            RequestMode::Bounded,
+        )
+        .await
     }
 
     async fn request_with(
@@ -141,7 +180,7 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
-        log_cancelled: bool,
+        mode: RequestMode,
     ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
@@ -153,9 +192,10 @@ impl<'a> Keeper<'a> {
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
         static INTENT_KEY: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r"\A[A-Za-z0-9_-]{1,128}\z").expect("Keeper log key pattern")
+            regex::Regex::new(r"\A[A-Za-z0-9_-]{1,128}\z")
+                .expect("Keeper log key pattern")
         });
-        let intent_key = (query == WAIT_INTENTS)
+        let intent_key = matches!(query, INTENTS | WAIT_INTENTS)
             .then(|| variables.get("key").and_then(Value::as_str))
             .flatten()
             .filter(|key| INTENT_KEY.is_match(key));
@@ -167,19 +207,21 @@ impl<'a> Keeper<'a> {
             intent_key,
             authenticated: token.is_some(),
             started,
-            log_cancelled,
+            log_cancelled: matches!(mode, RequestMode::Interruptible),
         };
         let mut response = ResponseLog::default();
-        let post = async {
-            let post = self.post(query, &variables, token, timeout, &mut response);
-            if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
-                tokio::time::timeout(timeout, post)
-                    .await
-                    .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))
-            } else {
-                post.await
-            }
-        };
+        let post =
+            async {
+                let post =
+                    self.post(query, &variables, token, timeout, &mut response);
+                if matches!(mode, RequestMode::Bounded) {
+                    tokio::time::timeout(timeout, post).await.unwrap_or_else(
+                        |_| Err(keeper_error("Keeper read deadline expired")),
+                    )
+                } else {
+                    post.await
+                }
+            };
         let (result, interrupted) = tokio::select! {
             biased;
             error = interrupt => (Err(error), true),
@@ -189,8 +231,12 @@ impl<'a> Keeper<'a> {
             Err(_) if interrupted => INTERRUPTED_READ,
             Ok(_) => ("ok", Level::Info, None, None),
             Err(error) => match error.code {
-                Code::NotSent => ("not_sent", Level::Warn, Some(error.code), None),
-                Code::AdmissionRejected => ("rejected", Level::Warn, Some(error.code), None),
+                Code::NotSent => {
+                    ("not_sent", Level::Warn, Some(error.code), None)
+                }
+                Code::AdmissionRejected => {
+                    ("rejected", Level::Warn, Some(error.code), None)
+                }
                 code => (
                     "error",
                     Level::Warn,
@@ -217,18 +263,22 @@ impl<'a> Keeper<'a> {
         log: &mut ResponseLog,
     ) -> Result<Map<String, Value>, SaiError> {
         check_url(self.endpoint)?;
-        let body = serde_json::to_vec(&json!({"query": query, "variables": variables}))
-            .map_err(|_| request_failed())?;
-        let (status, bytes) = transport::post(self.endpoint, body, token, timeout).await?;
+        let body =
+            serde_json::to_vec(&json!({"query": query, "variables": variables}))
+                .map_err(|_| request_failed())?;
+        let (status, bytes) =
+            transport::post(self.endpoint, body, token, timeout).await?;
         log.http_status = Some(status.as_u16());
         if !status.is_success() {
             return Err(request_failed());
         }
-        let result: Value = serde_json::from_slice(&bytes).map_err(|_| request_failed())?;
+        let result: Value =
+            serde_json::from_slice(&bytes).map_err(|_| request_failed())?;
         let Value::Object(mut result) = result else {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
-        if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
+        if let Some(errors) = result.get("errors").filter(|value| truthy(value))
+        {
             log.error_count = Some(errors.as_array().map_or(1, Vec::len));
             log.errors = if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
                 Some(wait_graphql_errors(errors))
@@ -238,9 +288,9 @@ impl<'a> Keeper<'a> {
             if query == SUBMIT
                 && !result.get("data").is_some_and(truthy)
                 && errors.as_array().is_some_and(|items| {
-                    items
-                        .iter()
-                        .all(|item| item["extensions"]["code"] == "INTENT_NOT_ACCEPTED")
+                    items.iter().all(|item| {
+                        item["extensions"]["code"] == "INTENT_NOT_ACCEPTED"
+                    })
                 })
             {
                 return Err(SaiError::new(
@@ -273,7 +323,10 @@ enum ProbeEndpoint {
     WebSocket,
 }
 
-fn check_transport(endpoint: &str, service: ProbeEndpoint) -> Result<(), &'static str> {
+fn check_transport(
+    endpoint: &str,
+    service: ProbeEndpoint,
+) -> Result<(), &'static str> {
     let (secure, plain, insecure, credentials) = match service {
         ProbeEndpoint::Keeper => (
             "https",
@@ -348,7 +401,10 @@ fn graphql_errors(errors: &Value) -> Field {
                     .and_then(|value| value.get("code"))
                     .and_then(Value::as_str)
                     .filter(|value| GRAPHQL_ERROR_CODES.contains(value))
-                    .map_or_else(|| json!(Code::KeeperError), |value| json!(value));
+                    .map_or_else(
+                        || json!(Code::KeeperError),
+                        |value| json!(value),
+                    );
                 json!({"code": code}).into()
             })
             .collect(),
@@ -382,16 +438,6 @@ fn wait_graphql_errors(errors: &Value) -> Field {
     json!(codes).into()
 }
 
-pub(crate) fn stringify(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => "None".into(),
-        Value::Bool(true) => "True".into(),
-        Value::Bool(false) => "False".into(),
-        _ => value.to_string(),
-    }
-}
-
 pub(crate) fn truthy(value: &Value) -> bool {
     match value {
         Value::Null => false,
@@ -404,9 +450,9 @@ pub(crate) fn truthy(value: &Value) -> bool {
 }
 
 pub(crate) fn is_evm_address(value: &str) -> bool {
-    value
-        .strip_prefix("0x")
-        .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+    value.strip_prefix("0x").is_some_and(|hex| {
+        hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
 }
 
 /// Canonicalize a 20-byte EVM or checksummed Nibiru account for ledger matching.

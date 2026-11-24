@@ -680,8 +680,13 @@ def run_case(
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints
         )
+        candidate_case = (
+            replace(case, wire=case.mcp_checkout_wire)
+            if candidate != reference and case.mcp_checkout_wire is not None
+            else case
+        )
         right, right_error = safe_observe(
-            case,
+            candidate_case,
             candidate,
             Path(temp) / "candidate",
             endpoints,

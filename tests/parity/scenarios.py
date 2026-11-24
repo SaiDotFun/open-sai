@@ -341,6 +341,14 @@ def loopback(
     if scenario == "quote-wrong-position-index":
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
+    if scenario == "mcp-reads":
+        status = {**status, "txHash": TRADE_REQUEST_HASH}
+    elif scenario == "mcp-pending-malformed-hash":
+        status = {
+            **status,
+            "lifecycleStep": "exec_fail",
+            "errorCode": "market_order_outcome_not_indexed",
+        }
     history = {
         "id": 7,
         "intentKey": INTENT,
