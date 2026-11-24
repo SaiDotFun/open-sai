@@ -171,12 +171,13 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         for name in ("config.toml", "trader/sessions.json"):
             (sai_home / name).chmod(0o600)
         return
-    if seed in {"config", "config-logs-disabled"}:
+    if seed in {"config", "config-logs-disabled", "invalid-expiry"}:
         path = sai_home / "config.toml"
         text = CONFIG if seed == "config" else "[logs]\nenabled = false\n"
         path.write_text(text, encoding="utf-8")
         path.chmod(0o600)
-        return
+        if seed != "invalid-expiry":
+            return
     if seed == "mcp-info-cache":
         path = sai_home / "update.json"
         path.write_text(
@@ -193,14 +194,17 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         "doctor-ledger-session",
         "history-token",
         "mcp-auth-switch",
+        "invalid-expiry",
     }:
         sessions.append(session_fixture(endpoints, "session"))
         if seed == "doctor-near-expiry":
             sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
-        if seed in {"accounts", "mcp-auth-switch"}:
+        if seed in {"accounts", "mcp-auth-switch", "invalid-expiry"}:
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+        if seed == "invalid-expiry":
+            sessions[0]["expiresAt"] = "synthetic-expiry-credential-marker"
     if seed == "doctor-ledger-session":
         config = sai_home / "config.toml"
         config.write_text("[logs]\nenabled = false\n")
@@ -212,7 +216,7 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         ledger=seed in {"ledger", "doctor-ledger-session"},
         disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
     )
-    if seed == "mcp-auth-switch":
+    if seed in {"mcp-auth-switch", "invalid-expiry"}:
         (sai_home / "trader" / "sessions.lock").chmod(0o600)
 
 

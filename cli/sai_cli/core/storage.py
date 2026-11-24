@@ -7,13 +7,14 @@ import base64
 import contextlib
 import hashlib
 import json
+import logging
 import os
 import shlex
 import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -101,8 +102,9 @@ _AAD = b"sai-sessions-v3"
 _V2_AAD = b"sai-session-v2-test"
 
 SIGN_IN_AGAIN = "run `sai auth import` or `sai auth login NAME` again"
+INVALID_EXPIRY = f"Stored session has an invalid expiry; {SIGN_IN_AGAIN}"
 NO_SESSION = "No Sai session; run `sai auth import` or `sai auth login NAME`"
-SESSION_FIELDS = ("token", "evmAddress", "expiresAt")
+SESSION_FIELDS = ("token", "evmAddress")
 # What delete_session reports after deleting a store it could not read.
 UNREADABLE_REMOVED = "unreadable session file"
 
@@ -123,11 +125,14 @@ def _decrypt(fields: dict[str, Any], aad: bytes) -> Any:
     return json.loads(AESGCM(_SESSION_KEY).decrypt(nonce, ciphertext, aad))
 
 
-def _check_session(session: Any) -> dict[str, str]:
+def check_session_fields(session: Any) -> dict[str, str]:
+    """Check the fields required to read a session from the store."""
     if not isinstance(session, dict) or not all(
         isinstance(session.get(k), str) for k in SESSION_FIELDS
     ):
         raise ValueError("Invalid session")
+    if not isinstance(session.get("expiresAt"), str):
+        raise SessionError(INVALID_EXPIRY)
     return session
 
 
@@ -157,8 +162,10 @@ def _load_v2(fields: dict[str, Any]) -> dict[str, Any]:
     if fields.get("version") != 2 or fields.get("backend") != "test":
         raise ValueError(f"Unsupported session version; {SIGN_IN_AGAIN}")
     try:
-        session = _check_session(_decrypt(fields, _V2_AAD))
+        session = check_session_fields(_decrypt(fields, _V2_AAD))
         log.remember([session["token"]])
+    except SessionError:
+        raise
     except (ValueError, KeyError, TypeError, InvalidTag) as exc:
         raise ValueError(f"Cannot unlock session; {SIGN_IN_AGAIN}") from exc
     addr = session["evmAddress"].lower()
@@ -188,11 +195,13 @@ def load_accounts() -> dict[str, Any]:
         stored = accounts["sessions"]
         if not isinstance(stored, dict):
             raise TypeError("Invalid session set")
-        sessions = {k: _check_session(v) for k, v in stored.items()}
+        sessions = {k: check_session_fields(v) for k, v in stored.items()}
         log.remember(session["token"] for session in sessions.values())
         active = accounts.get("active")
         if active is not None and active not in sessions:
             active = None
+    except SessionError:
+        raise
     except (ValueError, KeyError, TypeError, InvalidTag) as exc:
         raise ValueError(f"Cannot unlock session; {SIGN_IN_AGAIN}") from exc
     return {"active": active, "sessions": sessions}
@@ -218,7 +227,12 @@ def _save_accounts(accounts: dict[str, Any]) -> None:
         os.replace(temp, root / "sessions.json")
     finally:
         Path(temp).unlink(missing_ok=True)
-    _v2_path().unlink(missing_ok=True)
+    try:
+        _v2_path().unlink(missing_ok=True)
+    except OSError:
+        logging.getLogger(__name__).warning(
+            "Could not remove legacy session file trader/session.json after saving accounts."
+        )
 
 
 @contextlib.contextmanager
@@ -251,11 +265,12 @@ def _remove_files() -> None:
     _v2_path().unlink(missing_ok=True)
 
 
-def _find(accounts: dict[str, Any], addr: str) -> str:
+def _find(accounts: dict[str, Any], addr: str, *, include_addr: bool = True) -> str:
     key = addr.lower()
     if key not in accounts["sessions"]:
         raise ValueError(
-            f"{addr} is not connected; run `sai auth list` to see connected"
+            f"{addr if include_addr else 'Requested account'} is not connected;"
+            " run `sai auth list` to see connected"
             " accounts, or sign in with `sai auth login NAME` or `sai auth import`"
         )
     return key
@@ -323,15 +338,23 @@ def load_session(addr: str | None = None) -> dict[str, str]:
     return accounts["sessions"][accounts["active"]]
 
 
-def use_session(addr: str) -> dict[str, str]:
-    """Make the connected ADDR the active account and return its session."""
+def use_session(
+    addr: str, prepare: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Select ADDR, preparing its response from the candidate state before saving."""
+    from .session import expiry_time, session_address
+
     with _locked():
         accounts = load_accounts()
-        key = _find(accounts, addr)
+        key = _find(accounts, addr, include_addr=False)
+        session = accounts["sessions"][key]
+        address = session_address(session, key)
+        expiry_time(session)
         accounts["active"] = key
+        response = session if prepare is None else prepare(accounts)
         _save_accounts(accounts)
-        log.event("session.active", addr=accounts["sessions"][key]["evmAddress"])
-        return accounts["sessions"][key]
+        log.event("session.active", addr=address)
+        return response
 
 
 def session_exists() -> bool:
