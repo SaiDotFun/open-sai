@@ -190,6 +190,7 @@ class ClaudeRepair:
     replace_entry: bool = False
     sai_home: str | None = None
     directory: Path | None = None
+    launcher: str | None = None
 
 
 @dataclass(frozen=True)
@@ -204,35 +205,56 @@ class RegistrationCheck:
     manual_repairs: tuple[ClaudeRepair, ...] = ()
 
 
-def claude_replacement_commands(entry: ClaudeRepair) -> list[str]:
+def claude_replacement_command(entry: ClaudeRepair) -> str | None:
+    if entry.launcher is None or not os.path.isabs(entry.launcher):
+        return None
+    if entry.scope != "user" and (
+        entry.directory is None or not entry.directory.is_absolute()
+    ):
+        return None
+    if entry.sai_home is not None and not os.path.isabs(entry.sai_home):
+        return None
     scope_and_name = shlex.join(["--scope", entry.scope, entry.name])
+    launcher = shlex.quote(entry.launcher)
     profile = (
         f" {shlex.quote(f'--env=SAI_HOME={entry.sai_home}')}"
         if entry.sai_home is not None
         else ""
     )
     commands = [
+        f"test -f {launcher}",
+        f"test -x {launcher}",
         f"claude mcp remove {scope_and_name}",
-        f'claude mcp add {scope_and_name}{profile} -- "$(command -v sai)" mcp serve',
+        f"claude mcp add {scope_and_name}{profile} -- {launcher} mcp serve",
     ]
     if entry.directory is not None:
         cd = f"cd {shlex.quote(str(entry.directory))}"
-        return [f"({cd} && {command})" for command in commands]
-    return commands
+        commands.insert(0, cd)
+        return f"({' && '.join(commands)})"
+    return " && ".join(commands)
 
 
 def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
-    commands = [
-        " then ".join(f"`{command}`" for command in claude_replacement_commands(entry))
-        if entry.replace_entry
-        else (
-            f"`sai mcp install --client claude --scope {entry.scope}"
-            f" --repair-existing {entry.name}"
-            f"{' --reset-args' if entry.reset_args else ''}`"
-        )
-        for entry in entries
-    ]
-    hint = "Run " + " and ".join(commands) + "."
+    commands = []
+    needs_doctor = False
+    for entry in entries:
+        if entry.replace_entry:
+            command = claude_replacement_command(entry)
+            if command is None:
+                needs_doctor = True
+                continue
+        else:
+            command = (
+                f"sai mcp install --client claude --scope {entry.scope}"
+                f" --repair-existing {entry.name}"
+                f"{' --reset-args' if entry.reset_args else ''}"
+            )
+        commands.append(f"`{command}`")
+    hint = "Run " + " and ".join(commands) + "." if commands else ""
+    if needs_doctor:
+        hint = (
+            hint + " Run `sai doctor` for current replacement instructions."
+        ).strip()
     if any(entry.scope != "user" for entry in entries):
         hint += " Run project and local commands from the project directory."
     if any(entry.reset_args for entry in entries):
@@ -245,16 +267,25 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
 def report_different_claude_entry(
     client: Claude, result: Result, scope: str, target: Target
 ) -> Result:
+    launcher: str | None = target.argv[0]
+    if target.explicit_command:
+        # An explicit override can contain private arguments or paths.
+        default_launcher = shutil.which("sai", path=client.environ.get("PATH"))
+        launcher = os.path.abspath(default_launcher) if default_launcher else None
     entry = ClaudeRepair(
         scope,
         NAME,
         replace_entry=True,
         sai_home=target.env.get("SAI_HOME"),
         directory=client.scope_directory(scope),
+        launcher=launcher,
     )
     hint = claude_repair_hint((entry,))
     if target.explicit_command:
-        hint += " For a custom launcher, substitute your requested command after `--`."
+        hint += (
+            " For a custom launcher, update the executable checks and substitute"
+            " your requested command after `--`."
+        )
     result.command = None
     result.error = f"The existing {scope} Claude Code sai registration differs from the requested settings"
     result.fix = hint
@@ -1538,6 +1569,7 @@ def check_claude_differences(
                             else None
                         ),
                         directory=directory,
+                        launcher=expected.argv[0],
                     )
                 )
         elif issue is None:

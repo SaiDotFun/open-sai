@@ -595,6 +595,11 @@ class Outcome:
                                     if repair.directory is not None
                                     else {}
                                 ),
+                                **(
+                                    {"launcher": repair.launcher}
+                                    if repair.launcher is not None
+                                    else {}
+                                ),
                             }
                             for repair in check.manual_repairs
                         ],
@@ -1174,6 +1179,9 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
                     else None,
                     directory=Path(repair["directory"])
                     if isinstance(repair.get("directory"), str)
+                    else None,
+                    launcher=repair["launcher"]
+                    if isinstance(repair.get("launcher"), str)
                     else None,
                 )
                 for repair in manual

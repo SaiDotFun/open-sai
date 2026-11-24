@@ -382,8 +382,10 @@ only the `sai` entry's command, args, `SAI_HOME`, and the names of any other
 environment settings, and never run `claude mcp get`, which starts the
 server. The only environment value output shows is `SAI_HOME`, a path; other
 settings appear by name in `staleEnv`. For Claude Code, install leaves a
-differing `sai` entry in place and prints scoped `claude mcp remove` and
-`claude mcp add` commands. It adds missing entries and reports matching ones
+differing `sai` entry in place and prints one scoped shell command. The
+command checks the absolute launcher before running `claude mcp remove` and
+runs `claude mcp add` only if removal succeeds. It includes an absolute
+`SAI_HOME` when the target uses one. Install adds missing entries and reports matching ones
 as unchanged. `list` shows every
 scope's entry under `registrations` and marks the one the client uses as
 `effective` (Claude Code: local, then project, then user; Cursor: project,
@@ -554,10 +556,10 @@ and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
 
 Doctor can repair stale Codex and Cursor launchers. For a differing Claude
-Code `sai` entry, doctor prints the scoped remove and add commands. The add
-uses the default launcher and arguments. Supply any custom arguments or
-environment settings you want to keep. Run project and local commands from
-the directory doctor checked. For a stale legacy alias, doctor can suggest
+Code `sai` entry, doctor prints the guarded replacement command. The add
+uses the expected absolute launcher and default arguments. Supply any custom
+arguments or environment settings you want to keep. The command changes to
+the project or local scope's directory before editing. For a stale legacy alias, doctor can suggest
 an explicit `--repair-existing` command that preserves compatible arguments.
 
 Each check reports `pass`, `fixed`, `warn`, `fail`, or `skipped` and

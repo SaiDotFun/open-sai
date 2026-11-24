@@ -483,7 +483,7 @@ def test_doctor_reports_exact_claude_repairs_for_each_scope(env: Env, monkeypatc
         )
         add = (
             f"claude mcp add --scope {scope} sai --env=SAI_HOME={home}"
-            ' -- "$(command -v sai)" mcp serve'
+            f" -- {shlex.quote(str(env.sai))} mcp serve"
         )
         assert any(add in command for command in commands)
     assert (
@@ -1237,10 +1237,10 @@ def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.Monke
     [row] = payload(result)["error"]["details"]["results"]
     assert config.read_bytes() == before
     assert not env.calls()
-    remove, add = row["fix"].split("`")[1::2]
+    [command] = row["fix"].split("`")[1::2]
     shell = shutil.which("sh", path=os.defpath)
     assert shell is not None
-    subprocess.run([shell, "-c", f"{remove} && {add}"], cwd=env.project, check=True)
+    subprocess.run([shell, "-c", command], cwd=env.project, check=True)
     assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
         serve(env), {"SAI_HOME": str(profile)}
     )
@@ -1270,6 +1270,46 @@ def test_claude_printed_profile_matches_normal_install(
     assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": expected_home}
     monkeypatch.setenv("SAI_HOME", profile)
     assert actions(invoke("mcp", "install", "claude")) == {"claude": "unchanged"}
+
+
+@pytest.mark.parametrize("missing_launcher", [False, True])
+def test_claude_replacement_checks_absolute_launcher_before_remove(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    missing_launcher: bool,
+):
+    profile = env.root / "inline profile"
+    monkeypatch.setenv("SAI_HOME", str(profile))
+    config = env.home / ".claude.json"
+    before = json.dumps({"mcpServers": {"sai": claude_entry(["old-launcher"])}})
+    config.write_text(before)
+    result = invoke("mcp", "install", "claude")
+    failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    [command] = row["fix"].split("`")[1::2]
+    assert command.startswith(f"test -f {env.sai} && test -x {env.sai} && ")
+    assert "claude mcp remove --scope user sai && claude mcp add" in command
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    client_bin = env.root / "client bin"
+    client_bin.mkdir()
+    shutil.copy2(env.bin / "claude", client_bin / "claude")
+    monkeypatch.delenv("SAI_HOME")
+    monkeypatch.setenv("PATH", str(client_bin))
+    if missing_launcher:
+        env.sai.unlink()
+
+    finished = subprocess.run([shell, "-c", command], cwd=env.project, check=False)
+
+    if missing_launcher:
+        assert finished.returncode != 0
+        assert config.read_text() == before
+        assert not env.calls()
+    else:
+        assert finished.returncode == 0
+        assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
+            serve(env), {"SAI_HOME": str(profile)}
+        )
 
 
 @pytest.mark.parametrize("surface", ["install", "doctor"])
@@ -2203,7 +2243,7 @@ def test_claude_install_reports_scoped_commands_without_credentials(
     assert f"claude mcp remove --scope {scope} sai" in row["fix"]
     assert (
         f"claude mcp add --scope {scope} sai {shlex.quote(f'--env=SAI_HOME={profile}')}"
-        ' -- "$(command -v sai)" mcp serve'
+        f" -- {shlex.quote(str(env.sai))} mcp serve"
     ) in row["fix"]
     assert "substitute your requested command" in row["fix"]
     assert SECRET not in output and OTHER not in output
