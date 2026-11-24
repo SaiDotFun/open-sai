@@ -58,6 +58,13 @@ impl UpdateCommand {
         {
             return Err(SaiError::usage("--check takes no other update option."));
         }
+        let mut env = env.clone();
+        env.home = absolute_home(&env.home).map_err(|err| {
+            SaiError::new(
+                Code::InternalError,
+                format!("Could not resolve SAI_HOME: {err}"),
+            )
+        })?;
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -69,7 +76,7 @@ impl UpdateCommand {
         }
         let allowed = || {
             !self.background
-                || Settings::load(flags, env)
+                || Settings::load(flags, &env)
                     .is_ok_and(|settings| settings.value(Key::UpdateAuto).as_bool() == Some(true))
         };
         let out = runtime.block_on(self.update(&install, releases, &env.home, allowed));
@@ -483,6 +490,13 @@ fn notice(state: &Map<String, Value>) -> Option<(String, String)> {
     Some((key, message))
 }
 
+fn absolute_home(home: &Path) -> std::io::Result<std::path::PathBuf> {
+    if home.as_os_str().is_empty() {
+        return env::current_dir();
+    }
+    std::path::absolute(home)
+}
+
 /// Reserve a background check and print a pending notice on interactive commands.
 pub(crate) fn tick(command: &str, json: bool, home: &Path, events: EventContext<'_>) {
     if json
@@ -496,6 +510,10 @@ pub(crate) fn tick(command: &str, json: bool, home: &Path, events: EventContext<
     {
         return;
     }
+    let Ok(home) = absolute_home(home) else {
+        return;
+    };
+    let home = home.as_path();
     let install = Install::discover(home, WEB);
     let Some(launcher) = install.launcher().filter(|_| install.owner(false).is_ok()) else {
         return;

@@ -772,15 +772,22 @@ def test_uv_trial_home_is_private_under_a_group_writable_umask(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("relative_home", [False, True])
 def test_uv_upgrade_can_launch_offline_in_the_updating_profile(
-    standalone: NativeInstall, tmp_path: Path
+    standalone: NativeInstall, tmp_path: Path, relative_home: bool
 ) -> None:
     install, initial = uv_install(standalone, tmp_path)
+    profile = install.home.name if relative_home else str(install.home)
     with releases(cached_shim_release(install, initial, tmp_path)) as server:
-        updated = install.invoke("--json", "update", *server.args, umask=0o077)
+        updated = install.invoke(
+            "--json", "update", *server.args, umask=0o077, SAI_HOME=profile
+        )
         assert updated.returncode == 0, updated.stdout + updated.stderr
         assert json.loads(updated.stdout)["status"] == "updated"
-    offline = install.invoke("--version", SAI_NATIVE_RELEASE_BASE=server.base)
+    assert not (install.home / install.home.name / "bin").exists()
+    offline = install.invoke(
+        "--version", SAI_HOME=profile, SAI_NATIVE_RELEASE_BASE=server.base
+    )
     assert offline.returncode == 0, offline.stderr
     assert offline.stdout.strip() == f"sai {NEW}"
 
