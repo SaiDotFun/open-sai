@@ -80,6 +80,9 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    output: dict[str, Any] | None = None
+    retry_expect: int | None = None
+    mcp_calls: list[dict[str, Any]] | None = None
 
     @property
     def command(self) -> str:
@@ -121,8 +124,23 @@ def check_sandbox_exit(exit_code: int) -> None:
 
 
 def mcp_exchange(
-    binary: list[str], args: list[str], home: Path, env: dict[str, str]
+    binary: list[str],
+    args: list[str],
+    home: Path,
+    env: dict[str, str],
+    calls: list[dict[str, Any]] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    requests = (
+        MCP_REQUESTS
+        if calls is None
+        else (
+            *MCP_REQUESTS[:2],
+            *(
+                {"id": index, "method": "tools/call", "params": call}
+                for index, call in enumerate(calls, start=2)
+            ),
+        )
+    )
     # Keep stdin open until the server replies. Closing it while a request is
     # still running can cancel the MCP server's pending work.
     with tempfile.TemporaryFile(mode="w+", encoding="utf-8") as stderr:
@@ -153,7 +171,7 @@ def mcp_exchange(
             received: list[str] = []
             deadline = time.monotonic() + 20
             try:
-                for request in MCP_REQUESTS:
+                for request in requests:
                     proc.stdin.write(json.dumps({"jsonrpc": "2.0", **request}) + "\n")
                     proc.stdin.flush()
                     if "id" not in request:
@@ -193,29 +211,32 @@ def mcp_exchange(
         )
 
 
+ABSENT = object()
+
+
+def field_matches(actual: Any, keys: str, expected: Any) -> bool:
+    for key in keys.split(".") if keys else ():
+        if isinstance(actual, list) and key.isdecimal() and int(key) < len(actual):
+            actual = actual[int(key)]
+        else:
+            actual = actual.get(key, ABSENT) if isinstance(actual, dict) else ABSENT
+    if expected == "<absent>":
+        return actual is ABSENT
+    return first_difference(actual, expected, keys) is None
+
+
 def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
     # A filename and optional dotted field path are separated with '#'.
     for selector, expected in state.items():
         name, _, keys = selector.partition("#")
-        absent = object()
-        actual: Any = absent
+        actual: Any = ABSENT
         if entry := files.get(name):
             if keys == "@mode":
                 if entry.mode == expected:
                     continue
                 raise ValueError(f"Persisted mode differs from expectation at {name}")
             actual = entry.data if keys else entry.kind
-        for key in keys.split(".") if keys else ():
-            if isinstance(actual, list) and key.isdecimal() and int(key) < len(actual):
-                actual = actual[int(key)]
-            else:
-                actual = actual.get(key, absent) if isinstance(actual, dict) else absent
-        mismatch = (
-            actual is not absent
-            if expected == "<absent>"
-            else first_difference(actual, expected, selector)
-        )
-        if mismatch:
+        if not field_matches(actual, keys, expected):
             raise ValueError(f"Persisted state differs from expectation at {selector}")
 
 
@@ -234,7 +255,6 @@ def observe(
         if setup.returncode:
             raise ValueError(f"Setup exited {setup.returncode}")
     args = [endpoints.expand(arg) for arg in case.args]
-    run = mcp_exchange if case.mode == "mcp" else invoke
     contender = None
     concurrent = case.server == "concurrent-close"
     if concurrent:
@@ -265,8 +285,16 @@ def observe(
             finally:
                 admission.release.set()
             result = first.result()
+    elif case.mode == "mcp":
+        result = mcp_exchange(binary, args, home, env, case.mcp_calls)
     else:
-        result = run(binary, args, home, env)
+        result = invoke(binary, args, home, env)
+        if case.retry_expect is not None:
+            contender = invoke(binary, args, home, env)
+            if contender.returncode != case.retry_expect:
+                raise ValueError(
+                    f"Expected retry exit {case.retry_expect}, got {contender.returncode}"
+                )
     ended_at = time.time()
     if endpoints.errors:
         raise ValueError(endpoints.errors[0])
@@ -288,14 +316,20 @@ def observe(
     normalize = Normalize(
         home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
     )
+    admission_key = endpoints.admission.key
+    expected_id = (
+        normalize.identity("intentKey", admission_key) if admission_key else None
+    )
     files = snapshot(home / "sai", normalize)
     check_state(case.state or {}, files)
+    if expected_id is not None:
+        check_state({f"{LEDGER}#tables.intents.rows.0.id": expected_id}, files)
     try:
         output = stdout(result.stdout, case.mode, case.command, normalize)
         if contender:
             output = {
                 "first": output,
-                "contender": stdout(
+                "contender" if concurrent else "retry": stdout(
                     contender.stdout, case.mode, case.command, normalize
                 ),
             }
@@ -305,12 +339,16 @@ def observe(
         raise ValueError(
             f"Invalid {case.mode} stdout (exit {result.returncode})"
         ) from None
-    if case.mode == "mcp":
+    for keys, expected in (case.output or {}).items():
+        if not field_matches(output, keys, expected):
+            raise ValueError(f"Stdout differs from expectation at {keys}")
+    if case.mode == "mcp" and case.mcp_calls is None:
         mcp_tools(output)
     stderr = stderr_category(result.stderr)
     if contender:
+        followup = "contender" if concurrent else "retry"
         stderr += tuple(
-            f"contender {category}" for category in stderr_category(contender.stderr)
+            f"{followup} {category}" for category in stderr_category(contender.stderr)
         )
     return Observation(result.returncode, output, stderr, files)
 
@@ -400,7 +438,8 @@ def run_case(
             case, candidate, Path(temp) / "candidate", endpoints
         )
     tools = {}
-    if case.mode == "mcp" and left is not None:
+    inventory_case = case.mode == "mcp" and case.mcp_calls is None
+    if inventory_case and left is not None:
         expected = mcp_tools(left.output)
         actual = mcp_tools(right.output) if right is not None else {}
         for name in sorted(expected.keys() | actual.keys()):
@@ -425,7 +464,7 @@ def run_case(
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
         diffs.insert(0, "expected reference JSON output")
-    if case.mode == "mcp":
+    if inventory_case:
         calls = {reply.get("id"): reply.get("result", {}) for reply in left.output}
         for request_id, tool in [(3, "market_list"), (4, "market_prices")]:
             call = calls.get(request_id, {})
@@ -488,6 +527,11 @@ def main() -> int:
     if not selected:
         parser.error("No parity cases matched")
     reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
+    if configured_python := os.environ.get("SAI_PARITY_PYTHON"):
+        executable = shutil.which(configured_python)
+        if not executable:
+            parser.error("SAI_PARITY_PYTHON must name an executable file or command")
+        reference = [str(Path(executable).absolute())]
     candidate = reference
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])

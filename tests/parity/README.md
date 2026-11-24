@@ -26,9 +26,11 @@ namespace-dependent candidate tests with
 loopback prerequisites.
 
 The default run compares Python with Python. Set `SAI_PARITY_BIN` to an
-executable path or a command on `PATH` to compare a port. Arguments belong in
-`cases.toml`. The runner prints a Markdown report to stdout and exits 1 if
-any selected case differs or fails its expectations.
+executable path or a command on `PATH` to compare a port. Set
+`SAI_PARITY_PYTHON` to the `sai` executable installed from a pinned Python
+checkout to override the reference. Arguments belong in `cases.toml`. The
+runner prints a Markdown report to stdout and exits 1 if any selected case
+differs or fails its expectations.
 
 `PASS` means the selected invocation or MCP tool call matched. `LISTED`
 means the MCP tool's schema and metadata matched in `tools/list`.
@@ -59,6 +61,10 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   form `file#object.key.0.field`, with zero-based list indexes. Use
   `file#@mode` to assert a mode, or `"<absent>"` to assert that a file or
   field is missing.
+- The `output` table pins normalized stdout fields using dotted paths.
+  `mcp_calls` sends specific tool calls after initialization. If a case sets
+  `retry_expect`, the runner invokes the same command again in the same
+  home and checks both outputs under `first` and `retry`.
 - Keep the coverage inventory current. The runner checks that each leaf
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
@@ -71,6 +77,21 @@ contains one `unknown` row tied to the actual request before releasing the
 reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
+
+## Position Trade Reference
+
+The margin and partial-close cases use Python commit
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`, which includes the leverage binding
+from [PR 58](https://github.com/SaiDotFun/open-sai/pull/58). The cases pin
+decimal strings and the digest bytes returned by the MCP previews. The
+ambiguous-ack cases retry in the same home and require one Keeper mutation
+and one unresolved ledger row.
+
+```sh
+SAI_PARITY_PYTHON=/path/to/pinned/.venv/bin/sai \
+  SAI_PARITY_BIN=/path/to/rust/sai \
+  uv run python tests/parity/parity.py --case 'trade-margin*' --case 'trade-partial-close*'
+```
 
 ## Comparison Rules
 

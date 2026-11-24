@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
@@ -32,6 +32,39 @@ OTHER_ADDRESS = "0x" + "2" * 40
 INTENT = "parity-close-7"
 CONTRACT = "nibi1syntheticfixture"
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
+HEIGHT_HEADER = "x-cosmos-block-height"
+POSITION_HEIGHT = "120"
+POSITION_SCENARIOS = {
+    "position-precision",
+    "position-after-hours",
+    "position-index-lag",
+    "position-wrong-chain",
+    "position-no-oracle",
+    "position-wrong-height",
+    "partial-preview-changed",
+    "margin-accepted",
+    "margin-rejected",
+    "margin-unknown",
+    "partial-accepted",
+    "partial-unknown",
+}
+MARGIN_INTENT = {
+    "kind": "UPDATE_TRADE",
+    "target": {"userTradeId": "7"},
+    "body": {
+        "takeProfit": {"operation": "keep"},
+        "stopLoss": {"operation": "keep"},
+        "requestedLeverage": "1.818181818181818182",
+    },
+}
+PARTIAL_INTENT = {
+    "kind": "DECREASE_POSITION_SIZE",
+    "target": {"userTradeId": "7"},
+    "body": {
+        "collateral": {"amountUsdc": "5000000", "amountUsd": "5"},
+        "leverageDelta": "0",
+    },
+}
 RELEASES = "/repos/SaiDotFun/open-sai/releases"
 CONFIG = """# Keep this comment when editing
 [update]
@@ -236,6 +269,21 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "is_after_hours_market": False,
         "get_collateral_price": "1",
     }
+    if scenario in {"position-precision", "position-after-hours"}:
+        trade.update(collateralAmount=10000003, leverage=2.1234567890123457)
+        contracts["get_trade_raw"].update(
+            collateral_amount="10000003", leverage="2.123456789012345678"
+        )
+        contracts["get_collateral_price"] = "0.987654321098765432"
+    if scenario == "position-index-lag":
+        contracts["get_trade_raw"]["collateral_amount"] = "10000001"
+    if scenario == "position-after-hours":
+        contracts.update(
+            is_after_hours_market=True,
+            get_market={"block_last_opened": 110, "block_last_closed": 100},
+            get_trade_infos=[{"created_block": 90}],
+            get_after_hours_leverage="1.234567890123456789",
+        )
     contract_args = {
         "get_trade_raw": {"trader": position["trader"], "index": 7},
         "get_exchange_balance": {
@@ -244,14 +292,34 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         },
         "is_after_hours_market": {"market_index": market_index},
         "get_collateral_price": {"collateral_index": token_index},
+        "get_market": {"index": market_index},
+        "get_trade_infos": {
+            "trader": position["trader"],
+            "start_idx": 7,
+            "scan_limit": 1,
+        },
+        "get_after_hours_leverage": {},
     }
+    close_admission = PROTOCOL["close_admission_request"]
+    expected_intent = {
+        "concurrent-close": close_admission["intent"],
+        "margin-accepted": MARGIN_INTENT,
+        "margin-rejected": MARGIN_INTENT,
+        "margin-unknown": MARGIN_INTENT,
+        "partial-accepted": PARTIAL_INTENT,
+        "partial-unknown": PARTIAL_INTENT,
+    }.get(scenario)
 
     class Handler(BaseHTTPRequestHandler):
-        def reply(self, value: object, status_code: int = 200) -> None:
+        def reply(
+            self, value: object, status_code: int = 200, *, height: str | None = None
+        ) -> None:
             body = json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if height is not None:
+                self.send_header(f"grpc-metadata-{HEIGHT_HEADER}", height)
             self.end_headers()
             self.wfile.write(body)
 
@@ -262,17 +330,20 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         def do_CONNECT(self) -> None:
             self.reject("Unexpected external HTTP connection")
 
-        def admit_close(self, variables: Any) -> None:
+        def admit(self, variables: Any, intent: dict[str, Any]) -> None:
             envelope = variables["input"]
             key = envelope["intentKey"]
             intent_stamp = envelope["intent"]["tsIntentInit"]
             lifecycle_stamp = envelope["lifecycle"]["tsLifecycleStep"]
-            expected = PROTOCOL["close_admission_request"]
             expected = {
                 "intentKey": key,
-                "intent": {**expected["intent"], "tsIntentInit": intent_stamp},
+                "intent": {
+                    "intentSchemaVersion": "v0",
+                    **intent,
+                    "tsIntentInit": intent_stamp,
+                },
                 "lifecycle": {
-                    **expected["lifecycle"],
+                    **close_admission["lifecycle"],
                     "tsLifecycleStep": lifecycle_stamp,
                 },
             }
@@ -291,11 +362,38 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 return
             admission.key = key
             admission.arrived.set()
-            if not admission.release.wait(15):
+            if scenario == "concurrent-close" and not admission.release.wait(15):
                 self.reject("Synthetic admission gate timed out")
                 return
+            if scenario == "margin-rejected":
+                self.reply(
+                    {
+                        "errors": [
+                            {
+                                "message": "fixture rejected",
+                                "extensions": {"code": "INTENT_NOT_ACCEPTED"},
+                            }
+                        ]
+                    }
+                )
+                return
             ack = PROTOCOL["admission_ack"]["data"]["recordUserIntent"]
-            self.reply({"data": {"recordUserIntent": {**ack, "intentKey": key}}})
+            self.reply(
+                {
+                    "data": {
+                        "recordUserIntent": {
+                            **ack,
+                            "intentKey": "wrong-fixture-key"
+                            if scenario.endswith("-unknown")
+                            else key,
+                            "kind": intent["kind"],
+                            "txHash": "A" * 64
+                            if scenario.endswith("-accepted")
+                            else None,
+                        }
+                    }
+                }
+            )
 
         def do_POST(self) -> None:
             if not self.path.startswith("/") or (
@@ -315,14 +413,27 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     return
                 wire.append(request)
                 name = request.label
-                if name == "recordUserIntent" and scenario == "concurrent-close":
-                    self.admit_close(request.variables)
+                if name == "recordUserIntent" and expected_intent is not None:
+                    self.admit(request.variables, expected_intent)
                     return
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):
                         self.reject(f"Wrong Keeper variables for {name}")
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif name == "trade" and scenario == "partial-preview-changed":
+                        self.reply(
+                            {
+                                "data": {
+                                    "perp": {
+                                        "trade": {
+                                            **trade,
+                                            "leverage": self.position_leverage(),
+                                        }
+                                    }
+                                }
+                            }
+                        )
                     else:
                         self.reply(responses[name])
                     return
@@ -334,12 +445,18 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
                 return
-            path = urlsplit(self.path).path
+            url = urlsplit(self.path)
+            path = url.path
             if path.startswith(scope):
                 path = path.removeprefix(scope)
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
-                    self.reply({"default_node_info": {"network": "cataclysm-1"}})
+                    chain = (
+                        "wrong-fixture-chain"
+                        if scenario == "position-wrong-chain"
+                        else "cataclysm-1"
+                    )
+                    self.reply({"default_node_info": {"network": chain}})
                     return
                 if path == RELEASES:
                     wire.append(WireRequest("releases"))
@@ -364,7 +481,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
-                        self.reply({"data": contracts[name]})
+                        if scenario in POSITION_SCENARIOS:
+                            self.position_query(name, url.query)
+                        else:
+                            self.reply({"data": contracts[name]})
                         return
                     except (ValueError, KeyError, TypeError):
                         pass
@@ -375,6 +495,35 @@ def loopback(scenario: str) -> Generator[Endpoints]:
 
         def log_message(self, format: str, *args: object) -> None:
             pass
+
+        def position_leverage(self) -> float:
+            return 3.0 if sum(request.label == "trade" for request in wire) > 1 else 2.0
+
+        def position_query(self, name: str, query: str) -> None:
+            latest = max(i for i, item in enumerate(wire) if item.label == "trade")
+            snapshot = [item.label for item in wire[latest + 1 :]]
+            final_position = snapshot.count("get_trade_raw") == 2
+            pinned = final_position and name != "get_trade_raw"
+            fresh = pinned or final_position or name == "get_collateral_price"
+            height = self.headers.get(HEIGHT_HEADER)
+            if height != (POSITION_HEIGHT if pinned else None):
+                self.reject(f"Wrong LCD height for {name}")
+                return
+            if ("_sai_query" in parse_qs(query)) != fresh:
+                self.reject(f"Wrong LCD cache-busting query for {name}")
+                return
+            if scenario == "position-no-oracle" and name == "get_collateral_price":
+                self.reply({}, 503)
+                return
+            data = contracts[name]
+            if scenario == "partial-preview-changed" and name == "get_trade_raw":
+                data = {**data, "leverage": str(self.position_leverage())}
+            served = (
+                "121"
+                if scenario == "position-wrong-height" and pinned
+                else POSITION_HEIGHT
+            )
+            self.reply({"data": data}, height=served)
 
     def websocket(connection: ServerConnection) -> None:
         try:
