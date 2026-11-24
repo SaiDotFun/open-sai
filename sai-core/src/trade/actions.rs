@@ -6,7 +6,7 @@ use crate::{
     keeper::{MARKETS, TIMEOUT},
 };
 
-use super::{TradeIntent, TradePreview, Trading, positive_decimal};
+use super::{TradeIntent, TradePreview, Trading, confirmation::plain_decimal, positive_decimal};
 
 pub const MARKET_PRICE_NOTICE: &str =
     "Market orders use the refreshed Keeper price; --price is a dry-run reference.";
@@ -38,7 +38,7 @@ pub struct OpenTrade<'a> {
 
 impl OpenTrade<'_> {
     pub fn preview(&self) -> Result<TradePreview, SaiError> {
-        let market = id(self.market)?;
+        let market = id(self.market, "--market")?;
         if market.sign() == num_bigint::Sign::Minus {
             return Err(invalid("Market index must not be negative"));
         }
@@ -98,7 +98,7 @@ impl OpenTrade<'_> {
 }
 
 pub fn close_preview(trade_id: &str, cancel: bool) -> Result<TradePreview, SaiError> {
-    let trade_id = id(trade_id)?;
+    let trade_id = id(trade_id, "TRADE_ID")?;
     if trade_id.sign() == num_bigint::Sign::Minus {
         return Err(invalid("Trade id must not be negative"));
     }
@@ -156,11 +156,22 @@ impl Trading<'_> {
     }
 }
 
-fn id(value: &str) -> Result<BigInt, SaiError> {
-    let cleaned = value.trim().replace('_', "");
-    cleaned
-        .parse()
-        .map_err(|_| invalid("Expected an integer trade or market id"))
+fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
+    let invalid = || {
+        SaiError::usage(format!(
+            "Invalid value for '{parameter}': {} is not a valid integer.",
+            crate::settings::repr(value)
+        ))
+    };
+    let text = value.trim();
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if !digits
+        .split('_')
+        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(invalid());
+    }
+    text.replace('_', "").parse().map_err(|_| invalid())
 }
 
 fn invalid(message: &str) -> SaiError {
@@ -180,7 +191,16 @@ fn decimal_price(value: &Value) -> Result<String, SaiError> {
     let text = if let Some(text) = value.as_str() {
         text
     } else if let Some(value) = value.as_number() {
-        number = value.to_string();
+        let raw = value.to_string();
+        // Python's JSON reader parses fractional and exponent tokens as floats.
+        number = if raw.contains(['.', 'e', 'E']) {
+            let value = value
+                .as_f64()
+                .ok_or_else(|| invalid("Current price must be a positive finite decimal"))?;
+            format!("{value:?}")
+        } else {
+            raw
+        };
         &number
     } else {
         return Err(SaiError::internal());
@@ -213,18 +233,26 @@ fn decimal_price(value: &Value) -> Result<String, SaiError> {
     {
         return Err(invalid("Current price must be a positive finite decimal"));
     }
-    match (
+    Ok(plain_decimal(
+        significant,
         significant.len() as i64 - fractional_places,
-        fractional_places,
-    ) {
-        (_, fractional_places) if fractional_places <= 0 => Ok(format!(
-            "{significant}{}",
-            "0".repeat((-fractional_places) as usize)
-        )),
-        (whole, _) if whole <= 0 => Ok(format!("0.{}{significant}", "0".repeat((-whole) as usize))),
-        (whole, _) => {
-            let (whole, fractional) = significant.split_at(whole as usize);
-            Ok(format!("{whole}.{fractional}"))
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_price_formats_numbers_and_decimal_strings_like_python() {
+        for (wire, expected) in [
+            ("123.000", "123.0"),
+            ("1e-7", "0.0000001"),
+            ("1e16", "10000000000000000"),
+            (r#""+001.00200E-2""#, "0.0100200"),
+        ] {
+            let value = serde_json::from_str(wire).unwrap();
+            assert_eq!(decimal_price(&value).unwrap(), expected);
         }
     }
 }
