@@ -67,11 +67,10 @@ impl Trading<'_> {
             .ok_or_else(|| incomplete("TypeError"))?
             .get("enabled")
             .ok_or_else(|| incomplete("KeyError"))?;
-        let info = node["default_node_info"].as_object();
+        let network = node["default_node_info"]["network"].as_str();
         if !keeper::truthy(enabled)
-            || info.is_none()
-            || &node["default_node_info"]["network"]
-                != route.get("chainId").ok_or_else(|| incomplete("KeyError"))?
+            || !network
+                .is_some_and(|id| !id.trim().is_empty() && route["chainId"].as_str() == Some(id))
         {
             return Err(invalid("Keeper trading route and LCD network do not match"));
         }

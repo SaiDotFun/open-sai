@@ -186,12 +186,14 @@ def loopback(
         "txHash": status["txHash"],
         "trade": {"id": 7, "trader": ADDRESS},
     }
+    chains = {"unknown-chain": None, "empty-chain": ""}
+    chain = chains.get(cancel_target, "cataclysm-1")
     responses = {
         "oneClickTrading": {
             "data": {
                 "oneClickTrading": {
                     "enabled": True,
-                    "chainId": "cataclysm-1",
+                    "chainId": chain,
                     "contractAddress": CONTRACT,
                 }
             }
@@ -234,6 +236,8 @@ def loopback(
     pending_order = scenario == "pending-order" or cancel_target in {
         "pending",
         "foreign-owner",
+        "unknown-chain",
+        "empty-chain",
     }
     contracts = {
         "get_trade_raw": {
@@ -465,7 +469,13 @@ def loopback(
                 path = path.removeprefix(scope)
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
-                    self.reply({"default_node_info": {"network": "cataclysm-1"}})
+                    self.reply(
+                        {
+                            "default_node_info": {}
+                            if chain is None
+                            else {"network": chain}
+                        }
+                    )
                     return
                 if path == RELEASES:
                     wire.append(WireRequest("releases"))

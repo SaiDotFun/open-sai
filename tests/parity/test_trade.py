@@ -437,6 +437,36 @@ def test_cancel_refuses_an_lcd_response_for_another_owner(
         ]
 
 
+@pytest.mark.parametrize("target", ["unknown-chain", "empty-chain"])
+def test_cancel_requires_matching_known_chain_ids(
+    cancel_pair: tuple[CLI, CLI], tmp_path: Path, target: str
+) -> None:
+    python, rust = cancel_pair
+    with loopback("trade-accepted", cancel_target=target) as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        code, output, stderr = run(rust, home, endpoints, CANCEL, python=False)
+        assert (code, stderr) == (1, "")
+        assert output["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": "Keeper trading route and LCD network do not match",
+            "retryable": False,
+        }
+        assert [request.label for request in endpoints.wire] == CANCEL_READS[:2]
+        assert not endpoints.errors
+        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+    # The pinned Python guard treats matching absent or empty values as success.
+    with loopback("trade-accepted", cancel_target=target) as endpoints:
+        home = tmp_path / "python"
+        seed_home(home, endpoints, "session")
+        assert run(python, home, endpoints, CANCEL, python=True)[0] == 0
+        assert [request.label for request in endpoints.wire] == [
+            *CANCEL_READS,
+            "recordUserIntent",
+        ]
+
+
 def test_cancel_rechecks_the_pinned_account_after_reading(
     cancel_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
