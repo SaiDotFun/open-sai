@@ -438,7 +438,7 @@ def show_expiry_notice(ctx: click.Context, fields: Mapping[str, Any]) -> None:
         and sys.stdin.isatty()
         and sys.stderr.isatty()
     ):
-        warn(f"{fields['expiryWarning']} Run {fields['renewalCommand']}.")
+        warn(sessions.expiry_notice_text(fields))
 
 
 # Commands that never start or announce an automatic update. `mcp` serves
@@ -618,23 +618,31 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         endpoint = keeper_url(ctx)
         if stored.get("endpoint") != endpoint:
             raise SessionError("Stored session belongs to another Keeper endpoint")
+        if not keeper.is_address(stored["evmAddress"]):
+            raise ValueError(sessions.INVALID_RENEWAL_ADDRESS)
         name = stored.get("keyName")
         if not name:
+            fields = sessions.renewal_fields(stored)
+            command = fields["renewalCommand"]
+            guidance = fields.get("renewalGuidance", "")
             if stored.get("source") == "imported":
-                raise ValueError(
-                    f"This session was imported. Run {sessions.renewal_command(stored)} with a fresh token."
+                message = (
+                    f"This session was imported. Run `{command}` with a fresh token."
                 )
-            raise ValueError(
-                f"This session has no saved key name. Run {sessions.renewal_command(stored)}."
-            )
+            else:
+                message = f"This session has no saved key name. Run `{command}`."
+            raise ValueError(f"{message} {guidance}".rstrip())
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
         sessions.validate_issued_session(result)
         storage.replace_session(stored, result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
+        fields = sessions.renewal_fields(stored)
+        command = fields["renewalCommand"]
+        guidance = fields.get("renewalGuidance", "")
         raise SaiError(
-            f"{exc} Run {sessions.renewal_command(stored)} in a terminal.",
+            f"{exc} Run `{command}` in a terminal. {guidance}".rstrip(),
             Code.SESSION_UNAVAILABLE,
         ) from exc
 
@@ -822,8 +830,11 @@ def read_token() -> str:
 
 
 @auth.command("import")
+@click.option(
+    "--addr", metavar="ADDR", help="Require the token to match this EVM address."
+)
 @click.pass_context
-def import_token(ctx: click.Context) -> None:
+def import_token(ctx: click.Context, addr: str | None) -> None:
     """Connect with a session token copied from Sai Web.
 
     In a terminal, paste the token at the hidden prompt or press Enter to read
@@ -833,6 +844,8 @@ def import_token(ctx: click.Context) -> None:
     """
     token = read_token()
     result = sessions.import_session(token, keeper_url(ctx))
+    if addr is not None and addr.lower() != result["evmAddress"].lower():
+        raise ValueError("The Sai session token is for a different account than --addr")
     storage.save_session(result)
     # Re-read: the person may have copied something else since, and that
     # must survive.

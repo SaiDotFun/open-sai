@@ -54,6 +54,12 @@ def auth_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     return (executable,), cli_pair[1]
 
 
+@pytest.fixture
+def renewal_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
+    # Renewal output changes in both implementations, so use the Python checkout.
+    return (str(Path(sys.executable).with_name("sai")),), cli_pair[1]
+
+
 def homes(root: Path, commands: tuple[CLI, CLI]) -> tuple[Env, Env]:
     result = []
     for name, command in zip(("python", "rust"), commands, strict=True):
@@ -252,8 +258,8 @@ def original_keeper_argument(origin: str | None = None) -> str:
     )
 
 
-def reuse_keeper_suffix(origin: str) -> str:
-    return f" (reuse the Keeper endpoint at {origin} configured when this session was stored)"
+def reuse_keeper_guidance(origin: str) -> str:
+    return f"Reuse the Keeper endpoint at {origin} used to sign in."
 
 
 def save_expiry_fixture(
@@ -281,24 +287,28 @@ def save_expiry_fixture(
 
 
 @pytest.mark.parametrize(
-    ("seconds_left", "when", "source", "custom_endpoint"),
+    ("seconds_left", "when", "source", "keeper_source", "custom_endpoint"),
     [
-        (45, "under 1 min", "imported", True),
-        (100, "1 min", "imported", False),
-        (119 * 60 + 30, "119 min", "keystore", True),
-        (120 * 60 + 40, "2 h", "legacy", True),
-        (71 * 3600 + 1800, "71 h", "keystore", False),
-        (72 * 3600 + 120, None, "imported", False),
-        (-60, None, "imported", False),
+        (45, "under 1 min", "imported", "flag", True),
+        (100, "1 min", "imported", "flag", False),
+        (119 * 60 + 30, "119 min", "keystore", "flag", True),
+        (120 * 60 + 40, "2 h", "legacy", "flag", True),
+        (71 * 3600 + 1800, "71 h", "keystore", "flag", False),
+        (72 * 3600 + 120, None, "imported", "flag", False),
+        (-60, None, "imported", "flag", False),
+        (3650, "60 min", "imported", "default", False),
+        (3650, "60 min", "imported", "file", True),
+        (3650, "60 min", "imported", "env", True),
     ],
 )
 def test_auth_expiry_warning_matches_python(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    auth_pair: tuple[CLI, CLI],
+    renewal_pair: tuple[CLI, CLI],
     seconds_left: int,
     when: str | None,
     source: str,
+    keeper_source: str,
     custom_endpoint: bool,
 ) -> None:
     origin = "http://127.0.0.1:9"
@@ -307,16 +317,22 @@ def test_auth_expiry_warning_matches_python(
         if custom_endpoint
         else origin
     )
+    if keeper_source == "default":
+        endpoint = keeper.MAINNET_HTTP
+        origin = endpoint.removesuffix("/query")
     expiry = datetime.now(UTC) + timedelta(seconds=seconds_left)
-    option = original_keeper_argument() if custom_endpoint else origin
+    option = original_keeper_argument() if custom_endpoint else endpoint
     prefix = f"sai --endpoint {option} auth"
     command = {
-        "imported": f"{prefix} import",
+        "imported": f"{prefix} import --addr {ADDR}",
         "keystore": f"{prefix} renew {ADDR}",
-        "legacy": f"{prefix} login NAME or {prefix} import",
+        "legacy": f"{prefix} import --addr {ADDR}",
     }[source]
+    guidance = []
     if custom_endpoint:
-        command += reuse_keeper_suffix(origin)
+        guidance.append(reuse_keeper_guidance(origin))
+    if source == "legacy":
+        guidance.append("You can also sign in again with your Foundry keystore.")
     fields = (
         {
             "expiryWarning": f"Sai session for {ADDR} expires in {when}.",
@@ -325,14 +341,22 @@ def test_auth_expiry_warning_matches_python(
         if when
         else {}
     )
+    if when and guidance:
+        fields["renewalGuidance"] = " ".join(guidance)
     results = []
-    for env in homes(tmp_path, auth_pair):
+    for env in homes(tmp_path, renewal_pair):
+        if keeper_source == "file":
+            assert env.run("config", "set", "keeper.endpoint", endpoint).returncode == 0
+        elif keeper_source == "env":
+            env.extra_env["SAI_ENDPOINT"] = endpoint
         save_expiry_fixture(
             env, monkeypatch, addr=ADDR, endpoint=endpoint, expiry=expiry, source=source
         )
         runs = []
         for auth in ("status", "list"):
-            args = ("--endpoint", endpoint, "auth", auth)
+            args = ("auth", auth)
+            if keeper_source == "flag":
+                args = ("--endpoint", endpoint, *args)
             result = env.run("--json", *args)
             assert result.stderr == ""
             data = json.loads(result.stdout)
@@ -347,7 +371,7 @@ def test_auth_expiry_warning_matches_python(
                 assert row["endpoint"] == origin
                 assert {
                     key: row[key]
-                    for key in ("expiryWarning", "renewalCommand")
+                    for key in ("expiryWarning", "renewalCommand", "renewalGuidance")
                     if key in row
                 } == fields
                 if auth == "list":
@@ -361,6 +385,23 @@ def test_auth_expiry_warning_matches_python(
             assert "fixture-path-key" not in result.stdout
             assert "fixture-query-key" not in result.stdout
             runs.append(observed(result))
+        if source == "legacy":
+            env.clipboard()
+            token = fixture_token(OTHER)
+            env.clip.write_text(token)
+            before = session_state(env)
+            refused = env.run("--endpoint", endpoint, "auth", "import", "--addr", ADDR)
+            assert refused.returncode == 1
+            assert "different account than --addr" in refused.stderr
+            assert session_state(env) == before
+            assert env.clip.read_text() == token
+        if keeper_source == "default":
+            env.clipboard()
+            env.clip.write_text(fixture_token(ADDR))
+            (env.bin / "sai").symlink_to(env.command[0])
+            renewed = env.run_shell(command, SAI_ENDPOINT="http://127.0.0.1:9")
+            assert renewed.returncode == 0, renewed.stderr
+            assert session_state(env)["sessions"][ADDR]["endpoint"] == endpoint
         results.append(runs)
     assert results[0] == results[1]
 
@@ -402,31 +443,35 @@ def run_expiry_notice_on_terminal(env: Env, *args: str) -> tuple[int, str, str]:
 def test_auth_expiry_notice_on_terminal_matches_python(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    auth_pair: tuple[CLI, CLI],
+    renewal_pair: tuple[CLI, CLI],
+    keeper_auth: dict[str, Any],
     auth: str,
     json_output: bool,
     active_endpoint_matches: bool,
 ) -> None:
-    origin = "http://127.0.0.1:9"
+    origin = keeper_auth["endpoint"].removesuffix("/query")
     active_endpoint = origin + "/fixture-path-key/query?access=fixture-query-key"
     endpoint = active_endpoint if active_endpoint_matches else "http://127.0.0.1:10"
     expiry = datetime.now(UTC) + timedelta(hours=24, minutes=30)
     warning = f"Sai session for {ADDR} expires in 24 h."
-    renewal = f"sai --endpoint {original_keeper_argument()} auth import{reuse_keeper_suffix(origin)}"
+    renewal = f"sai --endpoint {original_keeper_argument()} auth import --addr {ADDR}"
+    guidance = reuse_keeper_guidance(origin)
     args = ("--endpoint", endpoint, "auth", auth)
     if json_output:
         args = ("--json", *args)
     results = []
-    for env in homes(tmp_path, auth_pair):
-        for addr, stored_endpoint in [(OTHER, endpoint), (ADDR, active_endpoint)]:
-            save_expiry_fixture(
-                env,
-                monkeypatch,
-                addr=addr,
-                endpoint=stored_endpoint,
-                expiry=expiry,
-                source="imported",
-            )
+    for env in homes(tmp_path, renewal_pair):
+        save_expiry_fixture(
+            env,
+            monkeypatch,
+            addr=OTHER,
+            endpoint=endpoint,
+            expiry=expiry,
+            source="imported",
+        )
+        env.clipboard()
+        env.clip.write_text(fixture_token(ADDR, expiry.timestamp()))
+        assert env.run("--endpoint", active_endpoint, "auth", "import").returncode == 0
         result = run_expiry_notice_on_terminal(env, *args)
         assert result[0] == 0
         data = json.loads(result[1])
@@ -434,19 +479,100 @@ def test_auth_expiry_notice_on_terminal_matches_python(
         assert row["addr"] == ADDR
         assert row["expiryWarning"] == warning
         assert row["renewalCommand"] == renewal
+        assert row["renewalGuidance"] == guidance
         if auth == "list":
             assert (
                 data["accounts"][1]["expiryWarning"]
                 == f"Sai session for {OTHER} expires in 24 h."
             )
         expected = (
-            f"{warning} Run {renewal}.\n"
+            f"{warning} {guidance} Run {renewal}\n"
             if active_endpoint_matches and not json_output
             else ""
         )
         assert result[2] == expected
+        if expected:
+            assert len(result[2].splitlines()) == 1
+            command = result[2].split(" Run ", 1)[1].removesuffix("\n")
+            (env.bin / "sai").symlink_to(env.command[0])
+            before = session_state(env)
+            wrong_token = fixture_token(OTHER)
+            env.clip.write_text(wrong_token)
+            refused = env.run_shell(command, SAI_RECONCILE_ENDPOINT=active_endpoint)
+            assert refused.returncode == 1
+            assert "different account than --addr" in refused.stderr
+            assert session_state(env) == before
+            assert env.clip.read_text() == wrong_token
+
+            env.clip.write_text(fixture_token(ADDR))
+            renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=active_endpoint)
+            assert renewed.returncode == 0, renewed.stderr
+            assert json.loads(renewed.stdout)["addr"] == ADDR
+            after = session_state(env)
+            assert after["sessions"][ADDR]["endpoint"] == active_endpoint
+            assert (
+                after["sessions"][ADDR]["expiresAt"]
+                > before["sessions"][ADDR]["expiresAt"]
+            )
+            assert after["sessions"][OTHER] == before["sessions"][OTHER]
         results.append(result)
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("source", ["legacy", "imported"])
+def test_auth_expiry_notice_for_invalid_subject_matches_python(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    renewal_pair: tuple[CLI, CLI],
+    source: str,
+) -> None:
+    endpoint = "http://127.0.0.1:9/private-path"
+    addr = ADDR[:-4] + "\n\r\x1b\u2028"
+    expiry = datetime.now(UTC) + timedelta(hours=24, minutes=30)
+    warning = rf"Sai session for {ADDR[:-4]}\n\r\x1b\u2028 expires in 24 h."
+    guidance = "Stored session address is invalid. Sign in again."
+    outputs = []
+    for env in homes(tmp_path, renewal_pair):
+        save_expiry_fixture(
+            env, monkeypatch, addr=addr, endpoint=endpoint, expiry=expiry, source=source
+        )
+        reports = []
+        for auth in ("status", "list"):
+            result = run_expiry_notice_on_terminal(
+                env, "--endpoint", endpoint, "auth", auth
+            )
+            assert result[0] == 0
+            data = json.loads(result[1])
+            report = data if auth == "status" else data["accounts"][0]
+            assert report["expiryWarning"] == warning
+            assert report["renewalGuidance"] == guidance
+            assert "renewalCommand" not in report
+            assert result[2].splitlines() == [f"{warning} {guidance}"]
+            reports.append(result)
+        doctor = env.run(
+            "--json", "--endpoint", endpoint, "doctor", "--offline", "--no-fix"
+        )
+        report = json.loads(doctor.stdout)
+        if "error" in report:
+            report = report["error"]["details"]
+        session = next(check for check in report["checks"] if check["id"] == "session")
+        assert session["summary"] == f"{warning} {guidance}"
+        assert session["fix"] is None
+        save_expiry_fixture(
+            env,
+            monkeypatch,
+            addr=addr,
+            endpoint=endpoint,
+            expiry=datetime.now(UTC) - timedelta(hours=1),
+            source=source,
+        )
+        expired = env.run("--json", "--endpoint", endpoint, "auth", "status")
+        assert expired.returncode == 6
+        failure = json.loads(expired.stdout)["error"]
+        assert failure["message"] == guidance
+        assert "hint" not in failure
+        outputs.append(reports)
+    assert outputs[0] == outputs[1]
 
 
 @pytest.mark.parametrize("path", ["", "/query", "/fixture-path-key/query"])
@@ -934,10 +1060,10 @@ def test_renew_keeps_truncated_store_error_code(
 
 def test_renew_matches_python_without_switching_active_account(
     tmp_path: Path,
-    auth_pair: tuple[CLI, CLI],
+    renewal_pair: tuple[CLI, CLI],
     keeper_auth: dict[str, Any],
 ) -> None:
-    python, rust = homes(tmp_path, auth_pair)
+    python, rust = homes(tmp_path, renewal_pair)
     results = []
     endpoint = keeper_auth["endpoint"]
     renewed_token = fixture_token(ADDR)
@@ -958,13 +1084,12 @@ def test_renew_matches_python_without_switching_active_account(
         assert error["code"] == "INVALID_REQUEST"
         origin = endpoint.removesuffix("/query")
         recovery = (
-            f"sai --endpoint {original_keeper_argument(origin)} auth import"
-            if env is rust
-            else f"sai --endpoint {original_keeper_argument()} auth import{reuse_keeper_suffix(origin)}"
+            f"sai --endpoint {original_keeper_argument()} auth import --addr {OTHER}"
         )
         assert (
             error["message"]
-            == f"This session was imported. Run {recovery} with a fresh token."
+            == f"This session was imported. Run `{recovery}` with a fresh token. "
+            f"{reuse_keeper_guidance(origin)}"
         )
         before = session_state(env)
         assert before["sessions"][ADDR]["expiresAt"] == old_expiry
@@ -1102,13 +1227,13 @@ def test_renew_does_not_restore_a_concurrent_logout(
 def test_expired_session_recovery_matches_python(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    auth_pair: tuple[CLI, CLI],
+    renewal_pair: tuple[CLI, CLI],
     keeper_auth: dict[str, Any],
     source: str,
 ) -> None:
     args = ("--endpoint", keeper_auth["endpoint"])
     results = []
-    python, rust = homes(tmp_path, auth_pair)
+    python, rust = homes(tmp_path, renewal_pair)
     for env in (python, rust):
         keeper_auth["expires_at"] = "2000-01-01T00:00:00+00:00"
         keeper_auth["token"] = fixture_token(ADDR, 0)
@@ -1127,19 +1252,13 @@ def test_expired_session_recovery_matches_python(
         structured = env.run("--json", *args, "auth", "status")
         assert text.returncode == structured.returncode == 6
         body = json.loads(structured.stdout)["error"]
-        hint = body.pop("hint")
-        command = f"renew {ADDR}" if source == "keystore" else "import"
+        command = f"renew {ADDR}" if source == "keystore" else f"import --addr {ADDR}"
         origin = keeper_auth["endpoint"].removesuffix("/query")
-        if env is rust and source == "imported":
-            assert (
-                hint == f"sai --endpoint {original_keeper_argument(origin)} auth import"
-            )
-        elif env is rust:
-            assert hint == f"sai auth {command}{reuse_keeper_suffix(origin)}"
-        else:
-            assert hint == (
-                f"sai --endpoint {original_keeper_argument()} auth {command}{reuse_keeper_suffix(origin)}"
-            )
+        assert (
+            body["hint"]
+            == f"sai --endpoint {original_keeper_argument()} auth {command}"
+        )
+        assert reuse_keeper_guidance(origin) in body["message"]
         results.append(
             (observed(text), (structured.returncode, body, structured.stderr))
         )
@@ -1176,11 +1295,14 @@ def test_import_recovery_keeps_the_one_off_keeper_endpoint(
 
     result = rust.run("--json", "--endpoint", endpoint, "auth", "status")
     assert result.returncode == 6
-    hint = json.loads(result.stdout)["error"]["hint"]
+    error = json.loads(result.stdout)["error"]
+    hint = error["hint"]
     assert "fixture-path-key" not in hint
     assert "fixture-query-key" not in hint
-    arg = original_keeper_argument(origin) if suffix else origin
-    assert hint == f"sai --endpoint {arg} auth import"
+    arg = original_keeper_argument() if suffix else origin
+    assert hint == f"sai --endpoint {arg} auth import --addr {ADDR}"
+    if suffix:
+        assert reuse_keeper_guidance(origin) in error["message"]
     if suffix:
         missing = subprocess.run(
             ["/bin/sh", "-c", hint],
