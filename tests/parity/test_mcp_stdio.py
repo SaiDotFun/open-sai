@@ -303,3 +303,27 @@ def test_info_observes_launcher_replacement(
         assert after["version"] == before["version"]
         assert after["installedVersion"] == "99.1.2"
         assert after["restartNeeded"] is True
+
+
+@pytest.mark.parametrize(
+    ("literal", "rendered"), [(b"1e2", "100.0"), (b"1e-7", "1e-07"), (b"-0.0", "-0.0")]
+)
+def test_extra_float_uses_python_spelling(
+    native: Path, tmp_path: Path, literal: bytes, rendered: str
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        stdio.write(
+            b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mcp_info","arguments":{"extra":'
+            + literal
+            + b"}}}"
+        )
+        response = stdio.receive()
+        assert response["id"] == 2
+        assert response["result"]["isError"] is True
+        assert (
+            f"input_value={rendered}, input_type=float"
+            in response["result"]["content"][0]["text"]
+        )

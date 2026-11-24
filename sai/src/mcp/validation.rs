@@ -261,7 +261,14 @@ fn python_repr(value: &Value) -> String {
         Value::Null => "None".into(),
         Value::Bool(true) => "True".into(),
         Value::Bool(false) => "False".into(),
-        Value::Number(number) => number.to_string(),
+        Value::Number(_) => {
+            let text = crate::reads::output::inline(value).expect("JSON number");
+            match text.as_str() {
+                "Infinity" => "inf".into(),
+                "-Infinity" => "-inf".into(),
+                _ => text,
+            }
+        }
         Value::String(text) => repr(text),
         Value::Array(values) => format!(
             "[{}]",
