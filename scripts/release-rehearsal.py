@@ -740,6 +740,10 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
         try:
             replay.lifecycle = "market_order_expired"
             check_doctor(tool, base, key, pending=False)
+            require(
+                ledger_row(ledger, key, migrated=True) == ("terminal", "terminal"),
+                "Doctor did not preserve the original open as terminal",
+            )
         finally:
             replay.lifecycle = "outcome_not_indexed"
             backup_ledger(checkpoint, ledger)
