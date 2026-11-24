@@ -1557,11 +1557,12 @@ def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
 
 SCOPE_OPTION = click.option(
     "--scope",
-    type=click.Choice(mcp_install.SCOPES),
+    type=click.Choice(mcp_install.UNINSTALL_SCOPES),
     default="user",
     show_default=True,
     help="user: every project. project: this directory's shared config"
-    " (Claude Code .mcp.json, Cursor .cursor/mcp.json). Codex is user only.",
+    " (Claude Code .mcp.json, Cursor .cursor/mcp.json)."
+    " local: this directory's Claude Code local config. Codex is user only.",
 )
 
 
@@ -1590,6 +1591,17 @@ def mcp_list(ctx: click.Context) -> None:
 
 @mcp_group.command("install", cls=ArgvAfterDash)
 @click.argument("clients", nargs=-1)
+@click.option("--client", "client_options", multiple=True, help="Name a client.")
+@click.option(
+    "--repair-existing",
+    type=click.Choice(mcp_install.SERVER_NAMES),
+    help="Repair only this existing Claude Code entry in the selected scope.",
+)
+@click.option(
+    "--reset-args",
+    is_flag=True,
+    help="Use default server arguments when repairing an existing entry.",
+)
 @click.option("--all", "all_clients", is_flag=True, help="Every detected client.")
 @click.option("--dry-run", is_flag=True, help="Show the changes; make none.")
 @SCOPE_OPTION
@@ -1597,6 +1609,9 @@ def mcp_list(ctx: click.Context) -> None:
 def mcp_install_command(
     ctx: click.Context,
     clients: tuple[str, ...],
+    client_options: tuple[str, ...],
+    repair_existing: str | None,
+    reset_args: bool,
     all_clients: bool,
     dry_run: bool,
     scope: str,
@@ -1611,9 +1626,34 @@ def mcp_install_command(
     With no CLIENT and no --all, a terminal asks which clients to register;
     without a terminal, this lists detected clients and changes nothing.
     """
+    names = chosen_clients((*clients, *client_options))
+    if reset_args and repair_existing is None:
+        raise click.UsageError("--reset-args requires --repair-existing.")
+    if repair_existing is not None and (
+        names != ["claude"] or all_clients or ctx.meta.get("server_argv")
+    ):
+        raise click.UsageError(
+            "--repair-existing requires --client claude and the default server command."
+        )
     found = mcp_clients()
     target = server_target(ctx)
-    names = chosen_clients(clients)
+    if repair_existing is not None:
+        claude = found["claude"]
+        assert isinstance(claude, mcp_install.Claude)
+        finish(
+            ctx,
+            [
+                mcp_install.repair_claude_existing(
+                    claude,
+                    scope,
+                    repair_existing,
+                    target,
+                    dry_run,
+                    reset_args=reset_args,
+                )
+            ],
+        )
+        return
     detected = [n for n, c in found.items() if c.detected()[0]]
     if all_clients:
         names = list(dict.fromkeys([*names, *detected]))
@@ -1634,6 +1674,8 @@ def mcp_install_command(
         if not detected:
             raise click.UsageError("No agent clients found; name one to register.")
         names = pick("Register Sai with (numbers, names, or all)", detected)
+    if scope == "local" and names != ["claude"]:
+        raise click.UsageError("Install scope local requires the Claude Code client.")
     results = [mcp_install.install_one(found[n], scope, target, dry_run) for n in names]
     finish(ctx, results)
 

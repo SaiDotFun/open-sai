@@ -147,10 +147,7 @@ BROKEN_WHEN_INSTALLED = (
         "failed",
         "deleted-cwd",
         "deleted-cwd-relative",
-        "denied-project",
-        "command-denied-background",
-        "opaque-policy-background",
-        "replacement-denied-foreground",
+        "legacy-project",
     ],
 )
 def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
@@ -160,19 +157,14 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
-    monkeypatch.delenv("CLAUDECODE", raising=False)
-    monkeypatch.delenv("WSL_DISTRO_NAME", raising=False)
     monkeypatch.setenv("FAKE_LOG", str(uv_dirs / "client-calls.jsonl"))
     project = uv_dirs / "project"
     project.mkdir()
-    denied = mode == "denied-project"
-    background_denied = mode == "command-denied-background"
-    opaque = mode == "opaque-policy-background"
-    replacement_denied = mode == "replacement-denied-foreground"
-    background = mode == "background" or background_denied or opaque
-    policy_blocked = denied or background_denied or opaque or replacement_denied
-    name = OLD_COMMAND if denied else "sai"
-    config = project / ".mcp.json" if denied else home / ".claude.json"
+    legacy = mode == "legacy-project"
+    background = mode == "background"
+    name = OLD_COMMAND if legacy else "sai"
+    scope = "project" if legacy else "user"
+    config = project / ".mcp.json" if legacy else home / ".claude.json"
     entry = {
         "command": OLD_COMMAND,
         "args": ["--endpoint", "https://private.example/" + SECRET],
@@ -197,7 +189,7 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         (home / ".cursor").mkdir()
         cursor.parent.mkdir()
         cursor.write_text(original)
-    if denied:
+    if legacy:
         policies = write_project_mcp_denials(project)
         codex_home.mkdir()
         codex_config = codex_home / "config.toml"
@@ -210,18 +202,6 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
                 }
             )
         )
-    if background_denied:
-        settings = project / ".claude/settings.json"
-        settings.parent.mkdir()
-        settings.write_text(
-            json.dumps(
-                {"deniedMcpServers": [{"serverCommand": [OLD_COMMAND, *entry["args"]]}]}
-            )
-        )
-    if opaque:
-        cache = home / ".claude/remote-settings.json"
-        cache.parent.mkdir()
-        cache.write_text(json.dumps({"policyHelper": {"path": SECRET}}))
     wheels = {
         "0.1.0": build_wheel("0.1.0"),
         "0.2.0": build_wheel("0.2.0", server_body),
@@ -229,16 +209,9 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     bad_hash = ("0.2.0",) if mode == "failed" else ()
     with Stub(release_routes(wheels, bad_hash=bad_hash)) as stub:
         tool = Tool(uv_dirs, stub.url)
-        if replacement_denied:
-            settings = project / ".claude/settings.json"
-            settings.parent.mkdir()
-            command = [str(tool.sai), "mcp", "serve", *entry["args"]]
-            settings.write_text(
-                json.dumps({"deniedMcpServers": [{"serverCommand": command}]})
-            )
         tool.install_release("0.1.0")
         write_exe(tool.sai.with_name("claude"), FAKE_CLAUDE)
-        if denied:
+        if legacy:
             write_exe(tool.sai.with_name("codex"), FAKE_CODEX)
         # Supply the installed tool prefix to the real CLI. Keep the test
         # runner's Python and dependencies while uv replaces the tool.
@@ -250,11 +223,7 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             args.insert(0, "--json")
         if background:
             args.append("--background")
-        if background_denied:
-            monkeypatch.setenv(updater.MCP_POLICY_CWD, str(project))
-            monkeypatch.chdir(updater.NEUTRAL_DIR)
-        else:
-            monkeypatch.chdir(project)
+        monkeypatch.chdir(project)
         if mode == "deleted-cwd-relative":
             monkeypatch.setenv("SAI_HOME", "../sai-home")
             monkeypatch.setenv("SAI_LOG", "false")
@@ -279,17 +248,14 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             },
             OTHER: other,
         }
-        if policy_blocked:
-            assert config.read_text() == original
-        else:
-            assert json.loads(config.read_text())["mcpServers"] == expected
+        assert config.read_text() == original
         if background:
             assert cursor.read_text() == original
         elif mode.startswith("deleted-cwd"):
             assert not project.exists()
         else:
             assert json.loads(cursor.read_text())["mcpServers"] == expected
-        if denied:
+        if legacy:
             assert all(
                 path.read_bytes() == content for path, content in policies.items()
             )
@@ -313,24 +279,19 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         assert repair[0]["background"] is background
         claude = repair[0]["clients"][0]
         assert claude["client"] == "claude"
-        if policy_blocked:
-            assert claude["status"] == "warn"
-            assert claude["policyBlocked"] is True
-            assert claude["changes"] == []
-            assert "sai mcp install claude" in claude["fix"]
-            assert state["result"]["mcp"] == repair[0]["clients"]
-        else:
-            assert claude["status"] == "fixed"
-        if denied:
+        assert claude["status"] == "fail" and claude["changes"] == []
+        assert claude["manualRepairs"] == [{"scope": scope, "name": name}]
+        command = (
+            f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
+        )
+        assert command in claude["fix"]
+        assert state["result"]["mcp"] == repair[0]["clients"]
+        if legacy:
             clients = {client["client"]: client for client in repair[0]["clients"]}
             assert set(clients) == {"claude", "codex", "cursor"}
             assert all(client["legacyName"] == name for client in clients.values())
             assert f"kept the existing {name} name" in result.stdout
-        message = (
-            "Skipped a Claude Code MCP repair because of policy."
-            if policy_blocked
-            else "Repaired Sai MCP registrations for claude"
-        )
+        message = "Claude Code MCP registrations need manual repair."
         if background:
             assert result.output == ""
             notices: list[str] = []
@@ -340,19 +301,19 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             updater.tick(notices.append, prefix=tool.prefix)
             assert len(notices) == 1 and message in notices[0]
             assert "sai doctor" in notices[0]
-            if policy_blocked:
-                assert "sai mcp install claude" in notices[0]
+            assert command in notices[0]
             assert "project registrations" in notices[0]
             assert state["result"]["mcpNotes"] == ["background"]
         elif mode == "deleted-cwd":
             assert "The working directory is gone." in result.stdout
+            assert command in result.stdout
             assert state["result"]["mcpNotes"] == ["cwd-missing"]
         elif mode == "json":
             assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
         else:
             assert message in result.stdout
-        if replacement_denied:
-            assert "Repaired Sai MCP registrations for claude" not in result.stdout
+            assert command in result.stdout
+        assert "Repaired Sai MCP registrations for claude" not in result.stdout
         if not background:
             assert updater.notice(state, "0.2.0") is None
         output = result.output + json.dumps(repair) + json.dumps(updater.read_state())
@@ -1611,19 +1572,17 @@ def test_spawn_starts_a_detached_process_in_a_neutral_directory(tmp_path, monkey
     code = (
         "import json, os, pathlib; "
         f"pathlib.Path({str(marker)!r}).write_text(json.dumps("
-        f'[os.getsid(0), os.getcwd(), os.environ["SAI_HOME"], '
-        f"os.environ[{updater.MCP_POLICY_CWD!r}]]))"
+        '[os.getsid(0), os.getcwd(), os.environ["SAI_HOME"]]))'
     )
     updater.spawn([sys.executable, "-I", "-c", code])
     deadline = time.monotonic() + 30
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     time.sleep(0.1)
-    session, cwd, home, policy_cwd = json.loads(marker.read_text())
+    session, cwd, home = json.loads(marker.read_text())
     assert session != os.getsid(0)
     assert cwd == updater.NEUTRAL_DIR != str(tmp_path)
     assert home == str(tmp_path / "relative-home")
-    assert policy_cwd == str(tmp_path)
 
 
 @pytest.mark.parametrize(

@@ -34,11 +34,6 @@ from .core import settings
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
 SERVER_NAMES = (NAME, RETIRED_NAME)
-CLAUDE_POLICY_REPAIR_HINT = (
-    "Review the Claude Code policy. Run `sai mcp install claude` for a user"
-    " registration named sai, or use `claude mcp --help` to repair the"
-    " existing entry in its original scope and under its original name."
-)
 HIDDEN = "<hidden>"
 CODEX_TOOL_FILTERS = ("enabled_tools", "disabled_tools")
 STILL_ACTIVE = "a project .codex/config.toml entry is still active"
@@ -87,6 +82,7 @@ class Registration:
     # be compared without keeping or printing their values.
     fingerprint: str = ""
     invalid_sai_home: bool = False
+    stdio: bool = True
 
     def shown(self, target: Target | None) -> dict[str, Any]:
         """The argv to print: in full only when it is the expected command.
@@ -171,8 +167,11 @@ class ClientError(Exception):
     """A client command or config file failed; the message is safe to print."""
 
 
-class ClaudeMcpPolicyError(ClientError):
-    """Repair cannot proceed under the client's deny rules."""
+@dataclass(frozen=True)
+class ClaudeRepair:
+    scope: str
+    name: str
+    reset_args: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,7 +183,24 @@ class RegistrationCheck:
     changes: tuple[str, ...] = ()
     pinned: bool = False
     legacy_name: bool = False
-    policy_blocked: bool = False
+    manual_repairs: tuple[ClaudeRepair, ...] = ()
+
+
+def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
+    commands = [
+        f"`sai mcp install --client claude --scope {entry.scope}"
+        f" --repair-existing {entry.name}"
+        f"{' --reset-args' if entry.reset_args else ''}`"
+        for entry in entries
+    ]
+    hint = "Run " + " and ".join(commands) + "."
+    if any(entry.scope != "user" for entry in entries):
+        hint += " Run project and local commands from the project directory."
+    if any(entry.reset_args for entry in entries):
+        hint += (
+            " The --reset-args flag replaces unsupported arguments with the defaults."
+        )
+    return hint
 
 
 def normalize_client(name: str) -> str:
@@ -312,116 +328,6 @@ def load_json(path: Path) -> dict[str, Any] | None:
     return data
 
 
-def file_present(path: Path) -> bool:
-    """Treat dangling links and unreadable files conservatively."""
-    try:
-        path.lstat()
-    except FileNotFoundError:
-        return False
-    return True
-
-
-def has_claude_managed_files(directory: Path) -> bool:
-    """Detect the system policy file or a visible JSON drop-in."""
-    if file_present(directory / "managed-settings.json"):
-        return True
-    drop_ins = directory / "managed-settings.d"
-    return file_present(drop_ins) and any(
-        path.suffix == ".json" and not path.name.startswith(".")
-        for path in drop_ins.iterdir()
-    )
-
-
-def has_claude_managed_preferences(home: Path) -> bool:
-    """Check the macOS policy domain without keeping any preference values."""
-    import pwd
-
-    domain = "com.anthropic.claudecode"
-    managed = Path("/Library/Managed Preferences")
-    username = pwd.getpwuid(os.getuid()).pw_name
-    preferences = (
-        managed,
-        managed / username,
-        home / "Library/Managed Preferences",
-        Path("/Library/Preferences"),
-    )
-    if any(file_present(path / f"{domain}.plist") for path in preferences):
-        return True
-    result = subprocess.run(
-        ["/usr/bin/defaults", "read", domain],
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        env={**os.environ, "LC_ALL": "C"},
-        timeout=5,
-        check=False,
-    )
-    return (
-        result.returncode != 1
-        or f"Domain {domain} does not exist".encode() not in result.stderr
-    )
-
-
-def main_checkout(root: Path) -> Path | None:
-    """Find a linked worktree's shared checkout for Claude's local settings."""
-    marker = root / ".git"
-    if not marker.is_file():
-        return None
-    _, separator, git_dir = (
-        marker.read_text(encoding="utf-8").strip().partition("gitdir: ")
-    )
-    if not separator or not git_dir:
-        return None
-    metadata = root / git_dir
-    try:
-        common = (metadata / "commondir").read_text(encoding="utf-8").strip()
-    except FileNotFoundError:
-        return None
-    shared = (metadata / common).resolve()
-    if shared.name != ".git":
-        raise ClaudeMcpPolicyError(
-            "Could not locate Claude Code's shared local settings"
-        )
-    return shared.parent
-
-
-def claude_command_denied(rule: object, argv: list[str]) -> bool:
-    # Claude expands both sides. Settings can set values outside Sai's
-    # environment, so treat an expansion as a potential match.
-    return (
-        isinstance(rule, list)
-        and len(rule) == len(argv)
-        and all(
-            isinstance(denied, str)
-            and (denied == actual or "${" in denied or "${" in actual)
-            for denied, actual in zip(rule, argv, strict=True)
-        )
-    )
-
-
-def claude_denied_entry(
-    paths: list[Path], scope: str, name: str, argv: list[str], replacement: list[str]
-) -> str | None:
-    """Identify any applicable denial of the old or proposed entry."""
-    for path in paths:
-        data = load_json(path) or {}
-        rules = data.get("deniedMcpServers", [])
-        disabled = data.get("disabledMcpjsonServers", []) if scope == "project" else []
-        if not isinstance(rules, list) or not isinstance(disabled, list):
-            raise ClaudeMcpPolicyError("Could not check Claude Code MCP deny rules")
-        if name in disabled:
-            return "existing entry"
-        for rule in rules:
-            if not isinstance(rule, dict):
-                continue
-            command = rule.get("serverCommand")
-            if rule.get("serverName") == name or claude_command_denied(command, argv):
-                return "existing entry"
-            if claude_command_denied(command, replacement):
-                return "replacement command"
-    return None
-
-
 def entry_registration(
     entry: Any,
     scope: str,
@@ -468,6 +374,7 @@ def entry_registration(
         extra_settings,
         fingerprint,
         invalid_sai_home="SAI_HOME" in env and not isinstance(home, str),
+        stdio=entry.get("type", "stdio") == "stdio" and "url" not in entry,
     )
 
 
@@ -591,7 +498,9 @@ class Client:
     def registration(self, scope: str, name: str = NAME) -> Registration | None:
         return next((r for r in self.registrations(name) if r.scope == scope), None)
 
-    def add_steps(self, scope: str, target: Target) -> list[list[str]]:
+    def add_steps(
+        self, scope: str, target: Target, name: str = NAME
+    ) -> list[list[str]]:
         raise NotImplementedError
 
     def remove_steps(self, scope: str, name: str = NAME) -> list[list[str]]:
@@ -619,95 +528,6 @@ class Claude(Client):
         configured = self.environ.get("CLAUDE_CONFIG_DIR")
         return (Path(configured) if configured else self.home) / ".claude.json"
 
-    def deny_settings_paths(self, scope: str, cwd: Path | None) -> list[Path]:
-        config = self.home_dir()
-        paths = [config / "settings.json"]
-        projects = {cwd} if cwd is not None else set()
-        if scope == "user":
-            # A shared registration can be denied in another Claude project.
-            known = (load_json(self.config_path()) or {}).get("projects")
-            if isinstance(known, dict):
-                projects.update(
-                    Path(path) for path in known if Path(path).is_absolute()
-                )
-        settings_dirs = set(projects)
-        shared_local = set()
-        for project in projects:
-            # Newer Claude releases can keep settings at the Git root.
-            root = next(
-                (
-                    parent
-                    for parent in (project, *project.parents)
-                    if (parent / ".git").exists()
-                ),
-                None,
-            )
-            if root is not None:
-                settings_dirs.add(root)
-                if (checkout := main_checkout(root)) is not None:
-                    shared_local.add(checkout)
-        paths.extend(
-            project / ".claude" / name
-            for project in settings_dirs
-            for name in ("settings.json", "settings.local.json")
-        )
-        paths.extend(
-            project / ".claude/settings.local.json" for project in shared_local
-        )
-        return paths
-
-    def opaque_policy_source(self) -> str | None:
-        if sys.platform not in ("linux", "darwin") or self.environ.get(
-            "WSL_DISTRO_NAME"
-        ):
-            return "Sai cannot verify Claude Code's platform policy"
-        # A Claude invocation can add private settings that are not on disk.
-        if self.environ.get("CLAUDECODE"):
-            return "Sai cannot verify settings for the current Claude Code session"
-        if file_present(self.home_dir() / "remote-settings.json"):
-            return "A Claude Code server-managed settings cache exists"
-        if sys.platform == "darwin":
-            managed = Path("/Library/Application Support/ClaudeCode")
-            if has_claude_managed_preferences(self.home):
-                return "A macOS Claude Code managed preference domain may be active"
-        else:
-            managed = Path("/etc/claude-code")
-        if has_claude_managed_files(managed):
-            return "A Claude Code managed settings file exists"
-        return None
-
-    def check_repair_policy(
-        self,
-        scope: str,
-        name: str,
-        argv: list[str],
-        replacement: list[str],
-        policy_cwd: Path | None,
-    ) -> None:
-        try:
-            opaque = self.opaque_policy_source()
-            denied = (
-                claude_denied_entry(
-                    self.deny_settings_paths(scope, policy_cwd or self.cwd),
-                    scope,
-                    name,
-                    argv,
-                    replacement,
-                )
-                if opaque is None
-                else None
-            )
-        except (ClientError, OSError, ValueError, KeyError, subprocess.TimeoutExpired):
-            raise ClaudeMcpPolicyError(
-                "Could not check Claude Code MCP deny rules"
-            ) from None
-        if denied:
-            raise ClaudeMcpPolicyError(
-                f"A Claude Code MCP deny rule matches the {denied}"
-            )
-        if opaque:
-            raise ClaudeMcpPolicyError(opaque)
-
     def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
@@ -727,10 +547,12 @@ class Claude(Client):
             found.append(entry_registration(shared, "project"))
         return self.ordered([r for r in found if r is not None])
 
-    def add_steps(self, scope: str, target: Target) -> list[list[str]]:
+    def add_steps(
+        self, scope: str, target: Target, name: str = NAME
+    ) -> list[list[str]]:
         exe = self.require_exe()
         env = [f"--env={k}={v}" for k, v in target.env.items()]
-        return [[exe, "mcp", "add", "--scope", scope, NAME, *env, "--", *target.argv]]
+        return [[exe, "mcp", "add", "--scope", scope, name, *env, "--", *target.argv]]
 
     def remove_steps(self, scope: str, name: str = NAME) -> list[list[str]]:
         return [[self.require_exe(), "mcp", "remove", "--scope", scope, name]]
@@ -968,10 +790,10 @@ def list_clients(
 
 
 def replacement_steps(
-    client: Client, scope: str, target: Target, existing_name: str | None
+    client: Client, scope: str, target: Target, name: str, exists: bool
 ) -> list[list[str]]:
-    remove = client.remove_steps(scope, existing_name) if existing_name else []
-    return [*remove, *client.add_steps(scope, target)]
+    remove = client.remove_steps(scope, name) if exists else []
+    return [*remove, *client.add_steps(scope, target, name)]
 
 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
@@ -982,6 +804,12 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             client.require_exe()
         found = client.registrations()
         existing = next((r for r in found if r.scope == scope), None)
+        name = NAME
+        if existing is None and isinstance(client, Claude):
+            existing = client.registration(scope, RETIRED_NAME)
+            if existing is not None:
+                name = RETIRED_NAME
+                result.name = name
         winner = client.effective(found)
         if (
             winner is not None
@@ -999,7 +827,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = replacement_steps(client, scope, target, NAME if existing else None)
+            steps = replacement_steps(client, scope, target, name, existing is not None)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", action
@@ -1013,7 +841,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
                 # changed the client.
                 result.changed = True
         result.changed = True
-        client.verify(scope, target)
+        client.verify(scope, target, name=name)
         result.action = action
     except (ClientError, OSError) as exc:
         result.action, result.error = "failed", str(exc)
@@ -1347,29 +1175,41 @@ def repair_path(client: Client, scope: str) -> Path:
 
 
 def replace_registration(
-    client: Client, stale: StaleRegistration, target: Target, policy_cwd: Path | None
+    client: Client, stale: StaleRegistration, target: Target
 ) -> None:
-    """Repair the existing entry without changing its name or client policy."""
+    """Automatically repair an existing Codex or Cursor entry."""
     scope, name = stale.registration.scope, stale.name
     if stale.args is None or scope in client.read_only_scopes:
         raise ClientError("This registration needs a manual edit")
-    launcher = target.argv[0]
-    expected = Target([launcher, *stale.args])
     if isinstance(client, Codex):
+        expected = Target([target.argv[0], *stale.args])
         path = client.config_path(scope)
         edit_codex_config(path, expected, stale=stale)
         actual = client.get(client.neutral_dir(), "user", name)
         if actual is None or actual.argv != expected.argv:
             raise ClientError("Codex did not load the repaired Sai registration")
         return
+    if not isinstance(client, Cursor):
+        raise ClientError("Only Codex and Cursor support automatic repair")
+    replace_json_registration(client, stale, target.argv[0], stale.args)
+
+
+def replace_json_registration(
+    client: Claude | Cursor, stale: StaleRegistration, launcher: str, args: list[str]
+) -> None:
+    scope, name = stale.registration.scope, stale.name
     path = repair_path(client, scope)
     config = read_client_config(client, scope, path)
-    entry = repair_entry(config.entries, stale)
     if isinstance(client, Claude):
-        client.check_repair_policy(
-            scope, name, stale.registration.argv, expected.argv, policy_cwd
-        )
-    entry["command"], entry["args"] = launcher, stale.args
+        entry = config.entries.get(name)
+        if (
+            not isinstance(entry, MutableMapping)
+            or entry_registration(entry, scope) != stale.registration
+        ):
+            raise ClientError("The Sai registration changed concurrently")
+    else:
+        entry = repair_entry(config.entries, stale)
+    entry["command"], entry["args"] = launcher, args
     # Publish a complete entry in one rename. In particular, Claude must
     # never observe a replacement that is missing its profile or endpoints.
     if not replace_bytes(
@@ -1378,13 +1218,62 @@ def replace_registration(
         raise ClientError("The Sai registration changed concurrently")
 
 
+def claude_repair_args(stale: StaleRegistration) -> list[str] | None:
+    if stale.args is not None:
+        return stale.args
+    if not stale.registration.argv:
+        return None
+    args = stale.registration.argv[1:]
+    if serves_mcp(args):
+        return args
+    replacement = ["mcp", "serve", *args]
+    return replacement if serves_mcp(replacement) else None
+
+
+def repair_claude_existing(
+    client: Claude,
+    scope: str,
+    name: str,
+    target: Target,
+    dry_run: bool,
+    *,
+    reset_args: bool,
+) -> Result:
+    """Explicitly repair a named entry. Refuse if the entry disappeared."""
+    result = Result(client.name, "failed", scope=scope, name=name)
+    try:
+        existing = client.registration(scope, name)
+        if existing is None:
+            raise ClientError(f"No existing {name} registration in {scope} scope")
+        if not existing.stdio:
+            raise ClientError("The existing Claude Code entry uses a remote transport")
+        stale = stale_registration(client, name, existing)
+        if stale is None:
+            result.action = "unchanged"
+            return result
+        args = target.argv[1:] if reset_args else claude_repair_args(stale)
+        if args is None:
+            raise ClientError(
+                "Unsupported server arguments. Use --reset-args to replace them with the defaults."
+            )
+        if dry_run:
+            result.action, result.would = "planned", "replaced"
+        else:
+            replace_json_registration(client, stale, target.argv[0], args)
+            result.action, result.changed = "replaced", True
+    except ClientError as exc:
+        result.error = str(exc)
+    except (OSError, ValueError):
+        result.error = "Could not edit the Claude Code registration"
+    return result
+
+
 def check_registration(
     client: Client,
     target: Target | None,
     *,
     fix: bool,
     compare_profile: bool,
-    policy_cwd: Path | None,
 ) -> RegistrationCheck:
     """Inspect recognized Sai registrations without exposing client data."""
     name = client.name
@@ -1411,6 +1300,30 @@ def check_registration(
     stale = [issue for _, issue in inspected if issue is not None]
     legacy_name = any(server == RETIRED_NAME for server, _ in found)
     legacy_warning = f"Sai retains its existing {RETIRED_NAME} registration name"
+    if stale and isinstance(client, Claude):
+        repairs = tuple(
+            ClaudeRepair(
+                issue.registration.scope, issue.name, claude_repair_args(issue) is None
+            )
+            for issue in stale
+            if issue.registration.stdio
+        )
+        hint = claude_repair_hint(repairs) if repairs else ""
+        if len(repairs) < len(stale):
+            hint = (
+                hint + " Review the remote Sai registration in Claude Code."
+            ).strip()
+        return RegistrationCheck(
+            name,
+            "fail",
+            ". ".join(
+                f"{issue.registration.scope} {issue.name}: {issue.reason}"
+                for issue in stale
+            ),
+            hint,
+            legacy_name=legacy_name,
+            manual_repairs=repairs,
+        )
     expected_env = server_env(client.environ) if compare_profile else {}
     different_profile = compare_profile and any(
         not reg.matches_sai_home(expected_env) for reg, _ in inspected
@@ -1422,7 +1335,7 @@ def check_registration(
         and Path(reg.argv[0]).resolve() != Path(target.argv[0]).resolve()
         for reg, issue in inspected
     )
-    changes, failures, blocked = [], [], []
+    changes, failures = [], []
     for issue in stale:
         scope = issue.registration.scope
         if issue.args is None or scope in client.read_only_scopes:
@@ -1435,9 +1348,7 @@ def check_registration(
             failures.append((issue.reason, "Run `sai doctor` with fixes enabled"))
         else:
             try:
-                replace_registration(client, issue, target, policy_cwd)
-            except ClaudeMcpPolicyError as exc:
-                blocked.append(f"Skipped {scope} repair. {exc}")
+                replace_registration(client, issue, target)
             except (ClientError, OSError, ValueError, TOMLKitError, TypeError):
                 failures.append(
                     (
@@ -1471,21 +1382,18 @@ def check_registration(
             )
     if failures:
         summary, hint = failures[0]
-        if blocked:
-            summary += ". " + ". ".join(blocked)
         if legacy_name:
             summary += f". {legacy_warning}"
         return RegistrationCheck(
             name,
             "fail",
             summary,
-            CLAUDE_POLICY_REPAIR_HINT if blocked else hint,
+            hint,
             tuple(changes),
             legacy_name=legacy_name,
-            policy_blocked=bool(blocked),
         )
-    if pinned or different_profile or legacy_name or blocked:
-        warnings = blocked
+    if pinned or different_profile or legacy_name:
+        warnings = []
         if pinned:
             warnings.append("Sai uses a pinned launcher from a different install")
         if different_profile:
@@ -1496,17 +1404,10 @@ def check_registration(
             name,
             "warn",
             ". ".join(warnings),
-            CLAUDE_POLICY_REPAIR_HINT
-            if blocked
-            else (
-                "Check SAI_HOME in the client registration"
-                if different_profile
-                else None
-            ),
+            "Check SAI_HOME in the client registration" if different_profile else None,
             changes=tuple(changes),
             pinned=pinned,
             legacy_name=legacy_name,
-            policy_blocked=bool(blocked),
         )
     if not changes:
         return RegistrationCheck(name, "pass", "Sai registration is current")
@@ -1521,7 +1422,6 @@ def check_registrations(
     fix: bool,
     cwd: Path | None,
     compare_profile: bool = False,
-    policy_cwd: Path | None = None,
 ) -> list[RegistrationCheck]:
     """Report only for detected clients, without running any registered server."""
     clients = make_clients(Path.home(), os.environ, cwd)
@@ -1531,7 +1431,6 @@ def check_registrations(
             target,
             fix=fix,
             compare_profile=compare_profile,
-            policy_cwd=policy_cwd,
         )
         for client in clients.values()
         if client.detected()[0]
