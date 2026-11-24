@@ -59,8 +59,15 @@ def _checked(
         before_submit(preview)
     except PreviewRefused as exc:
         if exc.preview is not None and estimate is not None:
-            exc.preview["estimates"] = estimate(exc.preview)
+            _attach_estimates(exc.preview, estimate(exc.preview))
         raise
+
+
+def _attach_estimates(preview: dict[str, Any], values: dict[str, Any]) -> None:
+    preview["estimates"] = values
+    if estimates.rejection_reason(values) is not None:
+        preview.pop("quote", None)
+        preview.pop("previewDigest", None)
 
 
 def _ignore(_message: str) -> None:
@@ -85,7 +92,7 @@ def preview_or_submit(
     preview = {"dryRun": True, "intent": payload}
     if dry_run:
         if estimate is not None:
-            preview["estimates"] = estimate(preview)
+            _attach_estimates(preview, estimate(preview))
         return preview
     active = get_session()
     _checked(before_submit, preview, estimate)
@@ -198,8 +205,7 @@ def open_trade(
         execution_estimates = estimate({})
         if (
             market_error is not None
-            and execution_estimates.get("execution", {}).get("status")
-            != "would_be_rejected"
+            and estimates.rejection_reason(execution_estimates) is None
         ):
             raise market_error
         preview = {
@@ -353,16 +359,13 @@ def _estimate_position(
     target: Decimal | None = None,
     updates_triggers: bool = False,
 ) -> dict[str, Any]:
-    state, effective, height = None, None, None
+    state = None
     if lcd is not None:
         try:
             addr = get_session()["evmAddress"]
-            state = margin.snapshot(endpoint, lcd, addr, trade_id)
-            if target is not None or updates_triggers:
-                height = margin.verified_position_height(lcd, state, trade_id)
-                effective, _ = margin.leverage_inputs(
-                    lcd, state, trade_id, height=height
-                )
+            state = margin.snapshot(
+                endpoint, lcd, addr, trade_id, require_open_market=target is None
+            )
         except estimates.READ_ERRORS:
             pass
     if target is None and not updates_triggers:
@@ -370,10 +373,8 @@ def _estimate_position(
     return estimates.position_estimates(
         lcd or "",
         state,
-        effective,
+        trade_id,
         target=target,
-        updates_triggers=updates_triggers,
-        height=height,
     )
 
 
@@ -392,7 +393,7 @@ def _position_preview(
 ) -> dict[str, Any]:
     state, inputs, preview = build()
     if dry_run:
-        preview["estimates"] = estimate(state, inputs, preview)
+        _attach_estimates(preview, estimate(state, inputs, preview))
         return preview
 
     try:
@@ -412,7 +413,7 @@ def _position_preview(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
     if changed or fresh != preview:
-        fresh["estimates"] = estimate(state, inputs, fresh)
+        _attach_estimates(fresh, estimate(state, inputs, fresh))
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
     _checked(before_submit, fresh, lambda _: estimate(state, inputs, fresh))
     return fresh
@@ -438,13 +439,15 @@ def change_margin(
     addr = active["evmAddress"]
 
     def build_preview() -> PositionPreview:
-        state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
+        state = margin.snapshot(
+            endpoint, lcd_endpoint, addr, trade_id, require_open_market=not dry_run
+        )
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         if leverage is None:
             raise ValueError("Cannot verify effective leverage for this margin change")
         quote = margin.margin_quote(
             state.raw,
-            state.funds,
+            None if dry_run else state.funds,
             state.market,
             direction,
             amount,
@@ -477,8 +480,9 @@ def change_margin(
         estimate=lambda state, inputs, fresh: estimates.position_estimates(
             lcd_endpoint,
             state,
-            _quoted_leverage(inputs),
+            trade_id,
             target=Decimal(fresh["quote"]["requestedLeverage"]),
+            quoted_effective=_quoted_leverage(inputs),
         ),
     )
     if dry_run:

@@ -418,7 +418,14 @@ def trading_contract(endpoint: str, lcd: str) -> str:
     return route["contractAddress"]
 
 
-def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
+def snapshot(
+    endpoint: str,
+    lcd: str,
+    addr: str,
+    trade_id: int,
+    *,
+    require_open_market: bool = True,
+) -> PositionSnapshot:
     contract = trading_contract(endpoint, lcd)
     position = _position(endpoint, addr, trade_id, timeout=20)
     borrowing = position["perpBorrowing"]
@@ -437,7 +444,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         not market
         or market["marketId"] != borrowing["marketId"]
         or market["collateralToken"]["id"] != collateral["id"]
-        or not market["isOpen"]
+        or (require_open_market and not market["isOpen"])
     ):
         raise MarketUnavailable("Open market data is unavailable")
 
@@ -478,14 +485,24 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         if time.monotonic() >= end or not _same_margin(raw, position):
             raise IndexLag(INDEX_LAG)
     observed_at = intents.now()
-    funds = smart(
+    funds = exchange_balance(lcd, contract, trader, token)
+    return PositionSnapshot(raw, funds, market, contract, observed_at)
+
+
+def exchange_balance(
+    lcd: str, contract: str, trader: str, token: str, *, height: str | None = None
+) -> dict[str, Any]:
+    funds = smart_value(
         lcd,
         contract,
         {"get_exchange_balance": {"user": trader, "collateral_index": token}},
+        height=height,
     )
+    if not isinstance(funds, dict):
+        raise TypeError("Contract returned invalid exchange balance")
     if funds.get("collateral_index") != token:
         raise PositionChanged("Position changed. Review the margin change again.")
-    return PositionSnapshot(raw, funds, market, contract, observed_at)
+    return funds
 
 
 def contract_decimal(value: Any) -> Decimal:
@@ -606,7 +623,7 @@ def _same_margin(raw: dict[str, Any], position: dict[str, Any]) -> bool:
 
 def margin_quote(
     raw: dict[str, Any],
-    funds: dict[str, Any],
+    funds: dict[str, Any] | None,
     market: dict[str, Any],
     direction: str,
     amount: str,
@@ -651,7 +668,11 @@ def margin_quote(
     actual = after - collateral if direction == "add" else collateral - after
     if next_leverage == old or actual <= 0 or actual > delta:
         raise ValueError("Margin change is too small after rounding")
-    if direction == "add" and actual > int(funds["available_to_trade"]):
+    if (
+        funds is not None
+        and direction == "add"
+        and actual > int(funds["available_to_trade"])
+    ):
         raise ValueError("Insufficient balance on Sai")
     whole, fraction = divmod(next_leverage, 10**18)
     leverage = f"{whole}.{fraction:018d}".rstrip("0").rstrip(".")

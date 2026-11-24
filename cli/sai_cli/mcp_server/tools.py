@@ -135,14 +135,19 @@ def describe(exc: Exception) -> dict[str, Any]:
         )
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
-        return error(failure.message, failure.code, **extra, **exc.extra)
+        reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
+        return error(reason or failure.message, failure.code, **extra, **exc.extra)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
             return error(failure.message, Code.PREVIEW_MISMATCH)
+        reason = estimates.rejection_reason(exc.preview.get("estimates", {}))
         return error(
-            "The position or quote changed during confirmation, so nothing was"
-            " submitted. Show the user the latest preview, get their confirmation"
-            " again, then retry with its previewDigest.",
+            reason
+            or (
+                "The position or quote changed during confirmation, so nothing was"
+                " submitted. Show the user the latest preview, get their confirmation"
+                " again, then retry with its previewDigest."
+            ),
             Code.PREVIEW_MISMATCH,
             preview=with_digest(exc.preview),
         )
@@ -504,6 +509,8 @@ def preview_digest(preview: dict[str, Any]) -> str:
 
 
 def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
+    if estimates.rejection_reason(preview.get("estimates", {})) is not None:
+        return preview
     return {**preview, "previewDigest": preview_digest(preview)}
 
 
