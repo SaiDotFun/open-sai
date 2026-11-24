@@ -91,6 +91,10 @@ class _LCDStatusError(ValueError):
     def __init__(self, endpoint: str, response: httpx.Response) -> None:
         super().__init__(f"LCD at {endpoint} returned HTTP {response.status_code}")
         self.body = response.text
+        self.query_heights = (
+            response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}"),
+            response.headers.get(BLOCK_HEIGHT_HEADER),
+        )
 
 
 async def _resolve_lcd_host(
@@ -377,18 +381,14 @@ def quote_leverage_liquidates(
         )
     except QueryHeightMismatch as exc:
         failure = exc.__cause__
-        if not isinstance(failure, httpx.HTTPStatusError):
+        if not isinstance(failure, _LCDStatusError):
             return False
-        response = failure.response
         # The gateway may omit block metadata on contract errors. The request
         # pins the height and bypasses the LCD cache.
-        if any(
-            response.headers.get(header) not in (None, height)
-            for header in (f"grpc-metadata-{BLOCK_HEIGHT_HEADER}", BLOCK_HEIGHT_HEADER)
-        ):
+        if any(value not in (None, height) for value in failure.query_heights):
             return False
         try:
-            body = response.json()
+            body = json.loads(failure.body)
         except ValueError:
             return False
         message = body.get("message") if isinstance(body, dict) else None
