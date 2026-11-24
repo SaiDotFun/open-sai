@@ -93,6 +93,28 @@ def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def pair_leverage_cap(
+    lcd: str, contract: str, market_id: int, *, height: str | None = None
+) -> Decimal:
+    """Read Perp's custom cap, where an absent map entry means no override."""
+    try:
+        value = smart_value(
+            lcd,
+            contract,
+            {"get_pair_custom_max_leverage": {"index": market_id}},
+            height=height,
+        )
+    except ValueError as exc:
+        failure = exc.__cause__
+        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+            r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found",
+            failure.response.text,
+        ):
+            return Decimal(0)
+        raise
+    return contract_decimal(value)
+
+
 def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> Any:
     """Read the live order and distinguish Perp's missing-target error from a quote mismatch."""
     try:

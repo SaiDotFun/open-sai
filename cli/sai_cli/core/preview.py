@@ -100,13 +100,22 @@ def minimum_fee_usd(schedule: dict[str, Any]) -> int:
 
 
 def leverage_allowed(
-    market: dict[str, Any], requested: Decimal, current: Decimal | None = None
+    lcd: str,
+    contract: str,
+    pair: dict[str, Any],
+    market_id: int,
+    requested: Decimal,
+    *,
+    current: Decimal | None = None,
+    height: str | None = None,
 ) -> bool:
-    """Check the market's quoted group minimum and effective pair maximum."""
-    minimum = Decimal(str(market["minLeverage"]))
-    maximum = Decimal(str(market["maxLeverage"]))
-    if not (minimum.is_finite() and maximum.is_finite() and 0 < minimum <= maximum):
-        raise ValueError("Market leverage limits are unavailable")
+    """Apply Perp's group limits and any nonzero pair override."""
+    group = contract_group(lcd, contract, pair, height=height)
+    minimum = margin.contract_decimal(group["min_leverage"])
+    maximum = margin.contract_decimal(group["max_leverage"])
+    custom = margin.pair_leverage_cap(lcd, contract, market_id, height=height)
+    if custom:
+        maximum = min(maximum, custom)
     return (
         requested != current
         and requested <= maximum
@@ -240,11 +249,14 @@ def open_estimates(
             token_id = row["collateralToken"]["id"]
             contract = margin.trading_contract(endpoint, lcd)
             pair = contract_market(lcd, contract, body["market"]["marketIndex"])
+            leverage = Decimal(body["leverage"])
+            within_leverage = leverage_allowed(
+                lcd, contract, pair, row["marketId"], leverage
+            )
             schedule = fee_schedule(lcd, contract, pair)
             token = f"TokenIndex({token_id})"
             collateral_price = read_collateral_price(lcd, contract, token)
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))
-            leverage = Decimal(body["leverage"])
             notional = _notional(collateral, leverage)
             with localcontext() as context:
                 context.prec = 90
@@ -252,9 +264,9 @@ def open_estimates(
                 collateral_value = int(
                     int(notional * Decimal(collateral_price["price"])) / leverage
                 )
-                allowed = leverage_allowed(
-                    row, leverage
-                ) and collateral_value >= 5 * minimum_fee_usd(schedule)
+                allowed = within_leverage and collateral_value >= 5 * minimum_fee_usd(
+                    schedule
+                )
             if not allowed:
                 outside = unavailable(
                     "The open request is outside the market's collateral or leverage limits."
@@ -479,12 +491,20 @@ def position_estimates(
             outside = unavailable(
                 "The leverage request is outside the market's collateral or leverage limits."
             )
-            if not leverage_allowed(state.market, target, current=effective):
-                result["liquidationPrice"] = outside
-                return result
             pair = contract_market(
                 lcd, state.contract, raw["market_index"], height=height
             )
+            if not leverage_allowed(
+                lcd,
+                state.contract,
+                pair,
+                state.market["marketId"],
+                target,
+                current=effective,
+                height=height,
+            ):
+                result["liquidationPrice"] = outside
+                return result
             schedule = fee_schedule(lcd, state.contract, pair, height=height)
             open_rate = margin.contract_decimal(schedule["open_fee_p"])
             entry = price_input(

@@ -39,6 +39,8 @@ class Position:
     missing_trade_status: int = 400
     leverage: str = "2"
     max_leverage: int = 100
+    quoted_max_leverage: int | None = None
+    pair_leverage: str | None = "0"
     liquidation_threshold: str = "60"
     block_timestamp: int = 2_000_000_000
     oracle_base_age: int | None = None
@@ -105,7 +107,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     market_row = {
                         **market,
                         "price": position.price,
-                        "maxLeverage": position.max_leverage,
+                        "maxLeverage": position.max_leverage
+                        if position.quoted_max_leverage is None
+                        else position.quoted_max_leverage,
                     }
                 data = {
                     keeper.ROUTE: {
@@ -263,7 +267,23 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 }
             elif "get_group" in message:
                 assert message["get_group"] == {"index": "GroupIndex(0)"}
-                data = {"stale_price_expiration_secs": position.oracle_ttl}
+                data = {
+                    "stale_price_expiration_secs": position.oracle_ttl,
+                    "min_leverage": "1",
+                    "max_leverage": str(position.max_leverage),
+                }
+            elif "get_pair_custom_max_leverage" in message:
+                assert message["get_pair_custom_max_leverage"] == {"index": 0}
+                if position.pair_leverage is None:
+                    self.reply(
+                        {
+                            "code": 2,
+                            "message": "type: cosmwasm_std::math::decimal::Decimal; key: [00, 18] not found: query wasm contract failed",
+                        },
+                        status=500,
+                    )
+                    return
+                data = position.pair_leverage
             elif "get_fees" in message:
                 assert message["get_fees"] == {"index": "FeeIndex(0)"}
                 data = (
@@ -1421,5 +1441,47 @@ def test_null_market_price_preserves_close_preview_and_refusal(position_service)
             assert result["code"] == "PREVIEW_MISMATCH"
             assert result["preview"] == preview
             assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("indexed_cap", "pair_cap", "status"),
+    [
+        (0, "0", "estimate"),
+        (0, None, "estimate"),
+        (20, "4", "unavailable"),
+    ],
+)
+def test_preview_uses_perp_group_and_pair_leverage_limits(
+    position_service, indexed_cap, pair_cap, status
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.max_leverage = 20
+    position.quoted_max_leverage = indexed_cap
+    position.pair_leverage = pair_cap
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            opened = await call(
+                client,
+                "preview_open",
+                {
+                    "market_id": 0,
+                    "side": "long",
+                    "order_type": "limit",
+                    "price": "100",
+                    "amount": "10",
+                    "leverage": "5",
+                    "slippage": "1",
+                },
+            )
+            changed = await call(
+                client, "preview_leverage", {"trade_id": 7, "leverage": "5"}
+            )
+            assert opened["estimates"]["fees"]["status"] == status
+            assert opened["estimates"]["liquidationPrice"]["status"] == status
+            assert changed["estimates"]["liquidationPrice"]["status"] == status
 
     asyncio.run(scenario())
