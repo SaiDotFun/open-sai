@@ -59,7 +59,10 @@ def _checked(
         before_submit(preview)
     except PreviewRefused as exc:
         if exc.preview is not None and estimate is not None:
-            exc.preview["estimates"] = estimate(exc.preview)
+            values = estimate(exc.preview)
+            exc.preview["estimates"] = values
+            if estimates.close_oracle_time_unknown(values):
+                exc.preview.pop("previewDigest", None)
         raise
 
 

@@ -53,7 +53,7 @@ class Position:
     pair_leverage: str | None = "0"
     liquidation_threshold: str = "60"
     block_timestamp: int = 2_000_000_000
-    oracle_base_age: int | None = None
+    oracle_base_age: int | None = 0
     null_market_price: bool = False
     oracle_quote_age: int | None = None
     oracle_ttl: int = 300
@@ -1682,6 +1682,55 @@ def test_null_market_price_preserves_close_preview_and_refusal(position_service)
             )
             assert result["code"] == "PREVIEW_MISMATCH"
             assert result["preview"] == preview
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_close_previews_withhold_estimates_and_digests_without_oracle_time(
+    position_service,
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.price = "95"
+    position.liquidation_threshold = "96"
+    position.oracle_base_age = None
+
+    def assert_unavailable(preview):
+        execution = preview["estimates"]["execution"]
+        assert execution["status"] == "unavailable"
+        assert execution["code"] == "OraclePublicationTimeUnknown"
+        assert preview["estimates"]["fees"]["status"] == "unavailable"
+        assert "previewDigest" not in preview
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            for action, options in (("close", {}), ("partial_close", {"percent": 10})):
+                args = {"trade_id": 7, **options}
+                assert_unavailable(await call(client, f"preview_{action}", args))
+                refused = await call(
+                    client, f"trade_{action}", {**args, "preview_digest": "wrong"}
+                )
+                assert refused["code"] == "PREVIEW_MISMATCH"
+                assert_unavailable(refused["preview"])
+            result = CliRunner().invoke(
+                main,
+                [
+                    "--endpoint",
+                    f"{base_url}/query",
+                    "--lcd-endpoint",
+                    base_url,
+                    "--json",
+                    "trade",
+                    "partial-close",
+                    "7",
+                    "--percent",
+                    "10",
+                    "--dry-run",
+                ],
+            )
+            assert result.exit_code == 0, result.output
+            assert_unavailable(json.loads(result.stdout))
             assert position.submitted == []
 
     asyncio.run(scenario())

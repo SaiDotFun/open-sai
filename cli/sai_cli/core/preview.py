@@ -12,10 +12,15 @@ ATOM = Decimal("1e-18")
 LIQUIDATION_THRESHOLD = Decimal("0.90")
 LIQUIDATION_FEE_RATE = Decimal("0.05")
 READ_ERRORS = (ValueError, TypeError, KeyError, DecimalException, keeper.KeeperError)
+UNKNOWN_ORACLE_TIME = "OraclePublicationTimeUnknown"
 
 
 def unavailable(reason: str) -> dict[str, Any]:
     return {"status": "unavailable", "reason": reason}
+
+
+def close_oracle_time_unknown(estimates: dict[str, Any]) -> bool:
+    return estimates.get("execution", {}).get("code") == UNKNOWN_ORACLE_TIME
 
 
 def not_applicable(reason: str) -> dict[str, Any]:
@@ -385,6 +390,12 @@ def close_estimates(
         if not isinstance(oracle, dict):
             return result
         published_at = oracle_publication_time(oracle)
+        if published_at is None:
+            missing_time = unavailable("The oracle price publication time is unknown.")
+            return {
+                **dict.fromkeys(result, missing_time),
+                "execution": {**missing_time, "code": UNKNOWN_ORACLE_TIME},
+            }
         pair = None
         if published_at is not None:
             pair = contract_market(

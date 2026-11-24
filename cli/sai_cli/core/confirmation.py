@@ -8,6 +8,8 @@ import json
 from decimal import Decimal
 from typing import Any
 
+from .preview import close_oracle_time_unknown
+
 
 def canonical_price(value: object) -> str:
     """Write numerically equal prices as equal text."""
@@ -50,4 +52,6 @@ def preview_digest(preview: dict[str, Any]) -> str:
 
 
 def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
+    if close_oracle_time_unknown(preview.get("estimates", {})):
+        return {key: value for key, value in preview.items() if key != "previewDigest"}
     return {**preview, "previewDigest": preview_digest(preview)}
