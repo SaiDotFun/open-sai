@@ -5,6 +5,7 @@ from http.client import HTTPConnection
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import pytest
 from scenarios import ADDRESS, loopback
 from trade_replay import SESSION, TradeReplay
 
@@ -12,6 +13,21 @@ FIRST = "20261124T120000000Z_0123456789ABCDEF"
 SECOND = "20261124T120001000Z_0123456789ABCDEF"
 STAMP = "2026-11-24T12:00:00.000Z"
 OPERATIONS = json.loads(Path(__file__).with_name("keeper-requests.json").read_text())
+OPEN_BODY = {
+    "market": {"marketIndex": "MarketIndex(3)"},
+    "side": "long",
+    "orderType": "market",
+    "amountUsd": "20",
+    "intentPrice": "100",
+    "leverage": "2",
+    "maxSlippagePct": "1",
+}
+KEEP = {"operation": "keep"}
+UPDATE_BODY = {"takeProfit": KEEP, "stopLoss": KEEP, "requestedLeverage": "2"}
+PARTIAL_BODY = {
+    "collateral": {"amountUsdc": "5000000", "amountUsd": "5"},
+    "leverageDelta": "0",
+}
 
 
 def post(endpoint: str, operation: str, variables: dict, *, authenticated: bool):
@@ -31,15 +47,17 @@ def post(endpoint: str, operation: str, variables: dict, *, authenticated: bool)
         connection.close()
 
 
-def report(key: str, body: object, stamp: str = STAMP) -> dict:
+def report(
+    key: str, body: object, stamp: str = STAMP, *, kind: str = "CLOSE_POSITION"
+) -> dict:
     return {
         "input": {
             "intentKey": key,
             "intent": {
                 "intentSchemaVersion": "v0",
                 "tsIntentInit": stamp,
-                "kind": "CLOSE_POSITION",
-                "target": {"userTradeId": "7"},
+                "kind": kind,
+                **({"target": {"userTradeId": "7"}} if kind != "OPEN_TRADE" else {}),
                 "body": body,
             },
             "lifecycle": {
@@ -71,6 +89,75 @@ def test_rejects_invalid_body_before_admission():
             {"user": ADDRESS, "key": FIRST},
             authenticated=False,
         ) == (200, {"data": {"userIntents": []}})
+
+
+@pytest.mark.parametrize(
+    ("kind", "body"),
+    [
+        ("OPEN_TRADE", {key: val for key, val in OPEN_BODY.items() if key != "market"}),
+        ("OPEN_TRADE", {**OPEN_BODY, "market": {}}),
+        ("OPEN_TRADE", {**OPEN_BODY, "market": {"marketIndex": "MarketIndex(-1)"}}),
+        (
+            "OPEN_TRADE",
+            {**OPEN_BODY, "market": {"marketIndex": f"MarketIndex({2**64})"}},
+        ),
+        ("OPEN_TRADE", {**OPEN_BODY, "amountUsd": "twenty"}),
+        ("OPEN_TRADE", {**OPEN_BODY, "amountUsd": "1.0000001"}),
+        ("OPEN_TRADE", {**OPEN_BODY, "intentPrice": "0"}),
+        ("OPEN_TRADE", {**OPEN_BODY, "leverage": str(2**128)}),
+        ("OPEN_TRADE", {**OPEN_BODY, "maxSlippagePct": "100.001"}),
+        ("OPEN_TRADE", {**OPEN_BODY, "maxSlippagePct": "0.00000000000000001"}),
+        ("OPEN_TRADE", {**OPEN_BODY, "stopLoss": 50}),
+        ("CANCEL_PENDING_TRADE", {"invalid": True}),
+        ("UPDATE_TRADE", {"takeProfit": KEEP, "stopLoss": KEEP}),
+        ("UPDATE_TRADE", {**UPDATE_BODY, "requestedLeverage": "0"}),
+        ("UPDATE_TRADE", {**UPDATE_BODY, "stopLoss": {"operation": "clear"}}),
+        (
+            "UPDATE_TRADE",
+            {"takeProfit": {"operation": "set", "value": "abc"}, "stopLoss": KEEP},
+        ),
+        ("DECREASE_POSITION_SIZE", {"sizeDelta": "1", "leverageDelta": "0"}),
+        ("DECREASE_POSITION_SIZE", {"collateral": PARTIAL_BODY["collateral"]}),
+        (
+            "DECREASE_POSITION_SIZE",
+            {**PARTIAL_BODY, "collateral": {"amountUsdc": "5000000", "amountUsd": "6"}},
+        ),
+        (
+            "DECREASE_POSITION_SIZE",
+            {
+                **PARTIAL_BODY,
+                "collateral": {"amountUsdc": str(2**128), "amountUsd": "5"},
+            },
+        ),
+    ],
+)
+def test_rejects_invalid_action_before_admission(kind, body):
+    replay = TradeReplay(kind=kind, entity="" if kind == "OPEN_TRADE" else "7")
+    with loopback("default", trade_replay=replay) as endpoints:
+        status, _ = post(
+            endpoints.keeper,
+            "recordUserIntent",
+            report(FIRST, body, kind=kind),
+            authenticated=True,
+        )
+        assert status == 400
+        assert replay.attempts() == {FIRST: 1}
+        assert not replay.admitted_keys()
+        assert not replay.arrived.is_set()
+
+
+@pytest.mark.parametrize("fields", [{"evmAddress": "0x" + "f" * 40}, {"signedTx": ""}])
+def test_rejects_invalid_handoff_before_admission(fields):
+    replay = TradeReplay()
+    variables = report(FIRST, {})
+    variables["input"].update(fields)
+    with loopback("default", trade_replay=replay) as endpoints:
+        status, _ = post(
+            endpoints.keeper, "recordUserIntent", variables, authenticated=True
+        )
+        assert status == 400
+        assert replay.attempts() == {FIRST: 1}
+        assert not replay.admitted_keys()
 
 
 def test_replays_identical_report_and_admits_distinct_intent():

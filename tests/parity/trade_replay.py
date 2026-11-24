@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import re
 import threading
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from compare import INTENT_ID, timestamp
@@ -13,6 +15,12 @@ from scenarios import ADDRESS, PROTOCOL
 
 SESSION = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
 REQUEST_HASH = "a" * 64
+MARKET_INDEX = re.compile(r"MarketIndex\(([0-9]+)\)")
+UNSIGNED = re.compile(r"[0-9]+")
+DECIMAL = re.compile(r"(0|[1-9][0-9]*)(?:\.([0-9]{1,18}))?")
+UINT64_MAX = 2**64 - 1
+UINT128_MAX = 2**128 - 1
+ATOMS_PER_USDC = 10**12  # Contract Decimal has 18 places, USDC has 6.
 Phase = Literal["absent", "pending", "filled"]
 
 
@@ -112,13 +120,25 @@ class TradeReplay:
             raise TypeError("Malformed intent mutation")
         intent = envelope.get("intent")
         stamp = intent.get("tsIntentInit") if isinstance(intent, dict) else None
+        address = envelope.get("evmAddress")
         if (
-            not INTENT_ID.fullmatch(key)
+            not key.isascii()
+            or not INTENT_ID.fullmatch(key)
             or authorization != f"Bearer {SESSION['token']}"
+            or envelope.get("signedTx") is not None
+            or (
+                address is not None
+                and (
+                    not isinstance(address, str)
+                    or address.strip().lower() not in ("", ADDRESS.lower())
+                )
+            )
             or not isinstance(intent, dict)
             or intent.get("intentSchemaVersion") != "v0"
             or intent.get("kind") != self.kind
+            or not isinstance(stamp, str)
             or not timestamp(stamp)
+            or datetime.fromisoformat(stamp) == datetime.min.replace(tzinfo=UTC)
             or not same_variables(
                 envelope.get("lifecycle"),
                 {"sequence": 1, "lifecycleStep": "jwt_pass", "tsLifecycleStep": stamp},
@@ -138,54 +158,42 @@ class TradeReplay:
         return {"data": {"recordUserIntent": self._record(key, "jwt_pass")}}
 
     def _validate_payload(self, intent: dict[str, Any]) -> None:
-        # Keeper's userintent.validateIntent, for the action kinds replayed here.
+        # Apply Keeper's report validation and BuildIntentTradeMsg checks before
+        # exposing the admission to readers.
         body, target = intent.get("body"), intent.get("target")
+        height, block_time = (
+            intent.get("blockIntentInit"),
+            intent.get("blockTsIntentInit"),
+        )
+        extensions = intent.get("extensions")
+        if (
+            (height is not None and (type(height) is not int or height < 0))
+            or (block_time is not None and not timestamp(block_time))
+            or (extensions is not None and not isinstance(extensions, dict))
+        ):
+            raise ValueError("Invalid intent metadata")
         if not isinstance(body, dict):
             raise TypeError("Intent body must be an object")
         if self.kind == "OPEN_TRADE":
             if target is not None:
                 raise ValueError("OPEN_TRADE must not set target")
-            if (
-                body.get("orderType") not in ("market", "limit", "stop")
-                or body.get("side") not in ("long", "short")
-                or not all(
-                    nonempty_string(body.get(name))
-                    for name in (
-                        "intentPrice",
-                        "maxSlippagePct",
-                        "amountUsd",
-                        "leverage",
-                    )
-                )
-            ):
-                raise ValueError("Invalid open order body")
+            validate_open(body)
             return
         if (
             not isinstance(target, dict)
-            or not nonempty_string(target.get("userTradeId"))
+            or unsigned_int(target.get("userTradeId"), UINT64_MAX) is None
             or target["userTradeId"] != self.entity
         ):
             raise ValueError("Expected target.userTradeId for the replayed position")
-        if self.kind in {"CLOSE_POSITION", "CANCEL_PENDING_TRADE"} and body:
-            raise ValueError(f"{self.kind} body must be empty")
-        if self.kind == "UPDATE_TRADE":
-            for name in ("takeProfit", "stopLoss"):
-                patch = body.get(name)
-                operation = patch.get("operation") if isinstance(patch, dict) else None
-                if operation not in ("keep", "clear") and (
-                    operation != "set"
-                    or not nonempty_string(
-                        patch.get("value") if isinstance(patch, dict) else None
-                    )
-                ):
-                    raise ValueError(f"Invalid {name} patch")
-            leverage = body.get("requestedLeverage")
-            if leverage is not None and not nonempty_string(leverage):
-                raise ValueError("requestedLeverage must be a nonempty string")
-        if self.kind == "DECREASE_POSITION_SIZE" and all(
-            body.get(name) is None for name in ("collateral", "sizeDelta")
-        ):
-            raise ValueError("Position size change requires collateral or sizeDelta")
+        if self.kind in {"CLOSE_POSITION", "CANCEL_PENDING_TRADE"}:
+            if body:
+                raise ValueError(f"{self.kind} body must be empty")
+        elif self.kind == "UPDATE_TRADE":
+            validate_update(body)
+        elif self.kind == "DECREASE_POSITION_SIZE":
+            validate_partial_close(body)
+        else:
+            raise ValueError("Unsupported trade action in replay")
 
     def _record(self, key: str, step: str) -> dict[str, Any]:
         return {
@@ -221,5 +229,85 @@ class TradeReplay:
         }
 
 
-def nonempty_string(value: object) -> bool:
-    return isinstance(value, str) and bool(value.strip())
+def unsigned_int(value: object, maximum: int) -> int | None:
+    if not isinstance(value, str) or not UNSIGNED.fullmatch(value):
+        return None
+    digits = value.lstrip("0") or "0"
+    if len(digits) > len(str(maximum)):
+        return None
+    number = int(digits)
+    return number if number <= maximum else None
+
+
+def decimal_atomics(value: object, field: str, *, positive: bool = False) -> int:
+    match = DECIMAL.fullmatch(value) if isinstance(value, str) else None
+    if match is None:
+        raise ValueError(f"Invalid {field} decimal")
+    whole, fraction = match.groups()
+    number = unsigned_int(whole + (fraction or "").ljust(18, "0"), UINT128_MAX)
+    if number is None or (positive and number == 0):
+        raise ValueError(f"Invalid {field} decimal")
+    return number
+
+
+def validate_open(body: dict[str, Any]) -> None:
+    market = body.get("market")
+    index = market.get("marketIndex") if isinstance(market, dict) else None
+    match = MARKET_INDEX.fullmatch(index) if isinstance(index, str) else None
+    if match is None or unsigned_int(match[1], UINT64_MAX) is None:
+        raise ValueError("Invalid market.marketIndex")
+    if body.get("orderType") not in ("market", "limit", "stop") or body.get(
+        "side"
+    ) not in ("long", "short"):
+        raise ValueError("Invalid open order type or side")
+    amount = decimal_atomics(body.get("amountUsd"), "amountUsd", positive=True)
+    if amount % ATOMS_PER_USDC:
+        raise ValueError("amountUsd exceeds six-decimal collateral precision")
+    for name in ("intentPrice", "leverage"):
+        decimal_atomics(body.get(name), name, positive=True)
+    for name in ("takeProfit", "stopLoss"):
+        if body.get(name) is not None:
+            decimal_atomics(body[name], name)
+    slippage = decimal_atomics(body.get("maxSlippagePct"), "maxSlippagePct")
+    if slippage > 100 * 10**18 or slippage % 100:
+        raise ValueError(
+            "Slippage must be at most 100% and exact as a contract fraction"
+        )
+
+
+def validate_update(body: dict[str, Any]) -> None:
+    changes_trigger = False
+    for name in ("takeProfit", "stopLoss"):
+        patch = body.get(name)
+        if not isinstance(patch, dict):
+            raise TypeError(f"{name} patch must be an object")
+        operation = patch.get("operation")
+        if operation not in ("keep", "clear", "set"):
+            raise ValueError(f"Invalid {name} patch")
+        value = patch.get("value")
+        if value is not None and not isinstance(value, str):
+            raise ValueError(f"Invalid {name} patch value")
+        if operation == "set":
+            decimal_atomics(value, name, positive=True)
+        changes_trigger |= operation != "keep"
+    leverage = body.get("requestedLeverage")
+    if leverage is not None:
+        if changes_trigger:
+            raise ValueError("TP/SL and leverage changes require separate intents")
+        decimal_atomics(leverage, "requestedLeverage", positive=True)
+    elif not changes_trigger:
+        raise ValueError("UPDATE_TRADE keeps both triggers and leverage")
+
+
+def validate_partial_close(body: dict[str, Any]) -> None:
+    collateral = body.get("collateral")
+    if not isinstance(collateral, dict):
+        raise TypeError("Partial close requires a collateral object")
+    usdc = collateral.get("amountUsdc")
+    units = unsigned_int(usdc, UINT128_MAX)
+    if units is None or usdc != str(units):
+        raise ValueError("Invalid collateral.amountUsdc")
+    amount = decimal_atomics(collateral.get("amountUsd"), "collateral.amountUsd")
+    if amount != units * ATOMS_PER_USDC:
+        raise ValueError("collateral.amountUsdc differs from collateral.amountUsd")
+    decimal_atomics(body.get("leverageDelta"), "leverageDelta")
