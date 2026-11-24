@@ -1,4 +1,4 @@
-"""Rehearse a sai-cli release wheel against the published v0.1.0 install."""
+"""Rehearse a sai-cli release wheel against a published install."""
 
 from __future__ import annotations
 
@@ -26,15 +26,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any, NamedTuple, TypeVar
 
-TESTS = Path(__file__).resolve().parents[1] / "cli" / "sai_cli" / "tests"
-sys.path.insert(0, str(TESTS))
+SCRIPTS = Path(__file__).resolve().parent
+TESTS = SCRIPTS.parent / "cli" / "sai_cli" / "tests"
+sys.path[:0] = [str(SCRIPTS), str(TESTS)]
+import install as release_install
 from loopback_keeper import KeeperHandler, keeper_server
 
-BASELINE = "0.1.0"
-REPO = "SaiDotFun/open-sai"
-INSTALLER = (
-    f"https://raw.githubusercontent.com/{REPO}/sai-cli/v{BASELINE}/scripts/install.py"
-)
+REPO = release_install.REPO
+VERSION = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}"
 CLIENTS = ("claude", "codex")
 SYNTHETIC_TOKEN = "release-rehearsal-fixture-only"
 CHAIN = "cataclysm-1"
@@ -200,6 +199,21 @@ def communicate(
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RehearsalError(message)
+
+
+def resolve_baseline(
+    api_base: str = release_install.API_BASE, web_base: str = release_install.WEB_BASE
+) -> str:
+    try:
+        tag = release_install.find_latest(api_base, web_base)
+    except release_install.LookupFailed as exc:
+        raise RehearsalError(
+            f"Could not resolve the latest published sai-cli release: {exc}. "
+            "Pass --from VERSION to select a published baseline."
+        ) from exc
+    if tag is None:
+        raise RehearsalError("No sai-cli release is published yet")
+    return release_install.version_of(tag)
 
 
 class ReplyReader:
@@ -550,7 +564,7 @@ class Replay:
         self.responses = {**fixture["recorded"], **fixture["replays"]}
         self.assets: dict[str, tuple[bytes, str]] = {}
         self.add_release(wheel, version)
-        self.latest = BASELINE
+        self.latest = version
         self.submitted: list[str] = []
         self.lifecycle = "outcome_not_indexed"
 
@@ -911,17 +925,19 @@ def backup_ledger(source: Path, destination: Path) -> None:
         old.backup(new)
 
 
-def ledger_row(ledger: Path, key: str, *, migrated: bool) -> tuple[Any, ...]:
+def ledger_row(ledger: Path, key: str, *, migrated: bool | None) -> tuple[Any, ...]:
     with closing(sqlite3.connect(f"{ledger.as_uri()}?mode=ro", uri=True)) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(intents)")}
+        has_keeper_status = "keeper_status" in columns
         require(
-            ("keeper_status" in columns) == migrated, "Unexpected intent ledger schema"
+            migrated is None or has_keeper_status == migrated,
+            "Unexpected intent ledger schema",
         )
         require(
             db.execute("PRAGMA user_version").fetchone() == (1,),
             "Unexpected ledger version",
         )
-        states = "status, keeper_status" if migrated else "status"
+        states = "status, keeper_status" if has_keeper_status else "status"
         row = db.execute(f"SELECT {states} FROM intents WHERE id=?", (key,)).fetchone()
     require(row is not None, "The original open is missing from the ledger")
     return row
@@ -971,16 +987,9 @@ def check_doctor(tool: Install, base: str, key: str, *, pending: bool) -> None:
         )
 
 
-def is_retry_block(
-    result: subprocess.CompletedProcess[str], key: str, *, legacy: bool
+def reports_intent_error(
+    result: subprocess.CompletedProcess[str], code: str, key: str
 ) -> bool:
-    if result.returncode == 0:
-        return False
-    if legacy:
-        return (
-            f"Reconcile uncertain intent {key} before submitting another trade"
-            in result.stderr
-        )
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -988,8 +997,32 @@ def is_retry_block(
     error = payload.get("error") if isinstance(payload, dict) else None
     return (
         isinstance(error, dict)
-        and error.get("code") == "RECENT_OPEN_PENDING"
+        and error.get("code") == code
         and error.get("intentKey") == key
+    )
+
+
+def is_lost_acknowledgement(result: subprocess.CompletedProcess[str], key: str) -> bool:
+    return (
+        result.returncode == 5 and reports_intent_error(result, "OUTCOME_UNKNOWN", key)
+    ) or (
+        result.returncode == 1
+        and f"Outcome unknown for intent {key}; reconcile before another trade"
+        in result.stderr
+    )
+
+
+def is_retry_block(
+    result: subprocess.CompletedProcess[str], key: str, *, legacy: bool
+) -> bool:
+    return (
+        result.returncode != 0
+        and reports_intent_error(result, "RECENT_OPEN_PENDING", key)
+    ) or (
+        legacy
+        and result.returncode == 1
+        and f"Reconcile uncertain intent {key} before submitting another trade"
+        in result.stderr
     )
 
 
@@ -1013,7 +1046,13 @@ def probe_retry(
 
 
 def rehearse(
-    root: Path, wheel: Path, version: str, diagnostics: Path | None, *, strict: bool
+    root: Path,
+    wheel: Path,
+    version: str,
+    baseline: str,
+    diagnostics: Path | None,
+    *,
+    strict: bool,
 ) -> int:
     tool = Install(root, diagnostics)
     prefix = namespace_prefix(tool.home, tool.env)
@@ -1021,12 +1060,15 @@ def rehearse(
         raise RehearsalError(
             "--strict requires a loopback-only network namespace for egress isolation"
         )
-    with keeper_server(Replay(wheel, version).handler()) as base:
+    replay = Replay(wheel, version)
+    replay.latest = baseline
+    installer = f"https://raw.githubusercontent.com/{REPO}/sai-cli/v{baseline}/scripts/install.py"
+    with keeper_server(replay.handler()) as base:
         tool.run(
             "Install the published release",
             tool.uv,
             "run",
-            INSTALLER,
+            installer,
             "--api-base",
             base,
         )
@@ -1048,7 +1090,7 @@ def rehearse(
             file=sys.stderr,
             flush=True,
         )
-        return rehearse_staged(tool, root, wheel, version)
+        return rehearse_staged(tool, root, wheel, version, baseline)
     print("Using a loopback-only network namespace for the rehearsal.", flush=True)
     command = (
         *prefix,
@@ -1060,6 +1102,7 @@ def rehearse(
         root,
         wheel,
         version,
+        baseline,
         str(diagnostics) if diagnostics else "",
     )
     # Only the rehearsal script's own progress reaches these streams. It keeps
@@ -1068,23 +1111,27 @@ def rehearse(
         return wait_with_cancellation(stage.wait, None)
 
 
-def isolated_stage(root_name: str, wheel_name: str, version: str, log_name: str) -> int:
+def isolated_stage(
+    root_name: str, wheel_name: str, version: str, baseline: str, log_name: str
+) -> int:
     root, wheel = Path(root_name), Path(wheel_name)
     tool = Install(root, Path(log_name) if log_name else None, prepared=True)
 
     def work() -> int:
         with cancel_on_signal(), reap_detached_children():
-            return rehearse_staged(tool, root, wheel, version)
+            return rehearse_staged(tool, root, wheel, version, baseline)
 
     return report_result(work)
 
 
-def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int:
-    replay = Replay(wheel, version)
+def rehearse_staged(
+    tool: Install, root: Path, wheel: Path, version: str, baseline: str
+) -> int:
     baseline_wheel = (
-        tool.sai_home / "cache/wheels" / f"sai_cli-{BASELINE}-py3-none-any.whl"
+        tool.sai_home / "cache/wheels" / release_install.wheel_name(baseline)
     )
-    replay.add_release(baseline_wheel, BASELINE)
+    replay = Replay(baseline_wheel, baseline)
+    replay.add_release(wheel, version)
     with (
         keeper_server(replay.handler()) as base,
         socket.socket(socket.AF_INET, socket.SOCK_STREAM) as dead_proxy,
@@ -1100,8 +1147,8 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             CHECK_NETWORK,
             f"{base}/repos/{REPO}/releases?per_page=100",
         )
-        tool.verify_version(BASELINE)
-        print(f"Installed published sai {BASELINE} at {tool.sai}", flush=True)
+        tool.verify_version(baseline)
+        print(f"Installed published sai {baseline} at {tool.sai}", flush=True)
 
         tool.json(
             "Configure loopback Keeper", "config", "set", "keeper.endpoint", endpoint
@@ -1127,22 +1174,21 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
         config = tool.sai_home / "config.toml"
         configured = config.read_bytes()
         tool.json("Register MCP clients", "mcp", "install", *CLIENTS)
-        tool.verify_mcp(BASELINE)
+        tool.verify_mcp(baseline)
 
         first = tool.run(
             "Open against loopback Keeper", tool.sai, "--json", *TRADE, check=False
         )
         require(
-            first.returncode == 1
-            and len(replay.submitted) == 1
-            and f"Outcome unknown for intent {replay.submitted[0]}" in first.stderr,
+            len(replay.submitted) == 1
+            and is_lost_acknowledgement(first, replay.submitted[0]),
             f"The baseline did not report a lost acknowledgement (exit {first.returncode},"
             f" {len(replay.submitted)} Keeper submissions)",
         )
         key = replay.submitted[0]
         ledger = tool.sai_home / "trader/intents.sqlite3"
         require(
-            ledger_row(ledger, key, migrated=False) == ("unknown",),
+            ledger_row(ledger, key, migrated=None) in (("unknown",), ("unknown", None)),
             "The baseline did not retain the unknown open",
         )
         require(
@@ -1206,20 +1252,21 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             "Downgrade through sai update",
             "update",
             "--to",
-            BASELINE,
+            baseline,
             "--web-base",
             base,
         )
-        tool.verify_version(BASELINE)
+        tool.verify_version(baseline)
         require(config.read_bytes() == configured, "Downgrade changed the user config")
         tool.verify_session(session)
-        tool.verify_mcp(BASELINE)
+        tool.verify_mcp(baseline)
         local = tool.json(
             "Read the migrated ledger with the old CLI", "intent", "local", replay.addr
         )
         require(
             any(
-                row["intentKey"] == key and row["status"] == "unknown" for row in local
+                row["intentKey"] == key and row["status"] in {"unknown", "pending"}
+                for row in local
             ),
             "The old CLI could not read the migrated pending open",
         )
@@ -1228,7 +1275,7 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             "The downgraded CLI submitted a second open before reconciliation",
         )
         print(
-            f"Downgraded to {BASELINE}. Retry before reconciliation: blocked.",
+            f"Downgraded to {baseline}. Retry before reconciliation: blocked.",
             flush=True,
         )
         tool.json("Reconcile with the old CLI", *args)
@@ -1236,7 +1283,7 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
         saved_status = ledger_row(ledger, key, migrated=True)[0]
         status = saved_status if saved_status in ("terminal", "unknown") else "other"
         print(
-            f"v{BASELINE} reconciled market_order_outcome_not_indexed as {status}. "
+            f"v{baseline} reconciled market_order_outcome_not_indexed as {status}. "
             f"Retry after reconciliation: {'blocked' if blocked else 'reached loopback Keeper'}."
         )
     return 0
@@ -1261,7 +1308,16 @@ def report_result(work: Callable[[], int]) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "wheel", type=Path, nargs="?", help="Candidate release wheel newer than 0.1.0"
+        "wheel",
+        type=Path,
+        nargs="?",
+        help="Candidate release wheel newer than the baseline",
+    )
+    parser.add_argument(
+        "--from",
+        dest="baseline",
+        metavar="VERSION",
+        help="Published baseline version (default: latest published sai-cli release)",
     )
     parser.add_argument(
         "--self-test", action="store_true", help="Run local rehearsal tests"
@@ -1282,6 +1338,8 @@ def main() -> int:
             parser.error("--self-test takes no candidate wheel")
         if args.strict:
             parser.error("--strict requires a candidate wheel")
+        if args.baseline is not None:
+            parser.error("--from requires a candidate wheel")
         suite = unittest.defaultTestLoader.discover(
             str(Path(__file__).resolve().parent), pattern="release_rehearsal_test.py"
         )
@@ -1289,21 +1347,19 @@ def main() -> int:
     if args.wheel is None:
         parser.error("a candidate wheel is required")
     wheel = args.wheel.resolve()
-    match = re.fullmatch(
-        r"sai_cli-((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-py3-none-any\.whl",
-        wheel.name,
-    )
-    if (
-        not match
-        or tuple(map(int, match[1].split("."))) <= (0, 1, 0)
-        or not wheel.is_file()
-    ):
-        parser.error(
-            "provide an existing sai_cli-X.Y.Z-py3-none-any.whl newer than 0.1.0"
-        )
+    match = re.fullmatch(rf"sai_cli-({VERSION})-py3-none-any\.whl", wheel.name)
+    if not match or not wheel.is_file():
+        parser.error("provide an existing sai_cli-X.Y.Z-py3-none-any.whl")
+    if args.baseline is not None and not re.fullmatch(VERSION, args.baseline):
+        parser.error("--from requires a version in X.Y.Z form")
     version = match[1]
 
     def work() -> int:
+        baseline = args.baseline if args.baseline is not None else resolve_baseline()
+        require(
+            tuple(map(int, version.split("."))) > tuple(map(int, baseline.split("."))),
+            f"Candidate sai {version} must be newer than baseline sai {baseline}",
+        )
         diagnostics = None
         if args.verbose:
             directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
@@ -1319,7 +1375,12 @@ def main() -> int:
             )
             with reap_detached_children():
                 return rehearse(
-                    Path(scratch), wheel, version, diagnostics, strict=args.strict
+                    Path(scratch),
+                    wheel,
+                    version,
+                    baseline,
+                    diagnostics,
+                    strict=args.strict,
                 )
 
     return report_result(work)

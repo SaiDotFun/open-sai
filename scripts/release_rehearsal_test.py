@@ -50,6 +50,9 @@ class RetryBlockTest(unittest.TestCase):
                 self.assertEqual(
                     REHEARSAL["is_retry_block"](result, key, legacy=False), accepted
                 )
+                self.assertEqual(
+                    REHEARSAL["is_retry_block"](result, key, legacy=True), accepted
+                )
 
     def test_legacy_message_is_accepted_only_for_the_original_key_and_legacy_cli(
         self,
@@ -128,6 +131,92 @@ class DiagnosticsTest(unittest.TestCase):
                         self.assertFalse(log.exists())
 
 
+class BaselineTest(unittest.TestCase):
+    def test_lost_acknowledgement_requires_the_original_intent_in_both_formats(
+        self,
+    ) -> None:
+        key = "original-intent"
+        legacy = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            f"Error: Outcome unknown for intent {key}; reconcile before another trade",
+        )
+        structured = subprocess.CompletedProcess(
+            [],
+            5,
+            json.dumps({"error": {"code": "OUTCOME_UNKNOWN", "intentKey": key}}),
+            "",
+        )
+        for result in (legacy, structured):
+            with self.subTest(exit_code=result.returncode):
+                self.assertTrue(REHEARSAL["is_lost_acknowledgement"](result, key))
+                self.assertFalse(
+                    REHEARSAL["is_lost_acknowledgement"](result, "other-intent")
+                )
+
+    def test_default_uses_highest_published_sai_cli_version_across_pages(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class Releases(keeper_handler):
+            def do_GET(self) -> None:
+                if self.path.endswith("?per_page=100&page=1"):
+                    body = json.dumps(
+                        [
+                            {"tag_name": "rust/v5.0.0"},
+                            {"tag_name": "sai-cli/v0.1.9"},
+                            {"tag_name": "sai-cli/v9.0.0", "draft": True},
+                            {"tag_name": "sai-cli/v8.0.0", "prerelease": True},
+                        ]
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("Link", '<ignored>; rel="next"')
+                    self.end_headers()
+                    self.wfile.write(body)
+                elif self.path.endswith("?per_page=100&page=2"):
+                    self.reply([{"tag_name": "sai-cli/v0.1.10"}])
+                else:
+                    self.send_error(404)
+
+        with REHEARSAL["keeper_server"](Releases) as base:
+            self.assertEqual(REHEARSAL["resolve_baseline"](base, base), "0.1.10")
+
+    def test_missing_or_unavailable_published_baseline_fails(self) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class NoReleases(keeper_handler):
+            def do_GET(self) -> None:
+                if self.path.startswith("/repos/"):
+                    self.reply([{"tag_name": "rust/v5.0.0"}])
+                else:
+                    self.send_error(404)
+
+        with REHEARSAL["keeper_server"](NoReleases) as base:
+            with self.assertRaisesRegex(REHEARSAL["RehearsalError"], "No.*published"):
+                REHEARSAL["resolve_baseline"](base, base)
+            with self.assertRaisesRegex(
+                REHEARSAL["RehearsalError"], "Could not resolve.*--from"
+            ):
+                REHEARSAL["resolve_baseline"](f"{base}/invalid", base)
+
+    def test_candidate_has_to_be_newer_than_the_explicit_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            wheel = Path(temp) / "sai_cli-0.1.9-py3-none-any.whl"
+            wheel.touch()
+            script = Path(__file__).with_name("release-rehearsal.py").resolve()
+            result = subprocess.run(
+                [sys.executable, str(script), "--from", "0.1.10", str(wheel)],
+                timeout=5,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(
+            "Candidate sai 0.1.9 must be newer than baseline sai 0.1.10", result.stderr
+        )
+
+
 class NetworkTest(unittest.TestCase):
     def test_strict_requires_a_namespace_before_installing(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -140,7 +229,14 @@ class NetworkTest(unittest.TestCase):
             wheel.write_bytes(b"unused wheel")
             script = Path(__file__).with_name("release-rehearsal.py").resolve()
             result = subprocess.run(
-                [sys.executable, str(script), "--strict", str(wheel)],
+                [
+                    sys.executable,
+                    str(script),
+                    "--strict",
+                    "--from",
+                    "0.1.0",
+                    str(wheel),
+                ],
                 cwd=root,
                 env={"HOME": temp, "TMPDIR": temp, "PATH": str(bin_dir)},
                 timeout=5,
