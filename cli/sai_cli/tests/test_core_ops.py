@@ -69,10 +69,11 @@ def test_import_session_and_summary_hide_the_token():
     token = jwt({"sub": ADDR, "exp": expires, "purpose": "user_intent"})
     result = session.import_session(token, ENDPOINT)
     assert result["token"] == token
+    assert result["endpoint"] == ENDPOINT
     assert session.summary(result) == {
         "addr": ADDR,
         "expiresAt": datetime.fromtimestamp(expires, UTC).isoformat(),
-        "endpoint": ENDPOINT,
+        "endpoint": "https://sai-keeper.nibiru.fi",
     }
     for bad in (
         "not-a-jwt",
