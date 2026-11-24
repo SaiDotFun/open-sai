@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from . import log, storage
-from .settings import public_url
+from .settings import public_origin, public_url
 
 EXPIRY_WARNING = timedelta(days=3)
 
@@ -121,12 +121,13 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
     }
 
 
-def summary(result: dict[str, str]) -> dict[str, str]:
+def summary(result: dict[str, str], *, origin_only: bool = False) -> dict[str, str]:
     """Return the fields safe to show: addr, expiry, endpoint; no token."""
     return {
         "addr": result["evmAddress"],
         "expiresAt": result["expiresAt"],
-        "endpoint": public_url(result["endpoint"]) or "",
+        "endpoint": (public_origin if origin_only else public_url)(result["endpoint"])
+        or "",
     }
 
 

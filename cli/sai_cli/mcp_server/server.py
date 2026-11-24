@@ -881,7 +881,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 },
                 "tools": names,
                 "trading": tools.trading_state(config),
-                "session": tools.session_state(config),
+                "session": tools.session_state(config, origin_only=True),
             }
 
         return await call(report)

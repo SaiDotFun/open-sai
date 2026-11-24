@@ -459,7 +459,7 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
         storage.replace_session(stored, result)
-        emit(ctx, sessions.summary(result))
+        emit(ctx, sessions.summary(result, origin_only=True))
     except NeedsTerminal as exc:
         raise click.ClickException(
             f"{exc} Run {sessions.renewal_command(stored)} in a terminal."
@@ -749,7 +749,7 @@ def auth_status(ctx: click.Context) -> None:
         result = session(ctx)
         fields = sessions.expiry_fields(result)
         show_expiry_notice(ctx, fields)
-        emit(ctx, {**sessions.summary(result), **fields})
+        emit(ctx, {**sessions.summary(result, origin_only=True), **fields})
     except ValueError as exc:
         raise click.ClickException(str(exc)) from exc
 

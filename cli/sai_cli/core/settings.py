@@ -404,6 +404,12 @@ def public_url(url: str | None) -> str | None:
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
+def public_origin(url: str | None) -> str | None:
+    """Remove the path as well when it could contain a credential."""
+    public = public_url(url)
+    return urlsplit(public)._replace(path="").geturl() if public else None
+
+
 def public(settings: Settings) -> dict[str, dict[str, Any]]:
     """Every key with its value, source, variable, and default; URLs are
     redacted with `public_url`."""

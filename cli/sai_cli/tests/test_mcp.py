@@ -1292,7 +1292,7 @@ def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
         "websocket": "wss://k.example:8443/query",
         "lcd": "https://lcd.example/",
     }
-    assert info["session"]["endpoint"] == "https://k.example/q"
+    assert info["session"]["endpoint"] == "https://k.example"
     text = json.dumps(info)
     for secret in ("user:pw", "key=", "apikey", "u:p@", "t=s"):
         assert secret not in text
@@ -1326,7 +1326,10 @@ def test_session_reports_never_include_the_token(mcp):
         "expiryWarning",
         "renewalCommand",
     }
-    assert (status["addr"], status["endpoint"]) == (ADDR, ENDPOINT)
+    assert (status["addr"], status["endpoint"]) == (
+        ADDR,
+        ENDPOINT.removesuffix("/query"),
+    )
     info = invoke(mcp, "mcp_info")
     assert info["session"]["addr"] == ADDR
     assert info["session"]["usable"] is True

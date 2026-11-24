@@ -873,11 +873,25 @@ def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
     assert env.run(*args, "import").returncode == 0
     status = env.run(*args, "status")
     row = json.loads(status.stdout)
+    assert row["endpoint"] == origin
     assert f"reuse the Keeper endpoint at {origin}" in row["renewalCommand"]
     refused = env.run(*args, "renew")
     assert refused.returncode == 1
     assert "reuse the Keeper endpoint" in refused.stderr
-    assert "synthetic-test-credential" not in row["renewalCommand"] + refused.stderr
+    assert "synthetic-test-credential" not in status.stdout + refused.stderr
+
+
+def test_renew_json_shows_only_the_keeper_origin(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    origin = keeper_auth["endpoint"].removesuffix("/query")
+    endpoint = f"{origin}/synthetic-test-credential/query"
+    args = ("--json", "--endpoint", endpoint, "auth")
+    assert env.run(*args, "login", "dev").returncode == 0
+    result = env.run(*args, "renew")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["endpoint"] == origin
+    assert "synthetic-test-credential" not in result.stdout
 
 
 def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
