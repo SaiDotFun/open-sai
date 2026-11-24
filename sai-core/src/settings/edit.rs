@@ -215,7 +215,7 @@ fn uneditable(section: &str, path: &Path) -> SettingsError {
             "{section} in {} is an inline table, dotted keys, or only subtables; rewrite it as a [{section}] table to edit it with sai config",
             path.display()
         ),
-        uneditable: true,
+        kind: super::SettingsErrorKind::Uneditable,
     }
 }
 

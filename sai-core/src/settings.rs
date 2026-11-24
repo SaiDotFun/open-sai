@@ -179,10 +179,16 @@ impl Key {
     }
 
     fn expected(self, expected: &str) -> SettingsError {
-        SettingsError::invalid(format!(
-            "Invalid value for {}: expected {expected}",
-            self.spec().name
-        ))
+        SettingsError {
+            message: format!(
+                "Invalid value for {}: expected {expected}",
+                self.spec().name
+            ),
+            kind: match self.spec().kind {
+                Kind::Url(_) => SettingsErrorKind::InvalidEndpoint,
+                _ => SettingsErrorKind::Invalid,
+            },
+        }
     }
 
     fn invalid_env_value(self) -> SettingsError {
@@ -285,19 +291,35 @@ fn parse_bool(raw: &str) -> Option<bool> {
 #[derive(Clone, Debug)]
 pub struct SettingsError {
     message: String,
-    uneditable: bool,
+    kind: SettingsErrorKind,
+}
+
+#[derive(Clone, Debug)]
+enum SettingsErrorKind {
+    Invalid,
+    InvalidEndpoint,
+    Uneditable,
 }
 
 impl SettingsError {
     fn invalid(message: String) -> Self {
         Self {
             message,
-            uneditable: false,
+            kind: SettingsErrorKind::Invalid,
         }
     }
 
     pub fn is_uneditable(&self) -> bool {
-        self.uneditable
+        matches!(self.kind, SettingsErrorKind::Uneditable)
+    }
+
+    pub fn is_invalid_endpoint(&self) -> bool {
+        matches!(self.kind, SettingsErrorKind::InvalidEndpoint)
+    }
+
+    fn at(mut self, location: impl fmt::Display) -> Self {
+        self.message = format!("{location}: {}", self.message);
+        self
     }
 }
 
@@ -436,7 +458,7 @@ impl Settings {
                     } else {
                         key.spec().env
                     };
-                    return Err(SettingsError::invalid(format!("{origin}: {error}")));
+                    return Err(error.at(origin));
                 }
             };
         }
@@ -509,7 +531,7 @@ impl FileSettings {
                     let entry = key.read_value(item, &parsed);
                     if let Err(ref error) = entry {
                         if !key.is_log() {
-                            return Err(SettingsError::invalid(format!("{path}: {error}")));
+                            return Err(error.clone().at(&path));
                         }
                         file.warnings
                             .push(format!("{path}: {error}; logging is off until it is fixed"));
