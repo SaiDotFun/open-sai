@@ -131,6 +131,8 @@ def json_requested(argv: Sequence[str]) -> bool:
 
 
 def cli_failure(exc: Exception) -> SaiError:
+    if isinstance(exc, sai_settings.InvalidEndpoint):
+        return SaiError(str(exc), Code.INVALID_REQUEST, exit_code=ExitCode.USAGE)
     if isinstance(exc, click.ClickException):
         return SaiError(
             exc.format_message(),
@@ -1146,7 +1148,7 @@ def doctor_command(
         ("keeper.ws_endpoint", ws_endpoint),
         ("lcd.endpoint", lcd_endpoint),
     ):
-        if value:
+        if value is not None:
             flags[key] = value
     config_check, config = doctor.check_config(flags)
     checks = [
@@ -1177,7 +1179,10 @@ def doctor_command(
                 if check.status == "fail"
             )
         raise SaiError(
-            report, code, details=doctor.report(checks) if ctx.obj["json"] else None
+            report,
+            code,
+            details=doctor.report(checks) if ctx.obj["json"] else None,
+            exit_code=ExitCode.USAGE if config_check.invalid_endpoint else None,
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
@@ -1231,12 +1236,18 @@ def watch_price(ctx: click.Context, token_id: int, ws_endpoint: str | None) -> N
 
 def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
     """The command's --ws-endpoint, else the resolved WebSocket setting."""
-    return ws_endpoint or settings(ctx).ws_endpoint
+    if ws_endpoint is not None:
+        sai_settings.check_value("keeper.ws_endpoint", ws_endpoint)
+        return ws_endpoint
+    return settings(ctx).ws_endpoint
 
 
 def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
     """The command's --lcd-endpoint, else the resolved LCD setting."""
-    return lcd_endpoint or settings(ctx).lcd_endpoint
+    if lcd_endpoint is not None:
+        sai_settings.check_value("lcd.endpoint", lcd_endpoint)
+        return lcd_endpoint
+    return settings(ctx).lcd_endpoint
 
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
@@ -1855,6 +1866,8 @@ def logs_intent(
 ) -> None:
     """Show an intent's CLI and MCP trail and its current Keeper record."""
     endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
+    if offline and endpoint is not None:
+        sai_settings.check_value("keeper.endpoint", endpoint)
     account = addr if addr is not None else ctx.obj["as_addr"]
     report = log_queries.intent(
         key, endpoint=endpoint, addr=account, offline=offline, before=before

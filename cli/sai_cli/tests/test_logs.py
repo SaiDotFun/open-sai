@@ -18,6 +18,7 @@ import threading
 import time
 import tracemalloc
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -1026,7 +1027,7 @@ def test_doctor_logs_the_invalid_request_code_for_a_failed_config_check(
 ):
     monkeypatch.setenv("PATH", "")
     code, _ = run_cli("--endpoint", "invalid-value", "doctor", "--offline")
-    assert code == 1
+    assert code == 2
     result = events(home, "doctor.result")[0]
     assert result["code"] == "INVALID_REQUEST"
     assert any(
@@ -1191,11 +1192,142 @@ def test_disabled_in_the_config_file_writes_nothing(home, keeper_stub):
     assert log.flush(60) and not (home / "logs").exists()
     code, output = run_cli("--json", "logs", "path")
     assert code == 0 and json.loads(output)["enabled"] is False
-    # Turning it back on takes effect in the same process.
-    (home / "config.toml").write_text("[logs]\nenabled = true\n")
-    log.reset()
+    # A config edit also refreshes the writer after it has skipped an event.
+    assert run_cli("config", "unset", "logs.enabled")[0] == 0
     log.event("something")
-    assert [line["event"] for line in read_logs(home)] == ["something"]
+    assert events(home, "something")
+
+
+def rewrite_with_same_mtime(path: Path, replacement: str) -> None:
+    before = path.stat()
+    path.write_text(replacement)
+    deadline = time.monotonic() + 3
+    while True:
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = path.stat()
+        if after.st_ctime_ns != before.st_ctime_ns:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("Filesystem did not update ctime after the rewrite")
+        time.sleep(0.01)
+    assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
+        before.st_ino,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+
+
+@posix_only
+def test_log_config_refreshes_after_a_same_size_rewrite(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true \n")
+    assert log.resolve_config(home, None, None)[0] is True
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
+    assert log.resolve_config(home, None, None)[0] is False
+
+
+@posix_only
+def test_log_writer_honors_external_disable_and_reenable(home):
+    path = home / "config.toml"
+    enabled = "[logs]\nenabled = true \n"
+    path.write_text(enabled)
+    log.event("test.before")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, enabled)
+    log.event("test.resumed")
+    assert [line["event"] for line in read_logs(home)] == [
+        "test.before",
+        "test.resumed",
+    ]
+
+
+def test_log_retry_only_stats_config_on_the_caller_thread(home, monkeypatch):
+    monkeypatch.delenv("SAI_LOG", raising=False)
+    (home / "config.toml").write_text("[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    operations = []
+
+    def record(frame, event, arg):
+        if event == "c_call" and arg.__name__ in {"stat", "open", "read", "acquire"}:
+            operations.append(arg.__name__)
+        if event == "call" and frame.f_code.co_name in {"read_file", "parse_file"}:
+            operations.append(frame.f_code.co_name)
+
+    previous = sys.getprofile()
+    sys.setprofile(record)
+    try:
+        active = log.active()
+        log.event("test.still.disabled")
+    finally:
+        sys.setprofile(previous)
+
+    assert not active
+    assert operations == ["stat", "stat"]
+    assert not (home / "logs").exists()
+
+
+def test_log_writer_reads_unchanged_config_once(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true\n")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """\
+import sys
+from sai_cli.core import log
+
+reads = 0
+
+def count_config_reads(event, args):
+    global reads
+    if event == "open" and args[0] == sys.argv[1]:
+        reads += 1
+
+sys.addaudithook(count_config_reads)
+for index in range(20):
+    log.event("test.config", index=index)
+assert log.flush(10)
+print(reads)
+""",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "SAI_LOG": "1", "SAI_LOG_KEEP_DAYS": "14"},
+    )
+    assert len(events(home, "test.config")) == 20
+    assert int(result.stdout) == 1
+
+
+def test_config_edits_finish_while_log_writer_is_stalled(home):
+    path = home / "config.toml"
+    with ThreadPoolExecutor(max_workers=1) as pool, log._io_lock:
+        log.event("test.config")
+        for key, value in (("logs.enabled", "false"), ("logs.keep_days", "3")):
+            edit = pool.submit(
+                settings.edit_file,
+                path,
+                lambda text, key=key, value=value: settings.set_value(
+                    text, key, value, path
+                )[0],
+            )
+            edit.result(timeout=5)
+
+    assert settings.read_file(path)[0] == {
+        "logs.enabled": False,
+        "logs.keep_days": 3,
+    }
+    assert log.flush(10)
 
 
 def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):

@@ -1295,7 +1295,7 @@ def test_logged_and_returned_errors_redact_the_session_token(mcp, monkeypatch, c
 
 
 def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
-    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s#f")
+    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s")
     monkeypatch.setenv("SAI_LCD_ENDPOINT", "https://lcd.example/?apikey=s")
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")

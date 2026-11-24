@@ -197,7 +197,26 @@ def _off(raw: str | None) -> bool:
     return bool(text) and text not in _TRUE
 
 
-_config_cache: dict[tuple[Any, ...], tuple[bool, int]] = {}
+_ConfigStat = tuple[int, int, int, int, int]
+_config_cache: dict[tuple[Any, ...], tuple[float, tuple[bool, int]]] = {}
+_config_generation = object()
+
+
+def _config_stat(path: Path) -> _ConfigStat | None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+
+
+def invalidate_config() -> None:
+    """Refresh the writer after a successful config edit."""
+    global _config_generation
+    # An in-flight read or write can still finish under its previous generation.
+    _config_generation = object()
+    _config_cache.clear()
+    _skip.clear()
 
 
 def resolve_config(
@@ -209,15 +228,31 @@ def resolve_config(
     Each key resolves on its own, environment first. With logging turned
     off, `logs.keep_days` is not validated. Otherwise any logs value that is
     invalid, or a config file that cannot be read or parsed, turns logging
-    off. The answer is cached until the file or the values change.
+    off. The answer is cached by file metadata and environment values.
     """
+    value, _ = _resolve_config(root, raw_enabled, raw_keep)
+    return value
+
+
+def _resolve_config(
+    root: Path, raw_enabled: str | None, raw_keep: str | None
+) -> tuple[tuple[bool, int], _ConfigStat | None]:
+    """Return the settings and the file metadata they were checked against."""
     from . import settings
 
+    generation = _config_generation
     path = root / settings.FILE_NAME
-    key = (str(path), _stat_key(path), raw_enabled, raw_keep)
+    try:
+        signature = _config_stat(path)
+    except OSError:
+        return (False, DEFAULT_KEEP_DAYS), None
+    key = (str(path), signature, raw_enabled, raw_keep, generation)
+    checked_at = time.monotonic()
     cached = _config_cache.get(key)
-    if cached is not None:
-        return cached
+    # Expire unchanged entries too, for filesystems with coarse timestamps
+    # and Windows versions that report creation time as ctime.
+    if cached is not None and checked_at - cached[0] < RECHECK_SECONDS:
+        return cached[1], signature
 
     def pick(name: str, raw: str | None, file: Mapping[str, Any]) -> Any:
         if raw is not None and raw.strip():
@@ -237,8 +272,8 @@ def resolve_config(
         value = (False, DEFAULT_KEEP_DAYS)
     if len(_config_cache) > 64:
         _config_cache.clear()
-    _config_cache[key] = value
-    return value
+    _config_cache[key] = (checked_at, value)
+    return value, signature
 
 
 def config() -> tuple[bool, int]:
@@ -889,8 +924,10 @@ _dropped = 0
 # Characters of text in the queue, under _size_lock.
 _queued_chars = 0
 _size_lock = threading.Lock()
-# Homes whose logging is off or failing, with when the writer last looked.
-_skip: dict[tuple[str, str | None, str | None], float] = {}
+# Homes whose logging is off or failing, with the config the writer checked.
+_skip: dict[
+    tuple[str, str | None, str | None], tuple[object, float, _ConfigStat | None]
+] = {}
 # The UTC day each home was last checked for old files.
 _pruned: dict[str, date] = {}
 
@@ -911,13 +948,14 @@ def _write(item: _Item) -> None:
     global _dropped
     key = (item.root, item.on, item.keep)
     root = Path(item.root)
-    on, keep_days = resolve_config(root, item.on, item.keep)
+    generation = _config_generation
+    (on, keep_days), signature = _resolve_config(root, item.on, item.keep)
     if not on:
-        _skip[key] = time.monotonic()
+        _skip[key] = (generation, time.monotonic(), signature)
         return
     opened = LogDir.open(root / DIR_NAME, create=True)
     if opened is None:
-        _skip[key] = time.monotonic()
+        _skip[key] = (generation, time.monotonic(), signature)
         return
     with opened:
         _skip.pop(key, None)
@@ -988,9 +1026,19 @@ def _target() -> tuple[str, str | None, str | None] | None:
     if _off(raw_on):
         return None
     key = (str(home()), raw_on, os.environ.get("SAI_LOG_KEEP_DAYS"))
-    skipped = _skip.get(key)
-    if skipped is not None and time.monotonic() - skipped < RECHECK_SECONDS:
-        return None
+    if skipped := _skip.get(key):
+        generation, checked_at, signature = skipped
+        if (
+            generation is _config_generation
+            and time.monotonic() - checked_at < RECHECK_SECONDS
+        ):
+            from . import settings
+
+            try:
+                if _config_stat(Path(key[0]) / settings.FILE_NAME) == signature:
+                    return None
+            except OSError:
+                return None
     return key
 
 
@@ -1004,12 +1052,12 @@ def active() -> bool:
 
 
 def event(name: str, level: str = "info", /, **fields: Any) -> None:
-    """Queue one event for the writer. Never blocks and never raises; with
-    logging off it returns before looking at FIELDS.
+    """Queue one event for the writer without waiting for the writer.
 
-    The work is bounded and does no I/O: FIELDS are copied within a fixed
-    budget and cleared of the session tokens this process has seen. The
-    writer thread reads the session store and scrubs again.
+    During a retry delay, check the config's metadata before deciding to
+    skip. FIELDS are copied within a fixed budget and cleared of the session
+    tokens this process has seen. The writer reads the session store and
+    scrubs again.
     """
     global _dropped, _queued_chars
     try:
@@ -1084,8 +1132,7 @@ def reset() -> None:
     _token_key = None
     with _token_lock:
         _known.clear()
-    _config_cache.clear()
-    _skip.clear()
+    invalidate_config()
     _pruned.clear()
 
 

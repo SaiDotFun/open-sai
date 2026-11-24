@@ -72,6 +72,7 @@ class Check:
     details: dict[str, Any] = field(default_factory=dict)
     duration_ms: int = 0
     changes: list[str] = field(default_factory=list)
+    invalid_endpoint: bool = False
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -113,9 +114,23 @@ def check_config(
     try:
         values, warnings = settings.read_file(path)
     except settings.ConfigError as exc:
-        return Check("config", "fail", exc.diagnostic, fix), None
+        return Check(
+            "config",
+            "fail",
+            exc.diagnostic,
+            fix,
+            invalid_endpoint=isinstance(exc, settings.InvalidEndpoint),
+        ), None
     try:
         config = settings.resolve(flags, os.environ, values)
+    except settings.InvalidEndpoint as exc:
+        return Check(
+            "config",
+            "fail",
+            str(exc),
+            "Check the settings listed by `sai config --help`",
+            invalid_endpoint=True,
+        ), None
     except ValueError:
         return Check(
             "config",

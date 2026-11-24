@@ -110,25 +110,36 @@ def run_cli(*args: str) -> tuple[int, str]:
 
 
 @pytest.mark.parametrize(
-    ("content", "expected", "summary"),
+    ("content", "expected", "exit_code", "summary"),
     [
-        (b"[update]\nauto = false\n", "pass", "Config file settings are valid"),
-        (b"[future]\nprivate_setting = 'private_value'\n", "warn", "unknown settings"),
-        (b"[update\n", "fail", "not valid TOML"),
-        (b"[keeper]\nendpoint = 'https://[private_value'\n", "fail", "keeper.endpoint"),
-        (b"[update]\nauto = 'private_value'\n", "fail", "update.auto"),
-        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", "logs.keep_days"),
-        (b"\xff", "fail", "UTF-8"),
+        (b"[update]\nauto = false\n", "pass", 0, "Config file settings are valid"),
+        (
+            b"[future]\nprivate_setting = 'private_value'\n",
+            "warn",
+            0,
+            "unknown settings",
+        ),
+        (b"[update\n", "fail", 1, "not valid TOML"),
+        (
+            b"[keeper]\nendpoint = 'https://[private_value'\n",
+            "fail",
+            2,
+            "keeper.endpoint",
+        ),
+        (b"[update]\nauto = 'private_value'\n", "fail", 1, "update.auto"),
+        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", 1, "logs.keep_days"),
+        (b"\xff", "fail", 1, "UTF-8"),
         pytest.param(
             b"[logs]\nkeep_days = " + b"9" * 5000,
             "fail",
+            1,
             "not valid TOML",
             id="oversized-TOML-integer",
         ),
     ],
 )
 def test_config_check_reports_file_errors_without_echoing_values(
-    isolated_home, monkeypatch, content, expected, summary
+    isolated_home, monkeypatch, content, expected, exit_code, summary
 ):
     path = isolated_home / "config.toml"
     path.write_bytes(content)
@@ -143,7 +154,7 @@ def test_config_check_reports_file_errors_without_echoing_values(
     assert checks["config"]["status"] == expected
     assert summary in checks["config"]["summary"]
     assert "home" in checks
-    assert code == (1 if expected == "fail" else 0)
+    assert code == exit_code
     assert "private_setting" not in output and "private_value" not in output
     assert path.read_bytes() == content
 
