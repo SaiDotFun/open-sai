@@ -309,16 +309,6 @@ fn load_settings(flags: &Flags, env: &Environment) -> Result<Settings, SettingsE
 
 const INVALID_ARGUMENTS: &str = "Invalid command arguments.";
 
-fn error_diagnostic(text: &str, code: ExitCode) -> &str {
-    if code == ExitCode::Usage && log::contains_url(text) {
-        INVALID_ARGUMENTS
-    } else if log::contains_private_url(text) {
-        "Command failed. The error contained a private URL."
-    } else {
-        text
-    }
-}
-
 fn complete(
     result: Result<(), SaiError>,
     usage_command: Option<&str>,
@@ -335,10 +325,7 @@ fn complete(
         eprintln!("Interrupted");
         return (error.exit_code, Some(error));
     }
-    let redact = |text: &str| {
-        let text = error_diagnostic(text, error.exit_code);
-        home.map_or_else(|| text.to_owned(), |home| log::redact(home, text))
-    };
+    let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
     let message = redact(&error.message);
     let interrupted = error.code == Code::InvalidRequest && error.message == "Aborted";
     // Auth import emits its own newline on cancellation.
@@ -446,15 +433,9 @@ fn finish(
         ];
         if let Some(error) = error {
             fields.push(("code", json!(error.code).into()));
-            fields.push((
-                "error",
-                Field::Untrusted(error_diagnostic(&error.message, code).into()),
-            ));
+            fields.push(("error", Field::Untrusted(error.message)));
             if let Some(key) = error.intent_key {
-                fields.push((
-                    "intentKey",
-                    Field::Text(error_diagnostic(&key, code).into()),
-                ));
+                fields.push(("intentKey", Field::Text(key)));
             }
         }
         writer.event(Surface::Cli, "command.end", level, fields);
@@ -522,34 +503,12 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
         return Some(SaiError::usage("Unexpected arguments to auth import."));
     }
     let message = match error.kind() {
-        ErrorKind::InvalidSubcommand => {
-            let command = context_text(error, ContextKind::InvalidSubcommand)?;
-            format!("No such command {}.", repr(command))
+        ErrorKind::InvalidSubcommand => "No such command.".into(),
+        ErrorKind::UnknownArgument if arg == Some("--json") => "No such option '--json'.".into(),
+        ErrorKind::UnknownArgument if arg.is_some_and(|arg| arg.starts_with('-')) => {
+            "No such option.".into()
         }
-        ErrorKind::UnknownArgument => {
-            let argument = arg?;
-            if argument.starts_with('-') {
-                format!("No such option {}.", repr(argument))
-            } else {
-                let consumed = match command {
-                    "config get" | "config unset" | "intent status" | "intent local"
-                    | "auth use" | "auth logout" | "auth login" | "auth renew" | "logs intent"
-                    | "logs run" | "account positions" | "account history" | "account balances"
-                    | "watch positions" | "watch balances" | "watch price" => 1,
-                    "config set" => 2,
-                    _ => 0,
-                };
-                let extra = positional(operands, command)
-                    .into_iter()
-                    .skip(consumed)
-                    .collect::<Vec<_>>();
-                if extra.len() > 1 {
-                    format!("Got unexpected extra arguments ({})", extra.join(" "))
-                } else {
-                    format!("Got unexpected extra argument ({argument})")
-                }
-            }
-        }
+        ErrorKind::UnknownArgument => "Got unexpected extra arguments.".into(),
         ErrorKind::MissingRequiredArgument => {
             let Some(ContextValue::Strings(args)) = error.get(ContextKind::InvalidArg) else {
                 return None;
@@ -557,53 +516,18 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
             let first = args.first()?.trim_matches(['<', '>']);
             format!("Missing argument {}.", repr(first))
         }
-        ErrorKind::InvalidValue => {
-            let argument = arg?.split(' ').next()?;
-            if command == "logs tail"
-                && argument == "--surface"
-                && let Some(value) =
-                    context_text(error, ContextKind::InvalidValue).filter(|value| !value.is_empty())
-            {
-                return Some(SaiError::usage(format!(
-                    "Invalid value for '--surface': {} is not one of 'cli', 'mcp', 'update'.",
-                    repr(value)
-                )));
-            }
+        ErrorKind::InvalidValue if context_text(error, ContextKind::InvalidValue) == Some("") => {
+            let argument = arg?.split_whitespace().next()?;
             format!("Option {} requires an argument.", repr(argument))
         }
-        ErrorKind::ValueValidation if command == "logs tail" => {
-            std::error::Error::source(error)?.to_string()
+        ErrorKind::InvalidValue | ErrorKind::ValueValidation | ErrorKind::TooManyValues => {
+            // InvalidArg is the argument declaration, not the supplied value.
+            let argument = arg?.split_whitespace().next()?;
+            format!("Invalid value for {}.", repr(argument))
         }
         _ => return None,
     };
     Some(SaiError::usage(message))
-}
-
-fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
-    let mut operands = operands.iter().map(String::as_str);
-    let mut options = true;
-    let mut positional = Vec::new();
-    let websocket = command.starts_with("watch ") || command == "account balances";
-    while let Some(arg) = operands.next() {
-        match arg {
-            "--" if options => options = false,
-            "--key" if options && command == "intent status" => {
-                operands.next();
-            }
-            "--addr" if options && command == "auth login" => {
-                operands.next();
-            }
-            arg if options && command == "intent status" && arg.starts_with("--key=") => {}
-            arg if options && command == "auth login" && arg.starts_with("--addr=") => {}
-            "--ws-endpoint" if options && websocket => {
-                operands.next();
-            }
-            arg if options && websocket && arg.starts_with("--ws-endpoint=") => {}
-            "--json" if options && command.starts_with("intent ") => {}
-            _ => positional.push(arg),
-        }
-    }
-    positional
 }
 
 fn print_parse_error(
@@ -694,8 +618,7 @@ fn print_parse_error(
             .collect::<Vec<_>>()
             .join(", ");
         let usage = SaiError::usage(format!(
-            "Invalid value for '--scope': {} is not one of {choices}.",
-            repr(value)
+            "Invalid value for '--scope': expected one of {choices}."
         ));
         return complete(Err(usage), Some(command), json, home);
     }
@@ -721,36 +644,15 @@ fn print_parse_error(
     if let Some(usage) = usage_error(error, usage_command, operands) {
         if !json && error.kind() == ErrorKind::InvalidValue && usage.message.starts_with("Option ")
         {
-            eprintln!(
-                "Error: {}",
-                error_diagnostic(&usage.message, ExitCode::Usage)
-            );
+            eprintln!("Error: {}", usage.message);
             return (ExitCode::Usage, Some(usage));
         }
         return complete(Err(usage), Some(usage_command), json, home);
     }
-    if json {
-        let message = match error.kind() {
-            ErrorKind::MissingSubcommand if command.is_empty() => {
-                "Pass a command when using --json."
-            }
-            _ => INVALID_ARGUMENTS,
-        };
-        return complete(
-            Err(SaiError::usage(message)),
-            Some(usage_command),
-            true,
-            home,
-        );
-    }
-    if log::contains_url(&error.to_string()) {
-        return complete(
-            Err(SaiError::usage(INVALID_ARGUMENTS)),
-            Some(usage_command),
-            false,
-            home,
-        );
-    }
-    let _ = error.print();
-    (ExitCode::Usage, None)
+    complete(
+        Err(SaiError::usage(INVALID_ARGUMENTS)),
+        Some(usage_command),
+        json,
+        home,
+    )
 }

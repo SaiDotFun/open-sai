@@ -9,7 +9,7 @@ use std::{
 use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
     errors::{Code, ExitCode, SaiError},
-    settings::{KEYS, repr},
+    settings::KEYS,
 };
 use serde_json::{Value, json};
 
@@ -893,10 +893,9 @@ fn chosen(names: impl IntoIterator<Item = String>) -> Result<Vec<Client>, SaiErr
             "codex" => Client::Codex,
             "cursor" => Client::Cursor,
             _ => {
-                return Err(SaiError::usage(format!(
-                    "unknown client {}; choose from claude, codex, cursor",
-                    repr(&name)
-                )));
+                return Err(SaiError::usage(
+                    "Invalid client: choose from claude, codex, cursor.",
+                ));
             }
         };
         if !selected.contains(&client) {

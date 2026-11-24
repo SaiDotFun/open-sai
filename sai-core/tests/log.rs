@@ -123,14 +123,8 @@ fn redaction_applies_to_nested_text_url_origins_arguments_and_untrusted_errors()
         })
     );
     assert_eq!(events[0]["url"], "https://example.com:443");
-    assert_eq!(
-        events[0]["argv"],
-        json!(["--endpoint=https://example.com:443"])
-    );
-    assert_eq!(
-        events[0]["error"],
-        "Bad [redacted hex] https://example.com [cut]"
-    );
+    assert_eq!(events[0]["argv"], json!(["--endpoint=[redacted]"]));
+    assert_eq!(events[0]["error"], "[redacted]");
     assert_eq!(events[0]["surface"], "mcp");
     assert_eq!(events[0]["level"], "info");
     assert_eq!(events[0]["pid"], std::process::id());

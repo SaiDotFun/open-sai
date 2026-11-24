@@ -14,7 +14,7 @@ use sai_core::{
         stream::{self, Connection, Failure, Subscription},
     },
     log::{EventContext, Field, Level},
-    settings::{Environment, Flags, repr},
+    settings::{Environment, Flags},
 };
 use serde_json::{Map, Number, Value, json};
 
@@ -205,12 +205,7 @@ impl WatchCommand {
 }
 
 fn parse_token_id(input: &str) -> Result<Number, SaiError> {
-    let invalid = || {
-        SaiError::usage(format!(
-            "Invalid value for 'TOKEN_ID': {} is not a valid integer.",
-            repr(input)
-        ))
-    };
+    let invalid = || SaiError::usage("Invalid value for 'TOKEN_ID': expected an integer.");
     let input = input.trim();
     let digits = input.strip_prefix(['+', '-']).unwrap_or(input);
     if digits.is_empty()

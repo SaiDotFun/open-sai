@@ -109,7 +109,15 @@ def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> No
     python, rust = homes(tmp_path, auth_pair)
     expected = observed(python.run(*args))
     assert expected[0] == (0 if "--help" in args else 2)
-    assert observed(rust.run(*args)) == expected
+    actual = observed(rust.run(*args))
+    if "--account" in args:
+        reference, candidate = json.loads(expected[1]), json.loads(actual[1])
+        assert "--account" in reference["error"]["message"]
+        reference["error"]["message"] = "No such option."
+        assert actual[0::2] == expected[0::2]
+        assert candidate == reference
+    else:
+        assert actual == expected
 
 
 @pytest.mark.parametrize(
@@ -243,7 +251,22 @@ def test_auth_login(
         }:
             assert "Keeper rejected the request" in result[1]
         assert bool(session_state(env)["sessions"]) == (expected_code == 0)
-    assert results[0] == results[1]
+    if case in {"missing", "unavailable"}:
+        reference, candidate = (json.loads(result[1]) for result in results)
+        if case == "missing":
+            assert "No key named dev" in reference["error"]["message"]
+            reference["error"]["message"] = (
+                "Invalid value for 'NAME': no wallet found. Run `cast wallet list` "
+                "to see keystores, or connect with `sai auth import`."
+            )
+        else:
+            reference["error"]["message"] = reference["error"]["message"].replace(
+                "`ud evm wallet show dev`", "`ud evm wallet show`"
+            )
+        assert results[0][0::2] == results[1][0::2]
+        assert candidate == reference
+    else:
+        assert results[0] == results[1]
     python_state, rust_state = session_state(python), session_state(rust)
     if expected_code == 0:
         assert rust_state["sessions"][addr]["keyName"] == "dev"

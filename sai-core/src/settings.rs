@@ -107,8 +107,7 @@ impl Key {
     pub fn parse(name: &str) -> Result<Self, SettingsError> {
         find_key(name).ok_or_else(|| {
             SettingsError::invalid(format!(
-                "Unknown setting {}. Valid keys: {}",
-                repr(name),
+                "Invalid value for 'KEY': unknown setting. Valid keys: {}",
                 valid_keys()
             ))
         })
@@ -122,15 +121,13 @@ impl Key {
             Kind::Bool => match parse_bool(text) {
                 Some(value) => Ok(Value::Bool(value)),
                 None => Err(SettingsError::invalid(format!(
-                    "Invalid value {} for {name}: expected true or false",
-                    repr(raw)
+                    "Invalid value for {name}: expected true or false"
                 ))),
             },
             Kind::Days => {
                 if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
                     return Err(SettingsError::invalid(format!(
-                        "Invalid value {} for {name}: expected a whole number, 1 or more",
-                        repr(raw)
+                        "Invalid value for {name}: expected a whole number, 1 or more"
                     )));
                 }
                 let digits = text.trim_start_matches('0');

@@ -165,7 +165,9 @@ def invoke(
     )
 
 
-def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any]]:
+def read_events(
+    home: Path, *, c4_reference: bool = False, rust: bool = False
+) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
@@ -173,6 +175,17 @@ def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any
     ]
     groups: dict[str, list[int]] = {}
     for event in events:
+        if isinstance(argv := event.get("argv"), list):
+            # These cases invoke intent status and auth status only. Compare
+            # the safe words and preserve argument count after projection.
+            safe = {"--json", "--endpoint", "intent", "auth", "status", "--key"}
+            if rust:
+                assert all(arg in safe or arg == "[redacted]" for arg in argv)
+            event["argv"] = [arg if arg in safe else "[redacted]" for arg in argv]
+        if "error" in event:
+            if rust:
+                assert event["error"] == "[redacted]"
+            event["error"] = "[redacted]"
         if c4_reference:
             # The C4 pin predates the v2 envelope and keyed endpoint identity.
             for field in ("schema", "commandId", "endpointId"):
@@ -409,7 +422,9 @@ def compare(
                 if index == 0 and step.code == 0:
                     stdout = public_intent_output(stdout, compact=step.json_output)
                 runs.append((stdout, result.stderr, list(requests), state))
-            observed.append((runs, read_events(home, c4_reference=True)))
+            observed.append(
+                (runs, read_events(home, c4_reference=True, rust=index == 1))
+            )
         assert observed[0] == observed[1]
 
 
@@ -740,7 +755,9 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert result.stderr == b""
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
-            outputs.append((result.stdout, read_events(home, c4_reference=True)))
+            outputs.append(
+                (result.stdout, read_events(home, c4_reference=True, rust=index == 1))
+            )
         assert outputs[0] == outputs[1]
 
 
@@ -809,6 +826,20 @@ def test_cli_errors_share_one_envelope(
             )
             assert payload["error"].pop("hint") == expected_hint
             outputs.append(payload)
+        elif args[0] == "--bad-option":
+            if index == 0:
+                assert "--bad-option" in payload["error"]["message"]
+                payload["error"]["message"] = "No such option."
+            outputs.append(payload)
+        elif args[1:] == ("config", "get", "invalid"):
+            if index == 0:
+                message = payload["error"]["message"]
+                assert "Valid keys: " in message
+                payload["error"]["message"] = (
+                    "Invalid value for 'KEY': unknown setting. Valid keys: "
+                    + message.split("Valid keys: ", 1)[1]
+                )
+            outputs.append(payload)
         else:
             outputs.append(result.stdout)
     assert outputs[0] == outputs[1]
@@ -876,7 +907,7 @@ def test_expired_auth_status(
                 'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
             )
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        observed.append((payload, read_events(home)))
+        observed.append((payload, read_events(home, rust=index == 1)))
     assert observed[0] == observed[1]
 
 

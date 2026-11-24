@@ -221,7 +221,7 @@ impl Storage<'_> {
             if let StorageError::Session(SessionError(failure)) = &mut error
                 && failure.code == Code::SignedOut
             {
-                failure.hint = Some(hint(addr));
+                failure.hint = Some(hint(addr.filter(|addr| is_evm_address(addr))));
             }
             error
         })?;

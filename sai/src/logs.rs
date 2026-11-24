@@ -49,16 +49,12 @@ pub enum LogsCommand {
 }
 
 fn positive(raw: &str) -> Result<usize, String> {
-    let count: i128 = raw.trim().parse().map_err(|_| {
-        format!(
-            "Invalid value for '-n': {} is not a valid integer.",
-            sai_core::settings::repr(raw)
-        )
-    })?;
+    let count: i128 = raw
+        .trim()
+        .parse()
+        .map_err(|_| "Expected a positive integer.")?;
     if count < 1 {
-        return Err(format!(
-            "Invalid value for '-n': {count} is not in the range x>=1."
-        ));
+        return Err("Expected a positive integer.".into());
     }
     Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }

@@ -159,16 +159,18 @@ impl Accounts {
     fn find(&self, addr: &str) -> Result<String, SessionError> {
         let key = addr.to_lowercase();
         if self.sessions.contains_key(&key) {
-            Ok(key)
-        } else {
-            Err(SessionError(SaiError::new(
-                Code::InvalidRequest,
-                format!(
-                    "{addr} is not connected; run `sai auth list` to see connected \
-                 accounts, or sign in with `sai auth login NAME` or `sai auth import`"
-                ),
-            )))
+            return Ok(key);
         }
+        if !crate::keeper::is_evm_address(&key) {
+            return Err(SessionError(SaiError::new(
+                Code::InvalidRequest,
+                "Expected an EVM address for the account.",
+            )));
+        }
+        Err(SessionError(SaiError::new(
+            Code::InvalidRequest,
+            "That account is not connected; run `sai auth list` to see connected accounts, or sign in with `sai auth login NAME` or `sai auth import`",
+        )))
     }
 }
 

@@ -10,6 +10,7 @@ use crate::endpoint::Endpoint;
 const REDACTED: &str = "[redacted session token]";
 const REDACTED_HEX: &str = "[redacted hex]";
 const REDACTED_URL: &str = "[redacted url]";
+pub(super) const REDACTED_INPUT: &str = "[redacted]";
 const CUT: &str = "[cut]";
 const MAX_TEXT: usize = 2000;
 const MAX_UNTRUSTED: usize = 300;
@@ -22,13 +23,6 @@ static JWT: LazyLock<Regex> =
     LazyLock::new(|| regex(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"));
 static URL: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z][A-Za-z0-9+.-]*://\S*"));
 static URL_REST: LazyLock<Regex> = LazyLock::new(|| regex(r"(?s)[A-Za-z][A-Za-z0-9+.-]*://.*"));
-static DIAGNOSTIC_URL: LazyLock<Regex> = LazyLock::new(|| {
-    regex(concat!(
-        r"(?i)(?:^|[^a-z0-9_+.-])(",
-        r"(?:https?|wss?):\s+[/\\]\S*|[a-z][a-z0-9+.-]*:\S*)|",
-        r"([?&](?:api[_-]?key|(?:access[_-]?)?token)=\S+)",
-    ))
-});
 static HOST: LazyLock<Regex> =
     LazyLock::new(|| regex(r"\A(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])\z"));
 static LONG_HEX: LazyLock<Regex> = LazyLock::new(|| regex(r"(?:0x)?[0-9A-Fa-f]{100,}"));
@@ -38,41 +32,182 @@ fn regex(pattern: &str) -> Regex {
     Regex::new(pattern).expect("valid log redaction pattern")
 }
 
-/// Detect URL-shaped values, including malformed ones rejected by the CLI.
-pub fn contains_url(text: &str) -> bool {
-    diagnostic_urls(text).next().is_some()
+fn numeric_argument(value: &str) -> bool {
+    value.parse::<f64>().is_ok_and(f64::is_finite)
 }
 
-/// Detect URLs that include more than an origin in CLI diagnostics.
-pub fn contains_private_url(text: &str) -> bool {
-    diagnostic_urls(text).any(|url| origin(url) != url)
+fn safe_option_value(flag: &str, value: &str) -> bool {
+    match flag {
+        "--surface" => matches!(value, "cli" | "mcp" | "update"),
+        "--scope" => matches!(value, "user" | "project" | "local"),
+        "--client" => matches!(value, "claude" | "codex" | "cursor"),
+        "--side" => matches!(value, "long" | "short"),
+        "--type" => matches!(value, "market" | "limit" | "stop"),
+        "-n" | "--market" | "--amount" | "--leverage" | "--price" | "--slippage"
+        | "--take-profit" | "--stop-loss" => numeric_argument(value),
+        _ => false,
+    }
 }
 
-fn diagnostic_urls(text: &str) -> impl Iterator<Item = &str> {
-    DIAGNOSTIC_URL
-        .captures_iter(text)
-        .map(|matched| {
-            matched
-                .get(1)
-                .or_else(|| matched.get(2))
-                .expect("diagnostic URL capture")
-                .as_str()
-                .trim_end_matches(['.', ',', ':', ';', ')', '}', '\'', '"'])
+fn value_option(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--endpoint"
+            | "--ws-endpoint"
+            | "--lcd-endpoint"
+            | "--as"
+            | "--addr"
+            | "--key"
+            | "--page"
+            | "--dir"
+            | "--before"
+            | "--since"
+            | "--event"
+            | "--surface"
+            | "-n"
+            | "--scope"
+            | "--client"
+            | "--server"
+            | "--side"
+            | "--type"
+            | "--market"
+            | "--amount"
+            | "--leverage"
+            | "--price"
+            | "--slippage"
+            | "--take-profit"
+            | "--stop-loss"
+    )
+}
+
+fn switch_option(flag: &str) -> bool {
+    matches!(
+        flag,
+        "--json"
+            | "--help"
+            | "-h"
+            | "--version"
+            | "-V"
+            | "--skill"
+            | "--offline"
+            | "--force"
+            | "--no-fix"
+            | "--dry-run"
+            | "--all"
+            | "--reset-args"
+            | "--cancel-order"
+            | "--allow-concurrent-open"
+            | "--clear-take-profit"
+            | "--clear-stop-loss"
+    )
+}
+
+fn known_command(group: &str, word: &str) -> bool {
+    match group {
+        "" => matches!(
+            word,
+            "account"
+                | "auth"
+                | "config"
+                | "doctor"
+                | "intent"
+                | "logs"
+                | "market"
+                | "mcp"
+                | "skill"
+                | "trade"
+                | "watch"
+        ),
+        "account" => matches!(word, "positions" | "history" | "balances" | "overview"),
+        "auth" => matches!(
+            word,
+            "login" | "import" | "renew" | "status" | "list" | "use" | "logout"
+        ),
+        "config" => matches!(word, "get" | "set" | "unset" | "list"),
+        "intent" => matches!(word, "local" | "status" | "wait"),
+        "logs" => matches!(word, "path" | "tail" | "intent" | "run" | "stats"),
+        "market" => matches!(word, "list" | "prices"),
+        "mcp" => matches!(word, "list" | "install"),
+        "skill" => matches!(word, "show" | "source" | "install"),
+        "trade" => matches!(word, "open" | "close" | "cancel" | "tpsl" | "leverage"),
+        "watch" => matches!(word, "positions" | "balances" | "price"),
+        _ => false,
+    }
+}
+
+fn safe_argv(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut group = String::new();
+    let mut command = String::new();
+    let mut position = 0;
+    let mut pending = None;
+    let mut opaque = false;
+    args.into_iter()
+        .take(MAX_ITEMS)
+        .map(|arg| {
+            let (flag, attached) = arg
+                .split_once('=')
+                .map_or((arg.as_str(), None), |(flag, value)| (flag, Some(value)));
+            let value_flag = value_option(flag);
+            let previous = pending.take();
+            if opaque {
+                return REDACTED_INPUT.into();
+            }
+            if arg == "--" {
+                opaque = true;
+                return arg;
+            }
+            if value_flag || switch_option(flag) {
+                if let Some(value) = attached {
+                    return if safe_option_value(flag, value) {
+                        arg
+                    } else {
+                        format!("{flag}={REDACTED_INPUT}")
+                    };
+                }
+                pending = value_flag.then(|| flag.to_owned());
+                return arg;
+            }
+            if let Some(flag) = previous {
+                return if safe_option_value(&flag, &arg) {
+                    arg
+                } else {
+                    REDACTED_INPUT.into()
+                };
+            }
+            if position == 0 && command.is_empty() && known_command(&group, &arg) {
+                if group.is_empty() {
+                    group.clone_from(&arg);
+                } else {
+                    command.clone_from(&arg);
+                }
+                return arg;
+            }
+            let safe = position == 0
+                && match (group.as_str(), command.as_str()) {
+                    ("trade", "close" | "cancel" | "tpsl" | "leverage") | ("watch", "price") => {
+                        numeric_argument(&arg)
+                    }
+                    ("config", "get" | "set" | "unset") => {
+                        crate::settings::Key::parse(&arg).is_ok()
+                    }
+                    _ => false,
+                };
+            position += 1;
+            if safe { arg } else { REDACTED_INPUT.into() }
         })
-        // Leave ordinary labels and scheme-only guidance such as `https://` intact.
-        .filter(|url| {
-            url.starts_with(['?', '&'])
-                || url
-                    .split_once(':')
-                    .is_some_and(|(_, suffix)| !matches!(suffix, "" | "//"))
-        })
+        .collect()
 }
 
-fn safe_argument(text: &str) -> &str {
-    if diagnostic_urls(text).any(|url| URL.find(url).is_none_or(|found| found.start() != 0)) {
-        REDACTED_URL
+fn endpoint_field(key: &str) -> bool {
+    matches!(key, "endpoint" | "keeper" | "websocket" | "lcd")
+}
+
+fn public_endpoint(value: &str) -> String {
+    let site = origin(value);
+    if site == REDACTED_URL {
+        REDACTED_INPUT.into()
     } else {
-        text
+        site
     }
 }
 
@@ -80,7 +215,6 @@ fn safe_argument(text: &str) -> &str {
 pub enum Field {
     Text(String),
     Untrusted(String),
-    Arg(String),
     Endpoint(String),
     EndpointIdentity([u8; 32]),
     Array(Vec<Field>),
@@ -106,7 +240,7 @@ impl From<Value> for Field {
 
 impl Field {
     pub fn argv(args: impl IntoIterator<Item = String>) -> Self {
-        Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Arg).collect())
+        Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Text).collect())
     }
 
     pub fn endpoint_identity(value: &str) -> Self {
@@ -121,7 +255,6 @@ impl Field {
             Self::Untrusted(text) => Self::Untrusted(copy_text(&text, budget, tokens)),
             Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
             Self::EndpointIdentity(_) => self,
-            Self::Arg(text) => Self::Arg(copy_text(safe_argument(&text), budget, tokens)),
             Self::Scalar(Value::Number(number))
                 if number.is_i64()
                     || number.is_u64()
@@ -148,7 +281,9 @@ impl Field {
                     let item = if budget.full() {
                         Self::Text(CUT.into())
                     } else {
-                        value.snapshot(budget, tokens, depth + 1)
+                        value
+                            .private_field(&key)
+                            .snapshot(budget, tokens, depth + 1)
                     };
                     copied.push((key, item));
                 }
@@ -170,11 +305,35 @@ impl Field {
         }
     }
 
+    fn private_field(self, key: &str) -> Self {
+        match (key, self) {
+            ("argv", Self::Array(args)) => Self::Array(
+                safe_argv(args.into_iter().map(|field| match field {
+                    Self::Text(text) => text,
+                    _ => REDACTED_INPUT.into(),
+                }))
+                .into_iter()
+                .map(Self::Text)
+                .collect(),
+            ),
+            ("argv" | "error" | "errorMsg" | "errorMessage", _) => {
+                Self::Text(REDACTED_INPUT.into())
+            }
+            (key, field) if endpoint_field(key) => match field {
+                Self::Text(text) | Self::Untrusted(text) | Self::Endpoint(text) => {
+                    Self::Text(public_endpoint(&text))
+                }
+                Self::Object(_) => field,
+                _ => Self::Text(REDACTED_INPUT.into()),
+            },
+            (_, field) => field,
+        }
+    }
+
     pub(super) fn clean(self, tokens: &[String]) -> Value {
         match self {
             Self::Text(text) => Value::String(scrub(&text, tokens, &URL, false)),
             Self::Untrusted(text) => Value::String(scrub(&text, tokens, &URL_REST, true)),
-            Self::Arg(text) => Value::String(scrub(safe_argument(&text), tokens, &URL_REST, false)),
             Self::Endpoint(text) => Value::String(origin(&text)),
             Self::EndpointIdentity(_) => Value::Null,
             Self::Array(items) => {

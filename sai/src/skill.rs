@@ -10,8 +10,7 @@ use std::{
 use clap::Subcommand;
 use sai_core::{
     errors::{Code, SaiError},
-    interrupt, log,
-    settings::repr,
+    interrupt,
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -50,10 +49,9 @@ impl SkillCommand {
                 if let Some(path) = &target
                     && path.is_file()
                 {
-                    return Err(SaiError::usage(format!(
-                        "Invalid value for '--dir': Directory {} is a file.",
-                        repr(&path.to_string_lossy())
-                    )));
+                    return Err(SaiError::usage(
+                        "Invalid value for '--dir': expected a directory.",
+                    ));
                 }
                 let target = match target {
                     Some(path) => expand_home(path)?,
@@ -114,13 +112,8 @@ pub fn show(page: Option<&str>) -> Result<(), SaiError> {
             } else {
                 "is ambiguous"
             };
-            let subject = if log::contains_url(name) {
-                "Skill page".to_owned()
-            } else {
-                format!("Skill page {}", repr(name))
-            };
             return Err(skill_error(format!(
-                "{subject} {problem}. Pages: {}",
+                "Skill page for '--page' {problem}. Pages: {}",
                 known.join(", ")
             )));
         };
@@ -302,16 +295,15 @@ fn exchange_dir(target: &Path, staging: tempfile::TempDir) -> Result<(), SaiErro
     }
     #[cfg(not(any(target_os = "linux", target_vendor = "apple", target_os = "redox")))]
     {
-        let _ = staging;
-        Err(skill_error(format!(
-            "Atomic replacement is unavailable for {}. Move it aside and retry.",
-            target.display()
-        )))
+        let _ = (staging, target);
+        Err(skill_error(
+            "Atomic replacement is unavailable for the skill directory. Move it aside and retry.",
+        ))
     }
 }
 
 fn action(target: &Path, force: bool) -> Result<&'static str, SaiError> {
-    let where_ = target.display();
+    let where_ = "The skill directory";
     let info = match fs::symlink_metadata(target) {
         Ok(info) => info,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -323,11 +315,9 @@ fn action(target: &Path, force: bool) -> Result<&'static str, SaiError> {
         if force {
             return Ok("replaced");
         }
-        let link = fs::read_link(target).map_err(io_error)?;
-        return Err(skill_error(format!(
-            "{where_} is a symlink to {}, so another tool manages it. Pass --force to replace the link with a copy; the link's target is left untouched.",
-            link.display()
-        )));
+        return Err(skill_error(
+            "The skill directory is a symlink. Pass --force to replace the link with a copy. The link target stays untouched.",
+        ));
     }
     if !info.is_dir() {
         return Err(skill_error(format!(
@@ -364,15 +354,8 @@ fn action(target: &Path, force: bool) -> Result<&'static str, SaiError> {
             )));
         }
         if !force {
-            let shown = changed
-                .iter()
-                .take(5)
-                .map(|path| path.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let more = if changed.len() > 5 { ", ..." } else { "" };
             return Err(skill_error(format!(
-                "{where_} differs from the packaged skill in {} file(s): {shown}{more}. Pass --force to replace the whole directory.",
+                "{where_} differs from the packaged skill in {} file(s). Pass --force to replace the whole directory.",
                 changed.len()
             )));
         }

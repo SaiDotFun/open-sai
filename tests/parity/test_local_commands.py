@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import stat
 import subprocess
@@ -988,6 +989,13 @@ def test_local_usage_matches_click(
                 b"Read earlier events before this UTC timestamp.",
                 b"Resume from a cursor or read before a UTC timestamp.",
             )
+        if args[:2] == ("logs", "tail"):
+            option = args[2].encode()
+            lines = stderr.splitlines(keepends=True)
+            assert lines[-1].startswith(b"Error: Invalid value for '" + option + b"'")
+            if index == 0:
+                lines[-1] = b"Error: Invalid value for '" + option + b"'.\n"
+            stderr = b"".join(lines)
         outputs.append((result.returncode, result.stdout, stderr))
     assert outputs[0] == outputs[1]
 
@@ -1113,6 +1121,10 @@ def test_rejected_values_hide_credentials_in_output_and_logs(
         f"https:fixture.invalid/private?api_key={key}",
         f"wss:/fixture.invalid/{key}",
         f"endpoint=fixture.invalid/private?api_key={key}",
+        f"//127.0.0.1/private?key={key}",
+        f"//127.0.0.1/private?api_key={key}",
+        f"https:/127.0.0.1/private?key={key}",
+        *rejected_value_samples(),
     )
     loopback = (
         "--endpoint",
@@ -1134,9 +1146,50 @@ def test_rejected_values_hide_credentials_in_output_and_logs(
                 logging="1",
             )
             assert result.returncode != 0, (index, mode)
-            assert key.encode() not in result.stdout + result.stderr, (index, mode)
-            for log in (root / "sai-home/logs").glob("*.jsonl"):
-                assert key.encode() not in log.read_bytes(), (index, mode, log.name)
+            for marker in (key.encode(), b"rev6-property-secret"):
+                assert marker not in result.stdout + result.stderr, (index, mode)
+                for log in (root / "sai-home/logs").rglob("*"):
+                    if log.is_file():
+                        assert marker not in log.read_bytes(), (index, mode, log.name)
+
+
+def rejected_value_samples() -> tuple[str, ...]:
+    randomizer = random.Random(126)
+    alphabet = "abcdefghijklmnopqrstuvwxyz0123456789:/?&= ._'\"[]+-"
+    return tuple(
+        "".join(randomizer.choices(alphabet, k=12))
+        + "key=rev6-property-secret"
+        + "".join(randomizer.choices(alphabet, k=12))
+        for _ in range(8)
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("config", "list"),
+        ("auth", "status"),
+        ("auth", "list"),
+        ("market", "list"),
+        ("market", "prices"),
+        ("logs", "path"),
+        ("mcp", "list"),
+    ],
+)
+def test_unexpected_flags_do_not_echo_generated_credentials(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    command: tuple[str, ...],
+) -> None:
+    _, rust = local_pair
+    for index, value in enumerate(rejected_value_samples()):
+        root = tmp_path / str(index)
+        result = invoke(rust, root, *command, "--unexpected=" + value, logging="1")
+        assert result.returncode == 2
+        assert b"rev6-property-secret" not in result.stdout + result.stderr
+        for path in (root / "sai-home/logs").rglob("*"):
+            if path.is_file():
+                assert b"rev6-property-secret" not in path.read_bytes()
 
 
 @pytest.mark.parametrize(

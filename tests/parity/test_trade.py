@@ -607,7 +607,7 @@ def test_non_ascii_market_id_is_an_accepted_parity_divergence(
                 assert code == 2
                 assert (
                     result["error"]["message"]
-                    == "Invalid value for '--market': '٣' is not a valid integer."
+                    == "Invalid value for '--market': expected an integer."
                 )
             assert not endpoints.wire
             assert not rows(home)
