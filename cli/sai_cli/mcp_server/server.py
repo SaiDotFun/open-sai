@@ -15,19 +15,22 @@ import asyncio
 import json
 import logging
 import os
+import signal
 import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextvars import copy_context
 from functools import partial
-from threading import BoundedSemaphore
+from queue import SimpleQueue
+from threading import BoundedSemaphore, Thread
 from typing import Any, Literal
 
-from anyio import BrokenResourceError
+from anyio import AsyncFile, BrokenResourceError
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.server.stdio import stdio_server
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import ConfigDict, ValidationError
 
@@ -755,7 +758,64 @@ TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
 TRADE_TOOL_NAMES = frozenset(function.__name__ for function, _ in TRADE_TOOLS)
 
 
+class StdioInput(AsyncFile[str]):
+    """Read stdin without making event loop shutdown wait for the next line."""
+
+    def __init__(self) -> None:
+        # The reader owns its file, so a blocked read cannot hold a lock on
+        # Python's standard streams when the interpreter exits.
+        super().__init__(
+            os.fdopen(os.dup(sys.stdin.fileno()), encoding="utf-8", errors="replace")
+        )
+        self.requests: SimpleQueue[Future[str] | None] = SimpleQueue()
+        Thread(target=self.read_lines, daemon=True, name="sai-mcp-stdin").start()
+
+    def read_lines(self) -> None:
+        with self.wrapped as stdin:
+            while (request := self.requests.get()) is not None:
+                if request.set_running_or_notify_cancel():
+                    try:
+                        request.set_result(stdin.readline())
+                    except OSError as exc:
+                        request.set_exception(exc)
+
+    async def readline(self) -> str:
+        request: Future[str] = Future()
+        self.requests.put(request)
+        return await asyncio.wrap_future(request)
+
+    def stop(self) -> None:
+        self.requests.put(None)
+
+
 class SaiMCP(FastMCP):
+    async def run_stdio_async(self) -> None:
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        assert task is not None
+        terminating = False
+
+        def terminate(_signum: int, _frame: object) -> None:
+            nonlocal terminating
+            terminating = True
+            loop.call_soon_threadsafe(task.cancel)
+
+        previous = signal.signal(signal.SIGTERM, terminate)
+        try:
+            stdin = StdioInput()
+            try:
+                async with stdio_server(stdin=stdin) as (read, write):
+                    await self._mcp_server.run(
+                        read, write, self._mcp_server.create_initialization_options()
+                    )
+            finally:
+                stdin.stop()
+        except asyncio.CancelledError:
+            if not terminating:
+                raise
+        finally:
+            signal.signal(signal.SIGTERM, previous)
+
     """FastMCP that checks the session before a trade tool's arguments.
 
     FastMCP validates arguments before the tool runs, so without this a

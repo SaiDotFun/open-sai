@@ -6,6 +6,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
@@ -1493,6 +1495,40 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
     assert info["trading"]["reason"] == "signed-out"
     assert "agent client should launch it" not in stderr
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
+@pytest.mark.parametrize("stop", [signal.SIGINT, signal.SIGTERM])
+def test_sai_mcp_serve_stops_while_stdin_is_open(tmp_path, stop):
+    initialize = {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    }
+    with subprocess.Popen(
+        [*sai_command(), "mcp", "serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"SAI_HOME": str(tmp_path), "PATH": os.defpath},
+        text=True,
+    ) as process:
+        assert process.stdin is not None and process.stdout is not None
+        assert process.stderr is not None
+        try:
+            process.stdin.write(rpc(1, "initialize", initialize))
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0], "MCP did not reply"
+            assert json.loads(process.stdout.readline())["id"] == 1
+
+            process.send_signal(stop)
+            code = process.wait(timeout=5)
+            assert code == 0, process.stderr.read()
+            assert process.stdout.read() == ""
+            assert process.stderr.read() == ""
+        finally:
+            if process.poll() is None:
+                process.kill()
 
 
 def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
