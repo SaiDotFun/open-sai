@@ -759,6 +759,22 @@ def test_verified_lcd_only_assigns_times_for_its_own_chain(replay):
     assert chain.block_time(49819589) is None
 
 
+def test_future_lcd_block_time_has_zero_source_age(replay):
+    fetched = datetime.now(UTC)
+    future = (fetched + timedelta(minutes=5)).isoformat()
+    replay["riskTime"] = future
+    chain = overview._chain_read(replay["config"])
+    assert chain is not None
+    assert overview._block_source(
+        {"block": RISK_BLOCK}, fetched.isoformat(), chain.block_time
+    ) == {"sourceBlock": RISK_BLOCK, "sourceAt": future, "sourceAgeSeconds": 0.0}
+
+    membership = mcp(replay, addr=ADDR)["positions"]["membership"]
+    assert membership["status"] == "stale"
+    assert membership["sourceAt"] == future
+    assert membership["sourceAgeSeconds"] == 0.0
+
+
 @pytest.mark.parametrize("settles", [True, False])
 def test_pagination_rechecks_membership_after_a_close_between_pages(replay, settles):
     template, _ = populate_trades(replay)

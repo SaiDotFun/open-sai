@@ -95,7 +95,7 @@ def _age(at: datetime | None, fetched: str) -> dict[str, Any]:
     return {
         "sourceAt": at.isoformat() if at is not None else None,
         "sourceAgeSeconds": (
-            round((datetime.fromisoformat(fetched) - at).total_seconds(), 3)
+            max(0.0, round((datetime.fromisoformat(fetched) - at).total_seconds(), 3))
             if at is not None
             else None
         ),
