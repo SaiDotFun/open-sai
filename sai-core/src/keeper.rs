@@ -88,6 +88,7 @@ impl<'a> Keeper<'a> {
             [
                 ("operation", json!(queries::operation(query)).into()),
                 ("endpoint", Field::Endpoint(self.endpoint.into())),
+                ("endpointId", Field::endpoint_identity(self.endpoint)),
                 ("addr", json!(addr).into()),
                 ("authenticated", json!(token.is_some()).into()),
                 ("durationMs", json!(duration).into()),

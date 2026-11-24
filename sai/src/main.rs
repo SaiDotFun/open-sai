@@ -101,6 +101,13 @@ fn main() -> process::ExitCode {
             .ok()
             .cloned()
             .and_then(LogWriter::start)
+            .map(|writer| {
+                if matches!(command.split(' ').next(), Some("market" | "account")) {
+                    writer.with_v2_command()
+                } else {
+                    writer
+                }
+            })
     };
     let command_field = || {
         if command.is_empty() {
