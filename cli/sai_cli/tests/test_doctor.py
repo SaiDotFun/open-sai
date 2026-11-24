@@ -386,8 +386,11 @@ def test_doctor_leaves_a_home_with_only_foreign_config_at_0755(isolated_home):
         ("sessions.lock", b""),
         ("sessions.lock", b"\0"),
         ("sessions.json", b""),
+        ("sessions.json", b'{"saved_filters":[]}'),
+        ("sessions.json", b'{"version":3,"nonce":"x","ciphertext":"x"}'),
         ("session.json", b""),
         ("intents.sqlite3", b""),
+        ("intents.sqlite3", b"not a database"),
         ("history", b"config list\n"),
     ],
 )
@@ -413,6 +416,42 @@ def test_doctor_needs_more_than_trader_artifacts(
         assert check.fix == doctor.SAI_HOME_MODE_FIX
         assert check.changes == []
         assert isolated_home.stat().st_mode & 0o777 == 0o755
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "CREATE TABLE saved_filters (name TEXT)",
+        (
+            "CREATE TABLE intents (id INTEGER, endpoint TEXT NOT NULL,"
+            " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+            " entity TEXT NOT NULL)"
+        ),
+    ],
+)
+def test_doctor_leaves_a_foreign_sqlite_ledger_unmodified(isolated_home, schema):
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+    trader = isolated_home / "trader"
+    trader.mkdir(mode=0o700)
+    path = trader / "intents.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(schema)
+    connection.close()
+    path.chmod(0o600)
+    before = path.read_bytes()
+
+    for flags in [("--no-fix",), (), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == 1
+        checks = {c["id"]: c for c in json.loads(output)["error"]["details"]["checks"]}
+        assert checks["home"]["status"] == "warn"
+        assert checks["home"]["fix"] == doctor.SAI_HOME_MODE_FIX
+        assert checks["home"]["changes"] == []
+        assert checks["intents"]["status"] == "fail"
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+        assert path.read_bytes() == before
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
@@ -891,7 +930,7 @@ def add_unknown(key: str, account: str = ADDR, endpoint: str = ENDPOINT) -> None
 def test_snapshot_retries_when_the_ledger_changes_during_the_copy(monkeypatch):
     save()
     path = ledger([])
-    copy = doctor.shutil.copyfile
+    copy = doctor.shutil.copyfileobj
     writes = iter(["k-late"])
 
     def copy_then_write(source, target):
@@ -902,7 +941,7 @@ def test_snapshot_retries_when_the_ledger_changes_during_the_copy(monkeypatch):
             add_unknown(key)
         return result
 
-    monkeypatch.setattr(doctor.shutil, "copyfile", copy_then_write)
+    monkeypatch.setattr(doctor.shutil, "copyfileobj", copy_then_write)
     check = one(doctor.check_intents, ctx())
     assert check.details["blocking"] == ["k-late"]
     assert path.is_file()
@@ -910,7 +949,7 @@ def test_snapshot_retries_when_the_ledger_changes_during_the_copy(monkeypatch):
 
 def test_ledger_that_keeps_changing_warns(monkeypatch):
     ledger([])
-    copy = doctor.shutil.copyfile
+    copy = doctor.shutil.copyfileobj
     count = iter(range(100))
 
     def copy_then_write(source, target):
@@ -919,7 +958,7 @@ def test_ledger_that_keeps_changing_warns(monkeypatch):
         add_unknown(f"k{next(count)}", account=OTHER)
         return result
 
-    monkeypatch.setattr(doctor.shutil, "copyfile", copy_then_write)
+    monkeypatch.setattr(doctor.shutil, "copyfileobj", copy_then_write)
     check = one(doctor.check_intents, ctx())
     assert check.status == "warn"
     assert "changed while reading" in check.summary

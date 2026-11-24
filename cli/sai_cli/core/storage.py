@@ -141,6 +141,26 @@ def _read_envelope(path: Path) -> dict[str, Any] | None:
     return envelope if isinstance(envelope, dict) else {}
 
 
+def is_session_envelope(name: str, value: object) -> bool:
+    """Recognize a supported session format without unlocking any tokens."""
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version")
+    if type(version) is not int:
+        return False
+    if name == "session.json":
+        if version != 2 or value.get("backend") != "test":
+            return False
+    elif version != _VERSION:
+        return False
+    try:
+        nonce = base64.b64decode(value["nonce"], validate=True)
+        ciphertext = base64.b64decode(value["ciphertext"], validate=True)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return len(nonce) == 12 and len(ciphertext) > 16
+
+
 def _load_v2(fields: dict[str, Any]) -> dict[str, Any]:
     """Read a version 2 single-session file as a version 3 account set.
 

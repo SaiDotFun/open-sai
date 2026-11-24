@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Any
+from typing import Any, BinaryIO
 
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
@@ -473,6 +473,35 @@ def tighten(
     return changes, failed
 
 
+@contextmanager
+def open_regular(path: str | Path, *, dir_fd: int | None = None) -> Generator[BinaryIO]:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    with os.fdopen(os.open(path, flags, dir_fd=dir_fd), "rb") as source:
+        if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+            raise OSError("Expected a regular file")
+        yield source
+
+
+def trader_file_is_evidence(fd: int, name: str, info: os.stat_result) -> bool:
+    if not info.st_size or info.st_nlink != 1:
+        return False
+    try:
+        if name == "intents.sqlite3":
+            with ledger_snapshot(Path(name), dir_fd=fd) as connection:
+                version = connection.execute("PRAGMA user_version").fetchone()[0]
+                if not matches_ledger_schema(connection, version):
+                    return False
+            return os.path.samestat(
+                info, os.stat(name, dir_fd=fd, follow_symlinks=False)
+            )
+        with open_regular(name, dir_fd=fd) as source:
+            return os.path.samestat(info, os.fstat(source.fileno())) and (
+                storage.is_session_envelope(name, json.load(source))
+            )
+    except (LedgerChanged, OSError, RecursionError, ValueError, sqlite3.Error):
+        return False
+
+
 def profile_has_data(
     fd: int, owner: int, directory: str = "", *, allow_loose_trader: bool = False
 ) -> bool | None:
@@ -509,11 +538,11 @@ def profile_has_data(
         ):
             return None
         elif (
-            directory == "trader"
+            not has_data
+            and directory == "trader"
             and name in ("intents.sqlite3", "sessions.json", "session.json")
-            and info.st_size > 0
         ):
-            has_data = True
+            has_data = trader_file_is_evidence(fd, name, info)
     return has_data
 
 
@@ -817,12 +846,16 @@ class LedgerChanged(Exception):
     """Another process kept writing the ledger while doctor copied it."""
 
 
-def ledger_fingerprint(path: Path) -> list[tuple[int, int, int] | None]:
+def ledger_fingerprint(
+    path: Path, *, dir_fd: int | None = None
+) -> list[tuple[int, int, int] | None]:
     """Size, mtime, and inode of the ledger and each journal, or None."""
     marks: list[tuple[int, int, int] | None] = []
     for suffix in ("", *LEDGER_JOURNALS):
         try:
-            info_ = path.with_name(path.name + suffix).stat()
+            info_ = os.stat(
+                path.with_name(path.name + suffix), dir_fd=dir_fd, follow_symlinks=False
+            )
         except FileNotFoundError:
             marks.append(None)
             continue
@@ -831,7 +864,9 @@ def ledger_fingerprint(path: Path) -> list[tuple[int, int, int] | None]:
 
 
 @contextmanager
-def ledger_snapshot(path: Path) -> Generator[sqlite3.Connection]:
+def ledger_snapshot(
+    path: Path, *, dir_fd: int | None = None
+) -> Generator[sqlite3.Connection]:
     """Read a private copy of the ledger at PATH with its WAL or rollback
     journal.
 
@@ -848,14 +883,20 @@ def ledger_snapshot(path: Path) -> Generator[sqlite3.Connection]:
     with tempfile.TemporaryDirectory(prefix="sai-doctor-") as temp:
         copy = Path(temp) / path.name
         for _attempt in range(SNAPSHOT_ATTEMPTS):
-            before = ledger_fingerprint(path)
+            before = ledger_fingerprint(path, dir_fd=dir_fd)
             for suffix in ("", *LEDGER_JOURNALS):
                 source = path.with_name(path.name + suffix)
                 target = copy.with_name(copy.name + suffix)
                 target.unlink(missing_ok=True)
-                if source.is_file():
-                    shutil.copyfile(source, target)
-            if ledger_fingerprint(path) == before:
+                try:
+                    with (
+                        open_regular(source, dir_fd=dir_fd) as infile,
+                        target.open("wb") as outfile,
+                    ):
+                        shutil.copyfileobj(infile, outfile)
+                except FileNotFoundError:
+                    continue
+            if ledger_fingerprint(path, dir_fd=dir_fd) == before:
                 break
         else:
             raise LedgerChanged
@@ -866,23 +907,46 @@ def ledger_snapshot(path: Path) -> Generator[sqlite3.Connection]:
             connection.close()
 
 
+def matches_ledger_schema(connection: sqlite3.Connection, version: int) -> bool:
+    if version not in (0, storage.SCHEMA_VERSION):
+        return False
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents'"
+    ).fetchone()
+    if table is None:
+        return False
+    columns = {
+        name: (kind.upper(), not_null, primary_key)
+        for _, name, kind, not_null, _, primary_key in connection.execute(
+            "PRAGMA table_info(intents)"
+        )
+    }
+    expected = {
+        name: ("TEXT", 1, 0)
+        for name in ("endpoint", "account", "kind", "status", "entity")
+    }
+    expected["id"] = ("TEXT", 0, 1)
+    if version >= 1:
+        expected["created_at"] = ("REAL", 0, 0)
+    if "keeper_status" in columns:
+        expected["keeper_status"] = ("TEXT", 0, 0)
+    return columns == expected
+
+
 def read_ledger(path: Path) -> tuple[int, str, list[tuple[str, str, str]]]:
     """Return the ledger's schema version, quick_check result, and
     (key, endpoint, account) for each unknown intent."""
     with ledger_snapshot(path) as connection:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
         integrity = connection.execute("PRAGMA quick_check").fetchone()[0]
-        tables = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents'"
-        ).fetchone()
-        rows = (
-            connection.execute(
-                "SELECT id, endpoint, account FROM intents"
-                " WHERE status='unknown' ORDER BY rowid DESC"
-            ).fetchall()
-            if tables and integrity == "ok"
-            else []
-        )
+        if integrity != "ok" or version > storage.SCHEMA_VERSION:
+            return version, integrity, []
+        if not matches_ledger_schema(connection, version):
+            raise sqlite3.DatabaseError("Unrecognized Sai intent schema")
+        rows = connection.execute(
+            "SELECT id, endpoint, account FROM intents"
+            " WHERE status='unknown' ORDER BY rowid DESC"
+        ).fetchall()
     return version, integrity, rows
 
 
