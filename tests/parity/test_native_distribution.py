@@ -90,14 +90,14 @@ def verify_mcp_startup(distribution: SimpleNamespace) -> None:
             send.flush()
             reply = json.loads(receive.line("MCP initialize"))
     except (d.rehearsal.RehearsalError, BrokenPipeError):
-        # C8 adds this module. Once it lands, even a missing command is a
-        # failure. Until then, only the known missing-command error is xfail.
+        # MCP registration is available before C8 adds the serve subcommand.
+        # Once the server module lands, a missing subcommand fails this test.
         if not (ROOT / "sai" / "src" / "mcp.rs").is_file():
             probe = d.tool.run("Check missing MCP command", *command, check=False)
             if (
                 probe.returncode == 2
                 and not probe.stdout
-                and "No such command 'mcp'" in probe.stderr
+                and "No such command 'serve'." in probe.stderr
             ):
                 pytest.xfail(MCP_PENDING)
         raise
