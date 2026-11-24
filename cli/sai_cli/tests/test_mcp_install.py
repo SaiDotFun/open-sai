@@ -1429,6 +1429,30 @@ def test_client_failure_keeps_config_values_out_of_output(
     assert SECRET not in result.output and OTHER not in result.output
 
 
+def test_codex_first_install_accepts_a_startup_warning_before_not_found(env: Env):
+    warning = (
+        "WARNING: proceeding, even though we could not create PATH aliases: "
+        "Read-only file system (os error 30)"
+    )
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "    if entry is None:\n",
+            f"    if entry is None:\n        print({warning!r}, file=sys.stderr)\n",
+        ),
+    )
+
+    result = invoke("mcp", "install", "codex")
+
+    assert result.exit_code == 0, result.output
+    assert actions(result) == {"codex": "added"}
+    entries = tomlkit.parse(env.codex_path().read_text())["mcp_servers"]
+    assert set(entries) == {"sai"}
+    assert entries["sai"]["command"] == str(env.sai)
+    assert env.calls() == GETS + LEGACY_GETS + CHECK
+    assert warning not in result.output
+
+
 @pytest.mark.parametrize(
     ("exit_code", "stdout", "stderr"),
     [
@@ -1436,6 +1460,8 @@ def test_client_failure_keeps_config_values_out_of_output(
         (1, "", "Error: No MCP server named 'sai' found."),
         (7, "", f"Error: No MCP server named '{OLD_COMMAND}' found."),
         (1, "Config I/O error", f"Error: No MCP server named '{OLD_COMMAND}' found."),
+        (1, "", f"I/O error\nError: No MCP server named '{OLD_COMMAND}' found."),
+        (1, "", f"WARNING: I/O diagnostic contains no MCP server text. TOKEN={SECRET}"),
         (0, "{}", ""),
     ],
 )

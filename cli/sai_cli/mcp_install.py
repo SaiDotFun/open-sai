@@ -637,10 +637,16 @@ class Codex(Client):
             ) from None
         if done.returncode != 0:
             missing = f"Error: No MCP server named '{name}' found.".encode()
+            # Codex can warn about PATH alias initialization before the lookup.
+            diagnostics = [
+                line
+                for line in done.stderr.splitlines()
+                if line.strip() and not line.startswith(b"WARNING: ")
+            ]
             if (
                 done.returncode == 1
                 and not done.stdout.strip()
-                and done.stderr.strip() == missing
+                and diagnostics == [missing]
             ):
                 return None
             raise ClientError(
