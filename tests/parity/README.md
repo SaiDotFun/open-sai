@@ -34,9 +34,8 @@ The intent wait and trade `--wait` replays use Python commit
 `bdc11da6c9938aa0371835d921f27d45daa77c36`, the main merge of PR #70. Set the
 reference launcher separately from the C4 parity reference. The cancel tests
 compare the Keeper route, LCD checks, submission, and wait requests. They
-also check that a filled target produces zero mutations. These cases are
-waiting on the shared pending-order preflight in PR #117. The dry-run case
-compares each CLI with and without `--wait`.
+also check that a filled target produces zero mutations for both submit
+modes. The dry-run case compares each CLI with and without `--wait`.
 
 ```sh
 SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \

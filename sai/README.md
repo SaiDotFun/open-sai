@@ -79,11 +79,15 @@ after `just rust-build` to compare `sai intent status` against the Python
 package in this checkout. The tests reuse the recorded Keeper outcomes
 and compare request bytes and counts, ledger rows, and log events.
 
-The C7a trade cases and digest fixtures use Python commit
+The C7a open and close cases and digest fixtures use Python commit
 `ea09f0d417a53a71079bb8c5e426005fa29051a4`. Set `SAI_PARITY_C7_PYTHON` to
 the absolute path of a `sai` binary installed from that checkout when
 running `pytest tests/parity/test_trade.py` with `SAI_PARITY_BIN`.
-Without that override the tests use Python from the current workspace.
+Without that override the open and close tests use Python from the current
+workspace. The cancellation cases use Python commit
+`bdc11da6c9938aa0371835d921f27d45daa77c36`. Set `SAI_PARITY_WAIT_PYTHON` to
+the absolute path of its `sai` launcher. Cancellation and wait tests share
+this checkout in CI.
 
 Native archives and compatible shim wheels ship on the existing
 `sai-cli/v*` tags with SHA-256 checksums. Each shim version fetches and

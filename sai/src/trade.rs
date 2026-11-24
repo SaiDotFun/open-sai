@@ -126,7 +126,16 @@ pub fn run(
         local::storage_event_with_endpoint(events, event, Some(settings.endpoint()))
     };
     let storage = Storage::new(&env.home).with_event_sink(&log_storage);
-    let trading = Trading::new(settings.endpoint(), &storage, events);
+    let trading = Trading::new(settings.endpoint(), &storage, events)
+        .with_lcd_endpoint(settings.lcd_endpoint());
+    let cancelling = matches!(
+        command,
+        TradeCommand::Cancel { .. }
+            | TradeCommand::Close {
+                cancel_order: true,
+                ..
+            }
+    );
     let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price) = match command {
         TradeCommand::Open(open) => (
             open.preview()?,
@@ -155,10 +164,12 @@ pub fn run(
     };
     let session = match trading.load_session(account) {
         Ok(session) => Some(session),
-        Err(error) if dry_run && account.is_none() && session_error(error.code) => None,
+        Err(error) if dry_run && !cancelling && account.is_none() && session_error(error.code) => {
+            None
+        }
         Err(error) => return Err(error),
     };
-    if dry_run {
+    if dry_run && !cancelling {
         local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
         return Ok(ExitCode::Ok);
     }
@@ -167,6 +178,13 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|_| SaiError::internal())?;
+    if dry_run {
+        local::emit(
+            &runtime.block_on(trading.cancel_preview(&session, &preview))?,
+            json,
+        )?;
+        return Ok(ExitCode::Ok);
+    }
     let endpoint = settings.endpoint();
     let addr = session.addr();
     let reservation = OnceLock::<String>::new();

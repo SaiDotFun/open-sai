@@ -56,9 +56,6 @@ CONTRACT = "nibi1contract"
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 SMART_QUERY = f"/cosmwasm/wasm/v1/contract/{CONTRACT}/smart/"
 ROUTE = {"enabled": True, "chainId": "cataclysm-1", "contractAddress": CONTRACT}
-WAITING_FOR_CANCEL_GUARD = pytest.mark.xfail(
-    strict=True, reason="Waiting on PR #117 for the shared pending-order preflight"
-)
 MARKETS = {
     "data": {
         "perp": {
@@ -190,16 +187,7 @@ def normalized(document: Any, key: str) -> Any:
     return document.replace(key, "<intent>") if isinstance(document, str) else document
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        pytest.param(case, marks=WAITING_FOR_CANCEL_GUARD)
-        if case.kind == "CANCEL_PENDING_TRADE"
-        else case
-        for case in CASES
-    ],
-    ids=lambda case: case.name,
-)
+@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 def test_trade_wait(
     wait_cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
@@ -347,7 +335,6 @@ def test_trade_wait(
     assert documents[0] == documents[1]
 
 
-@WAITING_FOR_CANCEL_GUARD
 @pytest.mark.parametrize("wait", [(), ("--wait",)], ids=["submit", "wait"])
 def test_trade_cancel_refuses_a_filled_target_before_mutation(
     wait_cli_pair: tuple[CLI, CLI],

@@ -1,4 +1,4 @@
-"""C7a compares trading with Python ea09f0d417a53a71079bb8c5e426005fa29051a4."""
+"""C7a uses Python ea09f0d for open and close and bdc11da for cancel."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ from compare import INTENT_ID, timestamp
 from keeper_wire import same_variables
 from scenarios import (
     ADDRESS,
+    OTHER_ADDRESS,
     TRADE_REQUEST_HASH,
     Endpoints,
     child_env,
@@ -48,6 +49,7 @@ OPEN = (
 )
 CLOSE = ("trade", "close", "7")
 CANCEL = ("trade", "cancel", "7")
+CANCEL_READS = ["oneClickTrading", "node_info", "get_trade_raw"]
 
 
 @pytest.fixture
@@ -62,13 +64,29 @@ def trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     return (str(reference),), candidate
 
 
+@pytest.fixture
+def cancel_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
+    _, candidate = cli_pair
+    reference = os.environ.get("SAI_PARITY_WAIT_PYTHON")
+    if reference is None:
+        pytest.fail("Set SAI_PARITY_WAIT_PYTHON to the Python bdc11da launcher")
+    assert Path(reference).is_file(), "Install the cancellation reference with uv sync"
+    return (reference,), candidate
+
+
 def run(
-    cli: CLI, root: Path, endpoints: Endpoints, args: CLI, *, python: bool
+    cli: CLI,
+    root: Path,
+    endpoints: Endpoints,
+    args: CLI,
+    *,
+    python: bool,
+    account: str | None = None,
 ) -> tuple[int, dict[str, Any], str]:
     if python and args[:2] == CANCEL[:2]:
         args = ("trade", "close", args[2], "--cancel-order", *args[3:])
     result = subprocess.run(
-        [*cli, "--json", *args],
+        [*cli, "--json", *(("--as", account) if account else ()), *args],
         cwd=root,
         env={**child_env(root, endpoints), "SAI_LOG": "1", "SAI_UPDATE_AUTO": "0"},
         stdin=subprocess.DEVNULL,
@@ -202,8 +220,6 @@ MARKET_PREVIEW = intent_for(
             False,
         ),
         (CLOSE, intent_for("CLOSE_POSITION", {}), False),
-        ((*CLOSE, "--cancel-order"), intent_for("CANCEL_PENDING_TRADE", {}), False),
-        (CANCEL, intent_for("CANCEL_PENDING_TRADE", {}), False),
     ],
 )
 def test_trade_dry_run(
@@ -265,10 +281,15 @@ def test_validate_before_loading_session(
             assert not rows(home)
 
 
-@pytest.mark.parametrize("args", [OPEN, CLOSE, CANCEL])
+@pytest.mark.parametrize("args", [OPEN, CLOSE, CANCEL, (*CANCEL, "--dry-run")])
 def test_signed_out_submits_nothing(
-    trade_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI
+    trade_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    args: CLI,
+    request: pytest.FixtureRequest,
 ) -> None:
+    if args[:2] == CANCEL[:2]:
+        trade_pair = request.getfixturevalue("cancel_pair")
     observations = []
     for index, cli in enumerate(trade_pair):
         with loopback("trade-accepted") as endpoints:
@@ -280,6 +301,116 @@ def test_signed_out_submits_nothing(
     assert observations[0] == observations[1]
     assert observations[0][0] == 6
     assert observations[0][1]["error"]["code"] == "SIGNED_OUT"
+
+
+@pytest.mark.parametrize("args", [CANCEL, (*CLOSE, "--cancel-order")])
+def test_cancel_dry_run_checks_pending_order(
+    cancel_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI
+) -> None:
+    unavailable = {
+        "status": "unavailable",
+        "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
+    }
+    for index, cli in enumerate(cancel_pair):
+        with loopback("trade-accepted", cancel_target="pending") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            assert run(
+                cli, home, endpoints, (*args, "--dry-run"), python=index == 0
+            ) == (
+                0,
+                {
+                    "addr": ADDRESS,
+                    "dryRun": True,
+                    "intent": intent_for("CANCEL_PENDING_TRADE", {}),
+                    "estimates": dict.fromkeys(
+                        ("fees", "liquidationPrice", "worstCaseFill"), unavailable
+                    ),
+                },
+                "",
+            )
+            assert [request.label for request in endpoints.wire] == CANCEL_READS
+            assert not endpoints.errors
+            assert not rows(home)
+
+
+@pytest.mark.parametrize("dry_run", [False, True], ids=["submit", "preview"])
+@pytest.mark.parametrize(
+    ("target", "message"),
+    [
+        (
+            "filled",
+            "Target is not an open pending order. Preview a market close for a filled position.",
+        ),
+        ("missing", "Trade 7 was not found for this account."),
+        ("other-account", "Trade 7 was not found for this account."),
+    ],
+)
+def test_cancel_refuses_non_pending_target(
+    cancel_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    target: str,
+    message: str,
+    dry_run: bool,
+) -> None:
+    args = (*CANCEL, "--dry-run") if dry_run else CANCEL
+    for index, cli in enumerate(cancel_pair):
+        with loopback("trade-accepted", cancel_target=target) as endpoints:
+            home = tmp_path / str(index)
+            other = target == "other-account"
+            seed_home(home, endpoints, "accounts" if other else "session")
+            assert run(
+                cli,
+                home,
+                endpoints,
+                args,
+                python=index == 0,
+                account=OTHER_ADDRESS if other else None,
+            ) == (
+                1,
+                {
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": message,
+                        "retryable": False,
+                    }
+                },
+                "",
+            )
+            assert [request.label for request in endpoints.wire] == CANCEL_READS
+            assert endpoints.wire[-1].variables["get_trade_raw"]["trader"] == (
+                OTHER_ADDRESS if other else ADDRESS
+            )
+            assert not endpoints.errors
+            assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+
+def test_cancel_rechecks_the_pinned_account_after_reading(
+    cancel_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(cancel_pair):
+        with loopback("trade-cancel-session", cancel_target="pending") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(
+                    run, cli, home, endpoints, CANCEL, python=index == 0
+                )
+                try:
+                    assert endpoints.admission.arrived.wait(5)
+                    assert (
+                        run(
+                            cli, home, endpoints, ("auth", "logout"), python=index == 0
+                        )[0]
+                        == 0
+                    )
+                finally:
+                    endpoints.admission.release.set()
+                code, output, stderr = result.result(timeout=10)
+            assert (code, output["error"]["code"], stderr) == (6, "SIGNED_OUT", "")
+            assert [request.label for request in endpoints.wire] == CANCEL_READS
+            assert not endpoints.errors
+            assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
 
 
 @pytest.mark.parametrize(
@@ -382,11 +513,17 @@ def test_trade_submission(
     exit_code: int,
     status: str,
     code: str | None,
+    request: pytest.FixtureRequest,
 ) -> None:
     observations = []
     markets = args == OPEN
+    cancel = args == CANCEL
+    if cancel:
+        trade_pair = request.getfixturevalue("cancel_pair")
     for index, cli in enumerate(trade_pair):
-        with loopback(f"trade-{verdict}") as endpoints:
+        with loopback(
+            f"trade-{verdict}", cancel_target="pending" if cancel else None
+        ) as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
             exit_status, output, stderr = run(
@@ -395,7 +532,8 @@ def test_trade_submission(
             assert exit_status == exit_code
             assert not endpoints.errors
             assert [request.label for request in endpoints.wire] == (
-                ["borrowings", "recordUserIntent"] if markets else ["recordUserIntent"]
+                (["borrowings"] if markets else CANCEL_READS if cancel else [])
+                + ["recordUserIntent"]
             )
             variables = endpoints.wire[-1].variables
             envelope = variables["input"]
@@ -448,7 +586,7 @@ def test_trade_submission(
                 assert output["error"]["intentKey"] == key
                 assert output["error"]["code"] == code
             expected_events = []
-            if markets:
+            if markets or cancel:
                 expected_events.append(("keeper.request", "ok"))
             expected_events.extend(
                 [
