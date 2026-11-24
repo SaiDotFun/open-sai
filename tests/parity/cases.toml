@@ -1,0 +1,294 @@
+# List uncovered commands explicitly so adding a command requires a decision.
+[deferred]
+"auth import" = "Requires an isolated clipboard input."
+"auth login" = "Requires an isolated signing program and challenge."
+"mcp install" = "Requires a client registration fixture."
+"mcp uninstall" = "Requires a client registration fixture."
+"skill install" = "Writes to the agents skill directory outside SAI_HOME."
+
+[[case]]
+name = "version"
+args = ["--version"]
+mode = "text"
+
+[[case]]
+name = "help"
+args = ["--help"]
+mode = "text"
+
+[[case]]
+name = "skill-flag"
+args = ["--skill"]
+mode = "text"
+
+[[case]]
+name = "config-list"
+args = ["--json","config","list"]
+
+[[case]]
+name = "config-get-default"
+args = ["--json","config","get","logs.keep_days"]
+
+[[case]]
+name = "config-get-env"
+args = ["--json","config","get","keeper.endpoint"]
+
+[[case]]
+name = "config-get-file"
+args = ["--json","config","get","update.auto"]
+seed = "config"
+
+[[case]]
+name = "config-get-text"
+args = ["config","get","keeper.endpoint"]
+mode = "text"
+
+[[case]]
+name = "config-set"
+args = ["--json","config","set","update.auto","false"]
+state = { "config.toml#update.auto" = false, "config.toml#@mode" = 0o600 }
+
+[[case]]
+name = "config-set-existing"
+args = ["--json","config","set","update.auto","false"]
+seed = "config"
+state = { "config.toml#update.auto" = false, "config.toml#logs.keep_days" = 3 }
+
+[[case]]
+name = "config-unset"
+args = ["--json","config","unset","update.auto"]
+seed = "config"
+state = { "config.toml#update" = {}, "config.toml#logs.keep_days" = 3 }
+
+[[case]]
+name = "config-invalid-value"
+args = ["--json","config","set","logs.keep_days","0"]
+expect = 2
+state = { "config.toml" = "<absent>" }
+
+[[case]]
+name = "config-unknown-key"
+args = ["config","get","fixture.unknown"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "market-list"
+args = ["--json","market","list"]
+wire = ["borrowings"]
+
+[[case]]
+name = "market-prices"
+args = ["--json","market","prices"]
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "market-keeper-error"
+args = ["--json","market","prices"]
+server = "keeper-error"
+expect = 1
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "account-positions"
+args = ["--json","account","positions","{addr}"]
+wire = ["trades"]
+
+[[case]]
+name = "account-history"
+args = ["--json","account","history","{addr}"]
+wire = ["tradeHistory"]
+
+[[case]]
+name = "account-balances"
+args = ["--json","account","balances","{addr}"]
+wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "auth-status-signed-out"
+args = ["--json","auth","status"]
+expect = 1
+
+[[case]]
+name = "auth-status-signed-in"
+args = ["--json","auth","status"]
+seed = "session"
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "auth-status-v0-1-0"
+args = ["--json","auth","status"]
+seed = "legacy"
+unset = ["SAI_ENDPOINT"]
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "auth-list"
+args = ["--json","auth","list"]
+seed = "accounts"
+
+[[case]]
+name = "auth-use"
+args = ["--json","auth","use","{addr}"]
+seed = "accounts"
+state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "auth-use-missing"
+args = ["--json","auth","use","{addr}"]
+expect = 1
+
+[[case]]
+name = "auth-logout"
+args = ["--json","auth","logout","{addr}"]
+seed = "accounts"
+state = { "trader/sessions.json#payload.sessions.0x1111111111111111111111111111111111111111" = "<absent>" }
+
+[[case]]
+name = "intent-local-empty"
+args = ["--json","intent","local","{addr}"]
+state = { "trader/intents.sqlite3#tables.intents.rows" = [] }
+
+[[case]]
+name = "intent-local-reserved"
+args = ["--json","intent","local","{addr}"]
+seed = "ledger"
+state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown" }
+
+[[case]]
+name = "intent-status"
+args = ["--json","intent","status","{addr}","--key","{intent}"]
+seed = "ledger"
+wire = ["userIntents","tradeHistory"]
+state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
+
+[[case]]
+name = "intent-status-unsubmitted"
+args = ["--json","intent","status","{addr}","--key","{intent}"]
+seed = "ledger"
+server = "absent"
+wire = ["userIntents"]
+state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "absent" }
+
+[[case]]
+name = "doctor-offline"
+args = ["--json","doctor","--offline","--no-fix"]
+state = { "trader" = "<absent>" }
+
+[[case]]
+name = "doctor-network"
+args = ["--json","doctor","--no-fix"]
+seed = "session"
+wire = ["oneClickTrading","ws:init","node_info"]
+
+[[case]]
+name = "doctor-fix"
+args = ["--json","doctor","--offline"]
+state = { "trader" = "directory" }
+
+[[case]]
+name = "watch-price"
+args = ["--json","watch","price","3"]
+mode = "jsonl"
+server = "watch"
+expect = 1
+wire = ["ws:init","ws:tokenPricesUsd"]
+
+[[case]]
+name = "watch-balances"
+args = ["--json","watch","balances","{addr}"]
+mode = "jsonl"
+server = "watch"
+expect = 1
+wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "watch-positions"
+args = ["--json","watch","positions","{addr}"]
+mode = "jsonl"
+server = "watch"
+expect = 1
+wire = ["ws:init","ws:perpTrades"]
+
+[[case]]
+name = "skill-show"
+args = ["skill","show"]
+mode = "text"
+
+[[case]]
+name = "skill-page"
+args = ["skill","show","--page","trading-safety"]
+mode = "text"
+
+[[case]]
+name = "skill-source"
+args = ["--json","skill","source"]
+
+[[case]]
+name = "mcp-list"
+args = ["--json","mcp","list"]
+
+[[case]]
+name = "mcp-tool-inventory"
+args = ["mcp","serve"]
+mode = "mcp"
+wire = ["borrowings", "tokenPricesUsd"]
+
+[[case]]
+name = "logs-path"
+args = ["--json","logs","path"]
+
+[[case]]
+name = "logs-tail"
+args = ["--json","logs","tail","--event","keeper.request"]
+mode = "jsonl"
+setup = ["--json","market","prices"]
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "update-check"
+args = ["--json","update","--check","--api-base","{http}","--web-base","{http}"]
+wire = ["releases"]
+state = { "update.json#latest" = "sai-cli/v0.99.0", "update.json#schema" = 1, "update.json#@mode" = 0o600 }
+
+[[case]]
+name = "trade-open-market"
+args = ["--json","trade","open","--market","3","--side","long","--type","market","--amount","20","--leverage","2","--slippage","1","--price","100","--dry-run"]
+
+[[case]]
+name = "trade-close"
+args = ["--json","trade","close","7","--dry-run"]
+
+[[case]]
+name = "trade-cancel"
+args = ["--json","trade","close","7","--cancel-order","--dry-run"]
+
+[[case]]
+name = "trade-tpsl"
+args = ["--json","trade","tpsl","7","--take-profit","110","--clear-stop-loss","--dry-run"]
+
+[[case]]
+name = "trade-leverage"
+args = ["--json","trade","leverage","7","--leverage","5","--dry-run"]
+
+[[case]]
+name = "trade-margin"
+args = ["--json","trade","margin","7","--direction","add","--amount","1","--dry-run"]
+seed = "session"
+wire = ["oneClickTrading","node_info","trade","borrowing","get_trade_raw","get_exchange_balance"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "trade-partial-close"
+args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
+seed = "session"
+wire = ["oneClickTrading","node_info","trade","borrowing","get_trade_raw","get_exchange_balance","borrowings"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "trade-concurrent-close"
+args = ["--json", "trade", "close", "7"]
+seed = "session"
+server = "concurrent-close"
+wire = ["recordUserIntent"]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

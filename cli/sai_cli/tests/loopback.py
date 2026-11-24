@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,7 +21,7 @@ def fixture(name: str) -> dict[str, Any]:
 
 
 @contextmanager
-def http_server(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
+def http_server(handler: type[BaseHTTPRequestHandler]) -> Generator[str]:
     with ThreadingHTTPServer(("127.0.0.1", 0), handler) as server:
         thread = threading.Thread(
             target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
@@ -35,7 +35,7 @@ def http_server(handler: type[BaseHTTPRequestHandler]) -> Iterator[str]:
 
 
 @contextmanager
-def graphql_ws(handler: Callable[[ServerConnection], None]) -> Iterator[str]:
+def graphql_ws(handler: Callable[[ServerConnection], None]) -> Generator[str]:
     with serve(
         handler, "127.0.0.1", 0, subprotocols=[Subprotocol("graphql-transport-ws")]
     ) as server:
