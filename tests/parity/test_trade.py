@@ -1,4 +1,4 @@
-"""C7a uses Python ea09f0d for open and close and bdc11da for cancel."""
+"""Trade parity with command-specific Python reference commits."""
 
 from __future__ import annotations
 
@@ -50,6 +50,7 @@ OPEN = (
 CLOSE = ("trade", "close", "7")
 CANCEL = ("trade", "cancel", "7")
 CANCEL_READS = ["oneClickTrading", "node_info", "get_trade_raw"]
+CLOSE_READS = ["trade", *CANCEL_READS]
 
 
 @pytest.fixture
@@ -62,6 +63,17 @@ def trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     )
     assert reference.is_file(), "Install the C7 Python reference with uv sync"
     return (str(reference),), candidate
+
+
+@pytest.fixture
+def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
+    _, candidate = cli_pair
+    reference = os.environ.get("SAI_PARITY_TRADE_MAIN_PYTHON")
+    if reference is None or not Path(reference).is_file():
+        pytest.fail(
+            "Install the pinned Python main reference and set SAI_PARITY_TRADE_MAIN_PYTHON"
+        )
+    return (reference,), candidate
 
 
 @pytest.fixture
@@ -157,7 +169,7 @@ def test_python_reads_rust_trade_events_offline(
     trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
     python, rust = trade_pair
-    with loopback("trade-accepted") as endpoints:
+    with loopback("trade-accepted", close_target="verified") as endpoints:
         home = tmp_path / "shared"
         seed_home(home, endpoints, "session")
         code, result, _ = run(rust, home, endpoints, CLOSE, python=False)
@@ -169,7 +181,10 @@ def test_python_reads_rust_trade_events_offline(
         assert code == 0
         assert report["intentKey"] == key
         assert report["txHash"] == TRADE_REQUEST_HASH.lower()
-        assert len(endpoints.wire) == 1
+        assert [request.label for request in endpoints.wire] == [
+            *CLOSE_READS,
+            "recordUserIntent",
+        ]
         events = {event["event"]: event for event in report["events"]}
         trade_events = [
             events[name]
@@ -185,7 +200,7 @@ def test_python_reads_rust_reconciliation_evidence_offline(
     trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
     python, rust = trade_pair
-    with loopback("trade-reconcile-offline") as endpoints:
+    with loopback("trade-reconcile-offline", close_target="verified") as endpoints:
         home = tmp_path / "shared"
         seed_home(home, endpoints, "session")
         code, result, _ = run(rust, home, endpoints, CLOSE, python=False)
@@ -209,6 +224,7 @@ def test_python_reads_rust_reconciliation_evidence_offline(
             "intent.status",
         }
         assert [request.label for request in endpoints.wire] == [
+            *CLOSE_READS,
             "recordUserIntent",
             "userIntents",
         ]
@@ -286,7 +302,6 @@ MARKET_PREVIEW = intent_for(
             intent_for("OPEN_TRADE", {**MARKET_PREVIEW["body"], "orderType": "stop"}),
             False,
         ),
-        (CLOSE, intent_for("CLOSE_POSITION", {}), False),
     ],
 )
 def test_trade_dry_run(
@@ -348,7 +363,9 @@ def test_validate_before_loading_session(
             assert not rows(home)
 
 
-@pytest.mark.parametrize("args", [OPEN, CLOSE, CANCEL, (*CANCEL, "--dry-run")])
+@pytest.mark.parametrize(
+    "args", [OPEN, CLOSE, (*CLOSE, "--dry-run"), CANCEL, (*CANCEL, "--dry-run")]
+)
 def test_signed_out_submits_nothing(
     trade_pair: tuple[CLI, CLI],
     tmp_path: Path,
@@ -357,6 +374,8 @@ def test_signed_out_submits_nothing(
 ) -> None:
     if args[:2] == CANCEL[:2]:
         trade_pair = request.getfixturevalue("cancel_pair")
+    elif args[:2] == CLOSE[:2]:
+        trade_pair = request.getfixturevalue("current_trade_pair")
     observations = []
     for index, cli in enumerate(trade_pair):
         with loopback("trade-accepted") as endpoints:
@@ -368,6 +387,46 @@ def test_signed_out_submits_nothing(
     assert observations[0] == observations[1]
     assert observations[0][0] == 6
     assert observations[0][1]["error"]["code"] == "SIGNED_OUT"
+
+
+@pytest.mark.parametrize(
+    ("target", "message", "wire"),
+    [
+        ("keeper-owner", "Keeper position belongs to a different account", ["trade"]),
+        ("keeper-index", "Keeper returned a different position index", ["trade"]),
+        (
+            "contract-owner",
+            "Contract position belongs to a different account",
+            CLOSE_READS,
+        ),
+        ("contract-index", "Unable to verify contract position 7", CLOSE_READS),
+    ],
+)
+def test_close_verifies_position_owner_before_reservation(
+    current_trade_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    target: str,
+    message: str,
+    wire: list[str],
+) -> None:
+    for index, cli in enumerate(current_trade_pair):
+        with loopback("trade-accepted", close_target=target) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            assert run(cli, home, endpoints, CLOSE, python=index == 0) == (
+                1,
+                {
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": message,
+                        "retryable": False,
+                    }
+                },
+                "",
+            )
+            assert [request.label for request in endpoints.wire] == wire
+            assert not endpoints.errors
+            assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
 
 
 @pytest.mark.parametrize("args", [CANCEL, (*CLOSE, "--cancel-order")])
@@ -644,11 +703,16 @@ def test_trade_submission(
     observations = []
     markets = args == OPEN
     cancel = args == CANCEL
+    close = args == CLOSE
+    if close:
+        trade_pair = request.getfixturevalue("current_trade_pair")
     if cancel:
         trade_pair = request.getfixturevalue("cancel_pair")
     for index, cli in enumerate(trade_pair):
         with loopback(
-            f"trade-{verdict}", cancel_target="pending" if cancel else None
+            f"trade-{verdict}",
+            cancel_target="pending" if cancel else None,
+            close_target="verified" if close else None,
         ) as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -658,7 +722,7 @@ def test_trade_submission(
             assert exit_status == exit_code
             assert not endpoints.errors
             assert [request.label for request in endpoints.wire] == (
-                (["borrowings"] if markets else CANCEL_READS if cancel else [])
+                (["borrowings"] if markets else CANCEL_READS if cancel else CLOSE_READS)
                 + ["recordUserIntent"]
             )
             variables = endpoints.wire[-1].variables
@@ -711,9 +775,8 @@ def test_trade_submission(
             else:
                 assert output["error"]["intentKey"] == key
                 assert output["error"]["code"] == code
-            expected_events = []
-            if markets or cancel:
-                expected_events.append(("keeper.request", "ok"))
+            keeper_reads = 2 if close else int(markets or cancel)
+            expected_events = [("keeper.request", "ok")] * keeper_reads
             expected_events.extend(
                 [
                     ("intent.reserved", "unknown"),
@@ -795,7 +858,7 @@ def test_connect_failure_releases_reservation(
             seed_home(home, endpoints, "session")
             for _ in range(2):
                 code, output, stderr = run(
-                    cli, home, endpoints, CLOSE, python=index == 0
+                    cli, home, endpoints, (*OPEN, "--type", "limit"), python=index == 0
                 )
                 assert code == 4
                 assert output["error"]["code"] == "NOT_SENT"
@@ -813,9 +876,9 @@ def test_connect_failure_releases_reservation(
 
 
 def test_concurrent_close_sends_once(
-    trade_pair: tuple[CLI, CLI], tmp_path: Path
+    current_trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
-    for index, cli in enumerate(trade_pair):
+    for index, cli in enumerate(current_trade_pair):
         with loopback("concurrent-close") as endpoints, ThreadPoolExecutor() as tasks:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -838,7 +901,11 @@ def test_concurrent_close_sends_once(
                     key,
                     "",
                 )
-                assert len(endpoints.wire) == 1
+                assert [entry.label for entry in endpoints.wire] == [
+                    *CLOSE_READS,
+                    "recordUserIntent",
+                    *CLOSE_READS,
+                ]
             finally:
                 endpoints.admission.release.set()
             code, accepted, stderr = first.result(timeout=10)
@@ -848,15 +915,19 @@ def test_concurrent_close_sends_once(
                 "accepted",
                 "",
             )
-            assert len(endpoints.wire) == 1
+            assert [entry.label for entry in endpoints.wire] == [
+                *CLOSE_READS,
+                "recordUserIntent",
+                *CLOSE_READS,
+            ]
             assert [row[2] for row in rows(home)] == ["accepted"]
             assert not endpoints.errors
 
 
 def test_interrupt_after_dispatch_reports_reserved_key(
-    trade_pair: tuple[CLI, CLI], tmp_path: Path
+    current_trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
-    for index, cli in enumerate(trade_pair):
+    for index, cli in enumerate(current_trade_pair):
         with loopback("concurrent-close") as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -892,7 +963,11 @@ def test_interrupt_after_dispatch_reports_reserved_key(
             code, result, _ = run(cli, home, endpoints, CLOSE, python=index == 0)
             assert code == 1
             assert result["error"]["intentKey"] == key
-            assert len(endpoints.wire) == 1
+            assert [entry.label for entry in endpoints.wire] == [
+                *CLOSE_READS,
+                "recordUserIntent",
+                *CLOSE_READS,
+            ]
 
 
 @pytest.mark.parametrize("first", [0, 1], ids=["python-sends", "rust-sends"])

@@ -107,6 +107,18 @@ impl TradePreview {
         output
     }
 
+    pub fn is_market_close(&self) -> bool {
+        self.intent.kind == "CLOSE_POSITION"
+    }
+
+    fn position_id(&self) -> Result<Value, SaiError> {
+        self.intent
+            .target
+            .as_ref()
+            .and_then(|target| serde_json::from_str(&target.trade_id).ok())
+            .ok_or_else(SaiError::internal)
+    }
+
     pub fn requires_market_price_refresh(&self) -> bool {
         self.intent.is_market_open()
     }
@@ -194,8 +206,11 @@ impl<'a> Trading<'a> {
         self.storage.check_active_trade(session, endpoint)?;
         let cancelling = preview.intent.kind == "CANCEL_PENDING_TRADE";
         let market = preview.requires_market_price_refresh();
+        let closing = preview.is_market_close();
         if cancelling {
             self.check_pending_order(session, preview).await?;
+        } else if closing {
+            self.check_close(account, preview).await?;
         }
         let update = if preview.is_standalone_position_update() {
             Some(
@@ -224,7 +239,11 @@ impl<'a> Trading<'a> {
         // Live reads can outlast the session. Reload the pinned account
         // before confirmation and reserve with its current token.
         let reloaded;
-        let session = if cancelling || market || update.is_some() || options.confirmation.is_some()
+        let session = if cancelling
+            || closing
+            || market
+            || update.is_some()
+            || options.confirmation.is_some()
         {
             reloaded = self.load_session(Some(account))?;
             &reloaded

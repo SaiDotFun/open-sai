@@ -226,6 +226,7 @@ def loopback(
     *,
     market_price: float | None = None,
     cancel_target: str | None = None,
+    close_target: str | None = None,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -248,6 +249,10 @@ def loopback(
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
+    if close_target == "keeper-owner":
+        trade["trader"] = OTHER_ADDRESS
+    if close_target == "keeper-index":
+        trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
     history = {
         "id": 7,
@@ -360,12 +365,16 @@ def loopback(
         "get_trade_raw": {
             "user": (
                 OTHER_ADDRESS
-                if cancel_target == "foreign-owner"
+                if cancel_target == "foreign-owner" or close_target == "contract-owner"
                 else ADDRESS
                 if cancel_target is not None or pending_order
                 else position["trader"]
             ),
-            "user_trade_index": "UserTradeIndex(7)",
+            "user_trade_index": (
+                "UserTradeIndex(8)"
+                if close_target == "contract-index"
+                else "UserTradeIndex(7)"
+            ),
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
@@ -405,6 +414,7 @@ def loopback(
                 cancel_trader
                 if scenario in {"pending-order", "concurrent-close"}
                 or cancel_target is not None
+                or close_target is not None
                 else position["trader"]
             ),
             "index": 7,

@@ -198,12 +198,22 @@ pub fn run(
     };
     let session = match trading.load_session(account) {
         Ok(session) => Some(session),
-        Err(error) if dry_run && !cancelling && account.is_none() && session_error(error.code) => {
+        Err(error)
+            if dry_run
+                && !cancelling
+                && !preview.is_market_close()
+                && account.is_none()
+                && session_error(error.code) =>
+        {
             None
         }
         Err(error) => return Err(error),
     };
-    if dry_run && !cancelling && !preview.is_standalone_position_update() {
+    if dry_run
+        && !cancelling
+        && !preview.is_market_close()
+        && !preview.is_standalone_position_update()
+    {
         return local::emit(&preview.output(session.as_ref().map(Session::addr)), json);
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -211,6 +221,13 @@ pub fn run(
         .build()
         .map_err(|_| SaiError::internal())?;
     if dry_run {
+        if preview.is_market_close() {
+            let session = session.as_ref().ok_or_else(SaiError::internal)?;
+            return local::emit(
+                &runtime.block_on(trading.close_position_preview(session, &preview))?,
+                json,
+            );
+        }
         if preview.is_standalone_position_update() {
             let output = runtime.block_on(trading.position_update_preview(
                 preview,

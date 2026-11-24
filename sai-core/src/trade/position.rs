@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    Trading,
+    TradePreview, Trading,
     actions::{incomplete, invalid},
     positive_decimal,
 };
@@ -92,6 +92,76 @@ impl Trading<'_> {
             chain_id: chain.into(),
             contract_address: contract.into(),
         })
+    }
+
+    pub(super) async fn read_contract_position(
+        &self,
+        lcd: &Lcd<'_>,
+        addr: &str,
+        id: &Value,
+        confirming: bool,
+    ) -> Result<(PositionRoute, Value), SaiError> {
+        let route = self.position_route(lcd, confirming).await?;
+        let (raw, _) = lcd
+            .position(&route.contract_address, addr, id, Read::Fresh)
+            .await?;
+        if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
+            return Err(invalid(&format!("Unable to verify contract position {id}")));
+        }
+        Ok((route, raw))
+    }
+
+    pub(super) async fn verify_position_owner(
+        &self,
+        lcd: &Lcd<'_>,
+        addr: &str,
+        id: &Value,
+        confirming: bool,
+    ) -> Result<PositionRoute, SaiError> {
+        let (route, raw) = self
+            .read_contract_position(lcd, addr, id, confirming)
+            .await?;
+        if !same_account(addr, raw.get("user")) {
+            return Err(contract_owner_error());
+        }
+        Ok(route)
+    }
+
+    pub(super) async fn check_close(
+        &self,
+        addr: &str,
+        preview: &TradePreview,
+    ) -> Result<PositionRoute, SaiError> {
+        let id = preview.position_id()?;
+        self.indexed_position(addr, &id, TIMEOUT).await?;
+        let lcd = self
+            .lcd_endpoint
+            .map(Lcd)
+            .ok_or_else(|| invalid("Cannot verify the position without an LCD"))?;
+        self.verify_position_owner(&lcd, addr, &id, false).await
+    }
+
+    pub async fn close_position_preview(
+        &self,
+        session: &crate::storage::Session,
+        preview: &TradePreview,
+    ) -> Result<Value, SaiError> {
+        self.storage
+            .check_active_trade(session, self.keeper.endpoint())?;
+        let addr = session.addr();
+        let id = preview.position_id()?;
+        self.indexed_position(addr, &id, TIMEOUT).await?;
+        let mut output = preview.output(Some(addr));
+        if let Some(lcd) = self.lcd_endpoint.map(Lcd)
+            && let Ok((_, raw)) = self.read_contract_position(&lcd, addr, &id, false).await
+        {
+            if !same_account(addr, raw.get("user")) {
+                return Err(contract_owner_error());
+            }
+        } else {
+            output["positionOwnerVerified"] = json!(false);
+        }
+        Ok(output)
     }
 
     pub(super) async fn indexed_position(
