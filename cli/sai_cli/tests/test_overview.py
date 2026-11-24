@@ -90,28 +90,33 @@ def replay():
             response = state["http"][query]
             self.answer(response(variables) if callable(response) else response)
 
+        def drip(self) -> None:
+            started = time.monotonic()
+            try:
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                while not stop_drips.is_set():
+                    self.wfile.write(b" ")
+                    stop_drips.wait(0.02)
+            except (BrokenPipeError, ConnectionResetError):
+                state["lcdDripSeconds"] = time.monotonic() - started
+                state["lcdDisconnected"].set()
+
         def do_GET(self):
             path = urlsplit(self.path).path
             drip_path = state.get("dripPath")
             if drip_path and drip_path in path:
                 del state["dripPath"]
-                started = time.monotonic()
-                try:
-                    self.send_response(200)
-                    self.send_header("Content-Type", "application/json")
-                    self.send_header("Content-Length", "1000000")
-                    self.end_headers()
-                    while not stop_drips.is_set():
-                        self.wfile.write(b" ")
-                        stop_drips.wait(0.02)
-                except (BrokenPipeError, ConnectionResetError):
-                    state["lcdDripSeconds"] = time.monotonic() - started
-                    state["lcdDisconnected"].set()
+                self.drip()
                 return
             if "/smart/" in path:
                 message = json.loads(base64.b64decode(unquote(path.rsplit("/", 1)[-1])))
                 assert self.headers["x-cosmos-block-height"] == str(RISK_BLOCK)
                 state["calls"].append(("contract", message))
+                if state.get("dripQuery") in message:
+                    self.drip()
+                    return
                 if "get_trade" in message:
                     args = message["get_trade"]
                     assert args["trader"] == ADDR
@@ -895,6 +900,27 @@ def test_slow_lcd_stops_enrichment_and_keeps_completed_sections(replay):
     assert positions["data"]["unrealizedPnlUsd"] is None
     assert result["balances"]["data"]["balance"]["usd"] == 150.813685
     assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
+
+
+@pytest.mark.parametrize(
+    ("query", "risk_status"), [("get_trade", "unavailable"), ("get_group", "partial")]
+)
+def test_individual_lcd_timeout_warns_about_partial_position_risk(
+    replay, monkeypatch, query, risk_status
+):
+    trade, _ = populate_trades(replay)
+    replay["http"][keeper.OVERVIEW_TRADES]["data"]["perp"]["trades"] = [trade]
+    replay["liveTradeIds"] = [trade["id"]]
+    replay["dripQuery"] = query
+    monkeypatch.setattr(overview, "LCD_REQUEST_SECONDS", 0.8)
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert replay["lcdDisconnected"].wait(1)
+    assert positions["membership"]["status"] == "verified"
+    assert positions["data"]["items"][0]["riskStatus"] == risk_status
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    assert positions["error"]["code"] == "INCOMPLETE_DATA"
+    assert "deadline" in positions["error"]["message"]
 
 
 @pytest.mark.parametrize("surface", ["cli", "mcp"])

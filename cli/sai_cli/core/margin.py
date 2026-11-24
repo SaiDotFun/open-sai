@@ -46,6 +46,10 @@ class QueryHeightMismatch(SaiError, ValueError):
     code = Code.PREVIEW_MISMATCH
 
 
+class LCDTimeout(ValueError):
+    """An overview LCD request ran out of time."""
+
+
 async def _resolve_lcd_host(
     host: str | bytes | None,
     port: str | bytes | int | None,
@@ -140,6 +144,10 @@ def _get_json_at_height(
         ValueError,
         TypeError,
     ) as exc:
+        if deadline is not None and isinstance(
+            exc, (TimeoutError, httpx.TimeoutException)
+        ):
+            raise LCDTimeout("LCD read timed out") from exc
         if height is not None or fresh:
             raise QueryHeightMismatch(
                 "Unable to verify contract state during confirmation."

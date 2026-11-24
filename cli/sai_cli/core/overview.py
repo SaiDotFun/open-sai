@@ -106,7 +106,7 @@ def _lcd_read(read: Callable[[float], Any], deadline: float) -> Any:
     """Hold a shared slot until the HTTP request finishes or is cancelled."""
     now = time.monotonic()
     if now >= deadline:
-        raise ValueError("LCD read deadline exceeded")
+        raise margin.LCDTimeout("LCD read deadline exceeded")
     if not _LCD_SLOTS.acquire(blocking=False):
         raise ValueError("LCD reads are busy")
     try:
@@ -382,15 +382,23 @@ class ContractReads:
 
     def __init__(self, chain: ChainRead) -> None:
         self.chain = chain
+        self.timed_out = False
         self.groups: dict[str, int | None] = {}
         self.rates: dict[tuple[int, int], tuple[dict[str, Any], str] | None] = {}
         self.markets: dict[int, dict[str, Any] | None] = {}
         self.oracle: str | None = None
 
+    def query(self, message: dict[str, Any], *, contract: str | None = None) -> Any:
+        try:
+            return self.chain.query(message, contract=contract)
+        except margin.LCDTimeout:
+            self.timed_out = True
+            raise
+
     def group_expiration(self, index: str) -> int | None:
         if index not in self.groups:
             try:
-                value = self.chain.query({"get_group": {"index": index}})
+                value = self.query({"get_group": {"index": index}})
                 expiration = value["stale_price_expiration_secs"]
                 self.groups[index] = (
                     expiration
@@ -404,7 +412,7 @@ class ContractReads:
     def market(self, market_id: int) -> dict[str, Any] | None:
         if market_id not in self.markets:
             try:
-                self.markets[market_id] = self.chain.query(
+                self.markets[market_id] = self.query(
                     {"get_market": {"index": f"MarketIndex({market_id})"}}
                 )
             except (TypeError, ValueError):
@@ -416,11 +424,11 @@ class ContractReads:
         if key not in self.rates:
             try:
                 if self.oracle is None:
-                    address = self.chain.query({"get_oracle_address": {}})
+                    address = self.query({"get_oracle_address": {}})
                     self.oracle = address if _is_contract(address) else ""
                 if not self.oracle:
                     raise ValueError("Oracle contract is unavailable")
-                data = self.chain.query(
+                data = self.query(
                     {"get_exchange_rate_stamped": {"base": base, "quote": quote}},
                     contract=self.oracle,
                 )
@@ -440,7 +448,7 @@ def _contract_risk(
     market = trade["perpBorrowing"]
     risk: dict[str, Any] = {"riskStatus": "unavailable"}
     try:
-        result = chain.query({"get_trade": {"trader": addr, "index": trade["id"]}})
+        result = reads.query({"get_trade": {"trader": addr, "index": trade["id"]}})
         fetched = datetime.now(UTC).isoformat()
         raw = result["trade"]
         if not _agrees(trade, raw):
@@ -825,13 +833,16 @@ def _trade_sections(
             positions["error"] = _failure(Code.INCOMPLETE_DATA, message)
         elif (
             "error" not in positions
-            and chain is not None
-            and time.monotonic() >= chain.deadline
+            and contract_reads is not None
+            and (
+                contract_reads.timed_out
+                or time.monotonic() >= contract_reads.chain.deadline
+            )
             and any(row["riskStatus"] != "verified" for row in items)
         ):
             positions["error"] = _failure(
                 Code.INCOMPLETE_DATA,
-                "The LCD deadline expired. Position risk is partial.",
+                "An LCD deadline expired. Position risk is partial.",
             )
         pnls = [row["unrealizedPnlUsd"] for row in items]
         positions["data"] = {
