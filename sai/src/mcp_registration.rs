@@ -8,7 +8,7 @@ use std::{
 
 use clap::{Args, Subcommand, ValueEnum};
 use sai_core::{
-    errors::{Code, SaiError},
+    errors::{Code, ExitCode, SaiError},
     settings::{KEYS, repr},
 };
 use serde_json::{Value, json};
@@ -17,8 +17,7 @@ use client::{Result as ClientResult, absolute, basename, resolved, which};
 
 const NAMES: [&str; 2] = ["sai", "sai-mcp"];
 const CLIENTS: [Client; 3] = [Client::Claude, Client::Codex, Client::Cursor];
-const INSTALL: &str =
-    "uv tool install git+https://github.com/SaiDotFun/open-sai";
+const INSTALL: &str = "uv tool install git+https://github.com/SaiDotFun/open-sai";
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
 
 #[derive(Args)]
@@ -144,13 +143,10 @@ impl Registration {
             return None;
         }
         let profile = entry["env"]["SAI_HOME"].as_str().map(str::to_owned);
-        let invalid_profile =
-            profile.is_none() && entry["env"].get("SAI_HOME").is_some();
+        let invalid_profile = profile.is_none() && entry["env"].get("SAI_HOME").is_some();
         let mut stale_env = std::collections::BTreeSet::new();
         if let Some(env) = entry["env"].as_object() {
-            stale_env.extend(
-                env.keys().filter(|key| key.as_str() != "SAI_HOME").cloned(),
-            );
+            stale_env.extend(env.keys().filter(|key| key.as_str() != "SAI_HOME").cloned());
         }
         if let Some(items) = entry["env_vars"].as_array() {
             stale_env.extend(items.iter().filter_map(|item| {
@@ -177,8 +173,7 @@ impl Registration {
         self.argv == target.argv
             || !self.argv.is_empty()
                 && self.argv[1..] == target.argv[1..]
-                && normalize_launcher(&self.argv[0])
-                    == normalize_launcher(&target.argv[0])
+                && normalize_launcher(&self.argv[0]) == normalize_launcher(&target.argv[0])
     }
 
     fn matches_profile(&self, profile: &Option<String>) -> bool {
@@ -194,9 +189,7 @@ impl Registration {
     }
 
     fn report(&self, target: Option<&Target>) -> Value {
-        let mut out = if let Some(target) =
-            target.filter(|target| self.matches_command(target))
-        {
+        let mut out = if let Some(target) = target.filter(|target| self.matches_command(target)) {
             json!({"command": target.argv})
         } else if let Some(command) = self.argv.first() {
             let mut out = json!({"command": [basename(command)]});
@@ -227,9 +220,10 @@ fn argv(entry: &Value) -> Vec<String> {
     let args = match entry.get("args") {
         None => Vec::new(),
         Some(args) => {
-            let Some(args) = args.as_array().and_then(|items| {
-                items.iter().map(Value::as_str).collect::<Option<Vec<_>>>()
-            }) else {
+            let Some(args) = args
+                .as_array()
+                .and_then(|items| items.iter().map(Value::as_str).collect::<Option<Vec<_>>>())
+            else {
                 return Vec::new();
             };
             args
@@ -286,10 +280,7 @@ fn profile(home: &Path) -> Option<String> {
     Some(absolute(&path).to_string_lossy().into_owned())
 }
 
-fn server_target(
-    override_argv: Vec<String>,
-    home: &Path,
-) -> ClientResult<Target> {
+fn server_target(override_argv: Vec<String>, home: &Path) -> ClientResult<Target> {
     let profile = profile(home);
     if !override_argv.is_empty() {
         return Ok(Target {
@@ -318,6 +309,21 @@ fn server_target(
     })
 }
 
+fn reported_target(override_argv: Vec<String>, home: &Path) -> ClientResult<Target> {
+    let target = server_target(override_argv, home)?;
+    if !target.explicit
+        && let Ok(exe) = env::current_exe()
+        && resolved(Path::new(&target.argv[0])) != resolved(&exe)
+    {
+        eprintln!(
+            "The `sai` on PATH ({}) is a different install than the one running ({}); clients get the one on PATH.",
+            target.argv[0],
+            exe.display()
+        );
+    }
+    Ok(target)
+}
+
 struct Clients {
     home: PathBuf,
     cwd: PathBuf,
@@ -325,10 +331,8 @@ struct Clients {
 
 impl Clients {
     fn open() -> ClientResult<Self> {
-        let home =
-            env::home_dir().ok_or("Could not determine the home directory")?;
-        let cwd = env::current_dir()
-            .map_err(|_| "Could not determine the working directory")?;
+        let home = env::home_dir().ok_or("Could not determine the home directory")?;
+        let cwd = env::current_dir().map_err(|_| "Could not determine the working directory")?;
         Ok(Self { home, cwd })
     }
 
@@ -372,16 +376,13 @@ impl Clients {
                 for (name, entries) in found {
                     for (index, entry) in entries.iter().enumerate() {
                         let mut info = entry.report(target);
-                        let current =
-                            target.is_some_and(|target| entry.matches(target));
+                        let current = target.is_some_and(|target| entry.matches(target));
                         if registrations.is_empty() {
                             row["registered"] = json!(true);
                             row["scope"] = json!(entry.scope.name());
                             row["current"] = json!(current);
                             row["registeredCommand"] = info["command"].clone();
-                            for key in
-                                ["args", "staleEnv", "extraSettings", "disabled"]
-                            {
+                            for key in ["args", "staleEnv", "extraSettings", "disabled"] {
                                 if let Some(value) = info.get(key) {
                                     row[key] = value.clone();
                                 }
@@ -412,33 +413,22 @@ impl Clients {
         scope: Scope,
         name: &str,
         target: &Target,
-        repair: bool,
         deadline: Instant,
     ) -> ClientResult<()> {
         let entries = self.registrations(client, name, deadline)?;
-        let matches = |entry: &Registration| {
-            if repair {
-                entry.matches_command(target)
-            } else {
-                entry.matches(target)
-            }
-        };
+        let matches = |entry: &Registration| entry.matches(target);
         if !entries
             .iter()
             .any(|entry| entry.scope == scope && matches(entry))
         {
-            return Err(format!(
-                "{} does not show the new sai entry",
-                client.name()
-            ));
+            return Err(format!("{} does not show the new sai entry", client.name()));
         }
         if client == Client::Codex
-            && !repair
-            && !entries.first().is_some_and(matches)
+            && !client::codex_get(&self.cwd, Scope::Project, name, deadline)?
+                .as_ref()
+                .is_some_and(matches)
         {
-            return Err(
-                "a project .codex/config.toml entry is still active".into()
-            );
+            return Err("a project .codex/config.toml entry is still active".into());
         }
         Ok(())
     }
@@ -472,15 +462,14 @@ fn after_options(mut args: &[String], root: bool) -> Option<&[String]> {
             }
         };
         if let Some(key) = key {
-            key.parse_value(value).ok()?;
+            key.check_diagnostic_url(value).ok()?;
         }
     }
     Some(args)
 }
 
 fn serves_mcp(args: &[String]) -> bool {
-    let Some(args) = after_options(args, true)
-        .and_then(|args| args.strip_prefix(&["mcp".into()]))
+    let Some(args) = after_options(args, true).and_then(|args| args.strip_prefix(&["mcp".into()]))
     else {
         return false;
     };
@@ -523,8 +512,7 @@ fn stale(reg: &Registration, home: &Path) -> Option<Stale> {
         "Sai registration points to a missing command"
     } else if binary == NAMES[0] && !serve {
         "Sai registration does not run `sai mcp serve`"
-    } else if binary == NAMES[0]
-        && in_uv_cache(on_path.as_deref().expect("command checked"), home)
+    } else if binary == NAMES[0] && in_uv_cache(on_path.as_deref().expect("command checked"), home)
     {
         "Sai registration points inside the uv cache"
     } else if binary == NAMES[0] && !Path::new(command).is_absolute() {
@@ -636,13 +624,10 @@ impl Clients {
             return check("warn", "Sai is not registered", Some(install));
         }
         let legacy = inspected.iter().any(|(name, _, _)| *name == NAMES[1]);
-        let legacy_warning =
-            "Sai retains its existing sai-mcp registration name";
+        let legacy_warning = "Sai retains its existing sai-mcp registration name";
         let issues = inspected
             .iter()
-            .filter_map(|(name, entry, issue)| {
-                issue.as_ref().map(|issue| (*name, *entry, issue))
-            })
+            .filter_map(|(name, entry, issue)| issue.as_ref().map(|issue| (*name, *entry, issue)))
             .collect::<Vec<_>>();
         if client == Client::Claude && !issues.is_empty() {
             return claude_check(&issues);
@@ -656,17 +641,14 @@ impl Clients {
                 issue.is_none()
                     && entry.argv.first().is_some_and(|command| {
                         let path = Path::new(command);
-                        path.is_absolute()
-                            && resolved(path)
-                                != resolved(Path::new(&target.argv[0]))
+                        path.is_absolute() && resolved(path) != resolved(Path::new(&target.argv[0]))
                     })
             })
         });
         let mut changes = Vec::new();
         let mut failure = None;
         for (name, entry, issue) in issues {
-            match self.repair(client, name, entry, issue, target, fix, deadline)
-            {
+            match self.repair(client, name, entry, issue, target, fix, deadline) {
                 Ok(()) => changes.push(format!(
                     "Repaired the Sai registration in {} scope",
                     entry.scope.name()
@@ -685,8 +667,7 @@ impl Clients {
                         .any(|entry| stale(entry, &self.home).is_some()) =>
                 {
                     failure = Some((
-                        "A stale Codex project registration is still active"
-                            .into(),
+                        "A stale Codex project registration is still active".into(),
                         "Edit the Sai registration in .codex/config.toml",
                     ));
                 }
@@ -707,12 +688,8 @@ impl Clients {
             check("fail", &summary, Some(hint.into()))
         } else if pinned || different_profile || legacy {
             let warnings = [
-                pinned.then_some(
-                    "Sai uses a pinned launcher from a different install",
-                ),
-                different_profile.then_some(
-                    "Sai registration has a different SAI_HOME setting",
-                ),
+                pinned.then_some("Sai uses a pinned launcher from a different install"),
+                different_profile.then_some("Sai registration has a different SAI_HOME setting"),
                 legacy.then_some(legacy_warning),
             ];
             check(
@@ -722,8 +699,7 @@ impl Clients {
                     .flatten()
                     .collect::<Vec<_>>()
                     .join(". "),
-                different_profile
-                    .then(|| "Check SAI_HOME in the client registration".into()),
+                different_profile.then(|| "Check SAI_HOME in the client registration".into()),
             )
         } else if changes.is_empty() {
             check("pass", "Sai registration is current", None)
@@ -758,16 +734,10 @@ impl Clients {
             ));
         }
         let Some(target) = target else {
-            return Err((
-                issue.reason.into(),
-                "Install a stable Sai launcher on PATH",
-            ));
+            return Err((issue.reason.into(), "Install a stable Sai launcher on PATH"));
         };
         if !fix {
-            return Err((
-                issue.reason.into(),
-                "Run `sai doctor` with fixes enabled",
-            ));
+            return Err((issue.reason.into(), "Run `sai doctor` with fixes enabled"));
         }
         let target = target.repair(args.clone(), client == Client::Codex);
         let problem = |_| {
@@ -791,8 +761,14 @@ impl Clients {
             )
             .map_err(problem)?;
         if client == Client::Codex {
-            self.verify(client, entry.scope, name, &target, true, deadline)
-                .map_err(problem)?;
+            let neutral = client.codex_neutral(&self.home);
+            let actual =
+                client::codex_get(&neutral, Scope::User, name, deadline).map_err(problem)?;
+            if !actual.is_some_and(|entry| entry.matches_command(&target)) {
+                return Err(problem(
+                    "Codex did not load the repaired Sai registration".into(),
+                ));
+            }
         }
         Ok(())
     }
@@ -801,21 +777,21 @@ impl Clients {
 fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
     let summary = issues
         .iter()
-        .map(|(name, entry, issue)| {
-            format!("{} {name}: {}", entry.scope.name(), issue.reason)
-        })
+        .map(|(name, entry, issue)| format!("{} {name}: {}", entry.scope.name(), issue.reason))
         .collect::<Vec<_>>()
         .join(". ");
     let mut commands = Vec::new();
     let mut reset = false;
     let mut project = false;
-    for (name, entry, issue) in issues.iter().filter(|(_, entry, _)| entry.stdio)
-    {
+    for (name, entry, issue) in issues.iter().filter(|(_, entry, _)| entry.stdio) {
         let needs_reset = claude_args(entry, issue).is_none();
         reset |= needs_reset;
         project |= entry.scope != Scope::User;
         let flag = if needs_reset { " --reset-args" } else { "" };
-        commands.push(format!("`sai mcp install --client claude --scope {} --repair-existing {name}{flag}`", entry.scope.name()));
+        commands.push(format!(
+            "`sai mcp install --client claude --scope {} --repair-existing {name}{flag}`",
+            entry.scope.name()
+        ));
     }
     let mut hint = if commands.is_empty() {
         String::new()
@@ -823,9 +799,7 @@ fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
         format!("Run {}.", commands.join(" and "))
     };
     if project {
-        hint.push_str(
-            " Run project and local commands from the project directory.",
-        );
+        hint.push_str(" Run project and local commands from the project directory.");
     }
     if reset {
         hint.push_str(" The --reset-args flag replaces unsupported arguments with the defaults.");
@@ -840,24 +814,16 @@ fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
 }
 
 impl McpArgs {
-    pub(crate) fn run(
-        self,
-        json: bool,
-        explicit_separator: bool,
-    ) -> Result<(), SaiError> {
-        let clients = Clients::open()
-            .map_err(|err| SaiError::new(Code::InternalError, err))?;
+    pub(crate) fn run(self, json: bool, explicit_separator: bool) -> Result<(), SaiError> {
+        let clients = Clients::open().map_err(|err| SaiError::new(Code::InternalError, err))?;
         match self.command {
             Some(McpCommand::List) => {
-                let target = server_target(Vec::new(), &clients.home)
+                let target = reported_target(Vec::new(), &clients.home)
                     .map_err(|err| eprintln!("{err}"))
                     .ok();
-                emit(&clients.list(target.as_ref()), json);
-                Ok(())
+                crate::local::emit(&clients.list(target.as_ref()), json)
             }
-            Some(McpCommand::Install(args)) => {
-                args.run(&clients, json, explicit_separator)
-            }
+            Some(McpCommand::Install(args)) => args.run(&clients, json, explicit_separator),
             None => {
                 use clap::CommandFactory;
                 let mut command = crate::Cli::command();
@@ -873,18 +839,7 @@ impl McpArgs {
     }
 }
 
-fn emit(value: &Value, json: bool) {
-    let text = if json {
-        value.to_string()
-    } else {
-        serde_json::to_string_pretty(value).expect("JSON value")
-    };
-    println!("{}", crate::local::ascii_json(&text));
-}
-
-fn chosen(
-    names: impl IntoIterator<Item = String>,
-) -> Result<Vec<Client>, SaiError> {
+fn chosen(names: impl IntoIterator<Item = String>) -> Result<Vec<Client>, SaiError> {
     let mut selected = Vec::new();
     for name in names {
         let client = match name.trim().to_ascii_lowercase().as_str() {
@@ -915,32 +870,26 @@ impl InstallArgs {
         if explicit_separator && self.server_argv.is_empty() {
             return Err(SaiError::usage("Give the server command after `--`."));
         }
-        let mut names =
-            chosen(self.clients.into_iter().chain(self.client_options))?;
+        let mut names = chosen(self.clients.into_iter().chain(self.client_options))?;
         if self.reset_args && self.repair_existing.is_none() {
-            return Err(SaiError::usage(
-                "--reset-args requires --repair-existing.",
-            ));
+            return Err(SaiError::usage("--reset-args requires --repair-existing."));
         }
         if self.repair_existing.is_some()
-            && (names != [Client::Claude]
-                || self.all_clients
-                || !self.server_argv.is_empty())
+            && (names != [Client::Claude] || self.all_clients || !self.server_argv.is_empty())
         {
             return Err(SaiError::usage(
                 "--repair-existing requires --client claude and the default server command.",
             ));
         }
-        let target = server_target(self.server_argv, &clients.home)
-            .map_err(|err| SaiError::new(Code::InternalError, err))?;
+        let target = reported_target(self.server_argv, &clients.home).map_err(|err| {
+            let mut error = SaiError::new(Code::InternalError, err);
+            error.exit_code = ExitCode::Unsupported;
+            error.hint = Some("sai mcp install --help".into());
+            error
+        })?;
         if let Some(name) = self.repair_existing {
-            let result = clients.explicit_claude(
-                self.scope,
-                &name,
-                &target,
-                self.dry_run,
-                self.reset_args,
-            );
+            let result =
+                clients.explicit_claude(self.scope, &name, &target, self.dry_run, self.reset_args);
             return finish(vec![result], json_output);
         }
         let detected = CLIENTS
@@ -957,7 +906,7 @@ impl InstallArgs {
         if names.is_empty() {
             use std::io::{self, IsTerminal, Write};
             if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
-                emit(&clients.list(Some(&target)), json_output);
+                crate::local::emit(&clients.list(Some(&target)), json_output)?;
                 eprintln!(
                     "Nothing changed. Name clients, as in `sai mcp install claude`, or pass --all."
                 );
@@ -980,9 +929,7 @@ impl InstallArgs {
             {
                 return Err(SaiError::new(Code::InternalError, "Aborted!"));
             }
-            if answer.trim().is_empty()
-                || answer.trim().eq_ignore_ascii_case("all")
-            {
+            if answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("all") {
                 names = detected;
             } else {
                 names = chosen(
@@ -1007,9 +954,7 @@ impl InstallArgs {
         }
         let results = names
             .into_iter()
-            .map(|client| {
-                clients.install(client, self.scope, &target, self.dry_run)
-            })
+            .map(|client| clients.install(client, self.scope, &target, self.dry_run))
             .collect();
         finish(results, json_output)
     }
@@ -1052,25 +997,15 @@ impl Clients {
         let mut result = InstallResult::new(client, scope);
         result.report["name"] = json!(name);
         let work = || -> ClientResult<Option<Target>> {
-            let mut entries = self.registrations(
-                client,
-                name,
-                Instant::now() + CLIENT_TIMEOUT,
-            )?;
+            let mut entries = self.registrations(client, name, Instant::now() + CLIENT_TIMEOUT)?;
             let entry = entries
                 .drain(..)
                 .find(|entry| entry.scope == scope)
                 .ok_or_else(|| {
-                    format!(
-                        "No existing {name} registration in {} scope",
-                        scope.name()
-                    )
+                    format!("No existing {name} registration in {} scope", scope.name())
                 })?;
             if !entry.stdio {
-                return Err(
-                    "The existing Claude Code entry uses a remote transport"
-                        .into(),
-                );
+                return Err("The existing Claude Code entry uses a remote transport".into());
             }
             let Some(issue) = stale(&entry, &self.home) else {
                 return Ok(None);
@@ -1080,7 +1015,9 @@ impl Clients {
             } else {
                 claude_args(&entry, &issue)
             };
-            let args = args.ok_or("Unsupported server arguments. Use --reset-args to replace them with the defaults.")?;
+            let args = args.ok_or(
+                "Unsupported server arguments. Use --reset-args to replace them with the defaults.",
+            )?;
             let replacement = target.repair(args, false);
             if !dry {
                 client.write(
@@ -1106,18 +1043,10 @@ impl Clients {
         result
     }
 
-    fn install(
-        &self,
-        client: Client,
-        scope: Scope,
-        target: &Target,
-        dry: bool,
-    ) -> InstallResult {
+    fn install(&self, client: Client, scope: Scope, target: &Target, dry: bool) -> InstallResult {
         let mut result = InstallResult::new(client, scope);
         result.report["command"] = json!(target.argv);
-        if let Err(error) =
-            self.install_one(client, scope, target, dry, &mut result)
-        {
+        if let Err(error) = self.install_one(client, scope, target, dry, &mut result) {
             result.failed(error);
         }
         result
@@ -1143,23 +1072,21 @@ impl Clients {
         let entries = self.registrations(client, NAMES[0], deadline)?;
         let existing = entries.iter().find(|entry| entry.scope == scope);
         if existing.is_none()
-            && let Some(legacy) =
-                self.registrations(client, NAMES[1], deadline)?.first()
+            && let Some(legacy) = self.registrations(client, NAMES[1], deadline)?.first()
         {
             *result = self.legacy_install(client, legacy, target);
             return Ok(());
         }
-        if client == Client::Claude
-            && existing.is_some_and(|entry| entry.disabled)
-        {
+        if client == Client::Claude && existing.is_some_and(|entry| entry.disabled) {
             return Err(format!(
                 "Claude Code has disabled the {} sai registration. Review MCP approvals and settings in the client.",
                 scope.name()
             ));
         }
-        if let Some(winner) = entries.first().filter(|entry| {
-            entry.scope.rank() < scope.rank() && !entry.matches(target)
-        }) {
+        if let Some(winner) = entries
+            .first()
+            .filter(|entry| entry.scope.rank() < scope.rank() && !entry.matches(target))
+        {
             if client == Client::Codex {
                 return Err("Codex uses a project-level sai entry in this directory that overrides the user entry; edit or remove it in the project's .codex/config.toml, then run this again".into());
             }
@@ -1207,8 +1134,7 @@ impl Clients {
             steps.push(add);
             result.report["argv"] = json!(steps);
         } else {
-            result.report["path"] =
-                json!(client.path(scope, &self.home, &self.cwd));
+            result.report["path"] = json!(client.path(scope, &self.home, &self.cwd));
         }
         if dry {
             result.planned(action);
@@ -1220,11 +1146,10 @@ impl Clients {
                 result.changed = true;
             }
         } else {
-            client
-                .write(scope, &self.home, &self.cwd, NAMES[0], target, None)?;
+            client.write(scope, &self.home, &self.cwd, NAMES[0], target, None)?;
             result.changed = true;
         }
-        self.verify(client, scope, NAMES[0], target, false, deadline)?;
+        self.verify(client, scope, NAMES[0], target, deadline)?;
         result.report["action"] = json!(action);
         Ok(())
     }
@@ -1256,31 +1181,23 @@ impl Clients {
     }
 }
 
-fn finish(
-    results: Vec<InstallResult>,
-    json_output: bool,
-) -> Result<(), SaiError> {
+fn finish(results: Vec<InstallResult>, json_output: bool) -> Result<(), SaiError> {
     let reconnect = results.iter().any(|result| result.changed);
     let mut summary = json!({
         "results": results.iter().map(|result| &result.report).collect::<Vec<_>>(),
         "reconnectNeeded": reconnect,
     });
     if reconnect {
-        eprintln!(
-            "Restart or reconnect the changed clients to load the change."
-        );
+        eprintln!("Restart or reconnect the changed clients to load the change.");
     }
     if results.iter().any(|r| {
         r.report["client"] == "cursor"
             && matches!(r.report["action"].as_str(), Some("added" | "replaced"))
     }) {
-        eprintln!(
-            "You may need to enable sai in Cursor under Cursor Settings > MCP."
-        );
+        eprintln!("You may need to enable sai in Cursor under Cursor Settings > MCP.");
     }
     if results.iter().all(|r| r.report["action"] != "failed") {
-        emit(&summary, json_output);
-        return Ok(());
+        return crate::local::emit(&summary, json_output);
     }
     let message = if json_output {
         let mut lines = results
@@ -1317,4 +1234,37 @@ fn finish(
     error.hint = Some("sai mcp list".into());
     error.details = summary.as_object().cloned().map(Box::new);
     Err(error)
+}
+
+pub(crate) fn launchers_on_path() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    if let Some(path) = env::var_os("PATH") {
+        for directory in env::split_paths(&path).filter(|dir| !dir.as_os_str().is_empty()) {
+            let launcher = absolute(&directory).join("sai");
+            if which(&launcher.to_string_lossy()).is_some() {
+                let launcher = resolved(&launcher);
+                if !found.contains(&launcher) {
+                    found.push(launcher);
+                }
+            }
+        }
+    }
+    found
+}
+
+pub(crate) fn checkout_state(path: &Path) -> Option<Value> {
+    let run = |args: &[&str]| {
+        let args = std::iter::once("git")
+            .chain(args.iter().copied())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let (status, out, _) =
+            client::invoke(&args, path, Instant::now() + Duration::from_secs(2), true).ok()?;
+        status
+            .success()
+            .then(|| String::from_utf8_lossy(&out).trim().to_owned())
+    };
+    let commit = run(&["rev-parse", "HEAD"])?;
+    let dirty = !run(&["status", "--porcelain", "--", "."])?.is_empty();
+    Some(json!({"commit": commit, "dirty": dirty}))
 }

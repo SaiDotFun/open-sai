@@ -181,7 +181,7 @@ pub fn intent(
     }
 }
 
-fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
     match event {
         StorageEvent::IntentStatus {
             key,
@@ -253,7 +253,7 @@ impl Formatter for InlineJson {
     }
 }
 
-fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
+pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     let mut bytes = Vec::new();
     if json {
         value.serialize(&mut serde_json::Serializer::with_formatter(

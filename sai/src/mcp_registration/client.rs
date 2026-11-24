@@ -15,6 +15,14 @@ use super::{Client, Registration, Scope, Target};
 pub(super) type Result<T> = std::result::Result<T, String>;
 
 impl Client {
+    pub(super) fn codex_neutral(self, home: &Path) -> PathBuf {
+        let directory = self.directory(home);
+        if directory.is_dir() {
+            directory
+        } else {
+            env::temp_dir()
+        }
+    }
     pub(super) fn executable(self) -> Option<PathBuf> {
         which(match self {
             Self::Claude => "claude",
@@ -35,9 +43,7 @@ impl Client {
     }
 
     pub(super) fn detected(self, home: &Path) -> Option<&'static str> {
-        if self.executable().is_some()
-            || self == Self::Cursor && which("cursor").is_some()
-        {
+        if self.executable().is_some() || self == Self::Cursor && which("cursor").is_some() {
             Some("cli")
         } else if self.directory(home).is_dir() {
             Some("home")
@@ -67,19 +73,13 @@ impl Client {
         deadline: Instant,
     ) -> Result<Vec<Registration>> {
         if self == Self::Codex {
-            let directory = self.directory(home);
-            let neutral = if directory.is_dir() {
-                directory
-            } else {
-                env::temp_dir()
-            };
+            let neutral = self.codex_neutral(home);
             let user = codex_get(&neutral, Scope::User, name, deadline)?;
             let project = if resolved(&neutral) == resolved(cwd) {
                 None
             } else {
-                codex_get(cwd, Scope::Project, name, deadline)?.filter(|entry| {
-                    user.as_ref().is_none_or(|user| user.raw != entry.raw)
-                })
+                codex_get(cwd, Scope::Project, name, deadline)?
+                    .filter(|entry| user.as_ref().is_none_or(|user| user.raw != entry.raw))
             };
             return Ok(project.into_iter().chain(user).collect());
         }
@@ -87,8 +87,7 @@ impl Client {
         let user = read_json(&self.path(Scope::User, home, cwd))?;
         let project = read_json(&self.path(Scope::Project, home, cwd))?;
         let local = &user["projects"][cwd.to_string_lossy().as_ref()];
-        let disabled =
-            self == Self::Claude && has_name(&local["disabledMcpServers"], name);
+        let disabled = self == Self::Claude && has_name(&local["disabledMcpServers"], name);
         let project_entry = &project["mcpServers"][name];
         let project_disabled = self == Self::Claude
             && project_entry.is_object()
@@ -120,9 +119,7 @@ impl Client {
     ) -> Result<()> {
         let path = self.path(scope, home, cwd);
         if self == Self::Codex {
-            return edit(&path, true, |source| {
-                edit_codex(source, name, target, old)
-            });
+            return edit(&path, true, |source| edit_codex(source, name, target, old));
         }
         edit(&path, old.is_none(), |source| {
             let mut doc = json_object(source, &path)?;
@@ -154,20 +151,18 @@ impl Client {
                     })
                     .and_then(Value::as_object_mut)
                     .ok_or("The Sai registration changed concurrently")?;
-                entry.insert(
-                    "command".into(),
-                    Value::from(target.argv[0].clone()),
-                );
+                entry.insert("command".into(), Value::from(target.argv[0].clone()));
                 entry.insert("args".into(), serde_json::json!(target.argv[1..]));
             } else {
-                let mut entry = serde_json::json!({"command": target.argv[0], "args": target.argv[1..]});
+                let mut entry =
+                    serde_json::json!({"command": target.argv[0], "args": target.argv[1..]});
                 if let Some(profile) = &target.profile {
                     entry["env"] = serde_json::json!({"SAI_HOME": profile});
                 }
                 entries.insert(name.to_owned(), entry);
             }
-            let rendered = serde_json::to_string_pretty(&doc)
-                .map_err(|_| "Could not write MCP config")?;
+            let rendered =
+                serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
             Ok(format!("{}\n", crate::local::ascii_json(&rendered)))
         })
     }
@@ -179,12 +174,7 @@ fn has_name(value: &Value, name: &str) -> bool {
         .is_some_and(|items| items.iter().any(|item| item == name))
 }
 
-fn claude_project_disabled(
-    home: &Path,
-    cwd: &Path,
-    name: &str,
-    deadline: Instant,
-) -> Result<bool> {
+fn claude_project_disabled(home: &Path, cwd: &Path, name: &str, deadline: Instant) -> Result<bool> {
     let mut paths = vec![
         Client::Claude.directory(home).join("settings.json"),
         cwd.join(".claude/settings.json"),
@@ -221,12 +211,8 @@ fn claude_project_disabled(
                     .all(|path| {
                         use std::os::unix::fs::MetadataExt;
                         match path.metadata() {
-                            Ok(meta) => {
-                                meta.uid() == rustix::process::getuid().as_raw()
-                            }
-                            Err(error) => {
-                                error.kind() == io::ErrorKind::NotFound
-                            }
+                            Ok(meta) => meta.uid() == rustix::process::getuid().as_raw(),
+                            Err(error) => error.kind() == io::ErrorKind::NotFound,
                         }
                     })
             {
@@ -242,7 +228,7 @@ fn claude_project_disabled(
     Ok(false)
 }
 
-fn codex_get(
+pub(super) fn codex_get(
     cwd: &Path,
     scope: Scope,
     name: &str,
@@ -259,16 +245,15 @@ fn codex_get(
         name.into(),
         "--json".into(),
     ];
-    let (status, out, err) = invoke(&args, cwd, deadline, true)
-        .map_err(|e| format!("`{label}` did not run: {e}"))?;
+    let (status, out, err) =
+        invoke(&args, cwd, deadline, true).map_err(|e| format!("`{label}` did not run: {e}"))?;
     if !status.success() {
         let missing = format!("Error: No MCP server named '{name}' found.");
         let mut lines = err
             .split(|byte| *byte == b'\n')
             .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
             .filter(|line| {
-                !line.iter().all(u8::is_ascii_whitespace)
-                    && !line.starts_with(b"WARNING: ")
+                !line.iter().all(u8::is_ascii_whitespace) && !line.starts_with(b"WARNING: ")
             });
         if status.code() == Some(1)
             && out.iter().all(u8::is_ascii_whitespace)
@@ -279,8 +264,8 @@ fn codex_get(
         }
         return Err(exit_message(&label, status));
     }
-    let data: Value = serde_json::from_slice(&out)
-        .map_err(|_| format!("`{label}` printed invalid JSON"))?;
+    let data: Value =
+        serde_json::from_slice(&out).map_err(|_| format!("`{label}` printed invalid JSON"))?;
     let filters = ["enabled_tools", "disabled_tools"]
         .into_iter()
         .filter(|key| !data[key].is_null())
@@ -296,14 +281,10 @@ fn codex_get(
     .ok_or_else(|| format!("`{label}` returned an invalid registration"))
 }
 
-pub(super) fn run_step(
-    args: &[String],
-    cwd: &Path,
-    deadline: Instant,
-) -> Result<()> {
+pub(super) fn run_step(args: &[String], cwd: &Path, deadline: Instant) -> Result<()> {
     let label = format!("{} {} {}", basename(&args[0]), args[1], args[2]);
-    let (status, _, _) = invoke(args, cwd, deadline, false)
-        .map_err(|e| format!("`{label}` did not run: {e}"))?;
+    let (status, _, _) =
+        invoke(args, cwd, deadline, false).map_err(|e| format!("`{label}` did not run: {e}"))?;
     if status.success() {
         Ok(())
     } else {
@@ -316,12 +297,10 @@ fn exit_message(label: &str, status: ExitStatus) -> String {
     let code = status
         .code()
         .unwrap_or_else(|| -status.signal().unwrap_or(1));
-    format!(
-        "`{label}` exited {code}. Run the client command directly for details."
-    )
+    format!("`{label}` exited {code}. Run the client command directly for details.")
 }
 
-fn invoke(
+pub(super) fn invoke(
     args: &[String],
     cwd: &Path,
     deadline: Instant,
@@ -354,15 +333,11 @@ fn invoke(
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => {
-                thread::sleep(Duration::from_millis(10))
-            }
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
             other => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(other
-                    .err()
-                    .map_or_else(|| "TimeoutExpired".into(), io_kind));
+                return Err(other.err().map_or_else(|| "TimeoutExpired".into(), io_kind));
             }
         }
     };
@@ -411,11 +386,9 @@ pub(super) fn which(command: &str) -> Option<PathBuf> {
         let path = PathBuf::from(command);
         return executable(&path).then_some(path);
     }
-    env::split_paths(
-        &env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into()),
-    )
-    .map(|dir| dir.join(command))
-    .find(|path| executable(path))
+    env::split_paths(&env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into()))
+        .map(|dir| dir.join(command))
+        .find(|path| executable(path))
 }
 
 pub(super) fn absolute(path: &Path) -> PathBuf {
@@ -488,19 +461,13 @@ fn json_object(source: &[u8], path: &Path) -> Result<Value> {
 }
 
 fn read_json(path: &Path) -> Result<Value> {
-    match read(path).map_err(|e| {
-        format!("could not read {}: {}", path.display(), io_kind(e))
-    })? {
+    match read(path).map_err(|e| format!("could not read {}: {}", path.display(), io_kind(e)))? {
         Some(source) => json_object(&source, path),
         None => Ok(serde_json::json!({})),
     }
 }
 
-fn edit(
-    path: &Path,
-    retry: bool,
-    render: impl Fn(&[u8]) -> Result<String>,
-) -> Result<()> {
+fn edit(path: &Path, retry: bool, render: impl Fn(&[u8]) -> Result<String>) -> Result<()> {
     let write = || -> Result<bool> {
         let destination = resolved(path);
         let seen = read(&destination).map_err(io_kind)?;
@@ -516,8 +483,7 @@ fn edit(
         }
         let parent = destination.parent().ok_or("Missing config directory")?;
         fs::create_dir_all(parent).map_err(io_kind)?;
-        let mut temp =
-            tempfile::NamedTempFile::new_in(parent).map_err(io_kind)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent).map_err(io_kind)?;
         temp.write_all(rendered.as_bytes()).map_err(io_kind)?;
         if seen.is_some() {
             let meta = match destination.metadata() {
@@ -531,9 +497,7 @@ fn edit(
                 .set_permissions(meta.permissions())
                 .map_err(io_kind)?;
         }
-        if resolved(path) != destination
-            || read(&destination).map_err(io_kind)? != seen
-        {
+        if resolved(path) != destination || read(&destination).map_err(io_kind)? != seen {
             return Ok(false);
         }
         temp.persist(destination)
@@ -561,9 +525,7 @@ fn edit_codex(
     target: &Target,
     old: Option<&Registration>,
 ) -> Result<String> {
-    use toml_edit::{
-        Array, DocumentMut, InlineTable, Item, Table, Value as TomlValue, value,
-    };
+    use toml_edit::{Array, DocumentMut, InlineTable, Item, Table, Value as TomlValue, value};
     let bad = "Could not edit Codex config.toml";
     let source = std::str::from_utf8(source).map_err(|_| bad)?;
     let mut doc = source.parse::<DocumentMut>().map_err(|_| bad)?;
@@ -577,9 +539,9 @@ fn edit_codex(
         .as_table_like_mut()
         .ok_or("Codex mcp_servers must be a table")?;
     if old.is_none()
-        && !entries
+        && entries
             .get(name)
-            .is_some_and(|entry| entry.as_table_like().is_some())
+            .is_none_or(|entry| entry.as_table_like().is_none())
     {
         let entry = if entries.is_dotted()
             || original
@@ -610,9 +572,7 @@ fn edit_codex(
                     .get("args")
                     .and_then(Item::as_array)
                     .into_iter()
-                    .flat_map(|args| {
-                        args.iter().map(|arg| arg.as_str().unwrap_or_default())
-                    }),
+                    .flat_map(|args| args.iter().map(|arg| arg.as_str().unwrap_or_default())),
             );
         if !saved.eq(old.argv.iter().map(String::as_str)) {
             return Err("The Sai registration changed concurrently".into());
@@ -622,8 +582,7 @@ fn edit_codex(
             .iter()
             .map(|(key, _)| key)
             .filter(|key| {
-                !(matches!(*key, "command" | "args")
-                    || *key == "env" && target.profile.is_some())
+                !(matches!(*key, "command" | "args") || *key == "env" && target.profile.is_some())
             })
             .map(str::to_owned)
             .collect::<Vec<_>>();
@@ -642,7 +601,7 @@ fn edit_codex(
     ] {
         if let Some(existing) = entry.get(key).and_then(Item::as_value) {
             next.decor_mut().clone_from(existing.decor());
-            if existing.to_string() == next.to_string() {
+            if semantic_value(existing) == semantic_value(&next) {
                 continue;
             }
         }
@@ -653,9 +612,7 @@ fn edit_codex(
     let mut after = rendered.parse::<DocumentMut>().map_err(|_| bad)?;
     let mut before = original;
     let without_entry = |doc: &mut DocumentMut| {
-        if let Some(entries) =
-            doc.get_mut("mcp_servers").and_then(Item::as_table_like_mut)
-        {
+        if let Some(entries) = doc.get_mut("mcp_servers").and_then(Item::as_table_like_mut) {
             entries.remove(name);
             if entries.is_empty() {
                 doc.remove("mcp_servers");
@@ -665,16 +622,12 @@ fn edit_codex(
     without_entry(&mut before);
     without_entry(&mut after);
     if semantic_table(before.as_table()) != semantic_table(after.as_table()) {
-        return Err(
-            "Could not preserve settings outside the Sai registration".into()
-        );
+        return Err("Could not preserve settings outside the Sai registration".into());
     }
     Ok(rendered)
 }
 
-fn semantic_table(
-    table: &dyn toml_edit::TableLike,
-) -> std::collections::BTreeMap<String, Value> {
+fn semantic_table(table: &dyn toml_edit::TableLike) -> std::collections::BTreeMap<String, Value> {
     table
         .iter()
         .map(|(key, item)| (key.to_owned(), semantic_item(item)))
@@ -701,9 +654,7 @@ fn semantic_value(value: &toml_edit::Value) -> Value {
     use toml_edit::Value as T;
     match value {
         T::InlineTable(table) => serde_json::json!(semantic_table(table)),
-        T::Array(array) => {
-            Value::Array(array.iter().map(semantic_value).collect())
-        }
+        T::Array(array) => Value::Array(array.iter().map(semantic_value).collect()),
         T::String(value) => serde_json::json!(["string", value.value()]),
         T::Integer(value) => serde_json::json!(["integer", value.value()]),
         T::Float(value) => serde_json::json!(["float", value.value().to_bits()]),
