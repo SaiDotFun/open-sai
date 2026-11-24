@@ -207,6 +207,16 @@ async def account_balances(addr: str | None = None) -> str:
     return await call(tools.account_balances, addr)
 
 
+async def account_overview(addr: str | None = None) -> str:
+    """Read Sai funds, position risk, pending and queued orders, local blockers,
+    and session expiry. Check each section for its fetch time and any error.
+
+    Args:
+        addr: EVM addr (0x...). Defaults to the active account for this endpoint.
+    """
+    return await call(tools.account_overview, addr)
+
+
 async def intent_local(addr: str | None = None) -> str:
     """List intents this machine recorded, with their local status.
 
@@ -297,9 +307,10 @@ async def preview_open(
     """Preview opening a market, limit, or stop trade without submitting.
 
     Show the user the result and get confirmation; trade_open then needs its
-    previewDigest. A market order preview sets requiresMarketPriceRefresh
-    and reports Keeper's current price as referencePrice: the submit uses
-    the price current at that time, and trade_open needs referencePrice too.
+    previewDigest. Use estimates for execution fees, liquidation price, and
+    the worst-case fill. A market order reports Keeper's current price as
+    referencePrice. Submit refreshes the price and checks it against the
+    referencePrice from the preview.
 
     Args:
         market_id: Market id from market_list.
@@ -703,6 +714,7 @@ READ_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
     (preview_margin, read_only("Preview Margin Change")),
     (preview_partial_close, read_only("Preview Partial Close")),
     (logs_intent, read_only("Intent Log Trail")),
+    (account_overview, read_only("Account Overview")),
 )
 
 TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
