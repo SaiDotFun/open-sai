@@ -763,7 +763,6 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
         ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
         (({"data": {"userIntents": 123}},), "unknown", "INCOMPLETE_DATA"),
-        (({"data": {"userIntents": [None]}},), "unknown", "INTERNAL_ERROR"),
         (("outcome_not_indexed", {"data": {}}), "pending", "INCOMPLETE_DATA"),
         (
             ("outcome_not_indexed", {"data": {"perp": {"tradeHistory": None}}}),
@@ -783,6 +782,54 @@ def test_request_and_data_failures(
     compare(
         cli_pair, tmp_path, monkeypatch, (Step(replies, local, code=1, error=error),)
     )
+
+
+@pytest.mark.parametrize("with_record", [False, True], ids=["null-only", "mixed"])
+def test_c11_intent_status_skips_null_records(
+    c11_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_record: bool,
+) -> None:
+    record = RESPONSES["started"]["data"]["userIntents"][0]
+    documents = []
+    for index, cli in enumerate(c11_cli_pair):
+        home = tmp_path / str(index)
+        with replay() as (endpoint, replies, requests):
+            seed(home, endpoint, monkeypatch, "unknown")
+            ledger = read_state(home)[1:]
+            rows = [None, record, None] if with_record else [None]
+            replies.append(response({"data": {"userIntents": rows}}))
+            result = invoke(
+                cli,
+                home,
+                "--json",
+                "--endpoint",
+                endpoint,
+                "intent",
+                "status",
+                ADDR,
+                "--key",
+                KEY,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert result.stderr == b""
+            assert [request.body for request in requests] == [
+                wire(keeper.INTENTS, user=ADDR, key=KEY)
+            ]
+        document = json.loads(result.stdout)
+        if with_record:
+            [intent] = document["userIntents"]
+            assert intent["intentKey"] == KEY
+            assert intent["lifecycleStep"] == "intent_start"
+        else:
+            assert document == {"userIntents": []}
+            assert all(event["event"] != "intent.keeper" for event in read_events(home))
+        # Even an expired local reservation stays unknown when Keeper sent
+        # a nonempty list with no usable record.
+        assert read_state(home)[1:] == ledger
+        documents.append(document)
+    assert documents[0] == documents[1]
 
 
 @pytest.mark.parametrize("operation", ["intents", "history"])

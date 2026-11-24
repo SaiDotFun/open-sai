@@ -115,10 +115,7 @@ pub async fn reconcile(
     let mut matching = Vec::new();
     match (original, &account) {
         (Value::Array(items), Some(account)) => {
-            for row in items {
-                if !row.is_object() {
-                    return Err(SaiError::internal());
-                }
+            for row in items.into_iter().filter(Value::is_object) {
                 if account_matches(&row["evmAddress"], account)
                     && (row["nibiAddress"].is_null()
                         || account_matches(&row["nibiAddress"], account))
