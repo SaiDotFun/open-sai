@@ -56,18 +56,20 @@ if program == "codex":
             reply[key] = transport[key]
     print(json.dumps(reply))
 elif program == "claude":
-    path = home / ".claude.json"
+    assert argv[0] == "mcp" and argv[2] == "--scope"
+    scope, name = argv[3:5]
+    path = Path.cwd() / ".mcp.json" if scope == "project" else home / ".claude.json"
     data = json.loads(path.read_text()) if path.is_file() else {}
-    entries = data.setdefault("mcpServers", {})
-    assert argv[0] == "mcp" and argv[2:5] == ["--scope", "user", "sai"]
+    holder = data["projects"][str(Path.cwd())] if scope == "local" else data
+    entries = holder.setdefault("mcpServers", {})
     if argv[1] == "remove":
-        del entries["sai"]
+        del entries[name]
     else:
         assert argv[1] == "add"
         divider = argv.index("--")
         launcher, *args = argv[divider + 1 :]
         variables = dict(item.removeprefix("--env=").split("=", 1) for item in argv[5:divider])
-        entries["sai"] = {"type": "stdio", "command": launcher, "args": args, "env": variables}
+        entries[name] = {"type": "stdio", "command": launcher, "args": args, "env": variables}
     path.write_text(json.dumps(data))
 else:
     raise AssertionError("A registered launcher was invoked")
@@ -116,9 +118,12 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
         "url": "https://fixture.invalid/mcp",
         "headers": {"Authorization": SECRET},
     }
-    document = json.dumps({"mcpServers": {name: entry, "other-server": unrelated}})
-    write(home / ".claude.json", document, 0o640)
-    write(home / ".cursor/mcp.json", document, 0o640)
+    document = {"mcpServers": {name: entry, "other-server": unrelated}}
+    write(home / ".cursor/mcp.json", json.dumps(document), 0o640)
+    if scenario == "uninstall-scopes":
+        write(home / ".mcp.json", json.dumps(document), 0o640)
+        document["projects"] = {str(home): {"mcpServers": {name: entry}}}
+    write(home / ".claude.json", json.dumps(document), 0o640)
     if scenario == "shadowed":
         write(home / ".codex/project.json", json.dumps(entry))
     lines = [
@@ -176,6 +181,11 @@ def client_state(
             }
         else:
             data = json.loads(raw)
+            if relative == ".claude.json" and isinstance(data.get("projects"), dict):
+                data["projects"] = {
+                    normalize.text(project): entry
+                    for project, entry in data["projects"].items()
+                }
         mode = stat.S_IMODE(path.stat().st_mode)
         files[f"clients/{relative}"] = Entry(
             "file",

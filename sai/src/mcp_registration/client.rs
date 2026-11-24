@@ -168,6 +168,36 @@ impl Client {
         verification
     }
 
+    pub(super) fn remove(
+        self,
+        path: &Path,
+        name: &str,
+        old: &Registration,
+        deadline: Instant,
+    ) -> Result<bool> {
+        let published = edit(path, false, deadline, |source| {
+            if self == Self::Codex {
+                return remove_codex(source, name, old);
+            }
+            let mut doc = json_object(source, path)?;
+            if doc["mcpServers"].get(name).is_none() {
+                return String::from_utf8(source.to_vec())
+                    .map_err(|_| "Could not write MCP config".into());
+            }
+            let entries = doc["mcpServers"]
+                .as_object_mut()
+                .ok_or("The Sai registration changed concurrently")?;
+            if entries.get(name) != Some(&old.raw) {
+                return Err("The Sai registration changed concurrently".into());
+            }
+            entries.remove(name);
+            let rendered =
+                serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
+            Ok(format!("{}\n", crate::local::ascii_json(&rendered)))
+        })?;
+        Ok(published.is_some())
+    }
+
     pub(super) fn replace_claude(
         self,
         home: &Path,
@@ -614,14 +644,15 @@ fn edit(
     for _ in 0..attempts {
         let destination = resolved(path);
         let seen = read(&destination, deadline).map_err(io_kind)?;
-        let rendered = render(seen.as_deref().unwrap_or(
-            if retry && path.extension().is_some_and(|e| e == "toml") {
-                b""
-            } else {
-                b"{}"
-            },
-        ))?;
-        if seen.as_deref() == Some(rendered.as_bytes()) {
+        let source =
+            seen.as_deref()
+                .unwrap_or(if retry && path.extension().is_some_and(|e| e == "toml") {
+                    b""
+                } else {
+                    b"{}"
+                });
+        let rendered = render(source)?;
+        if source == rendered.as_bytes() {
             return Ok(None);
         }
         let original_metadata = if seen.is_some() {
@@ -671,11 +702,8 @@ fn replace_if_current(
     original_metadata: Option<&Metadata>,
     deadline: Instant,
 ) -> Result<Option<Metadata>> {
-    if let Some(meta) = original_metadata
-        && (meta.permissions().readonly()
-            || rustix::fs::access(destination, rustix::fs::Access::WRITE_OK).is_err())
-    {
-        return Err(READ_ONLY_CONFIG.into());
+    if let Some(meta) = original_metadata {
+        writable(destination, meta)?;
     }
     let parent = destination.parent().ok_or("Missing config directory")?;
     fs::create_dir_all(parent).map_err(io_kind)?;
@@ -706,6 +734,64 @@ fn replace_if_current(
     temp.persist(destination)
         .map_err(|error| io_kind(error.error))?;
     Ok(Some(published_metadata))
+}
+
+pub(super) fn check_writable(path: &Path) -> Result<()> {
+    writable(path, &path.metadata().map_err(io_kind)?)
+}
+
+fn writable(path: &Path, metadata: &Metadata) -> Result<()> {
+    if metadata.permissions().readonly()
+        || rustix::fs::access(path, rustix::fs::Access::WRITE_OK).is_err()
+    {
+        return Err(READ_ONLY_CONFIG.into());
+    }
+    Ok(())
+}
+
+fn remove_codex(source: &[u8], name: &str, old: &Registration) -> Result<String> {
+    use toml_edit::{DocumentMut, Item};
+
+    let bad = "Could not edit Codex config.toml";
+    let source = std::str::from_utf8(source).map_err(|_| bad)?;
+    let mut doc = source.parse::<DocumentMut>().map_err(|_| bad)?;
+    let original = doc.clone();
+    let entries = doc
+        .get_mut("mcp_servers")
+        .and_then(Item::as_table_like_mut)
+        .ok_or("The Sai registration changed concurrently")?;
+    let entry = entries
+        .get(name)
+        .and_then(Item::as_table_like)
+        .ok_or("The Sai registration changed concurrently")?;
+    let matches = if old.stdio {
+        codex_argv_matches(entry, old)
+    } else {
+        let url = old.raw["transport"]["url"].as_str();
+        url.is_some() && entry.get("url").and_then(Item::as_str) == url
+    };
+    if !matches {
+        return Err("The Sai registration changed concurrently".into());
+    }
+    entries.remove(name);
+    render_codex(original, doc, name)
+}
+
+fn codex_argv_matches(entry: &dyn toml_edit::TableLike, old: &Registration) -> bool {
+    use toml_edit::Item;
+
+    entry
+        .get("command")
+        .and_then(Item::as_str)
+        .into_iter()
+        .chain(
+            entry
+                .get("args")
+                .and_then(Item::as_array)
+                .into_iter()
+                .flat_map(|args| args.iter().map(|arg| arg.as_str().unwrap_or_default())),
+        )
+        .eq(old.argv.iter().map(String::as_str))
 }
 
 fn edit_codex(
@@ -752,18 +838,7 @@ fn edit_codex(
         .map(String::as_str)
         .collect::<Array>();
     if let Some(old) = old {
-        let saved = entry
-            .get("command")
-            .and_then(Item::as_str)
-            .into_iter()
-            .chain(
-                entry
-                    .get("args")
-                    .and_then(Item::as_array)
-                    .into_iter()
-                    .flat_map(|args| args.iter().map(|arg| arg.as_str().unwrap_or_default())),
-            );
-        if !saved.eq(old.argv.iter().map(String::as_str)) {
+        if !codex_argv_matches(entry, old) {
             return Err("The Sai registration changed concurrently".into());
         }
     } else {
@@ -796,10 +871,21 @@ fn edit_codex(
         }
         entry.insert(key, Item::Value(next));
     }
+    render_codex(original, doc, name)
+}
+
+fn render_codex(
+    mut before: toml_edit::DocumentMut,
+    doc: toml_edit::DocumentMut,
+    name: &str,
+) -> Result<String> {
+    use toml_edit::{DocumentMut, Item};
+
     let rendered = doc.to_string();
     // Reparse so changes to TOML table boundaries cannot move unrelated keys.
-    let mut after = rendered.parse::<DocumentMut>().map_err(|_| bad)?;
-    let mut before = original;
+    let mut after = rendered
+        .parse::<DocumentMut>()
+        .map_err(|_| "Could not edit Codex config.toml")?;
     let without_entry = |doc: &mut DocumentMut| {
         if let Some(entries) = doc.get_mut("mcp_servers").and_then(Item::as_table_like_mut) {
             entries.remove(name);

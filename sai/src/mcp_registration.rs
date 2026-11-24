@@ -1,4 +1,5 @@
 mod client;
+mod uninstall;
 
 use std::{
     env,
@@ -20,6 +21,8 @@ const NAMES: [&str; 2] = ["sai", RETIRED_NAME];
 const CLIENTS: [Client; 3] = [Client::Claude, Client::Codex, Client::Cursor];
 const INSTALL: &str = "uv tool install git+https://github.com/SaiDotFun/open-sai";
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(60);
+const CODEX_PROJECT_ENTRY: &str = "Codex uses a project-level sai entry in this directory that overrides the user entry; edit or remove it in the project's .codex/config.toml, then run this again";
+const CODEX_STILL_ACTIVE: &str = "a project .codex/config.toml entry is still active";
 
 #[derive(Args)]
 pub(crate) struct McpArgs {
@@ -33,6 +36,8 @@ pub(crate) enum McpCommand {
     List,
     /// Register sai mcp serve with Claude Code, Codex, or Cursor.
     Install(InstallArgs),
+    /// Remove Sai from Claude Code, Codex, or Cursor.
+    Uninstall(uninstall::UninstallArgs),
 }
 
 #[derive(Args)]
@@ -475,7 +480,7 @@ impl Clients {
                 .as_ref()
                 .is_some_and(matches)
         {
-            return Err("a project .codex/config.toml entry is still active".into());
+            return Err(CODEX_STILL_ACTIVE.into());
         }
         Ok(())
     }
@@ -870,6 +875,7 @@ impl McpArgs {
                 crate::local::emit(&clients.list(target.as_ref()), json)
             }
             Some(McpCommand::Install(args)) => args.run(&clients, json, explicit_separator),
+            Some(McpCommand::Uninstall(args)) => args.run(&clients, json),
             None => {
                 use clap::CommandFactory;
                 let mut command = crate::Cli::command();
@@ -904,6 +910,45 @@ fn chosen(names: impl IntoIterator<Item = String>) -> Result<Vec<Client>, SaiErr
         }
     }
     Ok(selected)
+}
+
+fn interactive() -> bool {
+    use std::io::{self, IsTerminal};
+
+    io::stdin().is_terminal() && io::stdout().is_terminal()
+}
+
+fn pick_clients(prompt: &str, clients: Vec<Client>) -> Result<Vec<Client>, SaiError> {
+    use std::io::{self, Write};
+
+    for (index, client) in clients.iter().enumerate() {
+        eprintln!("  {}. {}", index + 1, client.name());
+    }
+    eprint!("{prompt} [all]: ");
+    let _ = io::stderr().flush();
+    let mut answer = String::new();
+    if !io::stdin()
+        .read_line(&mut answer)
+        .is_ok_and(|size| size != 0)
+    {
+        return Err(SaiError::new(Code::InternalError, "Aborted!"));
+    }
+    if answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("all") {
+        return Ok(clients);
+    }
+    chosen(
+        answer
+            .split(|c: char| c.is_whitespace() || c == ',')
+            .filter(|name| !name.is_empty())
+            .map(|name| {
+                name.parse::<usize>()
+                    .ok()
+                    .and_then(|index| index.checked_sub(1))
+                    .and_then(|index| clients.get(index))
+                    .map_or(name, |client| client.name())
+                    .to_owned()
+            }),
+    )
 }
 
 impl InstallArgs {
@@ -950,8 +995,7 @@ impl InstallArgs {
             }
         }
         if names.is_empty() {
-            use std::io::{self, IsTerminal, Write};
-            if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+            if !interactive() {
                 crate::local::emit(&clients.list(Some(&target)), json_output)?;
                 eprintln!(
                     "Nothing changed. Name clients, as in `sai mcp install claude`, or pass --all."
@@ -963,35 +1007,7 @@ impl InstallArgs {
                     "No agent clients found; name one to register.",
                 ));
             }
-            for (index, client) in detected.iter().enumerate() {
-                eprintln!("  {}. {}", index + 1, client.name());
-            }
-            eprint!("Register Sai with (numbers, names, or all) [all]: ");
-            let _ = io::stderr().flush();
-            let mut answer = String::new();
-            if !io::stdin()
-                .read_line(&mut answer)
-                .is_ok_and(|size| size != 0)
-            {
-                return Err(SaiError::new(Code::InternalError, "Aborted!"));
-            }
-            if answer.trim().is_empty() || answer.trim().eq_ignore_ascii_case("all") {
-                names = detected;
-            } else {
-                names = chosen(
-                    answer
-                        .split(|c: char| c.is_whitespace() || c == ',')
-                        .filter(|name| !name.is_empty())
-                        .map(|name| {
-                            name.parse::<usize>()
-                                .ok()
-                                .and_then(|index| index.checked_sub(1))
-                                .and_then(|index| detected.get(index))
-                                .map_or(name, |client| client.name())
-                                .to_owned()
-                        }),
-                )?;
-            }
+            names = pick_clients("Register Sai with (numbers, names, or all)", detected)?;
         }
         if self.scope == Scope::Local && names != [Client::Claude] {
             return Err(SaiError::usage(
@@ -1006,15 +1022,19 @@ impl InstallArgs {
     }
 }
 
-struct InstallResult {
+struct RegistrationResult {
     report: Value,
     changed: bool,
 }
 
-impl InstallResult {
-    fn new(client: Client, scope: Scope) -> Self {
+impl RegistrationResult {
+    fn new(client: Client, scope: impl Into<Option<Scope>>) -> Self {
+        let mut report = json!({"client": client.name(), "action": "failed"});
+        if let Some(scope) = scope.into() {
+            report["scope"] = json!(scope.name());
+        }
         Self {
-            report: json!({"client": client.name(), "action": "failed", "scope": scope.name()}),
+            report,
             changed: false,
         }
     }
@@ -1038,9 +1058,9 @@ impl Clients {
         target: &Target,
         dry: bool,
         reset: bool,
-    ) -> InstallResult {
+    ) -> RegistrationResult {
         let client = Client::Claude;
-        let mut result = InstallResult::new(client, scope);
+        let mut result = RegistrationResult::new(client, scope);
         result.report["name"] = json!(name);
         let work = || -> ClientResult<Option<Target>> {
             let deadline = Instant::now() + CLIENT_TIMEOUT;
@@ -1091,8 +1111,14 @@ impl Clients {
         result
     }
 
-    fn install(&self, client: Client, scope: Scope, target: &Target, dry: bool) -> InstallResult {
-        let mut result = InstallResult::new(client, scope);
+    fn install(
+        &self,
+        client: Client,
+        scope: Scope,
+        target: &Target,
+        dry: bool,
+    ) -> RegistrationResult {
+        let mut result = RegistrationResult::new(client, scope);
         result.report["command"] = json!(target.argv);
         if let Err(error) = self.install_one(client, scope, target, dry, &mut result) {
             result.failed(error);
@@ -1106,7 +1132,7 @@ impl Clients {
         scope: Scope,
         target: &Target,
         dry: bool,
-        result: &mut InstallResult,
+        result: &mut RegistrationResult,
     ) -> ClientResult<()> {
         if client == Client::Codex {
             if scope != Scope::User {
@@ -1136,7 +1162,7 @@ impl Clients {
             .filter(|entry| entry.scope.rank() < scope.rank() && !entry.matches(target))
         {
             if client == Client::Codex {
-                return Err("Codex uses a project-level sai entry in this directory that overrides the user entry; edit or remove it in the project's .codex/config.toml, then run this again".into());
+                return Err(CODEX_PROJECT_ENTRY.into());
             }
             result.report["shadowedBy"] = json!(winner.scope.name());
         }
@@ -1198,9 +1224,9 @@ impl Clients {
         client: Client,
         entry: &Registration,
         target: &Target,
-    ) -> InstallResult {
+    ) -> RegistrationResult {
         let name = NAMES[1];
-        let mut result = InstallResult::new(client, entry.scope);
+        let mut result = RegistrationResult::new(client, entry.scope);
         let shown = entry.report(Some(target));
         result.report["name"] = json!(name);
         result.report["command"] = shown["command"].clone();
@@ -1220,7 +1246,7 @@ impl Clients {
     }
 }
 
-fn finish(results: Vec<InstallResult>, json_output: bool) -> Result<(), SaiError> {
+fn finish(results: Vec<RegistrationResult>, json_output: bool) -> Result<(), SaiError> {
     let reconnect = results.iter().any(|result| result.changed);
     let mut summary = json!({
         "results": results.iter().map(|result| &result.report).collect::<Vec<_>>(),
@@ -1246,12 +1272,12 @@ fn finish(results: Vec<InstallResult>, json_output: bool) -> Result<(), SaiError
                 let detail = r["error"]
                     .as_str()
                     .map_or_else(String::new, |err| format!(": {err}"));
-                format!(
-                    "{} ({}): {}{detail}",
-                    r["client"].as_str().unwrap_or_default(),
-                    r["scope"].as_str().unwrap_or_default(),
-                    r["action"].as_str().unwrap_or_default()
-                )
+                let client = r["client"].as_str().unwrap_or_default();
+                let scope = r["scope"]
+                    .as_str()
+                    .map_or_else(String::new, |scope| format!(" ({scope})"));
+                let action = r["action"].as_str().unwrap_or_default();
+                format!("{client}{scope}: {action}{detail}")
             })
             .collect::<Vec<_>>();
         if reconnect {

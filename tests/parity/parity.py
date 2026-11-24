@@ -696,6 +696,7 @@ def main() -> int:
     c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
         Path(sys.executable).with_name("sai")
     )
+    uninstall_python = os.environ.get("SAI_MCP_UNINSTALL_PYTHON") or c9a_python
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -714,7 +715,9 @@ def main() -> int:
     for case in selected:
         # uv run prepends its own bin directory to PATH. Launch the Python
         # entry point directly so both CLIs inspect the fixture launcher.
-        if case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
+        if case.command == "mcp uninstall":
+            case_reference = [uninstall_python]
+        elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
             case_reference = [c9a_python]
         else:
             case_reference = reference

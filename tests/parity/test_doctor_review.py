@@ -299,6 +299,35 @@ def test_doctor_respects_read_only_cursor_config(
     assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444
 
 
+@pytest.mark.parametrize(
+    ("client", "filename"),
+    [
+        ("claude", ".claude.json"),
+        ("codex", ".codex/config.toml"),
+        ("cursor", ".cursor/mcp.json"),
+    ],
+)
+def test_uninstall_does_not_replace_read_only_client_config(
+    candidate: str,
+    tmp_path: Path,
+    fixture_env: dict[str, str],
+    client: str,
+    filename: str,
+) -> None:
+    seed_clients(tmp_path, fixture_env, "current")
+    path = tmp_path / filename
+    path.chmod(0o444)
+    before = path.read_bytes()
+    result = invoke(candidate, tmp_path, fixture_env, "mcp", "uninstall", client)
+    assert result.returncode == 1
+    details = json.loads(result.stdout)["error"]["details"]
+    assert details["reconnectNeeded"] is False
+    (row,) = details["results"]
+    assert row["error"] == "The client config is read-only"
+    assert row["changed"] is False
+    assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444
+
+
 def test_doctor_shows_only_origin_for_an_unreachable_lcd(
     candidate: str, tmp_path: Path, fixture_env: dict[str, str]
 ) -> None:

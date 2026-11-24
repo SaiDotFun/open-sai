@@ -137,6 +137,11 @@ The C9a cases compare against Python main at
 `SAI_PARITY_BIN` to the Rust binary. With `SAI_C9A_PYTHON` unset, the
 driver uses the Python entry point from its own environment.
 
+The `mcp-uninstall-*` cases use the Python `sai-cli/v0.1.2` reference at
+`8557a7e13dceab0accc369191182c8e01423c91b`. Point `SAI_MCP_UNINSTALL_PYTHON`
+at that checkout's `.venv/bin/sai` and run the driver with
+`--case 'mcp-uninstall-*'`.
+
 The `client_seed` key supplies private Claude Code, Codex, and Cursor
 configs. The runner uses fixture programs for client subprocesses and
 compares their arguments, file modes, config values, Codex comments, and
