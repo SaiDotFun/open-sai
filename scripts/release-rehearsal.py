@@ -23,7 +23,7 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, Any, NamedTuple
+from typing import IO, Any, NamedTuple, TypeVar
 
 TESTS = Path(__file__).resolve().parents[1] / "cli" / "sai_cli" / "tests"
 sys.path.insert(0, str(TESTS))
@@ -125,28 +125,22 @@ class RehearsalInterrupted(BaseException):
 class Cancellation:
     def __init__(self) -> None:
         self.signum: int | None = None
-        self.deferred = False
 
     def receive(self, signum: int, _frame: object) -> None:
+        # A Python handler can run before a context manager enters __exit__.
+        # Record cancellation here and raise only at explicit checkpoints.
         if self.signum is None:
             self.signum = signum
-            if not self.deferred:
-                raise RehearsalInterrupted(signum)
 
-    @contextmanager
-    def defer(self) -> Generator[None, None, None]:
-        already_received = self.signum
-        self.deferred = True
-        try:
-            yield
-        finally:
-            self.deferred = False
-            if already_received is None and self.signum is not None:
-                raise RehearsalInterrupted(self.signum)
+    def check(self) -> None:
+        if self.signum is not None:
+            raise RehearsalInterrupted(self.signum)
 
 
 CANCELLATION = Cancellation()
 STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+CANCEL_INTERVAL = 0.1
+T = TypeVar("T")
 
 
 @contextmanager
@@ -156,6 +150,7 @@ def cancel_on_signal() -> Generator[None, None, None]:
         for sig in STOP_SIGNALS:
             previous[sig] = signal.signal(sig, CANCELLATION.receive)
         yield
+        CANCELLATION.check()
     finally:
         for sig, handler in previous.items():
             if handler is not None:
@@ -166,26 +161,37 @@ def cancel_on_signal() -> Generator[None, None, None]:
 @contextmanager
 def cleanup_stack() -> Generator[ExitStack, None, None]:
     cleanup = ExitStack()
-
-    def close_stack() -> None:
-        # A signal sent to another thread can still invoke Python's handler.
-        with CANCELLATION.defer():
-            previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
-            try:
-                cleanup.close()
-            finally:
-                signal.pthread_sigmask(signal.SIG_SETMASK, previous)
-
     try:
+        yield cleanup
+    finally:
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
         try:
-            yield cleanup
+            cleanup.close()
         finally:
-            close_stack()
-    except RehearsalInterrupted:
-        # A first signal can arrive before close_stack() has blocked interruptions.
-        # ExitStack removes callbacks as they run, so closing again is safe.
-        close_stack()
-        raise
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def wait_with_cancellation(operation: Callable[[float], T], timeout: float | None) -> T:
+    deadline = time.monotonic() + timeout if timeout is not None else float("inf")
+    while True:
+        CANCELLATION.check()
+        remaining = deadline - time.monotonic()
+        try:
+            return operation(max(0, min(CANCEL_INTERVAL, remaining)))
+        except subprocess.TimeoutExpired as exc:
+            if timeout is not None and remaining <= CANCEL_INTERVAL:
+                exc.timeout = timeout
+                raise
+
+
+def communicate(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout: float,
+) -> tuple[bytes, bytes]:
+    return wait_with_cancellation(
+        lambda interval: process.communicate(timeout=interval), timeout
+    )
 
 
 def require(condition: bool, message: str) -> None:
@@ -203,9 +209,12 @@ class ReplyReader:
     def line(self, step: str, *, timeout: float = 10) -> str:
         deadline = time.monotonic() + timeout
         while (end := self.pending.find(b"\n")) < 0:
+            CANCELLATION.check()
             left = deadline - time.monotonic()
-            if left <= 0 or not select.select([self.fd], [], [], left)[0]:
+            if left <= 0:
                 raise RehearsalError(f"{step} timed out waiting for a complete reply")
+            if not select.select([self.fd], [], [], min(CANCEL_INTERVAL, left))[0]:
+                continue
             try:
                 chunk = os.read(self.fd, 8192)
             except BlockingIOError:
@@ -226,25 +235,27 @@ def owned_process(
     cwd: Path,
     env: dict[str, str],
     *,
+    stdin: IO[bytes] | int = subprocess.PIPE,
     stdout: int | None = subprocess.PIPE,
     stderr: int | IO[bytes] | None = subprocess.PIPE,
 ) -> Generator[subprocess.Popen[bytes], None, None]:
+    CANCELLATION.check()
     with cleanup_stack() as cleanup:
-        # Register cleanup before delivering a signal received during acquisition.
-        with CANCELLATION.defer():
-            process = cleanup.enter_context(
-                subprocess.Popen(
-                    command,
-                    cwd=cwd,
-                    env=env,
-                    stdin=subprocess.PIPE,
-                    stdout=stdout,
-                    stderr=stderr,
-                    start_new_session=True,
-                )
+        process = cleanup.enter_context(
+            subprocess.Popen(
+                command,
+                cwd=cwd,
+                env=env,
+                stdin=stdin,
+                stdout=stdout,
+                stderr=stderr,
+                start_new_session=True,
             )
-            cleanup.callback(stop_process_group, process)
+        )
+        cleanup.callback(stop_process_group, process)
+        CANCELLATION.check()
         yield process
+    CANCELLATION.check()
 
 
 def stop_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -302,7 +313,7 @@ def namespace_prefix(cwd: Path, env: dict[str, str]) -> tuple[str, ...] | None:
             with owned_process(
                 (*candidate, sys.executable, "-I", "-c", CHECK_NAMESPACE), cwd, env
             ) as probe:
-                probe.communicate(timeout=5)
+                communicate(probe, timeout=5)
                 if probe.returncode == 0:
                     return candidate
         except (OSError, subprocess.TimeoutExpired):
@@ -629,16 +640,23 @@ class Install:
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            with owned_process(
-                command, self.home, self.env if env is None else env
-            ) as process:
-                out, err = process.communicate(input_text.encode(), timeout=timeout)
-                result = subprocess.CompletedProcess(
+            # File-backed input stays readable across communicate() timeouts.
+            with tempfile.TemporaryFile(dir=self.home) as source:
+                source.write(input_text.encode())
+                source.seek(0)
+                with owned_process(
                     command,
-                    process.returncode,
-                    out.decode(errors="replace"),
-                    err.decode(errors="replace"),
-                )
+                    self.home,
+                    self.env if env is None else env,
+                    stdin=source,
+                ) as process:
+                    out, err = communicate(process, timeout=timeout)
+                    result = subprocess.CompletedProcess(
+                        command,
+                        process.returncode,
+                        out.decode(errors="replace"),
+                        err.decode(errors="replace"),
+                    )
         except subprocess.TimeoutExpired as exc:
             self.log_output(step, exc.output or b"", exc.stderr or b"")
             raise RehearsalError(f"{step} exited 124") from exc
@@ -745,7 +763,7 @@ class Install:
                         raise
                     process.stdin.close()
                     try:
-                        code = process.wait(timeout=5)
+                        code = wait_with_cancellation(process.wait, 5)
                     except subprocess.TimeoutExpired as exc:
                         raise RehearsalError(f"{step} exited 124") from exc
                     if code:
@@ -929,14 +947,18 @@ def rehearse(
     # Only the rehearsal script's own progress reaches these streams. It keeps
     # the installed CLI and agent clients' output behind its usual capture.
     with owned_process(command, tool.home, tool.env, stdout=None, stderr=None) as stage:
-        return stage.wait()
+        return wait_with_cancellation(stage.wait, None)
 
 
 def isolated_stage(root_name: str, wheel_name: str, version: str, log_name: str) -> int:
     root, wheel = Path(root_name), Path(wheel_name)
     tool = Install(root, Path(log_name) if log_name else None, prepared=True)
-    with cancel_on_signal():
-        return report_result(lambda: rehearse_staged(tool, root, wheel, version))
+
+    def work() -> int:
+        with cancel_on_signal():
+            return rehearse_staged(tool, root, wheel, version)
+
+    return report_result(work)
 
 
 def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int:
@@ -1171,13 +1193,12 @@ def main() -> int:
             diagnostics.touch(mode=0o600)
             print(f"Child output log: {diagnostics}", file=sys.stderr)
         with cancel_on_signal(), cleanup_stack() as cleanup:
-            with CANCELLATION.defer():
-                scratch = cleanup.enter_context(
-                    tempfile.TemporaryDirectory(
-                        prefix="sai-release-rehearsal-",
-                        dir=diagnostics.parent if diagnostics else None,
-                    )
+            scratch = cleanup.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix="sai-release-rehearsal-",
+                    dir=diagnostics.parent if diagnostics else None,
                 )
+            )
             return rehearse(
                 Path(scratch), wheel, version, diagnostics, strict=args.strict
             )

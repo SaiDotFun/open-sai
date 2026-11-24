@@ -215,6 +215,22 @@ for address, expected in (
 
 
 class ProcessTest(unittest.TestCase):
+    def test_delayed_command_reads_all_input_across_cancellation_polls(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            tool = REHEARSAL["Install"](Path(temp), prepared=True)
+            tool.home.mkdir()
+            payload = "x" * 2_000_000
+            result = tool.run(
+                "Read input after a delay",
+                sys.executable,
+                "-c",
+                "import sys, time; time.sleep(0.25); print(len(sys.stdin.read()))",
+                input_text=payload,
+                timeout=5,
+                env={"HOME": str(tool.home)},
+            )
+            self.assertEqual(result.stdout.strip(), str(len(payload)))
+
     def assert_group_released(self, lock: Path) -> None:
         with lock.open("r") as file:
             deadline = time.monotonic() + 2
@@ -236,23 +252,37 @@ import runpy, signal, sys, tempfile
 from pathlib import Path
 entry = runpy.run_path(sys.argv[1])
 hook = sys.argv[3]
+signum = int(sys.argv[4])
 
 def interrupt_at_teardown(frame, event, arg):
-    if event == "call" and frame.f_code.co_name == hook:
+    if event != "call":
+        return
+    name = frame.f_code.co_name
+    if name == "__exit__":
+        gen = getattr(frame.f_locals.get("self"), "gen", None)
+        if gen is not None:
+            name = gen.gi_code.co_name + ".__exit__"
+    if name == hook:
         sys.setprofile(None)
-        signal.raise_signal(signal.SIGTERM)
+        signal.raise_signal(signum)
+
+def verify_child_stopped(child):
+    if child.returncode is None:
+        raise RuntimeError("Child still running at the start of scratch cleanup")
 
 try:
     with entry["cancel_on_signal"](), entry["cleanup_stack"]() as cleanup:
         home = cleanup.enter_context(tempfile.TemporaryDirectory(dir=sys.argv[2]))
-        with entry["owned_process"](tuple(sys.argv[4:]), Path(home), {"HOME": home}) as child:
+        process_context = entry["owned_process"](tuple(sys.argv[5:]), Path(home), {"HOME": home})
+        with process_context as child:
+            cleanup.callback(verify_child_stopped, child)
             if entry["ReplyReader"](child.stdout).line("descendant") != "locked":
                 sys.exit(2)
             print(child.pid, home, flush=True)
             if hook:
                 sys.setprofile(interrupt_at_teardown)
             else:
-                child.communicate()
+                entry["communicate"](child, timeout=30)
 except entry["RehearsalInterrupted"] as exc:
     sys.exit(128 + exc.signum)
 """
@@ -266,6 +296,7 @@ except entry["RehearsalInterrupted"] as exc:
                     script,
                     temp,
                     teardown_hook,
+                    str(sig.value),
                     sys.executable,
                     "-c",
                     "import subprocess, sys; subprocess.run(sys.argv[1:])",
@@ -303,9 +334,16 @@ except entry["RehearsalInterrupted"] as exc:
                 self.assert_interruption_cleans_up(sig)
 
     def test_sigterm_during_teardown_stops_the_group_and_removes_the_home(self) -> None:
-        for hook in ("close_stack", "stop_process_group"):
+        for hook in ("cleanup_stack.__exit__", "stop_process_group"):
             with self.subTest(hook=hook):
                 self.assert_interruption_cleans_up(signal.SIGTERM, hook)
+
+    def test_signals_at_process_exit_stop_the_child_before_scratch_cleanup(
+        self,
+    ) -> None:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with self.subTest(signal=sig.name):
+                self.assert_interruption_cleans_up(sig, "owned_process.__exit__")
 
     def test_partial_reply_times_out(self) -> None:
         read, write = os.pipe()
