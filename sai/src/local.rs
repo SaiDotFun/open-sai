@@ -55,9 +55,11 @@ pub fn intent(
     json: bool,
     events: EventContext<'_>,
 ) -> Result<(), SaiError> {
-    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
-    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let settings = load_settings(flags, env)?;
+    let log_storage = |event: StorageEvent<'_>| {
+        storage_event_with_endpoint(events, event, Some(settings.endpoint()))
+    };
+    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     match command {
         IntentCommand::Status { addr, key } => {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -81,7 +83,45 @@ pub fn intent(
 }
 
 pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+    storage_event_with_endpoint(events, event, None);
+}
+
+pub(crate) fn storage_event_with_endpoint(
+    events: EventContext<'_>,
+    event: StorageEvent<'_>,
+    trade_endpoint: Option<&str>,
+) {
+    let endpoint_id = || {
+        trade_endpoint.map_or(
+            Field::Scalar(serde_json::Value::Null),
+            Field::endpoint_identity,
+        )
+    };
     match event {
+        StorageEvent::IntentReserved {
+            key,
+            kind,
+            addr,
+            entity,
+            endpoint,
+        } => {
+            events.event(
+                "intent.reserved",
+                Level::Info,
+                [
+                    ("intentKey", json!(key).into()),
+                    ("kind", json!(kind).into()),
+                    ("status", json!("unknown").into()),
+                    ("addr", json!(addr).into()),
+                    (
+                        "tradeId",
+                        json!((!entity.is_empty()).then_some(entity)).into(),
+                    ),
+                    ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("endpointId", endpoint_id()),
+                ],
+            );
+        }
         StorageEvent::IntentStatus {
             key,
             kind,
@@ -105,6 +145,7 @@ pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
                     ("status", json!(status.as_str()).into()),
                     ("addr", json!(addr).into()),
                     ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("endpointId", endpoint_id()),
                     ("code", json!(code).into()),
                 ],
             );
@@ -117,6 +158,7 @@ pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
                     ("code", json!(Code::SessionExpired).into()),
                     ("addr", json!(addr).into()),
                     ("expiresAt", json!(expires_at).into()),
+                    ("endpointId", endpoint_id()),
                 ],
             );
         }
@@ -171,7 +213,6 @@ pub(crate) fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
                 ],
             );
         }
-        StorageEvent::IntentReserved { .. } => {}
     }
 }
 
