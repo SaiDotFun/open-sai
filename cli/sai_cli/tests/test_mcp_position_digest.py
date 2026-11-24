@@ -36,6 +36,8 @@ class Position:
     collateral: int = 4_000_000
     trade_type: str = "trade"
     leverage: str = "2"
+    max_leverage: int = 100
+    liquidation_threshold: str = "60"
     snapshot_leverages: deque[str] = field(default_factory=deque)
     after_hours: bool = False
     risk_block: int = 90
@@ -90,6 +92,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     market_row = {
                         **market,
                         "price": position.price,
+                        "maxLeverage": position.max_leverage,
                     }
                 data = {
                     keeper.ROUTE: {
@@ -148,6 +151,32 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 }
                 if position.preview_inputs:
                     data.update(open_price="100", long=True)
+            elif "get_perp_prices" in message:
+                assert message["get_perp_prices"] == {
+                    "market_index": "MarketIndex(0)",
+                    "collateral_index": "TokenIndex(1)",
+                }
+                assert self.headers.get("x-cosmos-block-height") == str(
+                    position.reported_height
+                )
+                data = (
+                    {
+                        "market": {"base_per_quote": str(position.price)},
+                        "collateral": position.collateral_price,
+                    }
+                    if position.collateral_price is not None
+                    else None
+                )
+            elif "get_liquidation_price" in message:
+                assert message["get_liquidation_price"] == {
+                    "trader": TRADER,
+                    "trade_id": "UserTradeIndex(7)",
+                    "include_borrowing_fees": True,
+                }
+                assert self.headers.get("x-cosmos-block-height") == str(
+                    position.reported_height
+                )
+                data = {"liquidation_price": position.liquidation_threshold}
             elif "get_exchange_balance" in message:
                 data = {
                     "collateral_index": "TokenIndex(1)",
@@ -803,7 +832,7 @@ def test_mcp_position_estimates_do_not_change_confirmed_terms(
         async with connected_client(base_url) as client:
             variants = (
                 ("close", {}, "0.016", "unbounded", None),
-                ("partial_close", {"percent": 50}, "0.02", "unbounded", "60"),
+                ("partial_close", {"percent": 50}, "0.02", "unbounded", None),
                 ("leverage", {"leverage": "4"}, "0", "not_applicable", "80"),
                 (
                     "margin",
@@ -821,7 +850,11 @@ def test_mcp_position_estimates_do_not_change_confirmed_terms(
                 assert estimates["worstCaseFill"]["status"] == fill
                 quote = estimates["liquidationPrice"]
                 if liq is None:
-                    assert quote["status"] in {"unchanged", "not_applicable"}
+                    assert quote["status"] in {
+                        "unchanged",
+                        "not_applicable",
+                        "unavailable",
+                    }
                 else:
                     assert quote["status"] == "estimate"
                     assert Decimal(quote["price"]).quantize(
@@ -1006,5 +1039,49 @@ def test_partial_close_includes_the_perp_trigger_fee(position_service):
             )
             assert quote["quote"]["closedNotionalUsdc"] == "100"
             assert quote["estimates"]["fees"]["amountUsdc"] == "0.5"
+
+    asyncio.run(scenario())
+
+
+def test_close_previews_detect_full_liquidation_and_unknown_partial_settlement(
+    position_service,
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "20"
+    position.max_leverage = 20
+    position.price = "95"
+    position.liquidation_threshold = "96.025"
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            for tool, args in (
+                ("preview_close", {}),
+                ("preview_partial_close", {"percent": 10}),
+            ):
+                quote = await call(client, tool, {"trade_id": 7, **args})
+                result = quote["estimates"]
+                assert result["execution"]["status"] == "would_liquidate"
+                assert result["execution"]["marketPrice"]["price"] == "95"
+                assert result["execution"]["liquidationPrice"] == "96.025"
+                assert result["fees"]["amountUsdc"] == "10"
+                assert result["liquidationPrice"]["status"] == "not_applicable"
+
+            position.price = "96.10"
+            quote = await call(
+                client, "preview_partial_close", {"trade_id": 7, "percent": 1}
+            )
+            result = quote["estimates"]
+            assert result["execution"]["status"] == "unavailable"
+            assert "rejected" in result["execution"]["reason"]
+            assert result["liquidationPrice"]["status"] == "unavailable"
+            assert "price" not in result["liquidationPrice"]
+            position.reported_height = None
+            quote = await call(client, "preview_close", {"trade_id": 7})
+            assert quote["estimates"]["execution"]["status"] == "unavailable"
+            assert quote["estimates"]["fees"]["status"] == "unavailable"
+
+            assert position.submitted == []
 
     asyncio.run(scenario())

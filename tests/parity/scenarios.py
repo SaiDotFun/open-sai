@@ -236,6 +236,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         },
         "is_after_hours_market": False,
         "get_collateral_price": "1",
+        "get_perp_prices": {"market": {"base_per_quote": "100"}, "collateral": "1"},
+        "get_liquidation_price": {"liquidation_price": "60"},
         "get_market": {"fee_index": "FeeIndex(0)"},
         "get_fees": {
             "min_position_size_usd": str(market["minPositionSizeUSD"]),
@@ -256,14 +258,27 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "is_after_hours_market": {"market_index": market_index},
         "get_collateral_price": {"collateral_index": token_index},
         "get_market": {"index": market_index},
+        "get_perp_prices": {
+            "market_index": market_index,
+            "collateral_index": token_index,
+        },
+        "get_liquidation_price": {
+            "trade_id": "UserTradeIndex(7)",
+            "trader": position["trader"],
+            "include_borrowing_fees": True,
+        },
         "get_fees": {"index": "FeeIndex(0)"},
     }
 
     class Handler(BaseHTTPRequestHandler):
-        def reply(self, value: object, status_code: int = 200) -> None:
+        def reply(
+            self, value: object, status_code: int = 200, *, lcd: bool = False
+        ) -> None:
             body = json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
+            if lcd:
+                self.send_header("grpc-metadata-x-cosmos-block-height", "120")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -377,7 +392,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
-                        self.reply({"data": contracts[name]})
+                        self.reply({"data": contracts[name]}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):
                         pass

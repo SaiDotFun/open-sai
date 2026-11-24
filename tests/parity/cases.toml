@@ -295,7 +295,8 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price", "get_market", "get_fees", "get_collateral_price",
+    "get_collateral_price", "get_trade_raw", "get_perp_prices", "get_liquidation_price",
+    "is_after_hours_market", "get_market", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 

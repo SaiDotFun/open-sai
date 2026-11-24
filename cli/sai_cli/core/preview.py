@@ -144,9 +144,20 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
     return price_input(price, "Sai Perp collateral oracle", intents.now())
 
 
-def fee_schedule(lcd: str, contract: str, market: str) -> dict[str, Any]:
-    pair = margin.smart(lcd, contract, {"get_market": {"index": market}})
-    return margin.smart(lcd, contract, {"get_fees": {"index": pair["fee_index"]}})
+def fee_schedule(
+    lcd: str, contract: str, market: str, *, height: str | None = None
+) -> dict[str, Any]:
+    pair = margin.smart_value(
+        lcd, contract, {"get_market": {"index": market}}, height=height
+    )
+    if not isinstance(pair, dict):
+        raise TypeError("Perp market is unavailable")
+    fees = margin.smart_value(
+        lcd, contract, {"get_fees": {"index": pair["fee_index"]}}, height=height
+    )
+    if not isinstance(fees, dict):
+        raise TypeError("Perp fee schedule is unavailable")
+    return fees
 
 
 def _notional(collateral: int, leverage: Decimal) -> int:
@@ -206,105 +217,172 @@ def open_estimates(
     return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
 
 
-def position_estimates(
+def close_estimates(
     lcd: str,
+    state: margin.PositionSnapshot | None,
+    trade_id: int,
+    reduce_by: int | None,
+) -> dict[str, Any]:
+    """Check Perp's liquidation route before quoting the voluntary fee components."""
+    unknown = unavailable(
+        "Cannot verify the position and Perp liquidation inputs at one block."
+    )
+    result = {
+        "execution": unknown,
+        "fees": unknown,
+        "liquidationPrice": not_applicable("A full close leaves no position.")
+        if reduce_by is None
+        else unknown,
+        "worstCaseFill": {
+            "status": "unbounded",
+            "reason": "This Keeper intent carries no slippage limit.",
+        },
+    }
+    if state is None or type(long := state.raw.get("long")) is not bool:
+        return result
+
+    raw = state.raw
+    try:
+        height = margin.verified_position_height(lcd, state, trade_id)
+        prices = margin.smart_value(
+            lcd,
+            state.contract,
+            {
+                "get_perp_prices": {
+                    "market_index": raw["market_index"],
+                    "collateral_index": raw["collateral_index"],
+                }
+            },
+            height=height,
+        )
+        threshold = margin.smart_value(
+            lcd,
+            state.contract,
+            {
+                "get_liquidation_price": {
+                    "trade_id": raw["user_trade_index"],
+                    "trader": raw["user"],
+                    "include_borrowing_fees": True,
+                }
+            },
+            height=height,
+        )
+        market = margin.contract_decimal(prices["market"]["base_per_quote"])
+        trigger = margin.contract_decimal(threshold["liquidation_price"])
+        if market <= 0:
+            return result
+        observed_at = intents.now()
+        collateral = int(raw["collateral_amount"])
+        if (long and market <= trigger) or (not long and market >= trigger):
+            fee = 2 * (collateral * 5 // 100)
+            return {
+                **result,
+                "execution": {
+                    "status": "would_liquidate",
+                    "marketPrice": price_input(
+                        market, "Sai Perp market oracle", observed_at
+                    ),
+                    "liquidationPrice": format(trigger, "f"),
+                },
+                "fees": {
+                    "status": "estimate",
+                    "amountUsdc": format(Decimal(fee).scaleb(-6).normalize(), "f"),
+                    "basis": "Gross Perp liquidation fee components.",
+                    "excludes": ["Borrowing fees", "network fees"],
+                },
+                "liquidationPrice": not_applicable(
+                    "Liquidation closes the entire position."
+                ),
+            }
+
+        # Voluntary settlement runs the after-hours guard after checking for liquidation.
+        effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
+        if effective is None or effective != margin.contract_decimal(raw["leverage"]):
+            guarded = unavailable(
+                "The after-hours guard can change or close this position."
+            )
+            return {
+                **result,
+                "execution": guarded,
+                "fees": guarded,
+                "liquidationPrice": guarded,
+            }
+
+        if reduce_by is not None:
+            settlement = unavailable(
+                "Partial-close settlement can draw on the remaining collateral. "
+                "Execution may be rejected if the resulting leverage exceeds the market cap."
+            )
+            result.update(execution=settlement, liquidationPrice=settlement)
+        else:
+            result["execution"] = {"status": "voluntary_close"}
+
+        result["fees"] = unavailable(
+            "Perp fee schedule or collateral oracle price is unavailable."
+        )
+        price = margin.contract_decimal(prices["collateral"])
+        if price <= 0:
+            return result
+        schedule = fee_schedule(lcd, state.contract, raw["market_index"], height=height)
+        _, result["fees"] = base_fees(
+            schedule,
+            price_input(price, "Sai Perp collateral oracle", observed_at),
+            _notional(collateral if reduce_by is None else reduce_by, effective),
+            opening=False,
+            triggered=reduce_by is not None,
+        )
+    except READ_ERRORS:
+        pass
+    return result
+
+
+def position_estimates(
     state: margin.PositionSnapshot | None,
     effective: Decimal | None,
     *,
-    close: bool = False,
-    reduce_by: int = 0,
     target: Decimal | None = None,
     updates_triggers: bool = False,
 ) -> dict[str, Any]:
-    """Quote a close or a surviving position from the same snapshot as the intent."""
-    if target is not None or updates_triggers:
-        unknown_guard = unavailable(
-            "Cannot verify that the Perp after-hours guard is inactive."
-        )
-        result = dict.fromkeys(
-            ("fees", "liquidationPrice", "worstCaseFill"), unknown_guard
-        )
-    else:
-        result = {
-            "fees": unavailable("Current position or Perp fee inputs are unavailable."),
-            "liquidationPrice": not_applicable("A full close leaves no position.")
-            if close
-            else unavailable("A current position and effective leverage are required."),
-            "worstCaseFill": {
-                "status": "unbounded",
-                "reason": "This Keeper intent carries no slippage limit.",
-            },
-        }
+    """Quote leverage or TP/SL changes after checking the after-hours guard."""
+    unknown = unavailable("Cannot verify that the Perp after-hours guard is inactive.")
+    result = dict.fromkeys(("fees", "liquidationPrice", "worstCaseFill"), unknown)
     if state is None or effective is None:
         return result
     try:
         raw = state.raw
-        stored = margin.contract_decimal(raw["leverage"])
-        if effective != stored:
-            risk = unavailable(
-                "The after-hours guard can change or close this position."
+        if effective != margin.contract_decimal(raw["leverage"]):
+            return dict.fromkeys(
+                result,
+                unavailable("The after-hours guard can change or close this position."),
             )
-            return dict.fromkeys(result, risk)
-        if target is not None or updates_triggers:
-            result["fees"] = {
-                "status": "exact",
-                "amountUsdc": "0",
-                "excludes": ["Network fees"],
-            }
-            result["worstCaseFill"] = not_applicable("This action has no price fill.")
+        result["fees"] = {
+            "status": "exact",
+            "amountUsdc": "0",
+            "excludes": ["Network fees"],
+        }
+        result["worstCaseFill"] = not_applicable("This action has no price fill.")
+        result["liquidationPrice"] = unavailable(
+            "Position entry price or projected collateral is unavailable."
+        )
         if updates_triggers:
             result["liquidationPrice"] = {
                 "status": "unchanged",
                 "reason": "This action changes only TP/SL triggers.",
             }
-            return result
-        collateral = int(raw["collateral_amount"])
-        if target is None:
-            try:
-                schedule = fee_schedule(lcd, state.contract, raw["market_index"])
-                price = read_collateral_price(
-                    lcd, state.contract, raw["collateral_index"]
-                )
-                _, result["fees"] = base_fees(
-                    schedule,
-                    price,
-                    _notional(collateral if close else reduce_by, effective),
-                    opening=False,
-                    triggered=not close,
-                )
-            except READ_ERRORS:
-                pass
-        if close:
-            return result
-
-        entry = price_input(
-            intents.positive(raw["open_price"], "Entry price"),
-            "Sai Perp stored entry price",
-            state.observed_at,
-        )
-        long = raw["long"]
-        if type(long) is not bool:
-            return result
-        with localcontext() as context:
-            context.prec = 90
-            if target is not None:
-                remaining = int(collateral * effective / target)
-                leverage = target
-                assumption = (
+        elif target is not None and type(raw.get("long")) is bool:
+            entry = price_input(
+                intents.positive(raw["open_price"], "Entry price"),
+                "Sai Perp stored entry price",
+                state.observed_at,
+            )
+            with localcontext() as context:
+                context.prec = 90
+                collateral = int(int(raw["collateral_amount"]) * effective / target)
+            liq = liquidation(entry, raw["long"], collateral, target)
+            if liq["status"] == "estimate":
+                liq["assumption"] = (
                     "The target leverage takes effect at the quoted collateral."
                 )
-            else:
-                remaining = collateral - reduce_by
-                remaining_size = _notional(collateral, effective) - _notional(
-                    reduce_by, effective
-                )
-                leverage = (Decimal(remaining_size) / remaining).quantize(
-                    ATOM, rounding=ROUND_DOWN
-                )
-                assumption = "The close payout covers its own losses and fees."
-            liq = liquidation(entry, long, remaining, leverage)
-            if liq["status"] == "estimate":
-                liq["assumption"] = assumption
             result["liquidationPrice"] = liq
     except READ_ERRORS:
         pass

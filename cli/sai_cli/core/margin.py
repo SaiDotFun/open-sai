@@ -118,6 +118,18 @@ def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
     return all(latest.get(key) == prior[key] for key in fields)
 
 
+def verified_position_height(lcd: str, state: PositionSnapshot, trade_id: int) -> str:
+    latest, height = _latest_position(lcd, state, trade_id)
+    if (
+        height is None
+        or not _same_position(state.raw, latest)
+        or latest.get("long") is not state.raw.get("long")
+        or latest.get("open_price") != state.raw.get("open_price")
+    ):
+        raise ValueError("Cannot verify the quoted position at the LCD query height")
+    return height
+
+
 def position_unchanged(
     lcd: str, state: PositionSnapshot, trade_id: int, quoted_leverage: dict[str, Any]
 ) -> bool:

@@ -348,16 +348,14 @@ def _estimate_position(
         try:
             addr = get_session()["evmAddress"]
             state = margin.snapshot(endpoint, lcd, addr, trade_id)
-            effective, _ = margin.leverage_inputs(lcd, state, trade_id)
+            if target is not None or updates_triggers:
+                effective, _ = margin.leverage_inputs(lcd, state, trade_id)
         except estimates.READ_ERRORS:
             pass
+    if target is None and not updates_triggers:
+        return estimates.close_estimates(lcd or "", state, trade_id, None)
     return estimates.position_estimates(
-        lcd or "",
-        state,
-        effective,
-        close=target is None and not updates_triggers,
-        target=target,
-        updates_triggers=updates_triggers,
+        state, effective, target=target, updates_triggers=updates_triggers
     )
 
 
@@ -454,7 +452,6 @@ def change_margin(
         before_submit=before_submit,
         changed_message="Position changed; review the margin change again",
         estimate=lambda state, inputs, fresh: estimates.position_estimates(
-            lcd_endpoint,
             state,
             _quoted_leverage(inputs),
             target=Decimal(fresh["quote"]["requestedLeverage"]),
@@ -533,11 +530,11 @@ def partial_close(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the reduction again",
-        estimate=lambda state, inputs, fresh: estimates.position_estimates(
+        estimate=lambda state, inputs, fresh: estimates.close_estimates(
             lcd_endpoint,
             state,
-            _quoted_leverage(inputs),
-            reduce_by=int(fresh["intent"]["body"]["collateral"]["amountUsdc"]),
+            trade_id,
+            int(fresh["intent"]["body"]["collateral"]["amountUsdc"]),
         ),
     )
     if dry_run:
