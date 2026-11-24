@@ -166,6 +166,14 @@ jobs:
           path: .parity-python-c7
           persist-credentials: false
 
+      - name: Check out Python main for auth parity
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 3feb83a1ab3e46b4f618f497a4820d6179d19eba
+          path: .parity-auth-python
+          persist-credentials: false
+
       - name: Install uv and Python for parity
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -185,6 +193,7 @@ jobs:
           uv sync --project .parity-python --locked --all-groups
           uv sync --project .parity-python-c7 --locked --all-groups
           uv sync --project .parity-python-wait --locked --all-groups
+          uv sync --project .parity-auth-python --locked --all-groups
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -200,4 +209,5 @@ jobs:
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
           SAI_PARITY_C7_PYTHON: ${{ github.workspace }}/.parity-python-c7/.venv/bin/sai
           SAI_PARITY_WAIT_PYTHON: ${{ github.workspace }}/.parity-python-wait/.venv/bin/sai
+          SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
         run: uv run --locked pytest tests/parity

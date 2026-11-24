@@ -33,6 +33,8 @@ pub enum StorageError {
     RecentOpenPending { key: String, hint: String },
     #[error("{0}")]
     Session(#[from] SessionError),
+    #[error("{0}")]
+    SessionData(#[source] SessionError),
 }
 
 #[derive(Debug, Error)]
@@ -54,7 +56,7 @@ impl From<SessionError> for SaiError {
 impl From<StorageError> for SaiError {
     fn from(error: StorageError) -> Self {
         match error {
-            StorageError::Session(error) => error.into(),
+            StorageError::Session(error) | StorageError::SessionData(error) => error.into(),
             StorageError::RecentOpenPending { ref key, ref hint } => SaiError {
                 intent_key: Some(key.clone()),
                 hint: Some(hint.clone()),
@@ -114,7 +116,7 @@ pub enum StorageEvent<'a> {
 }
 
 /// Project a stored endpoint onto the same fields as Python's log.origin.
-fn endpoint_origin(endpoint: &str) -> String {
+pub(crate) fn endpoint_origin(endpoint: &str) -> String {
     fn origin(endpoint: &str) -> Option<String> {
         let normalized = endpoint.trim().replace(['\t', '\n', '\r'], "");
         let (scheme, rest) = normalized.split_once("://")?;
