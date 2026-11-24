@@ -42,6 +42,7 @@ from compare import (
     stdout,
 )
 from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, handshake
+from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
 from sai_cli.core import log
@@ -76,10 +77,13 @@ class Case:
     unset: list[str] | None = None
     wire: list[str] | None = None
     state: dict[str, Any] | None = None
+    client_seed: str | None = None
+    accepted_divergence: str | None = None
     absent_log_text: list[str] | None = None
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
     expected_overview_help: str | None = None
+    exact_output: bool = False
 
     @property
     def command(self) -> str:
@@ -331,13 +335,16 @@ def observe(
     home: Path,
     endpoints: Endpoints,
     *,
-    native_mcp: bool = False,
+    candidate: bool = False,
 ) -> Observation:
     started_at = time.time()
     seed_home(home, endpoints, case.seed)
     config = home / "sai" / "config.toml"
     before_config = config.read_bytes().decode("utf-8") if config.is_file() else None
     env = child_env(home, endpoints)
+    client_before = (
+        seed_clients(home, env, case.client_seed) if case.client_seed else {}
+    )
     for key in case.unset or ():
         env.pop(key, None)
     if case.setup:
@@ -400,7 +407,7 @@ def observe(
             env,
             endpoints,
             case,
-            probe_deferred_trade=native_mcp and case.mcp_deferred_trade_exception,
+            probe_deferred_trade=candidate and case.mcp_deferred_trade_exception,
         )
     else:
         result = invoke(binary, args, home, env)
@@ -430,8 +437,17 @@ def observe(
             text = path.read_text(encoding="utf-8")
             if any(value in text for value in case.absent_log_text):
                 raise ValueError("Fixture credential appeared in a log")
-    files = snapshot(home / "sai", normalize)
-    check_state(case.state or {}, files)
+    files = snapshot(
+        home / "sai", normalize, raw_config=case.seed == "doctor-malformed-toml"
+    )
+    if case.client_seed:
+        if SECRET in result.stdout or SECRET in result.stderr:
+            raise ValueError("Client config value escaped into CLI output")
+        files.update(client_state(home, client_before, normalize))
+    state = dict(case.state or {})
+    if candidate and case.accepted_divergence == "codex-repair-rollback":
+        state["clients/.codex/config.toml#changed"] = False
+    check_state(state, files)
     try:
         output = stdout(result.stdout, case.mode, case.command, normalize)
         if contender:
@@ -454,7 +470,11 @@ def observe(
         stderr += tuple(
             f"contender {category}" for category in stderr_category(contender.stderr)
         )
-    exact = case.command.split()[0] in {"market", "account", "watch"}
+    exact = case.exact_output or case.command.split()[0] in {
+        "market",
+        "account",
+        "watch",
+    }
     raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
     return Observation(result.returncode, output, stderr, files, raw)
 
@@ -576,7 +596,7 @@ def safe_observe(
     home: Path,
     endpoints: Endpoints,
     *,
-    native_mcp: bool = False,
+    candidate: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
     endpoints.interrupt_ready.clear()
@@ -588,7 +608,7 @@ def safe_observe(
     outbound = unroutable_packets()
     try:
         result: tuple[Observation | None, str] = (
-            observe(case, binary, home, endpoints, native_mcp=native_mcp),
+            observe(case, binary, home, endpoints, candidate=candidate),
             "",
         )
     except subprocess.TimeoutExpired:
@@ -643,6 +663,23 @@ def expect_native_mcp_info(
     return ", ".join(reasons) or None
 
 
+def project_reference_lcd_origin(output: dict[str, Any]) -> None:
+    """The pinned Python reference still displays the LCD URL path."""
+    error = output.get("error")
+    report = error["details"] if error is not None else output
+    lcd = next(check for check in report["checks"] if check["id"] == "lcd")
+    endpoint = lcd["details"]["endpoint"]
+    parts = urlsplit(endpoint)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    original_summary = lcd["summary"]
+    lcd["details"]["endpoint"] = origin
+    lcd["summary"] = original_summary.replace(endpoint, origin, 1)
+    if error is not None:
+        error["message"] = error["message"].replace(
+            f"lcd: {original_summary}", f"lcd: {lcd['summary']}", 1
+        )
+
+
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
 ) -> tuple[list[str], dict[str, str], str | None]:
@@ -658,7 +695,7 @@ def run_case(
             candidate,
             Path(temp) / "candidate",
             endpoints,
-            native_mcp=reference != candidate,
+            candidate=candidate != reference,
         )
     tools = {}
     if case.mode == "mcp" and left is not None:
@@ -688,6 +725,16 @@ def run_case(
             tools,
             None,
         )
+    if candidate != reference and case.accepted_divergence == "codex-repair-rollback":
+        # Both observations checked their expected change flag. Compare the
+        # saved file's existence and mode while allowing its contents to differ.
+        filename = "clients/.codex/config.toml"
+        for observation in (left, right):
+            observation.files[filename] = replace(
+                observation.files[filename], data=None
+            )
+    if candidate != reference and case.accepted_divergence == "lcd-origin-only":
+        project_reference_lcd_origin(left.output)
     expected = None
     if case.mode == "mcp" and reference != candidate:
         expected = expect_native_mcp_info(
@@ -766,6 +813,9 @@ def main() -> int:
         parser.error("No parity cases matched")
     reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
     candidate = reference
+    c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
+        Path(sys.executable).with_name("sai")
+    )
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -791,7 +841,13 @@ def main() -> int:
     expected_differences = 0
     tools: dict[str, str] = {}
     for case in selected:
-        oracle = mcp_reference if case.mode == "mcp" else reference
+        if case.mode == "mcp":
+            oracle = mcp_reference
+        elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
+            # Launch directly so uv cannot shadow the fixture launcher on PATH.
+            oracle = [c9a_python]
+        else:
+            oracle = reference
         if (
             candidate is reference
             and oracle is reference
@@ -808,7 +864,14 @@ def main() -> int:
         row(
             f"`sai {shlex.join(case.args)}` ({case.name})",
             "DIFF" if diffs else "EXPECTED DIFF" if expected else "PASS",
-            ", ".join(diffs) if diffs else expected or "",
+            ", ".join(diffs)
+            if diffs
+            else expected
+            or (
+                f"Accepted divergence ({case.accepted_divergence})"
+                if candidate is not reference and case.accepted_divergence
+                else ""
+            ),
         )
     if not args.case:
         for name, reason in sorted(deferred.items()):

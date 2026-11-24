@@ -22,7 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlsplit
 
 import httpx
 import tomlkit
@@ -450,39 +450,24 @@ def load(
 # Redacted output
 
 
-def public_url(url: str | None) -> str | None:
-    """Return URL without user info, query, or fragment, which can hold
-    credentials such as API keys."""
-    if url is None:
-        return None
-    parts = urlsplit(url)
-    host = parts.hostname or ""
-    if ":" in host:
-        host = f"[{host}]"
-    try:
-        port = parts.port
-    except ValueError:
-        port = None
-    netloc = host if port is None else f"{host}:{port}"
-    return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
+def public_value(
+    spec: Setting, value: str | bool | int | None
+) -> str | bool | int | None:
+    """Show only the origin for an endpoint setting."""
+    if spec.kind == "url" and isinstance(value, str):
+        return log.origin(value)
+    return value
 
 
 def public(settings: Settings) -> dict[str, dict[str, Any]]:
     """Every key with its display value, source, variable, and default."""
 
-    def shown(spec: Setting, value: Any) -> Any:
-        if spec.kind != "url" or value is None:
-            return value
-        if spec.section == "keeper":
-            return log.origin(value)
-        return public_url(value)
-
     return {
         spec.key: {
-            "value": shown(spec, settings.value(spec.key)),
+            "value": public_value(spec, settings.value(spec.key)),
             "source": settings.sources[spec.key],
             "env": spec.env,
-            "default": shown(spec, spec.default),
+            "default": public_value(spec, spec.default),
         }
         for spec in SETTINGS
     }

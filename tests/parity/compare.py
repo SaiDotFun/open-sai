@@ -260,6 +260,42 @@ def doctor_checks(checks: Any) -> None:
                 check["summary"] = re.sub(
                     rf"(?<=sai ){VERSION.pattern}(?=[ ;]|$)", "<version>", message
                 )
+            if name == "install":
+                checkout = "sai <version> runs from a source checkout at "
+                if check["summary"].startswith(checkout):
+                    root = check["summary"].removeprefix(checkout)
+                    if Path(root).is_absolute():
+                        check["summary"] = checkout + "<checkout>"
+                if isinstance(detail, dict) and isinstance(
+                    provenance := detail.get("provenance"), dict
+                ):
+                    doctor_provenance(provenance)
+
+
+def doctor_provenance(install: dict[str, Any]) -> None:
+    if install.get("kind") != "source-checkout":
+        return
+    replace_if(
+        install, "path", lambda path: isinstance(path, str) and Path(path).is_absolute()
+    )
+    if isinstance(git := install.get("git"), dict):
+        replace_if(
+            git,
+            "commit",
+            lambda sha: (
+                isinstance(sha, str) and re.fullmatch(r"[0-9a-f]{40}", sha) is not None
+            ),
+        )
+        replace_if(git, "dirty", lambda dirty: type(dirty) is bool)
+
+
+def doctor_report(value: dict[str, Any]) -> None:
+    replace_if(value, "generatedAt", timestamp)
+    doctor_checks(value.get("checks"))
+    if isinstance(sai := value.get("sai"), dict):
+        replace_if(sai, "version", is_version)
+        if isinstance(install := sai.get("install"), dict):
+            doctor_provenance(install)
 
 
 def rewrite_mcp_fields(text: str, updates: dict[str, Any]) -> str:
@@ -368,8 +404,13 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
             if isinstance(error.get(field), str):
                 error[field] = normalize.intent_refs(error[field])
     if command == "doctor" and isinstance(value, dict):
-        replace_if(value, "generatedAt", timestamp)
-        doctor_checks(value.get("checks"))
+        if isinstance(error := value.get("error"), dict):
+            if isinstance(report := error.get("details"), dict):
+                doctor_report(report)
+            if isinstance(error.get("message"), str):
+                error["message"] = DURATION.sub("<durationMs>", error["message"])
+        else:
+            doctor_report(value)
     if (
         command.startswith("trade ")
         and isinstance(value, dict)
@@ -687,7 +728,9 @@ def read_log(path: Path, day: str) -> list[dict[str, Any]]:
     return records
 
 
-def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
+def snapshot(
+    root: Path, normalize: Normalize, *, raw_config: bool = False
+) -> dict[str, Entry]:
     if not root.exists() and not root.is_symlink():
         return {}
     entries: dict[str, Entry] = {}
@@ -714,7 +757,11 @@ def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
                         raise ValueError("Log file modes differ within a surface")
                     records.extend(read_log(path, match["day"]))
                     continue
-                data = content(path, name, normalize)
+                data = (
+                    path.read_bytes()
+                    if raw_config and name == "config.toml"
+                    else content(path, name, normalize)
+                )
             except (InvalidReservationTime, InvalidLogTime):
                 raise
             except (ValueError, KeyError, TypeError, sqlite3.Error, InvalidTag) as exc:

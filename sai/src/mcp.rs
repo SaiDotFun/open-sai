@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use clap::Subcommand;
+use clap::Args;
 use rmcp::{
     ErrorData, RoleServer, ServerHandler, ServiceExt,
     model::{
@@ -43,35 +43,27 @@ static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
 });
 
-#[derive(Subcommand)]
-pub(crate) enum McpCommand {
-    /// Serve Sai tools to an agent client over stdio.
-    Serve {
-        #[arg(long, help = "Override the Keeper GraphQL HTTP endpoint")]
-        endpoint: Option<String>,
-        #[arg(long, help = "Override the Keeper WebSocket endpoint")]
-        ws_endpoint: Option<String>,
-        #[arg(long, help = "Override the Nibiru REST endpoint")]
-        lcd_endpoint: Option<String>,
-    },
+#[derive(Args)]
+pub(crate) struct ServeArgs {
+    #[arg(long, help = "Override the Keeper GraphQL HTTP endpoint")]
+    endpoint: Option<String>,
+    #[arg(long, help = "Override the Keeper WebSocket endpoint")]
+    ws_endpoint: Option<String>,
+    #[arg(long, help = "Override the Nibiru REST endpoint")]
+    lcd_endpoint: Option<String>,
 }
 
-impl McpCommand {
+impl ServeArgs {
     pub(crate) fn run(
         self,
         global: Flags,
         env: &Environment,
         writer: Option<Arc<LogWriter>>,
     ) -> Result<(), SaiError> {
-        let Self::Serve {
-            endpoint,
-            ws_endpoint,
-            lcd_endpoint,
-        } = self;
         let flags = Flags {
-            endpoint: endpoint.or(global.endpoint),
-            ws_endpoint: ws_endpoint.or(global.ws_endpoint),
-            lcd_endpoint: lcd_endpoint.or(global.lcd_endpoint),
+            endpoint: self.endpoint.or(global.endpoint),
+            ws_endpoint: self.ws_endpoint.or(global.ws_endpoint),
+            lcd_endpoint: self.lcd_endpoint.or(global.lcd_endpoint),
         };
         if io::stdin().is_terminal() {
             eprintln!(
@@ -302,9 +294,9 @@ impl SaiMcp {
             "mcpVersion": Implementation::from_build_env().version,
             "provenance": {"kind": "installed", "path": install_dir},
             "endpoints": {
-                "keeper": log::endpoint_origin(self.settings.endpoint()),
-                "websocket": log::endpoint_origin(self.settings.ws_endpoint()),
-                "lcd": log::endpoint_origin(self.settings.lcd_endpoint()),
+                "keeper": log::origin(self.settings.endpoint()),
+                "websocket": log::origin(self.settings.ws_endpoint()),
+                "lcd": log::origin(self.settings.lcd_endpoint()),
             },
             "configFile": self.env.path().to_string_lossy(),
             "logs": {
