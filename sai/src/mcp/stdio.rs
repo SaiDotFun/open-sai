@@ -51,12 +51,15 @@ impl Stdio {
     fn report_invalid_frame(&self) -> io::Result<()> {
         match serde_json::from_slice::<Value>(&self.line) {
             Ok(value) => {
-                if value.get("method").is_some()
+                if value["jsonrpc"] == "2.0"
+                    && value["method"].is_string()
+                    && (value["params"].is_null() || value["params"].is_object())
                     && let Ok(id) = serde_json::from_value(value["id"].clone())
                 {
-                    self.reject_request(id)?;
+                    return self.reject_request(id);
                 }
-                Ok(())
+                eprintln!("Invalid MCP JSON-RPC envelope");
+                self.enqueue(parse_diagnostic())
             }
             Err(error) => {
                 eprintln!(

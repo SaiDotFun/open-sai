@@ -386,3 +386,29 @@ def test_sigint_flushes_command_end_during_locked_reconciliation(
         ]
         assert events[-1]["event"] == "command.end"
         assert events[-1]["exitCode"] == 0
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [b'{"jsonrpc":"2.0","id":2}', b'{"jsonrpc":"1.0","id":2,"method":"ping"}'],
+    ids=["missing-method", "wrong-version"],
+)
+def test_invalid_envelope_reports_diagnostic(
+    native: Path, tmp_path: Path, envelope: bytes
+) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints) as stdio,
+    ):
+        stdio.write(envelope)
+        assert stdio.receive() == {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {
+                "level": "error",
+                "logger": "mcp.server.exception_handler",
+                "data": "Internal Server Error",
+            },
+        }
+        stdio.send("ping", id_=3)
+        assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
