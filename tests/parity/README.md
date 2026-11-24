@@ -129,3 +129,9 @@ Accepted C9b divergences from the pinned Python reference
 
 - Rust `logs tail` strips credentials, paths, queries, and fragments from
   endpoints in retained rows. Python currently prints the retained value.
+- Rust `logs intent` resumes at the first unread file positions when a
+  page ends. Python can omit events that share the last displayed timestamp.
+  Rust also returns attributed command starts on their retained page when
+  the scan budget ends before that file. Python may include those starts
+  on an earlier page. UTC timestamps passed directly to `--before` remain
+  exclusive.

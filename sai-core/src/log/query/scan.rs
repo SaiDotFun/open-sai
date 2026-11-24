@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::Path,
@@ -159,6 +159,7 @@ impl Reverse {
 
 #[derive(Default)]
 pub(super) struct Scan {
+    pub start: Option<Position>,
     pub truncated: bool,
     pub resume: Option<Position>,
 }
@@ -242,6 +243,7 @@ pub(super) fn page(
             return Scan {
                 truncated: true,
                 resume: Some(Position { day, offsets: None }),
+                ..scan
             };
         }
         budget.files -= count;
@@ -268,6 +270,14 @@ pub(super) fn page(
                 Err(_) => scan.truncated = true,
             }
         }
+        scan.start.get_or_insert_with(|| Position {
+            day,
+            offsets: Some(std::array::from_fn(|index| {
+                readers[index]
+                    .as_ref()
+                    .map_or(0, |reader| reader.reverse.end)
+            })),
+        });
         let position = |readers: &[Option<Reader>; SURFACES]| Position {
             day,
             offsets: Some(std::array::from_fn(|index| {
@@ -285,6 +295,7 @@ pub(super) fn page(
                         return Scan {
                             truncated: true,
                             resume: Some(position(&readers)),
+                            ..scan
                         };
                     }
                     Err(ReadError::Io) => {
@@ -312,6 +323,7 @@ pub(super) fn page(
                 return Scan {
                     truncated: true,
                     resume: Some(checkpoint),
+                    ..scan
                 };
             }
             budget.rows -= 1;
@@ -326,134 +338,53 @@ pub(super) fn page(
 
 pub(super) struct Context {
     pub rows: Vec<Row>,
-    pub visited: BTreeSet<String>,
     pub truncated: bool,
-    pub frontier: Option<String>,
 }
 
-pub(super) fn context(
-    root: &Path,
-    mut budget: Budget,
-    days: impl Fn(NaiveDate) -> bool,
-    skip: &BTreeSet<String>,
-    prefix: bool,
-    accept: impl Fn(&Row) -> bool,
-    cutoff: Option<&str>,
-) -> Context {
+pub(super) fn prefix(root: &Path, day: NaiveDate, accept: impl Fn(&Row) -> bool) -> Context {
     let mut result = Context {
         rows: Vec::new(),
-        visited: BTreeSet::new(),
         truncated: false,
-        frontier: None,
     };
     let Ok(directory) = LogDir::read_only(root) else {
         return result;
     };
-    let prefix_bytes = budget.bytes;
-    for (_, names) in files(&directory)
-        .into_iter()
-        .rev()
-        .filter(|(day, _)| days(*day))
-    {
-        let names: Vec<_> = names
-            .into_iter()
-            .rev()
-            .flatten()
-            .filter(|name| !skip.contains(name))
-            .collect();
-        let count = names.len();
-        let mut readers = Vec::new();
-        for name in names {
-            if budget.files == 0 {
-                result.truncated = true;
-                break;
-            }
-            budget.files -= 1;
-            match directory
-                .read_file(&name)
-                .and_then(|file| Reverse::new(file, None, MAX_LINE))
-            {
-                Ok(reader) if reader.end > 0 => readers.push((name, reader, None::<String>)),
-                Ok(_) => {}
-                Err(_) => result.truncated = true,
-            }
-        }
-        let mark_frontier = |result: &mut Context, pending: &[Option<String>]| {
+    let Some(names) = files(&directory).remove(&day) else {
+        return result;
+    };
+    let mut budget = Budget::CONTEXT;
+    let count = names.iter().flatten().count();
+    if count == 0 {
+        return result;
+    }
+    let max = (budget.bytes / count) as u64;
+    for name in names.into_iter().rev().flatten() {
+        let Ok((mut file, size)) = directory
+            .read_file(&name)
+            .and_then(|file| file.metadata().map(|metadata| (file, metadata.len())))
+        else {
             result.truncated = true;
-            if !pending.is_empty() && pending.iter().all(Option::is_some) {
-                result.frontier = pending.iter().flatten().max().cloned();
-            }
+            continue;
         };
-        while !readers.is_empty() {
-            let mut index = 0;
-            while index < readers.len() {
-                let (name, reader, oldest) = &mut readers[index];
-                let block = if prefix {
-                    let length = reader.end.min((prefix_bytes / count) as u64) as usize;
-                    result.truncated |= length as u64 != reader.end;
-                    budget.read(&mut reader.file, length).map(|data| {
-                        Some(
-                            data.split_inclusive(|&byte| byte == b'\n')
-                                .filter_map(|row| row.strip_suffix(b"\n"))
-                                .filter(|row| row.len() <= MAX_LINE)
-                                .map(|row| RawRow {
-                                    start: 0,
-                                    bytes: row.to_vec(),
-                                })
-                                .collect(),
-                        )
-                    })
-                } else {
-                    reader.block(&mut budget)
-                };
-                match block {
-                    Ok(Some(block)) => {
-                        result.visited.insert(name.clone());
-                        for row in block
-                            .into_iter()
-                            .filter_map(|row| decode_row(&row.bytes))
-                            .filter(&accept)
-                        {
-                            if budget.rows == 0 {
-                                let pending: Vec<_> = readers
-                                    .iter()
-                                    .map(|(_, _, oldest)| oldest.clone())
-                                    .collect();
-                                mark_frontier(&mut result, &pending);
-                                return result;
-                            }
-                            budget.rows -= 1;
-                            if let Some(ts) = row.get("ts").and_then(Value::as_str)
-                                && cutoff.is_none_or(|cutoff| ts < cutoff)
-                                && oldest.as_deref().is_none_or(|oldest| ts < oldest)
-                            {
-                                *oldest = Some(ts.into());
-                            }
-                            result.rows.push(row);
-                        }
-                        if prefix {
-                            readers.remove(index);
-                        } else {
-                            index += 1;
-                        }
-                    }
-                    Ok(None) => {
-                        readers.remove(index);
-                    }
-                    Err(ReadError::Budget) => {
-                        let pending: Vec<_> = readers
-                            .iter()
-                            .map(|(_, _, oldest)| oldest.clone())
-                            .collect();
-                        mark_frontier(&mut result, &pending);
-                        return result;
-                    }
-                    Err(ReadError::Io) => {
-                        result.truncated = true;
-                        readers.remove(index);
-                    }
-                }
+        let length = size.min(max);
+        result.truncated |= length != size;
+        let Ok(data) = budget.read(&mut file, length as usize) else {
+            result.truncated = true;
+            continue;
+        };
+        for row in data
+            .split_inclusive(|&byte| byte == b'\n')
+            .filter_map(|row| row.strip_suffix(b"\n"))
+            .filter(|row| row.len() <= MAX_LINE)
+            .filter_map(decode_row)
+            .filter(&accept)
+        {
+            if budget.rows == 0 {
+                result.truncated = true;
+                return result;
             }
+            budget.rows -= 1;
+            result.rows.push(row);
         }
     }
     result

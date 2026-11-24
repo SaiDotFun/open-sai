@@ -303,7 +303,7 @@ Options:
 Options:
   --offline      Read local logs only.
   --addr TEXT    EVM address to use for the Keeper lookup.
-  --before TEXT  Read earlier events before this UTC timestamp.
+  --before TEXT  Resume from a cursor or read before a UTC timestamp.
   --help         Show this message and exit."#
         }
         "logs run" => {

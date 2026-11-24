@@ -480,6 +480,79 @@ def test_logs_intent_scopes_and_projects(
     assert reports[0] == reports[1]
 
 
+def test_logs_intent_cursor_keeps_events_at_the_same_timestamp(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    # Accepted divergence: Python's timestamp cursor drops events tied with it.
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        fields = {"intentKey": INTENT_KEY, "addr": ADDR, "endpointId": ENDPOINT_ID}
+        upper = STAMP.replace(".000Z", ".001Z")
+        logs = seed_logs(
+            root,
+            {
+                "cli": [
+                    event("command.start", 1, commandId=COMMAND),
+                    *(
+                        event("intent.status", seq, commandId=COMMAND, **fields)
+                        for seq in range(2, 130, 2)
+                    ),
+                    event("intent.status", 130, ts=upper, commandId=COMMAND, **fields),
+                ],
+                "mcp": [
+                    event("intent.status", seq, surface="mcp", callId=CALL, **fields)
+                    for seq in range(3, 130, 2)
+                ],
+            },
+        )
+        args = ("logs", "intent", INTENT_KEY, "--offline")
+        first = cli_json(cli, root, *args, "--before", upper)
+        assert [row["seq"] for row in first["events"]] == list(range(2, 130))
+        if index:
+            # A new conflicting anchor must stay outside this continuation.
+            conflict = event(
+                "intent.status", 131, **{**fields, "addr": "0x" + "34" * 20}
+            )
+            with (logs / f"cli-{STAMP[:10]}.jsonl").open("a") as stream:
+                stream.write(json.dumps(conflict) + "\n")
+        second = cli_json(cli, root, *args, "--before", first["nextBefore"])
+        assert [row["seq"] for row in second["events"]] == ([1] if index else [])
+        assert "nextBefore" not in second
+        assert cli_json(cli, root, *args, "--before", STAMP)["events"] == []
+
+
+def test_logs_intent_cursor_keeps_cross_day_attribution(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    # Python reads the prior UTC day as side context and includes its start
+    # immediately. A Rust cursor reaches that row on its own physical page.
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        logs = seed_logs(root, {"cli": [event("command.start", 1, commandId=COMMAND)]})
+        next_day = "2026-11-24T00:00:00.000Z"
+        padding = event("command.start", 2, ts=next_day, run=OTHER_RUN)
+        anchor = event(
+            "intent.reserved",
+            3,
+            ts=next_day,
+            commandId=COMMAND,
+            intentKey=INTENT_KEY,
+            addr=ADDR,
+            endpointId=ENDPOINT_ID,
+        )
+        encoded = (json.dumps(padding) + "\n") * 20_001 + json.dumps(anchor) + "\n"
+        (logs / "cli-2026-11-24.jsonl").write_bytes(encoded.encode())
+        args = ("logs", "intent", INTENT_KEY, "--offline")
+        first = cli_json(cli, root, *args)
+        assert first["truncated"]
+        seen = [row["seq"] for row in first["events"]]
+        if index:
+            second = cli_json(cli, root, *args, "--before", first["nextBefore"])
+            seen.extend(row["seq"] for row in second["events"])
+            assert "nextBefore" not in second
+        assert sorted(seen) == [1, 3]
+
+
 def test_logs_intent_reads_keeper_once(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:

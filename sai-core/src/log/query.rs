@@ -541,15 +541,9 @@ pub fn run(home: &Path, identifier: &str, before: Option<&str>) -> Result<Value,
             .last_day
             .and_then(|day| day.checked_add_days(Days::new(1)))
     {
-        let next = scan::context(
-            &root,
-            Budget::CONTEXT,
-            |day| day == following,
-            &Default::default(),
-            true,
-            |row| text(row, "callId") == Some(identifier),
-            None,
-        );
+        let next = scan::prefix(&root, following, |row| {
+            text(row, "callId") == Some(identifier)
+        });
         if let Some(key) = next.rows.iter().rev().find_map(call_parent) {
             parent = key;
         }
