@@ -152,35 +152,12 @@ fn display_movement(moved: BigUint, reference: BigUint) -> String {
     format!("{whole}.{fraction}")
 }
 
-fn canonical_price(price: &str) -> String {
-    let (whole, fraction) = price.split_once('.').unwrap_or((price, ""));
-    let digits = format!("{whole}{fraction}");
-    let significant = digits.trim_start_matches('0');
-    let point = significant.len() as i64 - fraction.len() as i64;
-    if significant.is_empty() {
-        return "0".into();
-    }
-    if !significant.bytes().all(|byte| byte.is_ascii_digit()) {
-        return price.into();
-    }
-    // Python Decimal.normalize() rounds to the default 28 significant digits.
-    let rounded;
-    let (significant, point) = if significant.len() > 28 {
-        let (kept, rest) = significant.split_at(28);
-        let mut units = kept.parse::<u128>().expect("28 digits fit in u128");
-        let first = rest.as_bytes()[0];
-        let above_half =
-            first > b'5' || first == b'5' && rest[1..].bytes().any(|digit| digit != b'0');
-        if above_half || first == b'5' && units % 2 == 1 {
-            units += 1;
-        }
-        rounded = units.to_string();
-        let carry = rounded.len() as i64 - 28;
-        (rounded.as_str(), point + carry)
+fn canonical_price(price: &str) -> &str {
+    if price.contains('.') {
+        price.trim_end_matches('0').trim_end_matches('.')
     } else {
-        (significant, point)
-    };
-    plain_decimal(significant.trim_end_matches('0'), point)
+        price
+    }
 }
 
 pub(super) fn plain_decimal(significant: &str, point: i64) -> String {
@@ -258,14 +235,18 @@ mod tests {
             ));
             preview.reference_price = input["referencePrice"].as_str().map(str::to_owned);
             preview.quote = input.get("quote").cloned();
+            preview.estimates = Some(data["estimates"].clone());
+            if kind == "CLOSE_POSITION" {
+                preview.close_owner_verified = Some(true);
+            }
             let account = input["addr"].as_str();
             assert_eq!(
                 digest_bytes(&preview, account),
                 case["canonical"].as_str().unwrap().as_bytes()
             );
             assert_eq!(
-                preview_digest(&preview, account),
-                case["digest"].as_str().unwrap()
+                preview.confirmed_output(account)["previewDigest"],
+                case["digest"]
             );
         }
     }
