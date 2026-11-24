@@ -97,7 +97,7 @@ jobs:
           PROFILE
           fi
           unshare -Urn ip link set lo up
-          uv run pytest -m parity_namespace tests/parity
+          uv run pytest -m parity_namespace tests/parity --ignore=tests/parity/test_trade_shared_state.py
           uv run python tests/parity/parity.py
 
   check:
@@ -268,7 +268,7 @@ jobs:
           SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
           SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
-        run: uv run --locked pytest tests/parity
+        run: uv run --locked pytest tests/parity --ignore=tests/parity/test_trade_shared_state.py
 
       - name: Compare account overview in a loopback network namespace
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -289,3 +289,46 @@ jobs:
           uv run --locked python tests/parity/parity.py --case 'account-overview-*' --case account-bare
           unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
             uv run --locked pytest -m parity_namespace tests/parity/test_overview_dns.py
+
+      - name: Check out the shared-state Python reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 973f3f59f38dd89d0c2e03e674157934a00316ae
+          path: .parity-trade-python
+          persist-credentials: false
+
+      - name: Check out main for shipped Rust trade capabilities
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .parity-main
+          persist-credentials: false
+
+      - name: Replay shared-state trade scenarios
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_MAIN_BIN: ${{ github.workspace }}/target/parity-main/debug/sai
+          SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-trade-python
+        shell: bash
+        run: |
+          uv sync --project "$SAI_PYTHON_REFERENCE" --locked
+          cargo build --locked --bin sai --manifest-path .parity-main/Cargo.toml --target-dir target/parity-main
+          SAI_PARITY_RESERVE_BIN="$(cargo test --locked -p sai-core --test storage --no-run --message-format=json | jq -er '
+            select(.reason == "compiler-artifact" and .target.name == "storage" and .profile.test)
+            | .executable | select(. != null)
+          ')"
+          export SAI_PARITY_RESERVE_BIN
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          uv run --locked python tests/parity/network.py -m parity_namespace tests/parity/test_trade_shared_state.py -rs
