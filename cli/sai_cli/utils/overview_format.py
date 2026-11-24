@@ -24,7 +24,7 @@ def _source(row: dict[str, Any]) -> str:
 def _collateral(row: dict[str, Any]) -> str:
     if row["collateralUsd"] is not None:
         return _value(row["collateralUsd"])
-    return f"{row['collateralBaseUnits']} base units"
+    return f"{row['collateralBaseUnits']} {row['collateralToken']} base units"
 
 
 def _trigger(row: dict[str, Any], prefix: str) -> str:
@@ -59,7 +59,11 @@ def show(result: dict[str, Any]) -> None:
         table(
             ["Funds", "USD", "Source (Age)"],
             [
-                [key.title(), _value(row["usd"]), _source(row)]
+                [
+                    "Unsettled Teller" if key == "unsettled" else key.title(),
+                    _value(row["usd"]),
+                    _source(row),
+                ]
                 for key, row in balances.items()
             ],
         )
@@ -73,8 +77,8 @@ def show(result: dict[str, Any]) -> None:
                 "Size USD",
                 "Collateral USD",
                 "Leverage",
-                "PnL USD",
-                "PnL %",
+                "Gross PnL USD",
+                "Gross PnL %",
             ],
             [
                 [
@@ -99,7 +103,7 @@ def show(result: dict[str, Any]) -> None:
                     "Liquidation USD (%)",
                     "TP USD (%)",
                     "SL USD (%)",
-                    "Source (Age)",
+                    "Trade Source (Age)",
                 ],
                 [
                     [
@@ -115,8 +119,35 @@ def show(result: dict[str, Any]) -> None:
                 ],
                 max_col_width=72,
             )
+            for row in positions["items"]:
+                if risk := row.get("riskSource"):
+                    print(
+                        f"  Trade {row['id']} contract risk {_source(risk)}. Fetched at {risk['fetchedAt']}"
+                    )
+                    if row["liquidationPriceUsd"] is None:
+                        price = _value(row["liquidationPriceQuote"])
+                        print(
+                            f"    Contract liquidation price {price} {row['quoteToken']}"
+                        )
+                if mark := row.get("markSource"):
+                    print(
+                        f"  Trade {row['id']} oracle mark {_source(mark)}. Fetched at {mark['fetchedAt']}"
+                    )
+                    if row["quoteTokenId"] != 0:
+                        print(
+                            f"    Base price {_source(mark['base'])}. Quote price {_source(mark['quote'])}"
+                        )
+                if row["riskStatus"] != "verified":
+                    print(
+                        f"  Trade {row['id']} risk {row['riskStatus']}. {row['riskReason']}"
+                    )
+                    if "keeperLiquidationEstimatePriceQuote" in row:
+                        estimate = _value(row["keeperLiquidationEstimatePriceQuote"])
+                        print(
+                            f"    Keeper liquidation estimate {estimate} {row['quoteToken']}. Source time unknown."
+                        )
             print(
-                f"  Total unrealized PnL {_value(positions['unrealizedPnlUsd'], ' USD')}"
+                f"  Total gross unrealized PnL before fees {_value(positions['unrealizedPnlUsd'], ' USD')}"
             )
 
     orders = section("pendingOrders", "Pending Limit and Stop Orders")

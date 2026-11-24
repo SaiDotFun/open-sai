@@ -70,6 +70,7 @@
         "trades": [
           {
             "id": 0,
+            "trader": "nibi1syntheticoverviewfixture",
             "isLong": true,
             "tradeType": "trade",
             "collateralAmount": 48920868,
@@ -84,6 +85,11 @@
                 "id": 3,
                 "symbol": "BTC"
               },
+              "quoteToken": {
+                "id": 0,
+                "symbol": null,
+                "name": "uusd"
+              },
               "collateralToken": {
                 "id": 1,
                 "symbol": "USDC"
@@ -96,6 +102,7 @@
           },
           {
             "id": 1,
+            "trader": "nibi1syntheticoverviewfixture",
             "isLong": false,
             "tradeType": "trade",
             "collateralAmount": 79660000,
@@ -109,6 +116,11 @@
               "baseToken": {
                 "id": 21,
                 "symbol": "ARB"
+              },
+              "quoteToken": {
+                "id": 0,
+                "symbol": null,
+                "name": "uusd"
               },
               "collateralToken": {
                 "id": 1,

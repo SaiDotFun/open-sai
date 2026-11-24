@@ -28,9 +28,11 @@ OVERVIEW_TRADES = """
 query($trader:String!, $limit:Int!, $offset:Int!) {
   perp {
     trades(where:{trader:$trader,isOpen:true}, order_by:sequence, order_desc:false, limit:$limit, offset:$offset) {
-      id isLong tradeType collateralAmount leverage openPrice tp sl
-      state { liquidationPrice pnlCollateral pnlPct }
-      perpBorrowing { marketId baseToken { id symbol } collateralToken { id symbol } }
+      id trader isLong tradeType collateralAmount leverage openPrice tp sl
+      state { liquidationPrice }
+      perpBorrowing {
+        marketId baseToken { id symbol } quoteToken { id symbol name } collateralToken { id symbol }
+      }
       lastUpdatedBlock { block block_ts }
     }
   }

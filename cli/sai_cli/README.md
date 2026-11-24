@@ -60,13 +60,21 @@ Pass `--as ADDR` to read another EVM account, including one you have never
 connected. The MCP tool `account_overview` takes an optional `addr` and
 returns the same fields as the CLI's JSON output.
 
-- **Sai funds.** The balance and credits fields report separate amounts in
-  USD for funds in Sai. Wallet balances do not enter either amount.
-- **Positions.** Size is collateral in USD multiplied by leverage.
-  Unrealized PnL uses Keeper's PnL before fees. The total is available when
-  every position has a USD PnL value. Distances use the current oracle price
-  as the denominator. A negative distance means the oracle price is on the
-  trigger side of the liquidation, take-profit, or stop-loss level.
+- **Sai funds.** Backed deposits, credits, and unsettled Teller funds that
+  are available to trade are separate USD amounts. An omitted balance is
+  unknown. If Keeper returns no Sai funds rows, the section reports an error.
+- **Positions.** Size is collateral in USD multiplied by leverage. USDC
+  collateral is valued at par. Gross unrealized PnL is before fees and uses
+  the contract's range of -100% to +900% of collateral. The total requires
+  a confirmed list and a USD PnL value for every position.
+- **Risk.** The liquidation threshold includes borrowing fees from the
+  contract. Distances compare the same-block oracle mark and trigger levels
+  in the pair's quote token. A zero or negative distance means the price
+  reached or crossed the trigger. For a non-USD quote, displayed USD prices
+  use the oracle's quote-token conversion. If the contract threshold or
+  matching trade state is unavailable, any Keeper liquidation figure is
+  labeled as an estimate and has no distance. If only the oracle mark is
+  unavailable, the overview can still display the contract threshold.
 - **Orders.** Pending limit and stop orders list their trigger prices.
   Queued market orders come from Keeper's `pending_exec` records. For a
   queued open, the trade ID is reserved. Collateral on a queued order, when
@@ -77,19 +85,19 @@ returns the same fields as the CLI's JSON output.
 - **Session.** The overview shows the expiry of a stored session for the
   selected account and warns in its last three days.
 
-Each section's `fetchedAt` records when the client read it, in UTC.
-Source timestamps and `sourceAgeSeconds` describe the data at fetch time.
-For trade and order rows, these come from the record's block. Position PnL
-and liquidation price come from Keeper's indexed state, which exposes no
-separate timestamp. Oracle quotes have their own source metadata. For a
-balance that exposes only a block height, the CLI asks the configured
-Nibiru LCD for the block time. The block height stays visible if its time is
-unavailable. Local intent age measures time since reservation and session age
-measures time since issuance, when the store carries that information.
+Each section's `fetchedAt` records when the client read it, in UTC. Source
+timestamps and `sourceAgeSeconds` describe the data at fetch time. A
+position's indexed trade record, contract threshold, and oracle mark carry
+separate source times. The estimate from Keeper has an unknown source time.
+The LCD supplies missing block times after its chain matches Keeper's. A
+custom Keeper requires an explicit LCD for that chain. An independently
+overridden WebSocket can report balance block heights with unknown times.
+Local intent age starts at reservation. Session age starts at token issuance
+when the stored token provides that claim.
 
 A failed read produces a section `error` with a code and message. Other
-sections still return their data. A missing quote leaves the fields that
-depend on it unavailable, while the trade's own fields remain visible.
+sections still return their data. The overview flags a paginated list when
+it cannot confirm the list on a second scan.
 
 ## Updates
 
@@ -201,7 +209,9 @@ import`.
 Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
 warning when a session has less than three days left. Interactive commands
 can also print a one-line notice to stderr. JSON output carries the warning
-in the reported session data.
+in the reported session data. Use the Keeper endpoint named in the renewal
+or import hint. If the hint asks you to reuse your settings, keep the original
+Keeper configuration when running the command.
 
 `auth login NAME` picks the key named `NAME`:
 

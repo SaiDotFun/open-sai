@@ -12,7 +12,8 @@ timestamps are historical observations and must not be used as current quotes.
 
 `mainnet_account_overview.json` records public Keeper reads from 2026-11-24.
 The account had Sai USDC and credits, with no open trades or queued market
-orders. Two historical trades record the deployed response shape. Overview
+orders. Two historical trades record the deployed response shape with a
+synthetic trader identifier. Overview
 tests add synthetic states and orders to exercise positions, limit and stop
 orders, and next-oracle orders. The loopback LCD fixture supplies block times.
 

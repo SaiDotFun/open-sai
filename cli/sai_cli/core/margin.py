@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
@@ -13,13 +14,29 @@ import httpx
 from . import intents, keeper
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
+BLOCK_PATH = "/cosmos/base/tendermint/v1beta1/blocks/"
 
 
-def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
+def _get_json(
+    url: str, timeout: float = 20, *, height: int | None = None, fresh: bool = False
+) -> dict[str, Any]:
     keeper.check_url(url, "LCD")
     try:
-        response = httpx.get(url, timeout=timeout)
+        options: dict[str, Any] = {}
+        if height is not None:
+            # A proxy may cache a URL without varying on the request header.
+            options["params"] = {"sai_height": height}
+            options["headers"] = {"x-cosmos-block-height": str(height)}
+        elif fresh:
+            options["params"] = {"sai_at": time.time_ns()}
+        response = httpx.get(url, timeout=timeout, **options)
         response.raise_for_status()
+        if height is not None:
+            served = response.headers.get("grpc-metadata-x-cosmos-block-height")
+            if served is None:
+                served = response.headers.get("x-cosmos-block-height")
+            if served != str(height):
+                raise ValueError("LCD did not serve the requested block height")
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
@@ -28,13 +45,31 @@ def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
         raise ValueError("Unable to read contract state") from exc
 
 
-def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
+def block_header(lcd: str, height: int | str, *, timeout: float = 3) -> dict[str, Any]:
+    data = _get_json(
+        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}", timeout, fresh=height == "latest"
+    )["block"]["header"]
+    if not isinstance(data, dict):
+        raise TypeError("Invalid LCD block header")
+    return data
+
+
+def smart(
+    lcd: str,
+    contract: str,
+    message: dict[str, Any],
+    *,
+    height: int | None = None,
+    timeout: float = 20,
+) -> dict[str, Any]:
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
     data = _get_json(
-        f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
+        f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}",
+        timeout,
+        height=height,
     ).get("data")
     if not isinstance(data, dict):
         raise TypeError("Contract returned invalid state")
