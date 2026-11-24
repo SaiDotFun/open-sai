@@ -872,7 +872,8 @@ def test_trade_confirmation_binds_verified_route(
     asyncio.run(scenario())
 
 
-def test_market_open_rechecks_route_after_price_refresh(position_service):
+@pytest.mark.parametrize("market_open", [True, False])
+def test_market_open_rechecks_route_after_price_refresh(position_service, market_open):
     position, base_url = position_service
     position.preview_inputs = True
     args = {**OPEN_ARGS, "order_type": "market"}
@@ -885,6 +886,7 @@ def test_market_open_rechecks_route_after_price_refresh(position_service):
             digest = preview["previewDigest"]
             reference = preview["referencePrice"]
 
+            position.keeper_market_open = market_open
             position.switch_contract_on_market_read = "nibi1replacement"
             cli_result = cli.invoke(
                 main, [*cli_args, "--preview-digest", digest, "--price", reference]

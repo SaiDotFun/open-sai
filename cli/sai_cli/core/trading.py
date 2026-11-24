@@ -204,6 +204,16 @@ def open_trade(
             endpoint, lcd_endpoint, confirming=True
         )
 
+    def recheck_route() -> None:
+        if lcd_endpoint is None or "positionRoute" not in preview:
+            return
+        fresh_route = _trading_route(endpoint, lcd_endpoint, confirming=True)
+        if fresh_route != preview["positionRoute"]:
+            raise PositionChanged(
+                "The trading route changed during the market price refresh."
+                " Request a new preview before submitting."
+            )
+
     if order_type == "market":
         preview["requiresMarketPriceRefresh"] = True
         if not dry_run:
@@ -223,7 +233,9 @@ def open_trade(
                         "The market open no longer matches the confirmed preview."
                         " Request a new preview before submitting."
                     ) from exc
+                recheck_route()
                 raise
+            recheck_route()
             assert reference is not None
             payload["body"]["intentPrice"] = reference["price"]
         elif mcp_market:
@@ -246,17 +258,6 @@ def open_trade(
                 pass
         preview["estimates"] = estimate(preview)
         return preview
-    if (
-        order_type == "market"
-        and lcd_endpoint is not None
-        and "positionRoute" in preview
-    ):
-        fresh_route = _trading_route(endpoint, lcd_endpoint, confirming=True)
-        if fresh_route != preview["positionRoute"]:
-            raise PositionChanged(
-                "The trading route changed during the market price refresh."
-                " Request a new preview before submitting."
-            )
     _checked(before_submit, preview, estimate)
     result = intents.submit(
         endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
