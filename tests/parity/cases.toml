@@ -870,7 +870,7 @@ args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
 seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market",
     "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
     "is_after_hours_market", "get_market", "get_fees",
 ]
