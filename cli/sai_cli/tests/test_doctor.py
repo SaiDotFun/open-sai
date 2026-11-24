@@ -22,7 +22,7 @@ from urllib.parse import urlsplit
 import pytest
 from click.testing import CliRunner
 from sai_cli import doctor
-from sai_cli.core import keeper, margin, settings, storage, stream, update, updater
+from sai_cli.core import keeper, log, margin, settings, storage, stream, update, updater
 from sai_cli.sai_cli import main
 from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
@@ -955,6 +955,7 @@ class Stub:
         self.queries: list[str] = []
         self.paths: list[str] = []
         self.lcd_paths: list[str] = []
+        self.echo_lcd_target = False
 
 
 @pytest.fixture
@@ -1010,7 +1011,8 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
         def do_GET(self):
             state.lcd_paths.append(self.path)
             assert urlsplit(self.path).path.endswith(margin.NODE_INFO_PATH)
-            info = {} if state.network is None else {"network": state.network}
+            network = self.path if state.echo_lcd_target else state.network
+            info = {} if network is None else {"network": network}
             self.reply({"default_node_info": info})
 
         def log_message(self, format, *args):
@@ -1102,12 +1104,48 @@ def test_network_checks_pass_against_stubs(http_stub):
     ]
 
 
-def test_lcd_without_a_network_fails(http_stub):
+@pytest.mark.parametrize("network", [None, "a" * 51, "cataclysm-1\n"])
+def test_lcd_with_an_invalid_network_fails(http_stub, network):
     base, state = http_stub
-    state.network = None
+    state.network = network
     check = one(doctor.check_lcd, ctx(lcd_endpoint=base))
     assert check.status == "fail"
-    assert "network" in check.summary
+    assert "invalid chain ID" in check.summary
+    assert check.details == {"endpoint": base}
+
+
+def test_doctor_does_not_echo_an_lcd_request_target(http_stub, isolated_home):
+    base, state = http_stub
+    state.echo_lcd_target = True
+    path_key, query_key = "fixture-private-lcd-path", "fixture-private-lcd-query"
+    target = f"/{path_key}{margin.NODE_INFO_PATH}?key={query_key}"
+    ws, stop = ws_stub(ack=True)
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                base + "/query",
+                "doctor",
+                "--ws-endpoint",
+                ws,
+                "--lcd-endpoint",
+                f"{base}/{path_key}?key={query_key}",
+            )
+            assert code == 1
+            assert "invalid chain ID" in output
+            assert path_key not in output and query_key not in output
+            if flags:
+                checks = json.loads(output)["error"]["details"]["checks"]
+                lcd = next(check for check in checks if check["id"] == "lcd")
+                assert lcd["details"] == {"endpoint": base}
+    finally:
+        stop()
+    assert state.lcd_paths == [target, target]
+    assert log.flush(5)
+    logs = "".join(path.read_text() for path in (isolated_home / "logs").glob("*.jsonl"))
+    assert '"event":"doctor.result"' in logs
+    assert path_key not in logs and query_key not in logs
 
 
 @pytest.fixture

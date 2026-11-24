@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -62,6 +63,7 @@ STATUSES = ("pass", "fixed", "warn", "fail", "skipped")
 SIGN_IN = "sai auth login NAME, or sai auth import"
 REINSTALL = update.INSTALL_COMMAND
 FILE_MODE = 0o600
+CHAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,49}")
 
 
 @dataclass
@@ -1217,11 +1219,11 @@ def check_lcd(ctx: Context) -> Check:
         )
     info_block = node.get("default_node_info")
     network = info_block.get("network") if isinstance(info_block, dict) else None
-    if not isinstance(network, str) or not network:
+    if not isinstance(network, str) or CHAIN_ID.fullmatch(network) is None:
         return Check(
             "lcd",
             "fail",
-            f"{url} answered without a chain network in node_info",
+            f"{url} returned a missing or invalid chain ID in node_info network",
             "Check --lcd-endpoint points at a Nibiru REST (LCD) service",
             {"endpoint": url},
         )
