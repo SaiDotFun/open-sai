@@ -22,6 +22,7 @@ PAGE_SIZE = 100
 MAX_PAGES = 20
 LCD_BUDGET_SECONDS = 8.0
 LCD_REQUEST_SECONDS = 2.0
+MEMBERSHIP_MAX_AGE_SECONDS = 60
 _LCD_WORKERS = BoundedSemaphore(8)
 BALANCE_KEYS = {
     "USDC on Sai": "balance",
@@ -754,6 +755,32 @@ def _fill_awaits_indexing(endpoint: str, addr: str) -> bool:
         return False
 
 
+def _membership_check(
+    chain: ChainRead | None, addr: str, indexed_ids: set[int]
+) -> dict[str, Any]:
+    live_ids = _live_trade_ids(chain, addr)
+    if chain is None or live_ids is None:
+        return {
+            "status": "unavailable",
+            "fetchedAt": None,
+            "sourceBlock": None,
+            "sourceAt": None,
+            "sourceAgeSeconds": None,
+        }
+    fetched = datetime.now(UTC)
+    age = (fetched - chain.time).total_seconds()
+    if not 0 <= age <= MEMBERSHIP_MAX_AGE_SECONDS:
+        status = "stale"
+    else:
+        status = "verified" if live_ids == indexed_ids else "mismatch"
+    return {
+        "status": status,
+        "fetchedAt": fetched.isoformat(),
+        "sourceBlock": chain.height,
+        **_age(chain.time, fetched.isoformat()),
+    }
+
+
 def _trade_sections(
     settings: Settings,
     addr: str,
@@ -772,8 +799,8 @@ def _trade_sections(
     )
     quotes = prices.get("data", {})
     chain = get_chain()
-    live_ids = _live_trade_ids(chain, addr)
     indexed_ids = {trade["id"] for trade in trades if trade["tradeType"] == "trade"}
+    membership = _membership_check(chain, addr, indexed_ids)
     contract_reads = ContractReads(chain) if chain is not None else None
 
     def read_risk(trade: dict[str, Any]) -> dict[str, Any]:
@@ -791,6 +818,7 @@ def _trade_sections(
         ]
 
     positions, orders = _read(lambda: rows(True)), _read(lambda: rows(False))
+    positions["membership"] = membership
     complete = snapshot["data"].complete
     for section in (positions, orders):
         if "data" in section:
@@ -799,13 +827,14 @@ def _trade_sections(
                 _mark_incomplete(section)
     items = positions.get("data", [])
     if "data" in positions:
-        membership_complete = live_ids == indexed_ids and not unindexed_fill
+        membership_complete = membership["status"] == "verified" and not unindexed_fill
         if complete and not membership_complete:
-            message = (
-                "Keeper reports a fill awaiting indexing. Positions may be incomplete."
-                if unindexed_fill
-                else "The indexed positions could not be confirmed against the live contract list."
-            )
+            if unindexed_fill:
+                message = "Keeper reports a fill awaiting indexing. Positions may be incomplete."
+            elif membership["status"] == "stale":
+                message = "The live position check used a stale LCD block. Positions may be incomplete."
+            else:
+                message = "The indexed positions could not be confirmed against the live contract list."
             positions["error"] = _failure(Code.INCOMPLETE_DATA, message)
         elif (
             "error" not in positions

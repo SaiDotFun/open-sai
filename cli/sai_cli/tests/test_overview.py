@@ -28,8 +28,6 @@ OTHER = "0x" + "b" * 40
 BLOCK_TIME = "2026-05-21T12:05:00+00:00"
 RISK_BLOCK = 50_407_230
 MARK_BLOCK = RISK_BLOCK - 37
-RISK_TIME = "2026-11-23T12:00:00+00:00"
-MARK_TIME = "2026-11-23T11:59:43+00:00"
 CHAIN_ID = "fixture-1"
 
 
@@ -37,7 +35,10 @@ CHAIN_ID = "fixture-1"
 def replay():
     recorded = json.loads((FIXTURES / "mainnet_account_overview.json").read_text())
     quotes = json.loads((FIXTURES / "mainnet_prices_http.json").read_text())
+    risk_time = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=3)
     state: dict[str, Any] = {
+        "riskTime": risk_time.isoformat(),
+        "markTime": (risk_time - timedelta(seconds=17)).isoformat(),
         "recorded": recorded,
         "ws": recorded["balances"],
         "http": {
@@ -135,7 +136,9 @@ def replay():
                                 "height": str(RISK_BLOCK)
                                 if height == "latest"
                                 else height,
-                                "time": RISK_TIME if height == "latest" else BLOCK_TIME,
+                                "time": state["riskTime"]
+                                if height == "latest"
+                                else BLOCK_TIME,
                                 "chain_id": state.get("lcdChain", CHAIN_ID),
                             }
                         }
@@ -255,6 +258,11 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
         "unrealizedPnlUsd": 0,
         "unrealizedPnlBasis": "grossBeforeFees",
     }
+    membership = decoded["positions"]["membership"]
+    assert membership["status"] == "verified"
+    assert membership["sourceBlock"] == RISK_BLOCK
+    assert membership["sourceAt"] == replay["riskTime"]
+    assert 0 <= membership["sourceAgeSeconds"] <= overview.MEMBERSHIP_MAX_AGE_SECONDS
     assert decoded["queuedMarketOrders"]["data"] == []
     session = decoded["session"]["data"]
     assert "expires in" in session["expiryWarning"]
@@ -270,7 +278,7 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
 
 
 def install_oracle_quote(replay, base, quote, *, mark, quote_usd=1):
-    mark_at = int(datetime.fromisoformat(MARK_TIME).timestamp())
+    mark_at = int(datetime.fromisoformat(replay["markTime"]).timestamp())
     replay["oracleRates"][base, quote] = {
         "rate": {
             "base_per_quote": str(mark),
@@ -403,8 +411,8 @@ def test_open_positions_limits_stops_and_next_oracle_orders(replay):
         assert row["sourceAt"] is not None
         assert row["riskStatus"] == "verified"
         assert row["riskSource"]["sourceBlock"] == RISK_BLOCK
-        assert row["riskSource"]["sourceAt"] == RISK_TIME
-        assert row["markSource"]["sourceAt"] == MARK_TIME
+        assert row["riskSource"]["sourceAt"] == replay["riskTime"]
+        assert row["markSource"]["sourceAt"] == replay["markTime"]
         assert row["markSource"]["sourceBlock"] == MARK_BLOCK
         assert row["markSource"]["queryBlock"] == RISK_BLOCK
         assert row["sourceAt"] != row["riskSource"]["sourceAt"]
@@ -525,7 +533,7 @@ def test_unverified_risk_has_only_a_labeled_estimate(replay, failure, status):
     assert human.exit_code == 0, human.output
     if status == "partial":
         assert position["liquidationPriceUsd"] == 50
-        assert position["riskSource"]["sourceAt"] == RISK_TIME
+        assert position["riskSource"]["sourceAt"] == replay["riskTime"]
         assert "keeperLiquidationEstimatePriceQuote" not in position
     else:
         assert position["liquidationPriceUsd"] is None
@@ -549,7 +557,7 @@ def test_non_usd_market_compares_pair_units_and_shows_both_oracle_ages(replay):
     assert position["takeProfitDistancePercent"] == 10
     assert position["stopLossPriceUsd"] == 94
     assert position["stopLossDistancePercent"] == 6
-    assert position["markSource"]["base"]["sourceAt"] == MARK_TIME
+    assert position["markSource"]["base"]["sourceAt"] == replay["markTime"]
     assert (
         position["markSource"]["quote"]["sourceAgeSeconds"]
         > position["markSource"]["base"]["sourceAgeSeconds"]
@@ -713,7 +721,7 @@ def test_oracle_expiration_uses_the_contract_boundary(replay, expiration, verifi
     row = mcp(replay, addr=ADDR)["positions"]["data"]["items"][0]
     assert row["markSource"]["sourceBlock"] == MARK_BLOCK
     assert row["markSource"]["queryBlock"] == RISK_BLOCK
-    assert row["markSource"]["sourceAt"] == MARK_TIME
+    assert row["markSource"]["sourceAt"] == replay["markTime"]
     if verified:
         assert row["riskStatus"] == "verified"
         assert row["liquidationDistancePercent"] == 50
@@ -811,6 +819,33 @@ def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
     assert snapshot["data"]["items"] == []
     assert snapshot["data"]["unrealizedPnlUsd"] is None
     assert snapshot["error"]["code"] == "INCOMPLETE_DATA"
+
+
+@pytest.mark.parametrize("has_positions", [False, True])
+def test_stale_live_membership_keeps_block_provenance_but_withholds_total(
+    replay, has_positions
+):
+    old = datetime.now(UTC).replace(microsecond=0) - timedelta(minutes=5)
+    replay["riskTime"] = old.isoformat()
+    replay["markTime"] = (old - timedelta(seconds=17)).isoformat()
+    if has_positions:
+        populate_trades(replay)
+    snapshot = mcp(replay, addr=ADDR)["positions"]
+    membership = snapshot["membership"]
+    assert membership["status"] == "stale"
+    assert membership["sourceBlock"] == RISK_BLOCK
+    assert membership["sourceAt"] == old.isoformat()
+    assert membership["sourceAgeSeconds"] > overview.MEMBERSHIP_MAX_AGE_SECONDS
+    assert snapshot["data"]["unrealizedPnlUsd"] is None
+    assert "stale LCD block" in snapshot["error"]["message"]
+    if has_positions:
+        assert snapshot["data"]["items"][0]["unrealizedPnlUsd"] == 12
+    else:
+        assert snapshot["data"]["items"] == []
+        result = cli(replay, "account", "overview", "--as", ADDR)
+        assert result.exit_code == 0, result.output
+        assert f"Live position membership stale. Block {RISK_BLOCK}" in result.stdout
+        assert old.isoformat() in result.stdout
 
 
 def test_slow_lcd_stops_enrichment_and_keeps_completed_sections(replay):

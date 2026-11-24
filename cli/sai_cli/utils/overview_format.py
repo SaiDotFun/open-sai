@@ -50,6 +50,14 @@ def show(result: dict[str, Any]) -> None:
             print(f"  Source {source['endpoint']}")
         if warning := snapshot.get("warning"):
             print(f"  {warning}")
+        if membership := snapshot.get("membership"):
+            if membership["sourceBlock"] is None:
+                print("  Live position membership unavailable")
+            else:
+                print(
+                    f"  Live position membership {membership['status']}. "
+                    f"Block {membership['sourceBlock']}, {_source(membership)}"
+                )
         if error := snapshot.get("error"):
             print(f"  {error['message']} ({error['code']})")
         return snapshot.get("data")

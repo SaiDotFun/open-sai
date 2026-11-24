@@ -68,7 +68,9 @@ returns the same fields as the CLI's JSON output.
   the contract's range of -100% to +900% of collateral. Legacy stNIBI PnL
   uses the collateral price at the same pinned block. The total requires
   agreement with the contract's live positions, a USD PnL value for every
-  position, and no fill that Keeper reports as awaiting indexing.
+  position, and no fill that Keeper reports as awaiting indexing. The
+  positions section shows the membership check's block and age. The total
+  is unavailable when that block is more than 60 seconds old at the check.
 - **Risk.** The liquidation threshold includes borrowing fees from the
   contract. Distances compare the same-block oracle mark and trigger levels
   in the pair's quote token. A zero or negative distance means the price
