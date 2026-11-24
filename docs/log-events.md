@@ -63,6 +63,7 @@ The wait entries reserve fields for the intent wait implementation.
 | `session.removed` | `core.storage.delete_session` | `info`, `warn` | None | `addr` (string), `connectedAccounts` (integer), `code` (string), `reason` (string) |
 | `session.saved` | `core.storage.save_session` | `info` | `addr` (string), `expiresAt` (string), `connectedAccounts` (integer) | `endpoint` (string) |
 | `update.check` | `sai_cli.check_update` | `info`, `warn` | `ok` (boolean) | `installed` (string), `latest` (string), `updateAvailable` (boolean), `installKind` (string), `code` (string), `error` (string) |
+| `update.mcp_repair` | `core.updater.repair_after_update` | `info`, `warn` | `background` (boolean), `clients` (object[]), `notes` (string[]) | None |
 | `update.result` | `sai_cli.log_update` | `info`, `warn` | `status` (string), `rolledBack` (boolean), `background` (boolean) | `installed` (string), `target` (string), `message` (string), `code` (string) |
 | `update.scheduled` | `core.updater.tick` | `info` | None | None |
 | `watch.disconnected` | `sai_cli.watch_stream` | `warn` | `code` (string), `errorType` (string), `endpoint` (string) | None |

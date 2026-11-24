@@ -129,11 +129,17 @@ sai mcp uninstall codex
 
 `install` registers the `sai` on your `PATH`, normally `~/.local/bin/sai`,
 which keeps its path across updates. It refuses a `sai` run through `uvx`,
-because uv cleans that copy out of its cache. Claude Code and Codex change
-through their own `mcp add` and `mcp remove` commands; for Cursor, `install`
-edits `~/.cursor/mcp.json` and keeps your other servers. Cursor may ask you to
-enable `sai` in its MCP settings. Claude Code registers for your user by
-default; `--scope project` writes the project's `.mcp.json` instead.
+because uv cleans that copy out of its cache. Ordinary Claude Code installs
+use its MCP commands. Codex and Cursor installs edit the Sai entry in their
+config files. Cursor may ask you to enable Sai in its MCP settings. Claude
+Code installs use user scope by default. To register in the project's
+`.mcp.json`, pass `--scope project`.
+
+`sai doctor` and successful updates can repair stale Codex and Cursor
+launchers. For Claude Code, they report stale entries and leave them for you
+to repair. Run the command they print, such as
+`sai mcp install --client claude --scope user --repair-existing sai`.
+It edits the existing registration under its current name and scope.
 
 Running `install` again reports `unchanged`. An older entry is `replaced`,
 and so is one that sets other environment variables or that Codex has

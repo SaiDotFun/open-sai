@@ -85,9 +85,12 @@ before changing anything, when uv's current tool or executable directory is
 not where this `sai` is installed, or when the `sai` on your `PATH` now
 belongs to another install.
 
-The update does not move `~/.local/bin/sai` or change anything else under
-`$SAI_HOME`, so MCP registrations keep working. A running `sai mcp serve`
-keeps the old code until its client restarts; `mcp_info` reports
+The update keeps the path to `~/.local/bin/sai` stable. After verifying the
+install, it checks MCP registrations and can repair stale Codex and Cursor
+launchers. For stale Claude Code registrations, it prints an explicit repair
+command. Background updates include that command in the next update notice
+for any stale user registration they find. A running `sai mcp serve` keeps
+the old code until its client restarts. The `mcp_info` tool reports
 `restartNeeded`.
 
 With `update.auto` on, which is the default, sai also updates by itself. A
@@ -308,9 +311,9 @@ marks it `absent` and trading resumes. A connection that fails before the
 request is sent marks the intent `not_sent`, which does not block. Keeper
 admission does not establish execution or finality.
 
-`sai doctor` checks the install, the version, `$SAI_HOME/trader`,
-`$SAI_HOME/logs`, the session, the intent ledger, and the Keeper HTTP,
-WebSocket, and LCD endpoints, and fixes what it safely can. It creates
+`sai doctor` checks the install, the version, config, MCP registrations,
+`$SAI_HOME/trader`, `$SAI_HOME/logs`, the session, the intent ledger, and
+the Keeper HTTP, WebSocket, and LCD endpoints. It creates
 `$SAI_HOME/trader`, removes group and other access from it and the files sai
 keeps there (the connected accounts, the ledger and its journals, and the
 shell history) and from the logs directory and its log files, migrates the
@@ -320,6 +323,14 @@ unknown and pending intents for the signed-in account the way `sai intent status
 rewrites the session, never writes through a symlink in `$SAI_HOME/trader`,
 and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
+
+Doctor can repair stale Codex and Cursor launchers. It prints a repair command
+for each stale Claude Code launcher, such as
+`sai mcp install --client claude --scope user --repair-existing sai`.
+Use the name and scope in the command doctor prints. Run project and local
+repairs from the directory doctor checked. The command preserves the
+registration's environment and compatible server arguments. If the command
+includes `--reset-args`, it uses default server arguments.
 
 Each check prints pass, fixed, warn, fail, or skipped, with what changed or
 the command that fixes it. `sai --json doctor` prints a structured report on
