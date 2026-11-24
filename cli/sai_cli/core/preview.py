@@ -658,6 +658,16 @@ def _leverage_estimates(
             "The observed oracle price has reached the prospective liquidation threshold.",
         )
 
+    liq["assumption"] = (
+        "The target leverage takes effect if Perp's borrowing-inclusive "
+        "liquidation check passes."
+    )
+    result = _position_change_estimates(liq)
+    if queued:
+        result["execution"] = unavailable(
+            "Queued leverage changes settle on a fresh oracle update."
+        )
+
     required = collateral - before
     if required > 0:
         funds = margin.exchange_balance(
@@ -669,19 +679,11 @@ def _leverage_estimates(
         )
         available = int(funds["available_to_trade"])
         if available < required:
-            return rejected(
-                "InsufficientDepositBalance",
+            funding = (
                 f"Perp requires {Decimal(required).scaleb(-6):f} USDC of additional margin. "
-                f"The observed available balance is {Decimal(available).scaleb(-6):f} USDC.",
+                f"The observed available balance is {Decimal(available).scaleb(-6):f} USDC."
             )
-
-    liq["assumption"] = (
-        "The target leverage takes effect if Perp's borrowing-inclusive "
-        "liquidation check passes."
-    )
-    result = _position_change_estimates(liq)
-    if queued:
-        result["execution"] = unavailable(
-            "Queued leverage changes settle on a fresh oracle update."
-        )
+            if not queued:
+                return rejected("InsufficientDepositBalance", funding)
+            result["execution"]["warning"] = f"{funding} Perp checks funding at fill."
     return result

@@ -1819,3 +1819,39 @@ def test_leverage_submit_rechecks_balance_after_confirmation(
             assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("leverage", {"leverage": "5"}),
+        ("margin", {"direction": "add", "amount": "100"}),
+    ],
+)
+def test_queued_leverage_warns_about_funding_at_fill(position_service, tool, args):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.available_balance = 99_000_000
+    position.fill_at_next_oracle_price = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            request = {"trade_id": 7, **args}
+            quote = await call(client, f"preview_{tool}", request)
+            execution = quote["estimates"]["execution"]
+            assert execution["status"] == "unavailable"
+            assert "100.000000 USDC" in execution["warning"]
+            assert "99.000000 USDC" in execution["warning"]
+            assert "Perp checks funding at fill" in execution["warning"]
+            result = await call(
+                client,
+                f"trade_{tool}",
+                {**request, "preview_digest": quote["previewDigest"]},
+            )
+            assert result["status"] == "accepted"
+            assert len(position.submitted) == 1
+            assert position.submitted[0]["body"] == quote["intent"]["body"]
+
+    asyncio.run(scenario())
