@@ -22,6 +22,7 @@ from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from typing import Any, Literal
 
+from anyio import BrokenResourceError
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import ConfigDict
@@ -29,10 +30,12 @@ from pydantic import ConfigDict
 from ..core import log as sai_log
 from ..core import settings as sai_settings
 from ..core import wait
+from ..core.errors import Code, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
 
 log = logging.getLogger("sai_cli.mcp_server")
+BAD_SETTINGS = "BAD_SETTINGS"  # Legacy MCP result code.
 
 INSTRUCTIONS = """\
 Sai perpetuals trading on Nibiru through Sai Keeper.
@@ -118,7 +121,7 @@ async def call(action: Callable[..., Any], /, *args: Any, **kwargs: Any) -> str:
     try:
         config = server_settings()
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     return await asyncio.to_thread(tools.run, partial(action, config, *args, **kwargs))
 
 
@@ -718,11 +721,13 @@ class SaiMCP(FastMCP):
                 # first line is kept, as untrusted text, and nothing for an
                 # unknown tool, whose message is the name the client sent.
                 first = str(exc).partition("\n")[0] if known is not None else None
+                cause = exc.__cause__
+                failure = describe(cause if isinstance(cause, Exception) else exc)
                 sai_log.event(
                     "mcp.tool_result",
                     "error",
                     ok=False,
-                    code="TOOL_ERROR",
+                    code=Code.INVALID_REQUEST if known is None else failure.code,
                     errorType=type(exc).__name__,
                     error=sai_log.untrusted(first),
                     durationMs=round((time.monotonic() - started) * 1000),
@@ -834,6 +839,11 @@ def result_summary(text: str | None) -> dict[str, Any]:
             summary[name] = value[name]
     if isinstance(summary.get("error"), str):
         summary["error"] = sai_log.untrusted(summary["error"])
+    if not summary["ok"]:
+        if summary.get("code") == BAD_SETTINGS:
+            summary["code"] = Code.INVALID_REQUEST
+        elif not summary.get("code"):
+            summary["code"] = Code.INTERNAL_ERROR
     account = value.get("account", value.get("addr"))
     if isinstance(account, str):
         summary["account"] = sai_log.Arg(account)
@@ -846,7 +856,7 @@ def session_refusal(addr: str | None = None) -> str | None:
     try:
         tools.require_session(server_settings(), addr)
     except sai_settings.SettingsError as exc:
-        return json.dumps(tools.error(str(exc), "BAD_SETTINGS"))
+        return json.dumps(tools.error(str(exc), BAD_SETTINGS))
     except tools.SessionUnavailable as exc:
         return json.dumps(tools.describe(exc))
     return None
@@ -941,7 +951,7 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
     try:
         settings = sai_settings.load(flags, warn=log.warning)
     except sai_settings.SettingsError as exc:
-        raise SystemExit(f"sai mcp serve: {exc}") from None
+        raise SaiError(f"sai mcp serve: {exc}", Code.INVALID_REQUEST) from exc
     with sai_log.bind(surface="mcp"):
         sai_log.event(
             "mcp.server_start",
@@ -949,4 +959,10 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             websocket=sai_log.endpoint(settings.ws_endpoint),
             lcd=sai_log.endpoint(settings.lcd_endpoint),
         )
-        create_server(settings).run()
+        server = create_server(settings)
+        try:
+            server.run()
+        except* (KeyboardInterrupt, BrokenPipeError, BrokenResourceError):
+            pass
+        except* Exception as exc:
+            raise McpStdioError("Sai MCP stdio session failed") from exc

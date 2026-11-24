@@ -146,7 +146,7 @@ def test_commands_use_the_configured_endpoint():
     """A Keeper endpoint set in the file is the one queries go to."""
     sai("config", "set", "keeper.endpoint", DEAD)
     result = sai("market", "prices")
-    assert result.exit_code == 1
+    assert result.exit_code == 4
     assert "Could not connect to Keeper" in result.stderr
 
 
@@ -225,7 +225,9 @@ def test_per_command_flags_win(tmp_path):
     # Plain ws:// off loopback is refused before any connection, which shows
     # the command used its own flag rather than the derived ws://127.0.0.1.
     assert result.exit_code == 1
-    assert "WebSocket endpoint must use WSS" in result.stderr
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "STREAM_ERROR"
+    assert "WebSocket endpoint must use WSS" in error["message"]
 
 
 def test_repl_forwards_only_flags_the_person_passed():

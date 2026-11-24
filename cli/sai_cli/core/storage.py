@@ -8,6 +8,8 @@ import contextlib
 import hashlib
 import json
 import os
+import re
+import shlex
 import sqlite3
 import sys
 import tempfile
@@ -23,6 +25,17 @@ from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import log
+from .errors import Code, SaiError, SessionError
+
+PLAIN_KEEPER_URL = re.compile(
+    r"https?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query"
+)
+
+
+class UnresolvedIntent(SaiError, ValueError):
+    """The intent ledger already blocks a submission for this account."""
+
+    code = Code.INVALID_REQUEST
 
 
 def home() -> Path:
@@ -236,14 +249,19 @@ def load_session(addr: str | None = None) -> dict[str, str]:
     """Return the session for ADDR, or the active account's session."""
     accounts = load_accounts()
     if addr is not None:
-        return accounts["sessions"][_find(accounts, addr)]
+        try:
+            key = _find(accounts, addr)
+        except ValueError as exc:
+            raise SessionError(str(exc), Code.SIGNED_OUT) from exc
+        return accounts["sessions"][key]
     if accounts["active"] is None:
         if accounts["sessions"]:
-            raise ValueError(
+            raise SessionError(
                 "No active Sai account; run `sai auth use ADDR` with an"
-                " addr from `sai auth list`"
+                " addr from `sai auth list`",
+                hint="sai auth list",
             )
-        raise ValueError(NO_SESSION)
+        raise SessionError(NO_SESSION, Code.SIGNED_OUT)
     return accounts["sessions"][accounts["active"]]
 
 
@@ -280,7 +298,12 @@ def delete_session(addr: str | None = None) -> str | None:
             if addr is not None:
                 raise
             _remove_files()
-            log.event("session.removed", "warn", reason="unreadable session file")
+            log.event(
+                "session.removed",
+                "warn",
+                code=Code.SESSION_UNAVAILABLE,
+                reason="unreadable session file",
+            )
             return UNREADABLE_REMOVED
         if addr is None:
             key = accounts["active"]
@@ -363,12 +386,40 @@ def db() -> sqlite3.Connection:
     return connection
 
 
-class PendingOpen(ValueError):
-    def __init__(self, keys: list[str], pending_fill: bool) -> None:
+def keeper_command_hint(endpoint: str, *args: str) -> str:
+    """Pin the selected Keeper in a recovery command.
+
+    Only the standard /query path is safe to echo. Custom gateway paths
+    can carry credentials.
+    """
+    if PLAIN_KEEPER_URL.fullmatch(endpoint) and log.redact(endpoint) == endpoint:
+        flag = shlex.quote(endpoint)
+    else:
+        flag = (
+            '"${SAI_RECONCILE_ENDPOINT:?'
+            'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
+        )
+    return f"sai --endpoint {flag} {shlex.join(args)}"
+
+
+def intent_status_hint(endpoint: str, account: str, key: str) -> str:
+    return keeper_command_hint(endpoint, "intent", "status", account, "--key", key)
+
+
+class PendingOpen(UnresolvedIntent):
+    code = Code.RECENT_OPEN_PENDING
+
+    def __init__(
+        self, keys: list[str], pending_fill: bool, endpoint: str, account: str
+    ) -> None:
         self.keys = keys
         self.pending_fill = pending_fill
         super().__init__(
-            f"Reconcile uncertain intent {keys[0]} with sai intent wait before opening another trade"
+            f"Reconcile uncertain intent {keys[0]} with sai intent wait before opening another trade",
+            intent_key=keys[0],
+            hint=keeper_command_hint(
+                endpoint, "intent", "wait", keys[0], "--addr", account
+            ),
         )
 
 
@@ -389,6 +440,8 @@ def _check_open(
         raise PendingOpen(
             [key for key, _ in opens],
             any(status == "pending" for _, status in opens),
+            endpoint,
+            account,
         )
 
 
@@ -419,8 +472,11 @@ def pending(
             (endpoint, account.lower(), entity),
         ).fetchone()
         if unresolved:
-            raise ValueError(
-                f"Reconcile uncertain intent {unresolved[0]} before submitting another trade"
+            blocked_key = unresolved[0]
+            raise UnresolvedIntent(
+                f"Reconcile uncertain intent {blocked_key} before submitting another trade",
+                intent_key=blocked_key,
+                hint=intent_status_hint(endpoint, account, blocked_key),
             )
         connection.execute(
             "INSERT INTO intents (id, endpoint, account, kind, status, entity, created_at) VALUES (?, ?, ?, ?, 'unknown', ?, ?)",
@@ -506,6 +562,7 @@ def set_status(
 def _log_status(
     key: str, endpoint: str, account: str, kind: str, previous: str, status: str
 ) -> None:
+    code = {"rejected": Code.ADMISSION_REJECTED, "not_sent": Code.NOT_SENT}.get(status)
     log.event(
         "intent.status",
         intentKey=key,
@@ -514,6 +571,7 @@ def _log_status(
         status=status,
         addr=account,
         endpoint=log.endpoint(endpoint),
+        **({"code": code} if code is not None else {}),
     )
 
 

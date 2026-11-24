@@ -110,6 +110,28 @@ error after submission leaves the outcome unknown.
 - `sai doctor` settles unknown intents it can resolve by reading Keeper. It
   never places or cancels a trade.
 
+## CLI Errors and Exit Codes
+
+Use `sai --json COMMAND`. Failures write a JSON object with an `error`
+containing `code`, `message`, and `retryable`. Check for `hint` and
+`intentKey` as well. If a stream has already emitted rows, its final line
+contains the error. In text mode, read stderr.
+
+| Exit | Meaning | What to Do |
+| --- | --- | --- |
+| 0 | Success | Read the result. For trades, follow the intent to its final outcome. |
+| 1 | Other failure | Read the code and message. |
+| 2 | Command usage error | Check the command's `--help`. |
+| 3 | Unsupported install or environment | Follow the installation or terminal instructions in the error. |
+| 4 | Request rejected or never sent | Review the error. A revised trade needs a fresh preview and confirmation. |
+| 5 | Outcome unknown | Keep `intentKey` and run `sai --json intent status ADDR --key KEY` against the original Keeper endpoint. Do not resubmit. |
+| 6 | Signed out or session expired | Ask the person to sign in in their terminal. |
+
+`retryable: true` means the request executed nothing. It does not carry
+approval over to a revised trade. For MCP errors, read the top-level `code`
+and follow the same recovery rules for `NOT_SENT`, `ADMISSION_REJECTED`,
+`OUTCOME_UNKNOWN`, `SIGNED_OUT`, and `SESSION_EXPIRED`.
+
 ## Digest Confirmation in MCP
 
 Each preview returns `previewDigest`. A `trade_*` call must send it back as

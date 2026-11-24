@@ -9,12 +9,12 @@ import os
 import shlex
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
 from importlib import metadata
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any
 
 import click
 
@@ -23,7 +23,6 @@ from .core import (
     clipboard,
     keeper,
     log,
-    margin,
     reconcile,
     storage,
     stream,
@@ -34,6 +33,7 @@ from .core import (
 )
 from .core import session as sessions
 from .core import settings as sai_settings
+from .core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
@@ -69,10 +69,7 @@ def settings(ctx: click.Context) -> sai_settings.Settings:
     then mainnet defaults."""
     obj = ctx.find_root().obj
     if obj.get("settings") is None:
-        try:
-            obj["settings"] = sai_settings.load(obj["flags"], warn=warn)
-        except sai_settings.SettingsError as exc:
-            raise click.ClickException(str(exc)) from exc
+        obj["settings"] = sai_settings.load(obj["flags"], warn=warn)
     return obj["settings"]
 
 
@@ -119,6 +116,64 @@ def command_path(group: click.Group, args: list[str]) -> list[str]:
 INFO_FLAGS = ("--help", "--version", "--skill")
 
 
+def json_requested(argv: Sequence[str]) -> bool:
+    """Find the root --json flag even if Click fails before invoking main."""
+    valued = {option for option, _ in GLOBAL_FLAGS} | {"--as"}
+    args = iter(argv)
+    for arg in args:
+        if arg == "--" or not arg.startswith("-"):
+            break
+        if arg == "--json":
+            return True
+        if arg in valued:
+            next(args, None)
+    return False
+
+
+def cli_failure(exc: Exception) -> SaiError:
+    if isinstance(exc, click.ClickException):
+        return SaiError(
+            exc.format_message(),
+            Code.INVALID_REQUEST,
+            exit_code=(
+                ExitCode.USAGE if isinstance(exc, click.UsageError) else ExitCode.ERROR
+            ),
+        )
+    if isinstance(exc, click.Abort):
+        return SaiError("Aborted", Code.INVALID_REQUEST)
+    if isinstance(exc, mcp_install.InstallError):
+        return SaiError(
+            str(exc), exit_code=ExitCode.UNSUPPORTED, hint="sai mcp install --help"
+        )
+    return describe(exc)
+
+
+def redact_error(value: Any) -> Any:
+    """Redact stored tokens in an error without changing its JSON structure."""
+    if isinstance(value, dict):
+        return {log.redact(key): redact_error(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_error(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return log.redact(str(value))
+
+
+def show_failure(exc: Exception, failure: SaiError, json_output: bool) -> None:
+    if json_output and not isinstance(failure, McpStdioError):
+        error = failure.as_dict()
+        for key in ("message", "hint", "details"):
+            if key in error:
+                error[key] = redact_error(error[key])
+        click.echo(json.dumps({"error": error}, separators=(",", ":")))
+    elif isinstance(exc, click.UsageError):
+        click.UsageError(log.redact(failure.message), exc.ctx).show()
+    elif isinstance(exc, click.Abort):
+        click.echo("Aborted!", err=True)
+    else:
+        click.ClickException(log.redact(failure.message)).show()
+
+
 def unlogged(names: list[str], argv: list[str]) -> bool:
     """True for runs that write no log lines: reading the log, which should
     not add to it; `sai doctor --no-fix`, which promises to change nothing
@@ -132,76 +187,92 @@ def unlogged(names: list[str], argv: list[str]) -> bool:
     )
 
 
-class LoggedGroup(click.Group):
+class HelpOnMissingInput(click.Command):
+    """Show full help when Click requires input and the command received none."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        bare = not args
+        try:
+            return super().parse_args(ctx, args)
+        except click.MissingParameter:
+            if not bare or ctx.find_root().params.get("json_output"):
+                raise
+            click.echo(ctx.get_help(), err=True, color=ctx.color)
+            ctx.exit(ExitCode.USAGE)
+
+
+class SaiGroup(click.Group):
+    command_class = HelpOnMissingInput
+    group_class = type
+
+
+class LoggedGroup(SaiGroup):
     """The root group: logs `command.start` and `command.end` for each run.
 
     Events written while the command runs carry its `command`. `sai mcp
     serve` logs to the `mcp` surface and `sai update` to `update`.
     """
 
-    # One entry per `main` in progress; the REPL runs commands inside one.
-    runs: ClassVar[list[dict[str, Any]]] = []
+    group_class = SaiGroup
 
-    def main(self, args: Any = None, *rest: Any, **extra: Any) -> Any:
-        # Nothing here may fail the command: argv is logged as given, and
-        # the log writer removes credentials later.
-        try:
-            argv = [str(a) for a in (sys.argv[1:] if args is None else args)]
-            names = command_path(self, argv)
-            quiet = unlogged(names, argv)
-        except Exception:  # noqa: BLE001 - logging must not fail a command
-            argv, names, quiet = [], [], True
-        if quiet:
-            with log.silenced():
-                return super().main(args, *rest, **extra)
+    def main(
+        self,
+        args: Sequence[str] | None = None,
+        prog_name: str | None = None,
+        complete_var: str | None = None,
+        standalone_mode: bool = True,
+        windows_expand_args: bool = True,
+        **extra: Any,
+    ) -> Any:
+        argv = list(sys.argv[1:] if args is None else args)
+        names = command_path(self, argv)
+        quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
-        run: dict[str, Any] = {"exitCode": 0}
         started = time.monotonic()
-        with log.bind(surface=surface, command=command):
-            log.event("command.start", argv=log.argv(argv[:64]))
-            self.runs.append(run)
+        exit_code: int = ExitCode.OK
+        failure: SaiError | None = None
+        with log.silenced() if quiet else log.bind(surface=surface, command=command):
+            if not quiet:
+                log.event("command.start", argv=log.argv(argv[:64]))
             try:
-                return super().main(args, *rest, **extra)
-            except SystemExit as exc:
-                code = exc.code
-                run["exitCode"] = code if isinstance(code, int) else int(bool(code))
-                raise
-            except click.exceptions.Exit as exc:
-                run["exitCode"] = exc.exit_code
-                raise
-            except click.ClickException as exc:
-                run.update(exitCode=exc.exit_code, error=exc.format_message())
-                raise
-            except BaseException as exc:
-                run.update(exitCode=1)
-                run.setdefault("error", type(exc).__name__)
-                raise
-            finally:
-                self.runs.pop()
-                # The message can quote what the person typed.
-                if isinstance(run.get("error"), str):
-                    run["error"] = log.untrusted(run["error"])
-                log.event(
-                    "command.end",
-                    "info" if run["exitCode"] == 0 else "warn",
-                    durationMs=round((time.monotonic() - started) * 1000),
-                    **run,
+                result = super().main(
+                    args,
+                    prog_name,
+                    complete_var,
+                    standalone_mode=False,
+                    windows_expand_args=windows_expand_args,
+                    **extra,
                 )
-
-    def invoke(self, ctx: click.Context) -> Any:
-        """Keep the error message: in standalone mode click prints it and
-        exits before `main` can see it."""
-        try:
-            return super().invoke(ctx)
-        except click.ClickException as exc:
-            if self.runs:
-                self.runs[-1]["error"] = exc.format_message()
-            raise
-        except click.Abort:
-            if self.runs:
-                self.runs[-1]["error"] = "Aborted"
-            raise
+            except Exception as exc:
+                failure = cli_failure(exc)
+                exit_code = failure.exit_code
+                if not standalone_mode:
+                    raise
+                show_failure(exc, failure, json_requested(argv))
+            else:
+                # With standalone mode disabled, Click returns explicit exit codes.
+                if isinstance(result, int):
+                    exit_code = result
+                if not standalone_mode:
+                    return result
+            finally:
+                if not quiet:
+                    fields: dict[str, Any] = {}
+                    if failure is not None:
+                        fields.update(
+                            code=failure.code, error=log.untrusted(failure.message)
+                        )
+                        if failure.intent_key is not None:
+                            fields["intentKey"] = failure.intent_key
+                    log.event(
+                        "command.end",
+                        "info" if exit_code == ExitCode.OK else "warn",
+                        durationMs=round((time.monotonic() - started) * 1000),
+                        exitCode=exit_code,
+                        **fields,
+                    )
+        raise SystemExit(exit_code)
 
 
 @click.group(cls=LoggedGroup, invoke_without_command=True)
@@ -259,6 +330,8 @@ def main(
     if auto_update_applies(ctx.invoked_subcommand, json_output):
         updater.tick(warn)
     if ctx.invoked_subcommand is None:
+        if json_output:
+            raise click.UsageError("Pass a command when using --json.", ctx)
         repl(ctx)
 
 
@@ -332,6 +405,7 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
             break
         if line in ("exit", "quit"):
             break
+        args: list[str] = []
         try:
             args = repl_args(line)
             if args:
@@ -342,8 +416,8 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
                 )
         except (click.Abort, KeyboardInterrupt):
             click.echo("Interrupted", err=True)
-        except (click.ClickException, ValueError, keeper.KeeperError) as exc:
-            click.echo(f"Error: {exc}", err=True)
+        except Exception as exc:  # noqa: BLE001 - keep the REPL open
+            show_failure(exc, cli_failure(exc), json_requested(args))
 
 
 @main.group()
@@ -386,19 +460,24 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
       sai auth import
           Use a session token copied from Sai Web instead of a key.
     """
+    endpoint = keeper_url(ctx)
     try:
-        result = signed_login(keeper_url(ctx), name, addr)
-        result["endpoint"] = keeper_url(ctx)
+        result = signed_login(endpoint, name, addr)
+        result["endpoint"] = endpoint
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
-        # The same command, so the endpoint and --addr stay in force.
-        flags = forwarded_flags(ctx.find_root().obj)
-        chosen = ["--addr", addr] if addr else []
-        command = shlex.join(["sai", *flags, "auth", "login", name, *chosen])
-        raise click.ClickException(f"{exc} Run `{command}` in a terminal.") from exc
-    except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        json_flag = ("--json",) if ctx.obj["json"] else ()
+        chosen = ("--addr", addr) if addr else ()
+        command = storage.keeper_command_hint(
+            endpoint, *json_flag, "auth", "login", name, *chosen
+        )
+        raise SaiError(
+            f"{exc} Run `{command}` in a terminal.",
+            Code.INVALID_REQUEST,
+            hint=command,
+            exit_code=ExitCode.UNSUPPORTED,
+        ) from exc
 
 
 class NeedsTerminal(ValueError):
@@ -570,7 +649,12 @@ def read_token() -> str:
     if copied is None:
         if sys.stdin.isatty():
             raise ValueError(f"No working clipboard command ({clipboard.NAMES})")
-        raise ValueError(NO_CLIPBOARD.format(names=clipboard.NAMES))
+        raise SaiError(
+            NO_CLIPBOARD.format(names=clipboard.NAMES),
+            Code.INVALID_REQUEST,
+            hint="sai auth import",
+            exit_code=ExitCode.UNSUPPORTED,
+        )
     if not copied[0]:
         raise ValueError(
             "Clipboard is empty; copy the session token from Sai Web and retry"
@@ -588,18 +672,15 @@ def import_token(ctx: click.Context) -> None:
     clipboard. After storing the token, clear the clipboard if it still holds
     the token. Prints the addr, expiry, and endpoint, never the token.
     """
-    try:
-        token = read_token()
-        result = sessions.import_session(token, keeper_url(ctx))
-        storage.save_session(result)
-        # Re-read: the person may have copied something else since, and that
-        # must survive.
-        copied = clipboard.read()
-        if copied is not None and copied[0] == token and not clipboard.clear(copied[1]):
-            click.echo("Warning: could not clear the clipboard", err=True)
-        emit(ctx, sessions.summary(result))
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    token = read_token()
+    result = sessions.import_session(token, keeper_url(ctx))
+    storage.save_session(result)
+    # Re-read: the person may have copied something else since, and that
+    # must survive.
+    copied = clipboard.read()
+    if copied is not None and copied[0] == token and not clipboard.clear(copied[1]):
+        click.echo("Warning: could not clear the clipboard", err=True)
+    emit(ctx, sessions.summary(result))
 
 
 @auth.command("logout")
@@ -613,10 +694,7 @@ def logout(ctx: click.Context, addr: str | None) -> None:
     revoke session tokens yet, so a token copied elsewhere stays valid until
     it expires.
     """
-    try:
-        removed = storage.delete_session(addr or ctx.obj["as_addr"])
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    removed = storage.delete_session(addr or ctx.obj["as_addr"])
     emit(
         ctx,
         {
@@ -647,10 +725,7 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
 @click.pass_context
 def auth_list(ctx: click.Context) -> None:
     """List connected accounts, their expiry, and which one is active."""
-    try:
-        emit(ctx, {"accounts": account_rows(keeper_url(ctx))})
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(ctx, {"accounts": account_rows(keeper_url(ctx))})
 
 
 @auth.command("use")
@@ -662,10 +737,7 @@ def auth_use(ctx: click.Context, addr: str) -> None:
     Commands without `--as` act on the active account. Sign in again to
     connect a new one: `sai auth login NAME` and `sai auth import` add accounts.
     """
-    try:
-        emit(ctx, {**sessions.summary(storage.use_session(addr)), "active": True})
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(ctx, {**sessions.summary(storage.use_session(addr)), "active": True})
 
 
 @auth.command("status")
@@ -673,11 +745,8 @@ def auth_use(ctx: click.Context, addr: str) -> None:
 def auth_status(ctx: click.Context) -> None:
     """Show the active account, or the --as account, and its expiry without
     showing the token."""
-    try:
-        result = session(ctx)
-        emit(ctx, sessions.summary(result))
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    result = session(ctx)
+    emit(ctx, sessions.summary(result))
 
 
 @main.group()
@@ -707,10 +776,7 @@ def account() -> None:
 def perform_query(
     ctx: click.Context, query: str, variables: dict[str, Any] | None = None
 ) -> None:
-    try:
-        emit(ctx, keeper.request(keeper_url(ctx), query, variables))
-    except keeper.KeeperError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(ctx, keeper.request(keeper_url(ctx), query, variables))
 
 
 @account.command("positions")
@@ -735,18 +801,15 @@ def history(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def balances(ctx: click.Context, addr: str, ws_endpoint: str | None) -> None:
     """Read one account balance snapshot from Keeper's subscription."""
-    try:
-        emit(
-            ctx,
-            stream.snapshot(
-                ws_url(ctx, ws_endpoint),
-                stream.BALANCES,
-                {"user": addr},
-                notify=warn,
-            ),
-        )
-    except stream.StreamError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(
+        ctx,
+        stream.snapshot(
+            ws_url(ctx, ws_endpoint),
+            stream.BALANCES,
+            {"user": addr},
+            notify=warn,
+        ),
+    )
 
 
 @main.group()
@@ -763,10 +826,7 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
 
     Use --key to check one intent for a final outcome.
     """
-    try:
-        emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
-    except keeper.KeeperError as exc:
-        raise click.ClickException(str(exc)) from exc
+    emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
 
 
 @intent.command("wait")
@@ -782,23 +842,20 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
 @click.pass_context
 def intent_wait(ctx: click.Context, key: str, addr: str | None, timeout: float) -> None:
     """Wait for an intent's final outcome and print its receipt."""
-    try:
-        wait.validate_timeout(timeout)
-        endpoint = keeper_url(ctx)
-        account = addr or ctx.obj["as_addr"]
-        if account is None:
-            local = storage.intent_record(endpoint, key)
-            if local is not None:
-                account = local[0]
-            elif storage.session_exists():
-                stored = storage.load_session()
-                if stored.get("endpoint") == endpoint:
-                    account = stored["evmAddress"]
-        if account is None:
-            raise ValueError("Pass --addr with the account that submitted this intent")
-        emit_wait(ctx, wait.for_intent(endpoint, account, key, timeout=timeout))
-    except ValueError as exc:
-        raise click.ClickException(str(exc)) from exc
+    wait.validate_timeout(timeout)
+    endpoint = keeper_url(ctx)
+    account = addr or ctx.obj["as_addr"]
+    if account is None:
+        local = storage.intent_record(endpoint, key)
+        if local is not None:
+            account = local[0]
+        elif storage.session_exists():
+            stored = storage.load_session()
+            if stored.get("endpoint") == endpoint:
+                account = stored["evmAddress"]
+    if account is None:
+        raise ValueError("Pass --addr with the account that submitted this intent")
+    emit_wait(ctx, wait.for_intent(endpoint, account, key, timeout=timeout))
 
 
 @intent.command("local")
@@ -854,13 +911,31 @@ def wait_option(action: Callable[..., None]) -> Callable[..., None]:
 
 def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
+    exit_code = ExitCode.OK
     if outcome == "unknown":
-        result["hint"] = (
-            "Run sai intent wait again with the same key and account. Do not resubmit."
+        result["hint"] = storage.keeper_command_hint(
+            keeper_url(ctx),
+            "intent",
+            "wait",
+            result["intentKey"],
+            "--addr",
+            result["addr"],
         )
-    emit(ctx, result)
+    if isinstance(result.get("message"), str):
+        result["message"] = log.redact(result["message"])
     if outcome not in ("filled", "placed", "succeeded"):
-        ctx.exit({"unknown": 5, "rejected": 4}.get(outcome, 1))
+        failure = SaiError(
+            result.get("message") or "The intent outcome is still unknown.",
+            result.get("code", Code.KEEPER_ERROR),
+            intent_key=result["intentKey"],
+            hint=result.get("hint"),
+        )
+        exit_code = failure.exit_code
+        if ctx.obj["json"]:
+            result["error"] = redact_error(failure.as_dict())
+    emit(ctx, result)
+    if exit_code != ExitCode.OK:
+        ctx.exit(exit_code)
 
 
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
@@ -893,28 +968,21 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
 
 
 def trade_error(ctx: click.Context, exc: Exception) -> None:
-    if isinstance(exc, margin.PositionChanged) and ctx.obj["json"]:
-        emit(ctx, {"error": str(exc), "code": "PREVIEW_MISMATCH"})
-        ctx.exit(1)
-    if isinstance(exc, storage.PendingOpen) and ctx.obj["json"]:
-        emit(
-            ctx,
-            {
-                "error": str(exc),
-                "code": "RECENT_OPEN_PENDING",
-                "intentKey": exc.keys[0],
-            },
-        )
-        ctx.exit(1)
-    if ctx.meta.get("wait_for_trade") and isinstance(
-        exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected)
+    if (
+        ctx.meta.get("wait_for_trade")
+        and isinstance(exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected))
+        and not isinstance(exc.__cause__, KeyboardInterrupt)
     ):
         account = loader(ctx).addr
         if account and exc.intent_key:
-            final = wait.for_intent(keeper_url(ctx), account, exc.intent_key)
+            final = (
+                wait.rejected_result(exc.intent_key, account, str(exc))
+                if isinstance(exc, keeper.AdmissionRejected)
+                else wait.for_intent(keeper_url(ctx), account, exc.intent_key)
+            )
             emit_wait(ctx, {**final, "status": final["outcome"]})
             return
-    raise click.ClickException(str(exc)) from exc
+    raise exc
 
 
 def warn(message: str) -> None:
@@ -1196,20 +1264,33 @@ def doctor_command(
         lcd_endpoint=lcd_url(ctx, lcd_endpoint),
     )
     checks = doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline))
+    overall = doctor.overall(checks)
     log.event(
         "doctor.result",
-        "info" if doctor.overall(checks) == "pass" else "warn",
-        overall=doctor.overall(checks),
+        "info" if overall == "pass" else "warn",
+        overall=overall,
         fix=not no_fix,
         offline=offline,
         checks=[doctor.log_entry(check) for check in checks],
+        **({"code": Code.INTERNAL_ERROR} if overall == "fail" else {}),
     )
+    if overall == "fail":
+        if not ctx.obj["json"]:
+            report = doctor.render_text(checks)
+        else:
+            report = "\n".join(
+                f"{check.id}: {check.summary}"
+                + (f" Fix: {check.fix}" if check.fix else "")
+                for check in checks
+                if check.status == "fail"
+            )
+        raise SaiError(
+            report, details=doctor.report(checks) if ctx.obj["json"] else None
+        )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
     else:
         click.echo(doctor.render_text(checks))
-    if doctor.overall(checks) == "fail":
-        ctx.exit(1)
 
 
 @main.group()
@@ -1268,23 +1349,24 @@ def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
     """Print each snapshot as a JSON line, reconnecting until interrupted."""
-    try:
-        stream.check_ws(ws_endpoint)
-        while True:
-            try:
-                for payload in stream.payloads(
-                    ws_endpoint, query, variables, notify=warn
-                ):
-                    click.echo(json.dumps(payload, separators=(",", ":")))
-            except stream.DISCONNECTS as exc:
-                click.echo(
-                    f"Disconnected ({type(exc).__name__}); data may be stale;"
-                    " reconnecting in 2s",
-                    err=True,
-                )
-                time.sleep(2)
-    except stream.StreamError as exc:
-        raise click.ClickException(str(exc)) from exc
+    stream.check_ws(ws_endpoint)
+    while True:
+        try:
+            for payload in stream.payloads(ws_endpoint, query, variables, notify=warn):
+                click.echo(json.dumps(payload, separators=(",", ":")))
+        except stream.DISCONNECTS as exc:
+            log.event(
+                "watch.disconnected",
+                "warn",
+                code=Code.STREAM_ERROR,
+                errorType=type(exc).__name__,
+                endpoint=log.endpoint(ws_endpoint),
+            )
+            warn(
+                f"Disconnected ({type(exc).__name__}); data may be stale;"
+                " reconnecting in 2s"
+            )
+            time.sleep(2)
 
 
 @main.group("config")
@@ -1363,8 +1445,6 @@ def config_set(ctx: click.Context, key: str, value: str) -> None:
         )
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    except sai_settings.SettingsError as exc:
-        raise click.ClickException(str(exc)) from exc
     report_change(ctx, spec, {"key": spec.key, "value": parsed, "path": str(path)})
 
 
@@ -1387,8 +1467,6 @@ def config_unset(ctx: click.Context, key: str) -> None:
         sai_settings.edit_file(path, edit)
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    except sai_settings.SettingsError as exc:
-        raise click.ClickException(str(exc)) from exc
     report_change(
         ctx, spec, {"key": spec.key, "removed": removed[0], "path": str(path)}
     )
@@ -1558,20 +1636,34 @@ def quiet_target(ctx: click.Context) -> mcp_install.Target | None:
     return target
 
 
-def refuse(ctx: click.Context, exc: mcp_install.InstallError) -> None:
-    emit(ctx, {"error": str(exc), "code": exc.code})
-    ctx.exit(1)
-
-
 def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
     summary = mcp_install.summarize(results)
-    emit(ctx, summary)
     if summary["reconnectNeeded"]:
         warn("Restart or reconnect the changed clients to load the change.")
     if any(r.client == "cursor" and r.action in ("added", "replaced") for r in results):
         warn(mcp_install.Cursor.HINT)
-    if any(r.action == "failed" for r in results):
-        ctx.exit(1)
+    if any(result.action == "failed" for result in results):
+        if ctx.obj["json"]:
+            lines = []
+            for result in results:
+                target = (
+                    f"{result.client} ({result.scope})"
+                    if result.scope
+                    else result.client
+                )
+                detail = f": {result.error}" if result.error else ""
+                lines.append(f"{target}: {result.action}{detail}")
+            if summary["reconnectNeeded"]:
+                lines.append("Client registrations changed.")
+            details = "\n".join(lines)
+        else:
+            details = json.dumps(summary, indent=2)
+        report = {
+            **summary,
+            "results": [{**r.to_json(), "changed": r.changed} for r in results],
+        }
+        raise SaiError(details, hint="sai mcp list", details=report)
+    emit(ctx, summary)
 
 
 SCOPE_OPTION = click.option(
@@ -1631,11 +1723,7 @@ def mcp_install_command(
     without a terminal, this lists detected clients and changes nothing.
     """
     found = mcp_clients()
-    try:
-        target = server_target(ctx)
-    except mcp_install.InstallError as exc:
-        refuse(ctx, exc)
-        return
+    target = server_target(ctx)
     names = chosen_clients(clients)
     detected = [n for n, c in found.items() if c.detected()[0]]
     if all_clients:
@@ -1920,13 +2008,14 @@ def log_update(outcome: updater.Outcome, *, background: bool) -> None:
     """Record what an update run did in the log's `update` surface."""
     log.event(
         "update.result",
-        "warn" if outcome.status == updater.FAILED else "info",
+        "warn" if outcome.exit_code else "info",
         status=outcome.status,
         installed=outcome.installed,
         target=outcome.target,
         rolledBack=outcome.rolled_back,
         background=background,
         message=log.untrusted(outcome.message),
+        **({"code": Code.INTERNAL_ERROR} if outcome.exit_code else {}),
     )
 
 
@@ -1937,8 +2026,14 @@ def check_update(ctx: click.Context, api_base: str, web_base: str) -> None:
     except update.NoRelease:
         latest = None
     except update.UpdateError as exc:
-        log.event("update.check", "warn", ok=False, error=log.untrusted(str(exc)))
-        raise click.ClickException(f"update check failed: {exc}") from exc
+        log.event(
+            "update.check",
+            "warn",
+            ok=False,
+            code=Code.INTERNAL_ERROR,
+            error=log.untrusted(str(exc)),
+        )
+        raise SaiError(f"update check failed: {exc}") from exc
     # No release is a result too: it replaces a cached, withdrawn one.
     changes = {"latest": latest.tag if latest else None, "checkedAt": update.now()}
     if not updater.save_state(changes):
@@ -2033,11 +2128,18 @@ def update_command(
         return
     outcome = updater.update_now(options)
     log_update(outcome, background=False)
+    if outcome.exit_code:
+        raise SaiError(
+            outcome.message,
+            exit_code=outcome.exit_code,
+            hint=update.INSTALL_COMMAND
+            if outcome.exit_code == ExitCode.UNSUPPORTED
+            else None,
+        )
     if ctx.obj["json"]:
         emit(ctx, outcome.to_json())
     else:
-        click.echo(outcome.message, err=outcome.exit_code != 0)
-    ctx.exit(outcome.exit_code)
+        click.echo(outcome.message)
 
 
 if __name__ == "__main__":

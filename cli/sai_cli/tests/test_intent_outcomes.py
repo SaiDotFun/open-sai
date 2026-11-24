@@ -666,7 +666,10 @@ def test_cli_retry_with_wait_reports_acknowledged_open_key(keeper_replay):
 
     retry = runner.invoke(main, [*args, "--wait"])
     assert retry.exit_code == 1, retry.output
-    assert json.loads(retry.output)["intentKey"] == key
+    error = json.loads(retry.output)["error"]
+    assert error["intentKey"] == key
+    assert error["code"] == "RECENT_OPEN_PENDING"
+    assert endpoint in error["hint"]
     assert len(storage.list_pending(endpoint, ADDR)) == 1
 
     replies.extend((market, "admission_ack"))
@@ -826,7 +829,9 @@ def test_wait_unknown_returns_call_again_hint(keeper_replay, surface):
         )
         assert command.exit_code == 5, command.output
         result = json.loads(command.output)
-        assert "Run sai intent wait again" in result["hint"]
+        assert f"intent wait {KEY}" in result["hint"]
+        assert endpoint in result["hint"]
+        assert result["error"]["intentKey"] == KEY
     else:
         result = mcp_wait(endpoint, timeout=0.2)
         assert "Call intent_wait again" in result["hint"]

@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import log
+from .errors import Code, SaiError
 
 MAINNET_HTTP = "https://sai-keeper.nibiru.fi/query"
 MAINNET_WS = "wss://sai-keeper.nibiru.fi/query"
@@ -63,8 +64,10 @@ OPERATIONS = {
 }
 
 
-class KeeperError(Exception):
+class KeeperError(SaiError):
     """Keeper rejected a query or transport failed."""
+
+    code = Code.KEEPER_ERROR
 
 
 class UdUnavailable(KeeperError):
@@ -78,9 +81,7 @@ class SigningFailed(KeeperError):
 class AdmissionRejected(KeeperError):
     """Keeper confirmed that admission was rejected."""
 
-    def __init__(self, message: str, intent_key: str | None = None) -> None:
-        super().__init__(message)
-        self.intent_key = intent_key
+    code = Code.ADMISSION_REJECTED
 
 
 class OutcomeUnknown(KeeperError):
@@ -89,13 +90,18 @@ class OutcomeUnknown(KeeperError):
     INTENT_KEY names the intent to reconcile, when one was reserved.
     """
 
-    def __init__(self, message: str, intent_key: str | None = None) -> None:
-        super().__init__(message)
-        self.intent_key = intent_key
+    code = Code.OUTCOME_UNKNOWN
+
+    def __init__(
+        self, message: str, intent_key: str | None = None, *, hint: str | None = None
+    ) -> None:
+        super().__init__(message, intent_key=intent_key, hint=hint)
 
 
 class NotSent(KeeperError):
     """The connection failed before the request reached Keeper."""
+
+    code = Code.NOT_SENT
 
 
 # Keeper expires queued intents two minutes after admission. On an empty
@@ -140,19 +146,26 @@ def request(
     and the response data are never logged.
     """
     started = time.monotonic()
-    outcome: dict[str, Any] = {"status": "error"}
+    outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
     try:
         data = _request(endpoint, query, variables, token, timeout, outcome)
         outcome["status"] = "ok"
+        del outcome["code"]
         return data
-    except NotSent:
-        outcome["status"] = "not_sent"
+    except NotSent as exc:
+        outcome.update(status="not_sent", code=exc.code)
         raise
-    except AdmissionRejected:
-        outcome["status"] = "rejected"
+    except AdmissionRejected as exc:
+        outcome.update(status="rejected", code=exc.code)
         raise
     except KeeperError as exc:
-        outcome["error"] = str(exc)
+        outcome.update(
+            error=str(exc), code=Code.OUTCOME_UNKNOWN if query == SUBMIT else exc.code
+        )
+        raise
+    except KeyboardInterrupt:
+        if query == SUBMIT:
+            outcome["code"] = Code.OUTCOME_UNKNOWN
         raise
     finally:
         _log_request(endpoint, query, variables, token, started, outcome)

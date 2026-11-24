@@ -193,7 +193,7 @@ def test_remove_margin_when_index_lags_or_changes(scenario):
         assert submitted == []
         assert storage.list_pending(endpoint, ADDR) == []
     else:
-        assert result.exit_code == 1, result.output
-        assert json.loads(result.stdout)["code"] == "PREVIEW_MISMATCH"
+        assert result.exit_code == 4, result.output
+        assert json.loads(result.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
         assert submitted == []
         assert storage.list_pending(endpoint, ADDR) == []

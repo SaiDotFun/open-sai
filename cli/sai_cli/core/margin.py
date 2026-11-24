@@ -12,6 +12,7 @@ from urllib.parse import quote
 import httpx
 
 from . import intents, keeper
+from .errors import Code, SaiError
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
 INDEX_RETRY_DELAYS = (0.25, 0.5)
@@ -26,8 +27,10 @@ class IndexLag(ValueError):
     """Keeper's position did not catch up within the re-read budget."""
 
 
-class PositionChanged(ValueError):
+class PositionChanged(SaiError, ValueError):
     """The current position no longer matches the quote."""
+
+    code = Code.PREVIEW_MISMATCH
 
 
 class PositionUnavailable(ValueError):

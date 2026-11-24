@@ -14,6 +14,7 @@ from typing import Any, Literal
 import httpx
 
 from . import keeper, log, receipt, reconcile, storage
+from .errors import Code
 
 DEFAULT_TIMEOUT = 30.0
 MCP_MAX_TIMEOUT = 10.0
@@ -21,9 +22,9 @@ POLL_REQUEST_TIMEOUT = 2.0
 INITIAL_DELAY = 0.25
 MAX_DELAY = 2.0
 OUTCOME_CODES = {
-    "unknown": "OUTCOME_UNKNOWN",
-    "rejected": "ADMISSION_REJECTED",
-    "failed": "KEEPER_ERROR",
+    "unknown": Code.OUTCOME_UNKNOWN,
+    "rejected": Code.ADMISSION_REJECTED,
+    "failed": Code.KEEPER_ERROR,
 }
 Outcome = Literal[
     "filled",
@@ -238,6 +239,10 @@ async def _reconcile(
 
 def unknown_result(key: str, addr: str | None) -> dict[str, Any]:
     return _result(key, addr, "unknown", {}, [], None, None)
+
+
+def rejected_result(key: str, addr: str, message: str) -> dict[str, Any]:
+    return {**_result(key, addr, "rejected", {}, [], None, None), "message": message}
 
 
 def _result(

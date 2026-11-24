@@ -176,6 +176,16 @@ def actions(result: Any) -> dict[str, str]:
     return {r["client"]: r["action"] for r in payload(result)["results"]}
 
 
+def failure(result: Any, exit_code: int = 1) -> str:
+    assert result.exit_code == exit_code
+    envelope = payload(result)
+    assert set(envelope) == {"error"}
+    error = envelope["error"]
+    assert error["code"] == ("INVALID_REQUEST" if exit_code == 2 else "INTERNAL_ERROR")
+    assert error["retryable"] is False
+    return error["message"]
+
+
 def serve(e: Env) -> list[str]:
     return [str(e.sai), "mcp", "serve"]
 
@@ -307,9 +317,7 @@ def test_uv_cache_path_is_refused(env: Env, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("UV_CACHE_DIR", str(cache))
     monkeypatch.setenv("PATH", f"{tool_bin}{os.pathsep}{env.bin}")
     result = invoke("mcp", "install", "claude")
-    assert result.exit_code == 1
-    assert payload(result)["code"] == "UNSTABLE_PATH"
-    assert "uv tool install" in payload(result)["error"]
+    assert "uv tool install" in failure(result, 3)
     assert env.calls() == []
 
 
@@ -319,7 +327,7 @@ def test_default_uv_cache_is_refused_without_variables(env: Env, monkeypatch):
     write_exe(tool_bin / "sai", "")
     monkeypatch.setenv("PATH", f"{tool_bin}{os.pathsep}{env.bin}")
     result = invoke("mcp", "install", "--all", "--dry-run")
-    assert payload(result)["code"] == "UNSTABLE_PATH"
+    assert "inside the uv cache" in failure(result, 3)
 
 
 def test_argv_after_dash_overrides_the_sai_on_path(env: Env):
@@ -378,8 +386,7 @@ def test_uninstall_without_client_or_terminal_is_a_usage_error(env: Env):
     assert invoke("mcp", "install", "codex").exit_code == 0
     env.clear()
     result = invoke("mcp", "uninstall")
-    assert result.exit_code == 2
-    assert "codex (user)" in result.stderr
+    assert "codex (user)" in failure(result, 2)
     assert [c for c in env.calls() if c[1] != "get"] == []
 
 
@@ -398,19 +405,27 @@ def test_unknown_client_is_a_usage_error(env: Env):
 
 def test_codex_has_no_project_scope(env: Env):
     result = invoke("mcp", "install", "codex", "claude", "--scope", "project")
-    assert result.exit_code == 1
-    assert actions(result) == {"codex": "failed", "claude": "added"}
+    message = failure(result)
+    assert "codex (project): failed" in message
+    assert "claude (project): added" in message
+    details = payload(result)["error"]["details"]
+    assert details["reconnectNeeded"] is True
+    assert [
+        (row["client"], row["scope"], row["action"], row["changed"])
+        for row in details["results"]
+    ] == [
+        ("codex", "project", "failed", False),
+        ("claude", "project", "added", True),
+    ]
     assert json.loads((env.project / ".mcp.json").read_text())["mcpServers"]["sai"]
 
 
 def test_missing_client_cli_fails_that_client_only(env: Env):
     (env.bin / "claude").unlink()
     result = invoke("mcp", "install", "claude", "cursor")
-    assert result.exit_code == 1
-    rows = {r["client"]: r for r in payload(result)["results"]}
-    assert rows["claude"]["action"] == "failed"
-    assert "not on PATH" in rows["claude"]["error"]
-    assert rows["cursor"]["action"] == "added"
+    message = failure(result)
+    assert "claude (user): failed" in message and "not on PATH" in message
+    assert "cursor (user): added" in message
 
 
 def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
@@ -485,8 +500,7 @@ def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
 def test_unreadable_config_names_the_file_not_its_contents(env: Env):
     (env.home / ".claude.json").write_text(f'{{"broken": "{SECRET}"')
     result = invoke("mcp", "install", "claude")
-    assert result.exit_code == 1
-    error = payload(result)["results"][0]["error"]
+    error = failure(result)
     assert ".claude.json" in error
     assert SECRET not in result.stdout + result.stderr
 
@@ -662,8 +676,7 @@ def test_cursor_gives_up_when_the_file_keeps_changing(env: Env, monkeypatch):
 
     monkeypatch.setattr(mcp_install, "before_replace", concurrent)
     result = invoke("mcp", "install", "cursor")
-    assert result.exit_code == 1
-    assert "kept changing" in payload(result)["results"][0]["error"]
+    assert "kept changing" in failure(result)
     assert "sai" not in json.loads(path.read_text())["mcpServers"]
     assert [p.name for p in path.parent.iterdir()] == ["mcp.json"]
 
@@ -750,14 +763,9 @@ def test_codex_project_override_is_effective_and_not_edited(env: Env):
         }
     ]
     install = invoke("mcp", "install", "codex")
-    assert install.exit_code == 1
-    result = payload(install)["results"][0]
-    assert result["action"] == "failed"
-    assert ".codex/config.toml" in result["error"]
+    assert ".codex/config.toml" in failure(install)
     uninstall = invoke("mcp", "uninstall", "codex")
-    assert uninstall.exit_code == 1
-    got = payload(uninstall)["results"]
-    assert [(r["scope"], r["action"]) for r in got] == [("project", "failed")]
+    assert "codex (project): failed" in failure(uninstall)
     # Removing only the user entry still reports the override.
     assert invoke("mcp", "uninstall", "codex", "--scope", "user").exit_code == 1
     assert [c for c in env.calls() if c[1] != "get"] == []
@@ -795,8 +803,7 @@ def test_codex_override_differing_only_in_env_values_is_found(env: Env):
     row = payload(listed)["clients"][1]
     assert [r["scope"] for r in row["registrations"]] == ["project", "user"]
     install = invoke("mcp", "install", "codex")
-    assert install.exit_code == 1
-    assert actions(install) == {"codex": "failed"}
+    assert "codex (user): failed" in failure(install)
     assert [c for c in env.calls() if c[1] != "get"] == []
     for result in (listed, install):
         assert "example" not in result.stdout + result.stderr
@@ -809,29 +816,24 @@ def test_codex_identical_project_entry_fails_the_post_check(env: Env):
     codex_user(env, old)
     codex_project(env, old)
     uninstall = invoke("mcp", "uninstall", "codex")
-    assert uninstall.exit_code == 1
-    result = payload(uninstall)["results"][0]
-    assert (result["scope"], result["action"]) == ("user", "failed")
-    assert result["error"] == "a project .codex/config.toml entry is still active"
+    message = failure(uninstall)
+    assert (
+        "codex (user): failed: a project .codex/config.toml entry is still active"
+        in message
+    )
     # The user entry was removed, so clients elsewhere need to reconnect.
-    assert payload(uninstall)["reconnectNeeded"] is True
+    assert "Client registrations changed." in message
     codex_user(env, old)
     install = invoke("mcp", "install", "codex")
-    assert install.exit_code == 1
-    result = payload(install)["results"][0]
-    assert (result["action"], result["error"]) == (
-        "failed",
-        "a project .codex/config.toml entry is still active",
+    assert "failed: a project .codex/config.toml entry is still active" in failure(
+        install
     )
 
 
 def test_claude_post_check_catches_an_add_that_did_not_land(env: Env):
     write_exe(env.bin / "claude", "import sys\nsys.exit(0)\n")
     result = invoke("mcp", "install", "claude")
-    assert result.exit_code == 1
-    assert payload(result)["results"][0]["error"] == (
-        "claude does not show the new sai entry"
-    )
+    assert "claude does not show the new sai entry" in failure(result)
 
 
 def test_codex_project_tool_filter_is_an_override(env: Env):
@@ -847,9 +849,9 @@ def test_codex_project_tool_filter_is_an_override(env: Env):
     assert row["registrations"][0]["extraSettings"] == ["enabled_tools"]
     assert row["current"] is False
     result = invoke("mcp", "install", "codex")
-    assert result.exit_code == 1
-    assert actions(result) == {"codex": "failed"}
-    assert payload(result)["reconnectNeeded"] is False
+    message = failure(result)
+    assert "codex (user): failed" in message
+    assert "Client registrations changed." not in message
 
 
 def test_reconnect_is_needed_when_a_remove_ran_before_a_failed_add(env: Env):
@@ -862,5 +864,10 @@ def test_reconnect_is_needed_when_a_remove_ran_before_a_failed_add(env: Env):
     )
     write_exe(env.bin / "claude", fails_add)
     result = invoke("mcp", "install", "claude")
-    assert actions(result) == {"claude": "failed"}
-    assert payload(result)["reconnectNeeded"] is True
+    message = failure(result)
+    assert "claude (user): failed" in message
+    assert "Client registrations changed." in message
+    details = payload(result)["error"]["details"]
+    assert details["reconnectNeeded"] is True
+    [row] = details["results"]
+    assert row["action"] == "failed" and row["changed"] is True
