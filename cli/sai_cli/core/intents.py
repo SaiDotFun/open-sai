@@ -184,9 +184,9 @@ def submit(
             or ack["evmAddress"].lower() != account.lower()
         ):
             raise keeper.KeeperError("Acknowledgement does not match submitted intent")
-    except keeper.AdmissionRejected:
+    except keeper.AdmissionRejected as exc:
         storage.set_status(key, endpoint, account, "rejected")
-        raise
+        raise keeper.AdmissionRejected(str(exc), key) from exc
     except keeper.NotSent:
         storage.set_status(key, endpoint, account, "not_sent")
         raise

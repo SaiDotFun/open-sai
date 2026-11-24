@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from ..core import intents, keeper, reconcile, storage, stream, trading
+from ..core import intents, keeper, reconcile, storage, stream, trading, wait
 from ..core import log as sai_log
 from ..core import session as sessions
 from ..core.settings import Settings, public_url
@@ -131,7 +131,7 @@ def describe(exc: Exception) -> dict[str, Any]:
         key = exc.intent_key
         return error(
             str(exc),
-            "OUTCOME_UNKNOWN",
+            wait.OUTCOME_CODES["unknown"],
             intentKey=key,
             next=(
                 f"Call intent_status with key {key} to reconcile. Do not"
@@ -139,7 +139,7 @@ def describe(exc: Exception) -> dict[str, Any]:
             ),
         )
     if isinstance(exc, keeper.AdmissionRejected):
-        return error(str(exc), "ADMISSION_REJECTED")
+        return error(str(exc), wait.OUTCOME_CODES["rejected"])
     if isinstance(exc, keeper.NotSent):
         return error(str(exc), "NOT_SENT")
     if isinstance(exc, keeper.KeeperError):
@@ -414,6 +414,24 @@ def intent_status(
         **account,
         **reconcile.reconcile(settings.endpoint, account["addr"], key),
     }
+
+
+def intent_wait(
+    settings: Settings, key: str, addr: str | None, timeout: float
+) -> dict[str, Any]:
+    timeout = min(wait.validate_timeout(timeout), wait.MCP_MAX_TIMEOUT)
+    local = storage.intent_record(settings.endpoint, key) if addr is None else None
+    account = (
+        {"addr": local[0], "addrSource": "ledger"}
+        if local
+        else resolve_addr(settings, addr)
+    )
+    result = wait.for_intent(settings.endpoint, account["addr"], key, timeout=timeout)
+    if result["outcome"] == "unknown":
+        result["hint"] = (
+            "Call intent_wait again with the same key and address. Do not resubmit."
+        )
+    return {**account, **result}
 
 
 # Preview binding

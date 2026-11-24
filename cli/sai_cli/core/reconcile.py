@@ -17,8 +17,9 @@ IntentOutcome = Literal[
 FAILED_STEPS = ("exec_fail", "exec_req_fail")
 ACCEPTED_STEPS = ("jwt_pass", "exec_req_pass")
 OUTCOME_NOT_INDEXED = "market_order_outcome_not_indexed"
-HISTORY_READS = 2
-HISTORY_TIMEOUT = 2
+HISTORY_PAGE_SIZE = 25
+HISTORY_MAX_PAGES = 4
+HISTORY_BUDGET = 2.0
 HISTORY_RETRY_DELAY = 0.25
 PERP_HISTORY_KINDS = {
     "OPEN_TRADE",
@@ -81,42 +82,82 @@ def _explicit_market_pending(row: dict[str, Any]) -> bool:
 def _addresses(row: Mapping[str, Any]) -> set[str]:
     """Use the EVM and Nibiru address pair Keeper resolved for the intent."""
     return {
-        addr.lower() for addr in (row.get("evmAddress"), row.get("nibiAddress")) if addr
+        addr.lower()
+        for addr in (row.get("evmAddress"), row.get("nibiAddress"))
+        if isinstance(addr, str) and addr
     }
 
 
 def _hash(value: str | None) -> str:
-    return (value or "").lower().removeprefix("0x")
+    return value.lower().removeprefix("0x") if isinstance(value, str) else ""
 
 
 def _read_history(
-    endpoint: str, addr: str, row: dict[str, Any], timeout: float
+    endpoint: str,
+    addr: str,
+    row: dict[str, Any],
+    timeout: float,
+    clock: Callable[[], float],
+    sleep: Callable[[float], None],
+    remaining: Callable[[], float] | None,
 ) -> list[dict[str, Any]]:
     request_hash = _hash(row.get("txHash"))
     if not request_hash:
         return []
     traders = _addresses(row)
-    for attempt in range(HISTORY_READS):
-        if attempt:
-            time.sleep(HISTORY_RETRY_DELAY)
-        try:
-            history = keeper.request(
-                endpoint, keeper.HISTORY, {"trader": addr}, timeout=timeout
-            )
-        except keeper.KeeperError:
-            # The lifecycle still carries the best available outcome.
-            break
-        matches = [
+    end = clock() + min(timeout, HISTORY_BUDGET)
+
+    def left() -> float:
+        budget = end - clock()
+        return min(budget, remaining()) if remaining else budget
+
+    def matching(page: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
             item
-            for item in history["perp"]["tradeHistory"]
-            if item.get("intentKey") == row["intentKey"]
-            and ((item.get("trade") or {}).get("trader") or "").lower() in traders
+            for item in page
+            if isinstance(item, dict)
+            and item.get("intentKey") == row["intentKey"]
+            and isinstance(item.get("trade"), dict)
+            and str(item["trade"].get("trader") or "").lower() in traders
             and request_hash
             in (_hash(item.get("txHash")), _hash(item.get("evmTxHash")))
         ]
+
+    # Keeper filters by trader. Re-read the newest page once for rows arriving
+    # in the index while we check the recent pages.
+    for offset in range(0, HISTORY_PAGE_SIZE * HISTORY_MAX_PAGES, HISTORY_PAGE_SIZE):
+        page = _history_page(endpoint, addr, offset, left())
+        if page is None:
+            return []
+        matches = matching(page)
         if matches:
             return matches
+        if len(page) < HISTORY_PAGE_SIZE:
+            break
+    if left() > HISTORY_RETRY_DELAY:
+        sleep(HISTORY_RETRY_DELAY)
+        return matching(_history_page(endpoint, addr, 0, left()) or [])
     return []
+
+
+def _history_page(
+    endpoint: str, addr: str, offset: int, timeout: float
+) -> list[dict[str, Any]] | None:
+    if timeout <= 0:
+        return None
+    try:
+        history = keeper.request(
+            endpoint,
+            keeper.INTENT_HISTORY,
+            {"trader": addr, "limit": HISTORY_PAGE_SIZE, "offset": offset},
+            timeout=timeout,
+        )
+    except keeper.KeeperError:
+        # The lifecycle still carries the best available outcome.
+        return None
+    perp = history.get("perp")
+    page = perp.get("tradeHistory") if isinstance(perp, dict) else None
+    return page if isinstance(page, list) else None
 
 
 def _store_outcome(
@@ -141,27 +182,37 @@ def reconcile(
     *,
     timeout: float = 20,
     write: WriteGate = nullcontext,
+    clock: Callable[[], float] = time.monotonic,
+    sleep: Callable[[float], None] = time.sleep,
+    remaining: Callable[[], float] | None = None,
 ) -> dict[str, Any]:
     """Read Keeper's latest intent records for ADDR.
 
     An account list records pending observations for local keys. With KEY,
-    advance that intent using the matching Keeper record and at most two
-    history reads. Each ledger write uses `with write():` so a caller can
-    enforce its own deadline.
+    advance that intent using the matching Keeper record and bounded
+    history reads. A caller with a deadline supplies its remaining seconds
+    and a context manager for ledger writes.
     """
+    if remaining is not None:
+        timeout = min(timeout, remaining())
+        if timeout <= 0:
+            raise TimeoutError
     data = keeper.request(
         endpoint, keeper.INTENTS, {"user": addr, "key": key}, timeout=timeout
     )
     rows = data.get("userIntents")
+    if not isinstance(rows, list):
+        data["userIntents"] = None
+        return data
     matching = [
         row
-        for row in rows or []
-        if row.get("evmAddress")
+        for row in rows
+        if isinstance(row, dict)
+        and row.get("evmAddress")
         and addr.lower() in _addresses(row)
         and (key is None or row.get("intentKey") == key)
     ]
-    if rows is not None:
-        data["userIntents"] = matching
+    data["userIntents"] = matching
     if key is None:
         for row in matching:
             if not row.get("intentKey") or classify_outcome(row) != "pending":
@@ -214,7 +265,7 @@ def reconcile(
     if (
         outcome == "terminal-filled" and (kind is None or kind in PERP_HISTORY_KINDS)
     ) or (outcome == "pending" and step != "pending_exec"):
-        matches = _read_history(endpoint, addr, row, min(timeout, HISTORY_TIMEOUT))
+        matches = _read_history(endpoint, addr, row, timeout, clock, sleep, remaining)
         data["matchedTradeHistory"] = matches
         if matches and outcome == "pending":
             outcome = "terminal-filled"

@@ -9,7 +9,7 @@ import os
 import shlex
 import sys
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import asdict
 from datetime import UTC, datetime
 from importlib import metadata
@@ -29,6 +29,7 @@ from .core import (
     trading,
     update,
     updater,
+    wait,
 )
 from .core import session as sessions
 from .core import settings as sai_settings
@@ -767,6 +768,38 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
         raise click.ClickException(str(exc)) from exc
 
 
+@intent.command("wait")
+@click.argument("key")
+@click.option("--addr", help="EVM account that submitted the intent.")
+@click.option(
+    "--timeout",
+    type=float,
+    default=wait.DEFAULT_TIMEOUT,
+    show_default=True,
+    help="Maximum wait in seconds.",
+)
+@click.pass_context
+def intent_wait(ctx: click.Context, key: str, addr: str | None, timeout: float) -> None:
+    """Wait for an intent's final outcome and print its receipt."""
+    try:
+        wait.validate_timeout(timeout)
+        endpoint = keeper_url(ctx)
+        account = addr or ctx.obj["as_addr"]
+        if account is None:
+            local = storage.intent_record(endpoint, key)
+            if local is not None:
+                account = local[0]
+            elif storage.session_exists():
+                stored = storage.load_session()
+                if stored.get("endpoint") == endpoint:
+                    account = stored["evmAddress"]
+        if account is None:
+            raise ValueError("Pass --addr with the account that submitted this intent")
+        emit_wait(ctx, wait.for_intent(endpoint, account, key, timeout=timeout))
+    except ValueError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+
 @intent.command("local")
 @click.argument("addr")
 @click.pass_context
@@ -805,6 +838,30 @@ def loader(ctx: click.Context) -> PinnedSession:
     return ctx.obj.setdefault("loader", PinnedSession(ctx))
 
 
+def wait_option(action: Callable[..., None]) -> Callable[..., None]:
+    def record(ctx: click.Context, _param: click.Parameter, enabled: bool) -> None:
+        ctx.meta["wait_for_trade"] = enabled
+
+    return click.option(
+        "--wait",
+        is_flag=True,
+        expose_value=False,
+        callback=record,
+        help=f"Wait up to {wait.DEFAULT_TIMEOUT:g} seconds for the intent outcome.",
+    )(action)
+
+
+def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
+    outcome = result["outcome"]
+    if outcome == "unknown":
+        result["hint"] = (
+            "Run sai intent wait again with the same key and account. Do not resubmit."
+        )
+    emit(ctx, result)
+    if outcome != "filled":
+        ctx.exit({"unknown": 5, "rejected": 4, "failed": 1}[outcome])
+
+
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     """Print a trade result with the account it used or would use.
 
@@ -821,7 +878,29 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
             if ctx.obj["as_addr"]:
                 raise
             account = None
+    if (
+        ctx.meta.get("wait_for_trade")
+        and account
+        and result.get("status") == "accepted"
+    ):
+        final = wait.for_intent(keeper_url(ctx), account, result["intentKey"])
+        # Keep trade quote metadata, but report the final outcome as the status.
+        metadata = {key: value for key, value in result.items() if key != "message"}
+        emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
+        return
     emit(ctx, {"addr": account, **result})
+
+
+def trade_error(ctx: click.Context, exc: Exception) -> None:
+    if ctx.meta.get("wait_for_trade") and isinstance(
+        exc, (keeper.OutcomeUnknown, keeper.AdmissionRejected)
+    ):
+        account = loader(ctx).addr
+        if account and exc.intent_key:
+            final = wait.for_intent(keeper_url(ctx), account, exc.intent_key)
+            emit_wait(ctx, {**final, "status": final["outcome"]})
+            return
+    raise click.ClickException(str(exc)) from exc
 
 
 def warn(message: str) -> None:
@@ -847,6 +926,7 @@ def warn(message: str) -> None:
 @click.option("--take-profit")
 @click.option("--stop-loss")
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_open(
     ctx: click.Context,
@@ -882,7 +962,7 @@ def trade_open(
             ),
         )
     except (ValueError, KeyError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        trade_error(ctx, exc)
 
 
 @trade.command("close")
@@ -893,6 +973,7 @@ def trade_open(
     help="Cancel a pending order instead of closing a position.",
 )
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_close(
     ctx: click.Context, trade_id: int, cancel_order: bool, dry_run: bool
@@ -910,7 +991,7 @@ def trade_close(
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        trade_error(ctx, exc)
 
 
 @trade.command("tpsl")
@@ -920,6 +1001,7 @@ def trade_close(
 @click.option("--clear-take-profit", is_flag=True)
 @click.option("--clear-stop-loss", is_flag=True)
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_tpsl(
     ctx: click.Context,
@@ -946,13 +1028,14 @@ def trade_tpsl(
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        trade_error(ctx, exc)
 
 
 @trade.command("leverage")
 @click.argument("trade_id", type=int)
 @click.option("--leverage", required=True, help="Target leverage as a decimal.")
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_leverage(
     ctx: click.Context, trade_id: int, leverage: str, dry_run: bool
@@ -970,7 +1053,7 @@ def trade_leverage(
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        trade_error(ctx, exc)
 
 
 @trade.command("margin")
@@ -987,6 +1070,7 @@ def trade_leverage(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def trade_margin(
     ctx: click.Context,
@@ -1014,7 +1098,7 @@ def trade_margin(
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        trade_error(ctx, exc)
 
 
 @trade.command("partial-close")
@@ -1026,6 +1110,7 @@ def trade_margin(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
+@wait_option
 @click.pass_context
 def partial_close(
     ctx: click.Context,
@@ -1048,7 +1133,7 @@ def partial_close(
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
-        raise click.ClickException(str(exc)) from exc
+        trade_error(ctx, exc)
 
 
 @main.command("doctor")

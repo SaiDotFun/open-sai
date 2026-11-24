@@ -178,7 +178,9 @@ def test_reconcile_matches_executed_trade_history(monkeypatch):
     fake = FakeKeeper(
         {
             keeper.INTENTS: intent_row("k2", "exec_pass"),
-            keeper.HISTORY: {"perp": {"tradeHistory": [row, {"intentKey": "x"}]}},
+            keeper.INTENT_HISTORY: {
+                "perp": {"tradeHistory": [row, {"intentKey": "x"}]}
+            },
         }
     )
     monkeypatch.setattr(keeper, "request", fake)

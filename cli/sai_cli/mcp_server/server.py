@@ -28,6 +28,7 @@ from pydantic import ConfigDict
 
 from ..core import log as sai_log
 from ..core import settings as sai_settings
+from ..core import wait
 from ..core.settings import Settings
 from . import info, tools
 
@@ -50,9 +51,9 @@ market open also its referencePrice.
 - If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was \
 submitted: show the user the new preview in the result, get confirmation \
 again, and retry with the new previewDigest (and referencePrice).
-- "accepted" means Keeper admitted the intent. It does not mean the trade \
-executed. Use intent_status with the intent key to follow it.
-- If a trade returns code OUTCOME_UNKNOWN, call intent_status with its \
+- "accepted" means Keeper admitted the intent. Use intent_wait with its key \
+to check for a final outcome.
+- If a trade returns code OUTCOME_UNKNOWN, call intent_wait with its \
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
 retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
@@ -226,6 +227,22 @@ async def intent_status(addr: str | None = None, key: str | None = None) -> str:
         key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
     """
     return await call(tools.intent_status, addr, key)
+
+
+async def intent_wait(
+    key: str, addr: str | None = None, timeout: float = wait.MCP_MAX_TIMEOUT
+) -> str:
+    """Wait up to 10 seconds for a final outcome and return an intent receipt.
+
+    If the outcome is unknown, call this tool again with the same key and
+    address. Keep using the original key for follow-up.
+
+    Args:
+        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.
+        addr: EVM address. Defaults to the local intent account, then the active account.
+        timeout: Wait in seconds, capped at 10.
+    """
+    return await call(tools.intent_wait, key, addr, timeout)
 
 
 # Previews and trades share one implementation per action.
@@ -645,6 +662,7 @@ READ_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
     (preview_leverage, read_only("Preview Leverage")),
     (preview_margin, read_only("Preview Margin Change")),
     (preview_partial_close, read_only("Preview Partial Close")),
+    (intent_wait, read_only("Wait for Intent")),
 )
 
 TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (

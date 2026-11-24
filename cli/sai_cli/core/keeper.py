@@ -27,6 +27,21 @@ POSITIONS = """query($trader:String!) { perp { trades(where:{trader:$trader,isOp
 POSITION = """query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }"""
 ROUTE = """query { oneClickTrading { enabled chainId contractAddress } }"""
 HISTORY = """query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }"""
+INTENT_HISTORY = """query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) {
+      id intentKey tradeChangeType txHash evmTxHash block { block block_ts }
+      marketOrder { orderReqBlock orderReqTxHash orderExecBlock sequence execPrice collateralAmount }
+      openingFeeUsd closingFeeUsd borrowingFeeUsd
+      trade {
+        id trader tradeType isOpen isLong collateralAmount openCollateralAmount
+        leverage openPrice closePrice tp sl openBlock { block } closeBlock { block }
+        perpBorrowing { marketId collateralToken { symbol } }
+      }
+    }
+  }
+}"""
 INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
 SESSION = """mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }"""
@@ -40,6 +55,7 @@ OPERATIONS = {
     POSITION: "position",
     ROUTE: "route",
     HISTORY: "history",
+    INTENT_HISTORY: "history",
     INTENTS: "intents",
     CHALLENGE: "challenge",
     SESSION: "session",
@@ -61,6 +77,10 @@ class SigningFailed(KeeperError):
 
 class AdmissionRejected(KeeperError):
     """Keeper confirmed that admission was rejected."""
+
+    def __init__(self, message: str, intent_key: str | None = None) -> None:
+        super().__init__(message)
+        self.intent_key = intent_key
 
 
 class OutcomeUnknown(KeeperError):

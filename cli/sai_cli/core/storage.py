@@ -477,6 +477,19 @@ def list_pending(endpoint: str, account: str) -> list[dict[str, Any]]:
     return [{"intentKey": row[0], "kind": row[1], "status": row[2]} for row in rows]
 
 
+def intent_record(endpoint: str, key: str) -> tuple[str, str] | None:
+    """Return the recorded account and status for KEY on this endpoint."""
+    if not (home() / "intents.sqlite3").exists():
+        return None
+    with db() as connection:
+        row = connection.execute(
+            "SELECT account, COALESCE(keeper_status,status) FROM intents"
+            " WHERE id=? AND endpoint=?",
+            (key, endpoint),
+        ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
 def _key_time(key: str) -> float | None:
     """Read the reservation time embedded in an intent key, if it has one."""
     try:

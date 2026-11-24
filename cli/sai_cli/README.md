@@ -276,15 +276,14 @@ still needs the `previewDigest` of the preview the user confirmed.
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
 `account balances ADDR`, `account history ADDR`, `trade open`, `trade
-close`, `trade partial-close`, `trade tpsl`, `intent status ADDR --key KEY`,
+close`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
 and live `watch` streams. Run any command with `--help` for details. Trading
 requires a funded account; funding is performed separately. Trade commands
 support `--dry-run` to inspect the local semantic request.
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
 requiring refresh and may include an optional supplied reference. A partial close sizes the
-reduction from the Perp contract's collateral, refuses when Keeper's index
-disagrees with the contract, and rechecks the position before submission. It
+reduction from the Perp contract's collateral and rechecks the position before submission. It
 accepts `--lcd-endpoint` like `trade margin`. Market schedule and other Keeper admission checks
 remain authoritative.
 
@@ -296,17 +295,50 @@ change, and the actual margin delta may differ if the position changes after
 the final check. `--dry-run` reads live state and prints the quote without
 submitting an intent. Use `--lcd-endpoint` to select the matching network's
 Nibiru REST service; the CLI checks that its chain matches Keeper.
-The CLI refuses the quote if the indexed position and contract disagree. Wait
-for the index to synchronize and retry; no margin intent has been submitted.
+Margin changes and partial closes briefly re-read Keeper and the contract if
+their position data disagree. If the mismatch persists, the command stops
+before submitting and asks you to retry after Keeper synchronizes.
 
 The CLI persists non-secret request identities under `$SAI_HOME/trader` or
 `~/.sai/trader`. A network error after submission leaves the outcome unknown,
 and an unknown intent blocks new trades on the account. Reconcile it with
-`intent status ADDR --key KEY`. If Keeper has no record of the key five
+`sai intent wait KEY` or inspect the latest record with
+`sai intent status ADDR --key KEY`. If Keeper has no record of the key five
 minutes after submission, past Keeper's two-minute admission expiry, the CLI
 marks it `absent` and trading resumes. A connection that fails before the
 request is sent marks the intent `not_sent`, which does not block. Keeper
 admission does not establish execution or finality.
+
+### Wait for an Intent
+
+```bash
+sai --json intent wait INTENT_KEY --timeout 30
+```
+
+The command uses the account recorded for the key on the configured Keeper
+endpoint, then the active account on that endpoint. Pass `--addr ADDR` to
+look up an intent from another machine or account. Add `--wait` to a live
+trade command to submit once and wait up to 30 seconds for that key. With
+MCP, call `intent_wait` after the trade returns its key. The tool caps each
+call at 10 seconds.
+
+The result contains an `outcome` and a `receipt`. On timeout it returns
+`unknown` with code `OUTCOME_UNKNOWN` and exits 5 in the CLI. Call wait
+again with the same key and account. A confirmed failure exits 1, an
+admission rejection exits 4, and a successful outcome exits 0. For a limit
+or stop order, success confirms placement. The order may still be waiting
+for its trigger.
+
+The receipt's `requestTxHash` identifies the transaction that submitted
+the request. For a next-oracle fill, `execution.block` is the later block
+that filled it. When history is available, `execution.historyId` identifies
+the matching row and `position` shows Keeper's latest state for that trade.
+For market opens and closes, the fill can include the execution price and
+collateral size in base units. `fill.oraclePrice` is the oracle quote when
+Keeper provides it. `fill.positionFeesUsd` contains Keeper's cumulative
+position fees in USD. Fields without indexed evidence are null.
+
+### Doctor
 
 `sai doctor` checks the install, the version, `$SAI_HOME/trader`,
 `$SAI_HOME/logs`, the session, the intent ledger, and the Keeper HTTP,
