@@ -831,6 +831,21 @@ query($user:String!, $key:String) {
             data, {"p": {}, "route": {}, "matched": [{"intentKey": self.key}]}
         )
 
+    def test_rejects_conflicting_root_alias_with_skipped_children(self) -> None:
+        query = """
+query($user:String!, $key:String) {
+  shared: perp { tradeHistory @skip(if:true) { id } }
+  shared: userIntents(where:{user:$user, intentKey:$key}) { intentKey }
+}
+"""
+        with (
+            REHEARSAL["keeper_server"](self.replay.handler()) as base,
+            self.assertRaises(HTTPError) as error,
+        ):
+            self.query(base, query, user=self.replay.addr, key=self.key)
+        with error.exception as response:
+            self.assertEqual(response.code, 400)
+
     def test_empty_selection_does_not_replace_an_active_alias(self) -> None:
         self.replay.history = [{"id": 1, "trade": {"trader": self.replay.addr}}]
         query = """

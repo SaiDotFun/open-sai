@@ -760,6 +760,10 @@ class Replay:
                 except ValueError:
                     self.send_error(400)
                     return
+                aliased_fields = {(field.key, field.name) for field in selected}
+                if len(aliased_fields) != len({key for key, _ in aliased_fields}):
+                    self.send_error(400)
+                    return
                 empty_objects = {}
                 active = []
                 for field in selected:
