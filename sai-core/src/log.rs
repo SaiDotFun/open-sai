@@ -24,6 +24,7 @@ use crate::settings::{self, Environment};
 
 use files::LogDir;
 pub use privacy::Field;
+pub(crate) use privacy::origin;
 use privacy::{Budget, EVENT_CHARS, prefix};
 use session_tokens::{FileStamp, Tokens, stamp};
 

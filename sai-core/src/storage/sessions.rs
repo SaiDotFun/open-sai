@@ -83,6 +83,17 @@ impl Session {
         self.extra.get("endpoint").and_then(Value::as_str)
     }
 
+    pub(crate) fn key_name(&self) -> Option<&str> {
+        self.extra
+            .get("keyName")
+            .and_then(Value::as_str)
+            .filter(|key| !key.is_empty())
+    }
+
+    pub(crate) fn is_imported(&self) -> bool {
+        self.extra.get("source").and_then(Value::as_str) == Some("imported")
+    }
+
     pub fn summary(&self) -> Result<SessionSummary<'_>, StorageError> {
         let endpoint = self
             .endpoint()
@@ -119,6 +130,13 @@ pub struct Accounts {
 struct StoredAccounts(#[serde(with = "Accounts")] Accounts);
 
 impl Accounts {
+    pub(crate) fn selected(&self, addr: Option<&str>) -> Option<&Session> {
+        let key = addr.map(str::to_lowercase);
+        self.sessions
+            .get(key.as_ref().or(self.active.as_ref())?)
+            .map(|session| &session.0)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&Session, bool)> {
         self.sessions
             .iter()

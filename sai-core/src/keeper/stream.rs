@@ -32,11 +32,13 @@ const SUBPROTOCOL: &str = "graphql-transport-ws";
 pub const CONNECTED: &str = "Connected; waiting for current snapshot";
 
 const BALANCES: &str = "subscription($user:String!) { userBalances(where:{user:$user}) { amount usd_value token_info { name symbol decimals type } } }";
+const BALANCES_WITH_BLOCK: &str = "subscription($user:String!) { userBalances(where:{user:$user}) { amount usd_value lastUpdatedBlock token_info { name symbol decimals type } } }";
 const POSITIONS: &str = "subscription($user:String!) { perpTrades(where:{trader:$user}) { id trader isOpen isLong tradeType leverage openPrice tp sl } }";
 const PRICE: &str = "subscription($id:Int!) { tokenPricesUsd(where:{tokenId:$id}) { priceUsd token { id symbol } lastUpdatedBlock { block block_ts } } }";
 
 pub enum Subscription {
     Balances(String),
+    BalancesWithBlock(String),
     Positions(String),
     Price(Number),
 }
@@ -45,6 +47,9 @@ impl Subscription {
     fn parameters(&self) -> (&'static str, &'static str, Value) {
         match self {
             Self::Balances(addr) => (BALANCES, "userBalances", json!({"user": addr})),
+            Self::BalancesWithBlock(addr) => {
+                (BALANCES_WITH_BLOCK, "userBalances", json!({"user": addr}))
+            }
             Self::Positions(addr) => (POSITIONS, "perpTrades", json!({"user": addr})),
             Self::Price(id) => (PRICE, "tokenPricesUsd", json!({"id": id})),
         }
@@ -266,7 +271,9 @@ impl Connection {
                     }
                     return Ok(payload);
                 }
-                Some("error" | "complete") => return Err(protocol("Keeper subscription ended")),
+                Some("error" | "complete") => {
+                    return Err(protocol("Keeper subscription ended"));
+                }
                 _ => {}
             }
         }
@@ -303,7 +310,9 @@ impl Connection {
                     }
                 }
                 Ok(Some(Ok(Message::Ping(_)))) => self.socket.flush().await?,
-                Ok(Some(Ok(Message::Text(text)))) => return decode(text.as_bytes()),
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    return decode(text.as_bytes());
+                }
                 Ok(Some(Ok(Message::Binary(bytes)))) => return decode(&bytes),
                 Ok(Some(Ok(Message::Close(frame)))) => {
                     let normal = frame.is_none_or(|frame| {
@@ -318,7 +327,9 @@ impl Connection {
                     return Err(Failure::Disconnected(name));
                 }
                 Ok(Some(Err(error))) => return Err(error.into()),
-                Ok(None) => return Err(Failure::Disconnected("ConnectionClosedError")),
+                Ok(None) => {
+                    return Err(Failure::Disconnected("ConnectionClosedError"));
+                }
                 Ok(Some(Ok(Message::Frame(_)))) => {}
             }
         }

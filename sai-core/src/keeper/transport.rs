@@ -44,6 +44,33 @@ pub(super) async fn post(
     token: Option<&str>,
     timeout: Duration,
 ) -> Result<(StatusCode, Vec<u8>), SaiError> {
+    let (parts, bytes) = request(endpoint, RequestKind::Post { body, token }, timeout).await?;
+    Ok((parts.status, bytes))
+}
+
+pub(crate) async fn get(
+    endpoint: &str,
+    height: Option<&str>,
+    timeout: Duration,
+) -> Result<(hyper::http::response::Parts, Vec<u8>), SaiError> {
+    request(endpoint, RequestKind::Get { height }, timeout).await
+}
+
+enum RequestKind<'a> {
+    Post {
+        body: Vec<u8>,
+        token: Option<&'a str>,
+    },
+    Get {
+        height: Option<&'a str>,
+    },
+}
+
+async fn request(
+    endpoint: &str,
+    kind: RequestKind<'_>,
+    timeout: Duration,
+) -> Result<(hyper::http::response::Parts, Vec<u8>), SaiError> {
     let mut url = Url::parse(endpoint).map_err(|_| request_failed())?;
     url.set_fragment(None);
     let destination = url.as_str().parse::<Uri>().map_err(|_| request_failed())?;
@@ -60,20 +87,35 @@ pub(super) async fn post(
                 .clone(),
         )
     };
-    let mut request = Request::post(target)
-        .header(header::HOST, authority.as_str())
-        .header(header::ACCEPT, "*/*")
-        .header(header::ACCEPT_ENCODING, "gzip, deflate")
-        .header(header::CONNECTION, "keep-alive")
-        .header(header::USER_AGENT, "python-httpx/0.28.1")
-        .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CONTENT_LENGTH, body.len());
-    if let Some(token) = token {
-        let mut authorization = header::HeaderValue::from_str(&format!("Bearer {token}"))
-            .map_err(|_| request_failed())?;
-        authorization.set_sensitive(true);
-        request = request.header(header::AUTHORIZATION, authorization);
+    let mut request = match kind {
+        RequestKind::Get { .. } => Request::get(target),
+        RequestKind::Post { .. } => Request::post(target),
     }
+    .header(header::HOST, authority.as_str())
+    .header(header::ACCEPT, "*/*")
+    .header(header::ACCEPT_ENCODING, "gzip, deflate")
+    .header(header::CONNECTION, "keep-alive")
+    .header(header::USER_AGENT, "python-httpx/0.28.1");
+    let body = match kind {
+        RequestKind::Get { height } => {
+            if let Some(height) = height {
+                request = request.header("x-cosmos-block-height", height);
+            }
+            Vec::new()
+        }
+        RequestKind::Post { body, token } => {
+            request = request
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, body.len());
+            if let Some(token) = token {
+                let mut authorization = header::HeaderValue::from_str(&format!("Bearer {token}"))
+                    .map_err(|_| request_failed())?;
+                authorization.set_sensitive(true);
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            body
+        }
+    };
     if forward && let Some(auth) = proxy.as_ref().and_then(|proxy| proxy.basic_auth()) {
         request = request.header(header::PROXY_AUTHORIZATION, auth);
     }
@@ -261,7 +303,7 @@ async fn exchange(
     socket: SocketBox,
     request: Request<Full<Bytes>>,
     timeout: Duration,
-) -> Result<(StatusCode, Vec<u8>), SaiError> {
+) -> Result<(hyper::http::response::Parts, Vec<u8>), SaiError> {
     // Like the top-level httpx.post, this exchange owns its connection. There
     // is no shared pool to wait on and no automatic retry.
     let io = with_inactivity(socket, timeout).await;
@@ -270,16 +312,20 @@ async fn exchange(
         .handshake(io)
         .await
         .map_err(|_| request_failed())?;
-    let driver = tokio::spawn(connection);
-    let result = receive(&mut sender, request).await;
-    driver.abort();
-    result
+    let response = receive(&mut sender, request);
+    tokio::pin!(response);
+    // Keep the driver in this future so cancellation also drops the socket.
+    tokio::select! {
+        biased;
+        result = &mut response => result,
+        _ = connection => response.await,
+    }
 }
 
 async fn receive(
     sender: &mut http1::SendRequest<Full<Bytes>>,
     request: Request<Full<Bytes>>,
-) -> Result<(StatusCode, Vec<u8>), SaiError> {
+) -> Result<(hyper::http::response::Parts, Vec<u8>), SaiError> {
     let response = sender
         .send_request(request)
         .await
@@ -313,7 +359,7 @@ async fn receive(
         .map_err(|_| request_failed())?;
         bytes = decoded;
     }
-    Ok((parts.status, bytes))
+    Ok((parts, bytes))
 }
 
 fn keeper_tls_config() -> Result<ClientConfig, SaiError> {

@@ -5,7 +5,7 @@ mod proxy;
 mod public;
 mod queries;
 pub mod stream;
-mod transport;
+pub(crate) mod transport;
 
 use std::time::{Duration, Instant};
 
@@ -182,7 +182,7 @@ impl<'a> Keeper<'a> {
     }
 }
 
-fn check_url(endpoint: &str) -> Result<(), SaiError> {
+pub(crate) fn check_url(endpoint: &str) -> Result<(), SaiError> {
     let Some(url) = Endpoint::split(endpoint).filter(|url| {
         url.scheme == "https"
             || (url.scheme == "http"

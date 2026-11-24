@@ -1,7 +1,7 @@
 use std::{fs, os::unix::fs::PermissionsExt, str::FromStr};
 
 use chrono::{NaiveDateTime, Utc};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior::Immediate, params};
 use serde::Serialize;
 
 use super::{Storage, StorageError, StorageEvent, endpoint_origin};
@@ -60,6 +60,14 @@ pub struct IntentRow {
     pub key: String,
     pub kind: String,
     pub status: String,
+}
+
+pub(crate) struct UnresolvedIntent {
+    pub key: String,
+    pub kind: String,
+    pub status: String,
+    pub entity: Option<String>,
+    pub created_at: Option<f64>,
 }
 
 fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
@@ -316,6 +324,42 @@ impl Storage<'_> {
             endpoint: &endpoint_origin(endpoint),
         });
         Ok(Some(status.as_str().into()))
+    }
+
+    /// Read blockers from both ledger versions without creating or migrating a file.
+    pub(crate) fn unresolved_intents(
+        &self,
+        endpoint: &str,
+        account: &str,
+    ) -> Result<Vec<UnresolvedIntent>, StorageError> {
+        let path = self.trader.join(LEDGER_FILE);
+        if !path.try_exists()? {
+            return Ok(Vec::new());
+        }
+        let connection = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.busy_timeout(self.busy_timeout)?;
+        let version = schema_version(&connection)?;
+        let created_at = if version >= 1 { "created_at" } else { "NULL" };
+        let status = if has_column(&connection, "keeper_status")? {
+            "COALESCE(keeper_status, status)"
+        } else {
+            "status"
+        };
+        let mut statement = connection.prepare(&format!(
+            "SELECT id, kind, {status}, entity, {created_at} FROM intents
+             WHERE endpoint=?1 AND account=?2 AND {status} IN ('unknown', 'accepted', 'pending')
+             ORDER BY rowid DESC"
+        ))?;
+        let rows = statement.query_map(params![endpoint, account.to_lowercase()], |row| {
+            Ok(UnresolvedIntent {
+                key: row.get(0)?,
+                kind: row.get(1)?,
+                status: row.get(2)?,
+                entity: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
     /// List every local intent for the account, newest first.

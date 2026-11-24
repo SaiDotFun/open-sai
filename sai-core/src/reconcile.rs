@@ -11,7 +11,7 @@ use crate::{
     storage::{IntentStatus, StatusUpdateOptions, Storage},
 };
 
-const OUTCOME_NOT_INDEXED: &str = "market_order_outcome_not_indexed";
+pub(crate) const OUTCOME_NOT_INDEXED: &str = "market_order_outcome_not_indexed";
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(2);
 const HISTORY_RETRY_DELAY: Duration = Duration::from_millis(250);
 pub(crate) const PENDING_HINT: &str = "Fill pending at the next oracle price. Do not resubmit.";

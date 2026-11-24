@@ -219,7 +219,7 @@ pub(super) fn replace_tokens(text: &str, tokens: &[String]) -> String {
     text
 }
 
-fn origin(text: &str) -> String {
+pub(crate) fn origin(text: &str) -> String {
     let Some(url) = Endpoint::split(text.trim()) else {
         return REDACTED_URL.into();
     };
