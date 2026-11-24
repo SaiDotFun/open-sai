@@ -240,7 +240,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
-            "trade_type": "trade",
+            "trade_type": "limit" if scenario == "pending-order" else "trade",
             "collateral_amount": str(position["collateralAmount"]),
             "leverage": str(position["leverage"]),
             "open_price": str(position["openPrice"]),
@@ -254,7 +254,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "get_collateral_price": "1",
     }
     contract_args = {
-        "get_trade_raw": {"trader": position["trader"], "index": 7},
+        "get_trade_raw": {
+            "trader": ADDRESS if scenario == "pending-order" else position["trader"],
+            "index": 7,
+        },
         "get_exchange_balance": {
             "user": position["trader"],
             "collateral_index": token_index,

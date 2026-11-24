@@ -234,13 +234,51 @@ def close_trade(
     """Close a position or cancel a pending order."""
     payload = intents.close_intent(trade_id, cancel_order)
 
-    def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
-        if cancel_order:
-            return estimates.non_fill_estimates(cancels=True, updates_triggers=False)
-        return _estimate_position(endpoint, lcd_endpoint, get_session, trade_id)
+    if cancel_order:
+
+        def pending_order() -> None:
+            if lcd_endpoint is None:
+                raise ValueError("Cannot verify the pending order without an LCD")
+            addr = get_session()["evmAddress"]
+            contract = margin.trading_contract(endpoint, lcd_endpoint)
+            trade = margin.smart(
+                lcd_endpoint,
+                contract,
+                {"get_trade_raw": {"trader": addr, "index": trade_id}},
+            )
+            if (
+                trade.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+                or trade.get("is_open") is not True
+                or trade.get("trade_type") not in ("limit", "stop")
+            ):
+                raise ValueError(
+                    "Target is not an open pending order. Preview a market close for a filled position."
+                )
+
+        def cancel_estimate(_preview: dict[str, Any]) -> dict[str, Any]:
+            reason = "A pending order can fill before cancellation executes. Perp may close a filled position at market."
+            if dry_run:
+                pending_order()
+            return {
+                key: estimates.unavailable(reason)
+                for key in ("fees", "liquidationPrice", "worstCaseFill")
+            }
+
+        def check(preview: dict[str, Any]) -> None:
+            before_submit(preview)
+            pending_order()
+
+        return preview_or_submit(
+            endpoint, get_session, payload, dry_run, check, cancel_estimate
+        )
 
     return preview_or_submit(
-        endpoint, get_session, payload, dry_run, before_submit, estimate
+        endpoint,
+        get_session,
+        payload,
+        dry_run,
+        before_submit,
+        lambda _: _estimate_position(endpoint, lcd_endpoint, get_session, trade_id),
     )
 
 
@@ -266,7 +304,7 @@ def set_tpsl(
         payload,
         dry_run,
         before_submit,
-        lambda _: estimates.non_fill_estimates(cancels=False, updates_triggers=True),
+        lambda _: estimates.non_fill_estimates(updates_triggers=True),
     )
 
 

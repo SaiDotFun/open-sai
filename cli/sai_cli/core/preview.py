@@ -224,15 +224,7 @@ def open_estimates(
     return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
 
 
-def non_fill_estimates(*, cancels: bool, updates_triggers: bool) -> dict[str, Any]:
-    if cancels:
-        return {
-            "fees": not_applicable("Cancelling a pending order incurs no Perp fee."),
-            "liquidationPrice": not_applicable("A pending order has no open position."),
-            "worstCaseFill": not_applicable(
-                "A pending-order cancellation has no fill."
-            ),
-        }
+def non_fill_estimates(*, updates_triggers: bool) -> dict[str, Any]:
     return {
         "fees": {"status": "exact", "amountUsdc": "0", "excludes": ["Network fees"]},
         "liquidationPrice": {
@@ -257,7 +249,7 @@ def position_estimates(
 ) -> dict[str, Any]:
     """Quote a close or a surviving position from the same snapshot as the intent."""
     if target is not None:
-        result = non_fill_estimates(cancels=False, updates_triggers=False)
+        result = non_fill_estimates(updates_triggers=False)
     else:
         result = {
             "fees": unavailable("Current position or Perp fee inputs are unavailable."),

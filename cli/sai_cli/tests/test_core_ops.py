@@ -266,7 +266,6 @@ def test_live_market_order_refuses_a_closed_market(monkeypatch):
     ("action", "args"),
     [
         (trading.close_trade, {"trade_id": 3, "cancel_order": False}),
-        (trading.close_trade, {"trade_id": 3, "cancel_order": True}),
         (trading.set_leverage, {"trade_id": 3, "leverage": "4"}),
         (
             trading.set_tpsl,

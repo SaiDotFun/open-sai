@@ -266,6 +266,9 @@ args = ["--json","trade","close","7","--dry-run"]
 [[case]]
 name = "trade-cancel"
 args = ["--json","trade","close","7","--cancel-order","--dry-run"]
+seed = "session"
+server = "pending-order"
+wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 
 [[case]]
 name = "trade-tpsl"

@@ -34,6 +34,7 @@ TRADER = "nibi1trader"
 @dataclass
 class Position:
     collateral: int = 4_000_000
+    trade_type: str = "trade"
     leverage: str = "2"
     snapshot_leverages: deque[str] = field(default_factory=deque)
     after_hours: bool = False
@@ -144,7 +145,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     "market_index": "MarketIndex(0)",
                     "collateral_index": "TokenIndex(1)",
                     "is_open": True,
-                    "trade_type": "trade",
+                    "trade_type": position.trade_type,
                     "collateral_amount": str(position.collateral),
                     "leverage": position.leverage,
                 }
@@ -796,7 +797,6 @@ def test_mcp_position_estimates_do_not_change_confirmed_terms(
                     "20",
                 ),
                 ("tpsl", {"take_profit": "120"}, "0", "not_applicable", None),
-                ("close", {"cancel_order": True}, None, "not_applicable", None),
             )
             for tool, args, fee, fill, liq in variants:
                 preview = await call(client, f"preview_{tool}", {"trade_id": 7, **args})
@@ -907,5 +907,31 @@ def test_mcp_market_refuses_first_step_excess_of_one_price_atom(position_service
             result = await call(client, "trade_open", trade)
             assert result["status"] == "accepted"
             assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancel_checks_live_order_type_and_refuses_after_fill(position_service):
+    position, base_url = position_service
+    args = {"trade_id": 7, "cancel_order": True}
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            filled = await call(client, "preview_close", args)
+            assert filled["code"] == "INVALID_REQUEST"
+            assert "pending order" in filled["error"]
+            assert "estimates" not in filled
+            position.trade_type = "limit"
+            quote = await call(client, "preview_close", args)
+            assert quote["estimates"]["fees"]["status"] == "unavailable"
+            assert "market" in quote["estimates"]["fees"]["reason"]
+            trade = {**args, "preview_digest": quote["previewDigest"]}
+            position.trade_type = "trade"
+            result = await call(client, "trade_close", trade)
+            assert result["code"] == "INVALID_REQUEST"
+            assert position.submitted == []
+            position.trade_type = "limit"
+            assert (await call(client, "trade_close", trade))["status"] == "accepted"
+            assert position.submitted[0]["kind"] == "CANCEL_PENDING_TRADE"
 
     asyncio.run(scenario())

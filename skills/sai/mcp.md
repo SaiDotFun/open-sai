@@ -160,7 +160,8 @@ holds a fresh preview. Show it, get confirmation again, and retry with the
 new `preview_digest` and `reference_price`.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
-`trade_close`. Without it the tools close a position.
+`trade_close`. Both check that the order is pending. If it fills after the
+submit-time check, Perp can close the filled position at market.
 
 Call `auth_use` only when the person asks to switch accounts.
 

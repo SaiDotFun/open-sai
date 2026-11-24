@@ -253,8 +253,9 @@ What each command checks:
   index and the contract disagree, the CLI refuses and submits nothing. Wait
   and retry.
 - **Close and cancel.** `trade close ID` closes an open position. To cancel a
-  pending limit or stop order, add `--cancel-order`. Without the flag the CLI
-  sends a close-position intent for that ID.
+  pending limit or stop order, add `--cancel-order`. The CLI checks that the
+  order is pending before preview and submit. If it fills after the check,
+  Perp can close the filled position at market.
 
 An executed trade stays pending locally until the CLI sees matching indexed
 trade history.

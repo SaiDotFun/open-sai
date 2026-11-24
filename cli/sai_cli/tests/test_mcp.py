@@ -634,7 +634,6 @@ PREVIEWS = (
     ("preview_open", OPEN_ARGS),
     ("preview_open", {**OPEN_ARGS, "order_type": "market", "price": None}),
     ("preview_close", {"trade_id": 7}),
-    ("preview_close", {"trade_id": 7, "cancel_order": True}),
     ("preview_tpsl", {"trade_id": 7, "take_profit": "120"}),
     ("preview_leverage", {"trade_id": 7, "leverage": "3"}),
     ("preview_margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
@@ -673,7 +672,6 @@ def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     ("name", "preview_args", "trade_args"),
     [
         ("close", {"trade_id": 7}, {"trade_id": 8}),
-        ("close", {"trade_id": 7}, {"trade_id": 7, "cancel_order": True}),
         (
             "leverage",
             {"trade_id": 7, "leverage": "3"},
