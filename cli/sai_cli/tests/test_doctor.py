@@ -21,7 +21,7 @@ from typing import Any
 import pytest
 from click.testing import CliRunner
 from sai_cli import doctor
-from sai_cli.core import keeper, margin, settings, storage, stream, update, updater
+from sai_cli.core import keeper, log, margin, settings, storage, stream, update, updater
 from sai_cli.sai_cli import main
 from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
@@ -320,8 +320,9 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 @pytest.mark.parametrize("default_home", [False, True])
+@pytest.mark.parametrize("trader_mode", [0o700, 0o775])
 def test_doctor_repairs_a_dedicated_existing_sai_home(
-    isolated_home, default_home, monkeypatch
+    isolated_home, default_home, trader_mode, monkeypatch
 ):
     if default_home:
         monkeypatch.setenv("HOME", str(isolated_home))
@@ -332,21 +333,68 @@ def test_doctor_repairs_a_dedicated_existing_sai_home(
     wheels = updater.private_cache()
     (wheels / update.wheel_name("0.1.0")).touch()
     isolated_home.chmod(0o755)
+    trader = isolated_home / "trader"
+    trader.chmod(trader_mode)
+    expected_modes = [{"path": str(isolated_home), "mode": "755"}]
+    expected_fix = f"chmod go-rwx {isolated_home}"
+    expected_changes = [f"chmod {isolated_home} 755 -> 700"]
+    if trader_mode != 0o700:
+        expected_modes.append({"path": str(trader), "mode": f"{trader_mode:o}"})
+        expected_fix += f"; chmod go-rwx {trader}"
+        expected_changes.insert(0, f"chmod {trader} {trader_mode:o} -> 700")
 
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "warn"
-    assert check["details"]["looseModes"] == [
-        {"path": str(isolated_home), "mode": "755"}
-    ]
+    assert check["details"]["looseModes"] == expected_modes
+    assert check["fix"] == expected_fix
+    assert isolated_home.stat().st_mode & 0o777 == 0o755
+    assert trader.stat().st_mode & 0o777 == trader_mode
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "fixed"
+    assert check["changes"] == expected_changes
+    assert isolated_home.stat().st_mode & 0o777 == 0o700
+    assert trader.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_leaves_a_home_with_only_foreign_config_at_0755(isolated_home):
+    config = isolated_home / "config.toml"
+    config.write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+
+    # A second fix run sees the first run's empty trader directory and logs.
+    for flags in [("--no-fix",), (), ()]:
+        code, output = run_cli("--json", "doctor", "--offline", *flags)
+        assert code == 0
+        check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+        assert check["status"] == "warn"
+        assert "moving the profile to a dedicated directory" in check["fix"]
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
+        assert config.read_text() == "[foreign]\nsetting = true\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_repairs_a_home_with_sai_command_logs(isolated_home):
+    code, _ = run_cli("--json", "config", "get", "keeper.endpoint")
+    assert code == 0 and log.flush()
+    assert not (isolated_home / "trader").exists()
+    isolated_home.chmod(0o755)
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["fix"] == f"chmod go-rwx {isolated_home}"
     assert isolated_home.stat().st_mode & 0o777 == 0o755
 
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
     assert check["status"] == "fixed"
-    assert check["changes"] == [f"chmod {isolated_home} 755 -> 700"]
     assert isolated_home.stat().st_mode & 0o777 == 0o700
 
 

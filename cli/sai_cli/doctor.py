@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import stat
@@ -29,7 +30,7 @@ import tempfile
 import threading
 import time
 from collections.abc import Callable, Generator, Sequence
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
@@ -464,7 +465,9 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
     return changes, failed
 
 
-def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
+def profile_has_data(
+    fd: int, owner: int, directory: str = "", *, allow_loose_trader: bool = False
+) -> bool | None:
     """Check for Sai data. Return None if the layout contains an unfamiliar entry."""
     has_data = False
     for name in os.listdir(fd):
@@ -472,7 +475,11 @@ def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
         if info.st_uid != owner:
             return None
         if name in PROFILE_DIRS.get(directory, ()) and stat.S_ISDIR(info.st_mode):
-            if info.st_mode & PROFILE_SHARED_MODE:
+            mode = info.st_mode
+            if allow_loose_trader and not directory and name == "trader":
+                # check_home clears these bits before applying a root repair.
+                mode &= ~0o077
+            if mode & PROFILE_SHARED_MODE:
                 return None
             child = os.open(
                 name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
@@ -493,15 +500,25 @@ def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
             or (directory == "cache/wheels" and update.is_wheel_name(name))
         ):
             return None
-        elif directory != "logs":
-            # Doctor creates diagnostics when it runs. Those alone do not
-            # establish that the user had a Sai profile here.
+        elif directory in ("trader", "cache/wheels"):
             has_data = True
     return has_data
 
 
-def tighten_profile_root(path: Path) -> str | None:
-    """Repair a dedicated, user-owned profile during an explicit doctor fix."""
+def profile_has_sai_logs(path: Path) -> bool:
+    # Doctor can create logs in an ambiguous home. Require evidence of
+    # another Sai command before using the logs to identify the profile.
+    with closing(log.LogScan().rows(path / log.DIR_NAME)) as rows:
+        return any(
+            row.get("event") == "command.start"
+            and isinstance(command := row.get("command"), str)
+            and command != "doctor"
+            for row in rows
+        )
+
+
+def repair_profile_root(path: Path, *, apply: bool) -> str | None:
+    """Report or apply the mode repair for a dedicated, user-owned profile."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
@@ -511,10 +528,18 @@ def tighten_profile_root(path: Path) -> str | None:
                 info.st_uid != os.getuid()
                 or mode & PROFILE_SHARED_MODE
                 or not mode & 0o077
-                or not profile_has_data(fd, info.st_uid)
-                or os.fstat(fd).st_mode != info.st_mode
             ):
                 return None
+            has_data = profile_has_data(fd, info.st_uid, allow_loose_trader=not apply)
+            if (
+                has_data is None
+                or (not has_data and not profile_has_sai_logs(path))
+                or os.fstat(fd).st_mode != info.st_mode
+                or not os.path.samestat(info, path.lstat())
+            ):
+                return None
+            if not apply:
+                return f"chmod go-rwx {shlex.quote(str(path))}"
             private_mode = mode & ~0o077
             os.fchmod(fd, private_mode)
         finally:
@@ -549,7 +574,13 @@ def check_home(ctx: Context) -> Check:
         )
     trader_exists = root.is_dir()
     if loose and not ctx.fix:
-        trader_fix = "; ".join(f"chmod go-rwx {path}" for path, _, _ in trader_loose)
+        mode_fixes = [
+            f"chmod go-rwx {shlex.quote(str(path))}" for path, _, _ in trader_loose
+        ]
+        if home_loose and (repair := repair_profile_root(sai_home, apply=False)):
+            mode_fixes.insert(0, repair)
+            home_fix = ""
+        trader_fix = "; ".join(mode_fixes)
         return Check(
             "home",
             "warn",
@@ -570,7 +601,7 @@ def check_home(ctx: Context) -> Check:
     if trader_exists and trader_loose:
         changes, failed = tighten(root, MANAGED)
     if home_loose and not failed:
-        change = tighten_profile_root(sai_home)
+        change = repair_profile_root(sai_home, apply=True)
         if change is not None:
             changes.append(change)
             home_fix = ""
