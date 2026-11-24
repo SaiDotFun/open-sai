@@ -18,9 +18,16 @@ def cli_pair() -> tuple[tuple[str, ...], tuple[str, ...]]:
     executable = shutil.which(candidate)
     if executable is None:
         pytest.fail("SAI_PARITY_BIN must name an executable")
-    python_sai = shutil.which("sai", path=str(Path(sys.executable).parent))
+    reference = os.environ.get("SAI_PARITY_PYTHON")
+    python_sai = (
+        shutil.which(reference)
+        if reference is not None
+        else shutil.which("sai", path=str(Path(sys.executable).parent))
+    )
     if python_sai is None:
-        pytest.fail("Install the Python project in the test environment with uv sync")
+        pytest.fail(
+            "Install the Python reference with uv sync and set SAI_PARITY_PYTHON if needed"
+        )
     rust_sai = Path(executable).resolve()
     with rust_sai.open("rb") as binary:
         magic = binary.read(4)
