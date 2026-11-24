@@ -6,9 +6,11 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -53,6 +55,8 @@ if args[1] == "remove":
         sys.exit(1)
     del servers[name]
 else:
+    if name in servers:
+        sys.exit(1)
     dash = args.index("--")
     env = dict(
         a.split("=", 2)[1:] for a in args[:dash] if a.startswith("--env=")
@@ -2101,20 +2105,182 @@ def test_codex_project_tool_filter_is_an_override(env: Env):
     assert "Client registrations changed." not in message
 
 
-def test_reconnect_is_needed_when_a_remove_ran_before_a_failed_add(env: Env):
-    (env.home / ".claude.json").write_text(
-        json.dumps({"mcpServers": {"sai": claude_entry([OLD_COMMAND])}})
+@pytest.mark.parametrize("scope", ["user", "project", "local"])
+def test_claude_recovers_a_rejected_replacement(
+    env: Env, monkeypatch: pytest.MonkeyPatch, scope: str
+):
+    sai_home = env.root / "sai-home"
+    monkeypatch.setenv("SAI_HOME", str(sai_home))
+    entry = claude_entry(
+        [*serve(env), "--endpoint", "http://127.0.0.1:8765"], {"CUSTOM": SECRET}
     )
+    entry["customSetting"] = True
+    other = {"url": "https://private.example/mcp"}
+    original = {"mcpServers": {"sai": entry, OTHER: other}}
+    config = (
+        env.project / ".mcp.json" if scope == "project" else env.home / ".claude.json"
+    )
+    if scope == "local":
+        original = {"projects": {str(env.project): original}}
+    config.write_text(json.dumps(original))
     fails_add = FAKE_CLAUDE.replace(
         "args = sys.argv[1:]\n",
         "args = sys.argv[1:]\nif args[1] == 'add':\n    sys.exit(3)\n",
     )
     write_exe(env.bin / "claude", fails_add)
-    result = invoke("mcp", "install", "claude")
+
+    install = ("mcp", "install", "claude", "--scope", scope)
+    restore = (*install, "--restore-previous")
+    result = invoke(*install)
     message = failure(result)
-    assert "claude (user): failed" in message
+    assert f"claude ({scope}): failed" in message
     assert "Client registrations changed." in message
     details = payload(result)["error"]["details"]
     assert details["reconnectNeeded"] is True
     [row] = details["results"]
     assert row["action"] == "failed" and row["changed"] is True
+    assert SECRET not in result.output
+    assert SECRET not in config.read_text()
+    [record] = list((sai_home / "mcp-recovery").glob("*.json"))
+    assert OTHER not in record.read_text()
+    if os.name != "nt":
+        assert stat.S_IMODE(record.stat().st_mode) == 0o600
+        assert stat.S_IMODE(record.parent.stat().st_mode) == 0o700
+
+    before = config.read_bytes(), record.read_bytes()
+    advice = f"sai mcp install claude --scope {scope} --restore-previous"
+    retry = invoke(*install)
+    assert advice in failure(retry)
+    assert SECRET not in retry.output
+    doctor = invoke("doctor", "--offline", "--no-fix")
+    check = mcp_checks(doctor)["claude"]
+    assert check["status"] == "fail" and advice in check["fix"]
+    assert SECRET not in doctor.output
+    planned = invoke(*restore, "--dry-run")
+    assert planned.exit_code == 0, planned.output
+    assert payload(planned)["results"][0]["would"] == "restored"
+    assert (config.read_bytes(), record.read_bytes()) == before
+
+    restored = invoke(*restore)
+    assert restored.exit_code == 0, restored.output
+    assert actions(restored) == {"claude": "restored"}
+    assert payload(restored)["reconnectNeeded"]
+    assert SECRET not in restored.output
+    assert json.loads(config.read_text()) == original
+    assert not record.exists()
+    assert [args[1] for args in env.calls() if args[1] != "get"] == ["remove", "add"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Kills the installer with SIGKILL")
+def test_claude_recovers_after_installer_dies_between_remove_and_add(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SAI_HOME", str(env.root / "sai-home"))
+    config = env.home / ".claude.json"
+    entry = claude_entry([*serve(env), "--endpoint", "http://127.0.0.1:8765"])
+    original = {"mcpServers": {"sai": entry}}
+    config.write_text(json.dumps(original))
+    write_exe(
+        env.bin / "claude",
+        FAKE_CLAUDE
+        + "if args[1] == 'remove':\n    import signal\n"
+        + "    os.kill(os.getppid(), signal.SIGKILL)\n",
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-m", "sai_cli.sai_cli", "--json", "mcp", "install", "claude"],
+        cwd=env.project,
+        capture_output=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert result.returncode == -signal.SIGKILL, result.stderr
+    assert [args[1] for args in env.calls()] == ["remove"]
+    assert env.claude_json()["mcpServers"] == {}
+    doctor = invoke("doctor", "--offline")
+    assert doctor.exit_code == 1
+    assert "--restore-previous" in mcp_checks(doctor)["claude"]["fix"]
+    restored = invoke("mcp", "install", "claude", "--restore-previous")
+    assert restored.exit_code == 0, restored.output
+    assert json.loads(config.read_text()) == original
+
+
+def test_claude_restore_keeps_an_entry_added_during_the_failed_replacement(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SAI_HOME", str(env.root / "sai-home"))
+    config = env.home / ".claude.json"
+    config.write_text(json.dumps({"mcpServers": {"sai": claude_entry([OLD_COMMAND])}}))
+
+    # After removing the old entry, run an independent Claude install.
+    concurrent = (
+        "\nif args[1] == 'remove':\n"
+        "    import subprocess\n"
+        "    subprocess.run([sys.argv[0], 'mcp', 'add', '--scope', 'user', "
+        "'sai', '--', 'another-command'], check=True)\n"
+    )
+    write_exe(env.bin / "claude", FAKE_CLAUDE + concurrent)
+    assert "`claude mcp add` exited 1" in failure(invoke("mcp", "install", "claude"))
+    before = config.read_bytes()
+
+    restored = invoke("mcp", "install", "claude", "--restore-previous")
+
+    assert "already exists in Claude Code" in failure(restored)
+    assert config.read_bytes() == before
+    assert env.claude_json()["mcpServers"]["sai"]["command"] == "another-command"
+
+
+def test_concurrent_sai_uninstall_cancels_claude_recovery(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    sai_home = env.root / "sai-home"
+    monkeypatch.setenv("SAI_HOME", str(sai_home))
+    (env.home / ".claude.json").write_text(
+        json.dumps({"mcpServers": {"sai": claude_entry([OLD_COMMAND])}})
+    )
+    waiting = env.root / "add-waiting"
+    release = env.root / "release-add"
+    reject = f"""
+if args[1] == "add":
+    import time
+    Path({str(waiting)!r}).touch()
+    deadline = time.monotonic() + 12
+    while not Path({str(release)!r}).exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    sys.exit(3)
+"""
+    write_exe(
+        env.bin / "claude",
+        FAKE_CLAUDE.replace("args = sys.argv[1:]\n", "args = sys.argv[1:]\n" + reject),
+    )
+    command = [sys.executable, "-m", "sai_cli.sai_cli", "--json", "mcp"]
+    with subprocess.Popen(
+        [*command, "install", "claude"], cwd=env.project, stdout=subprocess.DEVNULL
+    ) as install:
+        try:
+            deadline = time.monotonic() + 10
+            while not waiting.exists() and time.monotonic() < deadline:
+                assert install.poll() is None
+                time.sleep(0.01)
+            assert waiting.exists()
+            with subprocess.Popen(
+                [*command, "uninstall", "claude", "--scope", "user"],
+                cwd=env.project,
+                stdout=subprocess.DEVNULL,
+            ) as uninstall:
+                try:
+                    with pytest.raises(subprocess.TimeoutExpired):
+                        uninstall.wait(timeout=2)
+                finally:
+                    release.touch()
+                assert uninstall.wait(timeout=10) == 0
+        finally:
+            release.touch()
+        assert install.wait(timeout=10) == 1
+
+    assert not list((sai_home / "mcp-recovery").glob("*.json"))
+    assert env.claude_json()["mcpServers"] == {}
+    assert "No previous Claude Code registration" in failure(
+        invoke("mcp", "install", "claude", "--restore-previous")
+    )

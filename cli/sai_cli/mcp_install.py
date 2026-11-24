@@ -5,8 +5,8 @@ Ordinary Claude Code installs and uninstalls use its `mcp add` and
 entry in its config file. Codex and Cursor writes also edit config files.
 
 Registration inspection keeps only Sai's command, args, and selected
-metadata. Repair retains the full entry in memory to preserve settings
-when publishing the replacement.
+metadata. Claude Code replacements save the original entry under SAI_HOME
+until the replacement succeeds.
 """
 
 from __future__ import annotations
@@ -20,7 +20,8 @@ import subprocess
 import sys
 import tempfile
 import tomllib
-from collections.abc import Callable, Mapping, MutableMapping
+from collections.abc import Callable, Generator, Mapping, MutableMapping
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -30,7 +31,7 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import InlineTable
 
-from .core import settings
+from .core import paths, settings
 
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
@@ -643,6 +644,44 @@ class Claude(Client):
     def remove_steps(self, scope: str, name: str = NAME) -> list[list[str]]:
         return [[self.require_exe(), "mcp", "remove", "--scope", scope, name]]
 
+    def recovery_dir(self) -> Path:
+        return paths.sai_home(self.environ) / "mcp-recovery"
+
+    def recovery_path(self, scope: str) -> Path:
+        path = repair_path(self, scope).resolve()
+        key = json.dumps(
+            [str(path), scope, str(self.cwd) if scope == "local" else None]
+        )
+        return (
+            self.recovery_dir()
+            / f"claude-{hashlib.sha256(key.encode()).hexdigest()}.json"
+        )
+
+    @contextmanager
+    def mutation_lock(self) -> Generator[None]:
+        # Keep the recovery record and Claude mutations in order across Sai
+        # processes. A dying installer releases the lock with its record intact.
+        root = paths.private_directory(self.recovery_dir().parent, profile_root=True)
+        directory = paths.private_directory(root / self.recovery_dir().name)
+        fd = os.open(directory / ".claude.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+
+    def recovery_scopes(self, scope: str | None = None) -> tuple[str, ...]:
+        if scope is not None:
+            return (scope,)
+        return UNINSTALL_SCOPES if self.cwd is not None else ("user",)
+
 
 class Codex(Client):
     name = "codex"
@@ -929,55 +968,79 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
     result = Result(client.name, "failed", command=target.argv, scope=scope)
     try:
-        if isinstance(client, Codex):
-            client.check_scope(scope)
-            client.require_exe()
-        found = client.registrations()
-        existing = next((r for r in found if r.scope == scope), None)
-        if existing is None:
-            legacy = client.effective(client.registrations(RETIRED_NAME))
-            if legacy is not None:
-                return report_legacy_install(client, legacy, target)
-        elif isinstance(client, Claude) and existing.disabled:
-            raise ClientError(
-                f"Claude Code has disabled the {existing.scope} sai registration. "
-                "Review MCP approvals and settings in the client."
-            )
-        winner = client.effective(found)
-        if (
-            winner is not None
-            and client.rank(winner.scope) < client.rank(scope)
-            and not winner.matches(target)
+        with (
+            client.mutation_lock()
+            if isinstance(client, Claude) and not dry_run
+            else nullcontext()
         ):
-            if winner.scope in client.read_only_scopes and isinstance(client, Codex):
-                raise ClientError(client.project_message())
-            result.shadowed_by = winner.scope
-        if existing is not None and existing.matches(target):
-            result.action = "unchanged"
-            return result
-        action = "added" if existing is None else "replaced"
-        if isinstance(client, (Codex, Cursor)):
-            result.path = str(client.config_path(scope))
-            steps: list[list[str]] = []
-        else:
-            steps = replacement_steps(client, scope, target, existing is not None)
-            result.argv = steps
-        if dry_run:
-            result.action, result.would = "planned", action
-            return result
-        if isinstance(client, (Codex, Cursor)):
-            client.write(scope, target)
-        else:
-            for argv in steps:
-                run(argv)
-                # Set per step: a remove that ran before a failed add still
-                # changed the client.
-                result.changed = True
-        result.changed = True
-        client.verify(scope, target)
-        result.action = action
+            return install_registration(client, scope, target, dry_run, result)
     except (ClientError, OSError) as exc:
-        result.action, result.error = "failed", str(exc)
+        result.error = str(exc)
+        return result
+
+
+def install_registration(
+    client: Client, scope: str, target: Target, dry_run: bool, result: Result
+) -> Result:
+    if isinstance(client, Codex):
+        client.check_scope(scope)
+        client.require_exe()
+    found = client.registrations()
+    existing = next((r for r in found if r.scope == scope), None)
+    recovery = client.recovery_path(scope) if isinstance(client, Claude) else None
+    if existing is None:
+        if recovery is not None and recovery.exists():
+            raise ClientError(
+                f"Claude Code's previous {scope} sai registration can be restored. "
+                + claude_recovery_hint(scope)
+            )
+        legacy = client.effective(client.registrations(RETIRED_NAME))
+        if legacy is not None:
+            return report_legacy_install(client, legacy, target)
+    elif isinstance(client, Claude) and existing.disabled:
+        raise ClientError(
+            f"Claude Code has disabled the {existing.scope} sai registration. "
+            "Review MCP approvals and settings in the client."
+        )
+    winner = client.effective(found)
+    if (
+        winner is not None
+        and client.rank(winner.scope) < client.rank(scope)
+        and not winner.matches(target)
+    ):
+        if winner.scope in client.read_only_scopes and isinstance(client, Codex):
+            raise ClientError(client.project_message())
+        result.shadowed_by = winner.scope
+    if existing is not None and existing.matches(target):
+        if recovery is not None and not dry_run:
+            recovery.unlink(missing_ok=True)
+        result.action = "unchanged"
+        return result
+    action = "added" if existing is None else "replaced"
+    if isinstance(client, (Codex, Cursor)):
+        result.path = str(client.config_path(scope))
+        steps: list[list[str]] = []
+    else:
+        steps = replacement_steps(client, scope, target, existing is not None)
+        result.argv = steps
+    if dry_run:
+        result.action, result.would = "planned", action
+        return result
+    if isinstance(client, (Codex, Cursor)):
+        client.write(scope, target)
+    else:
+        if isinstance(client, Claude) and existing is not None:
+            assert recovery is not None
+            save_claude_recovery(client, existing, recovery)
+        for argv in steps:
+            run(argv)
+            # A remove that ran before a failed add changed the client.
+            result.changed = True
+    result.changed = True
+    client.verify(scope, target)
+    if recovery is not None:
+        recovery.unlink(missing_ok=True)
+    result.action = action
     return result
 
 
@@ -990,9 +1053,25 @@ def uninstall_client(
     since removing the others leaves it running.
     """
     try:
-        found = [(name, client.registrations(name)) for name in SERVER_NAMES]
-    except ClientError as exc:
+        with (
+            client.mutation_lock()
+            if isinstance(client, Claude) and not dry_run
+            else nullcontext()
+        ):
+            return uninstall_registrations(client, scope, dry_run, target)
+    except (ClientError, OSError) as exc:
         return [Result(client.name, "failed", scope=scope, error=str(exc))]
+
+
+def uninstall_registrations(
+    client: Client, scope: str | None, dry_run: bool, target: Target | None
+) -> list[Result]:
+    found = [(name, client.registrations(name)) for name in SERVER_NAMES]
+    if isinstance(client, Claude) and not dry_run:
+        # An intentional uninstall cancels recovery, even if there is
+        # no entry left to remove or this process dies after removing it.
+        for selected_scope in client.recovery_scopes(scope):
+            client.recovery_path(selected_scope).unlink(missing_ok=True)
     results = []
     for name, entries in found:
         selected = [reg for reg in entries if scope is None or reg.scope == scope]
@@ -1292,8 +1371,10 @@ class ClientConfig:
     destination: Path
 
 
-def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
-    """Read an editable scope. Keep the full entry local to the repair."""
+def read_client_config(
+    client: Client, scope: str, path: Path, *, create_local: bool = False
+) -> ClientConfig:
+    """Read an editable scope without exposing its contents."""
     destination = path.resolve()
     seen = read_bytes(destination)
     raw = seen.decode() if seen is not None else ""
@@ -1302,8 +1383,13 @@ def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
         raise ClientError("Expected an MCP config object")
     holder = data
     if scope == "local":
-        projects = data.get("projects", {})
-        holder = projects.get(str(client.cwd)) if isinstance(projects, dict) else None
+        projects = (
+            data.setdefault("projects", {}) if create_local else data.get("projects")
+        )
+        if client.cwd is None or not isinstance(projects, dict):
+            raise ClientError("Could not find the local MCP config")
+        key = str(client.cwd)
+        holder = projects.setdefault(key, {}) if create_local else projects.get(key)
         if not isinstance(holder, dict):
             raise ClientError("Could not find the local MCP config")
     entries = holder.setdefault("mcpServers", {})
@@ -1326,6 +1412,69 @@ def repair_path(client: Client, scope: str) -> Path:
         return client.config_path()
     assert isinstance(client, Cursor)
     return client.config_path(scope)
+
+
+def save_claude_recovery(client: Claude, existing: Registration, record: Path) -> None:
+    path = repair_path(client, existing.scope)
+    try:
+        config = read_client_config(client, existing.scope, path)
+    except (OSError, ValueError):
+        raise ClientError(
+            "Could not read the previous Claude Code registration"
+        ) from None
+    entry = config.entries.get(NAME)
+    if entry_registration(entry, existing.scope, existing.disabled) != existing:
+        raise ClientError("The Sai registration changed before it could be backed up")
+    settings.write_file(record, json.dumps({"version": 1, "entry": entry}) + "\n")
+
+
+def claude_recovery_hint(scope: str) -> str:
+    hint = f"Run `sai mcp install claude --scope {scope} --restore-previous`."
+    if scope != "user":
+        hint += " Run this from the project directory."
+    return hint
+
+
+def restore_claude_previous(client: Claude, scope: str, dry_run: bool) -> Result:
+    result = Result(client.name, "failed", scope=scope)
+    try:
+        with nullcontext() if dry_run else client.mutation_lock():
+            path = repair_path(client, scope)
+            record = client.recovery_path(scope)
+            saved = load_json(record)
+            if saved is None:
+                raise ClientError(
+                    f"No previous Claude Code registration for {scope} scope"
+                )
+            entry = saved.get("entry")
+            if saved.get("version") != 1 or not isinstance(entry, dict):
+                raise ClientError("Invalid Claude Code recovery record")
+            config = read_client_config(client, scope, path, create_local=True)
+            if NAME in config.entries:
+                raise ClientError(
+                    f"A {scope} sai registration already exists in Claude Code"
+                )
+            if dry_run:
+                result.action, result.would = "planned", "restored"
+                return result
+            config.entries[NAME] = entry
+            if not replace_bytes(
+                path,
+                config.render().encode(),
+                config.seen,
+                destination=config.destination,
+            ):
+                raise ClientError(
+                    "The Claude Code registration changed before it could be restored"
+                )
+            result.changed = True
+            record.unlink()
+            result.action = "restored"
+    except ClientError as exc:
+        result.error = str(exc)
+    except (OSError, ValueError):
+        result.error = "Could not restore the previous Claude Code registration"
+    return result
 
 
 def replace_registration(
@@ -1451,6 +1600,20 @@ def check_registration(
         inspected = [
             (reg, stale_registration(client, server, reg)) for server, reg in found
         ]
+        if isinstance(client, Claude):
+            registered = {reg.scope for server, reg in found if server == NAME}
+            recoverable = [
+                scope
+                for scope in client.recovery_scopes()
+                if scope not in registered and client.recovery_path(scope).exists()
+            ]
+            if recoverable:
+                return RegistrationCheck(
+                    name,
+                    "fail",
+                    f"Claude Code's previous Sai registration can be restored in {', '.join(recoverable)} scope",
+                    " ".join(map(claude_recovery_hint, recoverable)),
+                )
     except (ClientError, OSError, ValueError):
         return RegistrationCheck(
             name, "fail", "Could not read the client's Sai registrations", install
