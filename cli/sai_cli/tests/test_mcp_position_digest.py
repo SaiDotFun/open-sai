@@ -803,7 +803,7 @@ def test_mcp_position_estimates_do_not_change_confirmed_terms(
         async with connected_client(base_url) as client:
             variants = (
                 ("close", {}, "0.016", "unbounded", None),
-                ("partial_close", {"percent": 50}, "0.008", "unbounded", "60"),
+                ("partial_close", {"percent": 50}, "0.02", "unbounded", "60"),
                 ("leverage", {"leverage": "4"}, "0", "not_applicable", "80"),
                 (
                     "margin",
@@ -990,5 +990,21 @@ def test_close_fee_uses_exact_perp_rate(position_service):
         async with connected_client(base_url) as client:
             quote = await call(client, "preview_close", {"trade_id": 7})
             assert quote["estimates"]["fees"]["amountUsdc"] == "3.999999"
+
+    asyncio.run(scenario())
+
+
+def test_partial_close_includes_the_perp_trigger_fee(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client, "preview_partial_close", {"trade_id": 7, "percent": 50}
+            )
+            assert quote["quote"]["closedNotionalUsdc"] == "100"
+            assert quote["estimates"]["fees"]["amountUsdc"] == "0.5"
 
     asyncio.run(scenario())

@@ -270,6 +270,7 @@ def position_estimates(
                     price,
                     _notional(collateral if close else reduce_by, effective),
                     opening=False,
+                    triggered=not close,
                 )
             except READ_ERRORS:
                 pass
