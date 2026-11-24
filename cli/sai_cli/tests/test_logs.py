@@ -105,6 +105,7 @@ def assert_log_golden(
     runs: dict[str, str] = {}
     calls: dict[str, str] = {}
     commands: dict[str, str] = {}
+    endpoints: dict[str, str] = {}
     pids: dict[int, int] = {}
     rows = []
     for index, line in enumerate(lines, 1):
@@ -127,6 +128,11 @@ def assert_log_golden(
                 case "commandId":
                     values[field] = commands.setdefault(
                         value, f"{len(commands) + 1:032x}"
+                    )
+                case "endpointId":
+                    assert log_queries.ENDPOINT_ID.fullmatch(value)
+                    values[field] = endpoints.setdefault(
+                        value, f"h1_{len(endpoints) + 1:064x}"
                     )
                 case "durationMs":
                     values[field] = 0
@@ -1644,8 +1650,8 @@ def test_sai_mcp_serve_logs_tool_calls_and_keeps_stdout_protocol_only(home):
 def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
     endpoint, state = keeper_stub
     token = save_session(endpoint)
-    request_hash = "0x" + "12" * 32
-    state.ack_tx_hash = request_hash
+    request_hash = "ab" * 32
+    state.ack_tx_hash = request_hash.upper()
     submitted = subprocess.run(
         [*sai_command(), "--json", "--endpoint", endpoint, "trade", "close", "7"],
         env={"SAI_HOME": str(home), "PATH": os.defpath},
@@ -1664,9 +1670,6 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
         {
             key: "20260101T000000000Z_0123456789ABCDEF",
             endpoint.removesuffix("/query"): "http://127.0.0.1:43210",
-            str(log.endpoint_id(endpoint)): str(
-                log.endpoint_id("http://127.0.0.1:43210/query")
-            ),
         },
     )
     assert state.authorizations == [f"Bearer {token}"]
@@ -1765,7 +1768,7 @@ def test_log_queries_report_process_gaps_and_order_legacy_events(home):
         "event": "intent.keeper",
         "intentKey": "KEY",
         "addr": ADDR,
-        "endpointId": log.endpoint_id("http://localhost/query"),
+        "endpointId": "h1_" + "1" * 64,
         "callId": "first",
         "seq": 2,
     }
@@ -1859,7 +1862,7 @@ def test_intent_scope_separates_accounts_paths_and_repl_invocations(home, keeper
     assert status(other_endpoint, ADDR, key)[0] == 0
     assert log.origin(other_endpoint) == log.origin(endpoint)
     assert log.endpoint_id(other_endpoint) != log.endpoint_id(endpoint)
-    assert log.endpoint_id(other_endpoint) == log.endpoint_id(
+    assert log.endpoint_id(other_endpoint) != log.endpoint_id(
         other_endpoint.partition("?")[0]
     )
     result = json.loads(run_cli("--json", "logs", "intent", key, "--offline")[1])
@@ -1882,6 +1885,117 @@ def test_intent_scope_separates_accounts_paths_and_repl_invocations(home, keeper
     assert code == 0 and "Several accounts match this key" in output
     assert "Keeper has no record" not in output
     assert len(state.requests) == request_count
+
+
+def test_query_routed_keepers_and_homes_have_distinct_endpoint_ids(home, keeper_stub):
+    base, state = keeper_stub
+    route_a = base + "?route=opaque-route-a"
+    route_b = base + "?route=opaque-route-b"
+    key = "KEY"
+    record = {
+        "intentKey": key,
+        "evmAddress": ADDR,
+        "execActor": "server",
+        "kind": "CLOSE_POSITION",
+        "lifecycleStep": "exec_req_pass",
+    }
+    state.intents = [{**record, "txHash": "A" * 64}]
+    assert (
+        run_cli("--endpoint", route_a, "intent", "status", ADDR, "--key", key)[0] == 0
+    )
+    state.intents = [{**record, "txHash": "B" * 64}]
+    report = json.loads(
+        run_cli("--json", "--endpoint", route_b, "logs", "intent", key, "--addr", ADDR)[
+            1
+        ]
+    )
+    assert report["keeper"]["txHash"] == report["txHash"] == "b" * 64
+    assert report["events"] == []
+
+    assert (
+        run_cli("--endpoint", route_b, "intent", "status", ADDR, "--key", key)[0] == 0
+    )
+    identity_a, identity_b = log.endpoint_id(route_a), log.endpoint_id(route_b)
+    assert identity_a and identity_b and identity_a != identity_b
+    entries = events(home, "intent.keeper")
+    assert [line["endpointId"] for line in entries] == [identity_a, identity_b]
+    assert {line["endpoint"] for line in entries} == {log.origin(base)}
+    assert "opaque-route-" not in raw_logs(home)
+    keyfile = home / "logs" / log.ENDPOINT_KEY
+    assert keyfile.stat().st_size == 32
+    if os.name != "nt":
+        assert stat.S_IMODE(keyfile.stat().st_mode) == 0o600
+
+    second_home = home / "second-home"
+    assert log.endpoint_id(route_a, second_home / "logs") is None
+    assert not second_home.exists()
+    subprocess.run(
+        [*sai_command(), "--endpoint", route_a, "market", "prices"],
+        env={"SAI_HOME": str(second_home), "PATH": os.defpath},
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    second_identity = log.endpoint_id(route_a, second_home / "logs")
+    assert second_identity and second_identity != identity_a
+
+
+def test_keeper_lifecycle_codes_and_user_actor_survive_mcp_and_audit(home, keeper_stub):
+    endpoint, state = keeper_stub
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    nibi = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
+    for code, actor, step, value, normalized in (
+        ("simulation_failed", "server", "exec_req_fail", "AB" * 32, "ab" * 32),
+        (
+            "chain_execution_failed",
+            "user",
+            "exec_fail",
+            "0x" + "CD" * 32,
+            "0x" + "cd" * 32,
+        ),
+    ):
+        state.intents = [
+            {
+                "intentKey": key,
+                "evmAddress": ADDR,
+                "nibiAddress": nibi,
+                "execActor": actor,
+                "lifecycleStep": step,
+                "errorCode": code,
+                "errorMsg": "opaque-upstream-error",
+                "txHash": value,
+            }
+        ]
+        status = call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][
+            0
+        ]
+        assert (status["errorCode"], status["execActor"], status["txHash"]) == (
+            code,
+            actor,
+            normalized,
+        )
+        assert status["errorMsg"] == "Keeper reported an intent error."
+        assert status["nibiAddress"] == nibi
+        assert "txHashInvalid" not in status
+        report = call(mcp, "logs_intent", {"key": key, "addr": ADDR})
+        assert report["keeper"]["errorCode"] == code
+        assert report["keeper"]["execActor"] == actor
+        assert report["txHash"] == normalized
+    assert "opaque-upstream-error" not in raw_logs(home)
+
+
+def test_mcp_audit_omits_invalid_arguments_from_call_log(home):
+    mcp = server.create_server()
+    marker = "opaque-audit-argument-secret"
+    result = call(
+        mcp,
+        "logs_intent",
+        {"key": "KEY", "offline": True, "before": marker, "addr": ADDR},
+    )
+    assert result["code"] == "INVALID_REQUEST"
+    assert events(home, "mcp.tool_call")[0]["arguments"] == {}
+    assert marker not in raw_logs(home)
 
 
 def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keeper_stub):
@@ -1925,19 +2039,31 @@ def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keepe
     invalid = call(mcp, "logs_intent", {"key": "https://host/?token=" + secret})
     assert invalid["code"] == "INVALID_REQUEST" and secret not in json.dumps(invalid)
     state.intents = [
-        {**state.intents[0], "lifecycleStep": "exec_pass", "execActor": "server"}
+        {
+            **state.intents[0],
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "kind": "CLOSE_POSITION",
+            "txHash": "a" * 64,
+        }
     ]
     state.history = [
         {
             "intentKey": key,
-            "trade": {"id": 7, "extra": secret},
+            "trade": {"id": 7, "trader": ADDR, "extra": secret},
+            "evmTxHash": "0x" + "a" * 64,
             "txHash": secret,
             "tradeChangeType": secret,
         }
     ]
     status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
     assert status["matchedTradeHistory"] == [
-        {"intentKey": key, "trade": {"id": 7}, "txHashInvalid": True}
+        {
+            "intentKey": key,
+            "trade": {"id": 7, "trader": ADDR},
+            "txHashInvalid": True,
+            "evmTxHash": "0x" + "a" * 64,
+        }
     ]
     assert secret not in json.dumps(status)
 
@@ -1946,7 +2072,7 @@ def test_intent_reports_unattributed_gaps_and_skips_nonfinite_rows(home):
     root = home / "logs"
     root.mkdir()
     path = log.file_path("cli", log.now().date(), root)
-    scope = {"addr": ADDR, "endpointId": log.endpoint_id("http://localhost/query")}
+    scope = {"addr": ADDR, "endpointId": "h1_" + "1" * 64}
     row = {
         **scope,
         "ts": log.stamp(log.now()),
@@ -2041,21 +2167,94 @@ def test_earlier_intent_page_keeps_same_day_invocation_anchor(home, keeper_stub)
     assert earlier in report["events"]
 
 
+def test_intent_page_finds_start_and_anchor_in_two_utc_days(home):
+    root = home / "logs"
+    root.mkdir()
+    start = {
+        "event": "command.start",
+        "runId": "process",
+        "commandId": "command",
+        "seq": 1,
+        "ts": "2026-11-23T23:59:59.900Z",
+        "surface": "cli",
+    }
+    anchor = {
+        **start,
+        "event": "intent.reserved",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "1" * 64,
+        "seq": 2,
+        "ts": "2026-11-24T00:00:00.100Z",
+    }
+    previous = log.file_path("cli", date(2026, 11, 23), root)
+    following = log.file_path("cli", date(2026, 11, 24), root)
+    previous.write_bytes(log.encode(start))
+    following.write_bytes(log.encode(anchor))
+    assert log_queries.intent("KEY", before="2026-11-23T23:59:59.999Z")["events"] == [
+        start
+    ]
+    assert log_queries.intent("KEY")["events"] == [start, anchor]
+
+    noise = {
+        **anchor,
+        "event": "command.start",
+        "intentKey": "OTHER",
+        "commandId": "other",
+    }
+    following.write_bytes(log.encode(noise) * log.MAX_SCAN_ROWS + log.encode(anchor))
+    assert log_queries.intent("KEY", before=anchor["ts"])["events"] == [start]
+    report = log_queries.intent("KEY")
+    assert report["truncated"] and report["events"] == [start, anchor]
+    assert report["nextBefore"] == anchor["ts"]
+
+
+def test_stats_does_not_spend_row_budget_on_stale_other_surface(home):
+    root = home / "logs"
+    root.mkdir()
+    now = log.now()
+    fresh = {
+        "event": "keeper.request",
+        "operation": "prices",
+        "durationMs": 7,
+        "ts": log.stamp(now),
+    }
+    stale = {**fresh, "ts": log.stamp(now - timedelta(hours=4))}
+    log.file_path("cli", now.date(), root).write_bytes(log.encode(fresh))
+    log.file_path("mcp", now.date(), root).write_bytes(
+        log.encode({**fresh, "operation": "markets"})
+        + log.encode(stale) * (log.MAX_SCAN_ROWS + 1)
+    )
+    report = log_queries.stats("2h")
+    assert report["keeper"] == {
+        "markets": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+        "prices": {"count": 1, "p50Ms": 7, "p95Ms": 7},
+    }
+    assert "truncated" not in report
+
+
 def test_stats_caps_the_number_of_scanned_rows(home):
     root = home / "logs"
     root.mkdir()
+    today = date(2026, 11, 24)
     row = {
         "event": "keeper.request",
         "operation": "prices",
         "durationMs": 7,
-        "ts": log.stamp(log.now()),
+        "ts": "2026-11-24T11:00:00.000Z",
     }
-    path = log.file_path("cli", log.now().date(), root)
+    path = log.file_path("mcp", today, root)
     path.write_bytes(log.encode(row) * (log.MAX_SCAN_ROWS + 1))
+    log.file_path("cli", today, root).write_bytes(
+        log.encode({**row, "operation": "markets", "ts": "2026-11-24T01:00:00.000Z"})
+    )
     report = log_queries.stats()
     assert (
-        report["truncated"] and report["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS
+        report["truncated"]
+        and report["keeper"]["prices"]["count"] == log.MAX_SCAN_ROWS - 1
     )
+    assert report["keeper"]["markets"]["count"] == 1
+    assert report["nextBefore"] == row["ts"]
 
 
 def test_mcp_log_concurrency_leaves_normal_tools_available(keeper_stub):

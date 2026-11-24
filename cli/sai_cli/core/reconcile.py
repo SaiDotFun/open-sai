@@ -86,8 +86,8 @@ def _matches_account(row: Mapping[str, Any], account: str) -> bool:
     )
 
 
-def _hash(value: str | None) -> str:
-    return (value or "").lower().removeprefix("0x")
+def _hash(value: object) -> str:
+    return value.lower().removeprefix("0x") if isinstance(value, str) else ""
 
 
 def _read_history(
@@ -203,7 +203,7 @@ def reconcile(
             found=False,
             addr=account,
             endpoint=log.endpoint(endpoint),
-            endpointId=log.endpoint_id(endpoint),
+            endpointId=log.endpoint_identity(endpoint),
         )
         with write():
             local = storage.mark_absent(
@@ -233,7 +233,7 @@ def reconcile(
         txHashInvalid=invalid_hash,
         addr=account,
         endpoint=log.endpoint(endpoint),
-        endpointId=log.endpoint_id(endpoint),
+        endpointId=log.endpoint_identity(endpoint),
         code=Code.KEEPER_ERROR if outcome == "terminal-failed" else None,
     )
     if outcome == "unknown":

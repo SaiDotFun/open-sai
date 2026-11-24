@@ -434,8 +434,9 @@ cannot be tied to the key. Lost events can include the original match.
 
 The `intent` command reads Keeper's current record and returns the request
 transaction hash when available. The configured Keeper endpoint selects the
-trail. The endpoint identity includes the path in a hash. The printed
-`endpoint` field shows just the origin. Use `--addr` to select an account
+trail. The endpoint identity uses a local key to hash the full request URL,
+including its path and query. The printed `endpoint` field shows the origin.
+Use `--addr` to select an account
 or `--offline` to skip Keeper. If the local trail has several endpoint
 identities, pass a root `--endpoint` flag to select one offline. The report
 warns when the scope is ambiguous or an older line lacks enough information
@@ -445,15 +446,19 @@ The read-only MCP tool `logs_intent` accepts `offline`, `addr`, and
 `before`. It handles up to two log queries at a time and returns a busy
 error when both slots are occupied. Log reports omit stored arguments and
 free-text diagnostics. Keeper failures return a recognized code and a
-short Sai message. A malformed request transaction hash is omitted and
-sets `txHashInvalid` in the corresponding record or event.
+short Sai message. Request hashes use lowercase hex and retain an existing
+`0x` prefix. A malformed hash is omitted and sets `txHashInvalid` in the
+corresponding record or event.
 
 The `stats` command uses the retained scan window by default. Pass a positive
 whole number followed by `s`, `m`, `h`, `d`, or `w` to limit the lookback.
 The p50 and p95 use the nearest rank for each Keeper operation. Error totals
 count each coded event, so a failure can count at more than one level.
 
-Queries scan up to 128 files, 16 MiB, and 20,000 rows. A report contains
+Queries scan up to 128 files, 16 MiB, and 20,000 rows. Stats seek by UTC day
+and skip out-of-window rows before charging the row budget. The scan
+alternates surfaces within a day. Intent reports reserve part of the scan
+budget for finding command starts and anchors across midnight. A report contains
 up to 128 event or gap rows and uses a 96 KiB response budget. When
 `truncated` is true, use `nextBefore` with `--before` or the MCP `before`
 argument for earlier timestamps within the scan window. Use the files
@@ -501,6 +506,7 @@ Keeper request and response payloads. The logger also scrubs every string.
 - `mcp.tool_call` logs only the parameters the tool defines.
   `unknownArguments` counts the rest, and a call to a tool the server does
   not have is logged as tool `unknown` with no arguments.
+  The `logs_intent` tool omits its arguments from the log.
 - Other strings are cut at 2000 characters, lists and objects at 64 items,
   and one event at 512 values and about 12,000 characters. A list or object
   passed where a tool takes a single value is logged as its type and length.

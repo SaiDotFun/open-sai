@@ -8,7 +8,16 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 SCHEMA_VERSION = 2
-VOLATILE_FIELDS = ("ts", "pid", "runId", "callId", "durationMs", "version", "commandId")
+VOLATILE_FIELDS = (
+    "ts",
+    "pid",
+    "runId",
+    "callId",
+    "durationMs",
+    "version",
+    "commandId",
+    "endpointId",
+)
 
 COMMON_REQUIRED = {
     "schema": "integer",
@@ -64,9 +73,9 @@ EVENTS = {
             "intentKey": "string",
             "addr": "string",
             "endpoint": "string",
-            "endpointId": "string",
         },
         {
+            "endpointId": "string",
             "kind": "string",
             "lifecycleStep": "string",
             "execActor": "string",
@@ -120,11 +129,11 @@ EVENTS = {
             "intentKey": "string",
             "addr": "string",
             "endpoint": "string",
-            "endpointId": "string",
             "status": "string",
             "errorType": "string",
             "code": "string",
         },
+        {"endpointId": "string"},
     ),
     "intent.wait.start": Event(
         "core intent wait (lane A4)",
@@ -341,8 +350,11 @@ def render_markdown() -> str:
         "The logger omits fields whose value is null. A failure carries a Sai error",
         "code in `code`. A Keeper lifecycle code, when present, goes in `errorCode`.",
         "MCP tool results carry the symbolic `code`. Numeric `exitCode` belongs to the CLI process.",
-        "The field `endpointId` hashes the endpoint origin and path. Query strings and credentials",
-        "are excluded. The field `endpoint` shows the origin.",
+        "The field `endpointId` is a per-home keyed digest of the request URL, including path and",
+        "query. The field `endpoint` shows the origin. Earlier unkeyed identities cannot establish",
+        "an intent's endpoint scope.",
+        "A request hash accepts 64 hexadecimal digits with an optional `0x` prefix.",
+        "The writer converts the hash to lowercase and preserves the prefix if present.",
         "A malformed request hash is omitted and sets `txHashInvalid`.",
         "The field `txHash` on `intent.submitted` is the request transaction hash when",
         "Keeper includes it in the admission response. It may appear first on `intent.keeper`.",

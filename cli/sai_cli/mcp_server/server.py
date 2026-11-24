@@ -790,13 +790,10 @@ class SaiMCP(FastMCP):
             if tool is None:
                 return None, len(given)
             names = tool.parameters.get("properties", {})
-            known = {
-                key: loggable_value(given[key])
-                for key in names
-                if key in given and (name != "logs_intent" or key != "key")
-            }
-            omitted_key = int(name == "logs_intent" and "key" in given)
-            return known, len(given) - len(known) - omitted_key
+            if name == "logs_intent":
+                return {}, sum(key not in names for key in given)
+            known = {key: loggable_value(given[key]) for key in names if key in given}
+            return known, len(given) - len(known)
         except Exception:  # noqa: BLE001 - logging must not fail a call
             return None, 0
 

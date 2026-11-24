@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from collections.abc import Callable
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +17,8 @@ from .log_events import COMMON_OPTIONAL, COMMON_REQUIRED, EVENTS
 LogLine = dict[str, Any]
 Scope = tuple[str, str]
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,128}")
-ENDPOINT_ID = re.compile(r"[a-f0-9]{64}")
+ENDPOINT_ID = re.compile(r"h1_[a-f0-9]{64}")
+PREVIEW_DIGEST = re.compile(r"[a-f0-9]{64}")
 MCP_STATUSES = frozenset(
     {"accepted", "rejected", "not_sent", "unknown", "terminal", "absent"}
 )
@@ -55,7 +57,13 @@ def _id(line: LogLine, field: str) -> str | None:
 
 def _timestamp(line: LogLine) -> str | None:
     ts = _id(line, "ts")
-    return ts if ts and TIMESTAMP.fullmatch(ts) else None
+    if ts and TIMESTAMP.fullmatch(ts):
+        try:
+            datetime.fromisoformat(ts)
+            return ts
+        except ValueError:
+            pass
+    return None
 
 
 def _address(line: LogLine) -> str | None:
@@ -91,8 +99,10 @@ def _lookup_intent(endpoint: str, key: str, addr: str) -> LogLine | None:
     for row in rows:
         if not isinstance(row, dict) or row.get("intentKey") != key:
             continue
-        address = row.get("evmAddress")
-        if isinstance(address, str) and address.lower() == addr.lower():
+        nibi = row.get("nibiAddress")
+        if keeper.canonical_account(row.get("evmAddress")) == addr.lower() and (
+            nibi is None or keeper.canonical_account(nibi) == addr.lower()
+        ):
             return keeper.safe_intent_record(row)
     return None
 
@@ -111,7 +121,7 @@ def _select_scope(
         if (
             not scope
             or (addr and scope[0] != addr)
-            or (identity and scope[1] != identity)
+            or (identity is not None and scope[1] != identity)
         ):
             continue
         candidates.add(scope)
@@ -149,22 +159,83 @@ def _before(value: str | None) -> datetime | None:
     )
 
 
+CONTEXT_BYTES = 256 * 1024
+CONTEXT_ROWS = 256
+CONTEXT_FILES = len(log.SURFACES)
+START_EVENTS = {"command.start", "mcp.tool_call"}
+
+
 def _scan(
-    root: Path | None, before: str | None = None
-) -> tuple[list[LogLine], bool, str | None]:
+    root: Path | None,
+    before: str | None,
+    anchor: Callable[[LogLine], bool],
+) -> tuple[list[LogLine], bool, str | None, str | None]:
     instant = _before(before)
     cutoff = log.stamp(instant) if instant else None
-    scan = log.LogScan()
-    log.flush(1.0)
-    rows = sorted(
-        (
-            line
-            for line in scan.rows(root, last_day=instant.date() if instant else None)
-            if _timestamp(line)
-        ),
-        key=log.event_order,
+    page_day = instant.date() if instant else None
+    scan = log.LogScan(
+        max_bytes=log.MAX_SCAN_BYTES - 2 * CONTEXT_BYTES,
+        max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
+        max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
     )
-    return rows, scan.truncated, cutoff
+    log.flush(1.0)
+    rows = [
+        line
+        for line in scan.rows(
+            root,
+            last_day=page_day,
+            accept=lambda line: _in_window(line, cutoff) or anchor(line),
+            frontier_before=cutoff,
+        )
+        if _timestamp(line)
+    ]
+    frontier = (
+        scan.frontier
+        if scan.truncated
+        else min(
+            (line["ts"] for line in rows if _in_window(line, cutoff)),
+            default=None,
+        )
+    )
+    truncated = scan.truncated
+    if page_day is not None and page_day < date.max:
+        # A start on this page can belong to an invocation first scoped
+        # just after midnight. The next day's prefix supplies that anchor.
+        following = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
+        rows.extend(
+            following.rows(
+                root, days={page_day + timedelta(days=1)}, prefix=True, accept=anchor
+            )
+        )
+        scan.visited.update(following.visited)
+        truncated |= following.truncated
+
+    starts = {_invocation(line) for line in rows if line.get("event") in START_EVENTS}
+    missing = {
+        invocation: date.fromisoformat(ts[:10]) - timedelta(days=1)
+        for line in rows
+        if anchor(line)
+        and (invocation := _invocation(line)) is not None
+        and invocation not in starts
+        and (ts := _timestamp(line))
+        and ts[:10] != "0001-01-01"
+    }
+    if missing:
+        # Reserve a bounded read near the end of the preceding day's files.
+        # Skip files already scanned by either phase.
+        previous = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
+        rows.extend(
+            previous.rows(
+                root,
+                days=set(missing.values()),
+                skip=scan.visited,
+                accept=lambda line: (
+                    line.get("event") in START_EVENTS and _invocation(line) in missing
+                ),
+            )
+        )
+        truncated |= previous.truncated
+    return sorted(rows, key=log.event_order), truncated, cutoff, frontier
 
 
 def _in_window(line: LogLine, cutoff: str | None) -> bool:
@@ -203,7 +274,7 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     if name == "mcp.tool_result":
         if "status" in safe and safe["status"] not in MCP_STATUSES:
             del safe["status"]
-        if "previewDigest" in safe and not ENDPOINT_ID.fullmatch(
+        if "previewDigest" in safe and not PREVIEW_DIGEST.fullmatch(
             str(safe["previewDigest"])
         ):
             del safe["previewDigest"]
@@ -229,21 +300,25 @@ def _limit(
 ) -> LogLine:
     tokens = log.known_tokens(check=True)
     bytes_left = MAX_REPORT_BYTES - 8192
-    next_before = oldest_scanned
+    last_returned = None
+    output_limited = False
     for rows, (field, line) in enumerate(reversed(entries)):
         safe = _export(line, tokens)
         size = len(json.dumps(safe, allow_nan=False).encode()) + 2
         if rows == MAX_REPORT_ROWS or size > bytes_left:
-            scan_truncated = True
+            output_limited = True
             break
         report[field].append(safe)
         if field != "unattributedGaps":
-            next_before = _timestamp(line)
+            last_returned = _timestamp(line)
         bytes_left -= size
     for field in {field for field, _line in entries}:
         report[field].reverse()
-    if scan_truncated:
+    if scan_truncated or output_limited:
         report["truncated"] = True
+        next_before = (
+            (last_returned or oldest_scanned) if output_limited else oldest_scanned
+        )
         if next_before:
             report["nextBefore"] = next_before
         report["more"] = (
@@ -268,8 +343,10 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    identity = log.endpoint_id(endpoint) if endpoint else None
-    rows, scan_truncated, cutoff = _scan(root, before)
+    rows, scan_truncated, cutoff, frontier = _scan(
+        root, before, lambda row: _has_intent(row, key)
+    )
+    identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
     anchors = [line for line in rows if _has_intent(line, key)]
     scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
     events: list[LogLine] = []
@@ -367,8 +444,7 @@ def intent(
         report["unattributedGaps"] = []
         entries = [("unattributedGaps", line) for line in unattributed[-8:]] + entries
         scan_truncated |= len(unattributed) > 8
-    oldest = next((_id(line, "ts") for line in rows if _in_window(line, cutoff)), None)
-    return _limit(report, entries, scan_truncated, oldest)
+    return _limit(report, entries, scan_truncated, frontier)
 
 
 def run(
@@ -377,12 +453,13 @@ def run(
     """Read a process run ID or one MCP call ID."""
     if TOKEN.fullmatch(identifier) is None:
         raise SaiError("Invalid log run or call ID.", Code.INVALID_REQUEST)
-    rows, scan_truncated, cutoff = _scan(root, before)
+
+    def matches_id(line: LogLine) -> bool:
+        return identifier in (_id(line, "runId"), _id(line, "callId"))
+
+    rows, scan_truncated, cutoff, frontier = _scan(root, before, matches_id)
     events = [
-        line
-        for line in rows
-        if line.get("event") != "log.dropped"
-        and identifier in (_id(line, "runId"), _id(line, "callId"))
+        line for line in rows if line.get("event") != "log.dropped" and matches_id(line)
     ]
     runs = {identifier} | {_id(line, "runId") for line in events} - {None}
     entries = [("events", line) for line in events if _in_window(line, cutoff)]
@@ -398,7 +475,7 @@ def run(
         {"id": identifier, "events": [], "gaps": []},
         entries,
         scan_truncated,
-        next((_id(line, "ts") for line in rows if _in_window(line, cutoff)), None),
+        frontier,
     )
 
 
@@ -441,7 +518,11 @@ def stats(
     gaps: list[tuple[str, LogLine]] = []
     oldest = None
     for line in scan.rows(
-        root, first_day=first_day, last_day=instant.date() if instant else None
+        root,
+        first_day=first_day,
+        last_day=instant.date() if instant else None,
+        since=cutoff,
+        before=upper,
     ):
         ts = _timestamp(line)
         if ts is None or (cutoff and ts < cutoff) or (upper and ts >= upper):
@@ -480,5 +561,5 @@ def stats(
         },
         gaps,
         scan.truncated,
-        oldest,
+        scan.frontier if scan.truncated else oldest,
     )

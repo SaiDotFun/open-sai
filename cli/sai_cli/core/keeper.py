@@ -37,7 +37,7 @@ SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$in
 
 INTENT_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}")
 GENERATED_INTENT_KEY = re.compile(r"[0-9]{8}T[0-9]{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
-REQUEST_HASH = re.compile(r"0x[0-9a-fA-F]{64}")
+REQUEST_HASH = re.compile(r"(?:0[xX])?[0-9a-fA-F]{64}")
 INTENT_KINDS = frozenset(
     {
         "OPEN_TRADE",
@@ -87,10 +87,14 @@ TRADE_CHANGES = frozenset(
         "after_hours_risk_trigger",
     }
 )
-INTENT_ACTORS = frozenset({"server", "client"})
+INTENT_ACTORS = frozenset({"server", "client", "user"})
 INTENT_ERROR_CODES = frozenset(
     {
         "SLIPPAGE",
+        "simulation_failed",
+        "admission_expired",
+        "broadcast_rejected",
+        "chain_execution_failed",
         "market_order_outcome_not_indexed",
         "intent_already_used",
         "below_minimum",
@@ -104,7 +108,7 @@ def request_hash(value: object) -> tuple[str | None, bool | None]:
     if value is None:
         return None, None
     if isinstance(value, str) and REQUEST_HASH.fullmatch(value):
-        return value, None
+        return value.lower(), None
     return None, True
 
 
@@ -150,8 +154,15 @@ def safe_intent_record(row: Mapping[str, Any]) -> dict[str, Any]:
     key, address = row.get("intentKey"), row.get("evmAddress")
     if isinstance(key, str) and GENERATED_INTENT_KEY.fullmatch(key):
         record["intentKey"] = key
-    if is_address(address):
+    if isinstance(address, str) and is_address(address):
         record["evmAddress"] = address
+        nibi = row.get("nibiAddress")
+        if (
+            isinstance(nibi, str)
+            and nibi.startswith("nibi1")
+            and canonical_account(nibi) == address.lower()
+        ):
+            record["nibiAddress"] = nibi
     for field, allowed in (
         ("kind", INTENT_KINDS),
         ("lifecycleStep", INTENT_STEPS),
@@ -196,7 +207,8 @@ def safe_intent_history(row: Mapping[str, Any]) -> dict[str, Any]:
         history["trade"] = {}
         if (trade_id := _row_id(trade.get("id"))) is not None:
             history["trade"]["id"] = trade_id
-        if is_address(trader := trade.get("trader")):
+        trader = trade.get("trader")
+        if canonical_account(trader) is not None:
             history["trade"]["trader"] = trader
     if isinstance(block := row.get("block"), dict):
         history["block"] = {}
@@ -362,7 +374,7 @@ def _log_request(
             "info" if outcome.get("status") == "ok" else "warn",
             operation=OPERATIONS.get(query, "custom"),
             endpoint=log.endpoint(endpoint),
-            endpointId=log.endpoint_id(endpoint),
+            endpointId=log.endpoint_identity(endpoint),
             addr=account,
             intentKey=intent_key
             if isinstance(intent_key, str) and INTENT_KEY.fullmatch(intent_key)

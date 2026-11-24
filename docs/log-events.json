@@ -7,7 +7,8 @@
     "callId",
     "durationMs",
     "version",
-    "commandId"
+    "commandId",
+    "endpointId"
   ],
   "common": {
     "required": {
@@ -80,10 +81,10 @@
       "required": {
         "intentKey": "string",
         "addr": "string",
-        "endpoint": "string",
-        "endpointId": "string"
+        "endpoint": "string"
       },
       "optional": {
+        "endpointId": "string",
         "kind": "string",
         "lifecycleStep": "string",
         "execActor": "string",
@@ -155,12 +156,13 @@
         "intentKey": "string",
         "addr": "string",
         "endpoint": "string",
-        "endpointId": "string",
         "status": "string",
         "errorType": "string",
         "code": "string"
       },
-      "optional": {}
+      "optional": {
+        "endpointId": "string"
+      }
     },
     "intent.wait.start": {
       "emitter": "core intent wait (lane A4)",

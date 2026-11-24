@@ -161,7 +161,7 @@ def _record_submission_status(
             intentKey=key,
             addr=account,
             endpoint=log.endpoint(endpoint),
-            endpointId=log.endpoint_id(endpoint),
+            endpointId=log.endpoint_identity(endpoint),
             status=status,
             errorType=type(exc).__name__,
         )
@@ -234,7 +234,7 @@ def submit(
         kind=intent["kind"],
         addr=account,
         endpoint=log.endpoint(endpoint),
-        endpointId=log.endpoint_id(endpoint),
+        endpointId=log.endpoint_identity(endpoint),
         txHash=tx_hash,
         txHashInvalid=invalid_hash,
     )
