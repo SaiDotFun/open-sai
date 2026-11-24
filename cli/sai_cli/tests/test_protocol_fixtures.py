@@ -87,7 +87,19 @@ def test_cli_replays_synthetic_intent_status(monkeypatch, synthetic):
         main, ["--json", "intent", "status", synthetic["address"]]
     )
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == golden["data"]
+    assert json.loads(result.output) == {
+        "userIntents": [
+            {
+                "kind": "CLOSE_POSITION",
+                "lifecycleStep": "exec_pass",
+                "execActor": "server",
+                "evmAddress": synthetic["address"],
+                "txHashInvalid": True,
+                "execBlock": 123,
+                "execBlockTs": "2099-01-01T00:00:10Z",
+            }
+        ]
+    }
 
 
 def test_synthetic_trading_request_goldens(synthetic):
