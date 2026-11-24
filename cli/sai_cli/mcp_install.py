@@ -414,21 +414,29 @@ def before_replace(path: Path) -> None:
 def replace_if_unchanged(
     path: Path, data: dict[str, Any], seen: bytes | None, destination: Path
 ) -> bool:
-    return replace_bytes(
-        path,
-        (json.dumps(data, indent=2) + "\n").encode(),
-        seen,
-        destination=destination,
+    return (
+        replace_bytes(
+            path,
+            (json.dumps(data, indent=2) + "\n").encode(),
+            seen,
+            destination=destination,
+        )
+        is not None
     )
 
 
 def replace_bytes(
-    path: Path, data: bytes, seen: bytes | None, *, destination: Path
-) -> bool:
+    path: Path,
+    data: bytes,
+    seen: bytes | None,
+    *,
+    destination: Path,
+    expected_file: os.stat_result | None = None,
+) -> os.stat_result | None:
     """Write data over path in one rename if path still holds `seen`.
 
-    Keeps the file mode (0600 for a new file). Returns False, writing
-    nothing, when another program changed the file since it was read.
+    Keeps the file mode (0600 for a new file). Returns the published file's
+    metadata, or None if another program has changed the file.
     """
     # Replace the file, including when the configured path is a symlink.
     # Recheck the link before writing so a concurrent retarget is detectable.
@@ -439,16 +447,24 @@ def replace_bytes(
             handle.write(data)
         before_replace(path)
         if path.resolve() != destination or read_bytes(destination) != seen:
-            return False
+            return None
         try:
-            mode = stat.S_IMODE(destination.stat().st_mode)
+            current = destination.stat()
+            if expected_file is not None and (
+                not os.path.samestat(current, expected_file)
+                or current.st_mtime_ns != expected_file.st_mtime_ns
+                or current.st_mode != expected_file.st_mode
+            ):
+                return None
+            mode = stat.S_IMODE(current.st_mode)
         except FileNotFoundError:
             if seen is not None:
-                return False
+                return None
             mode = 0o600
         os.chmod(temp, mode)
+        published = os.stat(temp)
         os.replace(temp, destination)
-        return True
+        return published
     finally:
         Path(temp).unlink(missing_ok=True)
 
@@ -1135,13 +1151,31 @@ def repair_entry(
     return original
 
 
+@dataclass(frozen=True)
+class CodexEdit:
+    destination: Path
+    original: bytes | None
+    replacement: bytes
+    published: os.stat_result
+
+    def restore(self, path: Path) -> None:
+        if self.original is None or not replace_bytes(
+            path,
+            self.original,
+            self.replacement,
+            destination=self.destination,
+            expected_file=self.published,
+        ):
+            raise ClientError("Codex config.toml changed before Sai could restore it")
+
+
 def edit_codex_config(
     path: Path,
     target: Target | None,
     *,
     stale: StaleRegistration | None = None,
     name: str = NAME,
-) -> None:
+) -> CodexEdit | None:
     """Change only Sai's table, publishing the complete config in one rename."""
     name = stale.name if stale else name
     for _ in range(2):
@@ -1159,8 +1193,11 @@ def edit_codex_config(
         except (ValueError, TOMLKitError, TypeError):
             raise ClientError("Could not edit Codex config.toml") from None
         data = rendered.encode()
-        if data == seen or replace_bytes(path, data, seen, destination=destination):
-            return
+        if data == seen:
+            return None
+        published = replace_bytes(path, data, seen, destination=destination)
+        if published is not None:
+            return CodexEdit(destination, seen, data, published)
     raise ClientError("Codex config.toml changed while Sai was writing it")
 
 
@@ -1299,10 +1336,15 @@ def replace_registration(
     if isinstance(client, Codex):
         expected = Target([normalize_launcher(target.argv[0]), *stale.args])
         path = client.config_path(scope)
-        edit_codex_config(path, expected, stale=stale)
-        actual = client.get(client.neutral_dir(), "user", name)
-        if actual is None or not actual.matches_command(expected):
-            raise ClientError("Codex did not load the repaired Sai registration")
+        edit = edit_codex_config(path, expected, stale=stale)
+        try:
+            actual = client.get(client.neutral_dir(), "user", name)
+            if actual is None or not actual.matches_command(expected):
+                raise ClientError("Codex did not load the repaired Sai registration")
+        except ClientError:
+            if edit is not None:
+                edit.restore(path)
+            raise
         return
     if not isinstance(client, Cursor):
         raise ClientError("Only Codex and Cursor support automatic repair")
@@ -1465,10 +1507,13 @@ def check_registration(
         else:
             try:
                 replace_registration(client, issue, target)
-            except (ClientError, OSError, ValueError, TOMLKitError, TypeError):
+            except (ClientError, OSError, ValueError, TOMLKitError, TypeError) as exc:
+                summary = f"{issue.reason}. Could not repair the {scope} registration"
+                if isinstance(exc, ClientError):
+                    summary += f". {exc}"
                 failures.append(
                     (
-                        f"{issue.reason}. Could not repair the {scope} registration",
+                        summary,
                         "Check this client's Sai registration and rerun `sai doctor`",
                     )
                 )

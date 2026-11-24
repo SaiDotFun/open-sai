@@ -816,6 +816,53 @@ def test_doctor_updates_symlink_referent_and_keeps_link(env: Env, client: str):
     assert stat.S_IMODE(referent.stat().st_mode) == 0o640
 
 
+@pytest.mark.parametrize("concurrent_write", [False, True])
+def test_doctor_restores_codex_entry_when_verification_fails(
+    env: Env, concurrent_write: bool
+):
+    source = (
+        f'[mcp_servers."{OLD_COMMAND}"] # keep this\n'
+        f'command = "{OLD_COMMAND}"\n'
+        'args = ["--endpoint", "http://127.0.0.1:8765"]\n'
+        f'env = {{ CUSTOM = "{SECRET}" }}\n'
+        '\n[mcp_servers.other]\ncommand = "other"\n'
+    )
+    config = env.codex_path()
+    config.write_text(source)
+    config.chmod(0o640)
+    # Reject only the new launcher. A second writer may publish an
+    # identical copy while Codex is verifying the repair.
+    reject = f"""
+    if entry["command"] == {str(env.sai)!r}:
+        if {concurrent_write!r}:
+            pending = config.with_suffix(".new")
+            pending.write_bytes(config.read_bytes())
+            pending.replace(config)
+        sys.stderr.write({SECRET!r})
+        sys.exit(3)
+"""
+    fixture = FAKE_CODEX.replace(
+        "    transport = dict(entry)", reject + "    transport = dict(entry)"
+    )
+    write_exe(env.bin / "codex", fixture)
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 1, result.output
+    check = mcp_checks(result)["codex"]
+    assert check["status"] == "fail"
+    assert "Could not repair the user registration" in check["summary"]
+    assert not check.get("changes")
+    if concurrent_write:
+        assert "changed before Sai could restore it" in check["summary"]
+        assert str(env.sai) in config.read_text()
+    else:
+        assert config.read_text() == source
+        if os.name != "nt":
+            assert stat.S_IMODE(config.stat().st_mode) == 0o640
+    assert SECRET not in result.output
+
+
 def test_doctor_reports_same_stale_codex_project_entry_after_repairing_user(env: Env):
     entry = {"command": OLD_COMMAND, "args": []}
     override = env.project / "fake-codex-project.json"
