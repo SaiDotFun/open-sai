@@ -240,6 +240,7 @@ class Pages:
     rows: list[dict[str, Any]]
     complete: bool
     paginated: bool
+    read_failed: bool = False
 
 
 def _scan_pages(
@@ -248,15 +249,22 @@ def _scan_pages(
     rows: list[dict[str, Any]] = []
     seen: set[int] = set()
     for page_num in range(MAX_PAGES):
-        response = keeper.request(
-            endpoint, query, {"trader": addr, "limit": PAGE_SIZE, "offset": len(rows)}
-        )
-        page = response["perp"][field]
-        if not isinstance(page, list):
-            raise TypeError("Expected a list")
+        try:
+            response = keeper.request(
+                endpoint,
+                query,
+                {"trader": addr, "limit": PAGE_SIZE, "offset": len(rows)},
+            )
+            page = response["perp"][field]
+            if not isinstance(page, list):
+                raise TypeError("Expected a list")
+            entries = [(row[id_field], row) for row in page]
+        except (keeper.KeeperError, KeyError, TypeError):
+            if not rows:
+                raise
+            return Pages(rows, False, True, read_failed=True)
         fetched = datetime.now(UTC).isoformat()
-        for row in page:
-            item_id = row[id_field]
+        for item_id, row in entries:
             if item_id in seen:
                 return Pages(rows, False, True)
             seen.add(item_id)
@@ -268,12 +276,22 @@ def _scan_pages(
 
 def _pages(endpoint: str, query: str, field: str, id_field: str, addr: str) -> Pages:
     snapshot = _scan_pages(endpoint, query, field, id_field, addr)
-    if not snapshot.paginated:
+    if not snapshot.paginated or snapshot.read_failed:
         return snapshot
     # The live Keeper query has offsets and no cursor. Confirm a paginated
     # list with a second scan so a close between pages cannot silently skip a row.
+    best = snapshot
     for _ in range(2):
-        current = _scan_pages(endpoint, query, field, id_field, addr)
+        try:
+            current = _scan_pages(endpoint, query, field, id_field, addr)
+        except (keeper.KeeperError, KeyError, TypeError):
+            break
+        if current.complete or (
+            not best.complete and len(current.rows) > len(best.rows)
+        ):
+            best = current
+        if current.read_failed:
+            break
         if (
             snapshot.complete
             and current.complete
@@ -282,7 +300,7 @@ def _pages(endpoint: str, query: str, field: str, id_field: str, addr: str) -> P
         ):
             return current
         snapshot = current
-    return Pages(snapshot.rows, False, snapshot.paginated)
+    return Pages(best.rows, False, True)
 
 
 def _trades(endpoint: str, addr: str) -> Pages:

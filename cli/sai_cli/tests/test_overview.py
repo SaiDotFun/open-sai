@@ -669,6 +669,42 @@ def test_pagination_rechecks_membership_after_a_close_between_pages(replay, sett
 
 
 @pytest.mark.parametrize(
+    ("failed_scan", "failed_offset", "kept"),
+    [(1, 100, 100), (2, 0, 101), (2, 100, 101)],
+)
+def test_failed_trade_page_preserves_loaded_positions(
+    replay, failed_scan, failed_offset, kept
+):
+    template, _ = populate_trades(replay)
+    replay["lcdChain"] = "different-chain"
+    scan = 0
+
+    def response(variables):
+        nonlocal scan
+        offset = variables["offset"]
+        if offset == 0:
+            scan += 1
+        if scan == failed_scan and offset == failed_offset:
+            return {"errors": [{"message": "page unavailable"}]}
+        return {
+            "data": {
+                "perp": {
+                    "trades": [
+                        {**template, "id": index}
+                        for index in range(offset + 1, min(offset + 100, 101) + 1)
+                    ]
+                }
+            }
+        }
+
+    replay["http"][keeper.OVERVIEW_TRADES] = response
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert [row["id"] for row in positions["data"]["items"]] == list(range(1, kept + 1))
+    assert "may be incomplete" in positions["error"]["message"]
+    assert positions["data"]["unrealizedPnlUsd"] is None
+
+
+@pytest.mark.parametrize(
     ("expiration", "verified"), [(16, False), (17, True), (0, True)]
 )
 def test_oracle_expiration_uses_the_contract_boundary(replay, expiration, verified):
