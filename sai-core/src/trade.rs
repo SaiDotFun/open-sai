@@ -3,6 +3,7 @@
 mod actions;
 mod cancel;
 mod confirmation;
+mod estimates;
 
 use std::future::{Future, pending};
 
@@ -20,6 +21,7 @@ use crate::{
 
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
+pub use estimates::PreviewMode;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TradeIntent {
@@ -55,6 +57,7 @@ pub struct TradePreview {
     pub reference_price: Option<String>,
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
+    pub estimates: Option<Value>,
 }
 
 impl TradePreview {
@@ -64,6 +67,7 @@ impl TradePreview {
             reference_price: None,
             quote: None,
             warning: None,
+            estimates: None,
         }
     }
 
@@ -76,14 +80,16 @@ impl TradePreview {
             output["quote"] = quote.clone();
         }
         output["intent"] = json!(self.intent);
+        if let Some(estimates) = &self.estimates {
+            output["estimates"] = estimates.clone();
+        } else if self.intent.kind == "CANCEL_PENDING_TRADE" {
+            output["estimates"] = cancel::estimates();
+        }
         if let Some(price) = &self.reference_price {
             output["referencePrice"] = json!(price);
         }
         if let Some(warning) = self.warning {
             output["warning"] = json!(warning);
-        }
-        if self.intent.kind == "CANCEL_PENDING_TRADE" {
-            output["estimates"] = cancel::estimates();
         }
         output
     }
@@ -184,10 +190,11 @@ impl<'a> Trading<'a> {
         if cancelling {
             self.check_pending_order(session, preview).await?;
         }
+        let mut market_row = None;
         let mut prepared;
         let preview = if market {
             prepared = preview.clone();
-            self.refresh_market_open(&mut prepared).await?;
+            market_row = Some(self.refresh_market_quote(&mut prepared).await?);
             let price = prepared
                 .reference_price
                 .as_deref()
@@ -207,8 +214,25 @@ impl<'a> Trading<'a> {
         } else {
             session
         };
-        if let Some(confirmation) = options.confirmation {
-            confirmation.verify(preview, account)?;
+        if let Some(confirmation) = options.confirmation
+            && let Err(mut error) = confirmation.verify(preview, account)
+        {
+            if let Some(fresh) = error
+                .details
+                .as_deref_mut()
+                .and_then(|details| details.get_mut("preview"))
+            {
+                let mut replacement = preview.clone();
+                self.estimate_preview(
+                    &mut replacement,
+                    Some(session),
+                    PreviewMode::Mcp,
+                    market_row,
+                )
+                .await;
+                *fresh = replacement.confirmed_output(Some(account));
+            }
+            return Err(error);
         }
 
         let (key, stamp) = intent_identity();

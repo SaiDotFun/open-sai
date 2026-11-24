@@ -1,5 +1,6 @@
 use num_bigint::BigInt;
 use serde_json::{Map, Value, json};
+use std::time::Duration;
 
 use crate::{
     errors::{Code, SaiError},
@@ -117,6 +118,25 @@ pub fn close_preview(trade_id: &str, cancel: bool) -> Result<TradePreview, SaiEr
 impl Trading<'_> {
     /// Fetch the public price used by market previews and market submissions.
     pub async fn refresh_market_open(&self, preview: &mut TradePreview) -> Result<(), SaiError> {
+        self.refresh_market_quote(preview).await.map(|_| ())
+    }
+
+    pub(super) async fn refresh_market_quote(
+        &self,
+        preview: &mut TradePreview,
+    ) -> Result<Value, SaiError> {
+        let row = self.open_market_row(preview, TIMEOUT).await?;
+        preview.reference_price = Some(decimal_price(
+            row.get("price").ok_or_else(|| incomplete("KeyError"))?,
+        )?);
+        Ok(row)
+    }
+
+    pub(super) async fn open_market_row(
+        &self,
+        preview: &TradePreview,
+        timeout: Duration,
+    ) -> Result<Value, SaiError> {
         let market = preview.intent.body["market"]["marketIndex"]
             .as_str()
             .and_then(|text| text.strip_prefix("MarketIndex(")?.strip_suffix(')'))
@@ -124,14 +144,14 @@ impl Trading<'_> {
         let market: Value = serde_json::from_str(market).map_err(|_| SaiError::internal())?;
         let data = self
             .keeper
-            .request(MARKETS, Map::new(), None, TIMEOUT)
+            .request(MARKETS, Map::new(), None, timeout)
             .await?;
         let borrowings = data
             .get("perp")
             .and_then(|perp| perp.get("borrowings"))
             .and_then(Value::as_array)
             .ok_or_else(|| incomplete("KeyError"))?;
-        let mut price = None;
+        let mut candidate = None;
         for row in borrowings {
             let market_id = row.get("marketId").ok_or_else(|| incomplete("KeyError"))?;
             if *market_id != market {
@@ -142,18 +162,21 @@ impl Trading<'_> {
                 .and_then(|token| token.get("symbol"))
                 .ok_or_else(|| incomplete("KeyError"))?;
             if symbol != "USDC"
-                || !crate::keeper::truthy(row.get("isOpen").ok_or_else(|| incomplete("KeyError"))?)
+                || (preview.requires_market_price_refresh()
+                    && !crate::keeper::truthy(
+                        row.get("isOpen").ok_or_else(|| incomplete("KeyError"))?,
+                    ))
             {
                 continue;
             }
-            if price.is_some() {
+            if candidate.is_some() {
                 return Err(invalid("Current open USDC market data is unavailable"));
             }
-            price = Some(row.get("price").ok_or_else(|| incomplete("KeyError"))?);
+            candidate = Some(row);
         }
-        let price = price.ok_or_else(|| invalid("Current open USDC market data is unavailable"))?;
-        preview.reference_price = Some(decimal_price(price)?);
-        Ok(())
+        candidate
+            .cloned()
+            .ok_or_else(|| invalid("Current open USDC market data is unavailable"))
     }
 }
 
@@ -187,7 +210,7 @@ pub(super) fn incomplete(kind: &str) -> SaiError {
 }
 
 /// Keeper prices may be JSON strings or numbers, with an optional exponent.
-fn decimal_price(value: &Value) -> Result<String, SaiError> {
+pub(super) fn decimal_price(value: &Value) -> Result<String, SaiError> {
     let number;
     let text = if let Some(text) = value.as_str() {
         text

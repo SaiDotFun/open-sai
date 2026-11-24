@@ -4,7 +4,7 @@ use sai_core::{
     log::EventContext,
     settings::{Environment, Flags},
     storage::{Session, Storage, StorageEvent},
-    trade::{self, OpenTrade, SubmitOptions, TradePreview, Trading, close_preview},
+    trade::{self, OpenTrade, PreviewMode, SubmitOptions, TradePreview, Trading, close_preview},
 };
 use serde_json::json;
 
@@ -149,20 +149,19 @@ pub fn run(
         }
         Err(error) => return Err(error),
     };
-    if dry_run && !cancelling {
-        return local::emit(&preview.output(session.as_ref().map(Session::addr)), json);
-    }
-    let session = session.ok_or_else(SaiError::internal)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| SaiError::internal())?;
     if dry_run {
-        return local::emit(
-            &runtime.block_on(trading.cancel_preview(&session, &preview))?,
-            json,
-        );
+        let preview = runtime.block_on(trading.prepare_preview(
+            preview,
+            session.as_ref(),
+            PreviewMode::Cli,
+        ))?;
+        return local::emit(&preview.output(session.as_ref().map(Session::addr)), json);
     }
+    let session = session.ok_or_else(SaiError::internal)?;
     if preview.requires_market_price_refresh() && supplied_price {
         eprintln!("{}", trade::MARKET_PRICE_NOTICE);
     }

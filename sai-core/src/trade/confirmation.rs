@@ -132,7 +132,7 @@ fn display_movement(moved: BigUint, reference: BigUint) -> String {
     format!("{whole}.{fraction}")
 }
 
-fn canonical_price(price: &str) -> String {
+pub(super) fn canonical_price(price: &str) -> String {
     let (whole, fraction) = price.split_once('.').unwrap_or((price, ""));
     let digits = format!("{whole}{fraction}");
     let significant = digits.trim_start_matches('0');
@@ -235,14 +235,15 @@ mod tests {
             ));
             preview.reference_price = input["referencePrice"].as_str().map(str::to_owned);
             preview.quote = input.get("quote").cloned();
+            preview.estimates = Some(data["estimates"].clone());
             let account = input["addr"].as_str();
             assert_eq!(
                 digest_bytes(&preview, account),
                 case["canonical"].as_str().unwrap().as_bytes()
             );
             assert_eq!(
-                preview_digest(&preview, account),
-                case["digest"].as_str().unwrap()
+                preview.confirmed_output(account)["previewDigest"],
+                case["digest"]
             );
         }
     }

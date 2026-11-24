@@ -26,10 +26,10 @@ impl Trading<'_> {
         session: &Session,
         preview: &TradePreview,
     ) -> Result<Value, SaiError> {
-        self.storage
-            .check_active_trade(session, self.keeper.endpoint())?;
-        self.check_pending_order(session, preview).await?;
-        Ok(preview.output(Some(session.addr())))
+        Ok(self
+            .prepare_preview(preview.clone(), Some(session), super::PreviewMode::Cli)
+            .await?
+            .output(Some(session.addr())))
     }
 
     pub(super) async fn check_pending_order(
@@ -47,6 +47,27 @@ impl Trading<'_> {
             .filter(|_| preview.intent.kind == "CANCEL_PENDING_TRADE")
             .map(|target| target.trade_id.as_str())
             .ok_or_else(SaiError::internal)?;
+        let contract = self.trading_contract(lcd).await?;
+        let trade =
+            read_cancel_target(lcd.trim_end_matches('/'), &contract, session.addr(), id).await?;
+        let owner = trade["user"].as_str().and_then(keeper::canonical_account);
+        if owner.is_none() || owner != keeper::canonical_account(session.addr()) {
+            return Err(invalid(&format!(
+                "Trade {id} was not found for this account."
+            )));
+        }
+        if trade["user_trade_index"] != format!("UserTradeIndex({id})")
+            || trade["is_open"].as_bool() != Some(true)
+            || !matches!(trade["trade_type"].as_str(), Some("limit" | "stop"))
+        {
+            return Err(invalid(
+                "Target is not an open pending order. Preview a market close for a filled position.",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) async fn trading_contract(&self, lcd: &str) -> Result<String, SaiError> {
         let route = self
             .keeper
             .request(ROUTE, Map::new(), None, TIMEOUT)
@@ -74,27 +95,12 @@ impl Trading<'_> {
         {
             return Err(invalid("Keeper trading route and LCD network do not match"));
         }
-        let contract = route
+        route
             .get("contractAddress")
             .ok_or_else(|| incomplete("KeyError"))?
             .as_str()
-            .ok_or_else(|| incomplete("TypeError"))?;
-        let trade = read_cancel_target(lcd, contract, session.addr(), id).await?;
-        let owner = trade["user"].as_str().and_then(keeper::canonical_account);
-        if owner.is_none() || owner != keeper::canonical_account(session.addr()) {
-            return Err(invalid(&format!(
-                "Trade {id} was not found for this account."
-            )));
-        }
-        if trade["user_trade_index"] != format!("UserTradeIndex({id})")
-            || trade["is_open"].as_bool() != Some(true)
-            || !matches!(trade["trade_type"].as_str(), Some("limit" | "stop"))
-        {
-            return Err(invalid(
-                "Target is not an open pending order. Preview a market close for a filled position.",
-            ));
-        }
-        Ok(())
+            .map(str::to_owned)
+            .ok_or_else(|| incomplete("TypeError"))
     }
 }
 
@@ -156,7 +162,7 @@ fn read_object(success: bool, bytes: &[u8]) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-fn lcd_url(raw: &str) -> Result<Url, SaiError> {
+pub(super) fn lcd_url(raw: &str) -> Result<Url, SaiError> {
     let Some(endpoint) = Endpoint::split(raw).filter(|endpoint| {
         endpoint.scheme == "https"
             || (endpoint.scheme == "http"
