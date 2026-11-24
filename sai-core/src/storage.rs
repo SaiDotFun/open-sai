@@ -27,6 +27,10 @@ pub enum StorageError {
     NewerLedger,
     #[error("Reconcile uncertain intent {0} before submitting another trade")]
     UncertainIntent(String),
+    #[error(
+        "Earlier open intent {key} may still execute. Check its status with `{hint}` before retrying."
+    )]
+    RecentOpenPending { key: String, hint: String },
     #[error("{0}")]
     Session(#[from] SessionError),
 }
@@ -51,6 +55,11 @@ impl From<StorageError> for SaiError {
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::Session(error) => error.into(),
+            StorageError::RecentOpenPending { ref key, ref hint } => SaiError {
+                intent_key: Some(key.clone()),
+                hint: Some(hint.clone()),
+                ..Self::new(Code::RecentOpenPending, error.to_string())
+            },
             StorageError::NewerLedger | StorageError::UncertainIntent(_) => {
                 Self::new(Code::InvalidRequest, error.to_string())
             }
@@ -174,6 +183,27 @@ impl<'a> Storage<'a> {
     pub fn with_event_sink(mut self, sink: &'a (dyn Fn(StorageEvent<'_>) + Sync)) -> Self {
         self.events = Some(sink);
         self
+    }
+
+    pub fn intent_status_hint(&self, endpoint: &str, account: &str, key: &str) -> String {
+        use crate::session::shell_quote;
+
+        let flag = if endpoint_origin(endpoint) == endpoint
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
+        {
+            shell_quote(endpoint)
+        } else {
+            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
+                .into()
+        };
+        format!(
+            "sai --endpoint {flag} intent status {} --key {}",
+            shell_quote(account),
+            shell_quote(key)
+        )
     }
 
     pub(crate) fn emit(&self, event: StorageEvent<'_>) {

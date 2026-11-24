@@ -6,6 +6,8 @@ use serde::Serialize;
 
 use super::{Storage, StorageError, StorageEvent, endpoint_origin};
 
+const OPEN_TRADE: &str = "OPEN_TRADE";
+
 const SCHEMA_VERSION: i64 = 1;
 const LEDGER_FILE: &str = "intents.sqlite3";
 const CREATE_INTENTS: &str = "CREATE TABLE IF NOT EXISTS intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, entity TEXT NOT NULL DEFAULT '', created_at REAL)";
@@ -99,6 +101,34 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
     Ok(())
 }
 
+fn check_open_pending(
+    connection: &Connection,
+    endpoint: &str,
+    account: &str,
+    allow_concurrent_open: bool,
+    storage: &Storage<'_>,
+) -> Result<(), StorageError> {
+    let key: Option<String> = connection
+        .query_row(
+            "SELECT id FROM intents WHERE endpoint=?1 AND account=?2 AND kind=?3
+             AND (keeper_status='pending' OR (NOT ?4 AND status IN ('unknown', 'accepted')))
+             ORDER BY rowid DESC LIMIT 1",
+            params![
+                endpoint,
+                account.to_lowercase(),
+                OPEN_TRADE,
+                allow_concurrent_open
+            ],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(key) = key {
+        let hint = storage.intent_status_hint(endpoint, account, &key);
+        return Err(StorageError::RecentOpenPending { key, hint });
+    }
+    Ok(())
+}
+
 fn unix_time() -> f64 {
     let now = Utc::now();
     now.timestamp() as f64 + f64::from(now.timestamp_subsec_nanos()) / 1e9
@@ -139,19 +169,47 @@ impl Storage<'_> {
         kind: &str,
         entity: &str,
     ) -> Result<(), StorageError> {
+        self.reserve(key, endpoint, account, kind, entity, false)
+    }
+
+    /// Check early for an unresolved open. Reservation repeats the check under the write lock.
+    pub fn check_open_pending(
+        &self,
+        endpoint: &str,
+        account: &str,
+        allow_concurrent_open: bool,
+    ) -> Result<(), StorageError> {
+        let connection = self.open_ledger()?;
+        check_open_pending(&connection, endpoint, account, allow_concurrent_open, self)
+    }
+
+    /// An explicit override skips unknown or accepted opens, but never Keeper-pending rows.
+    pub fn reserve(
+        &self,
+        key: &str,
+        endpoint: &str,
+        account: &str,
+        kind: &str,
+        entity: &str,
+        allow_concurrent_open: bool,
+    ) -> Result<(), StorageError> {
         let mut connection = self.open_ledger()?;
         let transaction = connection.transaction_with_behavior(Immediate)?;
         let addr = account.to_lowercase();
+        let concurrent_open = kind == OPEN_TRADE && allow_concurrent_open;
+        if kind == OPEN_TRADE {
+            check_open_pending(&transaction, endpoint, account, concurrent_open, self)?;
+        }
         let unresolved: Option<String> = transaction
             .query_row(
                 "SELECT id FROM intents WHERE endpoint=?1 AND account=?2
-                 AND (status=?3 OR keeper_status=?4 OR (status=?5 AND entity <> '' AND entity=?6)) LIMIT 1",
+                 AND ((status='unknown' AND (NOT ?3 OR kind<>?4))
+                 OR keeper_status='pending' OR (status='accepted' AND entity <> '' AND entity=?5)) LIMIT 1",
                 params![
                     endpoint,
                     addr,
-                    IntentStatus::Unknown.as_str(),
-                    IntentStatus::Pending.as_str(),
-                    IntentStatus::Accepted.as_str(),
+                    concurrent_open,
+                    OPEN_TRADE,
                     entity
                 ],
                 |row| row.get(0),
