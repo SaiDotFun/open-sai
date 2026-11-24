@@ -1,6 +1,7 @@
 //! Keeper GraphQL requests and their transport verdicts.
 
 mod ca_dir;
+mod diagnostics;
 mod proxy;
 mod public;
 mod queries;
@@ -17,6 +18,7 @@ use crate::{
     log::{self, EventContext, Field, Level},
 };
 
+pub use diagnostics::{lcd_network, websocket_handshake};
 pub use public::public_intent_status;
 pub use queries::*;
 

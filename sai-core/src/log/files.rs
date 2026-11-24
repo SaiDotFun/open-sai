@@ -18,24 +18,91 @@ pub(super) struct LogDir(File);
 pub(super) struct LogDir(std::path::PathBuf);
 
 impl LogDir {
+    #[cfg(unix)]
+    pub fn endpoint_key(&self) -> Option<[u8; 32]> {
+        use ring::rand::{SecureRandom, SystemRandom};
+        use rustix::{
+            fs::{AtFlags, Mode, OFlags, openat, renameat, unlinkat},
+            process::geteuid,
+        };
+        use std::{io::Read, os::unix::fs::MetadataExt};
+
+        const KEY: &str = ".endpoint-key";
+        const LOCK: &str = ".endpoint-key.lock";
+        let read = || -> io::Result<Option<[u8; 32]>> {
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+            let file = match openat(&self.0, KEY, flags, Mode::empty()) {
+                Ok(fd) => File::from(fd),
+                Err(rustix::io::Errno::NOENT) => return Ok(None),
+                Err(error) => return Err(error.into()),
+            };
+            let info = file.metadata()?;
+            if !info.is_file()
+                || info.nlink() != 1
+                || info.uid() != geteuid().as_raw()
+                || info.mode() & 0o077 != 0
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            let mut bytes = Vec::new();
+            file.take(33).read_to_end(&mut bytes)?;
+            bytes
+                .try_into()
+                .map(Some)
+                .map_err(|_| io::ErrorKind::InvalidData.into())
+        };
+        if let Some(key) = read().ok()? {
+            return Some(key);
+        }
+        let lock = self.private_file(LOCK, false).ok()?;
+        lock.try_lock().ok()?;
+        if let Some(key) = read().ok()? {
+            return Some(key);
+        }
+        let mut key = [0; 32];
+        SystemRandom::new().fill(&mut key).ok()?;
+        let name = format!(".endpoint-key-{}", uuid::Uuid::new_v4().simple());
+        let mut file = self.private_file(&name, true).ok()?;
+        let result = file
+            .write_all(&key)
+            .and_then(|()| renameat(&self.0, name.as_str(), &self.0, KEY).map_err(Into::into));
+        if result.is_err() {
+            let _ = unlinkat(&self.0, name.as_str(), AtFlags::empty());
+            return None;
+        }
+        Some(key)
+    }
+
+    #[cfg(not(unix))]
+    pub fn endpoint_key(&self) -> Option<[u8; 32]> {
+        None
+    }
+
     pub fn open(root: &Path) -> io::Result<Self> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
         {
             use rustix::{
-                fs::{Mode, OFlags, open},
+                fs::{Mode, OFlags, mkdirat, open, openat},
                 process::geteuid,
             };
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
             builder.mode(0o700);
-            builder.create(root)?;
-            let fd = open(
-                root,
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-                Mode::empty(),
-            )?;
+            let parent = root
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new("."));
+            let name = root.file_name().ok_or(io::ErrorKind::InvalidInput)?;
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            builder.create(parent)?;
+            let parent = open(parent, flags, Mode::empty())?;
+            match mkdirat(&parent, name, Mode::RUSR | Mode::WUSR | Mode::XUSR) {
+                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
+            }
+            let fd = openat(parent, name, flags, Mode::empty())?;
             let dir = File::from(fd);
             let info = dir.metadata()?;
             if info.uid() != geteuid().as_raw() {

@@ -83,6 +83,19 @@ impl Session {
         self.extra.get("endpoint").and_then(Value::as_str)
     }
 
+    pub fn has_named_signer(&self) -> bool {
+        self.extra
+            .get("keyName")
+            .and_then(Value::as_str)
+            .is_some_and(|key| !key.is_empty())
+    }
+
+    pub fn is_imported(&self) -> bool {
+        self.extra
+            .get("source")
+            .is_some_and(|source| source == "imported")
+    }
+
     pub fn summary(&self) -> Result<SessionSummary<'_>, StorageError> {
         let endpoint = self
             .endpoint()

@@ -6,7 +6,7 @@ pub(crate) struct Endpoint {
     pub scheme: String,
     pub authority: String,
     pub path: String,
-    query: String,
+    pub query: String,
     fragment: String,
 }
 

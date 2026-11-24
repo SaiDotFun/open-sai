@@ -10,6 +10,7 @@ publish = false
 [dependencies]
 chrono.workspace = true
 clap.workspace = true
+rusqlite = { version = "0.38", features = ["bundled"] }
 sai-core = { path = "../sai-core" }
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
