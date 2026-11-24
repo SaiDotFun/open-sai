@@ -9,8 +9,7 @@ and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
 
-Rendered diagnostics redact session tokens. Keeper endpoints are shown as
-origins.
+Rendered diagnostics redact session tokens and show endpoint origins.
 
 To add a check, write a function that takes a `Context` and returns a
 `Check` or a list of them (a check that repeats, such as one per MCP client),
@@ -22,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -52,7 +52,7 @@ from .core import (
     update,
     updater,
 )
-from .core.settings import Settings, public_url
+from .core.settings import Settings
 from .mcp_server import info, tools
 
 SCHEMA_VERSION = 1
@@ -64,6 +64,7 @@ STATUSES = ("pass", "fixed", "warn", "fail", "skipped")
 SIGN_IN = "sai auth login NAME, or sai auth import"
 REINSTALL = update.INSTALL_COMMAND
 FILE_MODE = 0o600
+CHAIN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,49}")
 
 
 @dataclass
@@ -76,6 +77,7 @@ class Check:
     duration_ms: int = 0
     changes: list[str] = field(default_factory=list)
     invalid_endpoint: bool = False
+    _lcd_chain_id: str | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, Any]:
         return {
@@ -1223,12 +1225,11 @@ def check_websocket(ctx: Context) -> Check:
 
 
 def check_lcd(ctx: Context) -> Check:
-    url = public_url(ctx.config.lcd_endpoint)
+    url = log.origin(ctx.config.lcd_endpoint)
     start = time.monotonic()
     try:
         node = margin._get_json(
-            f"{ctx.config.lcd_endpoint.rstrip('/')}"
-            "/cosmos/base/tendermint/v1beta1/node_info",
+            margin.lcd_url(ctx.config.lcd_endpoint, margin.NODE_INFO_PATH),
             timeout=NETWORK_TIMEOUT,
         )
     except ValueError as exc:
@@ -1241,20 +1242,20 @@ def check_lcd(ctx: Context) -> Check:
         )
     info_block = node.get("default_node_info")
     network = info_block.get("network") if isinstance(info_block, dict) else None
-    if not isinstance(network, str) or not network:
+    if not isinstance(network, str) or CHAIN_ID.fullmatch(network) is None:
         return Check(
             "lcd",
             "fail",
-            f"{url} answered without a chain network in node_info",
+            f"{url} returned a missing or invalid chain ID in node_info network",
             "Check --lcd-endpoint points at a Nibiru REST (LCD) service",
             {"endpoint": url},
         )
     return Check(
         "lcd",
         "pass",
-        f"{url} answered in {elapsed_ms(start)} ms (network {network})",
-        None,
-        {"endpoint": url, "network": network},
+        f"{url} answered in {elapsed_ms(start)} ms",
+        details={"endpoint": url},
+        _lcd_chain_id=network,
     )
 
 
@@ -1268,11 +1269,17 @@ def cross_check_network(checks: list[Check]) -> None:
     if keeper_check is None or lcd_check is None or lcd_check.status != "pass":
         return
     chain = keeper_check.details.get("chainId")
-    network = lcd_check.details.get("network")
-    if chain and network and chain != network:
-        lcd_check.status = "warn"
-        lcd_check.summary += f"; Keeper trades on {chain}"
-        lcd_check.fix = "Pass the --lcd-endpoint for Keeper's chain"
+    network = lcd_check._lcd_chain_id
+    if not isinstance(chain, str) or not chain or network is None:
+        return
+    matches = chain == network
+    lcd_check.details["matchesKeeperChain"] = matches
+    if matches:
+        lcd_check.summary += f" (matches Keeper chain {chain})"
+        return
+    lcd_check.status = "warn"
+    lcd_check.summary += f"; LCD network differs from Keeper chain {chain}"
+    lcd_check.fix = "Pass the --lcd-endpoint for Keeper's chain"
 
 
 LOCAL_CHECKS: list[tuple[str, CheckFn]] = [

@@ -1023,7 +1023,7 @@ def create_server(
                 "endpoints": {
                     "keeper": sai_log.origin(config.endpoint),
                     "websocket": sai_log.origin(config.ws_endpoint),
-                    "lcd": sai_settings.public_url(config.lcd_endpoint),
+                    "lcd": sai_log.origin(config.lcd_endpoint),
                 },
                 "configFile": str(sai_settings.config_path(os.environ)),
                 "logs": {

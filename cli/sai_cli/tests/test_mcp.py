@@ -1409,19 +1409,27 @@ def test_logged_and_returned_errors_redact_the_session_token(mcp, monkeypatch, c
 
 def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
     monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s")
-    monkeypatch.setenv("SAI_LCD_ENDPOINT", "https://lcd.example/?apikey=s")
+    monkeypatch.setenv(
+        "SAI_LCD_ENDPOINT", "http://[::1]:9/fixture-lcd-path?key=fixture-lcd-query"
+    )
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")
     assert info["endpoints"] == {
         "keeper": "https://k.example:8443",
         "websocket": "wss://k.example:8443",
-        "lcd": "https://lcd.example/",
+        "lcd": "http://[::1]:9",
     }
     assert info["session"]["endpoint"] == "https://k.example"
     text = json.dumps(info)
-    for secret in ("user:pw", "key=", "apikey", "u:p@", "t=s"):
+    for secret in (
+        "user:pw",
+        "key=",
+        "fixture-lcd-path",
+        "fixture-lcd-query",
+        "u:p@",
+        "t=s",
+    ):
         assert secret not in text
-    assert settings.public_url("http://[::1]:9/q?x=1") == "http://[::1]:9/q"
 
 
 def test_mcp_info_reports_versions_without_network(mcp, monkeypatch):
@@ -1513,6 +1521,8 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
         "serve",
         "--endpoint",
         "http://127.0.0.1:9/query",
+        "--lcd-endpoint",
+        "http://127.0.0.1:8/fixture-lcd-path?key=fixture-lcd-query",
     ]
     with subprocess.Popen(
         command,
@@ -1547,8 +1557,13 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     info = json.loads(called["content"][0]["text"])
     assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
     assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
+    assert info["endpoints"]["lcd"] == "http://127.0.0.1:8"
     assert info["trading"]["reason"] == "signed-out"
     assert "agent client should launch it" not in stderr
+    logs = "".join(path.read_text() for path in (tmp_path / "logs").glob("*.jsonl"))
+    assert '"event":"mcp.server_start"' in logs
+    for secret in ("fixture-lcd-path", "fixture-lcd-query"):
+        assert secret not in json.dumps(called) + stderr + logs
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
