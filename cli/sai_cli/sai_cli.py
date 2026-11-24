@@ -793,7 +793,8 @@ def positions(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def history(ctx: click.Context, addr: str) -> None:
     """Read trade history for ADDR."""
-    perform_query(ctx, keeper.HISTORY, {"trader": addr})
+    data = keeper.request(keeper_url(ctx), keeper.HISTORY, {"trader": addr})
+    emit(ctx, keeper.safe_history_response(data))
 
 
 @account.command("balances")
@@ -827,7 +828,8 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
 
     Use --key to check one intent for a final outcome.
     """
-    emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
+    data = reconcile.reconcile(keeper_url(ctx), addr, key)
+    emit(ctx, reconcile.status_report(data))
 
 
 @intent.command("local")

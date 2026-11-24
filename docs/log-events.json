@@ -222,7 +222,8 @@
         "code": "string",
         "error": "string",
         "httpStatus": "integer",
-        "keeperErrors": "object[]"
+        "keeperErrors": "object[]",
+        "keeperErrorCount": "integer"
       }
     },
     "log.dropped": {

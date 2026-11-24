@@ -160,6 +160,7 @@ class Keeper:
         self.intents: list[dict[str, Any]] = []
         self.history: list[dict[str, Any]] = []
         self.errors: list[dict[str, Any]] | None = None
+        self.history_errors: list[dict[str, Any]] | None = None
         self.status = 200
         self.ack_tx_hash: Any = None
         self.intents_block: threading.Event | None = None
@@ -203,7 +204,11 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
             elif "tokenPricesUsd" in query:
                 value = {"data": {"oracle": {"tokenPricesUsd": []}}}
             elif "tradeHistory" in query:
-                value = {"data": {"perp": {"tradeHistory": state.history}}}
+                value = (
+                    {"errors": state.history_errors}
+                    if state.history_errors is not None
+                    else {"data": {"perp": {"tradeHistory": state.history}}}
+                )
             else:
                 value = {"data": {"perp": {"borrowings": [], "trades": []}}}
             data = json.dumps(value).encode()
@@ -726,6 +731,64 @@ def test_keeper_errors_record_what_keeper_answered(home, keeper_stub):
     ]
     assert rejected["error"] == "Keeper rejected the request; check inputs and session"
     assert unavailable["operation"] == "custom" and unavailable["httpStatus"] == 503
+
+
+def test_intent_and_history_reads_log_graphql_codes_and_count(home, keeper_stub):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    secret = "OpaqueGraphqlUpstreamCredential"
+    errors = [
+        {"message": secret, "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}},
+        {"message": secret, "extensions": {"code": secret}},
+        {"message": secret},
+        {"message": secret},
+    ]
+    prefix = ("--json", "--endpoint", endpoint)
+    status = ("intent", "status", ADDR, "--key", key)
+    state.errors = errors
+    reads = [
+        run_cli(*prefix, *status),
+        run_cli(*prefix, "account", "history", ADDR),
+        run_cli(*prefix, "logs", "intent", key, "--addr", ADDR),
+    ]
+    assert [code for code, _ in reads] == [1, 1, 0]
+    assert json.loads(reads[2][1])["keeperError"]["code"] == "KEEPER_ERROR"
+
+    state.errors = None
+    state.history_errors = errors
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "txHash": "a" * 64,
+        }
+    ]
+    code, output = run_cli(*prefix, *status)
+    assert code == 0 and json.loads(output)["matchedTradeHistory"] == []
+    assert all(secret not in text for _, text in reads)
+    assert all(secret not in text for text in (output, raw_logs(home)))
+
+    requests = [row for row in events(home, "keeper.request") if "keeperErrors" in row]
+    assert [row["operation"] for row in requests] == [
+        "intents",
+        "history",
+        "history",
+    ]
+    assert requests[0]["intentKey"] == key
+    for row in requests:
+        assert row["keeperErrorCount"] == 4
+        assert row["keeperErrors"] == [
+            {"code": "GRAPHQL_VALIDATION_FAILED"},
+            {"code": "KEEPER_ERROR"},
+            {"code": "KEEPER_ERROR"},
+        ]
+    for flags in ((), ("--json",)):
+        code, tail = run_cli(*flags, "logs", "tail", "--event", "keeper.request")
+        assert code == 0
+        assert secret not in tail and "GRAPHQL_VALIDATION_FAILED" in tail
 
 
 def test_a_keeper_error_that_echoes_the_signature_is_scrubbed(home, keeper_stub):
@@ -2058,6 +2121,193 @@ def test_keeper_lifecycle_codes_and_user_actor_survive_mcp_and_audit(home, keepe
     assert "opaque-upstream-error" not in raw_logs(home)
 
 
+def test_cli_intent_status_keeps_keeper_code_without_echoing_session(home, keeper_stub):
+    endpoint, state = keeper_stub
+    token = save_session(endpoint, token=OPAQUE_TOKEN)
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "OPEN_TRADE",
+            "execActor": "server",
+            "lifecycleStep": "exec_req_fail",
+            "errorCode": "simulation_failed",
+            "errorMsg": f"upstream diagnostic with credential {token}",
+            "txHash": None,
+        }
+    ]
+    result = subprocess.run(
+        [
+            *sai_command(),
+            "--json",
+            "--endpoint",
+            endpoint,
+            "intent",
+            "status",
+            ADDR,
+            "--key",
+            key,
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10,
+    )
+    assert all(
+        token not in output for output in (result.stdout, result.stderr, raw_logs(home))
+    )
+    cli = json.loads(result.stdout)
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
+    assert cli == {
+        name: value
+        for name, value in status.items()
+        if name not in ("addr", "addrSource")
+    }
+    row = cli["userIntents"][0]
+    assert row["errorCode"] == "simulation_failed"
+    assert row["errorMsg"] == "Keeper reported an intent error."
+    assert "txHash" not in row
+    assert events(home, "intent.keeper")[0]["errorCode"] == "simulation_failed"
+
+
+@pytest.mark.parametrize(
+    ("timestamp", "valid"),
+    [
+        ("2026-11-20T15:43:31Z", True),
+        ("2026-11-20T15:43:31.082Z", True),
+        ("2026-11-20T15:43:31.123456789+05:30", True),
+        ("2026-11-20T15:43:31.1234567890123456Z", False),
+        ("2026-11-20x15:43:31Z", False),
+        ("2026-11-20T15:43:31+00:60", False),
+        ("2026-02-30T15:43:31Z", False),
+        (123, False),
+        (None, False),
+    ],
+)
+def test_keeper_read_timestamps_match_the_wire_format(keeper_stub, timestamp, valid):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "txHash": "a" * 64,
+            "execBlockTs": timestamp,
+        }
+    ]
+    state.history = [
+        {
+            "intentKey": key,
+            "trade": {"id": 7, "trader": ADDR},
+            "txHash": "a" * 64,
+            "block": {"block": 123, "block_ts": timestamp},
+        }
+    ]
+    prefix = ("--json", "--endpoint", endpoint)
+    code, output = run_cli(*prefix, "intent", "status", ADDR, "--key", key)
+    assert code == 0
+    report = json.loads(output)
+    code, output = run_cli(*prefix, "account", "history", ADDR)
+    assert code == 0
+    history = json.loads(output)["perp"]["tradeHistory"]
+    code, output = run_cli(*prefix, "logs", "intent", key, "--addr", ADDR)
+    assert code == 0
+    audit_row = json.loads(output)["keeper"]
+    for row, field in (
+        (report["userIntents"][0], "execBlockTs"),
+        (report["matchedTradeHistory"][0]["block"], "block_ts"),
+        (history[0]["block"], "block_ts"),
+        (audit_row, "execBlockTs"),
+    ):
+        assert row.get(field) == (timestamp if valid else None)
+        assert row.get(field + "Invalid") == (
+            True if timestamp is not None and not valid else None
+        )
+        if not valid:
+            assert field not in row
+
+
+@pytest.mark.parametrize(
+    ("error_code", "step"),
+    [
+        ("intent_validation_failed", "sign_failed"),
+        ("chain_switch_failed", "sign_failed"),
+        ("gas_estimation_failed", "sign_failed"),
+        ("wallet_rejected", "sign_reject"),
+        ("wallet_sign_failed", "sign_failed"),
+        ("chain_mismatch", "sign_failed"),
+        ("request_pending", "sign_failed"),
+        ("rpc_submission_failed", "exec_req_fail"),
+        ("sign_failed_unknown", "sign_failed"),
+        ("intent_auth_rejected", "jwt_failed"),
+        ("jwt_failed", "jwt_failed"),
+    ],
+)
+def test_browser_lifecycle_codes_survive_intent_status(keeper_stub, error_code, step):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "OPEN_TRADE",
+            "execActor": "user",
+            "lifecycleStep": step,
+            "errorCode": error_code,
+            "errorMsg": "provider-specific browser diagnostic",
+        }
+    ]
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    records = [
+        json.loads(output)["userIntents"][0],
+        call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][0],
+    ]
+    for record in records:
+        assert record["execActor"] == "user" and record["lifecycleStep"] == step
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
+@pytest.mark.parametrize(
+    "error_code", ["withdraw_evm_unconfigured", "invalid_withdraw"]
+)
+def test_withdrawal_codes_survive_cli_and_mcp_intent_status(keeper_stub, error_code):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "WITHDRAW_USD",
+            "execActor": "server",
+            "lifecycleStep": "exec_req_fail",
+            "errorCode": error_code,
+            "errorMsg": "private withdrawal diagnostic",
+        }
+    ]
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    records = [
+        json.loads(output)["userIntents"][0],
+        call(mcp, "intent_status", {"addr": ADDR, "key": key})["userIntents"][0],
+    ]
+    for record in records:
+        assert record["errorCode"] == error_code
+        assert record["errorMsg"] == "Keeper reported an intent error."
+
+
 @pytest.mark.parametrize(
     "error_code",
     [
@@ -2143,7 +2393,7 @@ def test_mcp_audit_validation_names_types_without_rejected_values(
     assert secret not in raw_logs(home)
 
 
-def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keeper_stub):
+def test_invalid_hash_and_keeper_text_are_excluded_from_reports(home, keeper_stub):
     endpoint, state = keeper_stub
     save_session(endpoint)
     secret = "some-opaque-credential-unrelated-to-the-active-session"
@@ -2202,7 +2452,7 @@ def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keepe
         }
     ]
     status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
-    assert status["matchedTradeHistory"] == [
+    expected = [
         {
             "intentKey": key,
             "trade": {"id": 7, "trader": ADDR},
@@ -2210,7 +2460,25 @@ def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keepe
             "evmTxHash": "0x" + "a" * 64,
         }
     ]
+    assert status["matchedTradeHistory"] == expected
     assert secret not in json.dumps(status)
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    assert json.loads(output)["matchedTradeHistory"] == expected
+    assert all(secret not in value for value in (output, raw_logs(home)))
+
+    code, output = run_cli("--json", "--endpoint", endpoint, "account", "history", ADDR)
+    assert code == 0
+    assert json.loads(output) == {"perp": {"tradeHistory": expected}}
+    history = call(mcp, "account_history", {"addr": ADDR})
+    assert history == {
+        "addr": ADDR,
+        "addrSource": "argument",
+        "perp": {"tradeHistory": expected},
+    }
+    assert secret not in raw_logs(home)
 
 
 def test_intent_reports_unattributed_gaps_and_skips_nonfinite_rows(home):
