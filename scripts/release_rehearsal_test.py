@@ -575,6 +575,31 @@ query($user: String!, $key: String, $other: DECLARATION) {
                     with error.exception as response:
                         self.assertEqual(response.code, 400)
 
+    def test_user_filter_requires_a_non_null_declaration_or_default(self) -> None:
+        query = """
+query($account: DECLARATION, $key: String) {
+  matched: userIntents(where: {user: $account, intentKey: $key}) { intentKey }
+}
+"""
+        addr = self.replay.addr
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for declaration in ("String", "String = null"):
+                with self.subTest(declaration=declaration):
+                    with self.assertRaises(HTTPError) as error:
+                        self.query(
+                            base,
+                            query.replace("DECLARATION", declaration),
+                            account=addr,
+                            key=self.key,
+                        )
+                    with error.exception as response:
+                        self.assertEqual(response.code, 400)
+            defaulted = query.replace("DECLARATION", f"String = {json.dumps(addr)}")
+            self.assertEqual(
+                self.query(base, defaulted, key=self.key),
+                {"matched": [{"intentKey": self.key}]},
+            )
+
     def test_uses_intent_filter_defaults_only_for_omitted_variables(self) -> None:
         query = (
             f"query($user: String! = {json.dumps(self.replay.addr)},"

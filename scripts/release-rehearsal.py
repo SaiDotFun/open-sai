@@ -477,6 +477,14 @@ def selection_set(
                 raise ValueError(
                     "Expected a String variable for the userIntents filter"
                 )
+            if (
+                path == ("userIntents", "where", "user")
+                and type_name == "String"
+                and default is None
+            ):
+                raise ValueError(
+                    "Expected a non-null declaration or default for the user filter"
+                )
             return bindings.get(name, default)
         if token == "{":
             return named_values("}", path)
