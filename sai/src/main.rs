@@ -207,7 +207,7 @@ fn main() -> process::ExitCode {
         if let Some(writer) = &writer
             && !log_started.replace(true)
         {
-            // Import accepts no operands, and a stray argument can contain a token.
+            // A stray argument to import can contain a token.
             let logged_argv = if command == "auth import" {
                 &argv[..argv.len() - operands.len()]
             } else {
