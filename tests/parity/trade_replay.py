@@ -7,7 +7,7 @@ import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypeGuard
 
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, same_variables
@@ -15,6 +15,21 @@ from scenarios import ADDRESS, PROTOCOL
 
 SESSION = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
 REQUEST_HASH = "a" * 64
+KEEPER_TIME = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:[.,][0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})"
+)
+REPORT_FIELDS = {"intentKey", "intent", "lifecycle", "evmAddress", "signedTx"}
+INTENT_FIELDS = {
+    "intentSchemaVersion",
+    "kind",
+    "tsIntentInit",
+    "blockIntentInit",
+    "blockTsIntentInit",
+    "target",
+    "body",
+    "extensions",
+}
 MARKET_INDEX = re.compile(r"MarketIndex\(([0-9]+)\)")
 UNSIGNED = re.compile(r"[0-9]+")
 DECIMAL = re.compile(r"(0|[1-9][0-9]*)(?:\.([0-9]{1,18}))?")
@@ -124,6 +139,7 @@ class TradeReplay:
         if (
             not key.isascii()
             or not INTENT_ID.fullmatch(key)
+            or envelope.keys() - REPORT_FIELDS
             or authorization != f"Bearer {SESSION['token']}"
             or envelope.get("signedTx") is not None
             or (
@@ -134,10 +150,10 @@ class TradeReplay:
                 )
             )
             or not isinstance(intent, dict)
+            or intent.keys() - INTENT_FIELDS
             or intent.get("intentSchemaVersion") != "v0"
             or intent.get("kind") != self.kind
-            or not isinstance(stamp, str)
-            or not timestamp(stamp)
+            or not keeper_time(stamp)
             or datetime.fromisoformat(stamp) == datetime.min.replace(tzinfo=UTC)
             or not same_variables(
                 envelope.get("lifecycle"),
@@ -167,8 +183,11 @@ class TradeReplay:
         )
         extensions = intent.get("extensions")
         if (
-            (height is not None and (type(height) is not int or height < 0))
-            or (block_time is not None and not timestamp(block_time))
+            (
+                height is not None
+                and (type(height) is not int or not 0 <= height < 2**63)
+            )
+            or (block_time is not None and not keeper_time(block_time))
             or (extensions is not None and not isinstance(extensions, dict))
         ):
             raise ValueError("Invalid intent metadata")
@@ -227,6 +246,16 @@ class TradeReplay:
             },
             "trade": {"id": 7, "trader": ADDRESS},
         }
+
+
+def keeper_time(value: object) -> TypeGuard[str]:
+    # Keeper's GraphQL Time scalar parses RFC3339Nano. In particular seconds
+    # and a time zone are required even when the fraction is omitted.
+    return (
+        isinstance(value, str)
+        and KEEPER_TIME.fullmatch(value) is not None
+        and timestamp(value)
+    )
 
 
 def unsigned_int(value: object, maximum: int) -> int | None:

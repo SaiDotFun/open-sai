@@ -146,11 +146,36 @@ def test_rejects_invalid_action_before_admission(kind, body):
         assert not replay.arrived.is_set()
 
 
-@pytest.mark.parametrize("fields", [{"evmAddress": "0x" + "f" * 40}, {"signedTx": ""}])
+@pytest.mark.parametrize(
+    "fields",
+    [{"evmAddress": "0x" + "f" * 40}, {"signedTx": ""}, {"execActor": "server"}],
+)
 def test_rejects_invalid_handoff_before_admission(fields):
     replay = TradeReplay()
     variables = report(FIRST, {})
     variables["input"].update(fields)
+    with loopback("default", trade_replay=replay) as endpoints:
+        status, _ = post(
+            endpoints.keeper, "recordUserIntent", variables, authenticated=True
+        )
+        assert status == 400
+        assert replay.attempts() == {FIRST: 1}
+        assert not replay.admitted_keys()
+
+
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"tsIntentInit": "2026-11-24T12:00Z"},
+        {"blockTsIntentInit": "2026-11-24T12:00Z"},
+        {"blockIntentInit": 2**63},
+        {"execActor": "server"},
+    ],
+)
+def test_rejects_invalid_intent_input_before_admission(fields):
+    replay = TradeReplay()
+    variables = report(FIRST, {}, fields.get("tsIntentInit", STAMP))
+    variables["input"]["intent"].update(fields)
     with loopback("default", trade_replay=replay) as endpoints:
         status, _ = post(
             endpoints.keeper, "recordUserIntent", variables, authenticated=True
