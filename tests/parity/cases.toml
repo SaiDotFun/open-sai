@@ -546,9 +546,8 @@ state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json
 name = "doctor-mcp-verification-failure"
 args = ["--json", "doctor", "--offline"]
 client_seed = "partial"
-accepted_divergence = "codex-repair-rollback"
 expect = 1
-state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
+state = { "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
 
 [[case]]
 name = "doctor-mcp-codex-shadow"

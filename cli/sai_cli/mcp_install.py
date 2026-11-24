@@ -31,7 +31,7 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import InlineTable
 
-from .core import paths, settings
+from .core import settings
 
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
@@ -178,7 +178,7 @@ class ClientError(Exception):
     """A client command or config file failed; the message is safe to print."""
 
 
-class CodexRestoreError(ClientError):
+class CodexPreflightError(ClientError):
     def __init__(self, message: str, fix: str) -> None:
         super().__init__(message)
         self.fix = fix
@@ -693,15 +693,25 @@ class Codex(Client):
             return
         raise ClientError(STILL_ACTIVE)
 
-    def get(self, cwd: Path, scope: str, name: str = NAME) -> Registration | None:
+    def get(
+        self,
+        cwd: Path,
+        scope: str,
+        name: str = NAME,
+        *,
+        overrides: tuple[str, ...] = (),
+    ) -> Registration | None:
         """Run `codex mcp get` for one Sai server name; keep command and args."""
         exe = self.exe()
         if exe is None:
             return None
         command = f"codex mcp get {name} --json"
+        argv = [exe, "mcp", "get", name, "--json"]
+        for override in overrides:
+            argv.extend(("-c", override))
         try:
             done = subprocess.run(
-                [exe, "mcp", "get", name, "--json"],
+                argv,
                 cwd=cwd,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -1157,100 +1167,81 @@ def repair_entry(
     return original
 
 
-@dataclass(frozen=True)
-class CodexEdit:
-    destination: Path
-    original: dict[str, Any]
-    replacement: dict[str, Any]
+def codex_restore_hint(name: str, original: dict[str, Any]) -> str:
+    """Show the original invocation's shape without printing saved values."""
+    launcher = original["command"]
+    args = []
+    for arg in original.get("args", []):
+        flag, equals, _ = arg.partition("=")
+        if flag in ENDPOINT_FLAGS or flag == "--as":
+            args.append(f"{flag}=<original-value>" if equals else flag)
+        elif arg in {"mcp", "serve", "--", "--json"}:
+            args.append(arg)
+        else:
+            args.append("<original-argument>")
+    command = shlex.join(
+        [
+            "codex",
+            "mcp",
+            "add",
+            name,
+            *(f"--env={key}=<original-value>" for key in original.get("env", {})),
+            "--",
+            launcher if launcher in SERVER_NAMES else "<original-launcher>",
+            *args,
+        ]
+    )
+    hint = (
+        "If you need to restore the entry, use the same Codex home. "
+        f"Replace the placeholders with the original values in `{command}`."
+    )
+    if original.keys() - {"command", "args", "env"}:
+        hint += " Restore settings such as tool filters in Codex config.toml."
+    return hint
 
 
-def codex_saved_entry(path: Path, name: str) -> dict[str, Any] | None:
-    entries = tomllib.loads(path.read_text(encoding="utf-8")).get("mcp_servers", {})
-    entry = entries.get(name) if isinstance(entries, dict) else None
-    return entry if isinstance(entry, dict) else None
-
-
-def codex_restore_instructions(
-    client: Codex, name: str, original: dict[str, Any], argv: list[str], *, manual: bool
-) -> str:
-    """Keep the exact original settings and command out of doctor output and logs."""
+def codex_entry_state(path: Path, name: str, original: dict[str, Any]) -> str:
     try:
-        home = client.home_dir().resolve()
-        directory = paths.private_directory(home / "sai-recovery")
-        detail = directory / f"{name}{'.txt' if manual else '.sh'}"
-        fd, filename = tempfile.mkstemp(prefix=f".{name}-", dir=directory)
-        pending = Path(filename)
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                pending.chmod(0o600)
-                config = tomlkit.dumps({"mcp_servers": {name: original}})
-                for line in config.splitlines():
-                    handle.write(f"# {line}\n")
-                handle.write(f"export CODEX_HOME={shlex.quote(str(home))}\n")
-                handle.write(f"exec {shlex.join(argv)}\n")
-            os.replace(pending, detail)
-        finally:
-            pending.unlink(missing_ok=True)
+        current = read_bytes(path)
+        servers = (
+            tomllib.loads(current.decode()).get("mcp_servers", {})
+            if current is not None
+            else {}
+        )
+        entry = servers.get(name) if isinstance(servers, dict) else None
     except (OSError, ValueError):
-        return "Review the Sai entry in the Codex user config. Could not save the private recovery instructions."
-    if manual:
-        return (
-            f"Restore only the original Sai entry from the private instructions at {detail}. "
-            "The add command in that file would reset settings that only Codex config.toml supports."
-        )
-    return f"Review the original settings in {detail}, then run `{shlex.join(['sh', str(detail)])}` to retry the Codex add."
+        return "Could not read the current Sai entry."
+    if entry == original:
+        return "The original Sai entry is unchanged."
+    if entry is None:
+        return "The Sai entry is missing."
+    return "The Sai entry was changed by another process."
 
 
-def restore_codex_entry(client: Codex, path: Path, name: str, edit: CodexEdit) -> None:
-    original = edit.original
-    env = original.get("env", {})
-    argv = [
-        client.exe() or client.binary,
-        "mcp",
-        "add",
-        name,
-        *(f"--env={key}={value}" for key, value in env.items()),
-        "--",
-        original["command"],
-        *original.get("args", []),
-    ]
-    unsupported = original.keys() - {"command", "args", "env"}
-    if unsupported:
-        raise CodexRestoreError(
-            "Codex rejected the repaired entry. Its original settings require a manual restore",
-            codex_restore_instructions(client, name, original, argv, manual=True),
-        )
+def validate_codex_repair(
+    client: Codex, path: Path, name: str, expected: Target, original: dict[str, Any]
+) -> None:
+    prefix = f"mcp_servers.{name}"
+    launcher = expected.argv[0]
+    overrides = (f"{prefix}.command={tomlkit.string(launcher).as_string()}",)
+    preview = expected
+    if original.get("args", []) != expected.argv[1:]:
+        # Codex treats args as opaque strings. Check the new legacy prefix
+        # without copying saved argument values into the subprocess argv.
+        # The rendered TOML retains the whole argument list.
+        overrides += (f'{prefix}.args=["mcp", "serve"]',)
+        preview = Target([launcher, "mcp", "serve"])
     try:
-        if path.resolve() != edit.destination:
-            raise ClientError("Codex config changed before Sai could restore the entry")
-        current = codex_saved_entry(path, name)
-        if current == original:
+        actual = client.get(client.neutral_dir(), "user", name, overrides=overrides)
+        if actual is not None and actual.matches_command(preview):
             return
-        if current != edit.replacement:
-            raise ClientError("The Sai entry changed before Sai could restore it")
-        run(
-            argv,
-            cwd=client.neutral_dir(),
-            env={**client.environ, "CODEX_HOME": str(client.home_dir().resolve())},
-        )
-        restored = codex_saved_entry(path, name)
-        if (
-            restored is None
-            or restored.get("command") != original["command"]
-            or restored.get("args", []) != original.get("args", [])
-            or restored.get("env", {}) != env
-        ):
-            raise ClientError("Codex did not save the original Sai entry")
-    except (ClientError, OSError, ValueError) as exc:
-        reason = (
-            str(exc)
-            if isinstance(exc, ClientError)
-            else "Could not read the Codex user config"
-        )
-        raise CodexRestoreError(
-            f"Codex rejected the repaired entry. {reason}",
-            codex_restore_instructions(client, name, original, argv, manual=False),
-        ) from None
+    except ClientError:
+        pass
+    state = codex_entry_state(path, name, original)
+    raise CodexPreflightError(
+        f"Codex rejected the proposed repair. {state}",
+        codex_restore_hint(name, original),
+    )
 
 
 def edit_codex_config(
@@ -1259,7 +1250,8 @@ def edit_codex_config(
     *,
     stale: StaleRegistration | None = None,
     name: str = NAME,
-) -> CodexEdit | None:
+    validate: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
     """Change only Sai's table, publishing the complete config in one rename."""
     name = stale.name if stale else name
     for _ in range(2):
@@ -1278,15 +1270,11 @@ def edit_codex_config(
             raise ClientError("Could not edit Codex config.toml") from None
         data = rendered.encode()
         if data == seen:
-            return None
+            return
+        if validate is not None:
+            validate(tomllib.loads(source)["mcp_servers"][name])
         if replace_bytes(path, data, seen, destination=destination):
-            if stale is None:
-                return None
-            return CodexEdit(
-                destination,
-                tomllib.loads(source)["mcp_servers"][name],
-                tomllib.loads(rendered)["mcp_servers"][name],
-            )
+            return
     raise ClientError("Codex config.toml changed while Sai was writing it")
 
 
@@ -1425,16 +1413,14 @@ def replace_registration(
     if isinstance(client, Codex):
         expected = Target([normalize_launcher(target.argv[0]), *stale.args])
         path = client.config_path(scope)
-        edit = edit_codex_config(path, expected, stale=stale)
-        try:
-            actual = client.get(client.neutral_dir(), "user", name)
-            if actual is None or not actual.matches_command(expected):
-                raise ClientError("Codex did not load the repaired Sai registration")
-        except ClientError as exc:
-            if edit is not None:
-                restore_codex_entry(client, path, name, edit)
-                raise ClientError(f"{exc}. The original Sai entry is present") from None
-            raise
+        edit_codex_config(
+            path,
+            expected,
+            stale=stale,
+            validate=lambda original: validate_codex_repair(
+                client, path, name, expected, original
+            ),
+        )
         return
     if not isinstance(client, Cursor):
         raise ClientError("Only Codex and Cursor support automatic repair")
@@ -1605,7 +1591,7 @@ def check_registration(
                     (
                         summary,
                         exc.fix
-                        if isinstance(exc, CodexRestoreError)
+                        if isinstance(exc, CodexPreflightError)
                         else "Check this client's Sai registration and rerun `sai doctor`",
                     )
                 )
