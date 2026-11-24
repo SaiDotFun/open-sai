@@ -245,12 +245,11 @@ pub(super) fn keeper_endpoint(path: &Path, flags: SettingsFlags<'_>) -> Result<S
             }
         }
     }
-    if let Some(raw) = env_value("SAI_UPDATE_AUTO")
-        && boolean(&raw).is_none()
-    {
-        return Err(format!(
-            "SAI_UPDATE_AUTO: Invalid value '{raw}' for update.auto: expected true or false"
-        ));
+    if env_value("SAI_UPDATE_AUTO").is_some_and(|raw| boolean(&raw).is_none()) {
+        return Err(
+            "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true, false, yes, no, on, off, 1, or 0"
+                .into(),
+        );
     }
 
     if let Some(raw) = env_value("SAI_LOG") {

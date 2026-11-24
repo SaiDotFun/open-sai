@@ -182,6 +182,44 @@ fn url_validation_rejects_malformed_authorities_without_echoing_them() {
 }
 
 #[test]
+fn invalid_settings_diagnostics_omit_supplied_values() {
+    let home = tempdir().unwrap();
+    let marker = "synthetic-secret-setting-value";
+    for (variable, key, code) in [
+        ("SAI_UPDATE_AUTO", "update.auto", 1),
+        ("SAI_ENDPOINT", "keeper.endpoint", 1),
+        ("SAI_WS_ENDPOINT", "keeper.ws_endpoint", 1),
+        ("SAI_LCD_ENDPOINT", "lcd.endpoint", 1),
+        ("SAI_LOG", "logs.enabled", 0),
+        ("SAI_LOG_KEEP_DAYS", "logs.keep_days", 0),
+    ] {
+        let output = rust(home.path())
+            .env("SAI_LOG", "1")
+            .env(variable, marker)
+            .args(["--json", "auth", "list"])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code), "{variable}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.contains(marker), "{variable} echoed its value");
+        assert!(stderr.contains(variable) && stderr.contains(key));
+        if variable == "SAI_UPDATE_AUTO" {
+            assert!(stderr.contains("expected true, false, yes, no, on, off, 1, or 0"));
+        }
+    }
+
+    fs::write(
+        home.path().join("config.toml"),
+        format!("[update]\nauto = {marker}\n"),
+    )
+    .unwrap();
+    let output = rust(home.path()).args(["auth", "list"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("Cannot parse") && !stderr.contains(marker));
+}
+
+#[test]
 #[ignore = "requires uv and a Python reference checkout"]
 fn invalid_settings_match_python_for_local_commands() {
     let home = tempdir().unwrap();
