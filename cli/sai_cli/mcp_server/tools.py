@@ -143,14 +143,21 @@ def describe(exc: Exception) -> dict[str, Any]:
         )
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
-        return error(failure.message, failure.code, **extra, **exc.extra)
+        reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
+        return error(reason or failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.ExecutionRejected):
+        return error(failure.message, failure.code, preview=exc.preview)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
             return error(failure.message, Code.PREVIEW_MISMATCH)
+        reason = estimates.rejection_reason(exc.preview.get("estimates", {}))
         return error(
-            "The position, quote, or route changed during confirmation, so nothing was"
-            " submitted. Show the user the latest preview, get their confirmation"
-            " again, then retry with its previewDigest.",
+            reason
+            or (
+                "The position, quote, or route changed during confirmation, so nothing was"
+                " submitted. Show the user the latest preview, get their confirmation"
+                " again, then retry with its previewDigest."
+            ),
             Code.PREVIEW_MISMATCH,
             preview=confirmation.with_digest(exc.preview),
         )
@@ -338,7 +345,7 @@ def session_state(settings: Settings) -> dict[str, Any]:
         **sessions.summary(stored),
         "expired": expired,
         "endpointMatches": matches,
-        **({"renewalCommand": sessions.renewal_command(stored)} if expired else {}),
+        **(sessions.renewal_fields(stored) if expired else {}),
         **(sessions.expiry_fields(stored, now) if matches else {}),
     }
 
