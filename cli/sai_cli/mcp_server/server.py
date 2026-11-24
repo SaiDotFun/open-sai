@@ -15,31 +15,29 @@ import asyncio
 import json
 import logging
 import os
-import signal
 import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from functools import partial
-from queue import SimpleQueue
-from threading import BoundedSemaphore, Thread
+from threading import BoundedSemaphore
 from typing import Annotated, Any, Literal
 
-from anyio import AsyncFile, BrokenResourceError
+from anyio import BrokenResourceError
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
-from mcp.server.stdio import stdio_server
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
 from pydantic import BeforeValidator, ConfigDict, ValidationError
 
-from ..core import log as sai_log
 from ..core import intents, log_queries, wait
+from ..core import log as sai_log
 from ..core import settings as sai_settings
 from ..core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from ..core.settings import Settings
 from . import info, tools
+from .stdio import run_stdio
 
 log = logging.getLogger("sai_cli.mcp_server")
 BAD_SETTINGS = "BAD_SETTINGS"  # Legacy MCP result code.
@@ -772,70 +770,18 @@ TRADE_TOOLS: tuple[tuple[Callable[..., Any], ToolAnnotations], ...] = (
 TRADE_TOOL_NAMES = frozenset(function.__name__ for function, _ in TRADE_TOOLS)
 
 
-class StdioInput(AsyncFile[str]):
-    """Read stdin without making event loop shutdown wait for the next line."""
-
-    def __init__(self) -> None:
-        # The reader owns its file, so a blocked read cannot hold a lock on
-        # Python's standard streams when the interpreter exits.
-        super().__init__(
-            os.fdopen(os.dup(sys.stdin.fileno()), encoding="utf-8", errors="replace")
-        )
-        self.requests: SimpleQueue[Future[str] | None] = SimpleQueue()
-        Thread(target=self.read_lines, daemon=True, name="mcp-stdin").start()
-
-    def read_lines(self) -> None:
-        with self.wrapped as stdin:
-            while (request := self.requests.get()) is not None:
-                if request.set_running_or_notify_cancel():
-                    try:
-                        request.set_result(stdin.readline())
-                    except OSError as exc:
-                        request.set_exception(exc)
-
-    async def readline(self) -> str:
-        request: Future[str] = Future()
-        self.requests.put(request)
-        return await asyncio.wrap_future(request)
-
-    def stop(self) -> None:
-        self.requests.put(None)
-
-
 class SaiMCP(FastMCP):
-    async def run_stdio_async(self) -> None:
-        loop = asyncio.get_running_loop()
-        task = asyncio.current_task()
-        assert task is not None
-        terminating = False
-
-        def terminate(_signum: int, _frame: object) -> None:
-            nonlocal terminating
-            terminating = True
-            loop.call_soon_threadsafe(task.cancel)
-
-        previous = signal.signal(signal.SIGTERM, terminate)
-        try:
-            stdin = StdioInput()
-            try:
-                async with stdio_server(stdin=stdin) as (read, write):
-                    await self._mcp_server.run(
-                        read, write, self._mcp_server.create_initialization_options()
-                    )
-            finally:
-                stdin.stop()
-        except asyncio.CancelledError:
-            if not terminating:
-                raise
-        finally:
-            signal.signal(signal.SIGTERM, previous)
-
     """FastMCP that checks the session before a trade tool's arguments.
 
     FastMCP validates arguments before the tool runs, so without this a
     signed-out call with missing or bad arguments would get a validation
     error instead of SIGNED_OUT and the sign-in guidance.
     """
+
+    standalone_stdio = False
+
+    async def run_stdio_async(self) -> None:
+        await run_stdio(self._mcp_server, standalone=self.standalone_stdio)
 
     async def call_tool(
         self, name: str, arguments: dict[str, Any]
@@ -1036,7 +982,9 @@ def session_refusal(addr: str | None = None) -> str | None:
     return None
 
 
-def create_server(settings: Settings | None = None) -> FastMCP:
+def create_server(
+    settings: Settings | None = None, *, standalone_stdio: bool = False
+) -> FastMCP:
     """Build a server that lists every read, preview, and trade tool.
 
     Trade tools check sign-in on each call, so registering them while
@@ -1046,6 +994,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
     global _settings
     _settings = settings
     server = SaiMCP("sai", instructions=INSTRUCTIONS)
+    server.standalone_stdio = standalone_stdio
 
     async def mcp_info() -> str:
         """Report this server's versions, provenance, endpoints, tools,
@@ -1109,7 +1058,9 @@ def forbid_unknown_arguments(server: FastMCP) -> None:
         tool.parameters["additionalProperties"] = False
 
 
-def serve(flags: Mapping[str, str | None] | None = None) -> None:
+def serve(
+    flags: Mapping[str, str | None] | None = None, *, standalone: bool = False
+) -> None:
     """Serve over stdio; stdout carries only protocol.
 
     FLAGS maps setting keys to the `sai mcp serve` flags given, the top
@@ -1139,7 +1090,7 @@ def serve(flags: Mapping[str, str | None] | None = None) -> None:
             websocket=sai_log.endpoint(settings.ws_endpoint),
             lcd=sai_log.endpoint(settings.lcd_endpoint),
         )
-        server = create_server(settings)
+        server = create_server(settings, standalone_stdio=standalone)
         try:
             server.run()
         except* (KeyboardInterrupt, BrokenPipeError, BrokenResourceError):

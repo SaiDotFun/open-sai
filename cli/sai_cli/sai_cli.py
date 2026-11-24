@@ -277,6 +277,11 @@ class LoggedGroup(SaiGroup):
                 }
             else:
                 log_start()
+            if command == "mcp serve":
+                extra["obj"] = {
+                    **(extra.get("obj") or {}),
+                    "mcp_standalone": standalone_mode,
+                }
             try:
                 result = super().main(
                     args,
@@ -1824,7 +1829,7 @@ def mcp_serve(
     )
     if sys.stdin.isatty():
         click.echo(SERVE_TTY_NOTICE, err=True)
-    server.serve(flags)
+    server.serve(flags, standalone=ctx.obj.get("mcp_standalone", False))
 
 
 def serve_flags(

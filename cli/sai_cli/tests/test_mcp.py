@@ -12,6 +12,7 @@ import subprocess
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from typing import Any, TextIO
 
 import pytest
@@ -397,12 +398,15 @@ def served_settings(monkeypatch, flags) -> settings.Settings:
         def run(self) -> None:
             pass
 
-    def build(resolved: settings.Settings | None = None) -> Idle:
+    def build(
+        resolved: settings.Settings | None = None, *, standalone_stdio: bool = False
+    ) -> Idle:
+        assert standalone_stdio
         seen.append(resolved)
         return Idle()
 
     monkeypatch.setattr(server, "create_server", build)
-    server.serve(flags)
+    server.serve(flags, standalone=True)
     assert len(seen) == 1 and seen[0] is not None
     return seen[0]
 
@@ -1581,6 +1585,133 @@ def test_sai_mcp_serve_stops_while_stdin_is_open(tmp_path, stop):
                 process.kill()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
+def test_mcp_serve_returns_to_its_in_process_caller_after_sigint(tmp_path):
+    script = """
+import time
+from sai_cli.mcp_server.stdio import SHUTDOWN_EXIT_TIMEOUT
+from sai_cli.sai_cli import main
+
+main.main(args=["mcp", "serve"], standalone_mode=False)
+time.sleep(SHUTDOWN_EXIT_TIMEOUT + 0.2)
+print("caller still running", flush=True)
+"""
+    initialize = {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    }
+    with subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"SAI_HOME": str(tmp_path), "PATH": os.defpath},
+        text=True,
+    ) as process:
+        assert process.stdin is not None and process.stdout is not None
+        try:
+            process.stdin.write(rpc(1, "initialize", initialize))
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0]
+            assert json.loads(process.stdout.readline())["id"] == 1
+            process.send_signal(signal.SIGINT)
+            assert process.wait(timeout=5) == 0
+            assert process.stdout.read() == "caller still running\n"
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
+@pytest.mark.parametrize("keeper_call", ["finishes", "blocks", "client-cancelled"])
+def test_sai_mcp_serve_replies_to_in_flight_request_on_sigint(tmp_path, keeper_call):
+    started = Event()
+    release = Event()
+
+    class Keeper(KeeperHandler):
+        def do_POST(self):
+            started.set()
+            if release.wait(10):
+                try:
+                    self.reply({"data": {"perp": {"borrowings": []}}})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+    with (
+        keeper_server(Keeper) as base,
+        subprocess.Popen(
+            [*sai_command(), "mcp", "serve", "--endpoint", f"{base}/query"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"SAI_HOME": str(tmp_path), "PATH": os.defpath},
+            text=True,
+        ) as process,
+    ):
+        assert process.stdin is not None and process.stdout is not None
+        assert process.stderr is not None
+        try:
+            process.stdin.write(
+                rpc(
+                    1,
+                    "initialize",
+                    {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "0"},
+                    },
+                )
+            )
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0], (
+                "MCP did not initialize"
+            )
+            assert json.loads(process.stdout.readline())["id"] == 1
+
+            process.stdin.write(rpc(None, "notifications/initialized", {}))
+            process.stdin.write(
+                rpc(2, "tools/call", {"name": "market_list", "arguments": {}})
+            )
+            process.stdin.flush()
+            assert started.wait(5), "MCP did not reach Keeper"
+
+            if keeper_call == "client-cancelled":
+                process.stdin.write(
+                    rpc(None, "notifications/cancelled", {"requestId": 2})
+                )
+                process.stdin.flush()
+                assert select.select([process.stdout], [], [], 5)[0]
+                cancelled = json.loads(process.stdout.readline())
+                assert (
+                    cancelled["id"] == 2
+                    and "cancelled" in cancelled["error"]["message"]
+                )
+
+            process.send_signal(signal.SIGINT)
+            if keeper_call == "finishes":
+                release.set()
+            assert process.wait(timeout=4) == 0
+            replies = process.stdout.read().splitlines()
+            if keeper_call == "client-cancelled":
+                assert replies == []
+                return
+            (message,) = map(json.loads, replies)
+            assert message["id"] == 2
+            if keeper_call == "finishes":
+                assert message["result"]["isError"] is False
+                assert json.loads(message["result"]["content"][0]["text"]) == {
+                    "perp": {"borrowings": []}
+                }
+            else:
+                assert "shutting down" in message["error"]["message"]
+            assert process.stderr.read() == ""
+        finally:
+            if process.poll() is None:
+                process.kill()
+            release.set()
+
+
 def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
     command, *args = sai_command()
 
@@ -1623,7 +1754,12 @@ def test_bare_sai_mcp_prints_help():
 def test_sai_mcp_serve_takes_the_root_endpoint(monkeypatch):
     """`sai --endpoint X mcp serve` serves X; serve's own flags win."""
     seen: list[dict[str, str | None] | None] = []
-    monkeypatch.setattr(server, "serve", seen.append)
+
+    def serve(flags, *, standalone):
+        assert standalone
+        seen.append(flags)
+
+    monkeypatch.setattr(server, "serve", serve)
     runner = CliRunner()
     url = "http://127.0.0.1:9/query"
     assert runner.invoke(main, ["--endpoint", url, "mcp", "serve"]).exit_code == 0
