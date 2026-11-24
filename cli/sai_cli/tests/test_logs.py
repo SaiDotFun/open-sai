@@ -2137,6 +2137,66 @@ def test_cli_intent_status_keeps_keeper_code_without_echoing_session(home, keepe
 
 
 @pytest.mark.parametrize(
+    ("timestamp", "valid"),
+    [
+        ("2026-11-20T15:43:31Z", True),
+        ("2026-11-20T15:43:31.082Z", True),
+        ("2026-11-20T15:43:31.123456789+05:30", True),
+        ("2026-11-20T15:43:31.1234567890123456Z", False),
+        ("2026-11-20x15:43:31Z", False),
+        ("2026-11-20T15:43:31+00:60", False),
+        ("2026-02-30T15:43:31Z", False),
+        (123, False),
+        (None, False),
+    ],
+)
+def test_keeper_read_timestamps_match_the_wire_format(keeper_stub, timestamp, valid):
+    endpoint, state = keeper_stub
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_pass",
+            "execActor": "server",
+            "txHash": "a" * 64,
+            "execBlockTs": timestamp,
+        }
+    ]
+    state.history = [
+        {
+            "intentKey": key,
+            "trade": {"id": 7, "trader": ADDR},
+            "txHash": "a" * 64,
+            "block": {"block": 123, "block_ts": timestamp},
+        }
+    ]
+    prefix = ("--json", "--endpoint", endpoint)
+    code, output = run_cli(*prefix, "intent", "status", ADDR, "--key", key)
+    assert code == 0
+    report = json.loads(output)
+    code, output = run_cli(*prefix, "account", "history", ADDR)
+    assert code == 0
+    history = json.loads(output)["perp"]["tradeHistory"]
+    code, output = run_cli(*prefix, "logs", "intent", key, "--addr", ADDR)
+    assert code == 0
+    audit_row = json.loads(output)["keeper"]
+    for row, field in (
+        (report["userIntents"][0], "execBlockTs"),
+        (report["matchedTradeHistory"][0]["block"], "block_ts"),
+        (history[0]["block"], "block_ts"),
+        (audit_row, "execBlockTs"),
+    ):
+        assert row.get(field) == (timestamp if valid else None)
+        assert row.get(field + "Invalid") == (
+            True if timestamp is not None and not valid else None
+        )
+        if not valid:
+            assert field not in row
+
+
+@pytest.mark.parametrize(
     "error_code",
     [
         "market_order_expired",

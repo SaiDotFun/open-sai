@@ -38,6 +38,11 @@ SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$in
 INTENT_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}")
 GENERATED_INTENT_KEY = re.compile(r"[0-9]{8}T[0-9]{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 REQUEST_HASH = re.compile(r"(?:0[xX])?[0-9a-fA-F]{64}")
+# gqlgen's Time scalar emits RFC3339Nano for block and execution timestamps.
+BLOCK_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
 INTENT_KINDS = frozenset(
     {
         "OPEN_TRADE",
@@ -145,12 +150,13 @@ def intent_error_code(row: Mapping[str, Any]) -> str | None:
 
 
 def _block_time(value: object) -> str | None:
-    if isinstance(value, str) and len(value) <= 40:
+    if isinstance(value, str) and BLOCK_TIMESTAMP.fullmatch(value):
         try:
-            if datetime.fromisoformat(value).tzinfo is not None:
-                return value
+            datetime.fromisoformat(value)
         except ValueError:
             pass
+        else:
+            return value
     return None
 
 
@@ -189,8 +195,11 @@ def safe_intent_record(row: Mapping[str, Any]) -> dict[str, Any]:
     block = row.get("execBlock")
     if type(block) is int and 0 <= block < 2**63:
         record["execBlock"] = block
-    if ts := _block_time(row.get("execBlockTs")):
-        record["execBlockTs"] = ts
+    timestamp = row.get("execBlockTs")
+    if valid := _block_time(timestamp):
+        record["execBlockTs"] = valid
+    elif timestamp is not None:
+        record["execBlockTsInvalid"] = True
     tx_hash, invalid = request_hash(row.get("txHash"))
     if tx_hash:
         record["txHash"] = tx_hash
@@ -230,8 +239,11 @@ def safe_intent_history(row: Mapping[str, Any]) -> dict[str, Any]:
         history["block"] = {}
         if (height := _row_id(block.get("block"))) is not None:
             history["block"]["block"] = height
-        if ts := _block_time(block.get("block_ts")):
-            history["block"]["block_ts"] = ts
+        timestamp = block.get("block_ts")
+        if valid := _block_time(timestamp):
+            history["block"]["block_ts"] = valid
+        elif timestamp is not None:
+            history["block"]["block_tsInvalid"] = True
     return log.clean(history)
 
 
