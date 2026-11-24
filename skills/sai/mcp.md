@@ -62,16 +62,17 @@ logs tail --surface mcp` in a terminal reads them ([cli.md](cli.md#logs)).
 | `account_positions`, `account_balances`, `account_history` | Reads for one account |
 | `intent_local`, `intent_status` | Locally recorded intents, and Keeper's record of them |
 | `intent_wait` | Wait for an existing intent key and return its receipt |
+| `logs_intent` | Read local events for one intent and optionally query Keeper |
 | `preview_open`, `preview_close`, `preview_partial_close`, `preview_tpsl`, `preview_leverage`, `preview_margin` | What a trade would do. Submits nothing. |
 | `trade_open`, `trade_close`, `trade_partial_close`, `trade_tpsl`, `trade_leverage`, `trade_margin` | Submit the previewed trade |
 
-Account reads take an optional `addr`. Without one they read the active
-account and report `addrSource` as `session`. Say so to the person, and pass
-`addr` to read any other account.
+Account reads take an optional `addr`. Pass a public address to read that
+account without a session. With no address, the tools use the active account
+and report `addrSource` as `session`.
 
 Use `account_overview` for a portfolio check. Report any failed section
-that matters to the user's question and check the source age separately
-from the fetch time.
+that matters to the user's question. Check `sourceAgeSeconds` even when
+`fetchedAt` is recent.
 
 ## Sign-In
 
@@ -79,14 +80,15 @@ The server lists every tool whether or not anyone is signed in. Each
 `trade_*` call checks the session of the account it acts as.
 
 If `mcp_info.session.expiryWarning` is present, tell the person when the
-session expires and pass along the `renewalCommand` it reports.
+session expires. To renew, use the same Keeper endpoint. The v0.1.2
+`renewalCommand` can include explanatory text after the command.
 
 | `mcp_info.trading.reason` | A `trade_*` call returns | Meaning |
 | --- | --- | --- |
 | `signed-in` | the trade result | Trades can submit. |
-| `signed-out` | `SIGNED_OUT` | No account is connected. |
+| `signed-out` | `SIGNED_OUT` or `SESSION_UNAVAILABLE` | No account is connected, or Sai could not load the selected session. |
 | `expired` | `SESSION_EXPIRED` | The session ran out. |
-| `other-endpoint` | `SESSION_UNAVAILABLE` | The session belongs to another Keeper endpoint, or its file is unreadable. |
+| `other-endpoint` | `SESSION_UNAVAILABLE` | The session belongs to another Keeper endpoint. |
 
 A refused call submits nothing. Ask the person to run `sai auth import`, or
 `sai auth login NAME` with their Foundry keystore name, in their own
@@ -129,7 +131,9 @@ the one the person confirmed. The digest covers:
   and leverage, and the contract inputs used to quote the requested slice,
   including the applicable after-hours cap and collateral/USD oracle price.
   Show the quoted notional and say whether `quote.closedNotionalIsEstimate`
-  is true.
+  is true. If the collateral oracle price is unavailable, the partial-close
+  estimate cannot be submitted. Preview again when Sai can verify the price
+  and ask the person to confirm the updated quote.
 
 The `estimates` object is informational. The price sources, time fields,
 and fee exclusions are in [Reading the Estimates](trading-safety.md#reading-the-estimates).
@@ -174,7 +178,8 @@ submit-time check, Perp can close the filled position at market.
 Call `auth_use` only when the person asks to switch accounts.
 
 After a trade returns its key, call `intent_wait` with that `key` and the
-trade's `addr`. Each call waits up to 10 seconds. On `OUTCOME_UNKNOWN`,
+trade's `addr`. The `timeout` argument is in seconds and caps at 10.
+On `OUTCOME_UNKNOWN`,
 call it again with the same key and address. A receipt gives the request
 transaction hash and the execution block when Keeper has that evidence.
 
