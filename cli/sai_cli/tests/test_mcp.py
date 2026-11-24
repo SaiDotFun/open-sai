@@ -21,6 +21,7 @@ from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 from sai_cli.core import keeper, margin, settings, storage, stream, update
+from sai_cli.core import log as sai_log
 from sai_cli.core import session as sessions
 from sai_cli.mcp_server import info as sai_info
 from sai_cli.mcp_server import server, tools
@@ -1472,6 +1473,48 @@ def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
             "reason": "signed-in",
             "addr": ADDR,
         }
+
+
+def test_stdio_auth_use_keeps_malformed_expiry_private(tmp_path: Path) -> None:
+    secret = "synthetic-mcp-expiry-credential-marker"
+    with sai_log.silenced():
+        storage.save_session({**stored_session(), "expiresAt": secret})
+        storage.save_session(
+            {**stored_session(), "evmAddress": OTHER, "token": OTHER_TOKEN}
+        )
+    path = tmp_path / "trader" / "sessions.json"
+    before = path.read_bytes()
+    command, *args = sai_command()
+    params = StdioServerParameters(
+        command=command,
+        args=[*args, "mcp", "serve"],
+        env={"SAI_HOME": str(tmp_path), "SAI_LOG": "1"},
+    )
+
+    async def switch(errlog: TextIO) -> None:
+        async with (
+            stdio_client(params, errlog=errlog) as (read, write),
+            ClientSession(read, write) as client,
+        ):
+            await client.initialize()
+            result = await client.call_tool("auth_use", {"addr": ADDR})
+            assert secret not in result.model_dump_json()
+            assert json.loads(text_of(result.content)) == {
+                "error": f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}",
+                "code": "SESSION_UNAVAILABLE",
+            }
+
+    stderr = tmp_path / "stderr.log"
+    with stderr.open("w") as errlog:
+        asyncio.run(switch(errlog))
+    logs = "".join(
+        file.read_text() for _, _, file in sai_log.log_files(tmp_path / "logs")
+    )
+    assert "mcp.tool_result" in logs and "SESSION_UNAVAILABLE" in logs
+    assert "session.active" not in logs
+    assert secret not in logs + stderr.read_text()
+    assert path.read_bytes() == before
+    assert storage.load_accounts()["active"] == OTHER
 
 
 def test_bare_sai_mcp_prints_help():

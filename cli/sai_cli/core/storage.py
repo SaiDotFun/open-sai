@@ -325,13 +325,17 @@ def load_session(addr: str | None = None) -> dict[str, str]:
 
 def use_session(addr: str) -> dict[str, str]:
     """Make the connected ADDR the active account and return its session."""
+    from .session import expiry_time
+
     with _locked():
         accounts = load_accounts()
         key = _find(accounts, addr)
+        session = accounts["sessions"][key]
+        expiry_time(session)
         accounts["active"] = key
         _save_accounts(accounts)
-        log.event("session.active", addr=accounts["sessions"][key]["evmAddress"])
-        return accounts["sessions"][key]
+        log.event("session.active", addr=session["evmAddress"])
+        return session
 
 
 def session_exists() -> bool:

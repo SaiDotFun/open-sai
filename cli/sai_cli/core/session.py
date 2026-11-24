@@ -15,9 +15,14 @@ EXPIRY_WARNING = timedelta(days=3)
 
 
 def expiry_time(result: dict[str, str]) -> datetime:
-    expiry = datetime.fromisoformat(result["expiresAt"])
-    if expiry.tzinfo is None:
-        raise ValueError("Stored session is invalid: expiry has no time zone")
+    try:
+        expiry = datetime.fromisoformat(result["expiresAt"])
+        if expiry.tzinfo is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise SessionError(
+            f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
+        ) from None
     return expiry
 
 
@@ -81,12 +86,7 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
     """Return RESULT if it belongs to ENDPOINT and has not expired."""
     if result.get("endpoint") != endpoint:
         raise SessionError("Stored session belongs to another Keeper endpoint")
-    try:
-        expiry = expiry_time(result)
-    except (KeyError, ValueError) as exc:
-        raise SessionError(
-            f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
-        ) from exc
+    expiry = expiry_time(result)
     if expiry <= datetime.now(UTC):
         log.event(
             "session.expired",

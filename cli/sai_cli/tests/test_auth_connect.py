@@ -25,7 +25,7 @@ from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sai_cli.core import keeper
+from sai_cli.core import keeper, log, storage
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
@@ -498,6 +498,46 @@ def test_accounts_connect_switch_and_disconnect(env: Env) -> None:
     status = env.run("auth", "status")
     assert status.returncode != 0
     assert "No active Sai account" in status.stderr
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize(
+    "expiry", ["synthetic-expiry-credential-marker", "2031-02-03T04:05:06"]
+)
+def test_use_rejects_malformed_expiry_before_switching(
+    env: Env, monkeypatch: pytest.MonkeyPatch, json_output: bool, expiry: str
+) -> None:
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    token = make_token()
+    with log.silenced():
+        storage.save_session({**session_for(token), "expiresAt": expiry})
+        storage.save_session({**session_for(make_token(OTHER)), "evmAddress": OTHER})
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    output = result.stdout + result.stderr
+    stored = env.stored_bytes()
+    for secret in (token, expiry):
+        assert secret not in output
+        assert secret.encode() not in stored
+    assert b"command.end" in stored and b"session.active" not in stored
+    assert path.read_bytes() == before
+    assert storage.load_accounts()["active"] == OTHER
+    message = f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"] == {
+            "code": "SESSION_UNAVAILABLE",
+            "message": message,
+            "retryable": False,
+        }
+    else:
+        assert result.stdout == ""
+        assert result.stderr == f"Error: {message}\n"
 
 
 def test_tampered_session_cannot_be_unlocked(env: Env) -> None:

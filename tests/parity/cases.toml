@@ -325,6 +325,21 @@ args = ["--json","auth","use","{addr}"]
 expect = 1
 
 [[case]]
+name = "auth-use-invalid-expiry-text"
+args = ["auth","use","{addr}"]
+mode = "text"
+expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
+
+[[case]]
+name = "auth-use-invalid-expiry-json"
+args = ["--json","auth","use","{addr}"]
+expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
+
+[[case]]
 name = "auth-logout"
 args = ["--json","auth","logout","{addr}"]
 seed = "accounts"
