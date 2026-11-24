@@ -564,7 +564,11 @@ def fixture_exchange(state: dict) -> dict[str, str]:
 
 @pytest.fixture
 def keeper_auth():
-    """Serve Keeper's challenge and session mutations on loopback."""
+    """Serve Keeper's challenge and session mutations on loopback.
+
+    Keeper owns signature verification, expiry, chain agreement, and replay
+    prevention. The client signs only after checking the challenge identity.
+    """
     state: dict[str, Any] = {
         "typed": typed_data(),
         "challenge_expires_at": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
@@ -606,7 +610,11 @@ def keeper_auth():
                     > datetime.now(UTC)
                 )
                 state["pending"] = False
-                if live and variables == fixture_exchange(state):
+                issued = state.get("issued")
+                chain_matches = issued is not None and (
+                    issued["typedData"]["domain"].get("chainId") == issued["chainId"]
+                )
+                if live and chain_matches and variables == fixture_exchange(state):
                     reply = {
                         "data": {
                             "createUserIntentSession": {
@@ -670,6 +678,16 @@ def test_keeper_fixture_rejects_expired_or_unbound_signatures(
             keeper.SESSION,
             {"signature": signature, "challenge": issued["nonce"]},
         )
+
+
+def test_keeper_fixture_rejects_a_consumed_challenge(keeper_auth) -> None:
+    endpoint = keeper_auth["endpoint"]
+    keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    exchange = fixture_exchange(keeper_auth)
+    accepted = keeper.request(endpoint, keeper.SESSION, exchange)
+    assert accepted["createUserIntentSession"]["evmAddress"] == ADDR
+    with pytest.raises(keeper.KeeperError, match="Keeper rejected the request"):
+        keeper.request(endpoint, keeper.SESSION, exchange)
 
 
 def fake_cast(

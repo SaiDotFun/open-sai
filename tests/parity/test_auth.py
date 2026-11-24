@@ -123,6 +123,7 @@ def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> No
         ("malformed-signature", 1, 1, 0),
         ("keeper-rejects-signature", 1, 1, 1),
         ("expired-challenge", 1, 1, 1),
+        ("wrong-typed-chain", 1, 1, 1),
         ("ud-locked", 3, 1, 0),
         ("terminal-fallback", 0, 2, 1),
         ("rotated-keystore", 1, 1, 0),
@@ -158,6 +159,8 @@ def test_auth_login(
         keeper_auth["typed"]["message"]["challenge"] = "0x" + "34" * 32
     if case == "expired-challenge":
         keeper_auth["challenge_expires_at"] = "2000-01-01T00:00:00Z"
+    if case == "wrong-typed-chain":
+        keeper_auth["typed"]["domain"]["chainId"] = 6901
     signer_output = {
         "malformed-signature": "0x0",
         "keeper-rejects-signature": "0x" + "1" * 130,
@@ -218,7 +221,11 @@ def test_auth_login(
             "wrong-typed-nonce",
         }:
             assert "wallet sign" not in env.log.read_text()
-        if case in {"keeper-rejects-signature", "expired-challenge"}:
+        if case in {
+            "keeper-rejects-signature",
+            "expired-challenge",
+            "wrong-typed-chain",
+        }:
             assert "Keeper rejected the request" in result[1]
         assert bool(session_state(env)["sessions"]) == (expected_code == 0)
     assert results[0] == results[1]
