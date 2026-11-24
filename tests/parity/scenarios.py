@@ -247,7 +247,12 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         endpoints,
         sessions,
         ledger=seed in {"ledger", "doctor-ledger-session"},
-        disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
+        disable_logs=seed
+        in {
+            "doctor-near-expiry",
+            "doctor-ledger-session",
+            "mcp-auth-redaction",
+        },
         malformed_expiry=malformed_expiry,
     )
     if malformed_expiry or seed in {

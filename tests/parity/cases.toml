@@ -833,7 +833,7 @@ args = ["mcp","serve"]
 mode = "mcp"
 mcp_profile = "auth-redaction"
 seed = "mcp-auth-redaction"
-state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111" }
+state = { "logs/cli.jsonl" = "<absent>", "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111" }
 
 [[case]]
 name = "mcp-overview-validation"
