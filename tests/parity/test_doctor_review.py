@@ -333,8 +333,10 @@ def test_uninstall_keeps_removal_after_confirmed_codex_override(
     candidate: str, tmp_path: Path, fixture_env: dict[str, str]
 ) -> None:
     seed_clients(tmp_path, fixture_env, "shadowed")
-    (tmp_path / "fail-second-project-query").touch()
     config = tmp_path / ".codex/config.toml"
+    user_entry = tomllib.loads(config.read_text())["mcp_servers"]["sai"]
+    (tmp_path / ".codex/project.json").write_text(json.dumps(user_entry))
+    (tmp_path / "fail-second-project-query").touch()
     result = subprocess.run(
         [candidate, "--json", "mcp", "uninstall", "codex", "--scope", "user"],
         cwd=tmp_path,
