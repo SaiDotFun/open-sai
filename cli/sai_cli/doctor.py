@@ -130,6 +130,19 @@ def check_config(
         return Check(
             "config", "fail", f"Invalid config.toml settings: {', '.join(invalid)}", fix
         ), config
+    invalid_env = [
+        f"{spec.env} ({spec.key})"
+        for spec in settings.SETTINGS
+        if config.sources[spec.key] == "invalid"
+        and os.environ.get(spec.env, "").strip()
+    ]
+    if invalid_env:
+        return Check(
+            "config",
+            "warn",
+            f"Invalid environment settings: {', '.join(invalid_env)}",
+            "Correct or unset the listed environment variables",
+        ), config
     if warnings:
         return Check(
             "config", "warn", "config.toml contains unknown settings", fix

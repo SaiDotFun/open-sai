@@ -119,6 +119,12 @@ def run_cli(*args: str) -> tuple[int, str]:
         (b"[update]\nauto = 'private_value'\n", "fail", "update.auto"),
         (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", "logs.keep_days"),
         (b"\xff", "fail", "UTF-8"),
+        pytest.param(
+            b"[logs]\nkeep_days = " + b"9" * 5000,
+            "fail",
+            "not valid TOML",
+            id="oversized-TOML-integer",
+        ),
     ],
 )
 def test_config_check_reports_file_errors_without_echoing_values(
@@ -145,6 +151,19 @@ def test_unusable_config_skips_checks_that_need_resolved_settings(isolated_home)
     assert code == 1
     for name in ("session", "intents", "keeper", "websocket", "lcd"):
         assert checks[name]["status"] == "skipped"
+
+
+def test_config_warns_about_invalid_logging_override(monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "private-invalid-boolean")
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 0
+    checks = {check["id"]: check for check in json.loads(output)["checks"]}
+    assert checks["config"]["status"] == "warn"
+    assert "SAI_LOG" in checks["config"]["summary"]
+    assert "logs.enabled" in checks["config"]["summary"]
+    assert "private-invalid-boolean" not in output
 
 
 # Session

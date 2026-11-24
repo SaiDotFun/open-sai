@@ -257,7 +257,7 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
     """
     try:
         data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
+    except ValueError as exc:
         raise ConfigError(
             "config.toml is not valid TOML", f"Cannot parse {path}: {exc}"
         ) from None
