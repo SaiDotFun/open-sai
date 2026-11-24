@@ -203,3 +203,5 @@ jobs:
           PROFILE
           fi
           uv run --locked python tests/parity/parity.py --case 'account-overview-*' --case account-bare
+          unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+            uv run --locked pytest -m parity_namespace tests/parity/test_overview_dns.py

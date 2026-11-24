@@ -142,13 +142,18 @@ impl AccountCommand {
             } => {
                 let addr = addr.as_deref().filter(|addr| !addr.is_empty()).or(account);
                 let settings = load_settings(flags, env)?;
-                let value = runtime()?.block_on(sai_core::overview::read(
+                let runtime = runtime()?;
+                let value = runtime.block_on(sai_core::overview::read(
                     &settings,
                     &env.home,
                     addr,
                     events,
                     interrupted(),
-                ))?;
+                ));
+                // A cancelled system DNS job can outlive the overview's deadline.
+                // Let the CLI report its result without waiting for that blocking job.
+                runtime.shutdown_background();
+                let value = value?;
                 return if json || overview_json {
                     output::read(&value, true)
                 } else {
