@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -15,7 +16,7 @@ import tarfile
 import threading
 import time
 import zipfile
-from collections.abc import Generator
+from collections.abc import Generator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler
@@ -191,9 +192,20 @@ class ReleaseFixture:
         return ("--api-base", self.base, "--web-base", self.base)
 
 
+@dataclass(frozen=True)
+class Redirect:
+    location: str
+
+
+@dataclass(frozen=True)
+class Streamed:
+    chunk: bytes
+    count: int
+
+
 @contextmanager
 def releases(
-    files: dict[str, bytes],
+    files: Mapping[str, bytes | Redirect | Streamed],
     *,
     tags: tuple[str, ...] = (NEW,),
     pause: tuple[str, threading.Event, threading.Event] | None = None,
@@ -217,6 +229,21 @@ def releases(
                 data = files[path]
             else:
                 self.send_error(404)
+                return
+            if isinstance(data, Redirect):
+                self.send_response(302)
+                self.send_header("Location", data.location)
+                self.end_headers()
+                return
+            if isinstance(data, Streamed):
+                # HTTP/1.0 delimits this body by closing the connection.
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    for _ in range(data.count):
+                        self.wfile.write(data.chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
                 return
             self.send_response(200)
             self.send_header("Content-Length", str(len(data)))
@@ -343,6 +370,53 @@ def test_invalid_assets_keep_the_working_launcher(
     assert sorted(
         path.name for path in standalone.executable.parent.parent.iterdir()
     ) == [standalone.executable.parent.name]
+
+
+def test_update_refuses_cross_origin_asset_redirect(standalone: NativeInstall) -> None:
+    published = assets(NEW, archive_name(), archive())
+    path = asset_key(NEW, archive_name())
+    with (
+        releases(published) as other,
+        releases({**published, path: Redirect(other.base + path)}) as server,
+    ):
+        result = standalone.update(server)
+        assert not other.reads
+    assert result.returncode == 1, result.stdout
+    assert standalone.launcher.resolve() == standalone.executable
+
+
+@pytest.mark.parametrize(
+    ("name", "chunk"),
+    [("SHA256SUMS", 1024), (archive_name(), 1 << 20)],
+)
+def test_update_bounds_streamed_release_assets(
+    standalone: NativeInstall, name: str, chunk: int
+) -> None:
+    published = assets(NEW, archive_name(), archive())
+    with releases(
+        {**published, asset_key(NEW, name): Streamed(b"x" * chunk, 65)}
+    ) as server:
+        result = standalone.update(server)
+    assert result.returncode == 1
+    assert f"{name} is too large" in json.loads(result.stdout)["error"]["message"]
+    assert standalone.launcher.resolve() == standalone.executable
+
+
+def test_update_bounds_the_expanded_tar(standalone: NativeInstall) -> None:
+    excess = io.BytesIO()
+    zeroes = bytes(1 << 20)
+    with gzip.GzipFile(fileobj=excess, mode="wb", compresslevel=1) as stream:
+        for _ in range(98):
+            stream.write(zeroes)
+    payload = archive() + excess.getvalue()
+    with releases(assets(NEW, archive_name(), payload)) as server:
+        result = standalone.update(server)
+    assert result.returncode == 1
+    assert (
+        "expanded native archive is too large"
+        in json.loads(result.stdout)["error"]["message"]
+    )
+    assert standalone.launcher.resolve() == standalone.executable
 
 
 @pytest.mark.parametrize("phase", ["trial", "installed"])
