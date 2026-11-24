@@ -16,11 +16,38 @@ EXPIRY_WARNING = timedelta(days=3)
 INVALID_RENEWAL_ADDRESS = "Stored session address is invalid. Sign in again."
 
 
+def _redact_field(result: dict[str, str], value: str) -> str:
+    secrets = (result.get("token"), *log.known_tokens())
+    return (
+        log.REDACTED if any(secret and secret in value for secret in secrets) else value
+    )
+
+
+def _display_origin(result: dict[str, str], endpoint: str) -> str:
+    # Compare the stored value before parsing, which can change its spelling.
+    if _redact_field(result, endpoint) == log.REDACTED:
+        return log.REDACTED
+    return _redact_field(result, log.origin(endpoint))
+
+
 def expiry_time(result: dict[str, str]) -> datetime:
-    expiry = datetime.fromisoformat(result["expiresAt"])
-    if expiry.tzinfo is None:
-        raise ValueError("Stored session is invalid: expiry has no time zone")
+    try:
+        expiry = datetime.fromisoformat(result["expiresAt"])
+        if expiry.tzinfo is None:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise SessionError(storage.INVALID_EXPIRY) from None
     return expiry
+
+
+def validate_issued_session(result: dict[str, str]) -> None:
+    """Reject a Keeper reply that the session store or expiry reader cannot use."""
+    try:
+        expiry_time(storage.check_session_fields(result))
+    except SessionError:
+        raise keeper.KeeperError("Keeper returned an invalid session expiry") from None
+    except ValueError:
+        raise keeper.KeeperError("Keeper returned invalid session data") from None
 
 
 def renewal_fields(result: dict[str, str]) -> dict[str, str]:
@@ -33,15 +60,15 @@ def renewal_fields(result: dict[str, str]) -> dict[str, str]:
     else:
         args = ("auth", "import", "--addr", addr)
     endpoint = result.get("endpoint") or ""
-    origin = log.origin(endpoint)
-    show_origin = origin != log.REDACTED_URL and log.redact(origin) == origin
-    public_default = (
-        endpoint == keeper.MAINNET_HTTP and log.redact(endpoint) == endpoint
-    )
+    origin = _display_origin(result, endpoint)
+    show_origin = origin not in (log.REDACTED, log.REDACTED_URL)
+    public_default = endpoint == keeper.MAINNET_HTTP and show_origin
     command = (
         shlex.join(("sai", "--endpoint", endpoint, *args))
         if public_default
-        else storage.keeper_command_hint(endpoint, *args)
+        else storage.keeper_command_hint(
+            log.REDACTED if origin == log.REDACTED else endpoint, *args
+        )
     )
     guidance = []
     if not public_default and (endpoint != origin or not show_origin):
@@ -52,7 +79,7 @@ def renewal_fields(result: dict[str, str]) -> dict[str, str]:
     fields = {"renewalCommand": command}
     if guidance:
         fields["renewalGuidance"] = " ".join(guidance)
-    return fields
+    return {name: _redact_field(result, value) for name, value in fields.items()}
 
 
 def expiry_notice_text(fields: Mapping[str, str]) -> str:
@@ -86,8 +113,8 @@ def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
         if minutes < 120
         else f"{minutes // 60} h"
     )
-    addr = escape_warning_text(result["evmAddress"])
-    return f"Sai session for {addr} expires in {when}."
+    addr = escape_warning_text(_redact_field(result, result["evmAddress"]))
+    return _redact_field(result, f"Sai session for {addr} expires in {when}.")
 
 
 def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str]:
@@ -113,12 +140,7 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
     """Return RESULT if it belongs to ENDPOINT and has not expired."""
     if result.get("endpoint") != endpoint:
         raise SessionError("Stored session belongs to another Keeper endpoint")
-    try:
-        expiry = expiry_time(result)
-    except (KeyError, ValueError) as exc:
-        raise SessionError(
-            f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}"
-        ) from exc
+    expiry = expiry_time(result)
     if expiry <= datetime.now(UTC):
         log.event(
             "session.expired",
@@ -180,13 +202,33 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
     }
 
 
-def summary(result: dict[str, str]) -> dict[str, str | None]:
+def session_address(result: dict[str, str], account_key: str) -> str:
+    addr = result["evmAddress"]
+    if not keeper.is_address(addr) or addr.lower() != account_key:
+        raise SessionError(
+            f"Stored session has an invalid address; {storage.SIGN_IN_AGAIN}"
+        )
+    return addr
+
+
+def summary(
+    result: dict[str, str], *, account_key: str | None = None
+) -> dict[str, str | None]:
     """Return the address, expiry, and Keeper origin for display."""
     endpoint = result.get("endpoint")
+    if endpoint is not None and not isinstance(endpoint, str):
+        raise SessionError(
+            f"Stored session has an invalid endpoint; {storage.SIGN_IN_AGAIN}"
+        )
+    addr = (
+        result["evmAddress"]
+        if account_key is None
+        else session_address(result, account_key)
+    )
     return {
-        "addr": result["evmAddress"],
-        "expiresAt": result["expiresAt"],
-        "endpoint": log.origin(endpoint) if endpoint is not None else None,
+        "addr": _redact_field(result, addr),
+        "expiresAt": _redact_field(result, result["expiresAt"]),
+        "endpoint": _display_origin(result, endpoint) if endpoint is not None else None,
     }
 
 
