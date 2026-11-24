@@ -24,7 +24,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
-from ..core import intents, keeper, reconcile, storage, stream, trading
+from ..core import intents, keeper, overview, reconcile, storage, stream, trading
 from ..core import log as sai_log
 from ..core import session as sessions
 from ..core.settings import Settings, public_url
@@ -404,6 +404,13 @@ def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
     }
 
 
+def account_overview(settings: Settings, addr: str | None) -> dict[str, Any]:
+    try:
+        return overview.account_overview(settings, addr)
+    except overview.AccountUnavailable as exc:
+        raise SessionUnavailable(f"{exc}. Pass addr explicitly.") from exc
+
+
 def intent_local(settings: Settings, addr: str | None) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
     pending = storage.list_pending(settings.endpoint, account["addr"])
@@ -560,8 +567,7 @@ def recent_opens(
         ).fetchall()
     recent: list[dict[str, str]] = []
     for key, status, created in rows:
-        stamp = created if created is not None else storage._key_time(key)
-        if stamp is None or current - stamp <= RECENT_OPEN_SECONDS:
+        if storage.intent_is_recent(key, created, current, RECENT_OPEN_SECONDS):
             recent.append({"intentKey": key, "status": status})
     return recent
 

@@ -49,6 +49,7 @@ READ_TOOLS = {
     "account_positions",
     "account_history",
     "account_balances",
+    "account_overview",
     "intent_local",
     "intent_status",
     "preview_open",

@@ -10,6 +10,12 @@ with `sai --json watch price 3` at the same time. It is the decoded GraphQL
 payload printed by the CLI, not the WebSocket transport frame. Values and
 timestamps are historical observations and must not be used as current quotes.
 
+`mainnet_account_overview.json` records public Keeper reads from 2026-11-24.
+The account had Sai USDC and credits, with no open trades or queued market
+orders. Two historical trades record the deployed response shape. Overview
+tests add synthetic states and orders to exercise positions, limit and stop
+orders, and next-oracle orders. The loopback LCD fixture supplies block times.
+
 `synthetic_protocol.json` is independently authored from the Keeper schema and
 the protocol shape exercised by the CLI. It is not a network capture. Its
 address, account data, signature placeholder, session token, and transaction

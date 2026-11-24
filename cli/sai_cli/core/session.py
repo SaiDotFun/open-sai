@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from . import log, storage
 
@@ -67,11 +68,19 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
     return result
 
 
+def token_claims(token: str) -> dict[str, Any]:
+    """Decode the public claims without verifying the token's signature."""
+    payload = token.split(".")[1]
+    claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+    if not isinstance(claims, dict):
+        raise TypeError("Expected session claims")
+    return claims
+
+
 def import_session(token: str, endpoint: str) -> dict[str, str]:
     """Validate a Sai Web session TOKEN and build the session to store."""
     try:
-        payload = token.split(".")[1]
-        data = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        data = token_claims(token)
         addr = data["sub"]
         expires = datetime.fromtimestamp(data["exp"], UTC)
         if (

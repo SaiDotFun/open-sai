@@ -24,6 +24,28 @@ MARKETS = """query { perp { borrowings { marketId price isOpen visible minLevera
 MARKET = """query($market:Int!, $collateral:Int!) { perp { borrowing(marketId:$market,collateralId:$collateral) { marketId isOpen minLeverage maxLeverage collateralToken { id symbol } } } }"""
 PRICES = """query { oracle { tokenPricesUsd(limit: 100) { priceUsd token { id symbol name } lastUpdatedBlock { block block_ts } } } }"""
 POSITIONS = """query($trader:String!) { perp { trades(where:{trader:$trader,isOpen:true}, limit:100) { id trader isOpen isLong tradeType collateralAmount leverage openPrice tp sl state { liquidationPrice pnlCollateral pnlPct positionValue } perpBorrowing { marketId baseToken { symbol } collateralToken { symbol } } } } }"""
+OVERVIEW_TRADES = """
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    trades(where:{trader:$trader,isOpen:true}, order_by:sequence, order_desc:false, limit:$limit, offset:$offset) {
+      id isLong tradeType collateralAmount leverage openPrice tp sl
+      state { liquidationPrice pnlCollateral pnlPct }
+      perpBorrowing { marketId baseToken { id symbol } collateralToken { id symbol } }
+      lastUpdatedBlock { block block_ts }
+    }
+  }
+}
+"""
+PENDING_MARKET_ORDERS = """
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    marketOrders(where:{trader:$trader,status:pending_exec}, limit:$limit, offset:$offset) {
+      sequence tradeId side perpMarketId status collateralAmount orderReqBlock orderReqBlockTs
+      orderReqTxHash orderReqEvmTxHash
+    }
+  }
+}
+"""
 POSITION = """query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }"""
 ROUTE = """query { oneClickTrading { enabled chainId contractAddress } }"""
 HISTORY = """query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }"""
@@ -37,6 +59,8 @@ OPERATIONS = {
     MARKET: "market",
     PRICES: "prices",
     POSITIONS: "positions",
+    OVERVIEW_TRADES: "overview_trades",
+    PENDING_MARKET_ORDERS: "pending_market_orders",
     POSITION: "position",
     ROUTE: "route",
     HISTORY: "history",

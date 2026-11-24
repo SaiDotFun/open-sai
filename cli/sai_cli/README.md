@@ -48,6 +48,49 @@ and the CLI derives the WebSocket from the Keeper endpoint instead. So
 file. The per-command `--ws-endpoint` and `--lcd-endpoint` options still
 work and override the setting for that command.
 
+## Account Overview
+
+```bash
+sai account overview
+sai account overview --as 0xYOUR_ADDR --json
+```
+
+The command uses the active account on the configured Keeper endpoint.
+Pass `--as ADDR` to read another EVM account, including one you have never
+connected. The MCP tool `account_overview` takes an optional `addr` and
+returns the same fields as the CLI's JSON output.
+
+- **Sai funds.** The balance and credits fields report separate amounts in
+  USD for funds in Sai. Wallet balances do not enter either amount.
+- **Positions.** Size is collateral in USD multiplied by leverage.
+  Unrealized PnL uses Keeper's PnL before fees. The total is available when
+  every position has a USD PnL value. Distances use the current oracle price
+  as the denominator. A negative distance means the oracle price is on the
+  trigger side of the liquidation, take-profit, or stop-loss level.
+- **Orders.** Pending limit and stop orders list their trigger prices.
+  Queued market orders come from Keeper's `pending_exec` records. For a
+  queued open, the trade ID is reserved. Collateral on a queued order, when
+  present, is in base units.
+- **Local blockers.** An unknown intent blocks all trades for the account.
+  An accepted intent for a position blocks requests on that position.
+  A recent accepted open can block another MCP open.
+- **Session.** The overview shows the expiry of a stored session for the
+  selected account and warns in its last three days.
+
+Each section's `fetchedAt` records when the client read it, in UTC.
+Source timestamps and `sourceAgeSeconds` describe the data at fetch time.
+For trade and order rows, these come from the record's block. Position PnL
+and liquidation price come from Keeper's indexed state, which exposes no
+separate timestamp. Oracle quotes have their own source metadata. For a
+balance that exposes only a block height, the CLI asks the configured
+Nibiru LCD for the block time. The block height stays visible if its time is
+unavailable. Local intent age measures time since reservation and session age
+measures time since issuance, when the store carries that information.
+
+A failed read produces a section `error` with a code and message. Other
+sections still return their data. A missing quote leaves the fields that
+depend on it unavailable, while the trade's own fields remain visible.
+
 ## Updates
 
 ```bash
@@ -139,8 +182,7 @@ MCP** button that copies it is in review
   non-zero and asks for the person to run `sai auth import` in their own
   terminal.
 - It never reads the token from arguments, environment variables, or piped
-  stdin, and never prints it. Like `auth login` and `auth status`, it prints
-  only `addr`, `expiresAt`, and `endpoint`.
+  stdin. Like `auth login`, it prints `addr`, `expiresAt`, and `endpoint`.
 - After storing the token, it reads the clipboard again and clears it only if
   it still holds the token. Anything copied in the meantime stays.
 
@@ -148,6 +190,18 @@ MCP** button that copies it is in review
 signs, the CLI checks that the typed data has primary type
 `UserTradingSession`, domain `Sai` version `1`, your addr, and the issued
 challenge nonce.
+
+Run `sai auth renew [ADDR]` to get a fresh session using the key saved by
+`sai auth login NAME`. With no address, it renews the active account. An
+explicit address renews that account and keeps the active selection. If a
+keystore session predates the saved key name, run `sai auth login NAME` once.
+For a session copied from Sai Web, copy a fresh token and run `sai auth
+import`.
+
+Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
+warning when a session has less than three days left. Interactive commands
+can also print a one-line notice to stderr. JSON output carries the warning
+in the reported session data.
 
 `auth login NAME` picks the key named `NAME`:
 

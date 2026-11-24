@@ -23,6 +23,7 @@ from .core import (
     clipboard,
     keeper,
     log,
+    overview,
     reconcile,
     storage,
     stream,
@@ -32,6 +33,7 @@ from .core import (
 )
 from .core import session as sessions
 from .core import settings as sai_settings
+from .utils import overview_format
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
@@ -263,7 +265,9 @@ def main(
         "skill",
     }:
         session_notice(ctx, as_addr)
-    if auto_update_applies(ctx.invoked_subcommand, json_output):
+    if ctx.invoked_subcommand != "account" and auto_update_applies(
+        ctx.invoked_subcommand, json_output
+    ):
         updater.tick(warn)
     if ctx.invoked_subcommand is None:
         repl(ctx)
@@ -776,6 +780,8 @@ def account(ctx: click.Context) -> None:
     """Inspect positions and account activity."""
     if ctx.invoked_subcommand != "overview":
         session_notice(ctx, ctx.obj["as_addr"])
+        if auto_update_applies("account", ctx.obj["json"]):
+            updater.tick(warn)
 
 
 def perform_query(
@@ -785,6 +791,26 @@ def perform_query(
         emit(ctx, keeper.request(keeper_url(ctx), query, variables))
     except keeper.KeeperError as exc:
         raise click.ClickException(str(exc)) from exc
+
+
+@account.command("overview")
+@click.option("--as", "addr", metavar="ADDR", help="Read this EVM account.")
+@click.option("--json", "json_output", is_flag=True, help="Print compact JSON.")
+@click.pass_context
+def account_overview(ctx: click.Context, addr: str | None, json_output: bool) -> None:
+    """Show Sai funds, positions, orders, local blockers, and session expiry."""
+    ctx.obj["json"] = ctx.obj["json"] or json_output
+    if auto_update_applies("account", ctx.obj["json"]):
+        updater.tick(warn)
+    try:
+        result = overview.account_overview(settings(ctx), addr or ctx.obj["as_addr"])
+    except overview.AccountUnavailable as exc:
+        raise click.ClickException(f"{exc}. Pass --as ADDR explicitly.") from exc
+    if ctx.obj["json"]:
+        emit(ctx, result)
+    else:
+        show_expiry_notice(ctx, result["session"].get("data", {}))
+        overview_format.show(result)
 
 
 @account.command("positions")

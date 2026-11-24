@@ -813,6 +813,48 @@ def test_cli_status_and_list_report_expiry_warnings(env: Env):
     assert status.stderr == result.stderr == ""
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    primary, secondary = pty.openpty()
+    flags = ["--json"] if json_output else []
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sai_cli",
+                *flags,
+                "config",
+                "get",
+                "keeper.endpoint",
+            ],
+            env={**env.vars(), "CI": "1"},
+            stdin=secondary,
+            stderr=secondary,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        os.set_blocking(primary, False)
+        try:
+            error = os.read(primary, 4096).decode()
+        except BlockingIOError:
+            error = ""
+    finally:
+        os.close(primary)
+        os.close(secondary)
+    assert "expires in" not in result.stdout
+    if json_output:
+        assert error == ""
+    else:
+        assert len(error.splitlines()) == 1
+        assert "expires in" in error and "sai auth import" in error
+
+
 def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
     fake_ud(env)
     result = login(env, keeper_auth, "dev")

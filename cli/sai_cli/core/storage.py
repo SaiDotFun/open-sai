@@ -449,6 +449,45 @@ def _key_time(key: str) -> float | None:
     return stamp.replace(tzinfo=UTC).timestamp()
 
 
+def intent_is_recent(key: str, created: float | None, now: float, window: int) -> bool:
+    stamp = created if created is not None else _key_time(key)
+    return stamp is None or now - stamp <= window
+
+
+def unresolved_intents(endpoint: str, account: str) -> list[dict[str, Any]]:
+    """Read unknown and accepted intents without creating or migrating a ledger."""
+    path = home() / "intents.sqlite3"
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return []
+    with contextlib.closing(
+        sqlite3.connect(
+            f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT.get()
+        )
+    ) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise ValueError("Intent database was written by a newer sai version")
+        created_column = "created_at" if version >= 1 else "NULL"
+        rows = connection.execute(
+            f"SELECT id, kind, status, entity, {created_column} FROM intents"
+            " WHERE endpoint=? AND account=? AND status IN ('unknown', 'accepted')"
+            " ORDER BY rowid DESC",
+            (endpoint, account.lower()),
+        ).fetchall()
+    return [
+        {
+            "intentKey": key,
+            "kind": kind,
+            "status": status,
+            "entity": entity,
+            "createdAt": created,
+        }
+        for key, kind, status, entity, created in rows
+    ]
+
+
 def mark_absent(
     key: str, endpoint: str, account: str, older_than: float, now: float | None = None
 ) -> str | None:
