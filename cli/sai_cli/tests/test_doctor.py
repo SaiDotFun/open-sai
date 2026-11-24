@@ -11,8 +11,9 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from click.testing import CliRunner
 from sai_cli import doctor
 from sai_cli.core import keeper, margin, settings, storage, stream, update, updater
 from sai_cli.sai_cli import main
+from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
 
@@ -231,8 +233,31 @@ def test_session_for_other_endpoint_fails():
     save(endpoint="https://user:pw@other.example/query?key=abc")
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
-    assert "https://other.example/query" in check.summary
+    assert check.details["endpoint"] == "https://other.example"
+    assert "https://other.example" in check.summary
+    assert "/query" not in check.summary
     assert "pw" not in check.summary and "key=abc" not in check.summary
+
+
+def test_session_without_an_endpoint_reports_a_missing_endpoint():
+    storage.save_session(
+        {
+            "token": TOKEN,
+            "evmAddress": ADDR,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        }
+    )
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 1
+    checks = json.loads(output)["error"]["details"]["checks"]
+    check = next(check for check in checks if check["id"] == "session")
+    assert check["status"] == "fail"
+    assert "has no stored Keeper endpoint" in check["summary"]
+    assert "auth login NAME" in check["fix"]
+    assert check["details"]["addr"] == ADDR
+    assert check["details"]["endpoint"] is None
+    assert check["details"]["endpointMatches"] is False
 
 
 def test_session_expiring_within_a_day_warns():
@@ -599,7 +624,9 @@ def test_unknown_intent_for_signed_in_account_fails():
     check = one(doctor.check_intents, ctx())
     assert check.status == "fail"
     assert check.summary == "1 unknown intent blocks trading for 0x4803…"
-    assert check.fix == (f"sai intent status {ADDR} --key 20261118T000000000000-a")
+    assert check.fix is not None
+    assert check.fix.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert check.fix.endswith(f"intent status {ADDR} --key 20261118T000000000000-a")
     assert check.details["otherAccounts"] == {"unknown": 1, "accounts": 1}
 
 
@@ -920,6 +947,7 @@ class Stub:
         # Called before each userIntents reply.
         self.on_intents: Any = None
         self.queries: list[str] = []
+        self.paths: list[str] = []
 
 
 @pytest.fixture
@@ -955,6 +983,7 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.queries.append(body["query"])
+            state.paths.append(self.path)
             if "userIntents" in body["query"]:
                 if state.on_intents:
                     state.on_intents()
@@ -988,17 +1017,31 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
     thread.join()
 
 
-def ws_stub(ack: bool) -> tuple[str, Any]:
+def ws_stub(
+    ack: bool,
+    *,
+    close_with_target: bool = False,
+    process_response: Callable[[ServerConnection, Request, Response], Response]
+    | None = None,
+) -> tuple[str, Any]:
     release = threading.Event()
 
     def handler(connection: ServerConnection) -> None:
         connection.recv()
+        if close_with_target:
+            assert connection.request is not None
+            connection.close(code=1008, reason=connection.request.path)
+            return
         if ack:
             connection.send(json.dumps({"type": "connection_ack"}))
         release.wait(10)
 
     server = serve(
-        handler, "127.0.0.1", 0, subprotocols=[Subprotocol("graphql-transport-ws")]
+        handler,
+        "127.0.0.1",
+        0,
+        subprotocols=[Subprotocol("graphql-transport-ws")],
+        process_response=process_response,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1193,6 +1236,75 @@ def test_silent_websocket_fails_within_the_timeout():
     assert "connection_ack" in check.summary
 
 
+def test_doctor_omits_peer_websocket_close_reason(http_stub):
+    base, _state = http_stub
+    ws, stop = ws_stub(ack=False, close_with_target=True)
+    path_key, query_key = "fixture-relative-path", "fixture-relative-query"
+    origin = ws.removesuffix("/query")
+    endpoint = f"{origin}/{path_key}?key={query_key}"
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                f"{base}/query",
+                "doctor",
+                "--no-fix",
+                "--ws-endpoint",
+                endpoint,
+                "--lcd-endpoint",
+                base,
+            )
+            assert code == 1
+            assert f"{origin} sent no connection_ack" in output
+            assert "ConnectionClosedError (close code 1008)" in output
+            assert path_key not in output and query_key not in output
+    finally:
+        stop()
+
+
+@pytest.mark.parametrize(
+    ("status", "diagnostic"),
+    [
+        (HTTPStatus.SWITCHING_PROTOCOLS, "InvalidHeaderFormat"),
+        (HTTPStatus.FORBIDDEN, "InvalidStatus (HTTP status 403)"),
+    ],
+)
+def test_doctor_omits_peer_websocket_handshake_text(http_stub, status, diagnostic):
+    base, _state = http_stub
+    path_key, query_key = "fixture-handshake-path", "fixture-handshake-query"
+
+    def respond(
+        connection: ServerConnection, request: Request, reply: Response
+    ) -> Response:
+        if status == HTTPStatus.FORBIDDEN:
+            return connection.respond(status, request.path)
+        del reply.headers["Sec-WebSocket-Protocol"]
+        reply.headers["Sec-WebSocket-Protocol"] = request.path
+        return reply
+
+    ws, stop = ws_stub(ack=False, process_response=respond)
+    origin = ws.removesuffix("/query")
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                f"{base}/query",
+                "doctor",
+                "--no-fix",
+                "--ws-endpoint",
+                f"{origin}/{path_key}?key={query_key}",
+                "--lcd-endpoint",
+                base,
+            )
+            assert code == 1
+            assert f"{origin} sent no connection_ack: {diagnostic}" in output
+            assert path_key not in output and query_key not in output
+    finally:
+        stop()
+
+
 def test_unreachable_endpoints_fail_and_exit_1():
     dead = f"http://127.0.0.1:{free_port()}"
     code, output = run_cli(
@@ -1243,6 +1355,59 @@ KEY = "20261118T000000000000-r"
 def blocked_on(endpoint: str) -> None:
     save(endpoint=endpoint)
     ledger([(KEY, endpoint, ADDR, "unknown")])
+
+
+@pytest.mark.parametrize(
+    "matches", [False, True], ids=["same-origin-mismatch", "match"]
+)
+def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
+    http_stub, matches, request
+):
+    base, state = http_stub
+    path_key, query_key = "fixture-keeper-path", "fixture-keeper-query"
+    stored_path_key = "fixture-stored-path"
+    route = f"/{path_key}/query?key={query_key}"
+    endpoint = base + route
+    if matches:
+        blocked_on(endpoint)
+    else:
+        save(endpoint=f"{base}/{stored_path_key}/query?key={query_key}")
+    ws, stop = ws_stub(ack=True)
+    request.addfinalizer(stop)
+    ws_origin = ws.removesuffix("/query")
+    for flags in ((), ("--json",)):
+        code, output = run_cli(
+            *flags,
+            "--endpoint",
+            endpoint,
+            "doctor",
+            "--no-fix",
+            "--ws-endpoint",
+            ws_origin + route,
+            "--lcd-endpoint",
+            base,
+        )
+        assert code == 1
+        assert ws_origin in output
+        assert path_key not in output and query_key not in output
+        assert stored_path_key not in output
+        assert "${SAI_RECONCILE_ENDPOINT:?" in output
+        if flags:
+            checks = {
+                check["id"]: check
+                for check in json.loads(output)["error"]["details"]["checks"]
+            }
+            assert checks["keeper"]["details"]["endpoint"] == base
+            session = checks["session"]["details"]
+            assert session["endpoint"] == base and session["endpointMatches"] is matches
+            assert checks["websocket"]["status"] == "pass"
+            assert checks["websocket"]["details"]["endpoint"] == ws_origin
+            fix = checks["intents" if matches else "session"]["fix"]
+            command = (
+                f"intent status {ADDR} --key {KEY}" if matches else "auth login NAME"
+            )
+            assert command in fix
+    assert state.paths == [route, route]
 
 
 def ledger_status(key: str) -> str:

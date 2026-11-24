@@ -603,6 +603,42 @@ def test_no_token_or_url_credential_reaches_a_log_line(home, keeper_stub):
     )
 
 
+def test_auth_and_mcp_show_only_keeper_origins(home, keeper_stub):
+    base, state = keeper_stub
+    origin = base.removesuffix("/query")
+    endpoint = f"{origin}/{PATH_KEY}/query?api_key={URL_KEY}"
+    save_session(endpoint)
+
+    for args in (("auth", "status"), ("auth", "list"), ("auth", "use", ADDR)):
+        for flags in ((), ("--json",)):
+            code, output = run_cli(*flags, "--endpoint", endpoint, *args)
+            assert code == 0
+            assert origin in output
+            assert PATH_KEY not in output and URL_KEY not in output
+
+    code, output = run_cli("--json", "--endpoint", base, "auth", "list")
+    assert code == 0
+    assert json.loads(output)["accounts"][0]["endpointMatches"] is False
+
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    info = call(mcp, "mcp_info")
+    assert info["session"]["endpoint"] == origin
+    assert info["session"]["endpointMatches"] is True
+    assert info["endpoints"]["keeper"] == origin
+    assert info["endpoints"]["websocket"] == origin.replace("http:", "ws:", 1)
+    status = call(mcp, "auth_status")
+    accounts = call(mcp, "auth_list")
+    assert status["endpoint"] == accounts["accounts"][0]["endpoint"] == origin
+    for report in (info, status, accounts):
+        output = json.dumps(report)
+        assert PATH_KEY not in output and URL_KEY not in output
+
+    assert "oracle" in call(mcp, "market_prices")
+    assert state.paths == [f"/{PATH_KEY}/query?api_key={URL_KEY}"]
+    output = raw_logs(home)
+    assert PATH_KEY not in output and URL_KEY not in output
+
+
 # What each event records
 
 
@@ -682,7 +718,7 @@ def test_help_version_and_skill_write_nothing(home):
 def test_keeper_errors_record_what_keeper_answered(home, keeper_stub):
     base, state = keeper_stub
     state.errors = [
-        {"message": "market is paused", "extensions": {"code": "MARKET_PAUSED"}}
+        {"message": "market is paused", "extensions": {"code": "FORBIDDEN"}}
     ]
     with pytest.raises(keeper.KeeperError):
         keeper.request(base, keeper.POSITIONS, {"trader": ADDR}, token=jwt())
@@ -692,11 +728,38 @@ def test_keeper_errors_record_what_keeper_answered(home, keeper_stub):
     rejected, unavailable = events(home, "keeper.request")
     assert rejected["operation"] == "positions" and rejected["status"] == "error"
     assert rejected["addr"] == ADDR and rejected["authenticated"] is True
-    assert rejected["keeperErrors"] == [
-        {"code": "MARKET_PAUSED", "message": "market is paused"}
-    ]
+    assert rejected["keeperErrorCount"] == 1
+    assert rejected["keeperErrors"] == [{"code": "FORBIDDEN"}]
     assert rejected["error"] == "Keeper rejected the request; check inputs and session"
     assert unavailable["operation"] == "custom" and unavailable["httpStatus"] == 503
+
+
+def test_market_list_logs_only_validated_graphql_codes(home, keeper_stub):
+    base, state = keeper_stub
+    origin = base.removesuffix("/query")
+    target = f"/{PATH_KEY}/query?api_key={URL_KEY}"
+    state.errors = [
+        {"message": target, "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}},
+        {"message": target, "extensions": {"code": target}},
+    ]
+
+    code, output = run_cli("--json", "--endpoint", origin + target, "market", "list")
+    assert code == 1 and json.loads(output)["error"]["code"] == "KEEPER_ERROR"
+    assert state.paths == [target]
+    [request] = events(home, "keeper.request")
+    assert request["operation"] == "markets" and request["endpoint"] == origin
+    assert request["httpStatus"] == 200
+    assert request["keeperErrorCount"] == 2
+    assert request["keeperErrors"] == [
+        {"code": "GRAPHQL_VALIDATION_FAILED"},
+        {"code": "KEEPER_ERROR"},
+    ]
+    for flags in ((), ("--json",)):
+        code, tail = run_cli(*flags, "logs", "tail", "--event", "keeper.request")
+        assert code == 0 and "GRAPHQL_VALIDATION_FAILED" in tail
+        assert PATH_KEY not in tail and URL_KEY not in tail
+    for text in (output, raw_logs(home)):
+        assert PATH_KEY not in text and URL_KEY not in text
 
 
 def test_intent_and_history_reads_log_graphql_codes_and_count(home, keeper_stub):
@@ -757,13 +820,13 @@ def test_intent_and_history_reads_log_graphql_codes_and_count(home, keeper_stub)
         assert secret not in tail and "GRAPHQL_VALIDATION_FAILED" in tail
 
 
-def test_a_keeper_error_that_echoes_the_signature_is_scrubbed(home, keeper_stub):
+def test_keeper_session_errors_log_codes_without_echoing_signatures(home, keeper_stub):
     """Keeper's message for a bad session mutation can quote its input."""
     base, state = keeper_stub
     token = jwt(OTHER)
     echo = f"invalid signature {SIGNATURE} for challenge {'c' * 64}, token {token}"
     state.errors = [
-        {"message": echo, "extensions": {"code": "BAD_SIGNATURE"}},
+        {"message": echo, "extensions": {"code": "UNAUTHENTICATED"}},
         {"message": "x" * 5000, "extensions": {"code": SIGNATURE}},
     ]
     variables = {"signature": SIGNATURE, "challenge": "c" * 64}
@@ -771,13 +834,11 @@ def test_a_keeper_error_that_echoes_the_signature_is_scrubbed(home, keeper_stub)
         keeper.request(base, keeper.SESSION, variables)
     request = events(home, "keeper.request")[0]
     assert request["operation"] == "session"
-    first, second = request["keeperErrors"]
-    assert first == {
-        "code": "BAD_SIGNATURE",
-        "message": f"invalid signature {log.REDACTED_HEX} for challenge"
-        f" {log.REDACTED_HEX}, token {log.REDACTED}",
-    }
-    assert second["code"] == log.REDACTED_HEX and len(second["message"]) < 350
+    assert request["keeperErrorCount"] == 2
+    assert request["keeperErrors"] == [
+        {"code": "UNAUTHENTICATED"},
+        {"code": "KEEPER_ERROR"},
+    ]
     raw = raw_logs(home)
     for secret in (SIGNATURE, SIGNATURE[2:], "c" * 64, token):
         assert secret not in raw
@@ -3404,6 +3465,76 @@ def test_logs_tail_filters_by_count_surface_and_event(home):
     assert run_cli("logs", "tail", "--surface", "web")[0] == 2
     # Reading the log adds nothing to it.
     assert raw_logs(home) == before
+
+
+def test_log_readers_project_retained_keeper_errors(home):
+    path = old_file(home / "logs", "cli", 1)
+    target = f"/{PATH_KEY}/query?api_key={URL_KEY}"
+    row = {
+        "schema": 2,
+        "ts": log.stamp(log.now() - timedelta(days=1)),
+        "level": "warn",
+        "event": "keeper.request",
+        "surface": "cli",
+        "pid": 1,
+        "version": "0.1.0",
+        "runId": "old-run",
+        "seq": 1,
+        "operation": "intents",
+        "endpoint": "https://keeper.example",
+        "endpointId": "h1_" + "a" * 64,
+        "addr": ADDR,
+        "intentKey": "KEY",
+        "authenticated": False,
+        "durationMs": 10,
+        "status": "error",
+        "keeperErrors": [
+            {"code": "GRAPHQL_VALIDATION_FAILED", "message": target},
+            {"code": target, "message": target},
+        ],
+    }
+    current = {
+        **row,
+        "seq": 2,
+        "keeperErrors": [{"code": "FORBIDDEN"}],
+        "keeperErrorCount": 5,
+    }
+    raw = log.encode(row) + log.encode(current)
+    path.write_bytes(raw)
+    expected = [
+        (2, [{"code": "GRAPHQL_VALIDATION_FAILED"}, {"code": "KEEPER_ERROR"}]),
+        (5, [{"code": "FORBIDDEN"}]),
+    ]
+
+    for args in (
+        ("tail", "--event", "keeper.request"),
+        ("run", "old-run"),
+        ("intent", "KEY", "--offline"),
+    ):
+        code, text = run_cli("logs", *args)
+        assert code == 0
+        assert PATH_KEY not in text and URL_KEY not in text
+        assert "GRAPHQL_VALIDATION_FAILED" in text and "KEEPER_ERROR" in text
+        assert "keeperErrorCount=2" in text and "keeperErrorCount=5" in text
+
+        code, output = run_cli("--json", "logs", *args)
+        assert code == 0
+        assert PATH_KEY not in output and URL_KEY not in output
+        rows = (
+            [json.loads(line) for line in output.splitlines()]
+            if args[0] == "tail"
+            else json.loads(output)["events"]
+        )
+        assert [
+            (item["keeperErrorCount"], item["keeperErrors"]) for item in rows
+        ] == expected
+
+    mcp = server.create_server(settings.load())
+    report = call(mcp, "logs_intent", {"key": "KEY", "offline": True})
+    assert [
+        (item["keeperErrorCount"], item["keeperErrors"]) for item in report["events"]
+    ] == expected
+    assert path.read_bytes() == raw
 
 
 def test_logs_tail_reads_from_the_end_of_large_files(home):
