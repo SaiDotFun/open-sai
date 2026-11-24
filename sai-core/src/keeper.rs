@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub use public::public_intent_status;
+pub(crate) use public::request_hash;
 pub use queries::*;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
