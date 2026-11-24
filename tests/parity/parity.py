@@ -34,6 +34,7 @@ from compare import (
     config_text,
     first_difference,
     ledger,
+    mask_overview_stdout,
     snapshot,
     stderr_category,
     stdout,
@@ -369,8 +370,11 @@ def observe(
                 raise ValueError("Fixture credential appeared in a log")
     files = snapshot(home / "sai", normalize)
     check_state(case.state or {}, files)
+    display = result.stdout
+    if case.command == "account overview" and case.mode == "text":
+        display = mask_overview_stdout(display, case.mode)
     try:
-        output = stdout(result.stdout, case.mode, case.command, normalize)
+        output = stdout(display, case.mode, case.command, normalize)
         if contender:
             output = {
                 "first": output,
@@ -392,13 +396,9 @@ def observe(
             f"contender {category}" for category in stderr_category(contender.stderr)
         )
     exact = case.command.split()[0] in {"market", "account", "watch"}
-    # Overview JSON has validated per-read timestamps. Its stderr is still byte-exact.
-    dynamic_stdout = case.command == "account overview" and case.mode == "json"
-    raw = (
-        ((b"" if dynamic_stdout else result.stdout.encode()), result.stderr.encode())
-        if exact
-        else None
-    )
+    if case.command == "account overview" and case.mode == "json":
+        display = mask_overview_stdout(display, case.mode)
+    raw = (display.encode(), result.stderr.encode()) if exact else None
     return Observation(result.returncode, output, stderr, files, raw)
 
 

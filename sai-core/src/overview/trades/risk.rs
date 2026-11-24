@@ -189,10 +189,10 @@ async fn load(
             return Some(());
         }
         let at = oracle_time(&rate["base_last_update_time"], chain);
-        let mut source = oracle_source(oracle.get("base")?, at, chain, *fetched)?;
+        let mut source = json!({"fetchedAt": iso(*fetched), "queryBlock": chain.height});
         merge(
             &mut source,
-            json!({"fetchedAt": iso(*fetched), "queryBlock": chain.height}),
+            oracle_source(oracle.get("base")?, at, chain, *fetched)?,
         );
         risk["collateralPriceSource"] = source;
         scale_collateral(&price)
@@ -220,6 +220,10 @@ async fn load(
 
 fn distance(mark: &BigDecimal, level: Option<&BigDecimal>, above: bool) -> Option<f64> {
     let delta = DECIMAL.round_decimal(level? - mark);
+    if delta.sign() == Sign::NoSign {
+        // BigDecimal has no signed zero. Python Decimal negates it below the mark.
+        return Some(if above { 0.0 } else { -0.0 });
+    }
     let ratio = DECIMAL.round_decimal(delta / mark);
     float(&DECIMAL.multiply(&ratio, &BigDecimal::from(if above { 100 } else { -100 })))
 }

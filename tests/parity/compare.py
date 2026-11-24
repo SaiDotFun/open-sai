@@ -262,6 +262,23 @@ def doctor_checks(checks: Any) -> None:
                 )
 
 
+def mask_overview_stdout(raw: str, mode: str) -> str:
+    """Mask clock values in place so serialization and table layout stay comparable."""
+    if mode == "json":
+        raw = re.sub(r'(?<!\\)("fetchedAt"\s*:\s*)"[^"]+"', r'\1"<fetchedAt>"', raw)
+        return re.sub(
+            r'(?<!\\)("sourceAgeSeconds"\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+            r'\1"<sourceAgeSeconds>"',
+            raw,
+        )
+    raw = re.sub(
+        r"(?i)(fetched at )\d{4}-\d\d-\d\dT[\d:.]+\+00:00",
+        r"\1<fetchedAt>",
+        raw,
+    )
+    return re.sub(r"(?<=\()-?[\d.,]+(?:e[+-]\d+)?(?= s\))", "<sourceAgeSeconds>", raw)
+
+
 def overview_clocks(
     value: Any, normalize: Normalize, fetched: datetime | None = None
 ) -> None:

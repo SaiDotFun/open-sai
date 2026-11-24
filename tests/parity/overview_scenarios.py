@@ -12,7 +12,12 @@ from urllib.parse import parse_qs, unquote
 from keeper_wire import WireRequest, same_variables
 from sai_cli.core import keeper
 from sai_cli.tests.loopback import fixture
-from sai_cli.tests.test_overview import RISK_BLOCK, populate_trades
+from sai_cli.tests.test_overview import (
+    RISK_BLOCK,
+    install_contract_trade,
+    install_oracle_quote,
+    populate_trades,
+)
 
 ORACLE = "nibi1oraclefixture"
 BLOCKS = "/cosmos/base/tendermint/v1beta1/blocks/"
@@ -43,6 +48,14 @@ class OverviewReplay:
             rate["rate"]["base_per_quote"] = "45"
             rate["rate"]["base_last_update_time"] -= 400
             rate["base"]["price_block_time_ms"] -= 400_000
+        if scenario == "overview-liquidation":
+            collateral = {"id": 2, "symbol": "stNIBI"}
+            long["perpBorrowing"] = {
+                **long["perpBorrowing"],
+                "collateralToken": collateral,
+            }
+            install_contract_trade(self.state, long, mark=100, liquidation=100)
+            install_oracle_quote(self.state, collateral["id"], 0, mark="0.04")
         self.balances = recorded["balances"]
         self.balances["data"]["userBalances"].append(
             {

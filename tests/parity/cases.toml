@@ -199,6 +199,63 @@ wire = [
 state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
 
 [[case]]
+name = "account-overview-liquidation-json"
+args = ["account", "overview", "--json"]
+seed = "overview-session"
+server = "overview-liquidation"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_exchange_rate_stamped",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "account-overview-liquidation-text"
+args = ["account", "overview"]
+mode = "text"
+seed = "overview-session"
+server = "overview-liquidation"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_exchange_rate_stamped",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
 name = "account-overview-public"
 args = ["--json", "--as", "{other_addr}", "account", "overview", "--as", "{addr}"]
 seed = "empty"
