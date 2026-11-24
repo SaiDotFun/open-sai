@@ -140,9 +140,9 @@ input `preview_digest`, and a market `trade_open` must also pass the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
 intent, position quote, or quoted price fails the confirmation check.
-The server refuses submission. Show the replacement preview if present and
-ask for confirmation again. If the quote is unavailable, follow the result's
-recovery instructions.
+The server refuses submission. Show the replacement preview and ask for
+confirmation if it has a `previewDigest`. If the quote is unavailable,
+follow the result's recovery instructions.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.

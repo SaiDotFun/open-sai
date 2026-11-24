@@ -123,7 +123,7 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
 def preview_mismatch(
     message: str, preview: dict[str, Any] | None = None, **extra: Any
 ) -> dict[str, Any]:
-    if preview is None:
+    if preview is None or "previewDigest" not in preview:
         return error(
             message,
             Code.PREVIEW_MISMATCH,
@@ -131,10 +131,11 @@ def preview_mismatch(
             recovery={
                 "action": "request_preview",
                 "message": (
-                    "If the position is still open and readable, call the matching"
-                    " preview tool and get confirmation before retrying."
+                    "Check the reported cause. If the trade is still possible, call"
+                    " the matching preview tool and get confirmation before retrying."
                 ),
             },
+            **({"preview": preview} if preview is not None else {}),
             **extra,
         )
     return error(
@@ -172,17 +173,24 @@ def describe(exc: Exception) -> dict[str, Any]:
             intentKeys=exc.keys,
         )
     if isinstance(exc, Refused):
+        reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
         if failure.code == Code.PREVIEW_MISMATCH:
-            return preview_mismatch(failure.message, exc.preview, **exc.extra)
+            return preview_mismatch(reason or failure.message, exc.preview, **exc.extra)
         extra = {} if exc.preview is None else {"preview": exc.preview}
-        return error(failure.message, failure.code, **extra, **exc.extra)
+        return error(reason or failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.ExecutionRejected):
+        return preview_mismatch(failure.message, exc.preview)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
             return preview_mismatch(failure.message)
+        reason = estimates.rejection_reason(exc.preview.get("estimates", {}))
         return preview_mismatch(
-            "The position, quote, or route changed during confirmation, so nothing was"
-            " submitted. Show the user the latest preview, get their confirmation"
-            " again, then retry with its previewDigest.",
+            reason
+            or (
+                "The position, quote, or route changed during confirmation, so nothing was"
+                " submitted. Show the user the latest preview, get their confirmation"
+                " again, then retry with its previewDigest."
+            ),
             confirmation.with_digest(exc.preview),
         )
     if failure.code == Code.PREVIEW_MISMATCH:

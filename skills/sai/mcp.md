@@ -108,8 +108,10 @@ for the token and never returns it.
    every preview and trade. Without `addr` a tool acts on whichever account
    is active at that moment, and another terminal or client can switch it.
 2. Show the person the preview, the `addr` it names, and the network from
-   `mcp_info`. Give the fees, liquidation price, and worst-case fill from
-   `estimates` where available. Wait for explicit confirmation.
+   `mcp_info`. If `estimates.execution.status` is `would_be_rejected`, show
+   the reason and stop. The server leaves out `previewDigest` for that
+   result. Otherwise, give the fees, liquidation price, and worst-case fill
+   where available. Wait for explicit confirmation.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
@@ -186,12 +188,14 @@ For `PREVIEW_MISMATCH`, the `quoteStatus` field tells you which
 - `available` with `confirm_preview`. Show the replacement `preview` and
   get confirmation before retrying with its `previewDigest` and, for a
   market open, its `referencePrice`.
-- `unavailable` with `request_preview`. If the position is still open and
-  readable, request a fresh preview and get confirmation before retrying.
-  The result omits the `preview` field.
+- `unavailable` with `request_preview`. Check the reported cause and request
+  a fresh preview if the trade is still possible. A contract rejection can
+  include a diagnostic `preview` without a `previewDigest`.
 
-For `PRICE_MOVED`, show the replacement `preview` and get confirmation before
-retrying with its `previewDigest` and `referencePrice`.
+For `PRICE_MOVED`, check that the replacement `preview` has a
+`previewDigest`. Show it and get confirmation before retrying with its
+`previewDigest` and `referencePrice`. If the digest is absent, address the
+reported rejection and request a fresh preview before asking for confirmation.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Both check that the order is pending. If it fills after the

@@ -208,8 +208,9 @@ Pass that preview's `previewDigest` as `preview_digest` in the trade call.
 Before submitting, the server rebuilds the trade and checks the confirmed
 terms listed below.
 If the trade returns `PREVIEW_MISMATCH` or `PRICE_MOVED`, it has submitted
-nothing. Use the returned `preview` when present. If it is missing, obtain a
-new preview before asking for confirmation again.
+nothing. Use the returned `preview` for confirmation if it has a
+`previewDigest`. Otherwise, check the reported cause and request a fresh
+preview before asking for confirmation.
 
 - Every trade: the signed-in account and the trade's arguments.
 - `trade_margin` also binds the margin quote, including the position's
