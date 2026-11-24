@@ -1060,8 +1060,14 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home, monkeypatch):
     monkeypatch.setenv("PATH", "")
     assert run_cli("doctor", "--offline", "--no-fix")[0] == 0
     assert list(home.iterdir()) == []
-    assert run_cli("doctor", "--offline")[0] == 0
+    lcd_origin = "http://127.0.0.1:9000"
+    lcd = f"{lcd_origin}/{PATH_KEY}?key={URL_KEY}"
+    assert run_cli("doctor", "--offline", "--lcd-endpoint", lcd)[0] == 0
     result = events(home, "doctor.result")[0]
+    start = events(home, "command.start")[0]
+    assert start["argv"][-2:] == ["--lcd-endpoint", lcd_origin]
+    output = raw_logs(home)
+    assert PATH_KEY not in output and URL_KEY not in output
     assert result["overall"] == "warn" and result["offline"] is True
     by_id = {check["id"]: check for check in result["checks"]}
     assert list(by_id) == [
