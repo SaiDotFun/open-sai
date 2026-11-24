@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::settings::{self, Environment};
 
 use files::LogDir;
-use privacy::{Budget, EVENT_CHARS, endpoint_digest, prefix};
+use privacy::{Budget, EVENT_CHARS, prefix};
 pub use privacy::{Field, contains_url, origin};
 use session_tokens::{FileStamp, Tokens, stamp};
 
@@ -33,8 +33,17 @@ const QUEUE_CHARS: usize = 4 * 1024 * 1024;
 const MAX_LINE: usize = 16 * 1024;
 pub const EXIT_FLUSH: Duration = Duration::from_millis(300);
 
-const COMMON: [&str; 9] = [
-    "schema", "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
+const COMMON: [&str; 10] = [
+    "ts",
+    "level",
+    "event",
+    "surface",
+    "pid",
+    "version",
+    "runId",
+    "seq",
+    "schema",
+    "commandId",
 ];
 static RUN_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -118,24 +127,16 @@ struct Event {
     name: String,
     level: Level,
     fields: Field,
-    endpoint: Option<[u8; 32]>,
     chars: usize,
+    endpoint_digest: Option<[u8; 32]>,
+    command_bound: bool,
 }
 
 pub struct LogWriter {
-    events: SyncSender<Work>,
+    events: SyncSender<QueueItem>,
     done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
-    command_id: Option<String>,
-}
-
-enum Work {
-    Record(Event),
-    Flush(mpsc::Sender<()>),
-}
-
-pub fn command_id() -> String {
-    Uuid::new_v4().simple().to_string()
+    command_schema: bool,
 }
 
 pub(crate) fn valid_identifier(value: &str) -> bool {
@@ -157,7 +158,9 @@ fn keyed_endpoint(digest: &[u8; 32], key: &[u8; 32]) -> String {
 }
 
 fn endpoint_id(root: &std::path::Path, endpoint: &str) -> Option<String> {
-    let digest = endpoint_digest(endpoint)?;
+    let Field::EndpointIdentity(digest) = Field::endpoint_identity(endpoint) else {
+        return None;
+    };
     let key = LogDir::read_only(root).ok()?.read_endpoint_key().ok()?;
     Some(keyed_endpoint(&digest, &key))
 }
@@ -168,7 +171,6 @@ pub struct EventContext<'a> {
     pub writer: Option<&'a LogWriter>,
     pub surface: Surface,
     pub command: Option<&'a str>,
-    pub command_id: Option<&'a str>,
 }
 
 impl EventContext<'_> {
@@ -177,7 +179,6 @@ impl EventContext<'_> {
             writer: None,
             surface: Surface::Cli,
             command: None,
-            command_id: None,
         }
     }
 
@@ -191,32 +192,49 @@ impl EventContext<'_> {
         let command = self
             .command
             .map(|command| ("command", Field::Text(command.into())));
-        let id = self
-            .command_id
-            .map(|id| ("commandId", Field::Text(id.into())));
-        writer.event(
-            self.surface,
-            name,
-            level,
-            command.into_iter().chain(id).chain(fields),
-        );
+        writer.event(self.surface, name, level, command.into_iter().chain(fields));
     }
 }
 
 impl LogWriter {
     /// Start a writer for one Sai home. Filesystem work stays on its thread.
     pub fn start(env: Environment) -> Option<Self> {
+        Self::start_bound(env, None, settings::log_keep_days)
+    }
+
+    /// Start a writer with the v2 CLI command envelope.
+    pub fn start_command(env: Environment) -> Option<Self> {
+        Self::start_bound(
+            env,
+            Some(Uuid::new_v4().simple().to_string()),
+            settings::log_keep_days,
+        )
+    }
+
+    pub fn start_diagnostic_command(env: Environment) -> Option<Self> {
+        Self::start_bound(env, Some(Uuid::new_v4().simple().to_string()), |env| {
+            let (enabled, days) = settings::doctor_log_settings(env);
+            enabled.then(|| days.as_u64().unwrap_or(u64::MAX))
+        })
+    }
+
+    fn start_bound(
+        env: Environment,
+        command_id: Option<String>,
+        log_days: fn(&Environment) -> Option<u64>,
+    ) -> Option<Self> {
         if settings::log_disabled_in_env(&env) {
             return None;
         }
         let (events, pending) = mpsc::sync_channel(QUEUE_SIZE);
         let (done_signal, done) = mpsc::channel();
         let queue = Arc::new(Queue::default());
+        let command_schema = command_id.is_some();
         let worker_queue = Arc::clone(&queue);
         thread::Builder::new()
             .name("sai-log".into())
             .spawn(move || {
-                drain(env, pending, &worker_queue);
+                drain(env, pending, &worker_queue, command_id.as_deref(), log_days);
                 let _ = done_signal.send(());
             })
             .ok()?;
@@ -224,14 +242,8 @@ impl LogWriter {
             events,
             done: Mutex::new(done),
             queue,
-            command_id: None,
+            command_schema,
         })
-    }
-
-    /// Enable Python's v2 event metadata for a ported CLI command.
-    pub fn with_v2_command(mut self) -> Self {
-        self.command_id = Some(Uuid::new_v4().simple().to_string());
-        self
     }
 
     /// Queue an event without waiting for disk, queue space, or the writer.
@@ -246,27 +258,12 @@ impl LogWriter {
         let sequence = SEQUENCE.fetch_add(1, Relaxed);
         let known = KNOWN.try_lock().ok().map(|value| Arc::clone(&value));
         let mut budget = Budget::new();
-        let mut endpoint = None;
-        let command = self
-            .command_id
-            .as_ref()
-            .map(|id| ("commandId", Field::Text(id.clone())));
+        let mut endpoint_digest = None;
+        let mut command_bound = false;
         let fields = Field::Object(
             fields
                 .into_iter()
-                .chain(command)
                 .filter_map(|(key, field)| {
-                    if key == "endpointId"
-                        && let Field::EndpointIdentity(digest) = field
-                    {
-                        endpoint = Some(digest);
-                        return None;
-                    }
-                    if key == "endpoint"
-                        && let Field::Endpoint(ref url) = field
-                    {
-                        endpoint = endpoint.or_else(|| endpoint_digest(url));
-                    }
                     if COMMON.contains(&key) || matches!(&field, Field::Scalar(Value::Null)) {
                         None
                     } else {
@@ -274,6 +271,23 @@ impl LogWriter {
                     }
                 })
                 .take(65)
+                .inspect(|(key, field)| {
+                    command_bound |= *key == "command";
+                    if self.command_schema
+                        && *key == "endpoint"
+                        && let Field::Endpoint(url) = field
+                        && let Field::EndpointIdentity(digest) = Field::endpoint_identity(url)
+                    {
+                        endpoint_digest = Some(digest);
+                    }
+                    if self.command_schema
+                        && *key == "endpointId"
+                        && let Field::EndpointIdentity(digest) = field
+                    {
+                        endpoint_digest = Some(*digest);
+                    }
+                })
+                .filter(|(_, field)| !matches!(field, Field::EndpointIdentity(_)))
                 .collect(),
         )
         .snapshot(&mut budget, known.as_deref().unwrap_or_default(), 0);
@@ -291,20 +305,21 @@ impl LogWriter {
             name: prefix(name, 300).to_owned(),
             level,
             fields,
-            endpoint,
             chars,
+            endpoint_digest,
+            command_bound,
         };
-        if self.events.try_send(Work::Record(event)).is_err() {
+        if self.events.try_send(QueueItem::Event(event)).is_err() {
             self.queue.chars.fetch_sub(chars, Relaxed);
             self.queue.dropped.fetch_add(1, Relaxed);
         }
     }
 
-    /// Allow a read in a long-lived process to see events already queued.
+    /// Wait for already queued diagnostics before inspecting log files.
     pub fn flush(&self, timeout: Duration) {
-        let (done, wait) = mpsc::channel();
-        if self.events.try_send(Work::Flush(done)).is_ok() {
-            let _ = wait.recv_timeout(timeout);
+        let (ack, done) = mpsc::channel();
+        if self.events.try_send(QueueItem::Flush(ack)).is_ok() {
+            let _ = done.recv_timeout(timeout);
         }
     }
 
@@ -317,17 +332,28 @@ impl LogWriter {
     }
 }
 
-fn drain(env: Environment, events: Receiver<Work>, queue: &Queue) {
+enum QueueItem {
+    Event(Event),
+    Flush(mpsc::Sender<()>),
+}
+
+fn drain(
+    env: Environment,
+    events: Receiver<QueueItem>,
+    queue: &Queue,
+    command_id: Option<&str>,
+    log_days: fn(&Environment) -> Option<u64>,
+) {
     let config_path = env.path();
     let log_path = env.home.join("logs");
     let mut config: Option<(Option<FileStamp>, Option<u64>)> = None;
     let mut checked_day = None;
     let mut tokens = Tokens::default();
-    for work in events {
-        let event = match work {
-            Work::Record(event) => event,
-            Work::Flush(done) => {
-                let _ = done.send(());
+    for item in events {
+        let event = match item {
+            QueueItem::Event(event) => event,
+            QueueItem::Flush(ack) => {
+                let _ = ack.send(());
                 continue;
             }
         };
@@ -336,7 +362,7 @@ fn drain(env: Environment, events: Receiver<Work>, queue: &Queue) {
         let keep = match config {
             Some((previous, keep)) if previous == current_stamp => keep,
             _ => {
-                let keep = settings::log_keep_days(&env);
+                let keep = log_days(&env);
                 config = Some((current_stamp, keep));
                 keep
             }
@@ -352,6 +378,7 @@ fn drain(env: Environment, events: Receiver<Work>, queue: &Queue) {
             event,
             known.as_deref().unwrap_or_default(),
             queue,
+            command_id,
         );
         let today: NaiveDate = Utc::now().date_naive();
         if Some(today) != checked_day {
@@ -361,9 +388,14 @@ fn drain(env: Environment, events: Receiver<Work>, queue: &Queue) {
     }
 }
 
-fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
+fn write(
+    directory: &LogDir,
+    event: Event,
+    tokens: &[String],
+    queue: &Queue,
+    command_id: Option<&str>,
+) {
     let mut line = Map::new();
-    line.insert("schema".into(), json!(2));
     line.insert(
         "ts".into(),
         json!(event.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -375,17 +407,23 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
     line.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
     line.insert("runId".into(), json!(RUN_ID.as_str()));
     line.insert("seq".into(), json!(event.sequence));
+    if let Some(command_id) = command_id {
+        line.insert("schema".into(), json!(2));
+        if event.command_bound {
+            line.insert("commandId".into(), json!(command_id));
+        }
+    }
+    if let Some(digest) = event.endpoint_digest
+        && let Ok(key) = directory.endpoint_key()
+    {
+        line.insert("endpointId".into(), json!(keyed_endpoint(&digest, &key)));
+    }
     if let Value::Object(fields) = event.fields.clean(tokens) {
         for (key, field) in fields {
             if !COMMON.contains(&key.as_str()) {
                 line.insert(key, field);
             }
         }
-    }
-    if let Some(digest) = event.endpoint
-        && let Ok(key) = directory.endpoint_key()
-    {
-        line.insert("endpointId".into(), json!(keyed_endpoint(&digest, &key)));
     }
     let mut data = encode(&line);
     let dropped = queue.dropped.swap(0, Relaxed);

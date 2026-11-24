@@ -1287,6 +1287,7 @@ dependencies = [
  "chrono",
  "clap",
  "libc",
+ "rusqlite",
  "rustix",
  "rustyline",
  "sai-core",
@@ -1296,6 +1297,7 @@ dependencies = [
  "signal-hook",
  "tempfile",
  "tokio",
+ "toml_edit",
  "zeroize",
  "zmij",
 ]
@@ -1732,6 +1734,7 @@ dependencies = [
  "indexmap",
  "toml_datetime",
  "toml_parser",
+ "toml_writer",
  "winnow",
 ]
 
@@ -1743,6 +1746,12 @@ checksum = "4c03bee5ce3696f31250db0bbaff18bc43301ce0e8db2ed1f07cbb2acf89984c"
 dependencies = [
  "winnow",
 ]
+
+[[package]]
+name = "toml_writer"
+version = "1.2.0+spec-1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "009dbb7700f11c55ef83aebbe4c0e9cf1f1ac0844bd8d6f00dc38f302026e13a"
 
 [[package]]
 name = "tower"

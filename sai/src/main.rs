@@ -1,12 +1,15 @@
 mod auth;
 mod config;
+mod doctor;
 mod local;
 mod logs;
+mod mcp_registration;
 mod reads;
 mod repl;
 mod skill;
 
 use std::{
+    cell::Cell,
     env,
     ffi::OsString,
     path::Path,
@@ -15,7 +18,7 @@ use std::{
 };
 
 use clap::{
-    Parser, Subcommand,
+    CommandFactory, Parser, Subcommand,
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use sai_core::errors::{Code, ExitCode, SaiError};
@@ -93,6 +96,10 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Run Sai as an MCP server for agent clients.
+    Mcp(mcp_registration::McpArgs),
+    /// Check the install, config, MCP registrations, session, intent ledger, and endpoints.
+    Doctor(doctor::DoctorArgs),
     /// Read, locate, and install the bundled agent skill.
     Skill {
         #[command(subcommand)]
@@ -105,141 +112,149 @@ enum Command {
     },
 }
 
-fn main() -> process::ExitCode {
-    let environment = Environment::from_process();
-    let writer = environment
-        .as_ref()
-        .ok()
-        .cloned()
-        .and_then(LogWriter::start);
-    let code = execute(env::args_os().collect(), &environment, writer.as_ref());
-    if let Some(writer) = writer {
-        writer.finish(EXIT_FLUSH);
+impl Cli {
+    fn run(
+        self,
+        env: &Environment,
+        json: bool,
+        events: EventContext<'_>,
+        operands: &[String],
+        start_log: impl FnOnce(),
+    ) -> Result<(), SaiError> {
+        let flags = Flags {
+            endpoint: self.endpoint,
+            ws_endpoint: self.ws_endpoint,
+            lcd_endpoint: self.lcd_endpoint,
+        };
+        match self.command {
+            Some(Command::Auth { command }) => {
+                auth::dispatch(command, self.account.as_deref(), &flags, env, json, events)
+            }
+            Some(Command::Intent { command, .. }) => {
+                local::intent(command, &flags, env, json, events)
+            }
+            Some(Command::Config { command }) => command.run(&flags, env, json),
+            Some(Command::Mcp(args)) => args.run(json, operands.iter().any(|arg| arg == "--")),
+            Some(Command::Doctor(args)) => args.run(flags, env, json, events, start_log),
+            Some(Command::Market { command }) => command.run(&flags, env, json, events),
+            Some(Command::Account { command }) => command.run(&flags, env, json, events),
+            Some(Command::Watch { command }) => command.run(&flags, env, events),
+            Some(Command::Skill { command }) => command.run(json),
+            Some(Command::Logs { command }) => {
+                command.run(env, &flags, self.account.as_deref(), json)
+            }
+            None if self.skill => skill::show(None),
+            None if json => Err(SaiError::usage("Pass a command when using --json.")),
+            None => {
+                if let Some(writer) = events.writer {
+                    writer.flush(Duration::from_secs(1));
+                }
+                let environment = Ok(env.clone());
+                repl::run(&env.home, &flags, self.account.as_deref(), |args| {
+                    let _ = execute(args, &environment);
+                })
+            }
+        }
     }
-    (code as u8).into()
+}
+
+fn main() -> process::ExitCode {
+    execute(env::args_os().collect(), &Environment::from_process())
 }
 
 fn execute(
     args: Vec<OsString>,
     environment: &Result<Environment, SettingsError>,
-    writer: Option<&LogWriter>,
-) -> ExitCode {
+) -> process::ExitCode {
     let argv: Vec<_> = args
         .iter()
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let (command, operands) = command_path(&argv);
+    let command = command.as_str();
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
     if eager_skill(&argv) {
-        return complete(skill::show(None), "skill show", requested_json, home).0;
+        let outcome = complete(skill::show(None), Some("skill show"), requested_json, home);
+        return (outcome.0 as u8).into();
     }
-    let started = Instant::now();
-    if command.starts_with("logs")
-        && let Some(writer) = writer
+    let parsed = Cli::try_parse_from(args);
+    let event_command = if parsed
+        .as_ref()
+        .is_ok_and(|cli| cli.command.is_none() && !cli.json)
     {
-        writer.flush(Duration::from_secs(1));
-    }
-    let events_writer = if command.starts_with("logs")
+        Some("repl")
+    } else {
+        (!command.is_empty()).then_some(command)
+    };
+    let started = Instant::now();
+    let writer = if command == "logs"
+        || command.starts_with("logs ")
         || command == "skill show"
+        || command == "doctor"
+            && (operands.iter().any(|arg| arg == "--no-fix")
+                || environment
+                    .as_ref()
+                    .is_ok_and(|env| !doctor::safe_log_path(env)))
         || argv
             .iter()
             .any(|flag| matches!(flag.as_str(), "--help" | "--version" | "--skill"))
     {
         None
     } else {
-        writer
-    };
-    let command_field = || {
-        if command.is_empty() {
-            if argv.is_empty() {
-                json!("repl")
-            } else {
-                Value::Null
-            }
-        } else {
-            json!(command)
-        }
-        .into()
-    };
-    let command_id = log::command_id();
-    let events = EventContext {
-        writer: events_writer,
-        surface: Surface::Cli,
-        command: (!command.is_empty()).then_some(command),
-        command_id: Some(&command_id),
-    };
-    if let Some(writer) = events_writer {
-        // Import accepts no operands, and a stray argument can contain a token.
-        let logged_argv = if command == "auth import" {
-            &argv[..argv.len() - operands.len()]
-        } else {
-            &argv
+        let start = match command {
+            "doctor" | "mcp install" | "mcp list" => LogWriter::start_diagnostic_command,
+            _ => LogWriter::start_command,
         };
-        writer.event(
-            Surface::Cli,
-            "command.start",
-            Level::Info,
-            [
-                ("command", command_field()),
-                ("commandId", json!(command_id).into()),
-                ("argv", Field::argv(logged_argv.iter().take(64).cloned())),
-            ],
-        );
+        environment.as_ref().ok().cloned().and_then(start)
+    };
+    let command_field = || json!(event_command).into();
+    let events = EventContext {
+        writer: writer.as_ref(),
+        surface: Surface::Cli,
+        command: event_command,
+    };
+    let log_started = Cell::new(false);
+    let start_log = || {
+        if let Some(writer) = &writer
+            && !log_started.replace(true)
+        {
+            // Import accepts no operands, and a stray argument can contain a token.
+            let logged_argv = if command == "auth import" {
+                &argv[..argv.len() - operands.len()]
+            } else {
+                &argv
+            };
+            writer.event(
+                Surface::Cli,
+                "command.start",
+                Level::Info,
+                [
+                    ("command", command_field()),
+                    ("argv", Field::argv(logged_argv.iter().take(64).cloned())),
+                ],
+            );
+        }
+    };
+    if command != "doctor" {
+        start_log();
     }
-    let outcome = match Cli::try_parse_from(args) {
+    let outcome = match parsed {
         Ok(cli) => {
             let json = cli.json || matches!(&cli.command, Some(Command::Intent { json: true, .. }));
+            let usage_command =
+                (!matches!(&cli.command, Some(Command::Doctor(_)))).then_some(command);
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
-                .and_then(|env| {
-                    let flags = Flags {
-                        endpoint: cli.endpoint,
-                        ws_endpoint: cli.ws_endpoint,
-                        lcd_endpoint: cli.lcd_endpoint,
-                    };
-                    match cli.command {
-                        Some(Command::Auth { command }) => auth::dispatch(
-                            command,
-                            cli.account.as_deref(),
-                            &flags,
-                            env,
-                            json,
-                            events,
-                        ),
-                        Some(Command::Intent { command, .. }) => {
-                            local::intent(command, &flags, env, json, events)
-                        }
-                        Some(Command::Config { command }) => command.run(&flags, env, json),
-                        Some(Command::Skill { command }) => command.run(json),
-                        Some(Command::Logs { command }) => {
-                            command.run(env, &flags, cli.account.as_deref(), json)
-                        }
-                        None if cli.skill => skill::show(None),
-                        None if json => Err(SaiError::usage("Pass a command when using --json.")),
-                        None => repl::run(&env.home, &flags, cli.account.as_deref(), |args| {
-                            execute(args, environment, writer);
-                        }),
-                        Some(Command::Market { command }) => command.run(&flags, env, json, events),
-                        Some(Command::Account { command }) => {
-                            command.run(&flags, env, json, events)
-                        }
-                        Some(Command::Watch { command }) => command.run(&flags, env, events),
-                    }
-                });
-            complete(result, command, json, home)
+                .and_then(|env| cli.run(env, json, events, operands, start_log));
+            complete(result, usage_command, json, home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
-    finish(
-        events_writer,
-        command_field(),
-        &command_id,
-        started,
-        outcome,
-    )
+    start_log();
+    finish(writer, command_field(), started, outcome)
 }
 
 fn eager_skill(argv: &[String]) -> bool {
@@ -299,7 +314,7 @@ fn usage_diagnostic(text: &str) -> &str {
 
 fn complete(
     result: Result<(), SaiError>,
-    command: &str,
+    usage_command: Option<&str>,
     json_output: bool,
     home: Option<&Path>,
 ) -> (ExitCode, Option<SaiError>) {
@@ -324,7 +339,7 @@ fn complete(
     let message = redact(&error.message);
     let interrupted = error.code == Code::InvalidRequest && error.message == "Aborted";
     // Auth import emits its own newline on cancellation.
-    if interrupted && command != "auth import" {
+    if interrupted && usage_command != Some("auth import") {
         eprintln!();
     }
     if json_output {
@@ -343,7 +358,10 @@ fn complete(
     } else if interrupted {
         eprintln!("Aborted!");
     } else {
-        if error.exit_code == ExitCode::Usage && error.show_usage {
+        if error.exit_code == ExitCode::Usage
+            && error.show_usage
+            && let Some(command) = usage_command
+        {
             eprintln!(
                 "{}\nTry '{} --help' for help.\n",
                 usage(command),
@@ -359,8 +377,9 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" | "auth import" | "market list"
-        | "market prices" => "",
+        "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
+        | "market list" | "market prices" => "",
+        "mcp install" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
@@ -404,12 +423,11 @@ fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
 }
 
 fn finish(
-    writer: Option<&LogWriter>,
+    writer: Option<LogWriter>,
     command: Field,
-    command_id: &str,
     started: Instant,
     (code, error): (ExitCode, Option<SaiError>),
-) -> ExitCode {
+) -> process::ExitCode {
     if let Some(writer) = writer {
         let duration_ms = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let level = if code == ExitCode::Ok {
@@ -419,7 +437,6 @@ fn finish(
         };
         let mut fields = vec![
             ("command", command),
-            ("commandId", json!(command_id).into()),
             ("durationMs", json!(duration_ms).into()),
             ("exitCode", json!(code as u8).into()),
         ];
@@ -431,11 +448,13 @@ fn finish(
             }
         }
         writer.event(Surface::Cli, "command.end", level, fields);
+        writer.finish(EXIT_FLUSH);
     }
-    code
+    (code as u8).into()
 }
 
-fn command_path(args: &[String]) -> (&'static str, &[String]) {
+// Recover the command name even when clap rejects its arguments.
+fn command_path(args: &[String]) -> (String, &[String]) {
     let mut skip = false;
     for (index, arg) in args.iter().enumerate() {
         if skip {
@@ -444,64 +463,35 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
         }
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
-            "config" | "auth" | "intent" | "skill" | "logs" | "market" | "account" | "watch" => {
-                let group = match arg.as_str() {
-                    "auth" => "auth",
-                    "intent" => "intent",
-                    "skill" => "skill",
-                    "logs" => "logs",
-                    "market" => "market",
-                    "account" => "account",
-                    "watch" => "watch",
-                    _ => "config",
-                };
-                let Some((index, leaf)) = args
-                    .iter()
-                    .enumerate()
-                    .skip(index + 1)
-                    .find(|(_, arg)| !arg.starts_with('-'))
-                else {
-                    return (group, &[]);
-                };
-                let path = match (group, leaf.as_str()) {
-                    ("config", "get") => "config get",
-                    ("config", "list") => "config list",
-                    ("config", "set") => "config set",
-                    ("config", "unset") => "config unset",
-                    ("auth", "status") => "auth status",
-                    ("auth", "list") => "auth list",
-                    ("auth", "use") => "auth use",
-                    ("auth", "logout") => "auth logout",
-                    ("auth", "login") => "auth login",
-                    ("auth", "import") => "auth import",
-                    ("auth", "renew") => "auth renew",
-                    ("intent", "local") => "intent local",
-                    ("intent", "status") => "intent status",
-                    ("skill", "show") => "skill show",
-                    ("skill", "source") => "skill source",
-                    ("skill", "install") => "skill install",
-                    ("logs", "path") => "logs path",
-                    ("logs", "tail") => "logs tail",
-                    ("logs", "intent") => "logs intent",
-                    ("logs", "run") => "logs run",
-                    ("logs", "stats") => "logs stats",
-                    ("market", "list") => "market list",
-                    ("market", "prices") => "market prices",
-                    ("account", "positions") => "account positions",
-                    ("account", "history") => "account history",
-                    ("account", "balances") => "account balances",
-                    ("watch", "positions") => "watch positions",
-                    ("watch", "balances") => "watch balances",
-                    ("watch", "price") => "watch price",
-                    _ => group,
-                };
-                return (path, &args[index + 1..]);
-            }
             _ if arg.starts_with('-') => {}
-            _ => break,
+            _ => {
+                let tree = Cli::command();
+                let Some(mut node) = tree.find_subcommand(arg) else {
+                    break;
+                };
+                let mut path = node.get_name().to_owned();
+                let mut operands = &args[index + 1..];
+                while node.has_subcommands() {
+                    let Some((index, word)) = operands
+                        .iter()
+                        .enumerate()
+                        .find(|(_, arg)| !arg.starts_with('-'))
+                    else {
+                        return (path, &[]);
+                    };
+                    operands = &operands[index + 1..];
+                    let Some(child) = node.find_subcommand(word) else {
+                        break;
+                    };
+                    path.push(' ');
+                    path.push_str(child.get_name());
+                    node = child;
+                }
+                return (path, operands);
+            }
         }
     }
-    ("", &[])
+    (String::new(), &[])
 }
 
 fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
@@ -639,7 +629,7 @@ fn print_parse_error(
             if matches!(command, "logs" | "skill")
                 && let Some(help) = help()
             {
-                return complete(Err(SaiError::usage(help)), command, json, home);
+                return complete(Err(SaiError::usage(help)), Some(command), json, home);
             }
             if matches!(
                 command,
@@ -648,31 +638,64 @@ fn print_parse_error(
             {
                 let error = SaiError::usage(help);
                 if json || matches!(command, "market" | "account" | "watch") {
-                    return complete(Err(error), command, json, home);
+                    return complete(Err(error), Some(command), json, home);
                 }
                 eprintln!("{}", error.message);
                 return (ExitCode::Usage, Some(error));
             }
         }
         ErrorKind::MissingRequiredArgument if !json && operands.is_empty() => {
-            let missing_help = if matches!(command, "logs run" | "logs intent") {
+            let command_help = if matches!(command, "logs run" | "logs intent") {
                 help()
             } else if matches!(command, "auth login" | "auth use") {
                 auth::help(command)
             } else {
                 reads::help(command)
             };
-            if let Some(help) = missing_help {
+            if let Some(help) = command_help {
                 eprintln!("{help}");
                 return (ExitCode::Usage, None);
             }
         }
         _ => {}
     }
+    if command == "mcp install"
+        && error.kind() == ErrorKind::InvalidValue
+        && context_text(error, ContextKind::InvalidArg)
+            .is_some_and(|arg| arg.split(' ').next() == Some("--scope"))
+        && let Some(value) = context_text(error, ContextKind::InvalidValue)
+        && let Some(ContextValue::Strings(choices)) = error.get(ContextKind::ValidValue)
+    {
+        let explicit_empty = operands.iter().any(|arg| arg == "--scope=")
+            || operands
+                .windows(2)
+                .any(|args| args[0] == "--scope" && args[1].is_empty());
+        if value.is_empty() && !explicit_empty {
+            let usage = SaiError::usage("Option '--scope' requires an argument.");
+            if !json {
+                eprintln!("Error: {}", usage.message);
+                return (ExitCode::Usage, Some(usage));
+            }
+            return complete(Err(usage), Some(command), json, home);
+        }
+        let choices = choices
+            .iter()
+            .map(|choice| repr(choice))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let usage = SaiError::usage(format!(
+            "Invalid value for '--scope': {} is not one of {choices}.",
+            repr(value)
+        ));
+        return complete(Err(usage), Some(command), json, home);
+    }
     let usage_command = match error.get(ContextKind::Usage) {
         Some(ContextValue::StyledStr(usage)) => {
             let usage = usage.to_string();
-            let path = usage.trim_start_matches("Usage: sai").trim();
+            let path = usage
+                .strip_prefix("Usage: ")
+                .and_then(|usage| usage.split_once(' '))
+                .map_or("", |(_, path)| path.trim());
             if path == command || path.starts_with(&format!("{command} ")) {
                 command
             } else if path == "config" || path.starts_with("config ") {
@@ -691,7 +714,7 @@ fn print_parse_error(
             eprintln!("Error: {}", usage_diagnostic(&usage.message));
             return (ExitCode::Usage, Some(usage));
         }
-        return complete(Err(usage), usage_command, json, home);
+        return complete(Err(usage), Some(usage_command), json, home);
     }
     if json {
         let message = match error.kind() {
@@ -700,12 +723,17 @@ fn print_parse_error(
             }
             _ => INVALID_ARGUMENTS,
         };
-        return complete(Err(SaiError::usage(message)), usage_command, true, home);
+        return complete(
+            Err(SaiError::usage(message)),
+            Some(usage_command),
+            true,
+            home,
+        );
     }
     if log::contains_url(&error.to_string()) {
         return complete(
             Err(SaiError::usage(INVALID_ARGUMENTS)),
-            usage_command,
+            Some(usage_command),
             false,
             home,
         );

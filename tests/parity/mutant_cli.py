@@ -180,3 +180,5 @@ finally:
         change_config()
     elif MUTATION == "stale-log":
         stamp_logs_in_past()
+    elif MUTATION == "doctor-create-trader":
+        (SAI_HOME / "trader").mkdir(mode=0o700, exist_ok=True)

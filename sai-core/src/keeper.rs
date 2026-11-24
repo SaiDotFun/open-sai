@@ -1,6 +1,7 @@
 //! Keeper GraphQL requests and their transport verdicts.
 
 mod ca_dir;
+mod diagnostics;
 mod proxy;
 mod public;
 mod queries;
@@ -18,6 +19,7 @@ use crate::{
     log::{self, EventContext, Field, Level},
 };
 
+pub use diagnostics::{lcd_network, websocket_handshake};
 pub(crate) use public::{
     known_intent_field, log_intent_error_code, log_intent_record, request_hash,
 };
@@ -190,24 +192,50 @@ impl<'a> Keeper<'a> {
 }
 
 fn check_url(endpoint: &str) -> Result<(), SaiError> {
+    check_transport(endpoint, ProbeEndpoint::Keeper).map_err(keeper_error)
+}
+
+enum ProbeEndpoint {
+    Keeper,
+    Lcd,
+    WebSocket,
+}
+
+fn check_transport(endpoint: &str, service: ProbeEndpoint) -> Result<(), &'static str> {
+    let (secure, plain, insecure, credentials) = match service {
+        ProbeEndpoint::Keeper => (
+            "https",
+            "http",
+            "Keeper endpoint must use HTTPS, except on loopback",
+            "Credentials are not allowed in the Keeper URL",
+        ),
+        ProbeEndpoint::Lcd => (
+            "https",
+            "http",
+            "LCD endpoint must use HTTPS, except on loopback",
+            "Credentials are not allowed in the LCD URL",
+        ),
+        ProbeEndpoint::WebSocket => (
+            "wss",
+            "ws",
+            "WebSocket endpoint must use WSS, except on loopback",
+            "Credentials are not allowed in the WebSocket URL",
+        ),
+    };
     let Some(url) = Endpoint::split(endpoint).filter(|url| {
-        url.scheme == "https"
-            || (url.scheme == "http"
+        url.scheme == secure
+            || (url.scheme == plain
                 && matches!(
                     url.host_port().0.as_str(),
                     "localhost" | "127.0.0.1" | "[::1]"
                 ))
     }) else {
-        return Err(keeper_error(
-            "Keeper endpoint must use HTTPS, except on loopback",
-        ));
+        return Err(insecure);
     };
     if let Some((userinfo, _)) = url.authority.rsplit_once('@')
         && !matches!(userinfo, "" | ":")
     {
-        return Err(keeper_error(
-            "Credentials are not allowed in the Keeper URL",
-        ));
+        return Err(credentials);
     }
     Ok(())
 }

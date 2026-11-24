@@ -1363,14 +1363,16 @@ def test_repl_interrupt_cancels_skill_lock_wait(
     assert (target / "SKILL.md").read_bytes() == (SKILL / "SKILL.md").read_bytes()
 
 
+@pytest.mark.parametrize("flags", [(), ("--endpoint", "http://127.0.0.1:1/graphql")])
 def test_repl_commands_share_run_but_keep_command_ids(
-    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path, flags: tuple[str, ...]
 ) -> None:
     for index, cli in enumerate(local_pair):
         root = tmp_path / str(index)
         result = invoke(
             cli,
             root,
+            *flags,
             stdin=b"config get logs.enabled\nconfig get logs.keep_days\nquit\n",
             logging="1",
         )

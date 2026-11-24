@@ -41,7 +41,7 @@ fn expiry_warning_time(left: TimeDelta) -> Option<String> {
 
 // Stored Keeper expiries follow Python's datetime.fromisoformat. Convert to
 // UTC for comparisons and retain the original text in the session.
-pub(crate) fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
+pub fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
     parse_iso_timestamp(text).map(|(instant, _)| instant)
 }
 
