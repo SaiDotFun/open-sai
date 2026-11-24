@@ -39,7 +39,8 @@ from test_mcp_install import (
 )
 from test_update import API_PATH, Stub, listing, make_prefix
 
-REAL_UV = os.environ.get("UV") or shutil.which("uv")
+_uv_executable = shutil.which(os.environ.get("UV") or "uv")
+REAL_UV = os.path.abspath(_uv_executable) if _uv_executable else None
 needs_uv = pytest.mark.skipif(REAL_UV is None, reason="uv is not on PATH")
 
 
@@ -101,12 +102,23 @@ def sai_home(tmp_path, monkeypatch) -> Path:
     return home
 
 
+@pytest.fixture(autouse=True)
+def private_updater_path(tmp_path, monkeypatch) -> None:
+    """Keep installed MCP clients out of post-update discovery."""
+    executables = tmp_path / "path"
+    executables.mkdir()
+    if REAL_UV is not None:
+        (executables / "uv").symlink_to(REAL_UV)
+    monkeypatch.setenv("PATH", str(executables))
+
+
 @pytest.fixture
 def uv_dirs(tmp_path, monkeypatch, sai_home) -> Path:
     """Point uv at temporary tool, bin, and cache directories."""
     monkeypatch.setenv("UV_TOOL_DIR", str(tmp_path / "tools"))
     monkeypatch.setenv("UV_TOOL_BIN_DIR", str(tmp_path / "bin"))
     monkeypatch.setenv("UV_CACHE_DIR", str(tmp_path / "uv-cache"))
+    monkeypatch.setenv("UV_PYTHON", str(Path(sys.executable).resolve()))
     monkeypatch.setenv("UV_PYTHON_DOWNLOADS", "never")
     monkeypatch.setenv("UV_NO_CONFIG", "1")
     monkeypatch.delenv("UV", raising=False)

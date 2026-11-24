@@ -227,11 +227,8 @@ def test_expired_session_fails():
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
     assert "expired" in check.summary
-    assert check.fix and check.fix.startswith(
-        'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-    )
-    assert "auth login NAME" in check.fix
-    assert ENDPOINT not in check.fix
+    assert check.fix == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
+    assert "Foundry keystore" in check.summary
 
 
 def test_session_for_other_endpoint_fails():
@@ -1665,15 +1662,13 @@ def test_json_report_shape_and_exit_code():
     error = json.loads(output)["error"]
     assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
     assert "expired" in error["message"]
-    assert "auth login NAME" in error["message"]
+    assert "Foundry keystore" in error["message"]
     details = error["details"]
     assert details["schemaVersion"] == 1 and details["overall"] == "fail"
     checks = {check["id"]: check for check in details["checks"]}
     assert checks["session"]["status"] == "fail"
     recovery = checks["session"]["fix"]
-    assert recovery.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert "auth login NAME" in recovery
-    assert ENDPOINT not in recovery
+    assert recovery == f"sai --endpoint {ENDPOINT} auth import --addr {ADDR}"
     assert checks["keeper"]["status"] == "skipped"
 
 
