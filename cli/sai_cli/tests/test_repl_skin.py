@@ -89,6 +89,26 @@ def test_repl_writes_history_and_shows_help(tmp_path, monkeypatch, capsys):
     assert "+help trade\n" in history
 
 
+def test_repl_history_excludes_import_and_rejected_auth_lines(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    marker = "synthetic-repl-credential-marker"
+    ctx = click.Context(main, obj={"flags": {}, "settings": None, "json": True})
+    with create_pipe_input() as pipe:
+        pipe.send_text(
+            f"auth import {marker}\r"
+            f"auth --{marker} import\r"
+            f"auth use '{marker}\r"
+            "auth import --help\r"
+            "auth list\r"
+        )
+        pipe.close()
+        repl(ctx, pt_input=pipe, pt_output=DummyOutput())
+
+    history = (tmp_path / "trader" / "history").read_text(encoding="utf-8")
+    assert marker not in history and "auth import" not in history
+    assert "+auth list\n" in history
+
+
 def test_history_file_is_private(tmp_path, monkeypatch):
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
     history = tmp_path / "trader" / "history"
