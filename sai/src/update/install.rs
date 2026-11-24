@@ -108,6 +108,13 @@ impl Install {
         }
     }
 
+    pub(super) fn recover_staged_launcher(&self) -> Result<()> {
+        match self {
+            Self::Standalone(install) => install.recover_staged_launcher(),
+            _ => Ok(()),
+        }
+    }
+
     pub(super) fn owner(&self, recover: bool) -> Result<()> {
         let Some(launcher) = self.launcher() else {
             return Err(
@@ -116,7 +123,6 @@ impl Install {
         };
         let pending = match self {
             Self::Uv(install) => install.authorized(recover)?,
-            Self::Standalone(install) if recover => install.interrupted_withdrawal()?,
             _ => false,
         };
         // When a recorded launcher is missing, PATH may fall through to
@@ -136,7 +142,6 @@ impl Install {
             ));
         }
         match self {
-            Self::Standalone(_) if pending => Ok(()),
             Self::Standalone(install) => install.active().map(|_| ()),
             Self::Uv(install) => install.owner(pending),
             Self::Other(..) => unreachable!(),

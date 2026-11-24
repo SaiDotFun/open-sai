@@ -95,10 +95,9 @@ fn recovery_returns_competitor(withdrawn: bool) {
     if withdrawn {
         fs::rename(&launcher, stage.join("public")).unwrap();
     }
-    assert_eq!(install.interrupted_withdrawal().unwrap(), withdrawn);
     assert!(
         install
-            .recover()
+            .recover_staged_launcher()
             .unwrap_err()
             .contains("launcher changed during the switch")
     );

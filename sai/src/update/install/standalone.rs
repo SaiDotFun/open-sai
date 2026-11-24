@@ -264,18 +264,6 @@ impl Standalone {
         }
     }
 
-    pub(super) fn interrupted_withdrawal(&self) -> Result<bool> {
-        if launcher_entry(&self.launcher).map_err(io_error)?.is_some() {
-            return Ok(false);
-        }
-        Ok(self.pending()?.is_some_and(|pending| {
-            pending.launcher_switch.is_some_and(|switch| {
-                switch.staged == LAUNCHER_STAGE
-                    && self.root.join(LAUNCHER_STAGE).symlink_metadata().is_ok()
-            })
-        }))
-    }
-
     fn pending(&self) -> Result<Option<Pending>> {
         let bytes = match fs::read(self.root.join(RECORD)) {
             Ok(bytes) => bytes,
@@ -289,17 +277,21 @@ impl Standalone {
             .map_err(|_| "could not read the pending Sai install record".to_owned())
     }
 
+    pub(super) fn recover_staged_launcher(&self) -> Result<()> {
+        if let Some(switch) = self.pending()?.and_then(|pending| pending.launcher_switch)
+            && self.settle_launcher_switch(&switch)?
+        {
+            remove_record(&self.root.join(RECORD))?;
+            return Err("the Sai launcher changed during the switch".into());
+        }
+        Ok(())
+    }
+
     pub(super) fn recover(&self) -> Result<Version> {
         let Some(pending) = self.pending()? else {
             return self.version();
         };
         let record = self.root.join(RECORD);
-        if let Some(switch) = &pending.launcher_switch
-            && self.settle_launcher_switch(switch)?
-        {
-            remove_record(&record)?;
-            return Err("the Sai launcher changed during the switch".into());
-        }
         let active = self.active()?;
         let invalid =
             || "the pending Sai install record names a missing or invalid binary".to_owned();

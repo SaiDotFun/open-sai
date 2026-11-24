@@ -178,6 +178,24 @@ impl UpdateCommand {
         {
             return Outcome::new("unsupported", reason, RUNNING, None);
         }
+        // An opted-out worker can still report an available release. Leave the
+        // launcher and any pending transaction for an authorized update.
+        let opted_in = allowed();
+        let allowed = || opted_in && allowed();
+        let recovery_error = |reason| {
+            Outcome::new(
+                "failed",
+                format!("Could not read or recover the installed sai version: {reason}"),
+                RUNNING,
+                None,
+            )
+        };
+        if !self.source
+            && opted_in
+            && let Err(reason) = install.recover_staged_launcher()
+        {
+            return recovery_error(reason);
+        }
         if let Err(reason) = install.owner(true) {
             return Outcome::new("unsupported", reason, RUNNING, None);
         }
@@ -189,10 +207,6 @@ impl UpdateCommand {
                 None,
             );
         }
-        // An opted-out worker can still report an available release. Leave the
-        // launcher and any pending transaction for an authorized update.
-        let opted_in = allowed();
-        let allowed = || opted_in && allowed();
         let version = if opted_in {
             install.recover_and_version(home, &allowed).await
         } else {
@@ -200,14 +214,7 @@ impl UpdateCommand {
         };
         let installed = match version {
             Ok(version) => version,
-            Err(reason) => {
-                return Outcome::new(
-                    "failed",
-                    format!("Could not read or recover the installed sai version: {reason}"),
-                    RUNNING,
-                    None,
-                );
-            }
+            Err(reason) => return recovery_error(reason),
         };
         let before = installed.to_string();
         if self.recover {

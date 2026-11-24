@@ -468,6 +468,79 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
     assert not record.exists()
 
 
+@pytest.mark.parametrize("interruption", ["installer-staged", "rust-withdrew"])
+@pytest.mark.parametrize("repopulated", [False, True], ids=["vacant", "new-owner"])
+def test_update_recovers_a_staged_competing_launcher(
+    standalone: NativeInstall, interruption: str, repopulated: bool
+) -> None:
+    def entry(path: Path) -> tuple[int, int, str]:
+        metadata = path.lstat()
+        return metadata.st_dev, metadata.st_ino, os.readlink(path)
+
+    launcher = standalone.launcher
+    root = standalone.executable.parent.parent
+    new = f"{NEW}-{'a' * 64}"
+    candidate = root / new / "sai"
+    candidate.parent.mkdir()
+    shutil.copy2(standalone.executable, candidate)
+    stage = root / ".launcher-switch"
+    stage.mkdir(mode=0o700)
+    displaced = stage / "sai"
+    competitor = launcher.with_name("competitor")
+    competitor.write_text(
+        "#!/bin/sh\nprintf 'competing launcher\\n'\n", encoding="utf-8"
+    )
+    competitor.chmod(0o700)
+
+    expected = entry(launcher)
+    launcher.unlink()
+    launcher.symlink_to(competitor.name)
+    launcher.rename(displaced)
+    displaced_entry = entry(displaced)
+    published = None
+    if interruption == "rust-withdrew":
+        launcher.symlink_to(candidate.relative_to(launcher.parent))
+        published = entry(launcher)
+        launcher.rename(stage / "public")
+    assert not launcher.is_symlink()
+    if repopulated:
+        launcher.symlink_to(competitor)
+        newer_entry = entry(launcher)
+
+    record = root / "pending.json"
+    pending = json.dumps(
+        {
+            "old": standalone.executable.parent.name,
+            "new": new,
+            "launcher_switch": {
+                "staged": str(displaced.relative_to(root)),
+                "expected": expected,
+                "published": published,
+            },
+        }
+    )
+    record.write_text(pending, encoding="utf-8")
+
+    with releases({}) as server:
+        result = standalone.invoke(
+            "--json", "update", *server.args, exe=standalone.executable
+        )
+        assert server.reads == []
+    assert result.returncode == 1, result.stdout
+    message = json.loads(result.stdout)["error"]["message"]
+    assert "launcher changed during the switch" in message
+    if repopulated:
+        assert "displaced launcher is at" in message
+        assert entry(launcher) == newer_entry
+        assert entry(displaced) == displaced_entry
+        assert record.read_text(encoding="utf-8") == pending
+    else:
+        assert entry(launcher) == displaced_entry
+        assert standalone.invoke("--version").stdout == "competing launcher\n"
+        assert not stage.exists()
+        assert not record.exists()
+
+
 def test_background_optout_keeps_pending_standalone_recovery(
     standalone: NativeInstall,
 ) -> None:
