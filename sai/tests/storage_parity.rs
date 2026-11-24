@@ -379,11 +379,13 @@ fn rust_saved_session_round_trips_in_python() {
             ENDPOINT.into(),
         ))
         .unwrap();
-    parity(
+    let status = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "status"],
-        1,
+        6,
     );
+    let error: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
     let output = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "list"],
