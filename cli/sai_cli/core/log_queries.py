@@ -249,12 +249,31 @@ def _in_window(line: LogLine, cutoff: str | None) -> bool:
     return cutoff is None or (ts := _id(line, "ts")) is not None and ts < cutoff
 
 
+NO_CALL_PARENT = "-"
+
+
+def _parse_position(day: str, parts: str) -> log.ScanPosition:
+    offsets = None if parts == "-" else tuple(int(part) for part in parts.split(","))
+    if offsets is not None and (
+        len(offsets) != len(log.SURFACES)
+        or any(not 0 <= offset < 2**63 for offset in offsets)
+    ):
+        raise ValueError
+    return log.ScanPosition(date.fromisoformat(day), offsets)
+
+
+def _encode_position(position: log.ScanPosition) -> tuple[str, str]:
+    offsets = "-" if position.offsets is None else ",".join(map(str, position.offsets))
+    return position.day.isoformat(), offsets
+
+
 @dataclass(frozen=True)
 class _Cursor:
     upper: str | None
     position: log.ScanPosition | None = None
     timestamp: str | None = None
     parent: str = ""
+    replay: log.ScanPosition | None = None
 
     @classmethod
     def parse(cls, value: str | None) -> _Cursor:
@@ -262,28 +281,25 @@ class _Cursor:
             instant = _before(value)
             return cls(log.stamp(instant) if instant else None)
         try:
-            if len(value) > 200:
+            if len(value) > 280:
                 raise ValueError
-            timestamp, day, parts, upper, parent = value.split("~")
+            timestamp, day, parts, upper, parent, *replay = value.split("~")
             if (
                 _timestamp({"ts": timestamp}) is None
                 or (upper and _timestamp({"ts": upper}) is None)
-                or (parent and SHA256_HEX.fullmatch(parent) is None)
-            ):
-                raise ValueError
-            offsets = (
-                None if parts == "-" else tuple(int(part) for part in parts.split(","))
-            )
-            if offsets is not None and (
-                len(offsets) != len(log.SURFACES)
-                or any(not 0 <= offset < 2**63 for offset in offsets)
+                or (
+                    parent not in ("", NO_CALL_PARENT)
+                    and SHA256_HEX.fullmatch(parent) is None
+                )
+                or (replay and (len(replay) != 2 or parent))
             ):
                 raise ValueError
             return cls(
                 upper or None,
-                log.ScanPosition(date.fromisoformat(day), offsets),
+                _parse_position(day, parts),
                 timestamp,
                 parent,
+                _parse_position(replay[0], replay[1]) if replay else None,
             )
         except ValueError:
             raise SaiError(
@@ -299,12 +315,16 @@ class _Cursor:
         # and an unread row can have a later timestamp.
         return date.fromisoformat(self.upper[:10]) if self.upper else None
 
-    def encode(self, position: log.ScanPosition, timestamp: str, parent: str) -> str:
-        offsets = (
-            "-" if position.offsets is None else ",".join(map(str, position.offsets))
-        )
+    def encode(
+        self,
+        position: log.ScanPosition,
+        timestamp: str,
+        parent: str,
+        replay: log.ScanPosition | None,
+    ) -> str:
+        fields = (timestamp, *_encode_position(position), self.upper or "", parent)
         return "~".join(
-            (timestamp, position.day.isoformat(), offsets, self.upper or "", parent)
+            (*fields, *_encode_position(replay)) if replay is not None else fields
         )
 
 
@@ -415,6 +435,8 @@ class _PageReport:
         last: str | None,
         stop: log.ScanPosition | None,
         parent: str = "",
+        *,
+        replay: log.ScanPosition | None = None,
     ) -> LogLine:
         for field in self.fields:
             self.report[field].sort(key=log.event_order)
@@ -427,7 +449,9 @@ class _PageReport:
                 stamp = last or cursor.timestamp or cursor.upper
                 if stamp is None:
                     stamp = f"{position.day.isoformat()}T00:00:00.000Z"
-                self.report["nextBefore"] = cursor.encode(position, stamp, parent)
+                self.report["nextBefore"] = cursor.encode(
+                    position, stamp, parent, replay
+                )
         return self.report
 
 
@@ -600,29 +624,43 @@ def run(
         start=cursor.position,
         last_day=last_day,
         before=cursor.upper,
-        observe=remember_call_run,
+        observe=remember_call_run if not parent else None,
     ):
         if (ts := _timestamp(line)) is None:
             continue
         last = ts
-        if line.get("event") == "log.dropped" or identifier in (
-            _id(line, "runId"),
-            _id(line, "callId"),
+        if cursor.replay is None and (
+            line.get("event") == "log.dropped"
+            or identifier in (_id(line, "runId"), _id(line, "callId"))
         ):
             entries.append((position, ts, line))
 
     report = _PageReport({"id": identifier, "events": [], "gaps": []})
+    if cursor.replay is not None:
+        if not parent and scan.resume is not None:
+            return report.finish(scan, cursor, last, None, replay=cursor.replay)
+        # Replay from the first withheld notice once attribution is settled.
+        return report.finish(
+            scan, cursor, last, cursor.replay, parent or NO_CALL_PARENT
+        )
+
     displayed = None
     for position, ts, line in entries:
         if line.get("event") == "log.dropped":
             run_id = _id(line, "runId")
-            if run_id != identifier and not (
-                parent
-                and run_id
-                and TOKEN.fullmatch(run_id)
-                and parent_key(run_id) == parent
-            ):
-                continue
+            if run_id != identifier:
+                if not run_id or TOKEN.fullmatch(run_id) is None:
+                    continue
+                if not parent and scan.resume is not None:
+                    # The scan can still find the call. Publish only entries
+                    # before this notice, and keep its position for replay.
+                    return report.finish(scan, cursor, last, None, replay=position)
+                if (
+                    not parent
+                    or parent == NO_CALL_PARENT
+                    or parent_key(run_id) != parent
+                ):
+                    continue
             field = "gaps"
         else:
             field = "events"

@@ -2363,6 +2363,68 @@ def test_logs_run_attributes_gap_before_consuming_the_call_file(home):
     assert "nextBefore" not in second
 
 
+@pytest.mark.parametrize("parent_found", [True, False])
+def test_logs_run_defers_gap_until_call_parent_is_found(home, parent_found):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    call = {
+        "event": "mcp.tool_call",
+        "callId": "call" if parent_found else "some-other-call",
+        "runId": "parent",
+        "ts": log.stamp(start),
+    }
+    padding = {
+        "event": "mcp.tool_result",
+        "runId": "other",
+        "ts": log.stamp(start + timedelta(milliseconds=1)),
+        "extra": "x" * 8_192,
+    }
+    gap = {
+        "event": "log.dropped",
+        "runId": "parent",
+        "count": 2,
+        "ts": log.stamp(start + timedelta(minutes=1)),
+    }
+    unrelated = {**gap, "runId": "other"}
+    middle = log.encode(padding) * 10
+    assert len(middle) > log.TAIL_CHUNK
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(call) + middle + log.encode(gap) + log.encode(unrelated)
+    )
+    log.file_path("cli", start.date(), root).write_bytes(
+        b"".join(
+            log.encode(
+                {
+                    "event": "command.start",
+                    "runId": "other",
+                    "ts": log.stamp(start + timedelta(milliseconds=i + 2)),
+                }
+            )
+            for i in range(log.MAX_SCAN_ROWS + 1)
+        )
+    )
+
+    before = None
+    seen = set()
+    events, gaps = [], []
+    while True:
+        args = ("--before", before) if before is not None else ()
+        code, output = run_cli("--json", "logs", "run", "call", *args)
+        assert code == 0
+        page = json.loads(output)
+        events.extend(page["events"])
+        gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in seen and len(seen) < 5
+        seen.add(before)
+
+    assert events == ([call] if parent_found else [])
+    assert gaps == ([gap] if parent_found else [])
+
+
 @pytest.mark.parametrize("cli_count", [1, log_queries.MAX_REPORT_ROWS + 1])
 def test_logs_run_paging_defers_rows_below_the_scan_frontier(home, cli_count):
     root = home / "logs"
