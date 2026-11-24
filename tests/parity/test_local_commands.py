@@ -950,6 +950,10 @@ def test_repl_history_matches_typed_prefix(
                         b"https://sai-keeper.nibiru.fi/query",
                     ),
                     (b"config get logs.\x1b[A", b"14\r\n"),
+                    (
+                        b"config get logs.\x1b[A --help",
+                        b"Usage: sai config get [OPTIONS] KEY",
+                    ),
                 ):
                     os.write(master, command + b"\r")
                     read_terminal(master, pending, output)

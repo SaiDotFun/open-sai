@@ -17,12 +17,12 @@ use std::{
 use chrono::Utc;
 use rustyline::{
     Cmd, ConditionalEventHandler, Config, Context, Editor, Event, EventContext, EventHandler,
-    Helper, KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
+    Helper, KeyCode, KeyEvent, Modifiers, RepeatCount,
     completion::Completer,
     error::ReadlineError,
     highlight::Highlighter,
     hint::{Hinter, HistoryHinter},
-    history::MemHistory,
+    history::{History, MemHistory, SearchDirection, SearchResult},
     validate::Validator,
 };
 use sai_core::{
@@ -58,15 +58,16 @@ impl Hinter for HistorySuggestions {
     }
 }
 
+#[derive(Default)]
 struct HistorySearch {
-    lines: Vec<String>,
     selection: Option<HistorySelection>,
+    pending: bool,
 }
 
 struct HistorySelection {
-    line: String,
+    original: String,
     prefix_end: usize,
-    index: usize,
+    current: String,
 }
 
 struct HistoryKeys(Arc<Mutex<HistorySearch>>);
@@ -79,42 +80,136 @@ impl ConditionalEventHandler for HistoryKeys {
         _: bool,
         context: &EventContext<'_>,
     ) -> Option<Cmd> {
-        let backwards = event.get(0)?.0 == KeyCode::Up;
-        let mut history = self.0.lock().ok()?;
-        let selection = history.selection.take();
-        let mut selection = selection
-            .filter(|entry| {
-                context.line() == history.lines[entry.index]
-                    && context.pos() == context.line().len()
-            })
-            .unwrap_or_else(|| HistorySelection {
-                line: context.line().into(),
-                prefix_end: context.pos(),
-                index: history.lines.len(),
-            });
-        let prefix = &selection.line[..selection.prefix_end];
-        let matches = |&index: &usize| history.lines[index].starts_with(prefix);
-        let skip = usize::from(count.saturating_sub(1));
-        let next = if backwards {
-            (0..selection.index).rev().filter(matches).nth(skip)
-        } else {
-            (selection.index + 1..history.lines.len())
-                .filter(matches)
-                .nth(skip)
-        };
-        if let Some(index) = next {
-            selection.index = index;
-            let line = history.lines[index].clone();
-            history.selection = Some(selection);
-            Some(Cmd::Replace(Movement::WholeLine, Some(line)))
-        } else if !backwards && selection.index < history.lines.len() {
-            Some(Cmd::Replace(Movement::WholeLine, Some(selection.line)))
-        } else {
-            if selection.index < history.lines.len() {
-                history.selection = Some(selection);
+        let mut search = self.0.lock().ok()?;
+        let command = match event.get(0)? {
+            KeyEvent(KeyCode::Up, Modifiers::NONE) => Cmd::LineUpOrPreviousHistory(count),
+            KeyEvent(KeyCode::Down, Modifiers::NONE) => Cmd::LineDownOrNextHistory(count),
+            _ => {
+                search.pending = false;
+                return None;
             }
-            Some(Cmd::Noop)
+        };
+        if search
+            .selection
+            .as_ref()
+            .is_none_or(|selection| selection.current != context.line())
+        {
+            search.selection = Some(HistorySelection {
+                original: context.line().into(),
+                prefix_end: context.pos(),
+                current: context.line().into(),
+            });
         }
+        search.pending = true;
+        Some(command)
+    }
+}
+
+// Use Rustyline's regular history navigation to restore the input and
+// leave the cursor at the end of each recalled entry.
+struct PrefixHistory {
+    entries: MemHistory,
+    search: Arc<Mutex<HistorySearch>>,
+}
+
+impl History for PrefixHistory {
+    fn get(
+        &self,
+        index: usize,
+        direction: SearchDirection,
+    ) -> rustyline::Result<Option<SearchResult<'_>>> {
+        let mut search = self
+            .search
+            .lock()
+            .map_err(|_| io::Error::other("History search state unavailable"))?;
+        if !std::mem::take(&mut search.pending) {
+            return self.entries.get(index, direction);
+        }
+        let Some(selection) = &mut search.selection else {
+            return self.entries.get(index, direction);
+        };
+        let prefix = &selection.original[..selection.prefix_end];
+        let found = if prefix.is_empty() {
+            self.entries.get(index, direction)?
+        } else {
+            self.entries.starts_with(prefix, index, direction)?
+        };
+        if let Some(found) = found {
+            selection.current = found.entry.to_string();
+            return Ok(Some(found));
+        }
+        if direction == SearchDirection::Forward {
+            let entry = selection.original.clone();
+            search.selection = None;
+            return Ok(Some(SearchResult {
+                pos: entry.len(),
+                idx: self.entries.len(),
+                entry: Cow::Owned(entry),
+            }));
+        }
+        Ok(None)
+    }
+
+    fn add(&mut self, line: &str) -> rustyline::Result<bool> {
+        self.entries.add(line)
+    }
+
+    fn add_owned(&mut self, line: String) -> rustyline::Result<bool> {
+        self.entries.add_owned(line)
+    }
+
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    fn set_max_len(&mut self, len: usize) -> rustyline::Result<()> {
+        self.entries.set_max_len(len)
+    }
+
+    fn ignore_dups(&mut self, yes: bool) -> rustyline::Result<()> {
+        self.entries.ignore_dups(yes)
+    }
+
+    fn ignore_space(&mut self, yes: bool) {
+        self.entries.ignore_space(yes);
+    }
+
+    fn save(&mut self, path: &Path) -> rustyline::Result<()> {
+        self.entries.save(path)
+    }
+
+    fn append(&mut self, path: &Path) -> rustyline::Result<()> {
+        self.entries.append(path)
+    }
+
+    fn load(&mut self, path: &Path) -> rustyline::Result<()> {
+        self.entries.load(path)
+    }
+
+    fn clear(&mut self) -> rustyline::Result<()> {
+        self.entries.clear()
+    }
+
+    fn search(
+        &self,
+        term: &str,
+        start: usize,
+        direction: SearchDirection,
+    ) -> rustyline::Result<Option<SearchResult<'_>>> {
+        self.entries.search(term, start, direction)
+    }
+
+    fn starts_with(
+        &self,
+        term: &str,
+        start: usize,
+        direction: SearchDirection,
+    ) -> rustyline::Result<Option<SearchResult<'_>>> {
+        self.entries.starts_with(term, start, direction)
     }
 }
 
@@ -330,7 +425,7 @@ fn open_history(directory: &Path) -> io::Result<File> {
 
 fn load_history(
     file: &mut File,
-    editor: &mut Editor<HistorySuggestions, MemHistory>,
+    editor: &mut Editor<HistorySuggestions, PrefixHistory>,
 ) -> Result<(), SaiError> {
     let mut stored = Vec::new();
     file.read_to_end(&mut stored)
@@ -377,17 +472,24 @@ pub fn run(
             .max_history_size(usize::MAX)
             .map_err(|_| SaiError::internal())?
             .build();
-        let mut editor = Editor::with_config(config).map_err(|_| SaiError::internal())?;
+        let search = Arc::new(Mutex::new(HistorySearch::default()));
+        let entries = MemHistory::with_config(&config);
+        let prefix_history = PrefixHistory {
+            entries,
+            search: Arc::clone(&search),
+        };
+        let mut editor =
+            Editor::with_history(config, prefix_history).map_err(|_| SaiError::internal())?;
         editor.set_helper(Some(HistorySuggestions::default()));
         let mut history = open_history(&directory).map_err(|_| SaiError::internal())?;
         load_history(&mut history, &mut editor)?;
-        let search = Arc::new(Mutex::new(HistorySearch {
-            lines: editor.history().into_iter().cloned().collect(),
-            selection: None,
-        }));
-        for key in [KeyCode::Up, KeyCode::Down] {
+        for event in [
+            Event::from(KeyEvent(KeyCode::Up, Modifiers::NONE)),
+            Event::from(KeyEvent(KeyCode::Down, Modifiers::NONE)),
+            Event::Any,
+        ] {
             editor.bind_sequence(
-                KeyEvent(key, Modifiers::NONE),
+                event,
                 EventHandler::Conditional(Box::new(HistoryKeys(Arc::clone(&search)))),
             );
         }
@@ -416,7 +518,7 @@ pub fn run(
 
     loop {
         let line = if let Some((editor, history, search)) = &mut session {
-            search.lock().map_err(|_| SaiError::internal())?.selection = None;
+            *search.lock().map_err(|_| SaiError::internal())? = HistorySearch::default();
             match editor.readline("◆ sai ❯ ") {
                 Ok(line) => {
                     if !line.is_empty()
@@ -425,11 +527,6 @@ pub fn run(
                             .map_err(|_| SaiError::internal())?
                     {
                         record_history(history, &line).map_err(|_| SaiError::internal())?;
-                        search
-                            .lock()
-                            .map_err(|_| SaiError::internal())?
-                            .lines
-                            .push(line.clone());
                     }
                     line
                 }
