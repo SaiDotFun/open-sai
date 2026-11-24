@@ -590,7 +590,10 @@ class LogDir:
         try:
             if create:
                 paths.private_directory(root.parent)
-                paths.private_directory(root)
+                # Preserve owner access on existing log directories. The
+                # descriptor below is used to clear group and other access.
+                if not root.exists():
+                    paths.private_directory(root)
             if not _DIR_FD:
                 if redirected(root) or not root.is_dir():
                     return None
