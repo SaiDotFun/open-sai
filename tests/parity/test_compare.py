@@ -297,6 +297,72 @@ def test_ledger_compares_collations_in_view_definitions(tmp_path: Path) -> None:
 
 
 @requires_sqlite_schema
+@pytest.mark.parametrize(
+    ("reference_sql", "equivalent", "changed"),
+    (
+        (
+            "CREATE INDEX indexed ON intents(status) WHERE status <> 'failed'",
+            (
+                "CREATE INDEX indexed ON intents(status) WHERE ((status <> 'failed'))",
+                "CREATE INDEX indexed ON intents(status) WHERE \"status\" <> 'failed'",
+            ),
+            "CREATE INDEX indexed ON intents(status) WHERE status <> 'status'",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(lower(status) DESC)",
+            (
+                "CREATE INDEX indexed ON intents((lower(status)) DESC)",
+                'CREATE INDEX indexed ON intents(lower("STATUS") DESC)',
+            ),
+            "CREATE INDEX indexed ON intents(lower('status') DESC)",
+        ),
+        (
+            "CREATE INDEX indexed ON intents(17 DESC, lower(état))",
+            ('CREATE INDEX indexed ON intents(((17)) DESC, lower("état"))',),
+            "CREATE INDEX indexed ON intents(18 DESC, lower(état))",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT lower(status) AS label FROM intents WHERE priority + 1 * 2 > 3",
+            (
+                "CREATE VIEW projected AS SELECT (lower(status)) AS label FROM intents WHERE (priority + 1 * 2 > 3)",
+                'CREATE VIEW projected AS SELECT lower("status") AS "label" FROM [intents] WHERE `priority` + 1 * 2 > 3',
+            ),
+            "CREATE VIEW projected AS SELECT lower(status) AS label FROM intents WHERE (priority + 1) * 2 > 3",
+        ),
+        (
+            "CREATE VIEW projected AS SELECT label FROM (SELECT lower(status) label FROM intents)",
+            (
+                'CREATE VIEW projected AS SELECT label FROM (SELECT (lower("status")) label FROM intents)',
+            ),
+            "CREATE VIEW projected AS SELECT label FROM (SELECT upper(status) label FROM intents)",
+        ),
+        (
+            'CREATE VIEW projected AS SELECT "true" AS label FROM intents',
+            ('CREATE VIEW projected AS SELECT ("true") AS label FROM intents',),
+            "CREATE VIEW projected AS SELECT true AS label FROM intents",
+        ),
+    ),
+)
+def test_schema_normalizes_only_safe_expression_formatting(
+    tmp_path: Path, reference_sql: str, equivalent: tuple[str, ...], changed: str
+) -> None:
+    def read(name: str, sql: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute(
+                "CREATE TABLE intents (status TEXT, priority INTEGER, état TEXT)"
+            )
+            db.execute(sql)
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read("reference.sqlite3", reference_sql)
+    for i, sql in enumerate(equivalent):
+        assert reference == read(f"equivalent-{i}.sqlite3", sql)
+    difference = first_difference(reference, read("changed.sqlite3", changed), "ledger")
+    assert difference and difference.startswith("ledger.schema.tables.")
+
+
+@requires_sqlite_schema
 def test_ledger_detects_added_or_changed_check_constraints(tmp_path: Path) -> None:
     ddl = """
         CREATE TABLE intents (

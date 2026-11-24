@@ -421,6 +421,130 @@ def normalize_collations(tokens: list[str]) -> list[str]:
     return normalized
 
 
+def parenthesis_pairs(tokens: list[str]) -> Iterator[tuple[int, int]]:
+    openings = []
+    for i, token in enumerate(tokens):
+        if token == "(":
+            openings.append(i)
+        elif token == ")":
+            yield openings.pop(), i
+
+
+def strip_outer_parentheses(tokens: list[str]) -> list[str]:
+    while (
+        tokens[:1] == ["("]
+        and (0, len(tokens) - 1) in parenthesis_pairs(tokens)
+        and tokens[1] not in {"SELECT", "VALUES", "WITH"}
+    ):
+        tokens = tokens[1:-1]
+    return tokens
+
+
+def view_expressions(tokens: list[str]) -> list[str]:
+    """Strip outer groups at view expression boundaries, including in subqueries."""
+    starts = {
+        ",",
+        "ALL",
+        "BY",
+        "DISTINCT",
+        "HAVING",
+        "LIMIT",
+        "OFFSET",
+        "ON",
+        "SELECT",
+        "WHERE",
+    }
+    ends = {
+        ")",
+        ",",
+        "AS",
+        "ASC",
+        "DESC",
+        "EXCEPT",
+        "FROM",
+        "GROUP",
+        "HAVING",
+        "INTERSECT",
+        "JOIN",
+        "LIMIT",
+        "NULLS",
+        "OFFSET",
+        "ORDER",
+        "UNION",
+        "WHERE",
+        "WINDOW",
+    }
+    removed = set()
+    for start, end in parenthesis_pairs(tokens):
+        if start == 0 or tokens[start - 1] not in starts:
+            continue
+        following = tokens[end + 1 : end + 3]
+        if following and following[0] not in ends:
+            alias = following[0]
+            if not (
+                (alias[0] in {'"', "`", "["} or unquoted_sqlite_name(alias))
+                and (len(following) == 1 or following[1] in ends)
+            ):
+                continue
+        expression = tokens[start : end + 1]
+        pairs = (len(expression) - len(strip_outer_parentheses(expression))) // 2
+        removed.update(range(start, start + pairs))
+        removed.update(range(end - pairs + 1, end + 1))
+    return [token for i, token in enumerate(tokens) if i not in removed]
+
+
+def unquoted_sqlite_name(token: str) -> bool:
+    match = sqlite_tokenizer().fullmatch(token)
+    return match is not None and match.lastgroup == "name"
+
+
+def normalize_expression_sql(
+    conn: sqlite3.Connection,
+    original: list[str],
+    ungrouped: list[str],
+    as_select: Callable[[str], str],
+) -> list[str]:
+    """Use SQLite's name resolution to check edits to expression syntax."""
+
+    def program(tokens: list[str]) -> list[tuple] | None:
+        try:
+            return conn.execute("EXPLAIN " + as_select(" ".join(tokens))).fetchall()
+        except sqlite3.DatabaseError:
+            return None
+
+    # SQLite can treat an unresolved double-quoted token as a string, and an
+    # unquoted name can be a keyword. Only accept rewrites with the same program.
+    # Collation names are identifiers by grammar and are normalized separately.
+    quoted = {
+        i
+        for i, token in enumerate(ungrouped)
+        if token[0] in {'"', "`", "["} and (i == 0 or ungrouped[i - 1] != "COLLATE")
+    }
+    if not quoted and ungrouped == original:
+        return normalize_collations(original)
+    reference = program(original)
+    if reference is None:
+        return normalize_collations(original)
+    if ungrouped != original and program(ungrouped) != reference:
+        return normalize_expression_sql(conn, original, original, as_select)
+    normalized = ungrouped.copy()
+    for i in sorted(quoted):
+        token = normalized[i]
+        name = sqlite_identifier(token)
+        # Keep a canonical quoted spelling for names that require quoting.
+        quoted_name = "`" + name.replace("`", "``") + "`"
+        candidates = (
+            (name, quoted_name) if unquoted_sqlite_name(name) else (quoted_name,)
+        )
+        for candidate in candidates:
+            normalized[i] = candidate
+            if candidate == token or program(normalized) == reference:
+                break
+        else:
+            normalized[i] = token
+    return normalize_collations(normalized)
+
+
 def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
     """Read CHECK expressions, table options, and column collations from stored DDL."""
     tokens = sqlite_tokens(sql)
@@ -478,6 +602,35 @@ def index_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
     raise ValueError("Unbalanced CREATE INDEX definition")
 
 
+def index_expressions(
+    conn: sqlite3.Connection,
+    table: str,
+    keys: list[list[str]],
+    where: list[str],
+    index_columns: list[tuple],
+) -> tuple[dict[int, list[str]], list[str]]:
+    source = '"' + table.replace('"', '""') + '" NOT INDEXED'
+    expressions = {}
+    for seqno, key in enumerate(keys):
+        # PRAGMA reports the effective collation and uses cid -2 for expressions.
+        if index_columns[seqno][1] != -2 and key.count("COLLATE") <= 1:
+            continue
+        end = -1 if key[-1] in {"ASC", "DESC"} else len(key)
+        ungrouped = strip_outer_parentheses(key[:end]) + key[end:]
+        # In a SELECT projection, SQLite reads a trailing ASC or DESC as the
+        # result alias. An integer key remains a literal in this context.
+        expressions[seqno] = normalize_expression_sql(
+            conn, key, ungrouped, lambda expr: f"SELECT {expr} FROM {source}"
+        )
+    predicate = normalize_expression_sql(
+        conn,
+        where,
+        strip_outer_parentheses(where),
+        lambda expr: f"SELECT {expr} FROM {source}",
+    )
+    return expressions, predicate
+
+
 def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         raise ValueError(SQLITE_SCHEMA_REQUIREMENT)
@@ -519,18 +672,15 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                 'SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?) ORDER BY seqno',
                 (index,),
             ).fetchall()
+            expressions, where = index_expressions(
+                conn, name, keys, where, index_columns
+            )
             indexes[index] = {
                 "unique": unique,
                 "origin": origin,
                 "partial": partial,
-                "where": normalize_collations(where),
-                "expressions": {
-                    seqno: normalize_collations(key)
-                    for seqno, key in enumerate(keys)
-                    # SQLite exposes the effective collation, but omits inner
-                    # COLLATE clauses and marks expression keys with cid -2.
-                    if index_columns[seqno][1] == -2 or key.count("COLLATE") > 1
-                },
+                "where": where,
+                "expressions": expressions,
                 "columns": [
                     (
                         seqno,
@@ -557,7 +707,12 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
             ).fetchall(),
         }
         if kind == "view":
-            tables[name]["definition"] = normalize_collations(sqlite_tokens(sql))
+            tokens = sqlite_tokens(sql)
+            query_start = tokens.index("AS") + 1
+            body = tokens[query_start:]
+            tables[name]["definition"] = normalize_expression_sql(
+                conn, body, view_expressions(body), str
+            )
     return {
         "tables": tables,
         "objects": [(kind, name, table) for kind, name, table, _ in catalog],
