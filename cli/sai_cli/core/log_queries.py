@@ -4,16 +4,19 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+import tempfile
+import zlib
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import keeper, log, storage
+from . import keeper, log, paths, storage
 from .errors import Code, ExitCode, SaiError
 from .log_events import COMMON_OPTIONAL, COMMON_REQUIRED, EVENTS
 
@@ -52,6 +55,7 @@ INTENT_EVIDENCE = {
     "intent.wait.end",
     "intent.status_write_failed",
 }
+TX_EVENTS = ("intent.submitted", "intent.wait.end", "intent.keeper")
 
 
 def _id(line: LogLine, field: str) -> str | None:
@@ -166,88 +170,33 @@ def _before(value: str | None) -> datetime | None:
 CONTEXT_BYTES = 256 * 1024
 CONTEXT_ROWS = 256
 CONTEXT_FILES = len(log.SURFACES)
-START_EVENTS = {"command.start", "mcp.tool_call"}
 
 
-def _scan(
+def _prefix(
     root: Path | None,
-    before: str | None,
-    anchor: Callable[[LogLine], bool],
-) -> tuple[list[LogLine], bool, str | None, str | None]:
-    instant = _before(before)
-    cutoff = log.stamp(instant) if instant else None
-    page_day = instant.date() if instant else None
-    scan = log.LogScan(
+    day: date,
+    accept: Callable[[LogLine], bool],
+    snapshot: log.FileSnapshot | None = None,
+    *,
+    budget: log.ScanBudget | None = None,
+) -> tuple[list[tuple[log.RowPosition, LogLine]], bool]:
+    return log.read_prefix(
+        root,
+        day,
+        accept,
+        max_bytes=CONTEXT_BYTES,
+        max_rows=CONTEXT_ROWS,
+        snapshot=snapshot,
+        budget=budget,
+    )
+
+
+def _trail_scan() -> log.PageScan:
+    return log.PageScan(
         max_bytes=log.MAX_SCAN_BYTES - 2 * CONTEXT_BYTES,
         max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
         max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
     )
-
-    log.flush(1.0)
-    rows = [
-        line
-        for line in scan.rows(
-            root,
-            last_day=page_day,
-            accept=lambda line: _in_window(line, cutoff) or anchor(line),
-            frontier_before=cutoff,
-        )
-        if _timestamp(line)
-    ]
-    frontier = (
-        scan.frontier
-        if scan.truncated
-        else min(
-            (line["ts"] for line in rows if _in_window(line, cutoff)),
-            default=None,
-        )
-    )
-    truncated = scan.truncated
-    if page_day is not None and page_day < date.max:
-        # A start on this page can belong to an invocation first scoped
-        # just after midnight. The next day's prefix supplies that anchor.
-        following = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
-        rows.extend(
-            following.rows(
-                root,
-                days={page_day + timedelta(days=1)},
-                prefix=True,
-                accept=anchor,
-            )
-        )
-        scan.visited.update(following.visited)
-        truncated |= following.truncated
-
-    starts = {_invocation(line) for line in rows if line.get("event") in START_EVENTS}
-    missing = {
-        invocation: date.fromisoformat(ts[:10]) - timedelta(days=1)
-        for line in rows
-        if anchor(line)
-        and (invocation := _invocation(line)) is not None
-        and invocation not in starts
-        and (ts := _timestamp(line))
-        and ts[:10] != "0001-01-01"
-    }
-    if missing:
-        # Reserve a bounded read near the end of the preceding day's files.
-        # Skip files already scanned by either phase.
-        previous = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
-        rows.extend(
-            previous.rows(
-                root,
-                days=set(missing.values()),
-                skip=scan.visited,
-                accept=lambda line: (
-                    line.get("event") in START_EVENTS and _invocation(line) in missing
-                ),
-            )
-        )
-        truncated |= previous.truncated
-    return sorted(rows, key=log.event_order), truncated, cutoff, frontier
-
-
-def _in_window(line: LogLine, cutoff: str | None) -> bool:
-    return cutoff is None or (ts := _id(line, "ts")) is not None and ts < cutoff
 
 
 NO_CALL_PARENT = "-"
@@ -329,6 +278,256 @@ class _Cursor:
         )
 
 
+CURSOR_STATE_SUFFIX = "~s2~"
+CURSOR_STATE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9a-f]{64})")
+MAX_CURSOR_STATES = 128
+MAX_CURSOR_CACHE_BYTES = 16 * 1024 * 1024
+MAX_CURSOR_FILE_BYTES = 1024 * 1024
+MAX_CURSOR_STATE_BYTES = 8 * 1024 * 1024
+LinkPositions = dict[str, set[log.RowPosition]]
+LINK_TAG = re.compile(r"[0-9a-f]{16}")
+
+
+def _cursor_directories(
+    root: Path | None, *, create: bool = False
+) -> Iterator[log.LogDir]:
+    root = root or log.directory()
+    if opened := log.LogDir.open(root / ".intent-cursors", create=create):
+        yield opened
+
+    # A log directory may be readable and stored on a read-only mount.
+    location = (str(Path.home()) + "\0" + str(root.absolute())).encode(
+        errors="surrogatepass"
+    )
+    fallback = (
+        Path(tempfile.gettempdir())
+        / f"sai-intent-cursors-{hashlib.sha256(location).hexdigest()}"
+    )
+    try:
+        if create:
+            paths.private_directory(fallback)
+    except OSError:
+        return
+    if opened := log.LogDir.open(fallback):
+        yield opened
+
+
+def _read_cursor_state(root: Path | None, name: str) -> bytes:
+    match = CURSOR_STATE_NAME.fullmatch(name)
+    if match is None:
+        raise ValueError
+    for opened in _cursor_directories(root):
+        with opened:
+            try:
+                with os.fdopen(opened.read_fd(name), "rb", buffering=0) as stream:
+                    data = stream.read(MAX_CURSOR_FILE_BYTES + 1)
+                if (
+                    len(data) > MAX_CURSOR_FILE_BYTES
+                    or hashlib.sha256(data).hexdigest() != match[2]
+                ):
+                    continue
+                inflater = zlib.decompressobj()
+                raw = inflater.decompress(data, MAX_CURSOR_STATE_BYTES + 1)
+                if (
+                    inflater.eof
+                    and not inflater.unused_data
+                    and len(raw) <= MAX_CURSOR_STATE_BYTES
+                ):
+                    return raw
+            except (OSError, zlib.error):
+                continue
+    raise SaiError(
+        "Log cursor state is unavailable. Start a new intent log query.",
+        Code.INVALID_REQUEST,
+        exit_code=ExitCode.USAGE,
+    )
+
+
+def _prune_cursor_states(opened: log.LogDir, keep: str, oldest: str) -> None:
+    candidates = []
+    for name in opened.names():
+        if (
+            not CURSOR_STATE_NAME.fullmatch(name)
+            or (info := opened.file_info(name)) is None
+        ):
+            continue
+        if info.st_size > MAX_CURSOR_FILE_BYTES or (
+            name != keep and name[:10] < oldest
+        ):
+            opened.unlink(name)
+            continue
+        candidates.append((name == keep, info.st_mtime_ns, name, info.st_size))
+
+    retained = used_bytes = 0
+    for _, _, name, size in sorted(candidates, reverse=True):
+        if retained == MAX_CURSOR_STATES or used_bytes + size > MAX_CURSOR_CACHE_BYTES:
+            opened.unlink(name)
+        else:
+            retained += 1
+            used_bytes += size
+
+
+def _write_cursor_state(
+    root: Path | None, raw: bytes, snapshot: log.FileSnapshot
+) -> str:
+    if len(raw) > MAX_CURSOR_STATE_BYTES:
+        raise SaiError(
+            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
+        )
+    data = zlib.compress(raw)
+    if len(data) > MAX_CURSOR_FILE_BYTES:
+        raise SaiError(
+            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
+        )
+    name = f"{max(snapshot)[0].isoformat()}_{hashlib.sha256(data).hexdigest()}"
+    for opened in _cursor_directories(root, create=True):
+        with opened:
+            try:
+                opened.publish_private(name, data)
+            except OSError:
+                continue
+            # A snapshot cannot refer to a file newer than the day in its name.
+            retained = log.snapshot_files(root)
+            oldest = min(retained)[0].isoformat() if retained else ""
+            _prune_cursor_states(opened, name, oldest)
+            return name
+    raise SaiError("Could not save the intent log continuation.", Code.INTERNAL_ERROR)
+
+
+def _intent_cursor(
+    value: str | None,
+    root: Path | None,
+) -> tuple[_Cursor, list[log.RowPosition], log.FileSnapshot | None, LinkPositions]:
+    base, separator, payload = (value or "").partition(CURSOR_STATE_SUFFIX)
+    if not separator:
+        if "~s~" in base or "~i~" in base:
+            raise log.stale_snapshot()
+        cursor = _Cursor.parse(value)
+        if cursor.position is not None:
+            raise log.stale_snapshot()
+        return cursor, [], None, {}
+    cursor = _Cursor.parse(base)
+    try:
+        if cursor.position is None:
+            raise ValueError
+        items, files, tagged = json.loads(_read_cursor_state(root, payload))
+        if not all(isinstance(value, list) for value in (items, files, tagged)):
+            raise TypeError
+
+        def position(item: Any) -> log.RowPosition:
+            if (
+                not isinstance(item, list)
+                or len(item) != 4
+                or any(type(value) is not int for value in item)
+            ):
+                raise ValueError
+            day, slot, offset, size = item
+            if not (
+                0 <= slot < len(log.SURFACES)
+                and 1 <= size <= log.MAX_LINE + 1
+                and 0 <= offset < 2**63 - size
+            ):
+                raise ValueError
+            return log.RowPosition(date.fromordinal(day), slot, offset, size)
+
+        positions = [position(item) for item in items]
+        snapshot: log.FileSnapshot = {}
+        for row in files:
+            if (
+                not isinstance(row, list)
+                or len(row) != 6
+                or any(type(value) is not int for value in row)
+            ):
+                raise ValueError
+            day, slot, size, device, inode, modified = row
+            if not (0 <= slot < len(log.SURFACES) and 0 < size < 2**63):
+                raise ValueError
+            snapshot[date.fromordinal(day), slot] = log.FileExtent(
+                size, device, inode, modified
+            )
+        links: LinkPositions = defaultdict(set)
+        for entry in tagged:
+            if (
+                not isinstance(entry, list)
+                or len(entry) != 5
+                or not isinstance(entry[0], str)
+                or LINK_TAG.fullmatch(entry[0]) is None
+            ):
+                raise ValueError
+            links[entry[0]].add(position(entry[1:]))
+        return cursor, positions, snapshot, links
+    except (TypeError, ValueError, OverflowError, RecursionError, zlib.error):
+        raise SaiError(
+            "Pass a log cursor or a UTC timestamp to --before.",
+            Code.INVALID_REQUEST,
+            exit_code=ExitCode.USAGE,
+        ) from None
+
+
+def _save_intent_cursor(
+    report: LogLine,
+    positions: list[log.RowPosition],
+    snapshot: log.FileSnapshot,
+    links: LinkPositions,
+    root: Path | None,
+) -> None:
+    if base := report.get("nextBefore"):
+
+        def fields(row: log.RowPosition) -> tuple[int, int, int, int]:
+            return row.day.toordinal(), row.slot, row.offset, row.size
+
+        raw = json.dumps(
+            (
+                list(map(fields, positions)),
+                [
+                    (
+                        day.toordinal(),
+                        slot,
+                        extent.size,
+                        extent.device,
+                        extent.inode,
+                        extent.modified,
+                    )
+                    for (day, slot), extent in sorted(snapshot.items())
+                ],
+                [
+                    (tag, *fields(row))
+                    for tag, refs in links.items()
+                    for row in sorted(refs)
+                ],
+            ),
+            separators=(",", ":"),
+        ).encode()
+        report["nextBefore"] = (
+            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, raw, snapshot)
+        )
+
+
+def _anchor_group(line: LogLine) -> tuple[Any, ...]:
+    """Rows with these facts in common provide the same attribution."""
+    event = _id(line, "event")
+    scope = _scope(line)
+    return (
+        scope,
+        _invocation(line),
+        _id(line, "runId"),
+        event in INTENT_EVIDENCE and line.get("found") is not False,
+        scope is None
+        and (line.get("endpoint") is not None or event in INTENT_EVIDENCE),
+        event
+        if event in TX_EVENTS and keeper.request_hash(line.get("txHash"))[0]
+        else None,
+    )
+
+
+def _link_tag(kind: str, value: str | tuple[str, str, str]) -> str:
+    # The cursor indexes candidate locations. The retained row must still
+    # establish the relationship before the report can use it.
+    return hashlib.blake2s(
+        json.dumps((kind, value)).encode(), digest_size=8
+    ).hexdigest()
+
+
 def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     name = _id(line, "event")
     spec = EVENTS.get(name) if name else None
@@ -371,8 +570,6 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     for name in ("intentKey", "runId", "callId", "commandId"):
         if name in safe and not TOKEN.fullmatch(str(safe[name])):
             del safe[name]
-    if "endpoint" in safe:
-        safe["endpoint"] = log.origin(str(safe["endpoint"]))
     tx_hash, invalid = keeper.request_hash(line.get("txHash"))
     safe.pop("txHash", None)
     if tx_hash:
@@ -380,37 +577,6 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
     if invalid:
         safe["txHashInvalid"] = True
     return log.clean(safe, tokens)
-
-
-def _limit(
-    report: LogLine,
-    entries: list[tuple[str, LogLine]],
-    scan_truncated: bool,
-    oldest_scanned: str | None,
-) -> LogLine:
-    page = _PageReport(report)
-    last_returned = None
-    output_limited = False
-    for field, line in reversed(entries):
-        if not page.add(field, line):
-            output_limited = True
-            break
-        if field != "unattributedGaps":
-            last_returned = _timestamp(line)
-    for field in {field for field, _line in entries}:
-        report[field].reverse()
-    if scan_truncated or output_limited:
-        report["truncated"] = True
-        next_before = (
-            (last_returned or oldest_scanned) if output_limited else oldest_scanned
-        )
-        if next_before:
-            report["nextBefore"] = next_before
-        report["more"] = (
-            "Use --before for earlier timestamps in the scan window. "
-            "To read past the scan limit, inspect files from sai logs path."
-        )
-    return report
 
 
 class _PageReport:
@@ -474,41 +640,96 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    rows, scan_truncated, cutoff, frontier = _scan(
-        root, before, lambda row: _has_intent(row, key)
-    )
-    identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
-    anchors = [line for line in rows if _has_intent(line, key)]
-    scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
-    events: list[LogLine] = []
-    if scope is not None:
-        direct = [line for line in anchors if _scope(line) == scope]
-        invocations = {match for line in direct if (match := _invocation(line))}
-        conflicting = {
-            match
-            for line in anchors
-            if _scope(line) not in (None, scope)
-            and (match := _invocation(line)) in invocations
+    cursor, positions, snapshot, links = _intent_cursor(before, root)
+    log.flush(1.0)
+    if snapshot is None:
+        snapshot = log.snapshot_files(root)
+    elif start := cursor.position:
+        required = {
+            (day, slot)
+            for day, slot in snapshot
+            if (cursor.last_day is None or day <= cursor.last_day)
+            and (
+                day < start.day
+                or (day == start.day and (start.offsets is None or start.offsets[slot]))
+            )
         }
-        for line in rows:
-            if not _in_window(line, cutoff) or line.get("event") == "log.dropped":
-                continue
-            if _has_intent(line, key) and _scope(line) == scope:
-                events.append(line)
-                continue
-            match = _invocation(line)
-            if (
-                match in invocations
-                and match not in conflicting
-                and line.get("intentKey") in (None, key)
-                and _address(line) in (None, scope[0])
-                and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
-                and line.get("endpointId") in (None, scope[1])
-            ):
-                events.append(line)
-    else:
-        direct = []
+        required.update((ref.day, ref.slot) for ref in positions)
+        for refs in links.values():
+            required.update((ref.day, ref.slot) for ref in refs)
+        log.check_snapshot(root, snapshot, required)
+    evidence: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
 
+    def is_anchor(line: LogLine) -> bool:
+        return _has_intent(line, key) and _timestamp(line) is not None
+
+    def remember_anchor(position: log.RowPosition, line: LogLine) -> None:
+        if is_anchor(line):
+            group = _anchor_group(line)
+            previous = evidence.get(group)
+            if previous is None or log.event_order(line) > log.event_order(previous[1]):
+                evidence[group] = (position, line)
+
+    budget = log.ScanBudget()
+    scan = log.PageScan()
+    previous, scan.truncated = log.read_rows_at(root, positions, snapshot, budget)
+    checked = set(positions)
+    rows = []
+    if not scan.truncated:
+        for position, line in previous:
+            remember_anchor(position, line)
+        if (
+            cursor.position is None
+            and (day := cursor.last_day) is not None
+            and day < date.max
+        ):
+            following_day = day + timedelta(days=1)
+            following, truncated = _prefix(
+                root,
+                following_day,
+                is_anchor,
+                snapshot,
+                budget=budget,
+            )
+            for position, line in following:
+                remember_anchor(position, line)
+            scan.truncated |= truncated
+        pending = set().union(*links.values()) - checked if links else set()
+        # Leave part of the same budget for links the selected rows need.
+        reserved = log.ScanBudget(
+            min(sum(ref.size for ref in pending), budget.bytes_left // 2),
+            min(len(pending), budget.rows_left // 2),
+            min(len({(ref.day, ref.slot) for ref in pending}), budget.files_left // 2),
+        )
+        rows = [
+            (position, ts, line)
+            for position, line in scan.rows(
+                root,
+                start=cursor.position,
+                last_day=cursor.last_day,
+                before=cursor.upper,
+                snapshot=snapshot,
+                budget=budget,
+                reserve=reserved,
+                observe=remember_anchor,
+                context=is_anchor,
+            )
+            if (ts := _timestamp(line)) is not None
+        ]
+        if not rows and scan.resume == cursor.position:
+            scan.resume = None
+    complete_scan = not scan.truncated
+    anchors = sorted((line for _, line in evidence.values()), key=log.event_order)
+    identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
+    scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
+    direct = [line for line in anchors if scope is not None and _scope(line) == scope]
+    invocations = {match for line in direct if (match := _invocation(line))}
+    conflicting = {
+        match
+        for line in anchors
+        if _scope(line) not in (None, scope)
+        and (match := _invocation(line)) in invocations
+    }
     report: LogLine = {
         "intentKey": key if scope else None,
         "events": [],
@@ -552,7 +773,7 @@ def intent(
     request_hash = next(
         (
             tx_hash
-            for event in ("intent.submitted", "intent.wait.end", "intent.keeper")
+            for event in TX_EVENTS
             for line in reversed(direct)
             if line.get("event") == event
             and (tx_hash := keeper.request_hash(line.get("txHash"))[0])
@@ -561,21 +782,138 @@ def intent(
     )
     report["txHash"] = keeper.request_hash(log.clean(request_hash))[0]
     matched_runs = {_id(line, "runId") for line in direct} - {None}
-    entries = [("events", line) for line in events]
+
+    def resolve_link(tag: str) -> bool:
+        pending = links.get(tag, set()) - checked
+        previous, truncated = log.read_rows_at(root, list(pending), snapshot, budget)
+        if truncated:
+            return False
+        checked.update(pending)
+        for position, anchor in previous:
+            if not is_anchor(anchor):
+                continue
+            remember_anchor(position, anchor)
+            anchor_scope = _scope(anchor)
+            if anchor_scope == scope:
+                if run_id := _id(anchor, "runId"):
+                    matched_runs.add(run_id)
+                if match := _invocation(anchor):
+                    invocations.add(match)
+            elif anchor_scope is not None and (match := _invocation(anchor)):
+                conflicting.add(match)
+        return True
+
+    page = _PageReport(report)
+    last = None
+    stop = None
     unattributed = []
-    for line in rows:
-        if _in_window(line, cutoff) and line.get("event") == "log.dropped":
-            if _id(line, "runId") in matched_runs:
-                entries.append(("gaps", line))
-            else:
+    for position, ts, line in rows:
+        if line.get("event") == "log.dropped":
+            run_id = _id(line, "runId")
+            if (
+                scope is not None
+                and run_id
+                and run_id not in matched_runs
+                and not resolve_link(_link_tag("run", run_id))
+            ):
+                stop = position
+                break
+            if run_id not in matched_runs:
                 unattributed.append(line)
-    entries.sort(key=lambda entry: log.event_order(entry[1]))
+                continue
+            field = "gaps"
+        elif scope is not None and _has_intent(line, key) and _scope(line) == scope:
+            field = "events"
+        elif (
+            scope is not None
+            and (match := _invocation(line)) is not None
+            and line.get("intentKey") in (None, key)
+            and _address(line) in (None, scope[0])
+            and (line.get("endpoint") is None or line.get("endpointId") == scope[1])
+            and line.get("endpointId") in (None, scope[1])
+        ):
+            if not resolve_link(_link_tag("invocation", match)):
+                stop = position
+                break
+            if match not in invocations or match in conflicting:
+                continue
+            field = "events"
+        else:
+            continue
+        if not page.add(field, line):
+            stop = position
+            break
+        last = ts
     if unattributed:
         report["unattributedGapCount"] = len(unattributed)
         report["unattributedGaps"] = []
-        entries = [("unattributedGaps", line) for line in unattributed[-8:]] + entries
-        scan_truncated |= len(unattributed) > 8
-    return _limit(report, entries, scan_truncated, frontier)
+        scan.truncated |= len(unattributed) > 8
+        scan.truncated |= any(
+            not page.add("unattributedGaps", line) for line in unattributed[:8]
+        )
+    if stop is not None and stop == cursor.position and last is None:
+        # The first unread row needs more context than this page can verify.
+        scan.truncated = True
+        scan.resume = stop = None
+    page.finish(scan, cursor, last, stop)
+    if frontier := stop or scan.resume:
+        # Scope evidence can be deeper than the next page's scan. Links to
+        # unread anchors are only needed when the scan already saw related rows.
+        remaining_rows = rows
+        if complete_scan and stop is not None:
+            first_unread = next(
+                index for index, (position, _, _) in enumerate(rows) if position == stop
+            )
+            remaining_rows = rows[first_unread:]
+        related_invocations = {
+            match
+            for _, _, line in remaining_rows
+            if (not _has_intent(line, key) or _scope(line) is None)
+            and (match := _invocation(line)) is not None
+        }
+        related_runs = {
+            _id(line, "runId")
+            for _, _, line in remaining_rows
+            if line.get("event") == "log.dropped"
+        }
+        if complete_scan:
+            # The entire unread range was visible. Drop links it cannot use.
+            needed = {_link_tag("invocation", match) for match in related_invocations}
+            needed.update(_link_tag("run", run) for run in related_runs if run)
+            links = {tag: refs for tag, refs in links.items() if tag in needed}
+        summaries: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
+        for group, (position, line) in evidence.items():
+            authority = (group[0], *group[3:])
+            previous = summaries.get(authority)
+            if previous is None or log.event_order(line) > log.event_order(previous[1]):
+                summaries[authority] = (position, line)
+            unread = position.day < frontier.day or (
+                position.day == frontier.day
+                and (
+                    frontier.offsets is None
+                    or position.offset < frontier.offsets[position.slot]
+                )
+            )
+            if (match := _invocation(line)) and (
+                (not unread and (not complete_scan or match in related_invocations))
+                or (not complete_scan and match in related_invocations)
+            ):
+                links.setdefault(_link_tag("invocation", match), set()).add(position)
+            if (run_id := _id(line, "runId")) and (
+                (not unread and (not complete_scan or run_id in related_runs))
+                or (not complete_scan and run_id in related_runs)
+            ):
+                links.setdefault(_link_tag("run", run_id), set()).add(position)
+        _save_intent_cursor(
+            report,
+            [position for position, _ in summaries.values()],
+            snapshot,
+            links,
+            root,
+        )
+    if report.get("truncated") and "nextBefore" not in report:
+        report["more"] = "Inspect the retained files from sai logs path."
+    return report
 
 
 def run(
@@ -613,20 +951,15 @@ def run(
         and last_day is not None
         and last_day < date.max
     ):
-        context = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
-        for line in context.rows(
+        following, _ = _prefix(
             root,
-            days={last_day + timedelta(days=1)},
-            prefix=True,
-            accept=lambda line: _id(line, "callId") == identifier,
-        ):
+            last_day + timedelta(days=1),
+            lambda row: _id(row, "callId") == identifier,
+        )
+        for _, line in following:
             remember_call_run(line)
 
-    scan = log.PageScan(
-        max_bytes=log.MAX_SCAN_BYTES - 2 * CONTEXT_BYTES,
-        max_rows=log.MAX_SCAN_ROWS - 2 * CONTEXT_ROWS,
-        max_files=log.MAX_SCAN_FILES - 2 * CONTEXT_FILES,
-    )
+    scan = _trail_scan()
     entries = []
     last = None
     for position, line in scan.rows(
@@ -634,7 +967,7 @@ def run(
         start=cursor.position,
         last_day=last_day,
         before=cursor.upper,
-        observe=remember_call_run if not parent else None,
+        observe=(lambda _, line: remember_call_run(line)) if not parent else None,
     ):
         if (ts := _timestamp(line)) is None:
             continue
