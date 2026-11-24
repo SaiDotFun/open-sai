@@ -1,4 +1,4 @@
-mod output;
+pub(crate) mod output;
 
 use std::{
     fmt::Write as _,
