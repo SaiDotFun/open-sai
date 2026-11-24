@@ -768,7 +768,7 @@ class StdioInput(AsyncFile[str]):
             os.fdopen(os.dup(sys.stdin.fileno()), encoding="utf-8", errors="replace")
         )
         self.requests: SimpleQueue[Future[str] | None] = SimpleQueue()
-        Thread(target=self.read_lines, daemon=True, name="sai-mcp-stdin").start()
+        Thread(target=self.read_lines, daemon=True, name="mcp-stdin").start()
 
     def read_lines(self) -> None:
         with self.wrapped as stdin:
