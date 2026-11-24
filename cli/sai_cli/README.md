@@ -775,10 +775,10 @@ Sai logs allowlisted fields such as the account, intent key, and request
 transaction hash. It omits session tokens, signatures, clipboard text, and
 Keeper request and response payloads. The logger also scrubs every string.
 
-- A URL anywhere, including in `argv` and `endpoint`, is cut to its scheme,
-  host, and port, so an API key in a path or query is not written. In
-  running text a URL runs to the next space; in a command-line token or a
-  tool argument it runs to the end of the value.
+- `command.start` records command and option names. Options that accept
+  values end in `=`. The event omits option values and positional arguments.
+- URLs in fields such as `endpoint` are reduced to their scheme, host, and
+  port, which keeps path and query credentials out of the log.
 - Session tokens this process has seen are replaced when the event is
   made, so signing out afterwards cannot leave one in a line that was
   still waiting to be written. The background writer rereads the session

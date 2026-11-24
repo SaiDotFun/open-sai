@@ -100,16 +100,16 @@ def command_path(group: click.Group, args: list[str]) -> list[str]:
 
 def _command_parts(
     group: click.Group, args: list[str]
-) -> tuple[list[str], int, frozenset[str]]:
-    """Find command names, the argument offset, and explicit setting flags."""
+) -> tuple[list[str], list[str], frozenset[str]]:
+    """Find command names, safe audit names, and explicit setting flags."""
     names: list[str] = []
+    audit_names: list[str] = []
     current: click.Command = group
-    tail = 0
     flag_keys: set[str] = set()
     endpoint_options = dict(GLOBAL_FLAGS)
     options = True
-    indexed = iter(enumerate(args))
-    for index, token in indexed:
+    tokens = iter(args)
+    for token in tokens:
         if options and token == "--":
             options = False
             continue
@@ -119,12 +119,20 @@ def _command_parts(
                 (
                     param
                     for param in current.params
-                    if isinstance(param, click.Option) and option_name in param.opts
+                    if isinstance(param, click.Option)
+                    and option_name in (*param.opts, *param.secondary_opts)
                 ),
                 None,
             )
-            if option is not None and not option.is_flag and not option.count:
-                supplied = bool(equals) or next(indexed, None) is not None
+            if option is None:
+                continue
+            if option.is_flag or option.count:
+                audit_names.append(option_name)
+            else:
+                # An empty assignment keeps the next option or command name
+                # from being read as a value in retained audit rows.
+                audit_names.append(f"{option_name}=")
+                supplied = bool(equals) or next(tokens, None) is not None
                 if supplied and (key := endpoint_options.get(option_name)):
                     flag_keys.add(key)
             continue
@@ -134,54 +142,10 @@ def _command_parts(
         if found is None:
             break
         names.append(token)
-        tail = index + 1
+        audit_names.append(token)
         current = found
         options = True
-    return names, tail, frozenset(flag_keys)
-
-
-def audit_argv(args: list[str], config_set_at: int | None) -> list[log.Arg]:
-    """Prepare command.start arguments before Click validates their values."""
-    safe = args.copy()
-    if config_set_at is not None:
-        key_at = config_set_at
-        if safe[key_at : key_at + 1] == ["--"]:
-            key_at += 1
-        value_at = key_at + 1
-        if key_at == config_set_at and safe[value_at : value_at + 1] == ["--"]:
-            value_at += 1
-        if value_at < len(safe):
-            key = safe[key_at]
-            spec = sai_settings.BY_KEY.get(key)
-            if spec is None:
-                safe[value_at] = "[redacted]"
-            elif spec.kind == "url":
-                safe[value_at] = audit_origin(key, safe[value_at])
-            else:
-                try:
-                    sai_settings.parse_value(key, safe[value_at])
-                except sai_settings.InvalidSetting:
-                    safe[value_at] = "[redacted]"
-
-    endpoint_options = dict(GLOBAL_FLAGS)
-    indexed = iter(enumerate(safe))
-    for index, token in indexed:
-        option, equals, value = token.partition("=")
-        if key := endpoint_options.get(option):
-            if equals:
-                safe[index] = f"{option}={audit_origin(key, value)}"
-            elif next(indexed, None) is not None:
-                safe[index + 1] = audit_origin(key, safe[index + 1])
-    return log.argv(safe)
-
-
-def audit_origin(key: str, value: str) -> str:
-    try:
-        sai_settings.check_value(key, value)
-    except sai_settings.InvalidSetting:
-        return "[redacted]"
-    origin = log.origin(value)
-    return "[redacted]" if origin == log.REDACTED_URL else origin
+    return names, audit_names, frozenset(flag_keys)
 
 
 # Options that print something and exit before any command runs.
@@ -311,7 +275,7 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names, tail, flag_keys = _command_parts(self, argv)
+        names, audit_names, flag_keys = _command_parts(self, argv)
         quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
@@ -327,12 +291,7 @@ class LoggedGroup(SaiGroup):
         def log_start() -> None:
             nonlocal start_logged
             if not quiet and not start_logged:
-                log.event(
-                    "command.start",
-                    argv=audit_argv(
-                        argv[:64], tail if names == ["config", "set"] else None
-                    ),
-                )
+                log.event("command.start", argv=audit_names[:64])
                 start_logged = True
 
         with (

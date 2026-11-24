@@ -355,11 +355,6 @@ class Arg(str):
     __slots__ = ()
 
 
-def argv(tokens: Any) -> list[Arg]:
-    """Mark each of TOKENS as one whole value. Parses nothing."""
-    return [Arg(token) for token in tokens]
-
-
 def origin(value: str) -> str:
     """The scheme, host, and port of the URL VALUE, or a placeholder when it
     does not parse. Never raises."""
@@ -1368,7 +1363,8 @@ def _redact_retained_endpoint_args(line: dict[str, Any]) -> None:
         flag, equals, value = arg.partition("=")
         if options and flag in flags:
             if equals:
-                argv[index] = flag + "=" + origin(value)
+                if value:
+                    argv[index] = flag + "=" + origin(value)
             elif index + 1 < len(argv) and isinstance(argv[index + 1], str):
                 index += 1
                 argv[index] = origin(argv[index])

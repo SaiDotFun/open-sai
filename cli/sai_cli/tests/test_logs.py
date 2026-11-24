@@ -490,7 +490,7 @@ def test_urls_with_awkward_characters_do_not_reach_the_log(home, keeper_stub):
     for secret in (PATH_KEY, URL_KEY, "it's", "api_key"):
         assert secret not in raw, secret
     start = events(home, "command.start")[0]
-    assert start["argv"] == ["--endpoint", site, "--json", "market", "prices"]
+    assert start["argv"] == ["--endpoint=", "--json", "market", "prices"]
     assert events(home, "mcp.tool_call")[0]["arguments"] == {"addr": site}
 
 
@@ -501,13 +501,12 @@ def test_command_start_redacts_malformed_endpoint_flags(home, command, flag, inl
     marker = "fixture-endpoint-credential"
     endpoint = f"keeper.invalid/graphql?credential={marker}"
     option = [f"{flag}={endpoint}"] if inline else [flag, endpoint]
-    shown = [f"{flag}=[redacted]"] if inline else [flag, "[redacted]"]
     if command == ("mcp", "serve"):
         args = ["--json", *command, *option]
-        expected = ["--json", *command, *shown]
+        expected = ["--json", *command, f"{flag}="]
     else:
         args = ["--json", *option, *command]
-        expected = ["--json", *shown, *command]
+        expected = ["--json", f"{flag}=", *command]
 
     assert run_cli(*args)[0] == 2
     assert events(home, "command.start")[0]["argv"] == expected
@@ -520,17 +519,18 @@ def test_command_start_redacts_rejected_config_set_values(home, key):
     args = ["--json", "config", "set", "--", key]
 
     assert run_cli(*args, marker)[0] == 2
-    assert events(home, "command.start")[0]["argv"] == [*args, "[redacted]"]
+    assert events(home, "command.start")[0]["argv"] == ["--json", "config", "set"]
     assert marker not in raw_logs(home)
 
 
-def test_command_start_keeps_only_the_configured_endpoint_origin(home):
+def test_command_start_omits_valid_config_set_arguments(home):
     marker = "fixture-config-credential"
     args = ["--json", "config", "set", "keeper.endpoint", "--"]
     url = f"https://keeper.invalid/graphql?credential={marker}"
 
     assert run_cli(*args, url)[0] == 0
-    assert events(home, "command.start")[0]["argv"] == [*args, "https://keeper.invalid"]
+    assert events(home, "command.start")[0]["argv"] == ["--json", "config", "set"]
+    assert "keeper.invalid" not in raw_logs(home)
     assert marker not in raw_logs(home)
 
 
@@ -552,13 +552,31 @@ def test_command_start_redacts_rejected_parseable_endpoints(
     suffix = ("config", "list") if prefix[0].startswith("--") else ()
     if inline:
         args = [*prefix[:-1], f"{prefix[-1]}={endpoint}"]
-        shown = [*prefix[:-1], f"{prefix[-1]}=[redacted]"]
     else:
         args = [*prefix, endpoint]
-        shown = [*prefix, "[redacted]"]
+    shown = (
+        [*prefix[:-1], f"{prefix[-1]}="]
+        if prefix[-1].startswith("--")
+        else list(prefix[:-1])
+    )
 
     assert run_cli("--json", *args, *suffix)[0] == 2
     assert events(home, "command.start")[0]["argv"] == ["--json", *shown, *suffix]
+    assert marker not in raw_logs(home)
+
+
+@pytest.mark.parametrize("account_arg", [("--as", "--endpoint"), ("--as=--endpoint",)])
+def test_command_start_omits_values_when_an_operand_looks_like_a_flag(
+    home, account_arg
+):
+    marker = "fixture-flag-shaped-operand-credential"
+    args = ["--json", *account_arg, "--endpoint", marker, "config", "list"]
+
+    assert run_cli(*args)[0] == 2
+    start = events(home, "command.start")[0]
+    expected = ["--json", "--as=", "--endpoint=", "config", "list"]
+    assert start["argv"] == expected
+    assert log.decode_row(json.dumps(start).encode())["argv"] == expected
     assert marker not in raw_logs(home)
 
 
@@ -723,7 +741,7 @@ def test_command_start_and_end_record_argv_exit_code_and_duration(home, keeper_s
     start, request, end = read_logs(home)
     assert start["event"] == "command.start" and start["command"] == "market prices"
     site = base.removesuffix("/query")
-    assert start["argv"] == ["--endpoint", site, "--json", "market", "prices"]
+    assert start["argv"] == ["--endpoint=", "--json", "market", "prices"]
     assert request["event"] == "keeper.request"
     assert request["command"] == "market prices"
     assert request["operation"] == "prices" and request["status"] == "ok"
@@ -947,7 +965,7 @@ def test_a_url_that_does_not_parse_neither_fails_nor_hides_the_error(home):
     requests = events(home, "keeper.request")
     assert [line["endpoint"] for line in requests] == [log.REDACTED_URL] * 2
     start = events(home, "command.start")[0]
-    assert start["argv"] == ["--json", "intent", "local", log.REDACTED_URL]
+    assert start["argv"] == ["--json", "intent", "local"]
 
 
 def test_intent_lifecycle_is_logged_from_reservation_to_terminal(home, keeper_stub):
@@ -1156,7 +1174,7 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home, monkeypatch):
     assert run_cli("doctor", "--offline", "--lcd-endpoint", lcd)[0] == 0
     result = events(home, "doctor.result")[0]
     start = events(home, "command.start")[0]
-    assert start["argv"][-2:] == ["--lcd-endpoint", lcd_origin]
+    assert start["argv"] == ["doctor", "--offline", "--lcd-endpoint="]
     output = raw_logs(home)
     assert PATH_KEY not in output and URL_KEY not in output
     assert result["overall"] == "warn" and result["offline"] is True
