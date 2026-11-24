@@ -20,7 +20,7 @@ use crate::{endpoint::Endpoint, files::open_regular, log};
 use toml::ParsedDocument;
 
 pub const FILE_NAME: &str = "config.toml";
-const MAINNET_HTTP: &str = "https://sai-keeper.nibiru.fi/query";
+pub(crate) const MAINNET_HTTP: &str = "https://sai-keeper.nibiru.fi/query";
 const MAINNET_WS: &str = "wss://sai-keeper.nibiru.fi/query";
 const MAINNET_LCD: &str = "https://lcd.nibiru.fi";
 const DEFAULT_KEEP_DAYS: u64 = 14;
