@@ -82,6 +82,12 @@ UNSUPPORTED = "unsupported"
 NO_RELEASE = "no-release"
 BUSY = "busy"
 
+MCP_NOTES = {
+    "background": "Background updates check user MCP registrations. Run `sai doctor` in each project to check project registrations.",
+    "cwd-missing": "The working directory is gone. Run `sai doctor` in a project to check its MCP registrations.",
+    "failed": "Could not check MCP registrations. Run `sai doctor` for details.",
+}
+
 # Runs a command and returns its exit code and its combined output.
 Runner = Callable[[Sequence[str], float], tuple[int, str]]
 
@@ -141,13 +147,14 @@ def write_state(changes: dict[str, Any], path: Path | None = None) -> None:
     update.write_json(target, state)
 
 
-def save_state(changes: dict[str, Any]) -> bool:
+def save_state(changes: dict[str, Any], path: Path | None = None) -> bool:
     """Take the state lock and merge CHANGES into update.json. Return False
     when the lock or the file could not be had; state is best effort."""
     try:
-        with locked(wait=STATE_WAIT) as held:
+        lock_path = path.with_name("update.lock") if path is not None else None
+        with locked(lock_path, wait=STATE_WAIT) as held:
             if held:
-                write_state(changes)
+                write_state(changes, path)
             return held
     except OSError:
         return False
@@ -562,6 +569,7 @@ class Outcome:
     target: str | None = None
     rolled_back: bool = False
     mcp: tuple[mcp_install.RegistrationCheck, ...] = ()
+    mcp_notes: tuple[str, ...] = ()
 
     @property
     def exit_code(self) -> int:
@@ -579,6 +587,8 @@ class Outcome:
         }
         if self.mcp:
             result["mcp"] = self.mcp_results()
+        if self.mcp_notes:
+            result["mcpNotes"] = [MCP_NOTES[note] for note in self.mcp_notes]
         return result
 
     def mcp_results(self) -> list[dict[str, Any]]:
@@ -620,7 +630,9 @@ class Options:
     download_timeout: float = DOWNLOAD_TIMEOUT
 
 
-def _record(outcome: Outcome, before: str | None, seen: bool) -> None:
+def _record(
+    outcome: Outcome, before: str | None, seen: bool, path: Path | None = None
+) -> None:
     """Save OUTCOME as the last update attempt.
 
     SEEN says the person watched this run, so no notice repeats it later.
@@ -635,10 +647,12 @@ def _record(outcome: Outcome, before: str | None, seen: bool) -> None:
     }
     if outcome.mcp:
         result["mcp"] = outcome.mcp_results()
+    if outcome.mcp_notes:
+        result["mcpNotes"] = list(outcome.mcp_notes)
     changes: dict[str, Any] = {"result": result}
     if seen:
         changes["notified"] = f"{outcome.status}:{outcome.target}"
-    save_state(changes)
+    save_state(changes, path)
 
 
 def _resolve(options: Options) -> update.Release | None:
@@ -1042,6 +1056,9 @@ def update_now(options: Options | None = None) -> Outcome:
         clear_snapshots(prefix)
         # The cache lock comes second, always after the tool lock, and is
         # held until the install is verified or rolled back.
+        # Capture the absolute state path while a relative SAI_HOME can
+        # still be resolved, even if the working directory goes away.
+        state_path = update.cache_path()
         with locked(cache_lock_path(), wait) as cache_held:
             if not cache_held:
                 message = (
@@ -1051,48 +1068,81 @@ def update_now(options: Options | None = None) -> Outcome:
                 status = BUSY if options.background else FAILED
                 return Outcome(status, message, installed, target)
             outcome, interrupted = _install(options, current, release, uv)
-        if outcome.status == UPDATED:
-            target = mcp_install.launcher_target(str(current.launcher), os.environ)
-            checks = mcp_install.check_registrations(target, fix=True)
-            outcome = replace(
-                outcome,
-                mcp=tuple(
-                    check for check in checks if check.status in ("fixed", "fail")
-                ),
-            )
-            if outcome.mcp:
-                log.event(
-                    "update.mcp_repair",
-                    "warn"
-                    if any(check.status == "fail" for check in outcome.mcp)
-                    else "info",
-                    background=options.background,
-                    clients=outcome.mcp_results(),
+        try:
+            if outcome.status == UPDATED:
+                outcome = repair_after_update(
+                    outcome, current.launcher, options.background
                 )
-        _record(outcome, installed, seen)
+        finally:
+            _record(outcome, installed, seen, state_path)
         if interrupted:
             raise KeyboardInterrupt
         return outcome
 
 
+def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> Outcome:
+    """Keep registration errors separate from the verified install outcome."""
+    notes: list[str] = []
+    cwd = None
+    if background:
+        notes.append("background")
+    else:
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            notes.append("cwd-missing")
+    checks: list[mcp_install.RegistrationCheck] = []
+    try:
+        target = mcp_install.launcher_target(str(launcher), {})
+        checks = mcp_install.check_registrations(target, fix=True, cwd=cwd)
+    except Exception:  # noqa: BLE001 - the installation has already succeeded
+        notes.append("failed")
+    outcome = replace(
+        outcome,
+        mcp=tuple(
+            check
+            for check in checks
+            if check.status in ("fixed", "fail") or check.pinned
+        ),
+        mcp_notes=tuple(notes),
+    )
+    if outcome.mcp or notes:
+        level = (
+            "warn"
+            if "failed" in notes
+            or any(c.status in ("warn", "fail") for c in outcome.mcp)
+            else "info"
+        )
+        log.event(
+            "update.mcp_repair",
+            level,
+            background=background,
+            clients=outcome.mcp_results(),
+            notes=notes,
+        )
+    return outcome
+
+
 # Automatic updates
 
 
-def mcp_notice(results: Any) -> str:
+def mcp_notice(results: Any, notes: Any = None) -> str:
     """Summarize this update's repairs using only known client names."""
-    if not isinstance(results, list):
-        return ""
-    repaired, failed = [], []
-    for entry in results:
+    repaired, failed, pinned = [], [], []
+    for entry in results if isinstance(results, list) else []:
         if (
             not isinstance(entry, dict)
             or entry.get("client") not in mcp_install.CLIENTS
         ):
             continue
-        if entry.get("status") == "fixed":
+        if entry.get("status") == "fixed" or (
+            entry.get("status") == "warn" and entry.get("changes")
+        ):
             repaired.append(entry["client"])
-        elif entry.get("status") == "fail":
+        if entry.get("status") == "fail":
             failed.append(entry["client"])
+        elif entry.get("status") == "warn":
+            pinned.append(entry["client"])
     messages = []
     if repaired:
         messages.append(f"Repaired Sai MCP registrations for {', '.join(repaired)}.")
@@ -1100,6 +1150,14 @@ def mcp_notice(results: Any) -> str:
         messages.append(
             f"Sai MCP registrations need attention for {', '.join(failed)}."
             " Run `sai doctor` for details."
+        )
+    if pinned:
+        messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
+    if isinstance(notes, (list, tuple)):
+        messages.extend(
+            MCP_NOTES[note]
+            for note in notes
+            if isinstance(note, str) and note in MCP_NOTES
         )
     return " ".join(messages)
 
@@ -1122,7 +1180,11 @@ def notice(state: dict[str, Any], installed: str | None) -> tuple[str, str] | No
         message = (
             f"sai updated itself to {target}. Restart agent clients so they load it."
         )
-        return key, " ".join(filter(None, [message, mcp_notice(result.get("mcp"))]))
+        return key, " ".join(
+            filter(
+                None, [message, mcp_notice(result.get("mcp"), result.get("mcpNotes"))]
+            )
+        )
     if installed is not None and not update.is_newer(update.tag_for(target), installed):
         return None
     if status == AVAILABLE:

@@ -1933,7 +1933,7 @@ def update_command(
         emit(ctx, outcome.to_json())
     else:
         click.echo(outcome.message, err=outcome.exit_code != 0)
-        if notice := updater.mcp_notice(outcome.mcp_results()):
+        if notice := updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes):
             click.echo(notice)
     ctx.exit(outcome.exit_code)
 

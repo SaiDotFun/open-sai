@@ -129,7 +129,17 @@ BROKEN_WHEN_INSTALLED = (
 
 @pytest.mark.slow
 @needs_uv
-@pytest.mark.parametrize("mode", ["foreground", "json", "background", "failed"])
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "foreground",
+        "json",
+        "background",
+        "failed",
+        "deleted-cwd",
+        "deleted-cwd-relative",
+    ],
+)
 def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     home = uv_dirs / "home"
     home.mkdir()
@@ -138,7 +148,8 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     monkeypatch.setenv("CODEX_HOME", str(codex_home))
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setenv("FAKE_LOG", str(uv_dirs / "client-calls.jsonl"))
-    monkeypatch.chdir(uv_dirs)
+    project = uv_dirs / "project"
+    project.mkdir()
     config = home / ".claude.json"
     entry = {
         "command": OLD_COMMAND,
@@ -148,7 +159,26 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     other = {"url": "https://private.example/mcp", "headers": {"X-Token": SECRET}}
     original = json.dumps({"mcpServers": {"sai": entry, OTHER: other}})
     config.write_text(original)
-    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    cursor = project / ".cursor" / "mcp.json"
+    server_body = ""
+    if mode.startswith("deleted-cwd"):
+        # An installed release's import runs in the updater's neutral directory.
+        # Remove the CLI's actual cwd during post-install verification.
+        server_body = (
+            "import sys\n"
+            "from pathlib import Path\n"
+            f"project = Path({str(project)!r})\n"
+            "if 'tools' in Path(sys.prefix).parts and project.is_dir():\n"
+            "    project.rmdir()\n"
+        )
+    else:
+        (home / ".cursor").mkdir()
+        cursor.parent.mkdir()
+        cursor.write_text(original)
+    wheels = {
+        "0.1.0": build_wheel("0.1.0"),
+        "0.2.0": build_wheel("0.2.0", server_body),
+    }
     bad_hash = ("0.2.0",) if mode == "failed" else ()
     with Stub(release_routes(wheels, bad_hash=bad_hash)) as stub:
         tool = Tool(uv_dirs, stub.url)
@@ -164,9 +194,16 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             args.insert(0, "--json")
         if mode == "background":
             args.append("--background")
+        monkeypatch.chdir(project)
+        if mode == "deleted-cwd-relative":
+            monkeypatch.setenv("SAI_HOME", "../sai-home")
+            monkeypatch.setenv("SAI_LOG", "false")
         with monkeypatch.context() as runtime:
             runtime.setattr(sys, "prefix", str(tool.prefix))
             result = CliRunner().invoke(main, args, catch_exceptions=False)
+        monkeypatch.chdir(uv_dirs)
+        if mode == "deleted-cwd-relative":
+            monkeypatch.setenv("SAI_HOME", str(uv_dirs / "sai-home"))
         if mode == "failed":
             assert result.exit_code == 1
             assert config.read_text() == original
@@ -174,7 +211,7 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             return
         assert result.exit_code == 0, result.output
         assert tool.version() == "0.2.0"
-        assert json.loads(config.read_text())["mcpServers"] == {
+        expected = {
             "sai": {
                 **entry,
                 "command": str(tool.sai),
@@ -182,6 +219,19 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             },
             OTHER: other,
         }
+        assert json.loads(config.read_text())["mcpServers"] == expected
+        if mode == "background":
+            assert cursor.read_text() == original
+        elif mode.startswith("deleted-cwd"):
+            assert not project.exists()
+        else:
+            assert json.loads(cursor.read_text())["mcpServers"] == expected
+        state = updater.read_state()
+        assert state["result"]["status"] == updater.UPDATED
+        if mode == "deleted-cwd-relative":
+            assert "The working directory is gone." in result.stdout
+            assert state["result"]["mcpNotes"] == ["cwd-missing"]
+            return
         assert log.flush()
         repair = [
             event
@@ -193,8 +243,7 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         assert repair[0]["background"] is (mode == "background")
         assert repair[0]["clients"][0]["client"] == "claude"
         assert repair[0]["clients"][0]["status"] == "fixed"
-        state = updater.read_state()
-        message = "Repaired Sai MCP registrations for claude."
+        message = "Repaired Sai MCP registrations for claude"
         if mode == "background":
             assert result.output == ""
             notices: list[str] = []
@@ -203,6 +252,12 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             updater.tick(notices.append, prefix=tool.prefix)
             updater.tick(notices.append, prefix=tool.prefix)
             assert len(notices) == 1 and message in notices[0]
+            assert "sai doctor" in notices[0]
+            assert "project registrations" in notices[0]
+            assert state["result"]["mcpNotes"] == ["background"]
+        elif mode == "deleted-cwd":
+            assert "The working directory is gone." in result.stdout
+            assert state["result"]["mcpNotes"] == ["cwd-missing"]
         elif mode == "json":
             assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
         else:
