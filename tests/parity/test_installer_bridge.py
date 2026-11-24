@@ -29,6 +29,28 @@ OLD_MCP_COMMAND = "sai" + "-mcp"
 WINDOWS = os.name == "nt"
 
 
+DENY_SYSCALLS = """
+import ctypes, errno, os, sys
+syscalls, binary, *args = sys.argv[1:]
+lib = ctypes.CDLL('libseccomp.so.2')
+lib.seccomp_init.argtypes = [ctypes.c_uint32]
+lib.seccomp_init.restype = ctypes.c_void_p
+lib.seccomp_rule_add_array.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+lib.seccomp_load.argtypes = [ctypes.c_void_p]
+lib.seccomp_release.argtypes = [ctypes.c_void_p]
+ctx = lib.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
+assert ctx
+for name in syscalls.split(","):
+    syscall = lib.seccomp_syscall_resolve_name(name.encode())
+    assert syscall >= 0
+    assert lib.seccomp_rule_add_array(ctx, 0x00050000 | errno.ENOSYS, syscall, 0, None) == 0
+assert lib.seccomp_load(ctx) == 0
+lib.seccomp_release(ctx)
+os.execv(binary, [binary, *args])
+"""
+
+
 def wheel_version(wheel: Path) -> str:
     return wheel.name.split("-")[1]
 
@@ -447,8 +469,21 @@ runpy.run_path(script, run_name='__main__')
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize(
+    "recovery",
+    [
+        "public",
+        "retained",
+        pytest.param(
+            "without-links",
+            marks=pytest.mark.skipif(
+                sys.platform != "linux", reason="uses Linux seccomp"
+            ),
+        ),
+    ],
+)
 def test_native_updater_returns_a_competing_launcher_after_killed_reinstall(
-    install: Install, replay: Replay
+    install: Install, replay: Replay, recovery: str
 ) -> None:
     native_artifact(replay, "RECOVERY_RUST")
     ok(install.install(replay, "--native"))
@@ -483,7 +518,28 @@ runpy.run_path(script, run_name='__main__')
         replay.base,
     )
     assert result.returncode == -9, (result.stdout, result.stderr)
-    result = install.update(replay)
+    recovery_command: list[str | Path] = [install.launcher]
+    if recovery == "retained":
+        # Rehearse a second interruption after recovery withdrew its own entry.
+        recovery_command = [install.launcher.resolve(strict=True)]
+        install.launcher.rename(pending(install).parent / ".launcher-switch" / "public")
+    elif recovery == "without-links":
+        recovery_command = [
+            sys.executable,
+            "-c",
+            DENY_SYSCALLS,
+            "link,linkat",
+            install.launcher,
+        ]
+    result = install.run(
+        *recovery_command,
+        "--json",
+        "update",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
     assert "launcher changed during the switch" in (result.stdout + result.stderr)
     assert os.path.samestat(install.launcher.lstat(), expected)
     assert install.launcher.readlink() == external
@@ -653,29 +709,12 @@ def test_standalone_rolls_back_without_rename_noreplace(
 ) -> None:
     native_artifact(replay, "MUTANT")
     # Simulate a kernel without renameat2 without replacing any installer code.
-    probe = """
-import ctypes, errno, runpy, sys
-lib = ctypes.CDLL('libseccomp.so.2')
-lib.seccomp_init.argtypes = [ctypes.c_uint32]
-lib.seccomp_init.restype = ctypes.c_void_p
-lib.seccomp_rule_add_array.argtypes = [
-    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
-lib.seccomp_load.argtypes = [ctypes.c_void_p]
-lib.seccomp_release.argtypes = [ctypes.c_void_p]
-ctx = lib.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
-assert ctx
-syscall = lib.seccomp_syscall_resolve_name(b'renameat2')
-assert syscall >= 0
-assert lib.seccomp_rule_add_array(ctx, 0x00050000 | errno.ENOSYS, syscall, 0, None) == 0
-assert lib.seccomp_load(ctx) == 0
-lib.seccomp_release(ctx)
-sys.argv = sys.argv[1:]
-runpy.run_path(sys.argv[0], run_name='__main__')
-"""
     result = install.run(
         sys.executable,
         "-c",
-        probe,
+        DENY_SYSCALLS,
+        "renameat2",
+        sys.executable,
         INSTALLER,
         "--native",
         "--api-base",
