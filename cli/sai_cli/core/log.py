@@ -1324,10 +1324,49 @@ def _redact_retained_urls(value: Any, *, argument: bool = False) -> Any:
     return value
 
 
+def _redact_retained_endpoint_args(line: dict[str, Any]) -> None:
+    argv = line.get("argv")
+    if not isinstance(argv, list):
+        return
+    from . import settings
+
+    endpoints = {spec.key for spec in settings.SETTINGS if spec.kind == "url"}
+    flags = {spec.flag for spec in settings.SETTINGS if spec.key in endpoints}
+    operands: list[int] = []
+    index = 0
+    options = True
+    while index < len(argv):
+        arg = argv[index]
+        if not isinstance(arg, str):
+            index += 1
+            continue
+        flag, equals, value = arg.partition("=")
+        if options and flag in flags:
+            if equals:
+                argv[index] = flag + "=" + origin(value)
+            elif index + 1 < len(argv) and isinstance(argv[index + 1], str):
+                index += 1
+                argv[index] = origin(argv[index])
+        elif options and arg == "--":
+            options = False
+        elif options and flag in ("--as", "--as-addr"):
+            index += not equals
+        elif not options or not arg.startswith("-") or len(operands) >= 3:
+            operands.append(index)
+        index += 1
+
+    if len(operands) >= 3:
+        group, action, key = (argv[index] for index in operands[:3])
+        if group == "config" and action in ("set", "get") and key in endpoints:
+            for index in operands[3:]:
+                argv[index] = origin(argv[index])
+
+
 def decode_row(raw: bytes) -> Any:
     line = json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
     if not isinstance(line, dict):
         return line
+    _redact_retained_endpoint_args(line)
     # Preserve the placeholder for malformed top-level endpoint fields.
     for field in ("endpoint", "keeper", "websocket", "lcd"):
         if (value := line.get(field)) is not None and not isinstance(value, str):

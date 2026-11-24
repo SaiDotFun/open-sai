@@ -3886,6 +3886,80 @@ def test_logs_tail_redacts_retained_urls_in_arguments_and_free_text(home):
     assert path.read_bytes() == raw
 
 
+@pytest.mark.parametrize(
+    "key,flag,action,value,shown",
+    [
+        (
+            "keeper.endpoint",
+            "--endpoint",
+            "set",
+            "keeper.example/private?key=hidden",
+            log.REDACTED_URL,
+        ),
+        (
+            "keeper.ws_endpoint",
+            "--ws-endpoint",
+            "set",
+            "wss:/keeper.example/private?key=hidden",
+            log.REDACTED_URL,
+        ),
+        (
+            "keeper.endpoint",
+            "--endpoint",
+            "set",
+            "-fixture.invalid/private?key=hidden",
+            log.REDACTED_URL,
+        ),
+        (
+            "lcd.endpoint",
+            "--lcd-endpoint",
+            "get",
+            "https://lcd.example:8443/private?key=hidden",
+            "https://lcd.example:8443",
+        ),
+    ],
+)
+def test_logs_tail_redacts_retained_config_endpoint_values(
+    home, key, flag, action, value, shown
+):
+    path = old_file(home / "logs", "cli", 1)
+    separator = ["--"] if action == "get" else []
+    row = {
+        "event": "command.start",
+        "command": f"config {action}",
+        "ts": log.stamp(log.now() - timedelta(days=1)),
+        "argv": [
+            flag,
+            value,
+            f"{flag}={value}",
+            "config",
+            action,
+            *separator,
+            key,
+            value,
+        ],
+    }
+    raw = log.encode(row)
+    path.write_bytes(raw)
+    for flags in ((), ("--json",)):
+        code, output = run_cli(*flags, "logs", "tail")
+        assert code == 0 and "/private" not in output and "key=hidden" not in output
+        if flags:
+            assert json.loads(output)["argv"] == [
+                flag,
+                shown,
+                f"{flag}={shown}",
+                "config",
+                action,
+                *separator,
+                key,
+                shown,
+            ]
+        else:
+            assert shown in output
+    assert path.read_bytes() == raw
+
+
 def test_logs_tail_reads_from_the_end_of_large_files(home):
     """Tail finds the newest events by reading backwards in chunks, so
     lines split across chunks, bad lines, and a missing final newline all
