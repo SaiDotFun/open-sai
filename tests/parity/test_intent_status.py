@@ -26,6 +26,7 @@ from typing import Any
 import pytest
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
 from sai_cli.core import keeper, log, storage
 from sai_cli.mcp_server.tools import _reconcile_fields
 
@@ -1133,6 +1134,71 @@ def test_local_neutral_intermediate_completes_leaf_only_chain(
     trust = ca_store_overrides(
         tmp_path, store, certs / "other-ca.pem", tmp_path / "neutral.pem"
     )
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
+
+
+@pytest.fixture(scope="module")
+def same_name_intermediates(
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+) -> list[bytes]:
+    _, certs = keeper_cross_signed_ca
+    issuer = x509.load_pem_x509_certificate((certs / "cross-signed.pem").read_bytes())
+    root_key = serialization.load_pem_private_key(
+        (certs / "other-ca.key").read_bytes(), None
+    )
+    assert isinstance(root_key, ec.EllipticCurvePrivateKey)
+    decoys = []
+    for serial in range(2, 82):
+        public_key = ec.generate_private_key(ec.SECP256R1()).public_key()
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(issuer.subject)
+            .issuer_name(issuer.issuer)
+            .not_valid_before(issuer.not_valid_before_utc)
+            .not_valid_after(issuer.not_valid_after_utc)
+            .serial_number(serial)
+            .public_key(public_key)
+        )
+        for extension in issuer.extensions:
+            value = extension.value
+            if isinstance(value, x509.SubjectKeyIdentifier):
+                value = x509.SubjectKeyIdentifier.from_public_key(public_key)
+            builder = builder.add_extension(value, extension.critical)
+        decoy = builder.sign(root_key, hashes.SHA256())
+        decoys.append(decoy.public_bytes(serialization.Encoding.PEM))
+    return [*decoys, issuer.public_bytes(serialization.Encoding.PEM)]
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize("matching_issuer_first", [True, False])
+def test_matching_local_issuer_works_in_any_order(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    same_name_intermediates: list[bytes],
+    store: str,
+    matching_issuer_first: bool,
+) -> None:
+    context, certs = keeper_certificate
+    root = certs / "other-ca.pem"
+    candidates = same_name_intermediates
+    if matching_issuer_first:
+        candidates = [candidates[-1], *candidates[:-1]]
+    if store == "file":
+        bundle = tmp_path / "bundle.pem"
+        bundle.write_bytes(root.read_bytes() + b"".join(candidates))
+        trust = {"SSL_CERT_FILE": str(bundle)}
+    else:
+        hashed = tmp_path / "hashed"
+        hashed.mkdir()
+        shutil.copyfile(root, hashed / "root.pem")
+        openssl_in(hashed, "rehash", ".")
+        issuer_hash = openssl_in(
+            certs, "x509", "-in", "cross-signed.pem", "-noout", "-subject_hash"
+        ).strip()
+        for index, certificate in enumerate(candidates):
+            (hashed / f"{issuer_hash}.{index}").write_bytes(certificate)
+        trust = {"SSL_CERT_DIR": str(hashed)}
     assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
 
 

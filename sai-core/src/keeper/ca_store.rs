@@ -1,6 +1,11 @@
 //! Build a Rustls trust store from the CA files and OpenSSL trust policies.
 
-use std::{collections::HashSet, sync::Arc};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    sync::Arc,
+};
+
+use der::{Decode, asn1::OctetString};
 
 use rustls::{
     CertificateError, ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
@@ -11,7 +16,11 @@ use rustls::{
     crypto::CryptoProvider,
     pki_types::{CertificateDer, ServerName, UnixTime},
 };
-use x509_cert::time::Validity;
+use x509_cert::{
+    Certificate,
+    ext::pkix::{AuthorityKeyIdentifier, SubjectKeyIdentifier},
+    time::Validity,
+};
 
 use super::ca_pem::{CaCertificate, ServerTrust};
 
@@ -144,6 +153,54 @@ impl StoreVerifier {
     }
 }
 
+fn issuer_key_ids(cert: &CertificateDer<'_>) -> (Option<OctetString>, Option<OctetString>) {
+    let Ok(cert) = Certificate::from_der(cert) else {
+        return (None, None);
+    };
+    let tbs = cert.tbs_certificate;
+    let subject = tbs
+        .get::<SubjectKeyIdentifier>()
+        .ok()
+        .flatten()
+        .map(|(_, id)| id.0);
+    let authority = tbs
+        .get::<AuthorityKeyIdentifier>()
+        .ok()
+        .flatten()
+        .and_then(|(_, id)| id.key_identifier);
+    (subject, authority)
+}
+
+fn prioritize_issuers<'a>(
+    leaf: &CertificateDer<'_>,
+    candidates: impl Iterator<Item = CertificateDer<'a>>,
+) -> Vec<CertificateDer<'a>> {
+    let mut by_subject_key = BTreeMap::<_, Vec<_>>::new();
+    let mut candidates: Vec<_> = candidates
+        .enumerate()
+        .map(|(index, cert)| {
+            let (subject, authority) = issuer_key_ids(&cert);
+            if let Some(subject) = subject {
+                by_subject_key.entry(subject).or_default().push(index);
+            }
+            (Some(cert), authority)
+        })
+        .collect();
+    let mut ordered = Vec::with_capacity(candidates.len());
+    let mut authority_keys: VecDeque<_> = issuer_key_ids(leaf).1.into_iter().collect();
+    // WebPKI tries candidates by name and caps signature checks. Give it the
+    // key-ID matches along the leaf's chain first, with other candidates as fallback.
+    while let Some(key) = authority_keys.pop_front() {
+        for index in by_subject_key.remove(&key).into_iter().flatten() {
+            let (cert, issuer_key) = &mut candidates[index];
+            ordered.extend(cert.take());
+            authority_keys.extend(issuer_key.take());
+        }
+    }
+    ordered.extend(candidates.into_iter().filter_map(|(cert, _)| cert));
+    ordered
+}
+
 impl ServerCertVerifier for StoreVerifier {
     fn verify_server_cert(
         &self,
@@ -157,12 +214,14 @@ impl ServerCertVerifier for StoreVerifier {
             return Err(CertificateError::ApplicationVerificationFailure.into());
         }
         // A peer may send a rejected CA as an intermediate under a trusted root.
-        let intermediates: Vec<_> = intermediates
-            .iter()
-            .filter(|cert| !self.rejected.contains(*cert))
-            .chain(&self.intermediates)
-            .cloned()
-            .collect();
+        let intermediates = prioritize_issuers(
+            end_entity,
+            intermediates
+                .iter()
+                .filter(|cert| !self.rejected.contains(*cert))
+                .chain(&self.intermediates)
+                .cloned(),
+        );
         self.verifier_at(now)?.verify_server_cert(
             end_entity,
             &intermediates,
