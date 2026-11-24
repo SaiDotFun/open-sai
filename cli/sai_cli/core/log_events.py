@@ -179,6 +179,7 @@ EVENTS = {
             "error": "string",
             "httpStatus": "integer",
             "keeperErrors": "object[]",
+            "keeperErrorCount": "integer",
         },
     ),
     "log.dropped": Event("core.log._write", ("warn",), {"count": "integer"}),
