@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,11 @@ else:
         "type": "stdio", "command": command[0], "args": command[1:], "env": env
     }
 path.write_text(json.dumps(data))
+if args[1] == "add" and (marker := os.environ.get("FAKE_ADD_INTERRUPT")):
+    import signal
+
+    Path(marker).write_text(json.dumps(servers[name]))
+    os.kill(os.getppid(), signal.SIGINT)
 """
 
 FAKE_CODEX = """
@@ -249,7 +255,7 @@ def test_doctor_repairs_recognized_registrations_in_all_clients(
     entry = {
         "command": command,
         "args": args,
-        "env": {"SAI_HOME": str(env.root / "other-profile"), "CUSTOM": SECRET},
+        "env": {"SAI_HOME": str(env.root / "sai-home"), "CUSTOM": SECRET},
         "enabled_tools": ["market_list"],
     }
     unrelated = write_doctor_entries(env, name, entry)
@@ -295,7 +301,7 @@ def test_doctor_repairs_recognized_registrations_in_all_clients(
     assert log.flush()
     output = report.output + result.output
     output += "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
-    for private_value in (SECRET, OTHER, "private.example", "other-profile"):
+    for private_value in (SECRET, OTHER, "private.example"):
         assert private_value not in output
 
 
@@ -325,6 +331,79 @@ def test_doctor_restores_original_entry_when_add_fails(
     assert all(SECRET not in " ".join(call) for call in calls)
     for private_value in (SECRET, OTHER, "private.example"):
         assert private_value not in result.output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX signal delivery")
+def test_claude_repair_publishes_profile_in_add_and_restores_on_interrupt(
+    env: Env, monkeypatch
+):
+    marker = env.root / "published-entry.json"
+    monkeypatch.setenv("FAKE_ADD_INTERRUPT", str(marker))
+    monkeypatch.setenv("SAI_HOME", str(env.root / "current-profile"))
+    pinned_home = str(env.root / "private-pinned-profile=v1")
+    entry = claude_entry(
+        [OLD_COMMAND, "--endpoint", "https://private.example/" + SECRET],
+        {"SAI_HOME": pinned_home, "CUSTOM": SECRET},
+    )
+    original = {"mcpServers": {"sai": entry, OTHER: {"command": "untouched"}}}
+    (env.home / ".claude.json").write_text(json.dumps(original))
+
+    result = subprocess.run(
+        [sys.executable, "-m", "sai_cli", "doctor", "--offline"],
+        check=False,
+        capture_output=True,
+        text=True,
+        cwd=env.project,
+        timeout=15,
+    )
+
+    assert result.returncode != 0
+    published = json.loads(marker.read_text())
+    assert published["command"] == str(env.sai)
+    assert published["env"] == {"SAI_HOME": pinned_home}
+    assert env.claude_json() == original
+    output = result.stdout + result.stderr
+    assert pinned_home not in output and SECRET not in output and OTHER not in output
+
+
+@pytest.mark.parametrize(
+    ("expected", "actual", "status"),
+    [
+        (None, None, "pass"),
+        ("current", "current", "pass"),
+        ("current", None, "warn"),
+        (None, "different", "warn"),
+        ("current", "different", "warn"),
+        (None, "", "warn"),
+        (None, 17, "warn"),
+    ],
+)
+def test_doctor_compares_sai_home_without_printing_or_rewriting_it(
+    env: Env,
+    monkeypatch,
+    expected,
+    actual,
+    status,
+):
+    profiles = {
+        "current": str(env.root / "current-profile"),
+        "different": str(env.root / "private-pinned-profile"),
+    }
+    if expected is not None:
+        monkeypatch.setenv("SAI_HOME", profiles[expected])
+    variables = {} if actual is None else {"SAI_HOME": profiles.get(actual, actual)}
+    path = env.home / ".claude.json"
+    original = json.dumps({"mcpServers": {"sai": claude_entry(serve(env), variables)}})
+    path.write_text(original)
+
+    result = invoke("doctor", "--offline")
+
+    check = mcp_checks(result)["claude"]
+    assert check["status"] == status
+    assert ("SAI_HOME" in check["summary"]) == (status == "warn")
+    assert profiles["different"] not in result.output
+    assert profiles["current"] not in json.dumps(check)
+    assert path.read_text() == original
 
 
 def test_doctor_warns_for_absent_entries_and_leaves_custom_entries_alone(env: Env):
@@ -357,6 +436,14 @@ def test_doctor_warns_for_absent_entries_and_leaves_custom_entries_alone(env: En
         (["mcp", "serve", "--endpoint=invalid-value"], "fail"),
         (["--endpoint=https://example.invalid", "mcp", "serve"], "pass"),
         (["mcp", "serve", "--endpoint", "https://example.invalid"], "pass"),
+        (["--json", "mcp", "serve"], "pass"),
+        (["--json", "--endpoint", "https://example.invalid", "mcp", "serve"], "pass"),
+        (["--as", "another-account", "--json", "mcp", "serve"], "pass"),
+        (["--json", "--version", "mcp", "serve"], "fail"),
+        (["--json", "--help", "mcp", "serve"], "fail"),
+        (["--json", "--", "mcp", "--", "serve", "--"], "pass"),
+        (["mcp", "serve", "--json"], "fail"),
+        (["--json=true", "mcp", "serve"], "fail"),
     ],
 )
 def test_doctor_validates_the_full_server_command(
@@ -465,6 +552,52 @@ def test_codex_install_keeps_an_inline_servers_table(env: Env):
     assert tomlkit.parse(updated)["mcp_servers"]["sai"]["command"] == str(env.sai)
     assert invoke("mcp", "uninstall", "codex").exit_code == 0
     assert env.codex_path().read_text() == source
+
+
+@pytest.mark.parametrize(
+    "layout", ["inline-child", "outer-inline", "dotted-child", "root-dotted"]
+)
+def test_doctor_renames_codex_inline_and_dotted_registrations(env: Env, layout: str):
+    other = f'"{OTHER}"  = {{command = "outer", enabled_tools = []}}'
+    old = f'"{OLD_COMMAND}"'
+    entry = f'{{command = "{OLD_COMMAND}", env = {{CUSTOM = "{SECRET}"}}, enabled_tools = []}}'
+    if layout == "inline-child":
+        source = f"[mcp_servers]\n{other} # keep this\n{old} = {entry}\n"
+        untouched = f"{other} # keep this\n"
+    elif layout == "outer-inline":
+        source = f"mcp_servers = {{ {other}, {old} = {entry} }} # keep this\n"
+        untouched = other
+    else:
+        prefix = "mcp_servers." if layout == "root-dotted" else ""
+        header = "" if prefix else "[mcp_servers]\n"
+        unrelated = f'{prefix}"{OTHER}".enabled_tools  =  [] # keep this\n'
+        source = (
+            f'{header}{prefix}"{OTHER}".command = "outer"\n'
+            f'{prefix}{old}.command = "{OLD_COMMAND}"\n'
+            f"{unrelated}"
+            f'{prefix}{old}.env.CUSTOM = "{SECRET}"\n'
+            f"{prefix}{old}.enabled_tools = []\n"
+        )
+        untouched = unrelated
+    env.codex_path().write_text(source)
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 0, result.output
+    assert mcp_checks(result)["codex"]["status"] == "fixed"
+    updated = env.codex_path().read_text()
+    assert untouched in updated
+    parsed = tomlkit.parse(updated).unwrap()["mcp_servers"]
+    assert parsed == {
+        OTHER: {"command": "outer", "enabled_tools": []},
+        "sai": {
+            "command": str(env.sai),
+            "args": ["mcp", "serve"],
+            "env": {"CUSTOM": SECRET},
+            "enabled_tools": [],
+        },
+    }
+    assert SECRET not in result.output and OTHER not in result.output
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks and modes")

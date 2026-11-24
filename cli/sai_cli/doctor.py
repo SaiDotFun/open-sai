@@ -174,7 +174,7 @@ def check_mcp(ctx: Context) -> list[Check]:
             changes=list(result.changes),
         )
         for result in mcp_install.check_registrations(
-            target, fix=ctx.fix, cwd=Path.cwd()
+            target, fix=ctx.fix, cwd=Path.cwd(), compare_profile=True
         )
     ]
 

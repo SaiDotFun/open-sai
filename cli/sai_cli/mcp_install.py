@@ -28,7 +28,7 @@ from typing import Any
 
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
-from tomlkit.items import InlineTable
+from tomlkit.items import InlineTable, Table
 
 from .core import settings
 
@@ -81,6 +81,7 @@ class Registration:
     # Hash of the whole entry (env values, URL, and all), so two entries can
     # be compared without keeping or printing their values.
     fingerprint: str = ""
+    invalid_sai_home: bool = False
 
     def shown(self, target: Target | None) -> dict[str, Any]:
         """The argv to print: in full only when it is the expected command.
@@ -100,11 +101,14 @@ class Registration:
     def matches(self, target: Target) -> bool:
         return (
             self.argv == target.argv
-            and self.sai_home == target.env.get("SAI_HOME")
+            and self.matches_sai_home(target.env)
             and not self.stale_env
             and not self.extra_settings
             and not self.disabled
         )
+
+    def matches_sai_home(self, env: Mapping[str, str]) -> bool:
+        return not self.invalid_sai_home and self.sai_home == env.get("SAI_HOME")
 
     def to_json(self, target: Target | None, effective: bool) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -341,6 +345,7 @@ def entry_registration(
         disabled,
         extra_settings,
         fingerprint,
+        invalid_sai_home="SAI_HOME" in env and not isinstance(home, str),
     )
 
 
@@ -873,29 +878,39 @@ class StaleRegistration:
     launcher: str | None = None  # Retain a working absolute launcher.
 
 
-def after_endpoint_flags(args: list[str]) -> list[str]:
-    """Consume the endpoint options accepted around `mcp serve`."""
+def after_server_options(args: list[str], *, root: bool = False) -> list[str] | None:
+    """Consume options that leave the server command running."""
     index = 0
     while index < len(args):
         flag, equals, value = args[index].partition("=")
+        if args[index] == "--":
+            return args[index + 1 :]
+        if root and args[index] == "--json":
+            index += 1
+            continue
         key = ENDPOINT_FLAGS.get(flag)
-        if key is None:
+        if key is None and not (root and flag == "--as"):
             break
         if not equals:
             index += 1
-            value = args[index] if index < len(args) else ""
-        try:
-            settings.parse_value(key, value)
-        except settings.SettingsError:
-            # Keep the invalid flag in the unconsumed arguments.
-            return args
+            if index == len(args):
+                return None
+            value = args[index]
+        if key is not None:
+            try:
+                settings.parse_value(key, value)
+            except settings.SettingsError:
+                return None
         index += 1
     return args[index:]
 
 
 def serves_mcp(args: list[str]) -> bool:
-    command = after_endpoint_flags(args)
-    return command[:2] == ["mcp", "serve"] and not after_endpoint_flags(command[2:])
+    command = after_server_options(args, root=True)
+    if not command or command[0] != "mcp":
+        return False
+    command = command[2:] if command[1:2] == ["--"] else command[1:]
+    return command[:1] == ["serve"] and after_server_options(command[1:]) == []
 
 
 def stale_registration(
@@ -1042,6 +1057,10 @@ def edit_codex_source(
         return doc.as_string()
     # Appending a new header to the original text leaves root-level dotted
     # keys in place. Inserting a header through the AST can capture them.
+    if not isinstance(entry, Table) or entry.is_super_table():
+        # Dotted keys and inline entries attached to an ordinary parent can
+        # render a second [mcp_servers] header unless the child has its own.
+        entry = tomlkit.item(dict(entry))
     table = tomlkit.table(is_super_table=True)
     table[NAME] = entry
     addition = tomlkit.document()
@@ -1135,8 +1154,9 @@ def placeholder_entry(entry: Any, target: Target) -> bool:
         and entry.get("args") == target.argv[1:]
         and entry.get("type", "stdio") == "stdio"
         and entry.get("enabled", True) is True
+        and (entry.get("env") or {}) == target.env
         and all(
-            key in ("command", "args", "type", "enabled") or not entry[key]
+            key in ("command", "args", "type", "enabled", "env") or not entry[key]
             for key in entry
         )
     )
@@ -1211,9 +1231,13 @@ def replace_registration(
         ):
             raise ClientError("The Sai registration changed concurrently")
         return
-    # CLI arguments contain only the stable launcher. Existing args and
-    # settings can hold credentials and are copied directly within the file.
-    placeholder = Target([launcher, "mcp", "serve"])
+    # Publish the original profile with the launcher. Other args and env
+    # can hold credentials, so copy them directly into the file.
+    original_env = original.get("env")
+    home = original_env.get("SAI_HOME") if isinstance(original_env, Mapping) else None
+    placeholder = Target(
+        [launcher, "mcp", "serve"], {"SAI_HOME": home} if isinstance(home, str) else {}
+    )
     steps = replacement_steps(client, scope, placeholder, name)
     if read_bytes(path) != config.seen:
         raise ClientError("The Sai registration changed concurrently")
@@ -1231,7 +1255,7 @@ def replace_registration(
 
 
 def check_registration(
-    client: Client, target: Target | None, *, fix: bool
+    client: Client, target: Target | None, *, fix: bool, compare_profile: bool
 ) -> RegistrationCheck:
     """Inspect recognized Sai registrations without exposing client data."""
     name = client.name
@@ -1256,6 +1280,10 @@ def check_registration(
     if not found:
         return RegistrationCheck(name, "warn", "Sai is not registered", install)
     stale = [issue for _, issue in inspected if issue is not None]
+    expected_env = server_env(client.environ) if compare_profile else {}
+    different_profile = compare_profile and any(
+        not reg.matches_sai_home(expected_env) for reg, _ in inspected
+    )
     pinned = target is not None and any(
         reg.argv
         and Path(reg.argv[0]).is_absolute()
@@ -1314,13 +1342,19 @@ def check_registration(
     if failures:
         summary, hint = failures[0]
         return RegistrationCheck(name, "fail", summary, hint, tuple(changes))
-    if pinned:
+    if pinned or different_profile:
+        warnings = []
+        if pinned:
+            warnings.append("Sai uses a pinned launcher from a different install")
+        if different_profile:
+            warnings.append("Sai registration has a different SAI_HOME setting")
         return RegistrationCheck(
             name,
             "warn",
-            "Sai uses a pinned launcher from a different install",
+            ". ".join(warnings),
+            "Check SAI_HOME in the client registration" if different_profile else None,
             changes=tuple(changes),
-            pinned=True,
+            pinned=pinned,
         )
     if not changes:
         return RegistrationCheck(name, "pass", "Sai registration is current")
@@ -1330,12 +1364,12 @@ def check_registration(
 
 
 def check_registrations(
-    target: Target | None, *, fix: bool, cwd: Path | None
+    target: Target | None, *, fix: bool, cwd: Path | None, compare_profile: bool = False
 ) -> list[RegistrationCheck]:
     """Report only for detected clients, without running any registered server."""
     clients = make_clients(Path.home(), os.environ, cwd)
     return [
-        check_registration(client, target, fix=fix)
+        check_registration(client, target, fix=fix, compare_profile=compare_profile)
         for client in clients.values()
         if client.detected()[0]
     ]

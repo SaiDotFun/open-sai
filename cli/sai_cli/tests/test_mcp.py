@@ -1338,7 +1338,8 @@ def rpc(message_id: int | None, method: str, params: dict[str, Any]) -> str:
     return json.dumps(message) + "\n"
 
 
-def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path):
+@pytest.mark.parametrize("global_flags", [[], ["--json", "--as", "another-account"]])
+def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     """initialize and tools/list over a real `sai mcp serve` process; every
     stdout line is a JSON-RPC message."""
     initialize = {
@@ -1346,7 +1347,14 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path):
         "capabilities": {},
         "clientInfo": {"name": "test", "version": "0"},
     }
-    command = [*sai_command(), "mcp", "serve", "--endpoint", "http://127.0.0.1:9/query"]
+    command = [
+        *sai_command(),
+        *global_flags,
+        "mcp",
+        "serve",
+        "--endpoint",
+        "http://127.0.0.1:9/query",
+    ]
     with subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
