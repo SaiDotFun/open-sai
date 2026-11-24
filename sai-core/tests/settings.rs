@@ -279,3 +279,98 @@ fn adding_to_an_explicit_table_keeps_its_subtable_separate() {
         );
     }
 }
+
+#[test]
+fn repairs_dotted_assignments_inside_an_explicit_section() {
+    let home = tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let new = json!("https://new.example");
+    let key = Key::KeeperEndpoint;
+
+    fs::write(&path, "[keeper]\nendpoint.a = 1").unwrap();
+    settings::set(&path, key, &new).unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[keeper]\nendpoint = \"https://new.example\"\n",
+    );
+    fs::write(&path, "[keeper]\nendpoint.a = 1").unwrap();
+    assert!(settings::unset(&path, key).unwrap());
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[keeper]\n# endpoint = \"https://sai-keeper.nibiru.fi/query\"\n",
+    );
+
+    let input = "[keeper]\nendpoint.a = 1\nws_endpoint = \"wss://old.example\"\nendpoint.b = [\n  2,\n]\n# lcd note\n[lcd]\nendpoint = \"https://lcd.example\"\n";
+    fs::write(&path, input).unwrap();
+    settings::set(&path, key, &new).unwrap();
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[keeper]\nws_endpoint = \"wss://old.example\"\n# lcd note\nendpoint = \"https://new.example\"\n[lcd]\nendpoint = \"https://lcd.example\"\n",
+    );
+    fs::write(&path, input).unwrap();
+    assert!(settings::unset(&path, key).unwrap());
+    assert_eq!(
+        fs::read_to_string(&path).unwrap(),
+        "[keeper]\n# endpoint = \"https://sai-keeper.nibiru.fi/query\"\nws_endpoint = \"wss://old.example\"\n# lcd note\n[lcd]\nendpoint = \"https://lcd.example\"\n",
+    );
+}
+
+#[test]
+fn editing_any_registry_key_preserves_other_tables_byte_for_byte() {
+    let home = tempdir().unwrap();
+    let path = home.path().join("config.toml");
+    let before = "[future.first]\n# first\nlist = [\n  1,\n]\n\n";
+    let between = "[future.middle]\n# middle café\nother.key = { keep = true }\n\n";
+    let after = "[[future.last]] # last\nother = '''\n# keep verbatim\n'''\n";
+    for key in KEYS {
+        let (section, name) = key.spec().name.split_once('.').unwrap();
+        let raw = match key {
+            Key::KeeperEndpoint | Key::LcdEndpoint => "https://new.example",
+            Key::KeeperWsEndpoint => "wss://new.example",
+            Key::UpdateAuto | Key::LogsEnabled => "false",
+            Key::LogsKeepDays => "7",
+        };
+        let value = key.parse_value(raw).unwrap();
+        for shape in [
+            String::new(),
+            format!("# {name} = false\n"),
+            format!("{name} = 2  # keep note\n"),
+            format!("{name} = {{ nested = 2 }}\n"),
+            format!("{name}.a.b = 1\nother = true\n\"{name}\".c = [\n  2,\n]\n"),
+            format!("[{section}.{name}] # invalid setting\na = 1\n"),
+            format!("[[{section}.{name}]]\na = 1\n"),
+        ] {
+            for newline in ["\n", "\r\n"] {
+                let nested = format!("[{section}.{name}.tail]\nx = 1\n");
+                let nested = if shape.starts_with('[') {
+                    nested.as_str()
+                } else {
+                    ""
+                };
+                let input = format!("{before}[{section}]\n{shape}{between}{nested}{after}")
+                    .replace('\n', newline);
+                for unset in [false, true] {
+                    fs::write(&path, &input).unwrap();
+                    if unset {
+                        settings::unset(&path, key).unwrap();
+                    } else {
+                        settings::set(&path, key, &value).unwrap();
+                    }
+                    let actual = fs::read_to_string(&path).unwrap();
+                    assert!(
+                        actual.starts_with(&before.replace('\n', newline)),
+                        "{input:?} => {actual:?}"
+                    );
+                    assert!(
+                        actual.contains(&between.replace('\n', newline)),
+                        "{input:?} => {actual:?}"
+                    );
+                    assert!(
+                        actual.ends_with(&after.replace('\n', newline)),
+                        "{input:?} => {actual:?}"
+                    );
+                }
+            }
+        }
+    }
+}

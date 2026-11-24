@@ -1,4 +1,4 @@
-use std::{fmt::Write as _, io};
+use std::{fmt::Write as _, io, path::Path};
 
 use clap::Subcommand;
 use sai_core::settings::{self, Environment, Flags, KEYS, Key, Settings, SettingsError};
@@ -21,10 +21,11 @@ impl ConfigCommand {
     pub fn run(self, flags: &Flags, env: &Environment, json: bool) -> Result<(), Error> {
         let path = env.path();
         let path = path.as_path();
+        let json_path = json.then(|| format_path_json(path));
         match self {
             Self::List => {
                 let resolved = load(flags, env)?;
-                if json {
+                if let Some(path) = json_path {
                     let entries: Map<String, Value> = KEYS
                         .into_iter()
                         .map(|key| {
@@ -41,8 +42,8 @@ impl ConfigCommand {
                         })
                         .collect();
                     println!(
-                        "{}",
-                        format_json(&json!({"path": path, "settings": entries}))
+                        "{{\"path\": {path}, \"settings\": {}}}",
+                        format_json(&Value::Object(entries))
                     );
                 } else {
                     println!("# {}", path.display());
@@ -79,10 +80,11 @@ impl ConfigCommand {
                     Error::usage(format!("{error}. Valid keys: {}", settings::valid_keys()))
                 })?;
                 settings::set(path, key, &value).map_err(Error::settings)?;
-                if json {
+                if let Some(path) = json_path {
                     println!(
-                        "{}",
-                        format_json(&json!({"key": key.spec().name, "value": value, "path": path}))
+                        "{{\"key\": {}, \"value\": {}, \"path\": {path}}}",
+                        format_json(&json!(key.spec().name)),
+                        format_json(&value)
                     );
                 } else {
                     println!("Set {} in {}", key.spec().name, path.display());
@@ -92,12 +94,10 @@ impl ConfigCommand {
             Self::Unset { key } => {
                 let key = parse_key(&key)?;
                 let removed = settings::unset(path, key).map_err(Error::settings)?;
-                if json {
+                if let Some(path) = json_path {
                     println!(
-                        "{}",
-                        format_json(
-                            &json!({"key": key.spec().name, "removed": removed, "path": path})
-                        )
+                        "{{\"key\": {}, \"removed\": {removed}, \"path\": {path}}}",
+                        format_json(&json!(key.spec().name))
                     );
                 } else {
                     let verb = if removed { "Unset" } else { "Already unset:" };
@@ -123,7 +123,7 @@ fn load(flags: &Flags, env: &Environment) -> Result<Settings, Error> {
 }
 
 fn warn_override(env: &Environment, key: Key) {
-    if env.value(key).is_some() {
+    if env.is_set(key) {
         let spec = key.spec();
         eprintln!(
             "Warning: {} is set and overrides {} in the file",
@@ -265,4 +265,28 @@ fn format_json(value: &Value) -> String {
         }
     }
     escaped
+}
+
+#[cfg(unix)]
+fn format_path_json(path: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    // Python decodes filesystem bytes with surrogateescape. U+DC80 through
+    // U+DCFF must go straight to JSON escapes because Rust strings cannot
+    // represent them.
+    let mut escaped = String::from("\"");
+    for chunk in path.as_os_str().as_bytes().utf8_chunks() {
+        let valid = format_json(&json!(chunk.valid()));
+        escaped.push_str(&valid[1..valid.len() - 1]);
+        for &byte in chunk.invalid() {
+            let _ = write!(escaped, "\\udc{byte:02x}");
+        }
+    }
+    escaped.push('"');
+    escaped
+}
+
+#[cfg(not(unix))]
+fn format_path_json(path: &Path) -> String {
+    format_json(&json!(path.to_string_lossy()))
 }

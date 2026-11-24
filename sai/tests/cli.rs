@@ -340,3 +340,136 @@ fn nested_cli_usage_stays_on_stderr() {
     assert!(output.stdout.is_empty());
     assert_eq!(output.stderr, b"Usage: sai config list [OPTIONS]\nTry 'sai config list --help' for help.\n\nError: Got unexpected extra arguments (extra second)\n");
 }
+
+#[cfg(unix)]
+#[test]
+fn json_config_escapes_non_utf8_home_bytes_like_python() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let temp = tempdir().unwrap();
+    let home = temp
+        .path()
+        .join(OsStr::from_bytes(b"home-\xff-\xe2\x82-\xc3\xa9-\"-\\"));
+    let suffix = r#"home-\udcff-\udce2\udc82-\u00e9-\"-\\/config.toml"#;
+    for (command, args) in [
+        ("set", &["update.auto", "false"][..]),
+        ("list", &[][..]),
+        ("unset", &["update.auto"][..]),
+    ] {
+        let output = sai(&home)
+            .env("SAI_LOG", "0")
+            .args(["--json", "config", command])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty());
+        let expected = format!("\"path\": \"{}/{suffix}\"", temp.path().display());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .contains(&expected)
+        );
+        let config = fs::read_to_string(home.join("config.toml")).unwrap();
+        assert_eq!(
+            config.lines().any(|line| line == "auto = false"),
+            command != "unset"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn undecodable_environment_values_keep_their_precedence() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+
+    let root = tempdir().unwrap();
+    let fixture = OsStr::from_bytes(b"\xff");
+    let output = sai(root.path())
+        .env("SAI_ENDPOINT", fixture)
+        .args(["config", "get", "keeper.endpoint"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stdout.is_empty());
+    assert_eq!(output.stderr, b"Error: SAI_ENDPOINT: Invalid value for keeper.endpoint: expected a URL starting with https:// or http://\n");
+
+    let output = sai(root.path())
+        .env("SAI_ENDPOINT", fixture)
+        .env("SAI_LOG", fixture)
+        .args([
+            "--endpoint",
+            "https://flag.example",
+            "--json",
+            "config",
+            "list",
+        ])
+        .output()
+        .unwrap();
+    let result = read_json(&output);
+    assert_eq!(result["settings"]["keeper.endpoint"]["source"], "flag");
+    assert_eq!(result["settings"]["logs.enabled"]["value"], false);
+    assert_eq!(result["settings"]["logs.enabled"]["source"], "invalid");
+    assert_eq!(
+        output.stderr,
+        b"SAI_LOG: invalid value for logs.enabled; logging is off until it is fixed\n",
+    );
+    assert!(!root.path().join("logs").exists());
+}
+
+#[test]
+fn rejects_malformed_bracketed_authorities_before_writing() {
+    let root = tempdir().unwrap();
+    for authority in ["[::1]suffix", "prefix[::1]", "[::1]]", "[::1%zone%foo]"] {
+        let endpoint = format!("https://{authority}/path");
+        let output = sai(root.path())
+            .env("SAI_LOG", "0")
+            .args(["config", "set", "keeper.endpoint", &endpoint])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(!root.path().join("config.toml").exists());
+        assert!(!root.path().join(".config.lock").exists());
+    }
+
+    let output = sai(root.path())
+        .args([
+            "--endpoint",
+            "https://user:pw@[::1]:8443/path",
+            "config",
+            "get",
+            "keeper.ws_endpoint",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"wss://user:pw@[::1]:8443/path\n");
+}
+
+#[test]
+fn repeating_the_key_reports_only_the_extra_operand() {
+    let root = tempdir().unwrap();
+    let output = sai(root.path())
+        .args([
+            "--endpoint",
+            "get",
+            "config",
+            "get",
+            "logs.enabled",
+            "logs.enabled",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"Usage: sai config get [OPTIONS] KEY\nTry 'sai config get --help' for help.\n\nError: Got unexpected extra argument (logs.enabled)\n",
+    );
+    let events = logs(root.path());
+    assert_eq!(
+        events[1]["error"],
+        "Got unexpected extra argument (logs.enabled)"
+    );
+}

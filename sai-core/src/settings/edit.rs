@@ -9,7 +9,7 @@ use serde_json::Value;
 use toml_edit::{Item, Table};
 
 use super::toml::ParsedDocument;
-use super::{Key, MAINNET_WS, SettingsError, os_message, parse_error, read_text, table_error};
+use super::{Key, MAINNET_WS, SettingsError, os_message, parse_error, read_raw_text, table_error};
 
 const TEMPLATE: &str = include_str!("../settings-template.toml");
 const LOCK_NAME: &str = ".config.lock";
@@ -60,7 +60,7 @@ fn edit_file(
     }
     let lock = options.open(parent.join(LOCK_NAME)).map_err(writing)?;
     lock.lock().map_err(writing)?;
-    let text = read_text(path)?;
+    let text = read_raw_text(path)?;
     let Some(new) = edit(text.as_deref())? else {
         return Ok(false);
     };
@@ -81,6 +81,7 @@ fn edit(
     new: Option<&Value>,
 ) -> Result<Option<String>, SettingsError> {
     let text = text.unwrap_or(TEMPLATE);
+    let newline = if text.contains("\r\n") { "\r\n" } else { "\n" };
     let parsed =
         ParsedDocument::parse(text).map_err(|error| parse_error(path, text, &error, true))?;
     let document = &parsed.document;
@@ -88,14 +89,20 @@ fn edit(
     let new_line = |value: &Value| format!("{name} = {}", toml_value(value));
     let Some(item) = document.get(section) else {
         return Ok(new.map(|value| {
-            let separator = if text.is_empty() || text.ends_with("\n\n") {
+            let trailing_blank = text
+                .strip_suffix(newline)
+                .is_some_and(|tail| tail.ends_with(newline));
+            let separator = if text.is_empty() || trailing_blank {
                 ""
-            } else if text.ends_with('\n') {
-                "\n"
             } else {
-                "\n\n"
+                newline
             };
-            format!("{text}{separator}[{section}]\n{}\n", new_line(value))
+            insert_line(
+                text,
+                text.len(),
+                &format!("{separator}[{section}]{newline}{}", new_line(value)),
+                newline,
+            )
         }));
     };
     let table = match item {
@@ -146,31 +153,26 @@ fn edit(
             return Ok(Some(replace(
                 text,
                 start..end,
-                &format!("{placeholder}{note}\n"),
+                &format!("{placeholder}{note}{newline}"),
             )));
         }
         // A table is an invalid value for every registry key. Overwriting or
         // removing it must remove its child headers and dotted assignments.
-        let invalid = item
-            .as_table()
-            .map(|child| table_ranges(text, child, document.as_table()))
-            .or_else(|| {
-                item.as_array_of_tables().map(|tables| {
-                    tables
-                        .iter()
-                        .flat_map(|table| table_ranges(text, table, document.as_table()))
-                        .collect()
-                })
-            })
-            .unwrap_or_default();
+        let invalid = item_ranges(text, item);
         let assignment = new.map_or_else(|| placeholder.clone(), new_line);
         let mut updated = text.to_owned();
         let mut offset = append_at;
+        if new.is_none()
+            && item.as_table().is_some_and(Table::is_dotted)
+            && let Some(first) = invalid.first()
+        {
+            offset = first.start;
+        }
         for range in invalid.into_iter().rev() {
             offset -= offset.saturating_sub(range.start).min(range.len());
             updated.replace_range(range, "");
         }
-        return Ok(Some(insert_line(&updated, offset, &assignment)));
+        return Ok(Some(insert_line(&updated, offset, &assignment, newline)));
     }
 
     let Some(new) = new else { return Ok(None) };
@@ -194,17 +196,17 @@ fn edit(
             return Ok(Some(replace(
                 text,
                 offset..next,
-                &format!("{assignment}{suffix}\n"),
+                &format!("{assignment}{suffix}{newline}"),
             )));
         }
         offset = next;
     }
     let assignment = if insert_gap {
-        format!("{assignment}\n")
+        format!("{assignment}{newline}")
     } else {
         assignment
     };
-    Ok(Some(insert_line(text, append_at, &assignment)))
+    Ok(Some(insert_line(text, append_at, &assignment, newline)))
 }
 
 fn uneditable(section: &str, path: &Path) -> SettingsError {
@@ -220,44 +222,61 @@ fn uneditable(section: &str, path: &Path) -> SettingsError {
 fn table_headers(table: &Table, offsets: &mut Vec<usize>) {
     for (_, item) in table.iter() {
         if let Some(table) = item.as_table() {
-            offsets.extend(table.span().map(|span| span.start));
+            offsets.extend(header_span(table).map(|span| span.start));
             table_headers(table, offsets);
         } else if let Some(tables) = item.as_array_of_tables() {
             for table in tables {
-                offsets.extend(table.span().map(|span| span.start));
+                offsets.extend(header_span(table).map(|span| span.start));
                 table_headers(table, offsets);
             }
         }
     }
 }
 
-fn table_ranges(text: &str, table: &Table, root: &Table) -> Vec<Range<usize>> {
-    let mut starts = Vec::new();
-    starts.extend(table.span().map(|span| span.start));
-    table_headers(table, &mut starts);
-    let mut headers = Vec::new();
-    table_headers(root, &mut headers);
-    let mut ranges = starts
-        .into_iter()
-        .map(|offset| {
-            let end = headers
-                .iter()
-                .copied()
-                .filter(|&next| next > offset)
-                .min()
-                .map_or(text.len(), |next| line_start(text, next));
-            line_start(text, offset)..end
-        })
-        .collect::<Vec<_>>();
-    if table.is_dotted() {
-        ranges.extend(table.get_values().into_iter().filter_map(|(keys, value)| {
-            let start = line_start(text, keys.first()?.span()?.start);
-            let end = line_end(text, value.span()?.end);
-            Some(start..end)
-        }));
+// A dotted or implicit table may have a span for its keys or values but
+// only an explicit table has a header and a physical body.
+fn header_span(table: &Table) -> Option<Range<usize>> {
+    if table.is_implicit() || table.is_dotted() {
+        None
+    } else {
+        table.span()
+    }
+}
+
+fn item_ranges(text: &str, item: &Item) -> Vec<Range<usize>> {
+    let mut ranges = Vec::new();
+    collect_item_ranges(item, &mut ranges);
+    for range in &mut ranges {
+        *range = line_start(text, range.start)..line_end(text, range.end);
     }
     ranges.sort_by_key(|range| range.start);
-    ranges
+    let mut merged: Vec<Range<usize>> = Vec::new();
+    for range in ranges {
+        if let Some(last) = merged.last_mut()
+            && range.start <= last.end
+        {
+            last.end = last.end.max(range.end);
+        } else {
+            merged.push(range);
+        }
+    }
+    merged
+}
+
+fn collect_item_ranges(item: &Item, ranges: &mut Vec<Range<usize>>) {
+    let mut add_table = |table: &Table| {
+        ranges.extend(header_span(table));
+        for (_, child) in table.iter() {
+            // An explicit table's span already covers its direct assignments.
+            collect_item_ranges(child, ranges);
+        }
+    };
+    match item {
+        Item::Value(value) => ranges.extend(value.span()),
+        Item::Table(table) => add_table(table),
+        Item::ArrayOfTables(tables) => tables.iter().for_each(add_table),
+        Item::None => {}
+    }
 }
 
 fn line_start(text: &str, offset: usize) -> usize {
@@ -273,7 +292,7 @@ fn line_end(text: &str, offset: usize) -> usize {
 }
 
 fn inline_note(suffix: &str) -> String {
-    let suffix = suffix.trim_end_matches('\n');
+    let suffix = suffix.trim_end_matches(['\r', '\n']);
     match suffix.find('#') {
         Some(0) => format!("  {suffix}"),
         Some(_) => suffix.to_owned(),
@@ -287,13 +306,13 @@ fn replace(text: &str, range: Range<usize>, value: &str) -> String {
     edited
 }
 
-fn insert_line(text: &str, offset: usize, line: &str) -> String {
+fn insert_line(text: &str, offset: usize, line: &str, newline: &str) -> String {
     let separator = if offset == 0 || text[..offset].ends_with('\n') {
         ""
     } else {
-        "\n"
+        newline
     };
-    replace(text, offset..offset, &format!("{separator}{line}\n"))
+    replace(text, offset..offset, &format!("{separator}{line}{newline}"))
 }
 
 fn placeholder_value(key: Key) -> String {

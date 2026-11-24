@@ -55,7 +55,7 @@ fn main() -> ExitCode {
         .skip(1)
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
-    let command = config_command(&argv);
+    let (command, operands) = config_command(&argv);
     let environment = Environment::from_process();
     let started = Instant::now();
     let writer = if command == "logs"
@@ -117,7 +117,7 @@ fn main() -> ExitCode {
                 writer,
                 command_field(),
                 started,
-                print_parse_error(&error, context, &argv),
+                print_parse_error(&error, context, operands),
             );
         }
     };
@@ -157,7 +157,7 @@ fn finish(
     code.into()
 }
 
-fn config_command(args: &[String]) -> &'static str {
+fn config_command(args: &[String]) -> (&'static str, &[String]) {
     let mut skip = false;
     for (index, arg) in args.iter().enumerate() {
         if skip {
@@ -166,26 +166,30 @@ fn config_command(args: &[String]) -> &'static str {
         }
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
-            "logs" => return "logs",
+            "logs" => return ("logs", &[]),
             "config" => {
-                return match args
+                let Some((index, leaf)) = args
                     .iter()
+                    .enumerate()
                     .skip(index + 1)
-                    .find(|arg| !arg.starts_with('-'))
-                    .map(String::as_str)
-                {
-                    Some("get") => "config get",
-                    Some("list") => "config list",
-                    Some("set") => "config set",
-                    Some("unset") => "config unset",
+                    .find(|(_, arg)| !arg.starts_with('-'))
+                else {
+                    return ("config", &[]);
+                };
+                let path = match leaf.as_str() {
+                    "get" => "config get",
+                    "list" => "config list",
+                    "set" => "config set",
+                    "unset" => "config unset",
                     _ => "config",
                 };
+                return (path, &args[index + 1..]);
             }
             _ if arg.starts_with('-') => {}
             _ => break,
         }
     }
-    ""
+    ("", &[])
 }
 
 fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
@@ -196,7 +200,7 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
     }
 }
 
-fn usage_error(error: &clap::Error, command: &str, argv: &[String]) -> Option<Error> {
+fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<Error> {
     let arg = context_text(error, ContextKind::InvalidArg);
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
@@ -208,11 +212,18 @@ fn usage_error(error: &clap::Error, command: &str, argv: &[String]) -> Option<Er
             if argument.starts_with('-') {
                 format!("No such option {}.", repr(argument))
             } else {
-                let leaf = command.split_whitespace().last();
-                let extra = argv
+                let consumed = match command {
+                    "config get" | "config unset" => 1,
+                    "config set" => 2,
+                    _ => 0,
+                };
+                let separator = operands.iter().position(|operand| operand == "--");
+                let extra = operands
                     .iter()
-                    .skip_while(|arg| leaf.is_some_and(|leaf| *arg != leaf))
-                    .skip_while(|arg| *arg != argument)
+                    .enumerate()
+                    .filter(|(index, _)| Some(*index) != separator)
+                    .map(|(_, arg)| arg)
+                    .skip(consumed)
                     .cloned()
                     .collect::<Vec<_>>();
                 if extra.len() > 1 {
@@ -238,7 +249,11 @@ fn usage_error(error: &clap::Error, command: &str, argv: &[String]) -> Option<Er
     Some(Error::usage(message))
 }
 
-fn print_parse_error(error: &clap::Error, command: &str, argv: &[String]) -> (u8, Option<String>) {
+fn print_parse_error(
+    error: &clap::Error,
+    command: &str,
+    operands: &[String],
+) -> (u8, Option<String>) {
     match error.kind() {
         ErrorKind::DisplayHelp if config::print_help(command, false) => (0, None),
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
@@ -264,7 +279,7 @@ fn print_parse_error(error: &clap::Error, command: &str, argv: &[String]) -> (u8
                 }
                 _ => command,
             };
-            if let Some(usage) = usage_error(error, usage_command, argv) {
+            if let Some(usage) = usage_error(error, usage_command, operands) {
                 if error.kind() == ErrorKind::InvalidValue && usage_command.is_empty() {
                     eprintln!("Error: {}", usage.message);
                     return (usage.code, None);

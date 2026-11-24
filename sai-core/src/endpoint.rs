@@ -30,8 +30,13 @@ impl Endpoint {
         }
         let bracketed = authority.contains(['[', ']']);
         if bracketed {
-            let (_, tail) = authority.split_once('[')?;
-            let (host, _) = tail.split_once(']')?;
+            let host_port = authority
+                .rsplit_once('@')
+                .map_or(authority, |(_, host)| host);
+            let (host, tail) = host_port.strip_prefix('[')?.split_once(']')?;
+            if !tail.is_empty() && !tail.starts_with(':') {
+                return None;
+            }
             if let Some(ipv_future) = host.strip_prefix('v') {
                 let (version, suffix) = ipv_future.split_once('.')?;
                 if version.is_empty()
@@ -42,7 +47,9 @@ impl Endpoint {
                 }
             } else {
                 let (address, zone) = host.split_once('%').unwrap_or((host, ""));
-                if Ipv6Addr::from_str(address).is_err() || (host.contains('%') && zone.is_empty()) {
+                if Ipv6Addr::from_str(address).is_err()
+                    || (host.contains('%') && (zone.is_empty() || zone.contains('%')))
+                {
                     return None;
                 }
             }

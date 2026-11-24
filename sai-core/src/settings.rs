@@ -5,7 +5,9 @@ mod home;
 mod toml;
 
 use std::{
-    env, fmt, fs, io,
+    env,
+    ffi::{OsStr, OsString},
+    fmt, fs, io,
     path::{Path, PathBuf},
 };
 
@@ -324,11 +326,15 @@ impl Source {
 #[derive(Clone)]
 pub struct Environment {
     pub home: PathBuf,
-    values: [Option<String>; KEYS.len()],
+    values: [Option<OsString>; KEYS.len()],
 }
 
 impl Environment {
     pub fn new(home: PathBuf, get: impl Fn(&str) -> Option<String>) -> Self {
+        Self::from_os(home, |name| get(name).map(OsString::from))
+    }
+
+    fn from_os(home: PathBuf, get: impl Fn(&str) -> Option<OsString>) -> Self {
         Self {
             home: home::normalize(&home),
             values: KEYS.map(|key| get(key.spec().env)),
@@ -338,17 +344,21 @@ impl Environment {
     pub fn from_process() -> Result<Self, SettingsError> {
         let home = home::from_process()
             .ok_or_else(|| SettingsError::invalid("Cannot find the home directory".into()))?;
-        Ok(Self::new(home, |name| env::var(name).ok()))
+        Ok(Self::from_os(home, |name| env::var_os(name)))
     }
 
     pub fn path(&self) -> PathBuf {
         self.home.join(FILE_NAME)
     }
 
-    pub fn value(&self, key: Key) -> Option<&str> {
+    pub fn is_set(&self, key: Key) -> bool {
+        self.raw(key).is_some()
+    }
+
+    fn raw(&self, key: Key) -> Option<&OsStr> {
         self.values[key as usize]
             .as_deref()
-            .filter(|value| !value.trim().is_empty())
+            .filter(|value| value.to_str().is_none_or(|text| !text.trim().is_empty()))
     }
 }
 
@@ -392,7 +402,7 @@ impl Settings {
                 Err(_) if key.is_log() => {
                     let already_off = resolved.value(Key::LogsEnabled).as_bool() == Some(false);
                     let source = if already_off { source } else { Source::Invalid };
-                    if source == Source::Invalid && env.value(key).is_some() {
+                    if source == Source::Invalid && env.is_set(key) {
                         resolved.warnings.push(format!(
                             "{}: invalid value for {}; logging is off until it is fixed",
                             key.spec().env,
@@ -518,8 +528,18 @@ fn table_error(section: &str) -> String {
 fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (Entry, Source) {
     if let Some(raw) = flags.value(key) {
         (key.parse_value(raw), Source::Flag)
-    } else if let Some(raw) = env.value(key) {
-        (key.parse_value(raw), Source::Env)
+    } else if let Some(raw) = env.raw(key) {
+        let value = match raw.to_str() {
+            Some(raw) => key.parse_value(raw),
+            None => match key.spec().kind {
+                Kind::Url(schemes) => Err(key.expected(&format!(
+                    "a URL starting with {}:// or {}://",
+                    schemes[0], schemes[1]
+                ))),
+                _ => Err(key.expected("a UTF-8 value")),
+            },
+        };
+        (value, Source::Env)
     } else if let Some(value) = file {
         (value.clone(), Source::File)
     } else {
@@ -544,17 +564,23 @@ pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
 }
 
 pub(crate) fn log_disabled_in_env(env: &Environment) -> bool {
-    env.value(Key::LogsEnabled)
-        .is_some_and(|raw| parse_bool(raw) != Some(true))
+    env.raw(Key::LogsEnabled)
+        .is_some_and(|raw| raw.to_str().and_then(parse_bool) != Some(true))
 }
 
 fn read_text(path: &Path) -> Result<Option<String>, SettingsError> {
-    match fs::read_to_string(path) {
-        Ok(text) => Ok(Some(if text.contains('\r') {
+    Ok(read_raw_text(path)?.map(|text| {
+        if text.contains('\r') {
             text.replace("\r\n", "\n").replace('\r', "\n")
         } else {
             text
-        })),
+        }
+    }))
+}
+
+fn read_raw_text(path: &Path) -> Result<Option<String>, SettingsError> {
+    match fs::read_to_string(path) {
+        Ok(text) => Ok(Some(text)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(SettingsError::invalid(format!(
             "Cannot read {}: {}",
