@@ -6,7 +6,7 @@ mod trades;
 use std::{collections::HashSet, path::Path};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use chrono::{DateTime, FixedOffset, SecondsFormat, TimeDelta, Timelike, Utc};
+use chrono::{DateTime, FixedOffset, SecondsFormat, Timelike, Utc};
 use serde_json::{Map, Value, json};
 use tokio::sync::OnceCell;
 
@@ -18,7 +18,7 @@ use crate::{
         stream::{self, Subscription},
     },
     log::{self, EventContext},
-    session::{parse_expiry, shell_quote},
+    session::parse_expiry,
     settings::Settings,
     storage::{Session, Storage, StorageError},
 };
@@ -80,7 +80,7 @@ pub async fn read(
             };
             (
                 addr.to_owned(),
-                session_section(stored, settings.endpoint(), home),
+                session_section(stored, settings.endpoint(), &storage),
             )
         }
         Err(error) => {
@@ -416,7 +416,7 @@ fn parse_balances(payload: Value) -> Result<Value, SaiError> {
     Ok(Value::Object(selected))
 }
 
-fn session_section(stored: Option<&Session>, endpoint: &str, home: &Path) -> Value {
+fn session_section(stored: Option<&Session>, endpoint: &str, storage: &Storage<'_>) -> Value {
     let fetched = now();
     let Some(stored) = stored else {
         return success(json!({"connected": false}), fetched);
@@ -435,46 +435,12 @@ fn session_section(stored: Option<&Session>, endpoint: &str, home: &Path) -> Val
         .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
         .and_then(|claims| unix_instant(&claims["iat"]));
     add_age(&mut data, issued_at, fetched);
-    let left = expiry.signed_duration_since(fetched);
-    if matches && TimeDelta::zero() < left && left < TimeDelta::days(3) {
-        let minutes = left.num_minutes();
-        let when = match minutes {
-            0 => "under 1 min".to_owned(),
-            1..=119 => format!("{minutes} min"),
-            _ => format!("{} h", minutes / 60),
-        };
-        data["expiryWarning"] = json!(format!(
-            "Sai session for {} expires in {when}.",
-            stored.addr()
-        ));
-        data["renewalCommand"] = json!(renewal_command(stored, endpoint, home));
+    if matches
+        && let Some(notice) = storage.expiry_notice(stored, expiry.signed_duration_since(fetched))
+    {
+        merge(&mut data, json!(notice));
     }
     success(data, fetched)
-}
-
-fn renewal_command(stored: &Session, endpoint: &str, home: &Path) -> String {
-    let origin = log::origin(endpoint);
-    let flag = if endpoint == origin && log::redact(home, endpoint) == endpoint {
-        shell_quote(endpoint)
-    } else {
-        r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-            .into()
-    };
-    let cmd = format!("sai --endpoint {flag} auth");
-    let suffix = if endpoint == origin {
-        String::new()
-    } else if origin == "[redacted url]" {
-        " (reuse the Keeper endpoint configured when this session was stored)".to_owned()
-    } else {
-        format!(" (reuse the Keeper endpoint at {origin} configured when this session was stored)")
-    };
-    if stored.key_name().is_some() {
-        format!("{cmd} renew {}{suffix}", shell_quote(stored.addr()))
-    } else if stored.is_imported() {
-        format!("{cmd} import{suffix}")
-    } else {
-        format!("{cmd} login NAME or {cmd} import{suffix}")
-    }
 }
 
 fn blocking_intents(storage: &Storage<'_>, endpoint: &str, addr: &str) -> Value {

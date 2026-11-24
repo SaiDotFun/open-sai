@@ -227,7 +227,11 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
                 "token": f"fixture.{claim}.signature",
                 "endpoint": endpoints.keeper,
                 "expiresAt": expires_at,
-                "keyName": "fixture",
+                **(
+                    {"source": "imported"}
+                    if seed == "overview-expiry"
+                    else {"keyName": "fixture"}
+                ),
             }
         )
     if seed == "doctor-ledger-session":

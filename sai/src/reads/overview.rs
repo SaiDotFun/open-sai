@@ -2,7 +2,7 @@
 
 use std::io::{self, IsTerminal, Write as _};
 
-use sai_core::errors::SaiError;
+use sai_core::{errors::SaiError, session::ExpiryNotice};
 use serde_json::Value;
 
 const UNKNOWN: &str = "unknown";
@@ -15,9 +15,14 @@ pub(super) fn show(result: &Value) -> Result<(), SaiError> {
         color,
     };
     let session = &result["session"]["data"];
-    let renewal = session["expiryWarning"]
-        .as_str()
-        .map(|warning| format!("{warning} Run {}.", text(&session["renewalCommand"])));
+    let renewal = session["expiryWarning"].as_str().map(|warning| {
+        ExpiryNotice {
+            expiry_warning: warning.to_owned(),
+            renewal_command: session["renewalCommand"].as_str().map(str::to_owned),
+            renewal_guidance: session["renewalGuidance"].as_str().map(str::to_owned),
+        }
+        .text()
+    });
     if io::stdin().is_terminal()
         && io::stderr().is_terminal()
         && let Some(renewal) = &renewal

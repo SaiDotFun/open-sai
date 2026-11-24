@@ -162,7 +162,7 @@ jobs:
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 53ef4fb70f30bd8c340749b131f509d65ab86ed4
+          ref: 20493c984e3398756365ea1a2b8786a7a0115a11
           path: .parity-overview-python
           persist-credentials: false
 

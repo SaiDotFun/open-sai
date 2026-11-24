@@ -440,6 +440,36 @@ wire = [
     "pendingMarketOrders",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
+[case.overview_expected]
+"session.data.renewalCommand" = 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth import --addr 0x1111111111111111111111111111111111111111'
+
+[[case]]
+name = "account-overview-expiry-text"
+args = ["account", "overview"]
+mode = "text"
+seed = "overview-expiry"
+server = "overview-full"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
 
 [[case]]
 name = "account-overview-wrong-height"
