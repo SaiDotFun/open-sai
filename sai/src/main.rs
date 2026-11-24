@@ -4,7 +4,7 @@ mod local;
 use std::{env, path::Path, process, time::Instant};
 
 use clap::{
-    Parser, Subcommand,
+    CommandFactory, Parser, Subcommand,
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use sai_core::errors::{ExitCode, SaiError};
@@ -65,6 +65,35 @@ enum Command {
     },
 }
 
+impl Cli {
+    fn run(
+        self,
+        env: &Environment,
+        json: bool,
+        events: EventContext<'_>,
+    ) -> Result<(), SaiError> {
+        let flags = Flags {
+            endpoint: self.endpoint,
+            ws_endpoint: self.ws_endpoint,
+            lcd_endpoint: self.lcd_endpoint,
+        };
+        match self.command {
+            Command::Auth { command, .. } => local::auth(
+                command,
+                self.account.as_deref(),
+                &flags,
+                env,
+                json,
+                events,
+            ),
+            Command::Intent { command, .. } => {
+                local::intent(command, &flags, env, json, events)
+            }
+            Command::Config { command } => command.run(&flags, env, json),
+        }
+    }
+}
+
 fn main() -> process::ExitCode {
     let args: Vec<_> = env::args_os().collect();
     let argv: Vec<_> = args
@@ -73,6 +102,7 @@ fn main() -> process::ExitCode {
         .map(|arg| arg.to_string_lossy().into_owned())
         .collect();
     let (command, operands) = command_path(&argv);
+    let command = command.as_str();
     let environment = Environment::from_process();
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
     let requested_json = json_requested(&argv);
@@ -128,22 +158,7 @@ fn main() -> process::ExitCode {
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
-                .and_then(|env| {
-                    let flags = Flags {
-                        endpoint: cli.endpoint,
-                        ws_endpoint: cli.ws_endpoint,
-                        lcd_endpoint: cli.lcd_endpoint,
-                    };
-                    match cli.command {
-                        Command::Auth { command, .. } => {
-                            local::auth(command, cli.account.as_deref(), &flags, env, json, events)
-                        }
-                        Command::Intent { command, .. } => {
-                            local::intent(command, &flags, env, json, events)
-                        }
-                        Command::Config { command } => command.run(&flags, env, json),
-                    }
-                });
+                .and_then(|env| cli.run(env, json, events));
             complete(result, command, json, home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
@@ -288,7 +303,8 @@ fn finish(
     (code as u8).into()
 }
 
-fn command_path(args: &[String]) -> (&'static str, &[String]) {
+// Recover the command name even when clap rejects its arguments.
+fn command_path(args: &[String]) -> (String, &[String]) {
     let mut skip = false;
     for (index, arg) in args.iter().enumerate() {
         if skip {
@@ -296,42 +312,39 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
             continue;
         }
         match arg.as_str() {
-            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
-            "logs" => return ("logs", &[]),
-            "config" | "auth" | "intent" => {
-                let group = match arg.as_str() {
-                    "auth" => "auth",
-                    "intent" => "intent",
-                    _ => "config",
-                };
-                let Some((index, leaf)) = args
-                    .iter()
-                    .enumerate()
-                    .skip(index + 1)
-                    .find(|(_, arg)| !arg.starts_with('-'))
-                else {
-                    return (group, &[]);
-                };
-                let path = match (group, leaf.as_str()) {
-                    ("config", "get") => "config get",
-                    ("config", "list") => "config list",
-                    ("config", "set") => "config set",
-                    ("config", "unset") => "config unset",
-                    ("auth", "status") => "auth status",
-                    ("auth", "list") => "auth list",
-                    ("auth", "use") => "auth use",
-                    ("auth", "logout") => "auth logout",
-                    ("intent", "local") => "intent local",
-                    ("intent", "status") => "intent status",
-                    _ => group,
-                };
-                return (path, &args[index + 1..]);
+            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => {
+                skip = true
             }
+            "logs" => return ("logs".into(), &[]),
             _ if arg.starts_with('-') => {}
-            _ => break,
+            _ => {
+                let tree = Cli::command();
+                let Some(mut node) = tree.find_subcommand(arg) else {
+                    break;
+                };
+                let mut path = node.get_name().to_owned();
+                let mut operands = &args[index + 1..];
+                while node.has_subcommands() {
+                    let Some((index, word)) = operands
+                        .iter()
+                        .enumerate()
+                        .find(|(_, arg)| !arg.starts_with('-'))
+                    else {
+                        return (path, &[]);
+                    };
+                    operands = &operands[index + 1..];
+                    let Some(child) = node.find_subcommand(word) else {
+                        break;
+                    };
+                    path.push(' ');
+                    path.push_str(child.get_name());
+                    node = child;
+                }
+                return (path, operands);
+            }
         }
     }
-    ("", &[])
+    (String::new(), &[])
 }
 
 fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
