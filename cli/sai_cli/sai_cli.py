@@ -27,6 +27,7 @@ from .core import (
     keeper,
     log,
     log_queries,
+    overview,
     reconcile,
     storage,
     stream,
@@ -37,7 +38,8 @@ from .core import (
 )
 from .core import session as sessions
 from .core import settings as sai_settings
-from .core.errors import Code, ExitCode, McpStdioError, SaiError, describe
+from .core.errors import Code, ExitCode, McpStdioError, SaiError, SessionError, describe
+from .utils import overview_format
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
@@ -362,12 +364,46 @@ def main(
     passed = (endpoint, ws_endpoint, lcd_endpoint)
     flags = {key: value for (_, key), value in zip(GLOBAL_FLAGS, passed, strict=True)}
     ctx.obj.update(flags=flags, settings=None, json=json_output, as_addr=as_addr)
-    if auto_update_applies(ctx.invoked_subcommand, json_output):
+    if ctx.invoked_subcommand not in {
+        "account",
+        "auth",
+        "doctor",
+        "mcp",
+        "logs",
+        "skill",
+    }:
+        session_notice(ctx, as_addr)
+    if ctx.invoked_subcommand != "account" and auto_update_applies(
+        ctx.invoked_subcommand, json_output
+    ):
         updater.tick(warn)
     if ctx.invoked_subcommand is None:
         if json_output:
             raise click.UsageError("Pass a command when using --json.", ctx)
         repl(ctx)
+
+
+def session_notice(ctx: click.Context, addr: str | None) -> None:
+    """Warn on a terminal without touching piped output or MCP stdio."""
+    if ctx.obj["json"] or not (sys.stdin.isatty() and sys.stderr.isatty()):
+        return
+    try:
+        stored = storage.load_session(addr)
+        if stored.get("endpoint") == keeper_url(ctx):
+            show_expiry_notice(ctx, sessions.expiry_fields(stored))
+    except (ValueError, click.ClickException):
+        # This notice is optional. The command handles its own settings and session.
+        return
+
+
+def show_expiry_notice(ctx: click.Context, fields: Mapping[str, Any]) -> None:
+    if (
+        fields.get("expiryWarning")
+        and not ctx.obj["json"]
+        and sys.stdin.isatty()
+        and sys.stderr.isatty()
+    ):
+        warn(f"{fields['expiryWarning']} Run {fields['renewalCommand']}.")
 
 
 # Commands that never start or announce an automatic update. `mcp` serves
@@ -499,6 +535,7 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
     try:
         result = signed_login(endpoint, name, addr)
         result["endpoint"] = endpoint
+        result["keyName"] = name
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
@@ -512,6 +549,37 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
             Code.INVALID_REQUEST,
             hint=command,
             exit_code=ExitCode.UNSUPPORTED,
+        ) from exc
+
+
+@auth.command("renew")
+@click.argument("addr", required=False)
+@click.pass_context
+def renew(ctx: click.Context, addr: str | None) -> None:
+    """Renew ADDR's session with its saved key name, or renew the active account."""
+    chosen = addr or ctx.obj["as_addr"]
+    try:
+        stored = storage.load_session(chosen)
+        endpoint = keeper_url(ctx)
+        if stored.get("endpoint") != endpoint:
+            raise SessionError("Stored session belongs to another Keeper endpoint")
+        name = stored.get("keyName")
+        if not name:
+            if stored.get("source") == "imported":
+                raise ValueError(
+                    f"This session was imported. Run {sessions.renewal_command(stored)} with a fresh token."
+                )
+            raise ValueError(
+                f"This session has no saved key name. Run {sessions.renewal_command(stored)}."
+            )
+        result = signed_login(endpoint, name, stored["evmAddress"])
+        result.update(endpoint=endpoint, keyName=name)
+        storage.replace_session(stored, result)
+        emit(ctx, sessions.summary(result))
+    except NeedsTerminal as exc:
+        raise SaiError(
+            f"{exc} Run {sessions.renewal_command(stored)} in a terminal.",
+            Code.SESSION_UNAVAILABLE,
         ) from exc
 
 
@@ -749,8 +817,9 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
         {
             **sessions.summary(result),
             "active": key == accounts["active"],
-            "expired": datetime.fromisoformat(result["expiresAt"]) <= now,
+            "expired": sessions.expiry_time(result) <= now,
             "endpointMatches": result.get("endpoint") == endpoint,
+            **sessions.expiry_fields(result, now),
         }
         for key, result in sorted(accounts["sessions"].items())
     ]
@@ -760,7 +829,11 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
 @click.pass_context
 def auth_list(ctx: click.Context) -> None:
     """List connected accounts, their expiry, and which one is active."""
-    emit(ctx, {"accounts": account_rows(keeper_url(ctx))})
+    rows = account_rows(keeper_url(ctx))
+    for row in rows:
+        if row["active"] and row["endpointMatches"]:
+            show_expiry_notice(ctx, row)
+    emit(ctx, {"accounts": rows})
 
 
 @auth.command("use")
@@ -781,7 +854,9 @@ def auth_status(ctx: click.Context) -> None:
     """Show the active account, or the --as account, and its expiry without
     showing the token."""
     result = session(ctx)
-    emit(ctx, sessions.summary(result))
+    fields = sessions.expiry_fields(result)
+    show_expiry_notice(ctx, fields)
+    emit(ctx, {**sessions.summary(result), **fields})
 
 
 @main.group()
@@ -804,14 +879,39 @@ def market_prices(ctx: click.Context) -> None:
 
 
 @main.group()
-def account() -> None:
+@click.pass_context
+def account(ctx: click.Context) -> None:
     """Inspect positions and account activity."""
+    if ctx.invoked_subcommand != "overview":
+        session_notice(ctx, ctx.obj["as_addr"])
+        if auto_update_applies("account", ctx.obj["json"]):
+            updater.tick(warn)
 
 
 def perform_query(
     ctx: click.Context, query: str, variables: dict[str, Any] | None = None
 ) -> None:
     emit(ctx, keeper.request(keeper_url(ctx), query, variables))
+
+
+@account.command("overview")
+@click.option("--as", "addr", metavar="ADDR", help="Read this EVM account.")
+@click.option("--json", "json_output", is_flag=True, help="Print compact JSON.")
+@click.pass_context
+def account_overview(ctx: click.Context, addr: str | None, json_output: bool) -> None:
+    """Show Sai funds, positions, orders, local blockers, and session expiry."""
+    ctx.obj["json"] = ctx.obj["json"] or json_output
+    if auto_update_applies("account", ctx.obj["json"]):
+        updater.tick(warn)
+    try:
+        result = overview.account_overview(settings(ctx), addr or ctx.obj["as_addr"])
+    except overview.AccountUnavailable as exc:
+        raise SessionError(f"{exc}. Pass --as ADDR explicitly.") from exc
+    if ctx.obj["json"]:
+        emit(ctx, result)
+    else:
+        show_expiry_notice(ctx, result["session"].get("data", {}))
+        overview_format.show(result)
 
 
 @account.command("positions")
@@ -1158,6 +1258,7 @@ def trade_open(
                 stop_loss=stop_loss,
                 allow_concurrent_open=allow_concurrent_open,
                 dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
                 notify=warn,
             ),
         )
@@ -1188,6 +1289,7 @@ def trade_close(
                 trade_id=trade_id,
                 cancel_order=cancel_order,
                 dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1225,6 +1327,7 @@ def trade_tpsl(
                 clear_take_profit=clear_take_profit,
                 clear_stop_loss=clear_stop_loss,
                 dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1250,6 +1353,7 @@ def trade_leverage(
                 trade_id=trade_id,
                 leverage=leverage,
                 dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:

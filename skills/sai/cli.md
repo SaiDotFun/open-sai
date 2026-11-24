@@ -10,6 +10,8 @@ plus `skill` on versions that have it. Global options go before the command:
 
 ```bash
 sai --json market prices
+sai account overview
+sai account overview --as 0xYOUR_ADDR --json
 sai --as 0xOTHER_ADDR --json account positions 0xOTHER_ADDR
 ```
 
@@ -30,6 +32,10 @@ sai --json watch price 3
 
 - `market list` returns Keeper's borrowing markets, and `market prices` the
   current indexed prices.
+- `account overview` reads the active account unless you pass `--as ADDR`.
+  Check each section's fetch time, source age, and any error before using
+  the funds, position risk, orders, or local intent data. Queued market
+  orders are waiting for the next oracle price.
 - `account positions ADDR` lists positions and pending orders.
   `account balances ADDR` reads one balance snapshot. `account history
   ADDR` reads trade history. These reads need no sign-in.
@@ -113,7 +119,14 @@ Once connected, commands need no prompt until the session expires.
 | `sai auth list` | Every connected account, its expiry, and which is active. |
 | `sai auth use ADDR` | Switch the active account. Only when the person asks. |
 | `sai --as ADDR ...` | Run one command as another connected account. |
+| `sai auth renew [ADDR]` | Renew a keystore session with its saved key name. Keeps the active account selected. |
 | `sai auth logout [ADDR]` | Remove one account, by default the active one. |
+
+Status, list, doctor, and the overview warn with less than three days left.
+Ask the person to renew in their terminal if the key prompts for a
+password. For an imported session, ask them to copy a fresh Sai Web token
+and run `sai auth import`. For an older keystore session without a saved key
+name, ask them to run `sai auth login NAME` once.
 
 Each sign-in adds an account and makes it active. If the person asks what the
 token is, tell them:

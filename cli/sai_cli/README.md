@@ -48,6 +48,68 @@ and the CLI derives the WebSocket from the Keeper endpoint instead. So
 file. The per-command `--ws-endpoint` and `--lcd-endpoint` options still
 work and override the setting for that command.
 
+## Account Overview
+
+```bash
+sai account overview
+sai account overview --as 0xYOUR_ADDR --json
+```
+
+The command uses the active account on the configured Keeper endpoint.
+Pass `--as ADDR` to read another EVM account, including one you have never
+connected. The MCP tool `account_overview` takes an optional `addr` and
+returns the same fields as the CLI's JSON output.
+
+- **Sai funds.** Backed deposits, credits, and unsettled Teller funds that
+  are available to trade are separate USD amounts. An omitted balance is
+  unknown. If Keeper returns no Sai funds rows, the section reports an error.
+- **Positions.** Size is collateral in USD multiplied by leverage. USDC
+  collateral is valued at par. Gross unrealized PnL is before fees and uses
+  the contract's range of -100% to +900% of collateral. Legacy stNIBI PnL
+  uses the collateral price at the same pinned block. The total requires
+  agreement with the contract's live positions, a USD PnL value for every
+  position, and no fill that Keeper reports as awaiting indexing. The
+  positions section shows the membership check's block and age. The total
+  is unavailable when that block is more than 60 seconds old at the check.
+- **Risk.** The liquidation threshold includes borrowing fees from the
+  contract. Distances compare the same-block oracle mark and trigger levels
+  in the pair's quote token. A zero or negative distance means the price
+  reached or crossed the trigger. For a non-USD quote, displayed USD prices
+  use the oracle's quote-token conversion. If the contract threshold or
+  matching trade state is unavailable, any Keeper liquidation figure is
+  labeled as an estimate and has no distance. If only the oracle mark is
+  unavailable or stale under the market's contract settings, the threshold
+  can still be shown. A stale mark at or past the liquidation threshold
+  carries a warning because a catalyst can liquidate at that price.
+  A pending after-hours leverage adjustment withholds
+  gross PnL and TP/SL distances and retains liquidation distance when the
+  mark is usable.
+- **Orders.** Pending limit and stop orders list their trigger prices.
+  Queued market orders come from Keeper's `pending_exec` records. For a
+  queued open, the trade ID is reserved. Collateral on a queued order, when
+  present, is in base units.
+- **Local blockers.** An unknown or pending intent blocks all trades for the account.
+  An accepted intent for a position blocks requests on that position.
+  An accepted open blocks another open by default until its outcome is settled.
+- **Session.** The overview shows the expiry of a stored session for the
+  selected account and warns in its last three days.
+
+Each section's `fetchedAt` records when the client read it, in UTC. Source
+timestamps and `sourceAgeSeconds` describe the data at fetch time. A
+position's indexed trade record, contract threshold, and oracle mark carry
+separate source times. Oracle metadata shows the publish block separately
+from the LCD read block. The estimate from Keeper has an unknown source time.
+The LCD supplies missing block times after its chain matches Keeper's. A
+custom Keeper requires an explicit LCD for that chain. An independently
+overridden WebSocket is labeled as a balance source on an unverified chain.
+Local intent age starts at reservation. Session age starts at token issuance
+when the stored token provides that claim.
+
+A failed read produces a section `error` with a code and message. Other
+sections still return their data. An eight-second LCD deadline keeps already
+loaded rows when further chain reads stall. The overview flags a paginated
+list when it cannot confirm the list on a second scan.
+
 ## Updates
 
 ```bash
@@ -142,8 +204,7 @@ specifies the Mainnet endpoint.
   Get-Clipboard` (WSL and Windows). If none works, as over SSH, it exits
   non-zero. Run the dialog's import command in your own terminal.
 - It never reads the token from arguments, environment variables, or piped
-  stdin, and never prints it. Like `auth login` and `auth status`, it prints
-  only `addr`, `expiresAt`, and `endpoint`.
+  stdin. Like `auth login`, it prints `addr`, `expiresAt`, and `endpoint`.
 - After storing the token, it reads the clipboard again and clears it only if
   it still holds the token. Anything copied in the meantime stays.
 
@@ -164,6 +225,20 @@ servers to pick up the change.
 signs, the CLI checks that the typed data has primary type
 `UserTradingSession`, domain `Sai` version `1`, your addr, and the issued
 challenge nonce.
+
+Run `sai auth renew [ADDR]` to get a fresh session using the key saved by
+`sai auth login NAME`. With no address, it renews the active account. An
+explicit address renews that account and keeps the active selection. If a
+keystore session predates the saved key name, run `sai auth login NAME` once.
+For a session copied from Sai Web, copy a fresh token and run `sai auth
+import`.
+
+Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
+warning when a session has less than three days left. Interactive commands
+can also print a one-line notice to stderr. JSON output carries the warning
+in the reported session data. Use the Keeper endpoint named in the renewal
+or import hint. If the hint asks you to reuse your settings, keep the original
+Keeper configuration when running the command.
 
 `auth login NAME` picks the key named `NAME`:
 
