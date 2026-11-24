@@ -416,9 +416,7 @@ def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> No
             raise UnresolvedIntent(
                 f"Reconcile uncertain intent {blocked_key} before submitting another trade",
                 intent_key=blocked_key,
-                hint=shlex.join(
-                    ["sai", "intent", "status", account, "--key", blocked_key]
-                ),
+                hint=intent_status_hint(endpoint, account, blocked_key),
             )
         connection.execute(
             "INSERT INTO intents (id, endpoint, account, kind, status, entity, created_at) VALUES (?, ?, ?, ?, 'unknown', ?, ?)",

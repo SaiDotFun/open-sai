@@ -11,6 +11,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,10 +24,56 @@ from websockets.sync.server import serve
 from websockets.typing import Subprotocol
 
 FIXTURES = Path(__file__).parent / "fixtures"
+TRADE_ADDR = "0x" + "a" * 40
 
 
 def fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def save_trade_session(endpoint: str) -> None:
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": TRADE_ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+
+
+@contextmanager
+def submission_keeper(reply: Callable[[str], dict | None]) -> Generator[str]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert body["query"] == keeper.SUBMIT
+            response = reply(body["variables"]["input"]["intentKey"])
+            if response is not None:
+                payload = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/query"
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def close_trade_args(endpoint: str) -> list[str]:
+    return [*_resolve_cli(), "--endpoint", endpoint, "--json", "trade", "close", "7"]
 
 
 def _resolve_cli() -> list[str]:
@@ -287,7 +335,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
             "message": f"Outcome unknown for intent {key}; reconcile before another trade",
             "retryable": False,
             "intentKey": key,
-            "hint": f"sai intent status {addr} --key {key}",
+            "hint": f"sai --endpoint {endpoint} intent status {addr} --key {key}",
         }
         saved = json.loads(invoke("intent", "local", addr).stdout)
         assert saved[0]["intentKey"] == key
@@ -297,6 +345,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         assert duplicate.returncode == 1
         blocked = json.loads(duplicate.stdout)["error"]
         assert blocked["intentKey"] == key and blocked["retryable"] is False
+        assert blocked["hint"] == error["hint"]
         assert "Reconcile" in blocked["message"]
         assert len(recorded) == 1
 
@@ -328,6 +377,38 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize("credential_in_path", [False, True], ids=["query", "path"])
+def test_reconciliation_hints_keep_endpoint_credentials_private(credential_in_path):
+    with submission_keeper(lambda _key: None) as base:
+        secret = "fixture-endpoint-secret"
+        if credential_in_path:
+            endpoint = f"{base.removesuffix('/query')}/{secret}/query"
+        else:
+            endpoint = f"{base}?api_key={secret}"
+        save_trade_session(endpoint)
+        attempts = [
+            subprocess.run(
+                close_trade_args(endpoint),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            for _ in range(2)
+        ]
+    received, blocked = attempts
+    assert (received.returncode, blocked.returncode) == (5, 1)
+    for result in attempts:
+        assert secret not in result.stdout + result.stderr
+        assert endpoint not in result.stdout + result.stderr
+    error, block = [json.loads(result.stdout)["error"] for result in attempts]
+    assert error["hint"] == block["hint"]
+    assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error["hint"]
+    assert error["hint"].endswith(
+        f"intent status {TRADE_ADDR} --key {error['intentKey']}"
+    )
 
 
 def test_two_processes_cannot_reserve_same_position(tmp_path, monkeypatch):

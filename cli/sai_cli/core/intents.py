@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import re
-import shlex
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from secrets import choice
@@ -197,7 +196,7 @@ def submit(
         raise keeper.OutcomeUnknown(
             f"Outcome unknown for intent {key}; reconcile before another trade",
             key,
-            hint=shlex.join(["sai", "intent", "status", account, "--key", key]),
+            hint=storage.intent_status_hint(endpoint, account, key),
         ) from exc
     storage.set_status(key, endpoint, account, "accepted")
     return {
