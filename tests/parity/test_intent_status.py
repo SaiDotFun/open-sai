@@ -341,24 +341,32 @@ def compare(
 @pytest.mark.parametrize(
     ("name", "local"),
     [
-        ("started", "unknown"),
-        ("jwt_failed", "unknown"),
-        ("user_rejected", "unknown"),
-        ("user_sign_failed", "unknown"),
-        ("user_submitted", "unknown"),
-        ("accepted", "accepted"),
-        ("submitted", "accepted"),
-        ("pending_exec", "pending"),
-        ("chain_execution_failed", "terminal"),
-        ("market_order_expired", "terminal"),
-        ("market_order_fill_failed", "terminal"),
-        ("market_order_trading_paused", "terminal"),
-        ("market_order_market_closed", "terminal"),
-        ("market_order_trade_not_open", "terminal"),
-        ("simulation_failed", "terminal"),
-        ("admission_expired", "terminal"),
-        ("broadcast_rejected", "terminal"),
-        ("absent", "absent"),
+        pytest.param("started", "unknown", id="started"),
+        pytest.param("jwt_failed", "unknown", id="jwt_failed"),
+        pytest.param("user_rejected", "unknown", id="user_rejected"),
+        pytest.param("user_sign_failed", "unknown", id="user_sign_failed"),
+        pytest.param("user_submitted", "unknown", id="user_submitted"),
+        pytest.param("accepted", "accepted", id="accepted"),
+        pytest.param("submitted", "accepted", id="submitted"),
+        pytest.param("pending_exec", "pending", id="pending_exec"),
+        pytest.param("chain_execution_failed", "terminal", id="chain_execution_failed"),
+        pytest.param("market_order_expired", "terminal", id="market_order_expired"),
+        pytest.param(
+            "market_order_fill_failed", "terminal", id="market_order_fill_failed"
+        ),
+        pytest.param(
+            "market_order_trading_paused", "terminal", id="market_order_trading_paused"
+        ),
+        pytest.param(
+            "market_order_market_closed", "terminal", id="market_order_market_closed"
+        ),
+        pytest.param(
+            "market_order_trade_not_open", "terminal", id="market_order_trade_not_open"
+        ),
+        pytest.param("simulation_failed", "terminal", id="simulation_failed"),
+        pytest.param("admission_expired", "terminal", id="admission_expired"),
+        pytest.param("broadcast_rejected", "terminal", id="broadcast_rejected"),
+        pytest.param("absent", "absent", id="absent"),
     ],
 )
 def test_lifecycle(
@@ -374,24 +382,56 @@ def test_lifecycle(
 @pytest.mark.parametrize(
     ("history", "local"),
     [
-        (("server_finality", "open_history"), "terminal"),
-        (("user_finality", "not_yet_in_history", "not_yet_in_history"), "pending"),
-        (("other_trade_finality", "other_trade_history"), "terminal"),
-        (("other_trade_executed", "other_trade_history"), "terminal"),
-        (("limit_placement_exec_pass", "limit_placement_history"), "terminal"),
-        (("filled", "not_yet_in_history", "not_yet_in_history"), "terminal"),
-        (("outcome_not_indexed", "not_yet_in_history", "filled_history"), "terminal"),
-        (
+        pytest.param(
+            ("server_finality", "open_history"), "terminal", id="server-finality"
+        ),
+        pytest.param(
+            ("user_finality", "not_yet_in_history", "not_yet_in_history"),
+            "pending",
+            id="user-finality-empty-history",
+        ),
+        pytest.param(
+            ("other_trade_finality", "other_trade_history"),
+            "terminal",
+            id="other-trade-finality",
+        ),
+        pytest.param(
+            ("other_trade_executed", "other_trade_history"),
+            "terminal",
+            id="other-trade-executed",
+        ),
+        pytest.param(
+            ("limit_placement_exec_pass", "limit_placement_history"),
+            "terminal",
+            id="limit-placement",
+        ),
+        pytest.param(
+            ("filled", "not_yet_in_history", "not_yet_in_history"),
+            "terminal",
+            id="filled-without-history",
+        ),
+        pytest.param(
+            ("outcome_not_indexed", "not_yet_in_history", "filled_history"),
+            "terminal",
+            id="late-fill",
+        ),
+        pytest.param(
             ("outcome_not_indexed", "not_yet_in_history", "not_yet_in_history"),
             "pending",
+            id="unresolved",
         ),
-        (("outcome_not_indexed", Reply(status=503)), "pending"),
-        (
+        pytest.param(
+            ("outcome_not_indexed", Reply(status=503)),
+            "pending",
+            id="service-unavailable",
+        ),
+        pytest.param(
             (
                 "outcome_not_indexed",
                 Reply(response("not_yet_in_history").body, body_delay=2.25),
             ),
             "pending",
+            id="body-timeout",
         ),
     ],
 )
@@ -433,7 +473,9 @@ def test_malformed_history_page_stays_pending_without_retry(
     )
 
 
-@pytest.mark.parametrize("key", [KEY, None])
+@pytest.mark.parametrize(
+    "key", [pytest.param(KEY, id="keyed"), pytest.param(None, id="unkeyed")]
+)
 def test_late_admission_and_stale_results(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
@@ -538,24 +580,44 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
 @pytest.mark.parametrize(
     ("replies", "local", "error"),
     [
-        (
+        pytest.param(
             (Reply(status=302, headers=(("Location", "/elsewhere"),)),),
             "unknown",
             "KEEPER_ERROR",
+            id="redirect",
         ),
-        ((Reply(status=401),), "unknown", "KEEPER_ERROR"),
-        ((Reply(status=500),), "unknown", "KEEPER_ERROR"),
-        ((Reply(disconnect=True),), "unknown", "KEEPER_ERROR"),
-        ((Reply(b"malformed"),), "unknown", "KEEPER_ERROR"),
-        ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
-        ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
-        (({"data": {"userIntents": 123}},), "unknown", None),
-        (({"data": {"userIntents": [None]}},), "unknown", None),
-        (("outcome_not_indexed", {"data": {}}), "pending", None),
-        (
+        pytest.param(
+            (Reply(status=401),), "unknown", "KEEPER_ERROR", id="unauthorized"
+        ),
+        pytest.param(
+            (Reply(status=500),), "unknown", "KEEPER_ERROR", id="server-error"
+        ),
+        pytest.param(
+            (Reply(disconnect=True),), "unknown", "KEEPER_ERROR", id="disconnect"
+        ),
+        pytest.param(
+            (Reply(b"malformed"),), "unknown", "KEEPER_ERROR", id="invalid-json"
+        ),
+        pytest.param(
+            (Reply(b"[]"),), "unknown", "KEEPER_ERROR", id="non-object-response"
+        ),
+        pytest.param(
+            (Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR", id="null-data"
+        ),
+        pytest.param(
+            ({"data": {"userIntents": 123}},), "unknown", None, id="non-list-intents"
+        ),
+        pytest.param(
+            ({"data": {"userIntents": [None]}},), "unknown", None, id="null-intent-row"
+        ),
+        pytest.param(
+            ("outcome_not_indexed", {"data": {}}), "pending", None, id="missing-history"
+        ),
+        pytest.param(
             ("outcome_not_indexed", {"data": {"perp": {"tradeHistory": None}}}),
             "pending",
             None,
+            id="null-history",
         ),
     ],
 )
@@ -667,17 +729,33 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("args", "exit_code", "code"),
     [
-        (("--json",), 2, "INVALID_REQUEST"),
-        (("--json", "config"), 2, "INVALID_REQUEST"),
-        (("--bad-option", "--json", "intent", "status", ADDR), 2, "INVALID_REQUEST"),
-        (("--json", "intent", "status"), 2, "INVALID_REQUEST"),
-        (
+        pytest.param(("--json",), 2, "INVALID_REQUEST", id="root-usage"),
+        pytest.param(
+            ("--json", "intent"), 2, "INVALID_REQUEST", id="intent-group-usage"
+        ),
+        pytest.param(("--json", "config"), 2, "INVALID_REQUEST", id="config-usage"),
+        pytest.param(
+            ("--bad-option", "--json", "intent", "status", ADDR),
+            2,
+            "INVALID_REQUEST",
+            id="unknown-option",
+        ),
+        pytest.param(
+            ("--json", "intent", "status"), 2, "INVALID_REQUEST", id="status-usage"
+        ),
+        pytest.param(
             ("--json", "intent", "status", ADDR, "--key"),
             2,
             "INVALID_REQUEST",
+            id="missing-key",
         ),
-        (("--json", "config", "get", "invalid"), 2, "INVALID_REQUEST"),
-        (
+        pytest.param(
+            ("--json", "config", "get", "invalid"),
+            2,
+            "INVALID_REQUEST",
+            id="invalid-config",
+        ),
+        pytest.param(
             (
                 "--json",
                 "--endpoint",
@@ -688,8 +766,9 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             ),
             1,
             "KEEPER_ERROR",
+            id="http-endpoint",
         ),
-        (
+        pytest.param(
             (
                 "--json",
                 "--endpoint",
@@ -700,8 +779,9 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             ),
             1,
             "KEEPER_ERROR",
+            id="userinfo-endpoint",
         ),
-        (("--json", "auth", "status"), 6, "SIGNED_OUT"),
+        pytest.param(("--json", "auth", "status"), 6, "SIGNED_OUT", id="signed-out"),
     ],
 )
 def test_cli_errors_share_one_envelope(
@@ -729,11 +809,20 @@ def test_cli_errors_share_one_envelope(
     assert outputs[0] == outputs[1]
 
 
-def test_intent_help(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(("intent",), id="group"),
+        pytest.param(("intent", "status"), id="status"),
+    ],
+)
+def test_intent_help(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, command: tuple[str, ...]
+) -> None:
     outputs = []
     for index, cli in enumerate(cli_pair):
         home = tmp_path / str(index)
-        result = invoke(cli, home, "intent", "status", "--help")
+        result = invoke(cli, home, *command, "--help")
         assert result.returncode == 0
         assert not result.stderr
         assert not home.exists()

@@ -121,7 +121,10 @@ to the CLI cases and the MCP transcripts.
 The focused Rust CI comparison uses `--release-xfails`. The file
 `release-xfails.toml` maps exact failing pytest IDs to the open PR that owns
 each gap. The cases still run, and an unexpected pass fails CI so the fixing
-PR can remove its mark. Run without the option to see the raw failures.
+PR removes its marks in the same change. Keep a scenario's explicit pytest
+ID when changing its fixture. If a first fix exposes a second known gap,
+retain the scenario and update its expected failure with the next owner.
+Run without the option to see the raw failures.
 
 ## Auth Subprocess Cases
 
