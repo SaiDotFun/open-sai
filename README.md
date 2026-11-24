@@ -143,8 +143,8 @@ It edits the existing registration under its current name and scope.
 
 Running `install` again reports `unchanged`. Install replaces a `sai` entry
 that uses an older command, sets other environment variables, or is disabled
-in Codex. Install reports a working `sai-mcp` entry under its existing name and
-scope. If the `sai-mcp` entry needs repair, run `sai doctor`.
+in Codex. Install reports a working legacy entry under its existing name and
+scope. If the legacy entry needs repair, run `sai doctor`.
 
 `uninstall` removes Sai from every scope it is registered in unless
 you pass `--scope`. When Codex loads a different `sai` entry from the current project's
