@@ -551,6 +551,17 @@ def safe_observe(
     return result
 
 
+def expect_native_mcp_info(output: list[dict[str, Any]], profile: str) -> str | None:
+    if profile != "session":
+        return None
+    report = output[2]["result"]["content"][0]["text"]
+    trading = report["trading"]
+    if trading["available"] is True and trading["reason"] == "signed-in":
+        trading.update(available=False, reason="not-implemented")
+        return "Native trading is unavailable while the trade tools are deferred"
+    return None
+
+
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
 ) -> tuple[list[str], dict[str, str], str | None]:
@@ -592,8 +603,10 @@ def run_case(
             tools,
             None,
         )
-    diffs = differences(left, right)
     expected = None
+    if case.mode == "mcp" and reference != candidate:
+        expected = expect_native_mcp_info(left.output, case.mcp_profile)
+    diffs = differences(left, right)
     if (
         diffs
         and case.expected_overview_help

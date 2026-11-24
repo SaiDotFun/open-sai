@@ -76,9 +76,9 @@ impl StoredSession {
                 let reason = match (matches, expired) {
                     (false, _) => "other-endpoint",
                     (true, true) => "expired",
-                    (true, false) => "signed-in",
+                    (true, false) => "not-implemented",
                 };
-                json!({"available": *matches && !expired, "reason": reason, "addr": session.addr()})
+                json!({"available": false, "reason": reason, "addr": session.addr()})
             }
         }
     }
