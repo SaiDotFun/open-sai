@@ -1,11 +1,14 @@
-"""Confirm position quotes through MCP against loopback Keeper and LCD routes."""
+"""Confirm position quotes through CLI and MCP against loopback Keeper and LCD."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
 import json
+import logging
 import threading
+import time
+import traceback
 from collections import deque
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
@@ -21,7 +24,8 @@ from click.testing import CliRunner
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
-from sai_cli.core import keeper, settings, storage
+from sai_cli.core import keeper, margin, settings, storage
+from sai_cli.core.errors import ExitCode
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
 
@@ -33,6 +37,10 @@ TRADER = "nibi1trader"
 
 @dataclass
 class Position:
+    chain_id: str = CHAIN_ID
+    contract_address: str = "nibi1contract"
+    lcd_chain_id: str | None = None
+    lcd_chain_ids: deque[str] = field(default_factory=deque)
     collateral: int = 4_000_000
     trade_type: str = "trade"
     keeper_market_open: bool = True
@@ -64,6 +72,8 @@ class Position:
     minimum_position_microusd: str = "1"
     preview_inputs: bool = False
     malformed_node_info: bool = False
+    deny_lcd: bool = False
+    denied_lcd_targets: list[str] = field(default_factory=list)
     price: float | str = 100.5
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
@@ -119,8 +129,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     keeper.ROUTE: {
                         "oneClickTrading": {
                             "enabled": True,
-                            "chainId": CHAIN_ID,
-                            "contractAddress": "nibi1contract",
+                            "chainId": position.chain_id,
+                            "contractAddress": position.contract_address,
                         }
                     },
                     keeper.POSITION: {
@@ -141,13 +151,20 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.reply({"data": data})
 
         def do_GET(self) -> None:
+            if position.deny_lcd:
+                position.denied_lcd_targets.append(self.path)
+                self.reply({}, status=401)
+                return
             path = urlsplit(self.path).path
             if path == "/cosmos/base/tendermint/v1beta1/node_info":
+                network = position.lcd_chain_id or position.chain_id
+                if position.lcd_chain_ids:
+                    network = position.lcd_chain_ids.popleft()
                 self.reply(
                     {
                         "default_node_info": None
                         if position.malformed_node_info
-                        else {"network": CHAIN_ID}
+                        else {"network": network}
                     }
                 )
                 return
@@ -168,7 +185,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     }
                 )
                 return
-            prefix = "/cosmwasm/wasm/v1/contract/nibi1contract/smart/"
+            prefix = f"/cosmwasm/wasm/v1/contract/{position.contract_address}/smart/"
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
@@ -372,7 +389,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
 
 
 @asynccontextmanager
-async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
+async def connected_client(
+    base_url: str, *, lcd_endpoint: str | None = None
+) -> AsyncGenerator[ClientSession]:
     endpoint = f"{base_url}/query"
     storage.save_session(
         {
@@ -383,7 +402,7 @@ async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
         }
     )
     config = settings.load(
-        flags={"keeper.endpoint": endpoint, "lcd.endpoint": base_url}
+        flags={"keeper.endpoint": endpoint, "lcd.endpoint": lcd_endpoint or base_url}
     )
     mcp = create_server(config)
     async with create_connected_server_and_client_session(mcp._mcp_server) as client:
@@ -398,6 +417,171 @@ async def call(
     block = result.content[0]
     assert isinstance(block, TextContent)
     return json.loads(block.text)
+
+
+position_commands = pytest.mark.parametrize(
+    ("tool", "args", "command"),
+    [
+        (
+            "margin",
+            {"trade_id": 7, "direction": "add", "amount": "1"},
+            ["margin", "7", "--direction", "add", "--amount", "1"],
+        ),
+        (
+            "partial_close",
+            {"trade_id": 7, "percent": 50},
+            ["partial-close", "7", "--percent", "50"],
+        ),
+    ],
+)
+
+
+def position_cli_args(base_url: str, command: list[str]) -> list[str]:
+    return [
+        "--json",
+        "--endpoint",
+        f"{base_url}/query",
+        "--lcd-endpoint",
+        base_url,
+        "trade",
+        *command,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "route_key"),
+    [
+        ("chain_id", "test-2", "chainId"),
+        ("contract_address", "nibi1replacement", "contractAddress"),
+    ],
+)
+@position_commands
+def test_position_confirmation_binds_keeper_route(
+    position_service: tuple[Position, str],
+    field: str,
+    value: str,
+    route_key: str,
+    tool: str,
+    args: dict[str, Any],
+    command: list[str],
+) -> None:
+    position, base_url = position_service
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, command)
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            cli_preview = cli.invoke(main, [*cli_args, "--dry-run"])
+            assert cli_preview.exit_code == 0, cli_preview.output
+            digest = preview["previewDigest"]
+            assert json.loads(cli_preview.stdout)["previewDigest"] == digest
+
+            setattr(position, field, value)
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            assert json.loads(cli_refusal.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
+            mcp_refusal = await call(
+                client, f"trade_{tool}", {**args, "preview_digest": digest}
+            )
+            assert mcp_refusal["code"] == "PREVIEW_MISMATCH", mcp_refusal
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+            fresh = mcp_refusal["preview"]
+            assert fresh["intent"] == preview["intent"]
+            assert fresh["quote"] == preview["quote"]
+            assert fresh["positionRoute"] == {
+                **preview["positionRoute"],
+                route_key: value,
+            }
+            assert fresh["previewDigest"] != digest
+            assert fresh == await call(client, f"preview_{tool}", args)
+
+            accepted = cli.invoke(
+                main, [*cli_args, "--preview-digest", fresh["previewDigest"]]
+            )
+            assert accepted.exit_code == 0, accepted.output
+            assert json.loads(accepted.stdout)["status"] == "accepted"
+            (submitted,) = position.submitted
+            assert {key: submitted[key] for key in fresh["intent"]} == fresh["intent"]
+
+    asyncio.run(scenario())
+
+
+@position_commands
+def test_position_confirmation_refuses_lcd_only_network_switch(
+    position_service: tuple[Position, str],
+    tool: str,
+    args: dict[str, Any],
+    command: list[str],
+) -> None:
+    position, base_url = position_service
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, command)
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            digest = preview["previewDigest"]
+            trade_args = {**args, "preview_digest": digest}
+
+            position.lcd_chain_id = "test-2"
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            mcp_error = await call(client, f"trade_{tool}", trade_args)
+            assert cli_error["code"] == mcp_error["code"] == "PREVIEW_MISMATCH"
+            assert cli_error["message"] == mcp_error["error"]
+            assert "Use an LCD on Keeper's chain" in cli_error["message"]
+            assert "details" not in cli_error and "preview" not in mcp_error
+
+            for flags in ([], ["--dry-run"]):
+                cli_invalid = cli.invoke(main, [*cli_args, *flags])
+                assert (
+                    json.loads(cli_invalid.stdout)["error"]["code"] == "INVALID_REQUEST"
+                )
+            assert (await call(client, f"preview_{tool}", args))[
+                "code"
+            ] == "INVALID_REQUEST"
+
+            position.lcd_chain_id = None
+            position.malformed_node_info = True
+            malformed = await call(client, f"trade_{tool}", trade_args)
+            assert malformed["code"] == "INVALID_REQUEST"
+            position.malformed_node_info = False
+            position.leverage = "2.5"
+            position.lcd_chain_ids.append("test-2")
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            assert cli_error["code"] == "PREVIEW_MISMATCH"
+
+            position.lcd_chain_ids.append("test-2")
+            mcp_error = await call(client, f"trade_{tool}", trade_args)
+            assert mcp_error["code"] == "PREVIEW_MISMATCH"
+            fresh = await call(client, f"preview_{tool}", args)
+            assert cli_error["details"]["preview"] == mcp_error["preview"] == fresh
+            assert fresh["previewDigest"] != digest
+            assert fresh["positionRoute"] == preview["positionRoute"]
+
+            position.lcd_chain_ids.append("test-2")
+            plain_refusal = cli.invoke(
+                main, [*cli_args[1:], "--preview-digest", digest]
+            )
+            assert plain_refusal.exit_code == ExitCode.REJECTED
+            assert "Run with --dry-run" in plain_refusal.stderr
+
+            position.trade_type = "limit"
+            position.lcd_chain_ids.append("test-2")
+            unavailable = await call(client, f"trade_{tool}", trade_args)
+            assert unavailable["code"] == "PREVIEW_MISMATCH"
+            assert "Could not refresh the position preview" in unavailable["error"]
+            assert "preview" not in unavailable
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -1105,6 +1289,53 @@ def test_malformed_lcd_keeps_the_limit_preview_and_digest_refusal(position_servi
             assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+def test_lcd_http_failure_logs_only_the_origin_in_an_embedded_server(
+    position_service, caplog
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.deny_lcd = True
+    path_key, query_key = "fixture-private-lcd-path", "fixture-private-lcd-query"
+    lcd = f"{base_url}/{path_key}?key={query_key}"
+
+    async def preview():
+        async with connected_client(base_url, lcd_endpoint=lcd) as client:
+            return await call(
+                client,
+                "preview_open",
+                {
+                    "market_id": 0,
+                    "side": "long",
+                    "order_type": "limit",
+                    "price": "100",
+                    "amount": "10",
+                    "leverage": "2",
+                    "slippage": "1",
+                },
+            )
+
+    with caplog.at_level(logging.INFO):
+        quote = asyncio.run(preview())
+        with pytest.raises(margin.QueryHeightMismatch) as denied:
+            margin.block_header(lcd, "latest", deadline=time.monotonic() + 5)
+    assert quote["estimates"]["fees"]["status"] == "unavailable"
+    assert position.submitted == []
+    assert any(record.name == "httpx" for record in caplog.records)
+    assert caplog.text.count(f"LCD HTTP response from {base_url} (status 401)") == 2
+    assert position.denied_lcd_targets[0] == (
+        f"/{path_key}{margin.NODE_INFO_PATH}?key={query_key}"
+    )
+    assert position.denied_lcd_targets[1].startswith(
+        f"/{path_key}{margin.BLOCK_PATH}latest?key={query_key}&_sai_query="
+    )
+    log_data = caplog.text + repr([record.args for record in caplog.records])
+    error_trace = "".join(traceback.format_exception(denied.value))
+    for secret in (path_key, query_key):
+        assert secret not in log_data
+        assert secret not in error_trace + json.dumps(quote)
+    assert f"LCD at {base_url} returned HTTP 401" in error_trace
 
 
 def test_mcp_market_refuses_first_step_excess_of_one_price_atom(position_service):
