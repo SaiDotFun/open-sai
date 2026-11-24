@@ -246,17 +246,14 @@ fn main() -> process::ExitCode {
                 ),
             }
         }
-        Err(error) => {
-            let (code, mut failure) =
-                print_parse_error(&error, command, operands, requested_json, home);
-            if auth_attempt
-                && code == ExitCode::Usage
-                && let Some(failure) = &mut failure
-            {
-                failure.message = auth_usage_log_message(&error, command, &failure.message).into();
-            }
-            (code, failure)
-        }
+        Err(error) => print_parse_error(
+            &error,
+            command,
+            operands,
+            requested_json,
+            home,
+            auth_attempt,
+        ),
     };
     start_log();
     finish(
@@ -475,34 +472,30 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
     }
 }
 
-// Clap's usage diagnostics can include operands and unknown option names.
-fn auth_usage_log_message<'a>(error: &clap::Error, command: &str, message: &'a str) -> &'a str {
+// Return a diagnostic that is safe for both terminal output and the log.
+fn auth_usage_error(error: &clap::Error, command: &str) -> SaiError {
     let option = (error.kind() == ErrorKind::UnknownArgument)
         .then(|| context_text(error, ContextKind::InvalidArg))
         .flatten()
         .filter(|arg| arg.starts_with('-'));
-    if option == Some("--json") {
+    let message = if option == Some("--json") {
         "No such option: --json"
     } else if command == "auth import" {
         "Unexpected arguments to auth import."
     } else if option.is_some() {
         "No such option for auth."
-    } else if error.kind() == ErrorKind::MissingRequiredArgument {
-        message
+    } else if error.kind() == ErrorKind::MissingRequiredArgument
+        && let Some(missing) = usage_error(error, command, &[])
+    {
+        return missing;
     } else {
         "Invalid arguments to auth."
-    }
+    };
+    SaiError::usage(message)
 }
 
 fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<SaiError> {
     let arg = context_text(error, ContextKind::InvalidArg);
-    if command == "auth import"
-        && !(error.kind() == ErrorKind::UnknownArgument
-            && arg == Some("--json")
-            && operands.first().is_some_and(|arg| arg == "--json"))
-    {
-        return Some(SaiError::usage("Unexpected arguments to auth import."));
-    }
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
             let command = context_text(error, ContextKind::InvalidSubcommand)?;
@@ -589,6 +582,7 @@ fn print_parse_error(
     operands: &[String],
     json: bool,
     home: Option<&Path>,
+    auth_attempt: bool,
 ) -> (ExitCode, Option<SaiError>) {
     let help = || {
         config::help(command)
@@ -693,6 +687,14 @@ fn print_parse_error(
         }
         _ => command,
     };
+    if auth_attempt {
+        return complete(
+            Err(auth_usage_error(error, command)),
+            Some(usage_command),
+            json,
+            home,
+        );
+    }
     if let Some(usage) = usage_error(error, usage_command, operands) {
         if !json && error.kind() == ErrorKind::InvalidValue && usage_command.is_empty() {
             eprintln!("Error: {}", usage.message);

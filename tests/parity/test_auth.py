@@ -114,14 +114,32 @@ def assert_unexposed(env: Env, output: str, *secrets: str) -> None:
         ("auth", "login"),
         ("auth", "use"),
         ("--json", "auth", "login"),
-        ("--json", "auth", "login", "--addr"),
-        ("--json", "auth", "login", "--account", "dev"),
     ],
 )
 def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> None:
     python, rust = homes(tmp_path, auth_pair)
     expected = observed(python.run(*args))
     assert expected[0] == (0 if "--help" in args else 2)
+    assert observed(rust.run(*args)) == expected
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--json", "auth", "login", "--addr"),
+        ("--json", "auth", "login", "--account", "dev"),
+        ("auth", "use", ADDR, "synthetic-rejected-extra-operand"),
+        ("--json", "auth", "use", ADDR, "synthetic-rejected-extra-operand"),
+    ],
+    ids=["missing-option-value", "unknown-option", "extra-text", "extra-json"],
+)
+def test_auth_parse_errors_are_private(
+    tmp_path: Path, auth_privacy_pair: tuple[CLI, CLI], args: CLI
+) -> None:
+    python, rust = homes(tmp_path, auth_privacy_pair)
+    expected = observed(python.run(*args))
+    assert expected[0] == 2
+    assert "synthetic-rejected-extra-operand" not in expected[1] + expected[2]
     assert observed(rust.run(*args)) == expected
 
 
@@ -162,7 +180,11 @@ def test_auth_logs_omit_argument_values(
     marker = "synthetic-auth-argument-value"
     for env in homes(tmp_path, auth_privacy_pair):
         env.extra_env["SAI_LOG"] = "1"
-        env.run(*(arg.replace("{private}", marker) for arg in args))
+        result = env.run(*(arg.replace("{private}", marker) for arg in args))
+        assert_unexposed(env, result.stdout + result.stderr, marker)
+        if parse_error is not None:
+            assert result.returncode == 2
+            assert parse_error in result.stderr
         logs = [
             path.read_text(encoding="utf-8")
             for path in (env.home / "logs").glob("*.jsonl")
