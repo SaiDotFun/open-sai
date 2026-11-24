@@ -24,8 +24,11 @@ import pytest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
+from network import require_loopback, restricted, unroutable_packets
 from scenarios import ADDRESS, OTHER_ADDRESS, Endpoints, child_env, loopback, seed_home
 from trade_replay import REQUEST_HASH, SESSION, TradeReplay
+
+pytestmark = pytest.mark.parity_namespace
 
 REFERENCE = "973f3f59f38dd89d0c2e03e674157934a00316ae"
 KEY = "20261124T120000000Z_0123456789ABCDEF"
@@ -53,6 +56,16 @@ print("reserved", file=sys.stderr, flush=True)
 if "SAI_TEST_RESERVE_WAIT" in os.environ:
     sys.stdin.buffer.read(1)
 """
+
+
+@pytest.fixture(autouse=True)
+def loopback_only() -> Generator[None]:
+    require_loopback()
+    before = unroutable_packets()
+    yield
+    assert unroutable_packets() == before, (
+        "A shared-state subprocess attempted network egress"
+    )
 
 
 @pytest.fixture(scope="module")
@@ -117,7 +130,7 @@ class Home:
 
     def invoke(self, runner: Runtime, *args: str) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
-            [*runner.cli, *args],
+            restricted([*runner.cli, *args]),
             cwd=self.path,
             env=self.env,
             stdin=subprocess.DEVNULL,
@@ -196,7 +209,7 @@ def reservation(
     if pause:
         env["SAI_TEST_RESERVE_WAIT"] = "1"
     with subprocess.Popen(
-        args,
+        restricted(args),
         cwd=home.path,
         env=env,
         stdin=subprocess.PIPE,
@@ -578,9 +591,10 @@ def test_submission_times_out_after_keeper_receives_mutation(
 
 @asynccontextmanager
 async def mcp_session(home: Home, runner: Runtime) -> AsyncGenerator[ClientSession]:
+    command, *args = restricted([*runner.cli, "mcp", "serve"])
     params = StdioServerParameters(
-        command=runner.cli[0],
-        args=[*runner.cli[1:], "mcp", "serve"],
+        command=command,
+        args=args,
         cwd=home.path,
         env=home.env,
     )

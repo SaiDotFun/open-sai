@@ -97,7 +97,7 @@ jobs:
           PROFILE
           fi
           unshare -Urn ip link set lo up
-          uv run pytest -m parity_namespace tests/parity
+          uv run pytest -m parity_namespace tests/parity --ignore=tests/parity/test_trade_shared_state.py
           uv run python tests/parity/parity.py
 
   check:
@@ -208,4 +208,14 @@ jobs:
             | .executable | select(. != null)
           ')"
           export SAI_PARITY_RESERVE_BIN
-          uv run --locked pytest tests/parity/test_trade_shared_state.py -rs
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          uv run --locked python tests/parity/network.py -m parity_namespace tests/parity/test_trade_shared_state.py -rs

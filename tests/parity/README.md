@@ -144,7 +144,10 @@ cargo test --locked -p sai-core --test storage --no-run
 Set `SAI_PYTHON_REFERENCE` to the pinned checkout, `SAI_PARITY_BIN` to the
 absolute path of the compiled Rust CLI, and `SAI_PARITY_RESERVE_BIN` to
 the storage test executable printed by the last Cargo command. Run
-`uv run --locked pytest tests/parity/test_trade_shared_state.py -rs`.
+`uv run --locked python tests/parity/network.py -m parity_namespace tests/parity/test_trade_shared_state.py -rs`.
+The network launcher requires Linux user namespaces, `libseccomp`, and the
+system commands listed at the top of this file. Direct pytest selection also
+checks that only loopback is available before launching any CLI or MCP process.
 
 Each case starts with a private `SAI_HOME` and uses fixture credentials
 against loopback Keeper and LCD servers. The crash cases stop the real
