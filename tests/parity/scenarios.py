@@ -138,20 +138,48 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         path.write_text(text, encoding="utf-8")
         path.chmod(0o600)
         return
-    session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
+    if seed == "mcp-info-cache":
+        path = sai_home / "update.json"
+        path.write_text(
+            '{"schema": 1, "latest": "sai-cli/v0.99.0", "checkedAt": "2000-01-01T00:00:00Z"}',
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
+        return
     sessions = []
     if seed in {"session", "accounts", "history-token"}:
-        sessions.append({**session, "endpoint": endpoints.keeper})
+        sessions.append(session_fixture(endpoints, "session"))
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+    write_seed(home, endpoints, sessions, ledger=seed == "ledger")
+
+
+def session_fixture(endpoints: Endpoints, state: str) -> dict[str, Any]:
+    session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
+    return {
+        **session,
+        "endpoint": endpoints.keeper if state != "other-endpoint" else endpoints.http,
+        "expiresAt": "2000-01-01T00:00:00Z"
+        if state == "expired"
+        else session["expiresAt"],
+    }
+
+
+def write_seed(
+    home: Path,
+    endpoints: Endpoints,
+    sessions: list[dict[str, Any]],
+    *,
+    ledger: bool = False,
+) -> None:
     subprocess.run(
         [sys.executable, "-c", SEED],
         input=json.dumps(
             {
                 "sessions": sessions,
-                "ledger": seed == "ledger",
+                "ledger": ledger,
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
@@ -383,7 +411,14 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     self.admit_close(request.variables)
                     return
                 if name in responses:
-                    if not same_variables(request.variables, variables.get(name, {})):
+                    expected = variables.get(name, {})
+                    if (
+                        scenario == "mcp-reads"
+                        and name == "userIntents"
+                        and request.variables.get("key") is None
+                    ):
+                        expected = {**expected, "key": None}
+                    if not same_variables(request.variables, expected):
                         self.reject(f"Wrong Keeper variables for {name}")
                     elif scenario == "interrupt-http":
                         interrupt_ready.set()

@@ -262,6 +262,52 @@ def doctor_checks(checks: Any) -> None:
                 )
 
 
+def normalize_mcp_result(result: dict[str, Any]) -> None:
+    info = result.get("serverInfo")
+    if isinstance(info, dict):
+        replace_if(info, "version", is_version)
+    for block in result.get("content", []):
+        if block.get("type") != "text":
+            continue
+        text = block["text"]
+        if not isinstance(text, str):
+            raise TypeError("MCP text content must be a string")
+        if result.get("isError"):
+            continue
+        if result.get("structuredContent") != {"result": text}:
+            raise ValueError("MCP structuredContent must carry the same JSON string")
+        value = json.loads(text)
+        if isinstance(value, dict) and value.get("name") == "sai":
+            for version in ("version", "installedVersion", "mcpVersion"):
+                replace_if(value, version, is_version)
+            # Each implementation reports its own installation or checkout.
+            # Validate the shape before substituting a common path.
+            provenance = value["provenance"]
+            kind = provenance.get("kind")
+            path = provenance.get("path")
+            if (
+                kind not in {"installed", "source-checkout"}
+                or not isinstance(path, str)
+                or not Path(path).is_absolute()
+            ):
+                raise ValueError("Invalid MCP server provenance")
+            keys = {"kind", "path"}
+            if kind == "source-checkout":
+                keys.add("git")
+                git = provenance.get("git")
+                if git is not None and (
+                    set(git) != {"commit", "dirty"}
+                    or not re.fullmatch(r"[0-9a-f]{40,64}", git["commit"])
+                    or type(git["dirty"]) is not bool
+                ):
+                    raise ValueError("Invalid MCP server Git provenance")
+            if set(provenance) != keys:
+                raise ValueError("Unexpected MCP server provenance fields")
+            value["provenance"] = "<provenance>"
+        block["text"] = value
+        result["structuredContent"]["result"] = value
+
+
 def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
     if raw == "":
         return ""
@@ -278,19 +324,7 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
             return [normalize.log_event(record) for record in records]
         if mode == "mcp":
             for record in records:
-                result = record.get("result", {})
-                info = result.get("serverInfo")
-                if isinstance(info, dict):
-                    replace_if(info, "version", is_version)
-                if isinstance(result.get("tools"), list):
-                    result["tools"].sort(key=lambda tool: tool["name"])
-                for block in result.get("content", []):
-                    if block.get("type") == "text":
-                        try:
-                            block["text"] = json.loads(block["text"])
-                        except (json.JSONDecodeError, TypeError):
-                            pass
-            records.sort(key=lambda record: str(record.get("id", "")))
+                normalize_mcp_result(record.get("result", {}))
         return normalize.paths(records)
     value = normalize.paths(json.loads(raw))
     if (

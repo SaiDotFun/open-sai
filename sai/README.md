@@ -19,6 +19,12 @@ GraphQL envelope and projects each row to validated public fields. The `account 
 command reads one WebSocket snapshot. Use `watch price TOKEN_ID`, `watch
 balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 
+`sai mcp serve` exposes the Sai tool inventory over stdio. The Rust server
+handles `mcp_info`, market and account reads, and local and Keeper intent
+lookups. Auth, preview, trade, and `logs_intent` calls that pass validation
+return `NOT_IMPLEMENTED`. Trade calls check the stored session first and
+return the usual session refusal when it cannot trade.
+
 ## Port Order
 
 C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
@@ -30,6 +36,10 @@ Logging v2 and intent wait have their own port work. [Port tracker #49](https://
 C5 compares read and watch commands against Python on `main` at
 `ea09f0d417a53a71079bb8c5e426005fa29051a4`. These commands emit schema v2
 events, including keyed endpoint IDs for Keeper HTTP reads.
+C8 compares stdio against Python at
+`ea09f0d417a53a71079bb8c5e426005fa29051a4` with CPython 3.12.
+The [MCP parity command](../tests/parity/README.md#compare-mcp-stdio) uses
+its own Python executable.
 
 | Lane | Acceptance criteria |
 | --- | --- |
