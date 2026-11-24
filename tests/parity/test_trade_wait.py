@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import select
 import signal
 import subprocess
 import time
@@ -479,3 +480,86 @@ def test_trade_wait_recovers_when_stdout_closes(
             assert ledger_state(home) == [(key, "terminal", "terminal")]
             documents.append(normalized(document, key))
     assert documents[0] == documents[1]
+
+
+def test_trade_wait_interrupts_a_full_stdout_pipe(
+    wait_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kind = "CLOSE_POSITION"
+    with replay() as (endpoint, replies, requests):
+        for index, cli in enumerate(wait_cli_pair):
+            home = tmp_path / str(index) / "sai"
+            connect(home, endpoint, monkeypatch)
+            requests.clear()
+            replies.extend(
+                (
+                    lambda request: accepted(submitted_key(request, kind), kind),
+                    lambda _: response(
+                        intent(
+                            "filled",
+                            kind=kind,
+                            intentKey=submitted_key(requests[0], kind),
+                        )
+                    ),
+                    lambda _: response(
+                        history(
+                            indexed(
+                                "position_closed_user",
+                                intentKey=submitted_key(requests[0], kind),
+                            )
+                        )
+                    ),
+                )
+            )
+            read_fd, write_fd = os.pipe()
+            os.set_blocking(write_fd, False)
+            try:
+                while True:
+                    os.write(write_fd, b"x" * 4096)
+            except BlockingIOError:
+                os.set_blocking(write_fd, True)
+            try:
+                with subprocess.Popen(
+                    [*cli, "--endpoint", endpoint, "--json", "trade", *CLOSE, "--wait"],
+                    env=cli_environment(home),
+                    cwd=home.parent,
+                    stdout=write_fd,
+                    stderr=subprocess.PIPE,
+                ) as process:
+                    try:
+                        end = time.monotonic() + 3
+                        while len(requests) < 3 and time.monotonic() < end:
+                            time.sleep(0.01)
+                        assert len(requests) == 3
+                        time.sleep(0.15)
+                        assert process.poll() is None
+                        assert os.get_blocking(write_fd), (
+                            "CLI changed the inherited pipe's flags"
+                        )
+                        process.send_signal(signal.SIGINT)
+                        assert process.stderr is not None
+                        assert select.select([process.stderr], [], [], 3)[0], (
+                            "no stderr recovery with stdout blocked"
+                        )
+                        document = json.loads(process.stderr.readline())
+                        if index == 1:
+                            assert process.wait(timeout=3) == 1
+                        # Let Python's final stdout flush finish after reading recovery.
+                        os.set_blocking(read_fd, False)
+                        while select.select([read_fd], [], [], 0)[0]:
+                            if not os.read(read_fd, 65536):
+                                break
+                        assert process.wait(timeout=3) == 1
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+            finally:
+                os.close(read_fd)
+                os.close(write_fd)
+            key = submitted_key(requests[0], kind)
+            assert document["intentKey"] == key
+            assert document["interrupted"] is True
+            assert document["localStatus"] == document["outcome"] == "terminal"
+            assert ledger_state(home) == [(key, "terminal", "terminal")]

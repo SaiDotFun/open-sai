@@ -1,9 +1,10 @@
 mod python_numbers;
+mod receipt_output;
 
 use std::{
     fmt::Write as _,
     io::{self, Write},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use chrono::Utc;
@@ -21,6 +22,7 @@ use sai_core::{
 use serde::Serialize;
 use serde_json::ser::{Formatter, PrettyFormatter};
 use serde_json::{Value, json};
+use tokio::signal::unix::{self, Signal, SignalKind};
 
 use crate::{load_settings, usage};
 
@@ -228,17 +230,21 @@ pub fn intent(
             let addr = addr
                 .filter(|addr| !addr.is_empty())
                 .or_else(|| as_addr.map(str::to_owned));
-            let addr = match addr {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| SaiError::internal())?;
+            return runtime.block_on(async {
+                let mut signal = wait_signal()?;
+                let addr = match addr {
                 Some(addr) => Some(addr),
                 None => {
-                    let busy = timeout
-                        .saturating_sub(started.elapsed())
-                        .min(std::time::Duration::from_millis(i32::MAX as u64));
-                    match storage
-                        .clone()
-                        .with_busy_timeout(busy)
-                        .intent_record(endpoint, &key)
-                    {
+                    let local = tokio::select! {
+                        biased;
+                        _ = signal.recv() => return Err(wait_aborted()),
+                        record = wait_account_record(&storage, endpoint, &key, started, timeout) => record,
+                    };
+                    match local {
                         Ok(Some((addr, _))) => Some(addr),
                         Ok(None) if storage.session_exists() => {
                             let session = storage.load_session(None)?;
@@ -253,7 +259,8 @@ pub fn intent(
                                 env,
                                 json,
                                 false,
-                            );
+                                &mut signal,
+                            ).await;
                         }
                         Err(error) => return Err(error.into()),
                     }
@@ -265,15 +272,10 @@ pub fn intent(
                     "Pass --addr with the account that submitted this intent",
                 )
             })?;
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|_| SaiError::internal())?;
-            let (receipt, recovered) = runtime.block_on(async {
-                tokio::select! {
+                let (receipt, recovered) = tokio::select! {
                     biased;
-                    signal = tokio::signal::ctrl_c() => (
-                        wait::recovery_result(&storage, endpoint, &addr, &key, signal.is_ok(), None), true,
+                    _ = signal.recv() => (
+                        wait::recovery_result(&storage, endpoint, &addr, &key, true, None), true,
                     ),
                     receipt = wait::for_intent(endpoint, &addr, &key, timeout, started, &storage, events) => {
                         match receipt {
@@ -281,43 +283,95 @@ pub fn intent(
                             Err(_) => (wait::recovery_result(&storage, endpoint, &addr, &key, false, None), true),
                         }
                     }
-                }
+                };
+                emit_wait(receipt, endpoint, env, json, recovered, &mut signal).await
             });
-            return emit_wait(receipt, endpoint, env, json, recovered);
         }
     }
     Ok(ExitCode::Ok)
 }
 
-pub(crate) fn emit_wait(
+pub(crate) fn wait_signal() -> Result<Signal, SaiError> {
+    unix::signal(SignalKind::interrupt()).map_err(|_| SaiError::internal())
+}
+
+pub(crate) fn wait_aborted() -> SaiError {
+    SaiError::new(Code::InvalidRequest, "Aborted")
+}
+
+async fn wait_account_record(
+    storage: &Storage<'_>,
+    endpoint: &str,
+    key: &str,
+    started: Instant,
+    timeout: Duration,
+) -> Result<Option<(String, String)>, sai_core::storage::StorageError> {
+    let storage = storage.clone().with_busy_timeout(Duration::ZERO);
+    loop {
+        let record = storage.intent_record(endpoint, key);
+        match &record {
+            Err(error) if wait::ledger_busy(error) => {
+                let left = timeout.saturating_sub(started.elapsed());
+                if left.is_zero() {
+                    return record;
+                }
+                tokio::time::sleep(left.min(Duration::from_millis(10))).await;
+            }
+            _ => return record,
+        }
+    }
+}
+
+pub(crate) async fn emit_wait(
     receipt: wait::ResultReceipt,
     endpoint: &str,
     env: &Environment,
     json: bool,
     recovered: bool,
+    signal: &mut Signal,
 ) -> Result<ExitCode, SaiError> {
     let confirmation = match receipt.outcome {
         outcome @ (wait::Outcome::Rejected | wait::Outcome::NotSent) => Some(outcome),
         _ => None,
     };
     let (body, exit) = wait_output(receipt, endpoint, env, json, recovered);
-    let text = encode_wait(&body, json)?;
-    let mut stdout = io::stdout().lock();
-    if writeln!(stdout, "{}", ascii_json(&text))
-        .and_then(|()| stdout.flush())
-        .is_ok()
+    let line = encode_wait_line(&body, json)?;
+    let mut output_started = false;
+    let interrupted = tokio::select! {
+        biased;
+        _ = signal.recv() => true,
+        output = async {
+            output_started = true;
+            receipt_output::write_stdout(line).await
+        } => {
+            if output.is_ok() {
+                return Ok(exit);
+            }
+            false
+        }
+    };
+    let (Some(addr), Some(key)) = (body["addr"].as_str(), body["intentKey"].as_str()) else {
+        return Err(if interrupted {
+            wait_aborted()
+        } else {
+            SaiError::internal()
+        });
+    };
+    let storage = Storage::new(&env.home);
+    let interrupted = interrupted || body["interrupted"].as_bool().unwrap_or(false);
+    let receipt = wait::recovery_result(&storage, endpoint, addr, key, interrupted, confirmation);
+    let (body, exit) = wait_output(receipt, endpoint, env, json, true);
+    let line = encode_wait_line(&body, json)?;
+    if !output_started
+        && tokio::select! {
+            biased;
+            _ = signal.recv() => false,
+        output = receipt_output::write_stdout(line.clone()) => output.is_ok(),
+        }
     {
         return Ok(exit);
     }
-    let (Some(addr), Some(key)) = (body["addr"].as_str(), body["intentKey"].as_str()) else {
-        return Err(SaiError::internal());
-    };
-    let storage = Storage::new(&env.home);
-    let interrupted = body["interrupted"].as_bool().unwrap_or(false);
-    let receipt = wait::recovery_result(&storage, endpoint, addr, key, interrupted, confirmation);
-    let (body, exit) = wait_output(receipt, endpoint, env, json, true);
-    let text = encode_wait(&body, json)?;
-    let _ = writeln!(io::stderr().lock(), "{}", ascii_json(&text));
+    let _ = io::stderr().lock().write_all(line.as_bytes());
     Ok(exit)
 }
 
@@ -489,13 +543,16 @@ pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     Ok(())
 }
 
-fn encode_wait(value: &Value, json: bool) -> Result<String, SaiError> {
+fn encode_wait_line(value: &Value, json: bool) -> Result<String, SaiError> {
     use python_numbers::PythonNumbers;
-    if json {
+    let text = if json {
         encode(value, PythonNumbers(InlineJson))
     } else {
         encode(value, PythonNumbers(PrettyFormatter::new()))
-    }
+    }?;
+    let mut line = ascii_json(&text).into_owned();
+    line.push('\n');
+    Ok(line)
 }
 
 fn encode(value: &impl Serialize, formatter: impl Formatter) -> Result<String, SaiError> {

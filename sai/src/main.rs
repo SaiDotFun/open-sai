@@ -8,7 +8,7 @@ use clap::{
     Parser, Subcommand,
     error::{ContextKind, ContextValue, ErrorKind},
 };
-use sai_core::errors::{ExitCode, SaiError};
+use sai_core::errors::{Code, ExitCode, SaiError};
 use sai_core::log::{self, EXIT_FLUSH, EventContext, Field, Level, LogWriter, Surface};
 use sai_core::settings::{Environment, Flags, Settings, SettingsError, repr};
 use serde_json::{Value, json};
@@ -211,6 +211,13 @@ fn complete(
     };
     let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
     let message = redact(&error.message);
+    if error.code == Code::InvalidRequest && error.message == "Aborted" {
+        eprintln!();
+        if !json_output {
+            eprintln!("Aborted!");
+            return (error.exit_code, Some(error));
+        }
+    }
     if json_output {
         let mut body =
             json!({"code": error.code, "message": message, "retryable": error.retryable()});

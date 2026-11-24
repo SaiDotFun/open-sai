@@ -193,7 +193,8 @@ pub fn run(
                 true,
             ))
         };
-        let (mut receipt, metadata, recovered) = runtime.block_on(async {
+        return runtime.block_on(async {
+            let mut signal = local::wait_signal()?;
             let waited = async {
                 let submission = trading
                     .submit_with_reference_price(
@@ -241,25 +242,23 @@ pub fn run(
                 .await?;
                 Ok((receipt, metadata, false))
             };
-            tokio::select! {
+            let (mut receipt, metadata, recovered) = tokio::select! {
                 biased;
-                signal = tokio::signal::ctrl_c() => recover(
-                    signal.is_ok(), SaiError::new(Code::InvalidRequest, "Aborted"),
-                ),
+                _ = signal.recv() => recover(true, local::wait_aborted()),
                 result = waited => result.or_else(|error| recover(false, error)),
+            }?;
+            if let Some(mut metadata) = metadata {
+                let Value::Object(body) = receipt.body else {
+                    return Err(SaiError::internal());
+                };
+                metadata.extend(body);
+                receipt.body = Value::Object(metadata);
             }
-        })?;
-        if let Some(mut metadata) = metadata {
-            let Value::Object(body) = receipt.body else {
-                return Err(SaiError::internal());
-            };
-            metadata.extend(body);
-            receipt.body = Value::Object(metadata);
-        }
-        if !recovered {
-            receipt.body["status"] = json!(receipt.outcome);
-        }
-        return local::emit_wait(receipt, endpoint, env, json, recovered);
+            if !recovered {
+                receipt.body["status"] = json!(receipt.outcome);
+            }
+            local::emit_wait(receipt, endpoint, env, json, recovered, &mut signal).await
+        });
     }
     let (result, reference_price) = runtime.block_on(trading.submit_with_reference_price(
         &session,

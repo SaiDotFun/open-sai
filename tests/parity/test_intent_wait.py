@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import signal
 import sqlite3
+import subprocess
 import time
 from contextlib import closing
 from copy import deepcopy
@@ -20,6 +22,7 @@ from test_intent_status import (
     OTHER,
     RESPONSES,
     Reply,
+    cli_environment,
     invoke,
     read_events,
     replay,
@@ -501,3 +504,59 @@ def test_wait_bounds_account_lookup_when_ledger_is_locked(
             ]
             observed.append(document)
     assert observed[0] == observed[1]
+
+
+def test_wait_interrupts_locked_account_lookup(
+    wait_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with replay() as (endpoint, _, requests):
+        for index, cli in enumerate(wait_cli_pair):
+            home = tmp_path / str(index) / "sai"
+            seed(home, endpoint, monkeypatch, "unknown")
+            with closing(sqlite3.connect(home / "trader/intents.sqlite3")) as db:
+                db.execute("BEGIN EXCLUSIVE")
+                with subprocess.Popen(
+                    [
+                        *cli,
+                        "--endpoint",
+                        endpoint,
+                        "--json",
+                        "intent",
+                        "wait",
+                        KEY,
+                        "--timeout",
+                        "1.5",
+                    ],
+                    env=cli_environment(home),
+                    cwd=home.parent,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                ) as process:
+                    try:
+                        end = time.monotonic() + 3
+                        while (
+                            not list((home / "logs").glob("*.jsonl"))
+                            and time.monotonic() < end
+                        ):
+                            time.sleep(0.01)
+                        assert list((home / "logs").glob("*.jsonl"))
+                        time.sleep(0.15)
+                        assert process.poll() is None
+                        process.send_signal(signal.SIGINT)
+                        stdout, stderr = process.communicate(timeout=3)
+                    finally:
+                        if process.poll() is None:
+                            process.kill()
+                    assert process.returncode == 1
+            assert stderr == b"\n"
+            assert json.loads(stdout) == {
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": "Aborted",
+                    "retryable": False,
+                },
+            }
+            assert not requests
+            assert ledger_state(home)[0] == (KEY, "unknown", None)
