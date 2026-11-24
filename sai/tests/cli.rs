@@ -56,7 +56,7 @@ fn missing_relative_config_leaves_sai_home_absent() {
     let root = tempdir().unwrap();
     let output = sai()
         .current_dir(root.path())
-        .env("SAI_HOME", "relative-home")
+        .env("SAI_HOME", "./relative-home//./")
         .args(["--json", "config", "list"])
         .output()
         .unwrap();

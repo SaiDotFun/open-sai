@@ -1,4 +1,7 @@
-use std::{env, fs, io, path::PathBuf};
+use std::{
+    env, fs, io,
+    path::{Component, Path, PathBuf},
+};
 
 use toml_edit::Document;
 
@@ -17,14 +20,69 @@ pub struct ConfigListing {
 }
 
 pub fn config_path() -> io::Result<PathBuf> {
-    let home = env::var_os("SAI_HOME")
-        .map(PathBuf::from)
-        .or_else(|| env::home_dir().map(|path| path.join(".sai")));
-    let Some(home) = home else {
-        let message = "Cannot find the home directory";
-        return Err(io::Error::new(io::ErrorKind::NotFound, message));
+    config_path_from(env::var_os("SAI_HOME").map(PathBuf::from), python_home())
+}
+
+fn config_path_from(sai_home: Option<PathBuf>, home: Option<PathBuf>) -> io::Result<PathBuf> {
+    // The Python settings reader evaluates Path.home() even with a Sai home override.
+    let Some(home) = home.filter(|path| !path.as_os_str().as_encoded_bytes().starts_with(b"~"))
+    else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "Cannot find the home directory",
+        ));
     };
-    Ok(home.join("config.toml"))
+    let home = sai_home.unwrap_or_else(|| home.join(".sai"));
+    Ok(normalize_path(&home).join("config.toml"))
+}
+
+#[cfg(unix)]
+fn python_home() -> Option<PathBuf> {
+    posix_home(env::var_os("HOME").map(PathBuf::from), env::home_dir)
+}
+
+#[cfg(unix)]
+fn posix_home(
+    home: Option<PathBuf>,
+    account_home: impl FnOnce() -> Option<PathBuf>,
+) -> Option<PathBuf> {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let home = home.or_else(account_home)?;
+    let bytes = home.as_os_str().as_bytes();
+    let end = bytes.iter().rposition(|&byte| byte != b'/');
+    let expanded = end.map_or(&b"/"[..], |end| &bytes[..=end]);
+    Some(PathBuf::from(OsStr::from_bytes(expanded)))
+}
+
+#[cfg(windows)]
+fn python_home() -> Option<PathBuf> {
+    env::var_os("USERPROFILE").map(PathBuf::from).or_else(|| {
+        let path = env::var_os("HOMEPATH")?;
+        let drive = env::var_os("HOMEDRIVE").unwrap_or_default();
+        Some(PathBuf::from(drive).join(path))
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn python_home() -> Option<PathBuf> {
+    env::home_dir()
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = path.components();
+    let mut normalized = PathBuf::new();
+    #[cfg(unix)]
+    {
+        let bytes = path.as_os_str().as_encoded_bytes();
+        if bytes.starts_with(b"//") && !bytes.starts_with(b"///") {
+            normalized.push("//");
+            components.next();
+        }
+    }
+    normalized.extend(components.filter(|part| *part != Component::CurDir));
+    normalized
 }
 
 /// List recognized keys present in the file. This stub leaves resolution and
@@ -64,4 +122,25 @@ pub fn list_config() -> io::Result<ConfigListing> {
         path,
         configured_keys,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_home_uses_root_and_missing_home_uses_account_directory() {
+        let account_home = || Some(PathBuf::from("/home/fixture"));
+        let empty = posix_home(Some(PathBuf::new()), account_home);
+        let missing = posix_home(None, account_home);
+
+        assert_eq!(
+            config_path_from(None, empty).unwrap(),
+            Path::new("/.sai/config.toml")
+        );
+        assert_eq!(
+            config_path_from(None, missing).unwrap(),
+            Path::new("/home/fixture/.sai/config.toml")
+        );
+    }
 }
