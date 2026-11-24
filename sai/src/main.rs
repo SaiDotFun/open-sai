@@ -140,7 +140,7 @@ impl Cli {
                 auth::dispatch(command, self.account.as_deref(), &flags, env, json, events)
             }
             Some(Command::Intent { command, .. }) => {
-                local::intent(command, self.account.as_deref(), &flags, env, json, events)
+                return local::intent(command, self.account.as_deref(), &flags, env, json, events);
             }
             Some(Command::Config { command }) => command.run(&flags, env, json),
             Some(Command::Mcp(args)) => args.run(
@@ -159,7 +159,7 @@ impl Cli {
                 command.run(env, &flags, self.account.as_deref(), json)
             }
             Some(Command::Trade { command }) => {
-                trade::run(command, self.account.as_deref(), &flags, env, json, events)
+                return trade::run(command, self.account.as_deref(), &flags, env, json, events);
             }
             None if self.skill => skill::show(None),
             None if json => Err(SaiError::usage("Pass a command when using --json.")),
