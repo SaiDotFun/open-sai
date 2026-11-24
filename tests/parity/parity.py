@@ -103,12 +103,16 @@ class Case:
 
     def rust_case(self) -> Case:
         wire = list(self.wire or [])
-        if self.name.startswith(("trade-margin", "trade-partial-close")):
+        if self.position_case:
             # Rust checks the position owner before its first LCD request.
             for index in range(len(wire) - 2):
                 if wire[index : index + 3] == ["oneClickTrading", "node_info", "trade"]:
                     wire[index + 1 : index + 3] = ["trade", "node_info"]
         return replace(self, **{"wire": wire, **(self.rust or {})})
+
+    @property
+    def position_case(self) -> bool:
+        return self.name.startswith(("trade-margin", "trade-partial-close"))
 
 
 @dataclass(frozen=True)
@@ -668,6 +672,8 @@ def run_case(
             )
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
+    if rust and case.position_case:
+        project_position_estimates(left.output)
     if rust and case.accepted_difference and case.mode != "mcp":
         diffs = []
         if right.exit_code != candidate_case.expect:
@@ -677,16 +683,6 @@ def run_case(
         if left.stderr != right.stderr:
             diffs.append("stderr differs")
     else:
-        if rust and case.accepted_difference and case.mode == "mcp":
-            # Both sides already checked the digest fields. Compare the rest,
-            # including the duplicate MCP structured-content representation.
-            reference_output = json.dumps(left.output)
-            for path, expected in (case.output or {}).items():
-                if path.endswith(".previewDigest"):
-                    reference_output = reference_output.replace(
-                        expected, (candidate_case.output or {})[path]
-                    )
-            left = replace(left, output=json.loads(reference_output))
         diffs = differences(left, right)
     expected = case.accepted_difference if rust else None
     if (
@@ -709,6 +705,18 @@ def run_case(
             elif not diffs:
                 tools[tool] = "PASS"
     return diffs, tools, expected
+
+
+def project_position_estimates(value: Any) -> None:
+    """Compare position quotes independently of Python's newer read-only estimates."""
+    if isinstance(value, list):
+        for item in value:
+            project_position_estimates(item)
+    elif isinstance(value, dict):
+        if value.get("dryRun") and "positionRoute" in value:
+            value.pop("estimates", None)
+        for item in value.values():
+            project_position_estimates(item)
 
 
 def cli_commands(group: click.Group, prefix: str = "") -> set[str]:

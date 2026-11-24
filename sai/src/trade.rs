@@ -87,6 +87,9 @@ pub struct Position {
     lcd_endpoint: Option<String>,
     #[arg(long)]
     dry_run: bool,
+    /// Confirm the digest printed by --dry-run.
+    #[arg(long)]
+    preview_digest: Option<String>,
 }
 
 #[derive(ValueEnum, Clone, Copy)]
@@ -350,21 +353,28 @@ impl Position {
             .as_deref()
             .unwrap_or_else(|| settings.lcd_endpoint());
         let mode = if self.dry_run {
-            PositionMode::DryRun
+            PositionMode::Preview
         } else {
-            PositionMode::Submit(None)
+            PositionMode::Submit(
+                self.preview_digest
+                    .as_deref()
+                    .map(trade::Confirmation::for_position_cli),
+            )
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| SaiError::internal())?;
-        let result = runtime.block_on(trading.position_trade(
-            account,
-            lcd_endpoint,
-            &self.trade_id,
-            action,
-            mode,
-        ))?;
+        let result = runtime
+            .block_on(trading.position_trade(account, lcd_endpoint, &self.trade_id, action, mode))
+            .map_err(|mut error| {
+                if !json && error.code == Code::PreviewMismatch && error.details.is_some() {
+                    error
+                        .message
+                        .push_str(" Run with --dry-run to review a fresh preview.");
+                }
+                error
+            })?;
         local::emit(&result, json)
     }
 }

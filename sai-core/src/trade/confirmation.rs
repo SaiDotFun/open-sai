@@ -15,6 +15,7 @@ const MISMATCH: &str = "The trade no longer matches the preview the user confirm
 pub struct Confirmation<'a> {
     digest: &'a str,
     reference_price: Option<(&'a str, u128)>,
+    position_cli: bool,
 }
 
 impl<'a> Confirmation<'a> {
@@ -28,7 +29,20 @@ impl<'a> Confirmation<'a> {
         Ok(Self {
             digest,
             reference_price,
+            position_cli: false,
         })
+    }
+
+    pub fn for_position_cli(digest: &'a str) -> Self {
+        Self {
+            digest,
+            reference_price: None,
+            position_cli: true,
+        }
+    }
+
+    pub(super) fn is_position_cli(&self) -> bool {
+        self.position_cli
     }
 
     pub(super) fn verify(self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
@@ -62,6 +76,12 @@ impl<'a> Confirmation<'a> {
             ..SaiError::new(code, message)
         };
         if preview_digest(&confirmed, Some(account)) != self.digest {
+            if self.position_cli {
+                return Err(SaiError::new(
+                    Code::PreviewMismatch,
+                    "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting.",
+                ));
+            }
             return Err(refusal(Code::PreviewMismatch, MISMATCH.into()));
         }
         if let (Some((_, reference)), Some(current)) =

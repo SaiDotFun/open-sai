@@ -763,6 +763,7 @@ wire = [
     "get_pair_custom_max_leverage", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market"] }
 
 [[case]]
 name = "trade-partial-close"
@@ -776,8 +777,10 @@ wire = [
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
-# C7b position cases use Python ea09f0d417a53a71079bb8c5e426005fa29051a4.
-# This reference includes the preview binding from PR 58.
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price"] }
+output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212" }
+
+# C7b position cases use the Python ownership and confirmation contracts from PRs 148 and 150.
 [[case]]
 name = "trade-margin-foreign-trader"
 args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1", "--dry-run"]
@@ -868,6 +871,7 @@ output = { "error.message" = "Invalid value for '--percent': '5__0' is not a val
 name = "trade-partial-close-unicode-percent"
 args = ["--json", "trade", "partial-close", "7", "--percent", "٥_٠", "--dry-run"]
 seed = "session"
+server = "position-default"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
@@ -917,7 +921,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.actualDeltaUsdc" = "999999", "quote.marginChangeIsEstimate" = true }
+output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.actualDeltaUsdc" = "999999", "quote.marginChangeIsEstimate" = true, "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
 
 [[case]]
 name = "trade-margin-signed-out-before-amount"
@@ -1059,17 +1063,17 @@ args = ["--json", "trade", "partial-close", "7", "--percent", "99", "--dry-run"]
 seed = "session"
 server = "position-index-lag"
 expect = 1
-wire = [
-    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance",
-]
+wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw", "trade", "get_trade_raw", "trade", "get_trade_raw"]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "error.message" = "Indexed position differs from contract state; wait for synchronization and retry" }
+output = { "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted." }
+accepted_difference = "Python retries stale Keeper index reads. Rust refuses the stale snapshot immediately."
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.message" = "Indexed position differs from contract state; wait for synchronization and retry" } }
 
 [[case]]
 name = "trade-partial-close-market-minimum"
 args = ["--json", "trade", "partial-close", "7", "--percent", "99", "--dry-run"]
 seed = "session"
+server = "position-default"
 expect = 1
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
@@ -1083,7 +1087,7 @@ name = "trade-partial-close-live-leverage-change"
 args = ["--json", "trade", "partial-close", "7", "--percent", "50"]
 seed = "session"
 server = "partial-preview-changed"
-expect = 1
+expect = 4
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
@@ -1093,6 +1097,66 @@ wire = [
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.message" = "Position changed; review the reduction again" }
+
+[[case]]
+name = "trade-partial-close-confirm-current-route"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "partial-accepted"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price", "recordUserIntent",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted" }
+output = { "status" = "accepted" }
+
+[[case]]
+name = "trade-partial-close-refuse-stale-chain"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "position-chain-changed"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
+
+[[case]]
+name = "trade-partial-close-refuse-stale-contract"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "position-contract-changed"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
+
+[[case]]
+name = "trade-partial-close-refuse-wrong-lcd-on-confirm"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "position-wrong-chain"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "oneClickTrading", "node_info",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "Keeper trading route and LCD network do not match. Use an LCD on Keeper's chain and request a new preview." }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "oneClickTrading", "trade", "node_info"] }
 
 [[case]]
 name = "trade-partial-close-accepted"
@@ -1144,9 +1208,7 @@ wire = [
     "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "1.result.content.0.text.previewDigest" = "9802cf3c7f2700d76cee2290b3799fbe054977bbe3fe3adf4c40fe4711db2b8e" }
-accepted_difference = "Rust includes the chain and contract in the preview digest."
-rust = { output = { "1.result.content.0.text.previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4", "1.result.content.0.text.quote.requestedLeverage" = "1.122334476175891794" } }
+output = { "1.result.content.0.text.previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
 
 [[case]]
 name = "trade-partial-close-mcp-changed-leverage"
@@ -1154,7 +1216,7 @@ args = ["mcp", "serve"]
 mode = "mcp"
 mcp_calls = [
     { name = "preview_partial_close", arguments = { trade_id = 7, percent = 50 } },
-    { name = "trade_partial_close", arguments = { trade_id = 7, percent = 50, preview_digest = "8f1c017ea7f28a2eb445bf1531681ad7ad2e2342eef9d2ff25389828df28b4d3" } },
+    { name = "trade_partial_close", arguments = { trade_id = 7, percent = 50, preview_digest = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212" } },
 ]
 seed = "session"
 server = "partial-preview-changed"
@@ -1167,13 +1229,6 @@ wire = [
     "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market", "get_collateral_price",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "1.result.content.0.text.previewDigest" = "8f1c017ea7f28a2eb445bf1531681ad7ad2e2342eef9d2ff25389828df28b4d3", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "65e315784c6c12a5e076391804e5b07e7c8c279f1f8ff6f8d8eed8ed0fcf68a6" }
-accepted_difference = "Rust includes the chain and contract in both preview digests."
-[case.rust]
-mcp_calls = [
-    { name = "preview_partial_close", arguments = { trade_id = 7, percent = 50 } },
-    { name = "trade_partial_close", arguments = { trade_id = 7, percent = 50, preview_digest = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212" } },
-]
 output = { "1.result.content.0.text.previewDigest" = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "9d1e0a934de703d77be13e9a3fe7f2586b7db77c848e7bac3af1858810d50fe7" }
 
 [[case]]

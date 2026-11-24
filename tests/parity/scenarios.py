@@ -42,6 +42,7 @@ NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 HEIGHT_HEADER = "x-cosmos-block-height"
 POSITION_HEIGHT = "120"
 POSITION_SCENARIOS = {
+    "position-default",
     "position-precision",
     "position-after-hours",
     "position-index-lag",
@@ -50,6 +51,8 @@ POSITION_SCENARIOS = {
     "position-foreign-contract-owner",
     "position-equivalent-owner",
     "position-wrong-index",
+    "position-chain-changed",
+    "position-contract-changed",
     "position-scientific-reduction",
     "position-no-oracle",
     "position-wrong-height",
@@ -285,7 +288,10 @@ def loopback(
         market["price"] = market_price
     recorded_markets.append(market)
     collateral = market["collateralToken"]
-    trader = OTHER_ADDRESS if scenario == "position-foreign-trader" else ADDRESS.upper()
+    trader = {
+        "position-foreign-trader": OTHER_ADDRESS,
+        "position-equivalent-owner": ADDRESS.upper(),
+    }.get(scenario, position["trader"])
     trade = {
         **position,
         "trader": trader,
@@ -301,14 +307,23 @@ def loopback(
         "trade": {"id": 7, "trader": ADDRESS},
     }
     chains = {"unknown-chain": None, "empty-chain": ""}
-    chain = chains.get(cancel_target, "cataclysm-1")
+    chain = (
+        "fixture-chain-2"
+        if scenario == "position-chain-changed"
+        else chains.get(cancel_target, "cataclysm-1")
+    )
+    contract = (
+        "nibi1replacementfixture"
+        if scenario == "position-contract-changed"
+        else CONTRACT
+    )
     responses = {
         "oneClickTrading": {
             "data": {
                 "oneClickTrading": {
                     "enabled": True,
                     "chainId": chain,
-                    "contractAddress": CONTRACT,
+                    "contractAddress": contract,
                 }
             }
         },
@@ -452,6 +467,8 @@ def loopback(
         contracts["get_collateral_price"] = "0.987654321098765432"
     if scenario == "position-index-lag":
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
+    if scenario in POSITION_SCENARIOS:
+        contracts["get_trade_raw"].pop("long", None)
     if scenario == "position-foreign-contract-owner":
         contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
     if scenario == "position-equivalent-owner":
@@ -831,7 +848,7 @@ def loopback(
                         ]
                     )
                     return
-                prefix = f"/cosmwasm/wasm/v1/contract/{CONTRACT}/smart/"
+                prefix = f"/cosmwasm/wasm/v1/contract/{contract}/smart/"
                 if path.startswith(prefix):
                     try:
                         query = json.loads(
@@ -842,9 +859,9 @@ def loopback(
                         if (
                             scenario == "position-equivalent-owner"
                             and name == "get_trade_raw"
+                            and "_sai_query" in parse_qs(url.query)
                         ):
-                            if "_sai_query" in parse_qs(url.query):
-                                expected = {**expected, "trader": position["trader"]}
+                            expected = {**expected, "trader": position["trader"]}
                         if not same_variables(query, {name: expected}):
                             self.reject(f"Wrong LCD variables for {name}")
                             return

@@ -4,6 +4,7 @@ mod quote;
 
 const KEEPER_OWNER_MISMATCH: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER_MISMATCH: &str = "Contract position belongs to a different account";
+const NETWORK_MISMATCH: &str = "Keeper trading route and LCD network do not match";
 
 use serde_json::{Map, Value, json};
 
@@ -145,7 +146,10 @@ impl Trading<'_> {
         let session = self.load_session(account)?;
         let addr = session.addr();
         let lcd = Lcd(lcd_endpoint);
-        let first = self.quote_position(&lcd, addr, &id, action).await?;
+        let confirming = matches!(&mode, PositionMode::Submit(Some(_)));
+        let first = self
+            .quote_for_position(&lcd, addr, &id, action, confirming)
+            .await?;
         let PositionMode::Submit(confirmation) = mode else {
             return Ok(match mode {
                 PositionMode::Preview => first.preview.confirmed_output(Some(addr)),
@@ -153,23 +157,24 @@ impl Trading<'_> {
             });
         };
 
-        let current = self.quote_position(&lcd, addr, &id, action).await?;
+        let cli = confirmation
+            .as_ref()
+            .is_none_or(Confirmation::is_position_cli);
+        let current = self
+            .quote_for_position(&lcd, addr, &id, action, confirming)
+            .await?;
         let changed = !current.unchanged(&lcd, &id).await?;
         if changed
             || current.snapshot.route != first.snapshot.route
             || current.preview.output(None) != first.preview.output(None)
         {
             let latest = if changed {
-                self.quote_position(&lcd, addr, &id, action).await
+                self.quote_for_position(&lcd, addr, &id, action, confirming)
+                    .await
             } else {
                 Ok(current)
             };
-            return Err(position_changed(
-                action,
-                addr,
-                latest,
-                confirmation.is_some(),
-            ));
+            return Err(position_changed(action, addr, latest, cli));
         }
         let accepted = self
             .submit(
@@ -192,6 +197,35 @@ impl Trading<'_> {
             output["warning"] = json!(current.preview.warning);
         }
         Ok(output)
+    }
+
+    async fn quote_for_position(
+        &self,
+        lcd: &Lcd<'_>,
+        addr: &str,
+        trade_id: &Value,
+        action: PositionAction<'_>,
+        confirming: bool,
+    ) -> Result<PositionQuote, SaiError> {
+        let error = match self.quote_position(lcd, addr, trade_id, action).await {
+            Err(error) if is_network_mismatch(&error) => error,
+            result => return result,
+        };
+        if !confirming {
+            return Err(invalid(&error.message));
+        }
+        let message = match self.quote_position(lcd, addr, trade_id, action).await {
+            Ok(fresh) => return Err(replacement_preview(
+                "Keeper trading route and LCD network differed during confirmation. Review the replacement preview before submitting.",
+                &fresh.preview, addr,
+            )),
+            Err(error) if is_network_mismatch(&error) => format!(
+                "{NETWORK_MISMATCH}. Use an LCD on Keeper's chain and request a new preview."
+            ),
+            Err(error) if is_owner_mismatch(&error) => return Err(error),
+            Err(_) => "Could not refresh the position preview after an LCD network mismatch. Request a new preview before submitting.".into(),
+        };
+        Err(SaiError::new(Code::PreviewMismatch, message))
     }
 
     async fn quote_position(
@@ -266,8 +300,8 @@ impl Trading<'_> {
     ) -> Result<Snapshot, SaiError> {
         let route = self.position_request(ROUTE, Map::new()).await?;
         let route = field(&route, "oneClickTrading")?;
-        if !truthy(field(route, "enabled")?) {
-            return Err(invalid("Keeper trading route and LCD network do not match"));
+        if route["enabled"] != true {
+            return Err(invalid(NETWORK_MISMATCH));
         }
         let position = self
             .position_request(
@@ -289,9 +323,21 @@ impl Trading<'_> {
             return Err(invalid("Open position not found"));
         }
         let trader = text_field(position, "trader")?;
-        let chain_id = text_field(route, "chainId")?;
-        if lcd.network().await? != chain_id {
-            return Err(invalid("Keeper trading route and LCD network do not match"));
+        let chain_id = route["chainId"]
+            .as_str()
+            .filter(|chain| !chain.is_empty())
+            .ok_or_else(|| invalid(NETWORK_MISMATCH))?;
+        let network = lcd.network().await?;
+        let network = network
+            .as_str()
+            .filter(|network| !network.is_empty())
+            .ok_or_else(|| invalid(NETWORK_MISMATCH))?;
+        let contract = route["contractAddress"]
+            .as_str()
+            .filter(|contract| !contract.is_empty())
+            .ok_or_else(|| invalid("Keeper trading route has no contract address"))?;
+        if network != chain_id {
+            return Err(SaiError::new(Code::PreviewMismatch, NETWORK_MISMATCH));
         }
         let borrowing = field(position, "perpBorrowing")?;
         let collateral = field(borrowing, "collateralToken")?;
@@ -317,7 +363,6 @@ impl Trading<'_> {
         {
             return Err(invalid("Open market data is unavailable"));
         }
-        let contract = text_field(route, "contractAddress")?;
         let token = format!("TokenIndex({token_id})");
         let (raw, _) = lcd
             .position(contract, trader, trade_id, Read::Snapshot)
@@ -541,51 +586,52 @@ fn position_changed(
     action: PositionAction<'_>,
     addr: &str,
     latest: Result<PositionQuote, SaiError>,
-    confirmed: bool,
+    cli: bool,
 ) -> SaiError {
     let message = match action {
         PositionAction::Margin { .. } => "Position changed; review the margin change again",
         PositionAction::PartialClose { .. } => "Position changed; review the reduction again",
     };
-    let code = if confirmed {
-        Code::PreviewMismatch
-    } else {
-        Code::InvalidRequest
-    };
-    let latest = match latest {
-        Ok(latest) => latest,
-        Err(error)
-            if error.code == Code::InvalidRequest
-                && matches!(
-                    error.message.as_str(),
-                    KEEPER_OWNER_MISMATCH | CONTRACT_OWNER_MISMATCH
-                ) =>
-        {
-            return error;
+    match latest {
+        Ok(latest) => {
+            let message = if cli {
+                message
+            } else {
+                "The position, quote, or route changed during confirmation, so nothing was submitted. Show the user the latest preview, get their confirmation again, then retry with its previewDigest."
+            };
+            replacement_preview(message, &latest.preview, addr)
         }
-        Err(error) => {
-            return SaiError::new(
-                code,
-                format!(
-                    "{message}. Could not quote the latest position. {}",
-                    error.message
-                ),
-            );
-        }
-    };
-    if confirmed {
-        return SaiError {
-            details: Some(Box::new(variables([(
-                "preview",
-                latest.preview.confirmed_output(Some(addr)),
-            )]))),
-            ..SaiError::new(
-                code,
-                "The position or quote changed during confirmation, so nothing was submitted. Show the user the latest preview, get their confirmation again, then retry with its previewDigest.",
-            )
-        };
+        Err(error) if is_owner_mismatch(&error) || error.code == Code::PreviewMismatch => error,
+        Err(error) => SaiError::new(
+            Code::PreviewMismatch,
+            format!(
+                "{message}. Could not quote the latest position. {}",
+                error.message
+            ),
+        ),
     }
-    SaiError::new(code, message)
+}
+
+fn replacement_preview(message: &str, preview: &TradePreview, addr: &str) -> SaiError {
+    SaiError {
+        details: Some(Box::new(variables([(
+            "preview",
+            preview.confirmed_output(Some(addr)),
+        )]))),
+        ..SaiError::new(Code::PreviewMismatch, message)
+    }
+}
+
+fn is_network_mismatch(error: &SaiError) -> bool {
+    error.code == Code::PreviewMismatch && error.message == NETWORK_MISMATCH
+}
+
+fn is_owner_mismatch(error: &SaiError) -> bool {
+    error.code == Code::InvalidRequest
+        && matches!(
+            error.message.as_str(),
+            KEEPER_OWNER_MISMATCH | CONTRACT_OWNER_MISMATCH
+        )
 }
 
 fn variables<const N: usize>(data: [(&str, Value); N]) -> Map<String, Value> {

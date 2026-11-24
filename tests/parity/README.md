@@ -94,16 +94,17 @@ by an exit before submission.
 ## Position Trade Reference
 
 The margin and partial-close cases use Python commit
-`ea09f0d417a53a71079bb8c5e426005fa29051a4`, which includes the leverage binding
-from [PR 58](https://github.com/SaiDotFun/open-sai/pull/58). The cases pin
-decimal strings and the digest bytes returned by the MCP previews. The
-ambiguous-ack cases retry in the same home and require one Keeper mutation
-and one unresolved ledger row.
+`275df9c60af376ba7d884863fb00b011cd07ae02`, including the ownership check
+from [PR 148](https://github.com/SaiDotFun/open-sai/pull/148) and route
+binding from [PR 150](https://github.com/SaiDotFun/open-sai/pull/150).
+The cases compare canonical ownership, the requested index, quote decimals,
+and preview digests. Rust checks the Keeper trader and index before contacting
+the LCD. Foreign-owner and stale-digest cases require zero reservations and
+submissions.
 
-Rust verifies that the Keeper trader belongs to the active account before
-contacting the LCD. The runner asserts the request order on each side. The
-foreign-trader cases record Python's existing behavior and require Rust to
-refuse with zero LCD calls, zero submissions, and no ledger.
+The standalone runner projects out Python-only estimates when comparing to
+Rust. It checks Python's estimate reads and Rust's quote reads separately.
+The stale-index case records Python's retries and Rust's immediate refusal.
 
 ```sh
 SAI_PARITY_PYTHON=/path/to/pinned/.venv/bin/sai \
