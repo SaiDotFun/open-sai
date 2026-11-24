@@ -1285,8 +1285,8 @@ def config_file() -> Path:
 def config_list(ctx: click.Context) -> None:
     """Show every setting with its value and source.
 
-    The source is flag, env, file, default, or derived. URLs are shown
-    without credentials; `sai config get` prints the exact value.
+    The source is flag, env, file, default, or derived. Keeper URLs are
+    shown as origins. `sai config get` prints the exact value.
     """
     shown = sai_settings.public(settings(ctx))
     if ctx.obj["json"]:
