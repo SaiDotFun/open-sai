@@ -265,7 +265,8 @@ def test_restart_after_reservation(
         home.row(KEY, replay.kind, replay.entity, "absent")
         for runner in (reader, writer):
             home.local(runner, KEY, replay.kind, "absent")
-        assert replay.counts() == {} and not endpoints.errors
+        assert replay.attempts() == {} and replay.admitted_keys() == set()
+        assert not endpoints.errors
         assert [wire.label for wire in endpoints.wire] == ["userIntents", "userIntents"]
         assert [
             (event["previous"], event["status"])
@@ -442,7 +443,8 @@ def test_lost_admission_blocks_until_reconciliation(
         assert status["matchedTradeHistory"][0]["tradeChangeType"] == action.change
         home.local(writer, key, action.kind, "terminal")
         home.row(key, action.kind, action.entity, "terminal")
-        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert replay.attempts() == {key: 1} and replay.admitted_keys() == {key}
+        assert not endpoints.errors
         assert_trade_events(home, key, ["pending", "terminal"], acked=False)
 
 
@@ -486,7 +488,8 @@ def test_trade_wait_replays_pending_then_receipt(
         else:
             assert receipt["fill"] is None
         home.row(key, action.kind, action.entity, "terminal")
-        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert replay.attempts() == {key: 1} and replay.admitted_keys() == {key}
+        assert not endpoints.errors
         assert [
             item.label
             for item in endpoints.wire
@@ -536,7 +539,8 @@ def test_wait_deadline_then_restart(
         assert receipt["intentKey"] == key and receipt["outcome"] == "filled"
         assert receipt["receipt"]["execution"]["tradeChangeType"] == action.change
         home.row(key, action.kind, action.entity, "terminal")
-        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert replay.attempts() == {key: 1} and replay.admitted_keys() == {key}
+        assert not endpoints.errors
         assert_trade_events(home, key, ["accepted", "pending", "terminal"], acked=True)
 
 
@@ -567,7 +571,8 @@ def test_submission_times_out_after_keeper_receives_mutation(
         status = home.json(reader, "intent", "status", ADDRESS, "--key", key)
         assert status["localStatus"] == "pending"
         home.row(key, replay.kind, replay.entity, "pending")
-        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert replay.attempts() == {key: 1} and replay.admitted_keys() == {key}
+        assert not endpoints.errors
         assert_trade_events(home, key, ["pending"], acked=False)
 
 
@@ -720,7 +725,7 @@ def test_cli_and_mcp_overlap(
                             f"{first_surface} exited before admission: {result}"
                         )
                     assert arrived.result(), f"{first_surface} did not reach Keeper"
-                    [key] = replay.counts()
+                    [key] = replay.admitted_keys()
                     home.row(key, replay.kind, replay.entity, "unknown")
                     sent = replay.intent(key).copy()
                     del sent["intentSchemaVersion"], sent["tsIntentInit"]
@@ -746,7 +751,7 @@ def test_cli_and_mcp_overlap(
                     assert key in blocked.get("message", blocked.get("error", ""))
                     if "intentKey" in blocked:
                         assert blocked["intentKey"] == key
-                    assert replay.counts() == {key: 1}
+                    assert replay.attempts() == {key: 1}
                 finally:
                     replay.release.set()
                     await arrived
@@ -761,7 +766,8 @@ def test_cli_and_mcp_overlap(
         replay.phase = "pending"
         home.json(reconciler, "intent", "status", ADDRESS, "--key", key)
         home.row(key, replay.kind, replay.entity, "pending")
-        assert replay.counts() == {key: 1} and not endpoints.errors
+        assert replay.attempts() == {key: 1} and replay.admitted_keys() == {key}
+        assert not endpoints.errors
         assert_trade_events(home, key, ["accepted", "pending"], acked=True)
 
 
@@ -808,5 +814,6 @@ def test_mcp_confirmation_rechecks_active_account(
             pytest.skip(
                 "Rust MCP preview_close and trade_close await signed-in handlers"
             )
-        assert replay.counts() == {} and not endpoints.errors
+        assert replay.attempts() == {} and replay.admitted_keys() == set()
+        assert not endpoints.errors
         assert not (home.path / LEDGER).exists()

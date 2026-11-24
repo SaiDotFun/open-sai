@@ -485,7 +485,7 @@ def loopback(
                 }:
                     try:
                         reply = trade_replay(request, self.headers.get("Authorization"))
-                    except ValueError as exc:
+                    except (TypeError, ValueError) as exc:
                         self.reject(str(exc))
                     else:
                         if reply is None:
