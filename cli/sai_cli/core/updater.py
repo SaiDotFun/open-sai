@@ -29,6 +29,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -37,6 +38,7 @@ import tempfile
 import threading
 import time
 import tomllib
+import zipfile
 from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -45,7 +47,7 @@ from typing import Any
 import httpx
 
 from .. import mcp_install
-from . import log, paths, update
+from . import log, native_bridge, paths, update
 from .errors import ExitCode
 
 EXIT_OK = ExitCode.OK
@@ -226,11 +228,17 @@ def _download(
 
 def expected_hash(sums: str, name: str) -> str | None:
     """Return the SHA-256 that SHA256SUMS text lists for file NAME."""
-    for line in sums.splitlines():
-        digest, _, listed = line.strip().partition(" ")
-        if listed.strip().removeprefix("*") == name and len(digest) == 64:
-            return digest.lower()
-    return None
+    matches = [
+        fields[0].lower()
+        for line in sums.splitlines()
+        if len(fields := line.split(maxsplit=1)) == 2
+        and fields[1].removeprefix("*") == name
+    ]
+    return (
+        matches[0]
+        if len(matches) == 1 and re.fullmatch(r"[0-9a-f]{64}", matches[0])
+        else None
+    )
 
 
 def sha256(path: Path) -> str:
@@ -412,16 +420,28 @@ def destination_error(
 
 
 def check_runs(
-    sai: Path, python: Path, version: str, imports: Sequence[str], runner: Runner
+    sai: Path,
+    python: Path,
+    version: str,
+    imports: Sequence[str],
+    runner: Runner,
+    *,
+    native: bool = False,
 ) -> str | None:
     """Return why SAI does not print VERSION or PYTHON cannot import the
     package, or None. Python runs isolated (`-I`), so it imports from its own
     environment and never from a working directory or PYTHONPATH."""
-    code, output = runner([str(sai), "--version"], VERIFY_TIMEOUT)
-    if code != 0:
-        return f"`sai --version` failed: {_last_line(output)}"
-    if not output.strip().endswith(f" {version}"):
-        return f"`sai --version` printed {_last_line(output)!r}, not {version}"
+    if native:
+        with tempfile.TemporaryDirectory(prefix="sai-bridge-profile-") as home:
+            problem = native_bridge.smoke(sai, version, Path(home), VERIFY_TIMEOUT)
+        if problem is not None:
+            return problem
+    else:
+        code, output = runner([str(sai), "--version"], VERIFY_TIMEOUT)
+        if code != 0:
+            return f"`sai --version` failed: {_last_line(output)}"
+        if not output.strip().endswith(f" {version}"):
+            return f"`sai --version` printed {_last_line(output)!r}, not {version}"
     statement = "import " + ", ".join(imports)
     code, output = runner([str(python), "-I", "-c", statement], VERIFY_TIMEOUT)
     if code != 0:
@@ -435,6 +455,8 @@ def verify(
     version: str,
     imports: Sequence[str],
     runner: Runner,
+    *,
+    native: bool = False,
 ) -> str | None:
     """Return why the install at PREFIX is not a working VERSION, or None.
 
@@ -444,11 +466,19 @@ def verify(
     owner = launcher_owner_error(prefix, launcher)
     if owner is not None:
         return owner
-    return check_runs(launcher, _executables(prefix)[1], version, imports, runner)
+    return check_runs(
+        launcher, _executables(prefix)[1], version, imports, runner, native=native
+    )
 
 
 def preverify(
-    spec: str, version: str, prefix: Path, uv: str, options: Options
+    spec: str,
+    version: str,
+    prefix: Path,
+    uv: str,
+    options: Options,
+    *,
+    native: bool = False,
 ) -> str | None:
     """Install SPEC into a throwaway environment and return why it is not a
     working VERSION, or None.
@@ -470,12 +500,17 @@ def preverify(
             code, output = runner(step, UV_TIMEOUT)
             if code != 0:
                 return f"uv {step[1]} failed: {_last_line(output)}"
-        return check_runs(sai, python, version, options.imports, runner)
+        return check_runs(sai, python, version, options.imports, runner, native=native)
 
 
-def install_spec(uv: str, spec: str, runner: Runner) -> str | None:
+def install_spec(
+    uv: str, spec: str, runner: Runner, *, offline: bool = False
+) -> str | None:
     """Run `uv tool install --force SPEC`; return the error, or None."""
-    code, output = runner([uv, "tool", "install", "--force", spec], UV_TIMEOUT)
+    args = [uv, "tool", "install", "--force"]
+    if offline:
+        args.append("--offline")
+    code, output = runner([*args, spec], UV_TIMEOUT)
     return None if code == 0 else f"uv tool install failed: {_last_line(output)}"
 
 
@@ -807,11 +842,15 @@ def prepare_rollback(current: Current, options: Options) -> Rollback | None:
 
 
 def restore(
-    current: Current, rollback: Rollback, options: Options, uv: str
+    current: Current,
+    rollback: Rollback,
+    options: Options,
+    uv: str,
+    *,
+    native: bool = False,
 ) -> str | None:
-    """Put CURRENT's version back from ROLLBACK and verify it. Return None
-    when it runs again, or the last error. The environment copy comes
-    first; the wheel is reinstalled only if that fails."""
+    """Restore and verify CURRENT. A shim handoff tries uv's offline wheel
+    reinstall first. Full Python updates prefer the environment copy."""
 
     def runs() -> str | None:
         return verify(
@@ -822,21 +861,29 @@ def restore(
             options.runner,
         )
 
+    def reinstall(wheel: tuple[str, str, Path]) -> str | None:
+        error = (
+            wheel_error(wheel)
+            or install_spec(uv, str(wheel[2]), options.runner, offline=native)
+            or runs()
+        )
+        if error is None:
+            with contextlib.suppress(OSError):
+                write_record(current.prefix, *wheel)
+        return error
+
     error: str | None = "nothing to roll back to"
+    if native and rollback.wheel is not None:
+        error = reinstall(rollback.wheel)
+        if error is None:
+            return None
     if rollback.snapshot is not None:
         swapped = swap_back(current.prefix, rollback.snapshot, current.launcher)
         error = swapped or runs()
         if error is None:
             return None
-    if rollback.wheel is not None:
-        error = (
-            wheel_error(rollback.wheel)
-            or install_spec(uv, str(rollback.wheel[2]), options.runner)
-            or runs()
-        )
-        if error is None:
-            with contextlib.suppress(OSError):
-                write_record(current.prefix, *rollback.wheel)
+    if not native and rollback.wheel is not None:
+        error = reinstall(rollback.wheel)
     return error
 
 
@@ -870,6 +917,7 @@ def _install(
     runner, imports = options.runner, options.imports
     wheel: tuple[str, str, Path] | None = None
     created = False
+    native = False
 
     def discard() -> None:
         """Remove the wheel this run downloaded and did not install."""
@@ -895,8 +943,26 @@ def _install(
                 str(exc) if isinstance(exc, UpdateFailed) else type(exc).__name__
             )
         spec, wheel = str(kept), (release.tag, digest, kept)
+        try:
+            native = native_bridge.is_shim(kept)
+        except zipfile.BadZipFile:
+            # Keep uv's existing trial-install diagnostic for invalid wheels.
+            pass
+        except OSError as error:
+            return unchanged(
+                f"could not inspect the release wheel: {type(error).__name__}"
+            )
+        if native and not native_bridge.supported():
+            discard()
+            message = (
+                f"Sai {target} requires a native binary for a supported platform. "
+                f"Keep the Python install with `sai-cli=={installed}`."
+            )
+            return Outcome(UNSUPPORTED, message, installed, target), False
 
-    trial = wheel_error(wheel) or preverify(spec, target, prefix, uv, options)
+    trial = wheel_error(wheel) or preverify(
+        spec, target, prefix, uv, options, native=native
+    )
     if trial is not None:
         return unchanged(f"the release failed its trial install: {trial}")
     rollback = prepare_rollback(current, options)
@@ -905,6 +971,7 @@ def _install(
             f"nothing to roll back to could be prepared: no copy of the"
             f" environment and no verified wheel of {installed}"
         )
+    retain_snapshot = False
     try:
         if options.allowed is not None and not options.allowed():
             # Turned off while this run downloaded and tested the release.
@@ -912,27 +979,35 @@ def _install(
             message = f"sai {target} is available. Run `sai update` to install it."
             return Outcome(AVAILABLE, message, installed, target), False
 
-        def failed(reason: str) -> Outcome:
+        def failed(reason: str) -> tuple[Outcome, bool]:
             """Report REASON after making sure the previous version runs."""
-            if verify(prefix, current.launcher, installed, imports, runner) is None:
+            was_replaced = native and update.installed_version(prefix) != installed
+            if (
+                not was_replaced
+                and verify(prefix, current.launcher, installed, imports, runner) is None
+            ):
                 message = f"{reason}. sai {installed} is unchanged."
-                return Outcome(FAILED, message, installed, target)
-            error = restore(current, rollback, options, uv)
+                return Outcome(FAILED, message, installed, target), True
+            error = restore(current, rollback, options, uv, native=native)
             if error is None:
                 message = f"{reason}. Rolled back to sai {installed}."
-                return Outcome(FAILED, message, installed, target, rolled_back=True)
+                return Outcome(
+                    FAILED, message, installed, target, rolled_back=True
+                ), True
             message = (
                 f"{reason}. Rolling back to sai {installed} also failed: {error}."
                 f" Reinstall with: {update.INSTALL_COMMAND}"
             )
-            return Outcome(FAILED, message, installed, target)
+            return Outcome(FAILED, message, installed, target), False
 
         interrupted = False
         try:
             # The wheel is hashed once more right before uv opens it.
             error = wheel_error(wheel) or install_spec(uv, spec, runner)
             if error is None:
-                error = verify(prefix, current.launcher, target, imports, runner)
+                error = verify(
+                    prefix, current.launcher, target, imports, runner, native=native
+                )
             if error is None and wheel is not None:
                 try:
                     write_record(prefix, *wheel)
@@ -943,8 +1018,10 @@ def _install(
             error = "interrupted"
         if error is not None:
             with _uninterrupted():
-                outcome = failed(f"Could not update to {target}: {error}")
-                discard()
+                outcome, recovered = failed(f"Could not update to {target}: {error}")
+                retain_snapshot = native and not recovered
+                if not retain_snapshot:
+                    discard()
             return outcome, interrupted
         if wheel is None:
             # A Git install has no release record; drop a stale one.
@@ -952,13 +1029,14 @@ def _install(
                 update.release_record_path(prefix).unlink(missing_ok=True)
         # Only now, verified: keep the new wheel and the one to go back to.
         prune_wheels((installed, target))
+        retain_snapshot = native
         message = (
             f"Updated sai from {installed} to {target}. Restart agent clients and"
             " any open `sai` shell so they load it."
         )
         return Outcome(UPDATED, message, target, target), False
     finally:
-        if rollback.snapshot is not None:
+        if rollback.snapshot is not None and not retain_snapshot:
             shutil.rmtree(rollback.snapshot, ignore_errors=True)
 
 
