@@ -1057,6 +1057,15 @@ def _install(
                 error = verify(
                     prefix, current.launcher, target, imports, runner, native=native
                 )
+            if error is None and native:
+                # The isolated probes leave the invoking profile's cache cold.
+                error = native_bridge.smoke(
+                    current.launcher,
+                    target,
+                    update.sai_home(),
+                    VERIFY_TIMEOUT,
+                    version_only=True,
+                )
             if error is None and wheel is not None:
                 try:
                     write_record(prefix, *wheel)

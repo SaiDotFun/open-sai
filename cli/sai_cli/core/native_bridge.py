@@ -68,7 +68,9 @@ def mcp_reply(process: subprocess.Popen[bytes], timeout: float) -> bool:
         return False
 
 
-def smoke(sai: Path, version: str, home: Path, timeout: float) -> str | None:
+def smoke(
+    sai: Path, version: str, home: Path, timeout: float, *, version_only: bool = False
+) -> str | None:
     env = {**os.environ, "SAI_HOME": str(home), "SAI_LOG": "false", "CI": "1"}
     for args in (["--version"], ["config", "get", "update.auto"]):
         label = f"`sai {' '.join(args)}`"
@@ -90,6 +92,8 @@ def smoke(sai: Path, version: str, home: Path, timeout: float) -> str | None:
             )
         if args == ["--version"] and done.stdout.strip() != f"sai {version}".encode():
             return f"{label} did not report {version}"
+        if version_only:
+            return None
     try:
         with (
             tempfile.TemporaryFile() as errors,

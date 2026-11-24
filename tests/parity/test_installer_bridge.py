@@ -544,7 +544,13 @@ def test_python_bridge_preserves_uv_and_rolls_back(
         assert json.loads(cursor.read_text()) == original
     else:
         ok(result)
+        archive_path = (
+            f"{REPO}/releases/download/sai-cli/v{version}/{asset_name(version)}"
+        )
+        del replay.assets[archive_path]
+        requests = len(replay.requests)
         install.pin(version)
+        assert len(replay.requests) == requests
         assert len(list(install.tools.glob(".sai-cli-rollback-*"))) == 1
         repaired = json.loads(cursor.read_text())["mcpServers"]
         assert repaired["sai"] == {
