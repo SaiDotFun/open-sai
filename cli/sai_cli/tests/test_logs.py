@@ -853,6 +853,20 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home, monkeypatch):
     assert "Signed out" in by_id["session"]["summary"]
 
 
+def test_doctor_logs_the_invalid_request_code_for_a_failed_config_check(
+    home, monkeypatch
+):
+    monkeypatch.setenv("PATH", "")
+    code, _ = run_cli("--endpoint", "invalid-value", "doctor", "--offline")
+    assert code == 1
+    result = events(home, "doctor.result")[0]
+    assert result["code"] == "INVALID_REQUEST"
+    assert any(
+        check["id"] == "config" and check["status"] == "fail"
+        for check in result["checks"]
+    )
+
+
 # Retention
 
 

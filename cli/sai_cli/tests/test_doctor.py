@@ -137,6 +137,7 @@ def test_config_check_reports_file_errors_without_echoing_values(
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
     report = json.loads(output)
     if expected == "fail":
+        assert report["error"]["code"] == "INVALID_REQUEST"
         report = report["error"]["details"]
     checks = {check["id"]: check for check in report["checks"]}
     assert checks["config"]["status"] == expected

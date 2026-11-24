@@ -1139,6 +1139,9 @@ def doctor_command(
         *doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline)),
     ]
     overall = doctor.overall(checks)
+    code = (
+        Code.INVALID_REQUEST if config_check.status == "fail" else Code.INTERNAL_ERROR
+    )
     log.event(
         "doctor.result",
         "info" if overall == "pass" else "warn",
@@ -1146,7 +1149,7 @@ def doctor_command(
         fix=not no_fix,
         offline=offline,
         checks=[doctor.log_entry(check) for check in checks],
-        **({"code": Code.INTERNAL_ERROR} if overall == "fail" else {}),
+        **({"code": code} if overall == "fail" else {}),
     )
     if overall == "fail":
         if not ctx.obj["json"]:
@@ -1159,7 +1162,7 @@ def doctor_command(
                 if check.status == "fail"
             )
         raise SaiError(
-            report, details=doctor.report(checks) if ctx.obj["json"] else None
+            report, code, details=doctor.report(checks) if ctx.obj["json"] else None
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
