@@ -21,4 +21,17 @@ def cli_pair() -> tuple[tuple[str, ...], tuple[str, ...]]:
     python_sai = shutil.which("sai", path=str(Path(sys.executable).parent))
     if python_sai is None:
         pytest.fail("Install the Python project in the test environment with uv sync")
-    return (python_sai,), (str(Path(executable).absolute()),)
+    rust_sai = Path(executable).resolve()
+    with rust_sai.open("rb") as binary:
+        magic = binary.read(4)
+    # Accept ELF and Mach-O executables, including macOS universal binaries.
+    native_formats = {
+        b"\x7fELF",
+        b"\xcf\xfa\xed\xfe",
+        b"\xfe\xed\xfa\xcf",
+        b"\xca\xfe\xba\xbe",
+        b"\xca\xfe\xba\xbf",
+    }
+    if magic not in native_formats or rust_sai.samefile(sys.executable):
+        pytest.fail("SAI_PARITY_BIN must point to the compiled Rust sai binary")
+    return (python_sai,), (str(rust_sai),)
