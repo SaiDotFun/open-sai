@@ -6,9 +6,10 @@ use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
 use regex::Regex;
 
 use crate::{
+    endpoint::Endpoint,
     errors::{Code, SaiError},
     log,
-    storage::{Session, SessionError, Storage, StorageError, StorageEvent},
+    storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
 };
 
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
@@ -163,6 +164,14 @@ impl Storage<'_> {
     }
 
     fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>) -> String {
+        let mut args = vec!["auth", "login", "NAME"];
+        if let Some(addr) = addr {
+            args.extend(["--addr", addr]);
+        }
+        self.keeper_command_hint(endpoint, &args)
+    }
+
+    pub fn keeper_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
         static PLAIN_KEEPER_URL: LazyLock<Regex> = LazyLock::new(|| {
             Regex::new(r"\Ahttps?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query\z")
                 .expect("valid Keeper URL pattern")
@@ -178,13 +187,47 @@ impl Storage<'_> {
             r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
                 .into()
         };
-        let mut hint = format!("sai --endpoint {flag} auth login NAME");
-        if let Some(addr) = addr {
-            hint.push_str(" --addr ");
-            hint.push_str(&shell_quote(addr));
-        }
-        hint
+        format!("sai --endpoint {flag} {}", shell_join(args))
     }
+}
+
+pub fn renewal_command(session: &Session) -> String {
+    let mut origin = String::new();
+    let mut prefix = "sai".to_owned();
+    let mut suffix = String::new();
+    if let Some(endpoint) = session.endpoint()
+        && let Some(url) = Endpoint::split(endpoint)
+    {
+        let public_origin = endpoint_origin(endpoint);
+        origin = format!(" at {public_origin}");
+        if matches!(url.path.as_str(), "" | "/" | "/query" | "/graphql")
+            && endpoint == format!("{public_origin}{}", url.path)
+        {
+            prefix.push_str(" --endpoint ");
+            prefix.push_str(&shell_quote(endpoint));
+        }
+    }
+    if prefix == "sai" {
+        suffix =
+            format!(" (reuse the Keeper endpoint{origin} configured when this session was stored)");
+    }
+    if session.key_name().is_some() {
+        format!(
+            "{prefix} auth renew {}{suffix}",
+            shell_quote(session.addr())
+        )
+    } else if session.is_imported() {
+        format!("{prefix} auth import{suffix}")
+    } else {
+        format!("{prefix} auth login NAME or {prefix} auth import{suffix}")
+    }
+}
+
+fn shell_join(args: &[&str]) -> String {
+    args.iter()
+        .map(|text| shell_quote(text))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn shell_quote(text: &str) -> String {

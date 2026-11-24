@@ -33,7 +33,7 @@ serde = "1"
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 sha2 = "0.10"
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+tokio = { version = "1", features = ["macros", "net", "process", "rt", "signal", "time"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tower = { version = "0.5", features = ["util"] }
 toml_edit = { version = "0.23.10", default-features = false, features = ["parse"] }
@@ -41,3 +41,4 @@ toml_edit = { version = "0.23.10", default-features = false, features = ["parse"
 toml_parser = "=1.0.5"
 unicode-normalization = "0.1"
 uuid = { version = "1", features = ["v4"] }
+zeroize = "1"

@@ -16,7 +16,10 @@ use super::{
     SessionError, Storage, StorageError, StorageEvent, endpoint_origin, private_file,
     remove_if_exists,
 };
-use crate::errors::{Code, SaiError};
+use crate::{
+    endpoint::Endpoint,
+    errors::{Code, SaiError},
+};
 
 const SESSIONS: &str = "sessions.json";
 const LEGACY_SESSION: &str = "session.json";
@@ -83,15 +86,59 @@ impl Session {
         self.extra.get("endpoint").and_then(Value::as_str)
     }
 
+    pub fn key_name(&self) -> Option<&str> {
+        self.extra
+            .get("keyName")
+            .and_then(Value::as_str)
+            .filter(|name| !name.is_empty())
+    }
+
+    pub fn is_imported(&self) -> bool {
+        self.extra
+            .get("source")
+            .is_some_and(|source| source == "imported")
+    }
+
+    pub(crate) fn set_key_name(&mut self, name: &str) {
+        self.extra
+            .insert("keyName".into(), Value::String(name.into()));
+    }
+
+    pub(crate) fn mark_imported(&mut self) {
+        self.extra
+            .insert("source".into(), Value::String("imported".into()));
+    }
+
     pub fn summary(&self) -> Result<SessionSummary<'_>, StorageError> {
         let endpoint = self
             .endpoint()
             .ok_or_else(|| SessionError::new("Stored session is missing its Keeper endpoint"))?;
+        // Keep the configured path as Python currently does for plain URLs.
+        // Preserve the storage port's origin-only handling of credential-bearing URLs.
+        let endpoint = match Endpoint::split(endpoint) {
+            Some(url) if !url.authority.contains('@') && !endpoint.contains(['?', '#']) => {
+                endpoint.to_owned()
+            }
+            _ => endpoint_origin(endpoint),
+        };
         Ok(SessionSummary {
             addr: self.addr(),
             expires_at: self.expires_at(),
-            endpoint: endpoint_origin(endpoint),
+            endpoint,
         })
+    }
+
+    pub fn origin_summary(&self) -> Result<SessionSummary<'_>, StorageError> {
+        let mut summary = self.summary()?;
+        summary.endpoint = endpoint_origin(&summary.endpoint);
+        Ok(summary)
+    }
+
+    fn same_as(&self, previous: &Self) -> bool {
+        self.token() == previous.token()
+            && self.addr == previous.addr
+            && self.expires_at == previous.expires_at
+            && self.extra == previous.extra
     }
 }
 
@@ -281,14 +328,47 @@ impl Storage<'_> {
         accounts.active = Some(key.clone());
         self.save_accounts(&accounts)?;
         drop(lock);
-        let session = &accounts.sessions[&key].0;
+        self.session_saved(&accounts, &key);
+        Ok(())
+    }
+
+    /// Replace the account only if it still contains the session that was renewed.
+    pub fn replace_session(
+        &self,
+        previous: &Session,
+        renewed: Session,
+    ) -> Result<(), StorageError> {
+        let lock = self.lock_sessions()?;
+        let mut accounts = self.load_accounts()?;
+        let key = previous.addr.to_lowercase();
+        if !accounts
+            .sessions
+            .get(&key)
+            .is_some_and(|session| session.0.same_as(previous))
+        {
+            return Err(SessionError(SaiError::new(
+                Code::InvalidRequest,
+                "Stored session changed during renewal. Run sai auth status.",
+            ))
+            .into());
+        }
+        accounts
+            .sessions
+            .insert(key.clone(), StoredSession(renewed));
+        self.save_accounts(&accounts)?;
+        drop(lock);
+        self.session_saved(&accounts, &key);
+        Ok(())
+    }
+
+    fn session_saved(&self, accounts: &Accounts, key: &str) {
+        let session = &accounts.sessions[key].0;
         self.emit(StorageEvent::SessionSaved {
             addr: session.addr(),
             expires_at: session.expires_at(),
             endpoint: session.endpoint().map(endpoint_origin).as_deref(),
             connected_accounts: accounts.sessions.len(),
         });
-        Ok(())
     }
 
     pub fn load_session(&self, addr: Option<&str>) -> Result<Session, StorageError> {

@@ -105,7 +105,7 @@ pub enum StorageEvent<'a> {
 }
 
 /// Project a stored endpoint onto the same fields as Python's log.origin.
-fn endpoint_origin(endpoint: &str) -> String {
+pub(crate) fn endpoint_origin(endpoint: &str) -> String {
     fn origin(endpoint: &str) -> Option<String> {
         let normalized = endpoint.trim().replace(['\t', '\n', '\r'], "");
         let (scheme, rest) = normalized.split_once("://")?;
