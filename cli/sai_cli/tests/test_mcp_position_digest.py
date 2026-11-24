@@ -1855,3 +1855,46 @@ def test_queued_leverage_warns_about_funding_at_fill(position_service, tool, arg
             assert position.submitted[0]["body"] == quote["intent"]["body"]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("price", "queued", "rejected"),
+    [
+        ("90", False, True),
+        ("92.2", False, True),
+        ("93", False, False),
+        ("90", True, False),
+    ],
+)
+def test_leverage_checks_stored_liquidation_before_after_hours_cap(
+    position_service, price, queued, rejected
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    position.cap = "5"
+    position.price = price
+    position.oracle_base_age = 100
+    position.liquidation_threshold = "92.2"
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client,
+                "preview_margin",
+                {"trade_id": 7, "direction": "remove", "amount": "50"},
+            )
+            if rejected:
+                assert_rejected_preview(quote, "LiquidationReached", "stored leverage")
+            else:
+                assert (
+                    "after-hours guard"
+                    in quote["estimates"]["liquidationPrice"]["reason"]
+                )
+                assert quote["previewDigest"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())

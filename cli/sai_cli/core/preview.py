@@ -378,6 +378,24 @@ def past_liquidation(price: Decimal, threshold: Decimal, long: bool) -> bool:
     return price <= threshold if long else price >= threshold
 
 
+def stored_liquidation_price(
+    lcd: str, state: margin.PositionSnapshot, height: str
+) -> Decimal:
+    threshold = margin.smart_value(
+        lcd,
+        state.contract,
+        {
+            "get_liquidation_price": {
+                "trade_id": state.raw["user_trade_index"],
+                "trader": state.raw["user"],
+                "include_borrowing_fees": True,
+            }
+        },
+        height=height,
+    )
+    return margin.contract_decimal(threshold["liquidation_price"])
+
+
 def close_estimates(
     lcd: str,
     state: margin.PositionSnapshot | None,
@@ -427,20 +445,8 @@ def close_estimates(
                     "OraclePriceStale",
                     "Perp rejects the close at the observed stale oracle price.",
                 )
-        threshold = margin.smart_value(
-            lcd,
-            state.contract,
-            {
-                "get_liquidation_price": {
-                    "trade_id": raw["user_trade_index"],
-                    "trader": raw["user"],
-                    "include_borrowing_fees": True,
-                }
-            },
-            height=height,
-        )
         market = margin.contract_decimal(oracle["base_per_quote"])
-        trigger = margin.contract_decimal(threshold["liquidation_price"])
+        trigger = stored_liquidation_price(lcd, state, height)
         if market <= 0:
             return result
         observed_at = intents.now()
@@ -608,7 +614,22 @@ def _leverage_estimates(
             raise ValueError("Invalid Perp market oracle price")
 
     effective, _ = margin.leverage_inputs(lcd, state, trade_id, height=height)
-    if effective is None or effective != margin.contract_decimal(raw["leverage"]):
+    if effective is None:
+        raise ValueError("Cannot verify effective leverage")
+    if effective < margin.contract_decimal(raw["leverage"]):
+        long = raw.get("long")
+        # Perp checks the stored position before it applies the after-hours cap.
+        if (
+            price is not None
+            and type(long) is bool
+            and past_liquidation(
+                price, stored_liquidation_price(lcd, state, height), long
+            )
+        ):
+            return rejected(
+                "LiquidationReached",
+                "The after-hours guard reaches liquidation at the stored leverage.",
+            )
         return dict.fromkeys(
             ESTIMATE_FIELDS,
             unavailable("The after-hours guard can change or close this position."),
