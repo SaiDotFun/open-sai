@@ -13,8 +13,8 @@ use sai_core::{
     keeper::{POSITION, ROUTE, SUBMIT},
     storage::{Session, Storage},
     trade::{
-        Confirmation, SubmitOptions, TradePreview, Trading, leverage_preview, preview_digest,
-        tpsl_preview,
+        Confirmation, SubmitOptions, TradePreview, Trading, close_preview, leverage_preview,
+        preview_digest, tpsl_preview,
     },
 };
 use serde_json::{Value, json};
@@ -161,6 +161,22 @@ fn fixture_storage<'a>(home: &'a TempDir, endpoint: &str) -> Storage<'a> {
         ))
         .unwrap();
     storage
+}
+
+#[tokio::test]
+async fn cancel_preview_rejects_a_close_before_network_reads() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let close = close_preview("7", false).unwrap();
+
+    let error = trading.cancel_preview(&session, &close).await.unwrap_err();
+    assert_eq!(error.code, Code::InternalError);
+    assert!(server.requests().is_empty());
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
 
 #[tokio::test]

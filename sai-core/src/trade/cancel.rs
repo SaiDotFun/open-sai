@@ -26,6 +26,9 @@ impl Trading<'_> {
         session: &Session,
         preview: &TradePreview,
     ) -> Result<Value, SaiError> {
+        if preview.intent.kind != "CANCEL_PENDING_TRADE" || preview.intent.target.is_none() {
+            return Err(SaiError::internal());
+        }
         Ok(self
             .prepare_preview(preview.clone(), Some(session), super::PreviewMode::Cli)
             .await?
