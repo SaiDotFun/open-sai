@@ -241,28 +241,40 @@ def owned_process(
 ) -> Generator[subprocess.Popen[bytes], None, None]:
     CANCELLATION.check()
     with cleanup_stack() as cleanup:
-        process = cleanup.enter_context(
+        # Keep the group ID owned even when communicate() reaps the command.
+        leader = cleanup.enter_context(
             subprocess.Popen(
-                command,
+                (sys.executable, "-I", "-c", "import sys; sys.stdin.buffer.read(1)"),
                 cwd=cwd,
                 env=env,
-                stdin=stdin,
-                stdout=stdout,
-                stderr=stderr,
-                start_new_session=True,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                process_group=0,
             )
         )
-        cleanup.callback(stop_process_group, process)
+        try:
+            process = cleanup.enter_context(
+                subprocess.Popen(
+                    command,
+                    cwd=cwd,
+                    env=env,
+                    stdin=stdin,
+                    stdout=stdout,
+                    stderr=stderr,
+                    process_group=leader.pid,
+                )
+            )
+        finally:
+            cleanup.callback(stop_process_group, leader)
         CANCELLATION.check()
         yield process
     CANCELLATION.check()
 
 
-def stop_process_group(process: subprocess.Popen[bytes]) -> None:
-    # The leader can exit while a descendant still owns a pipe or file.
+def stop_process_group(leader: subprocess.Popen[bytes]) -> None:
     with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    process.wait()
+        os.killpg(leader.pid, signal.SIGKILL)
 
 
 def loopback_env(base: str, proxy_port: int) -> dict[str, str]:

@@ -248,7 +248,7 @@ class ProcessTest(unittest.TestCase):
     ) -> None:
         script = Path(__file__).with_name("release-rehearsal.py").resolve()
         parent = """
-import runpy, signal, sys, tempfile
+import os, runpy, signal, sys, tempfile
 from pathlib import Path
 entry = runpy.run_path(sys.argv[1])
 hook = sys.argv[3]
@@ -278,7 +278,7 @@ try:
             cleanup.callback(verify_child_stopped, child)
             if entry["ReplyReader"](child.stdout).line("descendant") != "locked":
                 sys.exit(2)
-            print(child.pid, home, flush=True)
+            print(os.getpgid(child.pid), home, flush=True)
             if hook:
                 sys.setprofile(interrupt_at_teardown)
             else:
@@ -379,6 +379,20 @@ except entry["RehearsalInterrupted"] as exc:
                 )
                 child.communicate(timeout=0.1)
             self.assert_group_released(lock)
+
+    def test_group_leader_stays_owned_after_communicate_reaps_the_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            command = (sys.executable, "-c", "print('done')")
+            with REHEARSAL["owned_process"](
+                command, Path(temp), {"HOME": temp}
+            ) as process:
+                leader = os.getpgid(process.pid)
+                self.assertEqual(process.communicate(timeout=5)[0], b"done\n")
+                self.assertEqual(process.returncode, 0)
+                self.assertNotEqual(leader, process.pid)
+                os.kill(leader, 0)
+            with self.assertRaises(ChildProcessError):
+                os.waitpid(leader, os.WNOHANG)
 
 
 class KeeperReplayTest(unittest.TestCase):
