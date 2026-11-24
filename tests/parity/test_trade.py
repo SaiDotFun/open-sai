@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -73,7 +74,8 @@ def run(
         stdin=subprocess.DEVNULL,
         capture_output=True,
         encoding="utf-8",
-        timeout=20,
+        # Keeper may wait 20 seconds for a response after dispatch.
+        timeout=30,
         check=False,
     )
     assert result.stdout, f"Exit {result.returncode}: {result.stderr}"
@@ -89,6 +91,53 @@ def rows(home: Path) -> list[tuple[Any, ...]]:
             "SELECT id, kind, status, entity, account, keeper_status, created_at"
             " FROM intents ORDER BY rowid"
         ).fetchall()
+
+
+def test_numeric_keeper_price_rounds_to_even(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("trade-accepted", market_price=68669.000244140625) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, result, _ = run(cli, home, endpoints, OPEN, python=index == 0)
+            assert code == 0
+            assert [request.label for request in endpoints.wire] == [
+                "borrowings",
+                "recordUserIntent",
+            ]
+            body = endpoints.wire[-1].variables["input"]["intent"]["body"]
+            assert (
+                body["intentPrice"] == result["referencePrice"] == "68669.00024414062"
+            )
+
+
+def test_python_reads_rust_trade_events_offline(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    python, rust = trade_pair
+    with loopback("trade-accepted") as endpoints:
+        home = tmp_path / "shared"
+        seed_home(home, endpoints, "session")
+        code, result, _ = run(rust, home, endpoints, CLOSE, python=False)
+        assert code == 0
+        key = result["intentKey"]
+        code, report, _ = run(
+            python, home, endpoints, ("logs", "intent", key, "--offline"), python=True
+        )
+        assert code == 0
+        assert report["intentKey"] == key
+        assert report["txHash"] == TRADE_REQUEST_HASH.lower()
+        assert len(endpoints.wire) == 1
+        events = {event["event"]: event for event in report["events"]}
+        trade_events = [
+            events[name]
+            for name in ("intent.reserved", "intent.submitted", "intent.status")
+        ]
+        assert len({event["endpointId"] for event in trade_events}) == 1
+        endpoint_key = home / "sai" / "logs" / ".endpoint-key"
+        assert endpoint_key.stat().st_size == 32
+        assert endpoint_key.stat().st_mode & 0o777 == 0o600
 
 
 def trade_events(home: Path, key: str, endpoint: str) -> list[tuple[str, str | None]]:
@@ -231,6 +280,80 @@ def test_signed_out_submits_nothing(
     assert observations[0] == observations[1]
     assert observations[0][0] == 6
     assert observations[0][1]["error"]["code"] == "SIGNED_OUT"
+
+
+@pytest.mark.parametrize(
+    ("args", "message"),
+    [
+        (
+            ("--leverage", "340282366920938463463.374607431768211456"),
+            "Leverage must be a positive finite decimal",
+        ),
+        (
+            ("--amount", "100000000000000000000.000000000000000001"),
+            "Amount must have at most six decimal places",
+        ),
+    ],
+)
+def test_exact_decimal_checks_intentionally_differ_from_python(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI, message: str
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("trade-accepted") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "empty")
+            exact_max = ("--leverage", "340282366920938463463.374607431768211455")
+            assert (
+                run(
+                    cli,
+                    home,
+                    endpoints,
+                    (*OPEN, *exact_max, "--dry-run"),
+                    python=index == 0,
+                )[0]
+                == 0
+            )
+            code, result, stderr = run(
+                cli, home, endpoints, (*OPEN, *args, "--dry-run"), python=index == 0
+            )
+            assert stderr == ""
+            if index == 0:
+                assert code == 0 and result["dryRun"]
+            else:
+                assert code == 1 and result["error"]["message"] == message
+            assert not endpoints.wire
+            assert not rows(home)
+
+
+def test_non_ascii_market_id_is_an_accepted_parity_divergence(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("trade-accepted") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "empty")
+            code, result, stderr = run(
+                cli,
+                home,
+                endpoints,
+                (*OPEN, "--market", "٣", "--dry-run"),
+                python=index == 0,
+            )
+            assert stderr == ""
+            if index == 0:
+                assert code == 0
+                assert (
+                    result["intent"]["body"]["market"]["marketIndex"]
+                    == "MarketIndex(3)"
+                )
+            else:
+                assert code == 2
+                assert (
+                    result["error"]["message"]
+                    == "Invalid value for '--market': '٣' is not a valid integer."
+                )
+            assert not endpoints.wire
+            assert not rows(home)
 
 
 @pytest.mark.parametrize(
@@ -464,3 +587,89 @@ def test_concurrent_close_sends_once(
             assert len(endpoints.wire) == 1
             assert [row[2] for row in rows(home)] == ["accepted"]
             assert not endpoints.errors
+
+
+def test_interrupt_after_dispatch_reports_reserved_key(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("concurrent-close") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            with subprocess.Popen(
+                [*cli, "--json", *CLOSE],
+                cwd=home,
+                env={
+                    **child_env(home, endpoints),
+                    "SAI_LOG": "1",
+                    "SAI_UPDATE_AUTO": "0",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+            ) as child:
+                try:
+                    assert endpoints.admission.arrived.wait(5)
+                    [(key, _, status, *_)] = rows(home)
+                    assert status == "unknown"
+                    child.send_signal(signal.SIGINT)
+                    stdout, stderr = child.communicate(timeout=5)
+                    assert (child.returncode, stderr) == (5, "")
+                    error = json.loads(stdout)["error"]
+                    assert error["code"] == "OUTCOME_UNKNOWN"
+                    assert error["intentKey"] == key
+                    assert key in error["hint"]
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    endpoints.admission.release.set()
+            assert rows(home)[0][2] == "unknown"
+            code, result, _ = run(cli, home, endpoints, CLOSE, python=index == 0)
+            assert code == 1
+            assert result["error"]["intentKey"] == key
+            assert len(endpoints.wire) == 1
+
+
+@pytest.mark.parametrize("first", [0, 1], ids=["python-sends", "rust-sends"])
+def test_mixed_clients_reconcile_a_post_dispatch_timeout(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path, first: int
+) -> None:
+    sender, peer = trade_pair[first], trade_pair[1 - first]
+    args = (*OPEN, "--type", "limit")
+    with loopback("trade-timeout") as endpoints:
+        home = tmp_path / "shared"
+        seed_home(home, endpoints, "session")
+        try:
+            code, result, stderr = run(sender, home, endpoints, args, python=first == 0)
+        finally:
+            endpoints.admission.release.set()
+        assert (code, stderr) == (5, "")
+        key = result["error"]["intentKey"]
+        assert result["error"]["code"] == "OUTCOME_UNKNOWN"
+        assert key == endpoints.admission.key
+        assert [row[2] for row in rows(home)] == ["unknown"]
+
+        code, result, _ = run(peer, home, endpoints, args, python=first == 1)
+        assert code == 1
+        assert result["error"]["code"] == "RECENT_OPEN_PENDING"
+        assert result["error"]["intentKey"] == key
+        assert [request.label for request in endpoints.wire] == ["recordUserIntent"]
+
+        code, _, _ = run(
+            peer,
+            home,
+            endpoints,
+            ("intent", "status", ADDRESS, "--key", key),
+            python=first == 1,
+        )
+        assert code == 0
+        assert [row[2] for row in rows(home)] == ["terminal"]
+        assert run(sender, home, endpoints, args, python=first == 0)[0] == 0
+        assert [request.label for request in endpoints.wire] == [
+            "recordUserIntent",
+            "userIntents",
+            "recordUserIntent",
+        ]
+        assert [row[2] for row in rows(home)] == ["terminal", "accepted"]
+        assert not endpoints.errors

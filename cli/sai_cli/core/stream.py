@@ -17,6 +17,7 @@ from . import keeper
 from .errors import Code, SaiError
 
 BALANCES = "subscription($user:String!) { userBalances(where:{user:$user}) { amount usd_value token_info { name symbol decimals type } } }"
+BALANCES_WITH_BLOCK = BALANCES.replace("usd_value", "usd_value lastUpdatedBlock")
 POSITIONS = "subscription($user:String!) { perpTrades(where:{trader:$user}) { id trader isOpen isLong tradeType leverage openPrice tp sl } }"
 PRICE = "subscription($id:Int!) { tokenPricesUsd(where:{tokenId:$id}) { priceUsd token { id symbol } lastUpdatedBlock { block block_ts } } }"
 

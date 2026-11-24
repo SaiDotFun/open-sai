@@ -267,7 +267,7 @@ fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
     }
 }
 
-fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
+fn write(directory: &LogDir, mut event: Event, tokens: &[String], queue: &Queue) {
     let mut line = Map::new();
     line.insert(
         "ts".into(),
@@ -280,6 +280,24 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
     line.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
     line.insert("runId".into(), json!(RUN_ID.as_str()));
     line.insert("seq".into(), json!(event.sequence));
+    if let Field::Object(fields) = &mut event.fields
+        && let Some(index) = fields.iter().position(|(name, field)| {
+            name == "endpointId" && matches!(field, Field::EndpointIdentity(_))
+        })
+        && let (_, Field::EndpointIdentity(identity)) = fields.remove(index)
+    {
+        #[cfg(unix)]
+        if let Ok(key) = directory.endpoint_key() {
+            use ring::hmac;
+
+            let mut id = String::from("h1_");
+            let hash = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &key), &identity);
+            for byte in hash.as_ref() {
+                let _ = write!(id, "{byte:02x}");
+            }
+            line.insert("endpointId".into(), json!(id));
+        }
+    }
     if let Value::Object(fields) = event.fields.clean(tokens) {
         for (key, field) in fields {
             if !COMMON.contains(&key.as_str()) {

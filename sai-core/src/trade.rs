@@ -3,6 +3,8 @@
 mod actions;
 mod confirmation;
 
+use std::future::{Future, pending};
+
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -151,19 +153,32 @@ impl<'a> Trading<'a> {
         preview: &TradePreview,
         options: SubmitOptions<'_>,
     ) -> Result<AcceptedTrade, SaiError> {
+        self.submit_with_reference_price(session, preview, options, pending())
+            .await
+            .map(|(accepted, _)| accepted)
+    }
+
+    /// Return the submitted market price and report an interruption during dispatch as unknown.
+    pub async fn submit_with_reference_price(
+        &self,
+        session: &Session,
+        preview: &TradePreview,
+        options: SubmitOptions<'_>,
+        interrupted: impl Future<Output = ()>,
+    ) -> Result<(AcceptedTrade, Option<String>), SaiError> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
         self.storage.check_active(session, endpoint)?;
         let mut prepared;
         let preview = if preview.requires_market_price_refresh() {
-            let price = preview.reference_price.as_deref().ok_or_else(|| {
-                SaiError::new(
-                    Code::InvalidRequest,
-                    "Current open USDC market data is unavailable",
-                )
-            })?;
-            positive_decimal(price, "Current price")?;
             prepared = preview.clone();
+            self.refresh_market_open(&mut prepared).await?;
+            self.storage.check_active(session, endpoint)?;
+            let price = prepared
+                .reference_price
+                .as_deref()
+                .ok_or_else(SaiError::internal)?;
+            positive_decimal(price, "Current price")?;
             prepared.intent.body["intentPrice"] = json!(price);
             &prepared
         } else {
@@ -225,10 +240,16 @@ impl<'a> Trading<'a> {
             hint: Some(status_hint(&key)),
             ..SaiError::new(Code::OutcomeUnknown, message)
         };
-        let response = self
-            .keeper
-            .request(SUBMIT, variables, Some(session.token()), keeper::TIMEOUT)
-            .await;
+        let unknown_send = || {
+            unknown(format!(
+                "Outcome unknown for intent {key}; reconcile before another trade"
+            ))
+        };
+        let response = tokio::select! {
+            biased;
+            () = interrupted => return Err(unknown_send()),
+            response = self.keeper.request(SUBMIT, variables, Some(session.token()), keeper::TIMEOUT) => response,
+        };
         let ack = match response {
             Ok(ref data) if valid_ack(data.get("recordUserIntent"), &key, account) => {
                 &data["recordUserIntent"]
@@ -245,11 +266,7 @@ impl<'a> Trading<'a> {
                 error.intent_key = Some(key);
                 return Err(error);
             }
-            _ => {
-                return Err(unknown(format!(
-                    "Outcome unknown for intent {key}; reconcile before another trade"
-                )));
-            }
+            _ => return Err(unknown_send()),
         };
         let (hash, invalid_hash) = keeper::request_hash(&ack["txHash"]);
         self.events.event(
@@ -260,6 +277,7 @@ impl<'a> Trading<'a> {
                 ("kind", json!(kind).into()),
                 ("addr", json!(account).into()),
                 ("endpoint", Field::Endpoint(endpoint.into())),
+                ("endpointId", Field::endpoint_identity(endpoint)),
                 ("txHash", json!(hash).into()),
                 ("txHashInvalid", json!(invalid_hash.then_some(true)).into()),
             ],
@@ -269,11 +287,17 @@ impl<'a> Trading<'a> {
                 "Keeper accepted intent {key}, but the local ledger update failed; reconcile before another trade"
             )));
         }
-        Ok(AcceptedTrade {
-            intent_key: key,
-            status: "accepted",
-            message: "Accepted by Keeper; execution is not yet confirmed",
-        })
+        Ok((
+            AcceptedTrade {
+                intent_key: key,
+                status: "accepted",
+                message: "Accepted by Keeper; execution is not yet confirmed",
+            },
+            preview
+                .requires_market_price_refresh()
+                .then(|| preview.reference_price.clone())
+                .flatten(),
+        ))
     }
 
     fn record_status(&self, key: &str, account: &str, status: IntentStatus) -> bool {
@@ -293,6 +317,7 @@ impl<'a> Trading<'a> {
                 ("intentKey", json!(key).into()),
                 ("addr", json!(account).into()),
                 ("endpoint", Field::Endpoint(endpoint.into())),
+                ("endpointId", Field::endpoint_identity(endpoint)),
                 ("status", json!(status.as_str()).into()),
                 ("errorType", json!(error_type).into()),
             ],

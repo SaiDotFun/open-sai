@@ -248,6 +248,30 @@ mod tests {
     }
 
     #[test]
+    fn refuses_price_movement_that_decimal_context_rounds_to_the_limit() {
+        let account = "0xaa00000000000000000000000000000000000001";
+        let mut preview = TradePreview::new(TradeIntent::new(
+            "OPEN_TRADE",
+            None,
+            json!({"orderType": "market", "maxSlippagePct": "10"}),
+        ));
+        let reference = "100000000000";
+        preview.reference_price = Some(reference.into());
+        let digest = preview_digest(&preview, Some(account));
+        preview.reference_price = Some("110000000000".into());
+        Confirmation::new(&digest, Some(reference))
+            .unwrap()
+            .verify(&preview, account)
+            .unwrap();
+        preview.reference_price = Some("110000000000.000000000000000001".into());
+        let refusal = Confirmation::new(&digest, Some(reference))
+            .unwrap()
+            .verify(&preview, account)
+            .unwrap_err();
+        assert_eq!(refusal.code, Code::PriceMoved);
+    }
+
+    #[test]
     fn confirmation_binds_the_account_before_checking_market_movement() {
         let account = "0xaa00000000000000000000000000000000000001";
         let mut preview = TradePreview::new(TradeIntent::new(

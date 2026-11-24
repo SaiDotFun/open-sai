@@ -1,13 +1,9 @@
 //! Endpoint and expiry checks shared by the CLI and other front ends.
 
-use std::sync::LazyLock;
-
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
-use regex::Regex;
 
 use crate::{
     errors::{Code, SaiError},
-    log,
     storage::{Session, SessionError, Storage, StorageError, StorageEvent},
 };
 
@@ -163,21 +159,7 @@ impl Storage<'_> {
     }
 
     fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>) -> String {
-        static PLAIN_KEEPER_URL: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"\Ahttps?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query\z")
-                .expect("valid Keeper URL pattern")
-        });
-        let flag = if PLAIN_KEEPER_URL.is_match(endpoint)
-            && self
-                .trader
-                .parent()
-                .is_some_and(|home| log::redact(home, endpoint) == endpoint)
-        {
-            shell_quote(endpoint)
-        } else {
-            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-                .into()
-        };
+        let flag = self.keeper_hint_flag(endpoint);
         let mut hint = format!("sai --endpoint {flag} auth login NAME");
         if let Some(addr) = addr {
             hint.push_str(" --addr ");
