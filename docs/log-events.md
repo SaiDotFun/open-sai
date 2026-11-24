@@ -39,7 +39,9 @@ The writer converts the hash to lowercase and preserves the prefix if present.
 A malformed request hash is omitted and sets `txHashInvalid`.
 The field `txHash` on `intent.submitted` is the request transaction hash when
 Keeper includes it in the admission response. It may appear first on `intent.keeper`.
-When polling starts, `intent.wait.start` records the intent key and timeout.
+The `intent.wait.start` event records the intent key and timeout.
+A wait can return a locally recorded `not_sent` or `rejected` outcome
+without querying Keeper.
 The `intent.wait.end` event records the outcome in `status`, the elapsed
 milliseconds in `durationMs`, and a Sai `code` when assigned.
 In v0.1.2 the wait writer does not populate `txHash`, `txHashInvalid`,
