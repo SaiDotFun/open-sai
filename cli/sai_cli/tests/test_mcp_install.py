@@ -29,7 +29,7 @@ OTHER = "otherserver-private-name"
 # Both fakes record argv to $FAKE_LOG and keep state where the real client
 # would, so a second run sees the first run's change.
 FAKE_CLAUDE = """
-import json, os, sys
+import json, os, shutil, subprocess, sys
 from pathlib import Path
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(sys.argv) + "\\n")
@@ -44,7 +44,13 @@ path = (
 data = json.loads(path.read_text()) if path.exists() else {}
 holder = data
 if scope == "local":
-    holder = data.setdefault("projects", {}).setdefault(str(Path.cwd()), {})
+    git = shutil.which("git")
+    root = Path.cwd()
+    if git is not None:
+        found = subprocess.run([git, "rev-parse", "--show-toplevel"], capture_output=True)
+        if found.returncode == 0:
+            root = Path(os.fsdecode(found.stdout.strip()))
+    holder = data.setdefault("projects", {}).setdefault(str(root), {})
 servers = holder.setdefault("mcpServers", {})
 name = args[args.index("--scope") + 2]
 if args[1] == "remove":
@@ -471,11 +477,14 @@ def test_doctor_reports_exact_claude_repairs_for_each_scope(env: Env, monkeypatc
     assert [user_file.read_bytes(), project_file.read_bytes()] == before
     commands = check["fix"].split("`")[1::2]
     for scope in ("user", "project", "local"):
-        assert f"claude mcp remove --scope {scope} sai" in commands
-        assert (
+        assert any(
+            f"claude mcp remove --scope {scope} sai" in command for command in commands
+        )
+        add = (
             f'claude mcp add --scope {scope} sai --env="SAI_HOME=${{SAI_HOME:?Set SAI_HOME first}}"'
             ' -- "$(command -v sai)" mcp serve'
-        ) in commands
+        )
+        assert any(add in command for command in commands)
     assert (
         f"sai mcp install --client claude --scope local --repair-existing {OLD_COMMAND}"
         in commands
@@ -1232,6 +1241,47 @@ def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.Monke
     assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
         serve(env), {"SAI_HOME": str(profile)}
     )
+
+
+@pytest.mark.parametrize("surface", ["install", "doctor"])
+def test_claude_local_replacement_targets_git_root(
+    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+):
+    git = shutil.which("git", path=os.defpath)
+    shell = shutil.which("sh", path=os.defpath)
+    assert git and shell
+    subprocess.run([git, "-C", str(env.project), "init", "--quiet"], check=True)
+    nested = env.project / "nested checkout"
+    nested.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
+    monkeypatch.chdir(nested)
+    root_entry = claude_entry(["missing-root-wrapper"])
+    nested_entry = claude_entry(["untouched-nested-wrapper"])
+    original = {
+        "projects": {
+            str(env.project): {"mcpServers": {"sai": root_entry}},
+            str(nested): {"mcpServers": {"sai": nested_entry}},
+        }
+    }
+    (env.home / ".claude.json").write_text(json.dumps(original))
+
+    if surface == "doctor":
+        result = invoke("doctor", "--offline")
+        check = mcp_checks(result)["claude"]
+        assert "points to a missing command" in check["summary"]
+        fix = check["fix"]
+    else:
+        result = invoke("mcp", "install", "claude", "--scope", "local")
+        assert "differs from the requested settings" in failure(result)
+        [row] = payload(result)["error"]["details"]["results"]
+        fix = row["fix"]
+    assert env.claude_json() == original
+    commands = fix.split("`")[1::2]
+    assert all(command.startswith(f"(cd {env.project} && ") for command in commands)
+    subprocess.run([shell, "-c", " && ".join(commands)], cwd=env.root, check=True)
+    projects = env.claude_json()["projects"]
+    assert projects[str(env.project)]["mcpServers"]["sai"] == claude_entry(serve(env))
+    assert projects[str(nested)]["mcpServers"]["sai"] == nested_entry
 
 
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):

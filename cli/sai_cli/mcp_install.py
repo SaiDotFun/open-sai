@@ -189,6 +189,7 @@ class ClaudeRepair:
     reset_args: bool = False
     replace_entry: bool = False
     use_profile: bool = False
+    directory: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -208,10 +209,14 @@ def claude_replacement_commands(entry: ClaudeRepair) -> list[str]:
     profile = (
         ' --env="SAI_HOME=${SAI_HOME:?Set SAI_HOME first}"' if entry.use_profile else ""
     )
-    return [
+    commands = [
         f"claude mcp remove {scope_and_name}",
         f'claude mcp add {scope_and_name}{profile} -- "$(command -v sai)" mcp serve',
     ]
+    if entry.directory is not None:
+        cd = f"cd {shlex.quote(str(entry.directory))}"
+        return [f"({cd} && {command})" for command in commands]
+    return commands
 
 
 def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
@@ -235,9 +240,15 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
     return hint
 
 
-def report_different_claude_entry(result: Result, scope: str, target: Target) -> Result:
+def report_different_claude_entry(
+    client: Claude, result: Result, scope: str, target: Target
+) -> Result:
     entry = ClaudeRepair(
-        scope, NAME, replace_entry=True, use_profile="SAI_HOME" in target.env
+        scope,
+        NAME,
+        replace_entry=True,
+        use_profile="SAI_HOME" in target.env,
+        directory=client.scope_directory(scope),
     )
     hint = claude_repair_hint((entry,))
     if target.explicit_command:
@@ -573,6 +584,39 @@ class Claude(Client):
         configured = self.environ.get("CLAUDE_CONFIG_DIR")
         return (Path(configured) if configured else self.home) / ".claude.json"
 
+    def scope_directory(self, scope: str) -> Path | None:
+        if self.cwd is None or scope == "user":
+            return None
+        if scope != "local":
+            return self.cwd
+        # Claude resolves a local registration launched inside a repository
+        # to the checkout root, including when invoked from a subdirectory.
+        git = shutil.which("git", path=self.environ.get("PATH"))
+        if git is not None:
+            try:
+                result = subprocess.run(
+                    [git, "rev-parse", "--show-toplevel"],
+                    cwd=self.cwd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                    check=False,
+                )
+                root = Path(os.fsdecode(result.stdout.removesuffix(b"\n")))
+                if result.returncode == 0 and root.is_absolute():
+                    return root
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return next(
+            (
+                path
+                for path in (self.cwd, *self.cwd.parents)
+                if (path / ".git" / "HEAD").is_file() or (path / ".git").is_file()
+            ),
+            self.cwd,
+        )
+
     def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
@@ -591,7 +635,11 @@ class Claude(Client):
             found.append(self.read_entry(user, "user", name, disabled))
         if self.cwd is None:
             return self.ordered([r for r in found if r is not None])
-        local = servers(project).get(name)
+        local_key = str(self.scope_directory("local"))
+        local_project = projects.get(local_key) if isinstance(projects, dict) else None
+        local = servers(local_project if isinstance(local_project, dict) else None).get(
+            name
+        )
         if local is not None:
             found.append(self.read_entry(local, "local", name, disabled))
         shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
@@ -981,7 +1029,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.action = "unchanged"
             return result
         if isinstance(client, Claude) and existing is not None:
-            return report_different_claude_entry(result, scope, target)
+            return report_different_claude_entry(client, result, scope, target)
         action = "added" if existing is None else "replaced"
         if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
@@ -1306,7 +1354,12 @@ def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
     holder = data
     if scope == "local":
         projects = data.get("projects", {})
-        holder = projects.get(str(client.cwd)) if isinstance(projects, dict) else None
+        local_dir = (
+            client.scope_directory("local")
+            if isinstance(client, Claude)
+            else client.cwd
+        )
+        holder = projects.get(str(local_dir)) if isinstance(projects, dict) else None
         if not isinstance(holder, dict):
             raise ClientError("Could not find the local MCP config")
     entries = holder.setdefault("mcpServers", {})
@@ -1410,7 +1463,7 @@ def repair_claude_existing(
                     "Review MCP approvals and settings in the client."
                 )
             if not existing.matches(target):
-                return report_different_claude_entry(result, scope, target)
+                return report_different_claude_entry(client, result, scope, target)
             result.action = "unchanged"
             return result
         if not existing.stdio:
@@ -1437,6 +1490,7 @@ def repair_claude_existing(
 
 
 def check_claude_differences(
+    client: Claude,
     found: list[tuple[str, Registration]],
     stale: list[StaleRegistration],
     target: Target | None,
@@ -1462,6 +1516,7 @@ def check_claude_differences(
                         name,
                         replace_entry=True,
                         use_profile="SAI_HOME" in target.env,
+                        directory=client.scope_directory(reg.scope),
                     )
                 )
         elif issue is None:
@@ -1529,7 +1584,9 @@ def check_registration(
     legacy_warning = f"Sai retains its existing {RETIRED_NAME} registration name"
     expected_env = server_env(client.environ) if compare_profile else {}
     if isinstance(client, Claude):
-        claude_check = check_claude_differences(found, stale, target, legacy_name)
+        claude_check = check_claude_differences(
+            client, found, stale, target, legacy_name
+        )
         if claude_check is not None:
             return claude_check
     different_profile = compare_profile and any(

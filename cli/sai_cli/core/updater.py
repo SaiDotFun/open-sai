@@ -586,6 +586,11 @@ class Outcome:
                                     else {}
                                 ),
                                 **({"useProfile": True} if repair.use_profile else {}),
+                                **(
+                                    {"directory": str(repair.directory)}
+                                    if repair.directory is not None
+                                    else {}
+                                ),
                             }
                             for repair in check.manual_repairs
                         ],
@@ -1161,6 +1166,9 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
                     repair.get("resetArgs") is True,
                     replace_entry=repair.get("replaceEntry") is True,
                     use_profile=repair.get("useProfile") is True,
+                    directory=Path(repair["directory"])
+                    if isinstance(repair.get("directory"), str)
+                    else None,
                 )
                 for repair in manual
                 if isinstance(repair, dict)
