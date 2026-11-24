@@ -161,7 +161,8 @@ TP/SL changes leave the liquidation price unchanged, and margin and leverage
 updates have no fill price. With an active or unverified guard, the preview
 reports fees and liquidation as unavailable. Full and partial close previews check Perp's live threshold with borrowing
 fees. The execution status `would_liquidate` means Perp would close the
-entire position at the observed oracle price. Otherwise a partial close
+entire position at the observed oracle price. A price beyond the market
+group's freshness limit produces `would_be_rejected`. Otherwise a partial close
 can draw on remaining collateral and exceed the leverage cap. Its
 resulting liquidation price stays unavailable until settlement.
 

@@ -147,7 +147,7 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
     return price_input(price, "Sai Perp collateral oracle", intents.now())
 
 
-def fee_schedule(
+def contract_market(
     lcd: str, contract: str, market: str, *, height: str | None = None
 ) -> dict[str, Any]:
     pair = margin.smart_value(
@@ -155,6 +155,23 @@ def fee_schedule(
     )
     if not isinstance(pair, dict):
         raise TypeError("Perp market is unavailable")
+    return pair
+
+
+def contract_group(
+    lcd: str, contract: str, pair: dict[str, Any], *, height: str | None = None
+) -> dict[str, Any]:
+    group = margin.smart_value(
+        lcd, contract, {"get_group": {"index": pair["group_index"]}}, height=height
+    )
+    if not isinstance(group, dict):
+        raise TypeError("Perp market group is unavailable")
+    return group
+
+
+def fee_schedule(
+    lcd: str, contract: str, pair: dict[str, Any], *, height: str | None = None
+) -> dict[str, Any]:
     fees = margin.smart_value(
         lcd, contract, {"get_fees": {"index": pair["fee_index"]}}, height=height
     )
@@ -197,7 +214,8 @@ def open_estimates(
         try:
             token_id = row["collateralToken"]["id"]
             contract = margin.trading_contract(endpoint, lcd)
-            schedule = fee_schedule(lcd, contract, body["market"]["marketIndex"])
+            pair = contract_market(lcd, contract, body["market"]["marketIndex"])
+            schedule = fee_schedule(lcd, contract, pair)
             token = f"TokenIndex({token_id})"
             collateral_price = read_collateral_price(lcd, contract, token)
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))
@@ -258,6 +276,35 @@ def close_estimates(
             },
             height=height,
         )
+        oracle = prices["market"]
+        update_times = [
+            time
+            for key in ("base_last_update_time", "quote_last_update_time")
+            if (time := oracle.get(key)) is not None
+        ]
+        pair = None
+        if update_times:
+            if any(type(time) is not int or time < 0 for time in update_times):
+                raise ValueError("Invalid Perp oracle publication time")
+            pair = contract_market(
+                lcd, state.contract, raw["market_index"], height=height
+            )
+            group = contract_group(lcd, state.contract, pair, height=height)
+            ttl = group["stale_price_expiration_secs"]
+            if type(ttl) is not int or ttl < 0:
+                raise ValueError("Invalid Perp oracle TTL")
+            if ttl and margin.block_timestamp(lcd, height) - min(update_times) > ttl:
+                stale = unavailable(
+                    "Perp rejects the close at the observed stale oracle price."
+                )
+                return {
+                    **dict.fromkeys(result, stale),
+                    "execution": {
+                        "status": "would_be_rejected",
+                        "code": "OraclePriceStale",
+                        "reason": stale["reason"],
+                    },
+                }
         threshold = margin.smart_value(
             lcd,
             state.contract,
@@ -270,7 +317,7 @@ def close_estimates(
             },
             height=height,
         )
-        market = margin.contract_decimal(prices["market"]["base_per_quote"])
+        market = margin.contract_decimal(oracle["base_per_quote"])
         trigger = margin.contract_decimal(threshold["liquidation_price"])
         if market <= 0:
             return result
@@ -329,7 +376,11 @@ def close_estimates(
         price = margin.contract_decimal(prices["collateral"])
         if price <= 0:
             return result
-        schedule = fee_schedule(lcd, state.contract, raw["market_index"], height=height)
+        if pair is None:
+            pair = contract_market(
+                lcd, state.contract, raw["market_index"], height=height
+            )
+        schedule = fee_schedule(lcd, state.contract, pair, height=height)
         _, result["fees"] = base_fees(
             schedule,
             price_input(price, "Sai Perp collateral oracle", observed_at),

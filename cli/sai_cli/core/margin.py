@@ -7,6 +7,7 @@ import json
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from secrets import token_hex
 from typing import Any
@@ -203,6 +204,21 @@ def position_unchanged(
         str(collateral_price(lcd, state, height=height))
         == quoted_inputs["collateralPriceUsd"]
     )
+
+
+def block_timestamp(lcd: str, height: str) -> int:
+    """Read the UTC timestamp of a specific LCD block."""
+    result = _get_json(
+        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/blocks/{height}"
+    )
+    block = result.get("sdk_block") or result.get("block")
+    if not isinstance(block, dict):
+        raise TypeError("LCD block header is unavailable")
+    header = block["header"]
+    time = datetime.fromisoformat(header["time"])
+    if header["height"] != height or time.tzinfo is None:
+        raise ValueError("Cannot verify the timestamp of the quoted LCD block")
+    return int(time.timestamp())
 
 
 def trading_contract(endpoint: str, lcd: str) -> str:

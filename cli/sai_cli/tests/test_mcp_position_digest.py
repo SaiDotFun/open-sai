@@ -40,6 +40,10 @@ class Position:
     leverage: str = "2"
     max_leverage: int = 100
     liquidation_threshold: str = "60"
+    block_timestamp: int = 2_000_000_000
+    oracle_base_age: int | None = None
+    oracle_quote_age: int | None = None
+    oracle_ttl: int = 300
     snapshot_leverages: deque[str] = field(default_factory=deque)
     after_hours: bool = False
     risk_block: int = 90
@@ -137,6 +141,23 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     }
                 )
                 return
+            if (
+                path
+                == f"/cosmos/base/tendermint/v1beta1/blocks/{position.reported_height}"
+            ):
+                self.reply(
+                    {
+                        "sdk_block": {
+                            "header": {
+                                "height": str(position.reported_height),
+                                "time": datetime.fromtimestamp(
+                                    position.block_timestamp, UTC
+                                ).isoformat(),
+                            }
+                        }
+                    }
+                )
+                return
             prefix = "/cosmwasm/wasm/v1/contract/nibi1contract/smart/"
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
@@ -192,7 +213,17 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 )
                 data = (
                     {
-                        "market": {"base_per_quote": str(position.price)},
+                        "market": {
+                            "base_per_quote": str(position.price),
+                            "base_last_update_time": position.block_timestamp
+                            - position.oracle_base_age
+                            if position.oracle_base_age is not None
+                            else None,
+                            "quote_last_update_time": position.block_timestamp
+                            - position.oracle_quote_age
+                            if position.oracle_quote_age is not None
+                            else None,
+                        },
                         "collateral": position.collateral_price,
                     }
                     if position.collateral_price is not None
@@ -224,7 +255,11 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     "block_last_opened": 110,
                     "block_last_closed": 100,
                     "fee_index": "FeeIndex(0)",
+                    "group_index": "GroupIndex(0)",
                 }
+            elif "get_group" in message:
+                assert message["get_group"] == {"index": "GroupIndex(0)"}
+                data = {"stale_price_expiration_secs": position.oracle_ttl}
             elif "get_fees" in message:
                 assert message["get_fees"] == {"index": "FeeIndex(0)"}
                 data = (
@@ -1280,5 +1315,35 @@ def test_cancel_missing_trade_is_a_usage_error(position_service, status):
             assert result["error"] == "Trade 99 was not found for this account."
             assert "preview" not in result
             assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("age", "execution"), [(300, "would_liquidate"), (900, "would_be_rejected")]
+)
+def test_close_liquidation_respects_perp_oracle_ttl(position_service, age, execution):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "20"
+    position.price = "95"
+    position.liquidation_threshold = "96"
+    position.oracle_base_age = 100
+    position.oracle_quote_age = age
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            for tool, args in (
+                ("preview_close", {}),
+                ("preview_partial_close", {"percent": 10}),
+            ):
+                quote = await call(client, tool, {"trade_id": 7, **args})
+                result = quote["estimates"]
+                assert result["execution"]["status"] == execution
+                if age > position.oracle_ttl:
+                    assert result["execution"]["code"] == "OraclePriceStale"
+                    assert result["fees"]["status"] == "unavailable"
+                    assert "amountUsdc" not in result["fees"]
 
     asyncio.run(scenario())
