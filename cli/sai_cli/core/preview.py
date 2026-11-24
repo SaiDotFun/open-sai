@@ -380,6 +380,11 @@ def close_estimates(
     raw = state.raw
     try:
         height = margin.verified_position_height(lcd, state, trade_id)
+        if fills_at_next_oracle_price(lcd, state.contract, height):
+            return dict.fromkeys(
+                result,
+                unavailable("Queued closes settle on a fresh oracle update."),
+            )
         prices = perp_prices(lcd, state, height)
         oracle = prices["market"]
         if not isinstance(oracle, dict):
@@ -391,11 +396,6 @@ def close_estimates(
                 lcd, state.contract, raw["market_index"], height=height
             )
             if stale_oracle(lcd, state.contract, pair, height, published_at):
-                if fills_at_next_oracle_price(lcd, state.contract, height):
-                    return dict.fromkeys(
-                        result,
-                        unavailable("Queued closes settle on a fresh oracle update."),
-                    )
                 stale = unavailable(
                     "Perp rejects the close at the observed stale oracle price."
                 )

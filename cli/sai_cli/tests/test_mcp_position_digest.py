@@ -1498,13 +1498,14 @@ def test_preview_uses_perp_group_and_pair_leverage_limits(
     asyncio.run(scenario())
 
 
-def test_stale_prices_are_unavailable_for_queued_closes(position_service):
+@pytest.mark.parametrize(("price", "age"), [("95", 900), ("95", 100), ("99", 100)])
+def test_queued_closes_defer_settlement_to_the_next_tick(position_service, price, age):
     position, base_url = position_service
     position.preview_inputs = True
     position.leverage = "20"
-    position.price = "95"
+    position.price = price
     position.liquidation_threshold = "96"
-    position.oracle_base_age = 900
+    position.oracle_base_age = age
     position.fill_at_next_oracle_price = True
 
     async def scenario():
@@ -1518,6 +1519,7 @@ def test_stale_prices_are_unavailable_for_queued_closes(position_service):
                 assert result["execution"]["status"] == "unavailable"
                 assert "fresh oracle update" in result["execution"]["reason"]
                 assert result["fees"]["status"] == "unavailable"
+                assert result["liquidationPrice"]["status"] == "unavailable"
 
     asyncio.run(scenario())
 
