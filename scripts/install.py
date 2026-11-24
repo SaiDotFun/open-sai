@@ -748,9 +748,17 @@ def launcher_entry(path: Path) -> tuple[int, int, str | None] | None:
     raise LauncherChanged("the Sai launcher changed while reading its owner")
 
 
-def rename_launcher(source: Path, destination: Path, *, exchange: bool) -> None:
+def rename_launcher(
+    source: Path,
+    destination: Path,
+    *,
+    exchange: bool,
+    private_destination: bool = False,
+) -> None:
     """Exchange two paths, or move into an empty destination, on this filesystem."""
+    sys.audit("sai.launcher.rename", os.fspath(source), os.fspath(destination))
     libc = ctypes.CDLL(None, use_errno=True)
+    code = errno.ENOSYS
     try:
         if sys.platform == "darwin":
             rename = libc.renamex_np
@@ -765,14 +773,22 @@ def rename_launcher(source: Path, destination: Path, *, exchange: bool) -> None:
                 os.fsencode(destination),
                 2 if exchange else 1,
             )
-    except AttributeError as error:
-        raise LookupFailed(
-            "this platform does not provide an atomic launcher rename"
-        ) from error
-    sys.audit("sai.launcher.rename", os.fspath(source), os.fspath(destination))
-    if rename(*args) != 0:
-        code = ctypes.get_errno()
-        raise OSError(code, os.strerror(code), os.fspath(destination))
+    except AttributeError:
+        pass
+    else:
+        code = ctypes.get_errno() if rename(*args) != 0 else 0
+    if code:
+        if exchange or code not in (errno.ENOSYS, errno.ENOTSUP, errno.EINVAL):
+            raise OSError(code, os.strerror(code), os.fspath(destination))
+        if private_destination:
+            # The installer lock protects this vacant staging path.
+            os.rename(source, destination)
+        else:
+            # Preserve the inode and fail atomically if another owner published.
+            # Only the source in our private stage is ever unlinked.
+            os.link(source, destination, follow_symlinks=False)
+            sync_dir(destination.parent)
+            source.unlink()
     sys.audit("sai.launcher.renamed", os.fspath(source), os.fspath(destination))
 
 
@@ -788,7 +804,9 @@ def protect_displaced_launcher(
             withdrawn = displaced.with_name("public")
             if launcher_entry(withdrawn) is None and active == published:
                 # Capture and check the public entry before putting anything back.
-                rename_launcher(launcher, withdrawn, exchange=False)
+                rename_launcher(
+                    launcher, withdrawn, exchange=False, private_destination=True
+                )
             captured = launcher_entry(withdrawn)
             if captured != published:
                 if captured is not None:
@@ -888,9 +906,16 @@ def switch_launcher(
         else native_binary(root, directory).relative_to(launcher.parent)
     )
     if previous is None:
-        # symlink(2) atomically fails with EEXIST, including for a dangling link.
         assert target is not None
-        launcher.symlink_to(target)
+        staged = root / LAUNCHER_SWITCH
+        staged.parent.mkdir(mode=0o700)
+        try:
+            staged.symlink_to(target)
+            rename_launcher(staged, launcher, exchange=False)
+        finally:
+            staged.unlink(missing_ok=True)
+            staged.parent.rmdir()
+            sync_dir(root)
     else:
         expected = launcher_entry(launcher)
         if expected is None or installed_directory(launcher, root) != previous:
@@ -910,7 +935,9 @@ def switch_launcher(
         sync_dir(stage)
         write_native_pending(root, pending)
         if target is None:
-            rename_launcher(launcher, displaced, exchange=False)
+            rename_launcher(
+                launcher, displaced, exchange=False, private_destination=True
+            )
         else:
             rename_launcher(displaced, launcher, exchange=True)
         settle_launcher_switch(launcher, root, pending)

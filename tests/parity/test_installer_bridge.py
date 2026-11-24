@@ -358,7 +358,7 @@ import os, runpy, sys
 from pathlib import Path
 script, destination, *args = sys.argv[1:]
 def race(event, values):
-    if event in ('os.rename', 'os.symlink') and os.fsdecode(values[1]) == destination:
+    if event == 'sai.launcher.rename' and os.fsdecode(values[1]) == destination:
         try:
             with Path(destination).open('x') as file:
                 file.write('another installer owns this launcher')
@@ -647,6 +647,49 @@ def test_native_rolls_back_failed_installed_mcp(
     assert config.read_bytes() == content
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="uses Linux seccomp")
+def test_standalone_rolls_back_without_rename_noreplace(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay, "MUTANT")
+    # Simulate a kernel without renameat2 without replacing any installer code.
+    probe = """
+import ctypes, errno, runpy, sys
+lib = ctypes.CDLL('libseccomp.so.2')
+lib.seccomp_init.argtypes = [ctypes.c_uint32]
+lib.seccomp_init.restype = ctypes.c_void_p
+lib.seccomp_rule_add_array.argtypes = [
+    ctypes.c_void_p, ctypes.c_uint32, ctypes.c_int, ctypes.c_uint, ctypes.c_void_p]
+lib.seccomp_load.argtypes = [ctypes.c_void_p]
+lib.seccomp_release.argtypes = [ctypes.c_void_p]
+ctx = lib.seccomp_init(0x7fff0000)  # SCMP_ACT_ALLOW
+assert ctx
+syscall = lib.seccomp_syscall_resolve_name(b'renameat2')
+assert syscall >= 0
+assert lib.seccomp_rule_add_array(ctx, 0x00050000 | errno.ENOSYS, syscall, 0, None) == 0
+assert lib.seccomp_load(ctx) == 0
+lib.seccomp_release(ctx)
+sys.argv = sys.argv[1:]
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "installed MCP startup mutation" in result.stderr
+    assert "rolled back" in result.stderr
+    assert not install.launcher.is_symlink()
+    assert not pending(install).exists()
+
+
 def interrupt_install(install: Install, replay: Replay, boundary: str) -> None:
     probe = """
 import os, runpy, signal, sys
@@ -654,7 +697,7 @@ script, launcher, record, boundary, *args = sys.argv[1:]
 def interrupt(event, values):
     if (
         (boundary == 'record' and event == 'os.rename' and os.fsdecode(values[1]) == record)
-        or (boundary == 'link' and event == 'os.symlink' and os.fsdecode(values[1]) == launcher)
+        or (boundary == 'link' and event == 'sai.launcher.rename' and os.fsdecode(values[1]) == launcher)
         or (boundary == 'smoke' and event == 'subprocess.Popen'
             and [os.fsdecode(value) for value in values[1]] == [launcher, '--version'])
         or (boundary == 'commit' and event == 'os.remove' and os.fsdecode(values[0]) == record)
