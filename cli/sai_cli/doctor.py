@@ -36,6 +36,8 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from websockets.exceptions import ConnectionClosed
+
 from . import mcp_install
 from .core import (
     keeper,
@@ -1047,7 +1049,12 @@ def check_websocket(ctx: Context) -> Check:
     try:
         stream.handshake(ws, NETWORK_TIMEOUT)
     except (stream.StreamError, *stream.DISCONNECTS) as exc:
-        reason = log.scrub(log.Untrusted(str(exc) or type(exc).__name__))
+        reason = type(exc).__name__
+        if isinstance(exc, ConnectionClosed):
+            if exc.rcvd is not None:
+                reason += f" (close code {exc.rcvd.code})"
+        else:
+            reason = log.scrub(log.Untrusted(str(exc) or reason))
         return Check(
             "websocket",
             "fail",

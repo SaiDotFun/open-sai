@@ -823,11 +823,15 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
     thread.join()
 
 
-def ws_stub(ack: bool) -> tuple[str, Any]:
+def ws_stub(ack: bool, *, close_with_target: bool = False) -> tuple[str, Any]:
     release = threading.Event()
 
     def handler(connection: ServerConnection) -> None:
         connection.recv()
+        if close_with_target:
+            assert connection.request is not None
+            connection.close(code=1008, reason=connection.request.path)
+            return
         if ack:
             connection.send(json.dumps({"type": "connection_ack"}))
         release.wait(10)
@@ -1026,6 +1030,33 @@ def test_silent_websocket_fails_within_the_timeout():
     assert time.monotonic() - start < doctor.NETWORK_TIMEOUT + 4
     assert check.status == "fail"
     assert "connection_ack" in check.summary
+
+
+def test_doctor_omits_peer_websocket_close_reason(http_stub):
+    base, _state = http_stub
+    ws, stop = ws_stub(ack=False, close_with_target=True)
+    path_key, query_key = "fixture-relative-path", "fixture-relative-query"
+    origin = ws.removesuffix("/query")
+    endpoint = f"{origin}/{path_key}?key={query_key}"
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                f"{base}/query",
+                "doctor",
+                "--no-fix",
+                "--ws-endpoint",
+                endpoint,
+                "--lcd-endpoint",
+                base,
+            )
+            assert code == 1
+            assert f"{origin} sent no connection_ack" in output
+            assert "ConnectionClosedError (close code 1008)" in output
+            assert path_key not in output and query_key not in output
+    finally:
+        stop()
 
 
 def test_unreachable_endpoints_fail_and_exit_1():
