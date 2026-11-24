@@ -5,7 +5,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import threading
+import time
+import traceback
 from collections import deque
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import asynccontextmanager
@@ -21,7 +24,7 @@ from click.testing import CliRunner
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
-from sai_cli.core import keeper, settings, storage
+from sai_cli.core import keeper, margin, settings, storage
 from sai_cli.core.errors import ExitCode
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
@@ -74,6 +77,8 @@ class Position:
     minimum_position_microusd: str = "1"
     preview_inputs: bool = False
     malformed_node_info: bool = False
+    deny_lcd: bool = False
+    denied_lcd_targets: list[str] = field(default_factory=list)
     price: float | str = 100.5
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
@@ -151,6 +156,10 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.reply({"data": data})
 
         def do_GET(self) -> None:
+            if position.deny_lcd:
+                position.denied_lcd_targets.append(self.path)
+                self.reply({}, status=401)
+                return
             path = urlsplit(self.path).path
             if path == "/cosmos/base/tendermint/v1beta1/node_info":
                 network = position.lcd_chain_id or position.chain_id
@@ -436,7 +445,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
 
 
 @asynccontextmanager
-async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
+async def connected_client(
+    base_url: str, *, lcd_endpoint: str | None = None
+) -> AsyncGenerator[ClientSession]:
     endpoint = f"{base_url}/query"
     storage.save_session(
         {
@@ -447,7 +458,7 @@ async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
         }
     )
     config = settings.load(
-        flags={"keeper.endpoint": endpoint, "lcd.endpoint": base_url}
+        flags={"keeper.endpoint": endpoint, "lcd.endpoint": lcd_endpoint or base_url}
     )
     mcp = create_server(config)
     async with create_connected_server_and_client_session(mcp._mcp_server) as client:
@@ -1337,6 +1348,53 @@ def test_malformed_lcd_keeps_the_limit_preview_and_digest_refusal(position_servi
             assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+def test_lcd_http_failure_logs_only_the_origin_in_an_embedded_server(
+    position_service, caplog
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.deny_lcd = True
+    path_key, query_key = "fixture-private-lcd-path", "fixture-private-lcd-query"
+    lcd = f"{base_url}/{path_key}?key={query_key}"
+
+    async def preview():
+        async with connected_client(base_url, lcd_endpoint=lcd) as client:
+            return await call(
+                client,
+                "preview_open",
+                {
+                    "market_id": 0,
+                    "side": "long",
+                    "order_type": "limit",
+                    "price": "100",
+                    "amount": "10",
+                    "leverage": "2",
+                    "slippage": "1",
+                },
+            )
+
+    with caplog.at_level(logging.INFO):
+        quote = asyncio.run(preview())
+        with pytest.raises(margin.QueryHeightMismatch) as denied:
+            margin.block_header(lcd, "latest", deadline=time.monotonic() + 5)
+    assert quote["estimates"]["fees"]["status"] == "unavailable"
+    assert position.submitted == []
+    assert any(record.name == "httpx" for record in caplog.records)
+    assert caplog.text.count(f"LCD HTTP response from {base_url} (status 401)") == 2
+    assert position.denied_lcd_targets[0] == (
+        f"/{path_key}{margin.NODE_INFO_PATH}?key={query_key}"
+    )
+    assert position.denied_lcd_targets[1].startswith(
+        f"/{path_key}{margin.BLOCK_PATH}latest?key={query_key}&_sai_query="
+    )
+    log_data = caplog.text + repr([record.args for record in caplog.records])
+    error_trace = "".join(traceback.format_exception(denied.value))
+    for secret in (path_key, query_key):
+        assert secret not in log_data
+        assert secret not in error_trace + json.dumps(quote)
+    assert f"LCD at {base_url} returned HTTP 401" in error_trace
 
 
 def test_mcp_market_refuses_first_step_excess_of_one_price_atom(position_service):
