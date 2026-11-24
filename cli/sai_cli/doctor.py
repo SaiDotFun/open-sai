@@ -137,8 +137,9 @@ def check_config(
         return Check(
             "config",
             "fail",
-            f"Invalid config.toml settings: {', '.join(invalid)}",
+            f"Invalid settings in {path}: {', '.join(invalid)}",
             file_fix,
+            invalid_setting=True,
         ), config
     invalid_env = [
         f"{spec.env} ({spec.key})"

@@ -130,7 +130,7 @@ def run_cli(*args: str) -> tuple[int, str]:
             "keeper.endpoint",
         ),
         (b"[update]\nauto = 'private_value'\n", "fail", 2, "update.auto"),
-        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", 1, "logs.keep_days"),
+        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", 2, "logs.keep_days"),
         (b"\xff", "fail", 1, "UTF-8"),
         pytest.param(
             b"[logs]\nkeep_days = " + b"9" * 5000,
