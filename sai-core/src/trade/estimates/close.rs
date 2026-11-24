@@ -6,12 +6,11 @@ use tokio::time::{Instant, sleep, timeout_at};
 use crate::{
     keeper::{MARKET, POSITION, TIMEOUT, truthy},
     storage::Session,
-    trade::{TradePreview, Trading, confirmation::canonical_price},
+    trade::{TradePreview, Trading},
 };
 
 use super::{
-    COLLATERAL_ORACLE, FEE_UNAVAILABLE, Price, SCALE, USDC_PLACES, base_fees, decimal, fixed,
-    integer, json_index,
+    COLLATERAL_ORACLE, FEE_UNAVAILABLE, Price, SCALE, base_fees, decimal, integer, json_index,
     lcd::{QuoteLcd, ReadError},
     liquidation_fee, not_applicable, now, unavailable,
 };
@@ -139,7 +138,7 @@ impl Trading<'_> {
             });
             result["fees"] = json!({
                 "status": "estimate",
-                "amountUsdc": canonical_price(&fixed(&liquidation_fee(&collateral), USDC_PLACES)),
+                "amountUsdc": liquidation_fee(&collateral),
                 "basis": "Gross Perp liquidation fee components.",
                 "excludes": ["Borrowing fees", "network fees"],
             });

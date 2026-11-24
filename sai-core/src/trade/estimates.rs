@@ -268,8 +268,24 @@ fn worst_case_fill(
     })
 }
 
-fn liquidation_fee(collateral: &BigUint) -> BigUint {
+fn liquidation_fee_units(collateral: &BigUint) -> BigUint {
     (collateral * 5u32 / 100u32) * 2u32
+}
+
+fn liquidation_fee(collateral: &BigUint) -> String {
+    let fee = liquidation_fee_units(collateral);
+    // Python's Decimal.scaleb uses its default 28-digit, half-even context here.
+    let excess = fee.to_string().len().saturating_sub(28) as u32;
+    if excess == 0 {
+        return fixed(&fee, USDC_PLACES);
+    }
+    let divisor = BigUint::from(10u32).pow(excess);
+    let mut rounded = &fee / &divisor;
+    let double_remainder = (fee % &divisor) * 2u32;
+    if double_remainder > divisor || (double_remainder == divisor && rounded.bit(0)) {
+        rounded += 1u32;
+    }
+    fixed(&(rounded * divisor), USDC_PLACES)
 }
 
 fn open_liquidation(
@@ -288,7 +304,7 @@ fn open_liquidation(
     // units. The final multiplication by the 90% threshold floors at one atom.
     let price_per_unit = (&price / &remaining) * SCALE / leverage;
     let distance =
-        price_per_unit * (&remaining * 90u32 - liquidation_fee(&remaining) * 100u32) / 100u32;
+        price_per_unit * (&remaining * 90u32 - liquidation_fee_units(&remaining) * 100u32) / 100u32;
     let trigger = if !long {
         price + distance
     } else if price > distance {
