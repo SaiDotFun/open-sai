@@ -26,6 +26,7 @@ from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
+CHECKSUM_ADDR = "0xaAaAaAaaAaAaAaaAaAAAAAAAAaaaAaAaAaaAaaAa"
 TOKEN = "fake-token"
 CHAIN_ID = "test-1"
 TRADER = "nibi1424242424242424242424242424242422mldj0"
@@ -36,6 +37,7 @@ OTHER_TRADER = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 class Position:
     collateral: int = 4_000_000
     trader: str = TRADER
+    contract_owner: str = TRADER
     position_reads: int = 0
     trade_type: str = "trade"
     keeper_market_open: bool = True
@@ -55,6 +57,7 @@ class Position:
     fill_at_next_oracle_price: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
     snapshot_traders: deque[str] = field(default_factory=deque)
+    indexed_collaterals: deque[int] = field(default_factory=deque)
     after_hours: bool = False
     risk_block: int = 90
     cap: str | None = "5"
@@ -94,11 +97,14 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_POST(self) -> None:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            indexed_collateral = position.collateral
             if request["query"] == keeper.POSITION:
                 if position.snapshot_leverages:
                     position.leverage = position.snapshot_leverages.popleft()
                 if position.snapshot_traders:
                     position.trader = position.snapshot_traders.popleft()
+                if position.indexed_collaterals:
+                    indexed_collateral = position.indexed_collaterals.popleft()
             if request["query"] == keeper.SUBMIT:
                 assert self.headers["Authorization"] == f"Bearer {TOKEN}"
                 envelope = request["variables"]["input"]
@@ -137,7 +143,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                                 "trader": position.trader,
                                 "isOpen": True,
                                 "tradeType": "trade",
-                                "collateralAmount": position.collateral,
+                                "collateralAmount": indexed_collateral,
                                 "leverage": float(position.leverage),
                                 "perpBorrowing": market,
                             }
@@ -211,7 +217,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 return
             if "get_trade_raw" in message:
                 data = {
-                    "user": position.trader,
+                    "user": position.contract_owner,
                     "user_trade_index": "UserTradeIndex(7)",
                     "market_index": "MarketIndex(0)",
                     "collateral_index": "TokenIndex(1)",
@@ -425,6 +431,7 @@ def test_cli_refuses_another_accounts_position(position_service, command):
     endpoint = f"{base_url}/query"
     save_session(endpoint)
     position.trader = OTHER_TRADER
+    position.contract_owner = OTHER_TRADER
     args = ["--json", "--endpoint", endpoint, "--lcd-endpoint", base_url, "trade"]
     runner = CliRunner()
 
@@ -455,6 +462,7 @@ def test_mcp_refuses_another_accounts_position(position_service, action, args):
             preview = await call(client, f"preview_{action}", args)
             assert preview["addr"] == ADDR
             position.trader = OTHER_TRADER
+            position.contract_owner = OTHER_TRADER
             position_reads = position.position_reads
 
             refused_preview = await call(client, f"preview_{action}", args)
@@ -500,6 +508,43 @@ def test_mcp_refuses_another_account_during_quote_rebuild(position_service):
                 "error": "Keeper position belongs to a different account",
             }
             assert not position.snapshot_traders
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("action", "args"),
+    [
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+    ],
+)
+def test_mcp_quotes_equivalent_position_addresses_through_index_retry(
+    position_service, action, args
+):
+    position, base_url = position_service
+    position.snapshot_traders.extend([CHECKSUM_ADDR, TRADER])
+    position.indexed_collaterals.append(3_000_000)
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            assert preview["addr"] == ADDR
+            assert preview["quote"]["collateralBefore"] == "4000000"
+            assert not position.snapshot_traders
+
+            position.contract_owner = OTHER_TRADER
+            refused = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused == {
+                "code": "INVALID_REQUEST",
+                "error": "Contract position belongs to a different account",
+            }
             assert position.submitted == []
             assert not (storage.home() / "intents.sqlite3").exists()
 

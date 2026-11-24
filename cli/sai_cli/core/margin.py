@@ -332,6 +332,8 @@ def _latest_position(
     raw = result.get("data")
     if not isinstance(raw, dict):
         raise TypeError("Contract returned invalid state")
+    if not keeper.same_account(state.raw["user"], raw.get("user")):
+        raise PositionOwnerMismatch("Contract position belongs to a different account")
     if height is not None and (
         not height.isascii() or not height.isdecimal() or not height.lstrip("0")
     ):
@@ -344,7 +346,6 @@ def _latest_position(
 
 def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
     fields = (
-        "user",
         "user_trade_index",
         "market_index",
         "collateral_index",
@@ -449,9 +450,12 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
 
     def raw_trade(timeout: float) -> dict[str, Any]:
         raw = _read_position(lcd, contract, trader, trade_id, timeout)
+        if not keeper.same_account(addr, raw.get("user")):
+            raise PositionOwnerMismatch(
+                "Contract position belongs to a different account"
+            )
         if (
-            raw.get("user") != trader
-            or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+            raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
             or raw.get("market_index") != f"MarketIndex({borrowing['marketId']})"
             or raw.get("collateral_index") != token
             or raw.get("is_open") is not True
@@ -471,7 +475,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
             if left <= 0:
                 break
             position = _position(endpoint, addr, trade_id, timeout=left)
-            if position["trader"] != trader or position["perpBorrowing"] != borrowing:
+            if position["perpBorrowing"] != borrowing:
                 raise PositionChanged(
                     "Position changed. Review the margin change again."
                 )
@@ -601,8 +605,7 @@ def _position(
     )["perp"]["trade"]
     if not position or not position["isOpen"] or position["tradeType"] != "trade":
         raise PositionUnavailable("Open position not found")
-    account = keeper.canonical_account(addr)
-    if account is None or keeper.canonical_account(position.get("trader")) != account:
+    if not keeper.same_account(addr, position.get("trader")):
         raise PositionOwnerMismatch("Keeper position belongs to a different account")
     return position
 
