@@ -54,7 +54,7 @@ fn keeper_identity_reuses_the_python_log_key_and_omits_private_url_parts() {
             [
                 ("endpoint", Field::Endpoint(url.into())),
                 ("endpointId", Field::endpoint_identity(url)),
-                ("command", "market list".into()),
+                ("command", Field::Text("market list".into())),
             ],
         );
     }

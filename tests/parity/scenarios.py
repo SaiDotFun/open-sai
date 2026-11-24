@@ -763,7 +763,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             errors,
             wire,
             admission,
-            interrupt_ready,
-            interrupt_closed,
+            interrupt_ready=interrupt_ready,
+            interrupt_closed=interrupt_closed,
             keeper_path=keeper_path,
         )
