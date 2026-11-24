@@ -30,7 +30,7 @@ def session_for(endpoint: str) -> dict[str, str]:
 def partial_close(monkeypatch, indexed: int, contract: int, *args: str):
     submitted = []
 
-    def gql(endpoint, query, variables=None, token=None):
+    def gql(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.ROUTE:
             return {
                 "oneClickTrading": {
@@ -104,7 +104,9 @@ def partial_close(monkeypatch, indexed: int, contract: int, *args: str):
     monkeypatch.setattr(
         margin,
         "smart",
-        lambda lcd, contract, message: raw if "get_trade_raw" in message else funds,
+        lambda lcd, contract, message, **kwargs: (
+            raw if "get_trade_raw" in message else funds
+        ),
     )
     storage.save_session(session_for(keeper.MAINNET_HTTP))
     result = CliRunner().invoke(
@@ -118,7 +120,7 @@ def test_partial_close_refuses_index_lag(monkeypatch):
     # Margin removal made the contract $1.50 while Keeper still shows $2.
     result, submitted = partial_close(monkeypatch, 2_000_000, 1_500_000)
     assert result.exit_code != 0
-    assert "wait for synchronization" in result.output
+    assert "Retry after Keeper synchronizes" in result.output
     assert submitted == []
 
 
