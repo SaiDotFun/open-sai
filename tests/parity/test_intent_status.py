@@ -333,6 +333,59 @@ def test_c11_rejects_endpoints_before_network_io(
                 assert result.stderr == f"Error: {message}\n".encode()
 
 
+@pytest.mark.parametrize(
+    ("host", "accepted"),
+    [
+        ("☃.localhost", False),
+        ("ｂücher.example", False),
+        ("bu\u0308cher.example", False),
+        ("b·cher.example", False),
+        ("bücher._example", False),
+        ("bücher..example", False),
+        ("Bücher.example", True),
+        ("例え。テスト.", True),
+        ("l·l.example", True),
+        ("bücher.xn--bcher-kva", True),
+        ("bücher.xn--n3h", False),
+    ],
+)
+def test_c11_http_idna_hostname(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path, host: str, accepted: bool
+) -> None:
+    endpoint = f"http://{host}/query"
+    for index, cli in enumerate(c11_cli_pair):
+        result = invoke(
+            cli,
+            tmp_path / str(index),
+            "--json",
+            "--endpoint",
+            endpoint,
+            "config",
+            "get",
+            "keeper.endpoint",
+            overrides={"SAI_LOG": "0"},
+        )
+        assert result.stderr == b""
+        assert result.returncode == (0 if accepted else 2)
+        if accepted:
+            assert json.loads(result.stdout) == {
+                "key": "keeper.endpoint",
+                "value": endpoint,
+                "source": "flag",
+            }
+        else:
+            assert json.loads(result.stdout) == {
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": (
+                        "--endpoint: Invalid value for keeper.endpoint: expected "
+                        "a URL starting with https:// or http://"
+                    ),
+                    "retryable": False,
+                }
+            }
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and directory modes")
 def test_c11_log_writer_leaves_symlink_target_untouched(
     c11_cli_pair: tuple[CLI, CLI], tmp_path: Path

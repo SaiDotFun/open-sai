@@ -22,6 +22,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-timeout.workspace = true
 hyper-util.workspace = true
+idna = "1"
 rustls.workspace = true
 ring.workspace = true
 rustls-native-certs.workspace = true

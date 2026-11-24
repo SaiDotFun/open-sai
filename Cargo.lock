@@ -1436,6 +1436,7 @@ dependencies = [
  "hyper",
  "hyper-timeout",
  "hyper-util",
+ "idna",
  "num-bigint",
  "openssl-probe",
  "regex",

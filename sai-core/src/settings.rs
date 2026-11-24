@@ -2,6 +2,7 @@
 
 mod edit;
 mod home;
+mod hostname;
 mod toml;
 
 use std::{
@@ -204,13 +205,11 @@ impl Key {
         if Endpoint::split(value).is_some_and(|url| {
             let (host, port) = url.host_port();
             let authority = url.authority.rsplit('@').next().unwrap_or_default();
-            // HTTPX rejects IPvFuture literals even though urlsplit accepts them.
-            let http_ipvfuture = schemes[0] == "https" && authority.starts_with("[v");
             schemes.contains(&url.scheme.as_str())
                 && !host.is_empty()
                 && port.is_ok()
                 && !url.authority.contains('\\')
-                && !http_ipvfuture
+                && (schemes[0] != "https" || hostname::valid_http_host(authority, &host))
         }) {
             return Ok(json!(value));
         }
