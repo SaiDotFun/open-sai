@@ -226,6 +226,27 @@ def test_session_for_other_endpoint_fails():
     assert "pw" not in check.summary and "key=abc" not in check.summary
 
 
+def test_session_without_an_endpoint_reports_a_missing_endpoint():
+    storage.save_session(
+        {
+            "token": TOKEN,
+            "evmAddress": ADDR,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        }
+    )
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 1
+    checks = json.loads(output)["error"]["details"]["checks"]
+    check = next(check for check in checks if check["id"] == "session")
+    assert check["status"] == "fail"
+    assert "has no stored Keeper endpoint" in check["summary"]
+    assert "auth login NAME" in check["fix"]
+    assert check["details"]["addr"] == ADDR
+    assert check["details"]["endpoint"] is None
+    assert check["details"]["endpointMatches"] is False
+
+
 def test_session_expiring_within_a_day_warns():
     save(hours=0.5)
     check = one(doctor.check_session, ctx())

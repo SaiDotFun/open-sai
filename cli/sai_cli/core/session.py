@@ -85,10 +85,11 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
     }
 
 
-def summary(result: dict[str, str]) -> dict[str, str]:
+def summary(result: dict[str, str]) -> dict[str, str | None]:
     """Return the address, expiry, and Keeper origin for display."""
+    endpoint = result.get("endpoint")
     return {
         "addr": result["evmAddress"],
         "expiresAt": result["expiresAt"],
-        "endpoint": log.origin(result["endpoint"]),
+        "endpoint": log.origin(endpoint) if endpoint is not None else None,
     }

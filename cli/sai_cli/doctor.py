@@ -611,11 +611,20 @@ def check_session(ctx: Context) -> Check:
         login = storage.keeper_command_hint(
             ctx.config.endpoint, "auth", "login", "NAME"
         )
+        stored_origin = state["endpoint"]
+        if stored_origin is None:
+            return Check(
+                "session",
+                "fail",
+                f"Session for {short(addr)} has no stored Keeper endpoint",
+                login,
+                details,
+            )
         return Check(
             "session",
             "fail",
             f"Session for {short(addr)} belongs to a different Keeper endpoint."
-            f" Stored origin {state['endpoint']}, configured origin"
+            f" Stored origin {stored_origin}, configured origin"
             f" {log.origin(ctx.config.endpoint)}",
             f"{login}, or restore the Keeper URL used to sign in",
             details,

@@ -1310,6 +1310,22 @@ def test_session_reports_never_include_the_token(mcp):
     assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"
 
 
+def test_session_reports_keep_an_account_without_an_endpoint(mcp):
+    stored = stored_session()
+    del stored["endpoint"]
+    storage.save_session(stored)
+
+    info = invoke(mcp, "mcp_info")
+    [account] = invoke(mcp, "auth_list")["accounts"]
+    assert info["session"]["signedIn"] is True
+    assert account["active"] is True
+    for report in (info["session"], account):
+        assert report["addr"] == ADDR
+        assert report["endpoint"] is None
+        assert report["endpointMatches"] is False
+        assert report["usable"] is False
+
+
 # Stdio
 
 
