@@ -408,13 +408,16 @@ pub async fn intent(
                 .iter()
                 .rev()
                 .filter(|row| event(row) == name)
-                .find_map(|row| row.get("txHash").and_then(keeper::request_hash))
+                .find_map(|row| {
+                    row.get("txHash")
+                        .and_then(|hash| keeper::request_hash(hash).0)
+                })
         })
-        .or_else(|| keeper::request_hash(&value["keeper"]["txHash"]));
+        .or_else(|| keeper::request_hash(&value["keeper"]["txHash"]).0);
     let scrub = log::scrubber(home);
     value["txHash"] = json!(
         hash.as_ref()
-            .and_then(|hash| keeper::request_hash(&scrub(json!(hash).into())))
+            .and_then(|hash| keeper::request_hash(&scrub(json!(hash).into())).0)
     );
     if !value["keeper"].is_null() {
         value["keeper"] = scrub(value["keeper"].clone().into());

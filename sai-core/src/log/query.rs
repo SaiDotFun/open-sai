@@ -405,10 +405,11 @@ fn export(row: &Row, scrub: &impl Fn(Field) -> Value) -> Value {
         *endpoint = scrub(Field::Endpoint(keeper::stringify(endpoint)));
     }
     safe.shift_remove("txHash");
-    if let Some(hash) = row.get("txHash").filter(|hash| !hash.is_null()) {
-        if let Some(hash) = keeper::request_hash(hash) {
+    if let Some(value) = row.get("txHash") {
+        let (hash, invalid) = keeper::request_hash(value);
+        if let Some(hash) = hash {
             safe.insert("txHash".into(), json!(hash));
-        } else {
+        } else if invalid {
             safe.insert("txHashInvalid".into(), json!(true));
         }
     }

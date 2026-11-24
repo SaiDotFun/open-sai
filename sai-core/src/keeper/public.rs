@@ -196,28 +196,29 @@ fn block_time(value: &Value) -> bool {
 }
 
 fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
-    if value.is_null() {
-        return;
-    }
-    if let Some(hash) = request_hash(value) {
+    let (hash, invalid) = request_hash(value);
+    if let Some(hash) = hash {
         out.insert(key.into(), json!(hash));
-    } else {
+    }
+    if invalid {
         out.insert(format!("{key}Invalid"), json!(true));
     }
 }
 
-pub(crate) fn request_hash(value: &Value) -> Option<String> {
-    value.as_str().and_then(|hash| {
+pub(crate) fn request_hash(value: &Value) -> (Option<String>, bool) {
+    if value.is_null() {
+        return (None, false);
+    }
+    if let Some(hash) = value.as_str() {
         let digits = hash
             .strip_prefix("0x")
             .or_else(|| hash.strip_prefix("0X"))
             .unwrap_or(hash);
         if digits.len() == 64 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            Some(hash.to_ascii_lowercase())
-        } else {
-            None
+            return (Some(hash.to_ascii_lowercase()), false);
         }
-    })
+    }
+    (None, true)
 }
 
 pub(crate) fn known_intent_field(field: &str, value: &Value) -> bool {

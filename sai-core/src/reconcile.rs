@@ -385,6 +385,7 @@ fn log_keeper(
         ("intentKey", json!(key).into()),
         ("addr", json!(addr).into()),
         ("endpoint", Field::Endpoint(endpoint.into())),
+        ("endpointId", Field::endpoint_identity(endpoint)),
     ];
     if let Some((row, outcome)) = observed {
         for key in ["kind", "lifecycleStep", "execActor"] {
@@ -395,9 +396,10 @@ fn log_keeper(
         if let Some(code) = row.as_object().and_then(keeper::log_intent_error_code) {
             fields.push(("errorCode", json!(code).into()));
         }
-        if let Some(hash) = keeper::request_hash(&row["txHash"]) {
+        let (hash, invalid) = keeper::request_hash(&row["txHash"]);
+        if let Some(hash) = hash {
             fields.push(("txHash", json!(hash).into()));
-        } else if !row["txHash"].is_null() {
+        } else if invalid {
             fields.push(("txHashInvalid", json!(true).into()));
         }
         if outcome == Outcome::TerminalFailed {

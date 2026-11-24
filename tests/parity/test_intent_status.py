@@ -165,7 +165,7 @@ def invoke(
     )
 
 
-def read_events(home: Path) -> list[dict[str, Any]]:
+def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
@@ -173,6 +173,10 @@ def read_events(home: Path) -> list[dict[str, Any]]:
     ]
     groups: dict[str, list[int]] = {}
     for event in events:
+        if c4_reference:
+            # The C4 pin predates the v2 envelope and keyed endpoint identity.
+            for field in ("schema", "commandId", "endpointId"):
+                event.pop(field, None)
         run = event["runId"]
         event["runId"] = list(groups).index(run) if run in groups else len(groups)
         seq = groups.setdefault(run, [])
@@ -217,7 +221,10 @@ def read_events(home: Path) -> list[dict[str, Any]]:
 
 def read_state(home: Path) -> tuple[Any, ...]:
     files = {
-        str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
+        str(path.relative_to(home)): path.stat().st_mode
+        for path in home.rglob("*")
+        if path.relative_to(home).as_posix()
+        not in {"logs/.endpoint-key", "logs/.endpoint-key.lock"}
     }
     for name in ("logs/.endpoint-key", "logs/.endpoint-key.lock"):
         if name in files:
@@ -402,7 +409,7 @@ def compare(
                 if index == 0 and step.code == 0:
                     stdout = public_intent_output(stdout, compact=step.json_output)
                 runs.append((stdout, result.stderr, list(requests), state))
-            observed.append((runs, read_events(home)))
+            observed.append((runs, read_events(home, c4_reference=True)))
         assert observed[0] == observed[1]
 
 
@@ -733,7 +740,7 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert result.stderr == b""
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
-            outputs.append((result.stdout, read_events(home)))
+            outputs.append((result.stdout, read_events(home, c4_reference=True)))
         assert outputs[0] == outputs[1]
 
 

@@ -7,6 +7,7 @@ mod mcp_registration;
 mod reads;
 mod repl;
 mod skill;
+mod trade;
 
 use std::{
     cell::Cell,
@@ -110,6 +111,11 @@ enum Command {
         #[command(subcommand)]
         command: logs::LogsCommand,
     },
+    /// Submit authenticated trading intents.
+    Trade {
+        #[command(subcommand)]
+        command: trade::TradeCommand,
+    },
 }
 
 impl Cli {
@@ -142,6 +148,9 @@ impl Cli {
             Some(Command::Skill { command }) => command.run(json),
             Some(Command::Logs { command }) => {
                 command.run(env, &flags, self.account.as_deref(), json)
+            }
+            Some(Command::Trade { command }) => {
+                trade::run(command, self.account.as_deref(), &flags, env, json, events)
             }
             None if self.skill => skill::show(None),
             None if json => Err(SaiError::usage("Pass a command when using --json.")),
@@ -374,7 +383,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
-        | "market list" | "market prices" => "",
+        | "market list" | "market prices" | "trade open" => "",
         "mcp install" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
@@ -384,6 +393,7 @@ fn usage(command: &str) -> String {
         "logs path" | "logs tail" | "logs stats" => "",
         "logs intent" => " KEY",
         "logs run" => " ID",
+        "trade close" | "trade cancel" => " TRADE_ID",
         "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
