@@ -339,6 +339,8 @@ In that case the wait returns `succeeded` for a market intent.
 If matched history records liquidation or another effect that differs from
 the request, the CLI exits 1. The receipt reports the observed
 `execution.tradeChangeType` and the outcome is `liquidated` or `unexpected`.
+An after-hours risk adjustment alongside the recorded action appears in
+`execution.extraEffects`.
 
 An acknowledged open blocks another open for the same account and Keeper
 endpoint. The refusal gives the existing intent key. Use

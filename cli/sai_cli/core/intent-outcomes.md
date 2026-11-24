@@ -72,10 +72,11 @@ outcome verified by this version stays terminal.
 
 A keyed check can corroborate a fill or attach history to a canonical
 `exec_pass`. It reads up to four pages of 25 history rows for the trader
-in descending block order. If they have no match, it re-reads the newest
-page after 250 ms when the two-second history budget allows it. It stops
-on a history request error. A later check can pick up rows that arrive
-after the re-read.
+in descending block order. When it finds a match, it keeps reading within
+the budget until it passes the execution block. If it finds no match,
+it starts again at the newest page after 250 ms and uses any remaining
+reads. Both passes share a five-request limit and a two-second history
+budget. A history request error ends the scan.
 
 A history row must have the same `intentKey`, a `trade.trader` that decodes
 to the requested account, and a request hash matching the lifecycle

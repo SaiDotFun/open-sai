@@ -103,6 +103,12 @@ def _hash(value: object) -> str:
     return value.lower().removeprefix("0x") if isinstance(value, str) else ""
 
 
+def _history_block(item: object) -> int | None:
+    block = item.get("block") if isinstance(item, dict) else None
+    height = block.get("block") if isinstance(block, dict) else None
+    return height if isinstance(height, int) else None
+
+
 def _read_history(
     addr: str,
     account: str,
@@ -132,20 +138,54 @@ def _read_history(
             in (_hash(item.get("txHash")), _hash(item.get("evmTxHash")))
         ]
 
-    # Keeper filters by trader. Re-read the newest page once for rows arriving
-    # in the index while we check the recent pages.
-    for offset in range(0, HISTORY_PAGE_SIZE * HISTORY_MAX_PAGES, HISTORY_PAGE_SIZE):
-        page = yield from _history_page(addr, offset, left())
-        if page is None:
-            return []
-        matches = matching(page)
-        if matches:
-            return matches
-        if len(page) < HISTORY_PAGE_SIZE:
-            break
+    pages_left = HISTORY_MAX_PAGES + 1
+
+    def scan(
+        max_pages: int,
+    ) -> Generator[Read, dict[str, Any] | None, tuple[list[dict[str, Any]], bool]]:
+        nonlocal pages_left
+        # An execution can span pages. Scan until we cross its block or
+        # reach the request count or time budget.
+        found: list[dict[str, Any]] = []
+        seen: set[int] = set()
+        execution_block = (
+            row.get("execBlock") if row.get("lifecycleStep") == "exec_pass" else None
+        )
+        for page_number in range(max_pages):
+            pages_left -= 1
+            page = yield from _history_page(
+                addr, page_number * HISTORY_PAGE_SIZE, left()
+            )
+            if page is None:
+                return found, False
+            for item in matching(page):
+                history_id = item.get("id")
+                if isinstance(history_id, int):
+                    if history_id in seen:
+                        continue
+                    seen.add(history_id)
+                found.append(item)
+            if len(page) < HISTORY_PAGE_SIZE:
+                break
+            if found:
+                if not isinstance(execution_block, int):
+                    execution_block = _history_block(found[0])
+                oldest = _history_block(page[-1])
+                if (
+                    isinstance(execution_block, int)
+                    and oldest is not None
+                    and oldest < execution_block
+                ):
+                    break
+        return found, True
+
+    found, completed = yield from scan(HISTORY_MAX_PAGES)
+    if found or not completed:
+        return found
     if left() > HISTORY_RETRY_DELAY:
         yield HISTORY_RETRY_DELAY
-        return matching((yield from _history_page(addr, 0, left())) or [])
+        found, _ = yield from scan(min(pages_left, HISTORY_MAX_PAGES))
+        return found
     return []
 
 

@@ -1264,7 +1264,9 @@ def test_partial_close_wait_reports_observed_history(
     )
     if outcome != "filled":
         # A plausible row must not hide another observed effect of this intent.
-        rows.insert(0, {**rows[0], "tradeChangeType": "trade_size_decrease"})
+        rows.insert(
+            0, {**rows[0], "id": 1006, "tradeChangeType": "trade_size_decrease"}
+        )
     replies.extend((completed, history))
     command = CliRunner().invoke(
         main, ["--endpoint", endpoint, "--json", "intent", "wait", KEY]
@@ -1291,6 +1293,89 @@ def test_leverage_wait_flags_a_take_profit_update(keeper_replay):
     result = wait.for_intent(endpoint, ADDR, KEY)
     assert result["outcome"] == "unexpected"
     assert result["receipt"]["execution"]["tradeChangeType"] == "tp_updated"
+    assert status(endpoint) == "terminal"
+
+
+@pytest.mark.parametrize("pages", ["single", "split", "retry_split"])
+@pytest.mark.parametrize(
+    ("changes", "selected", "outcome", "exit_code"),
+    [
+        (
+            ["after_hours_risk_trigger", "leverage_updated"],
+            "leverage_updated",
+            "succeeded",
+            0,
+        ),
+        (
+            ["leverage_updated", "after_hours_risk_trigger"],
+            "leverage_updated",
+            "succeeded",
+            0,
+        ),
+        (
+            ["after_hours_risk_trigger", "leverage_updated", "position_liquidated"],
+            "position_liquidated",
+            "liquidated",
+            1,
+        ),
+        (["after_hours_risk_trigger"], "after_hours_risk_trigger", "unexpected", 1),
+    ],
+)
+def test_leverage_wait_reports_after_hours_adjustment_as_an_extra_effect(
+    keeper_replay, changes, selected, outcome, exit_code, pages
+):
+    endpoint, replies = keeper_replay
+    storage.pending(KEY, endpoint, ADDR, "UPDATE_TRADE", "7")
+    completed = deepcopy(RESPONSES["filled"])
+    completed["data"]["userIntents"][0].update(
+        kind="UPDATE_TRADE", body={"requestedLeverage": "2"}
+    )
+    history = fill_history()
+    rows = history["data"]["perp"]["tradeHistory"]
+    base = rows[0]
+    rows[:] = [
+        {**base, "tradeChangeType": change, "id": 2000 + index}
+        for index, change in enumerate(changes)
+    ]
+    rows.append(
+        {
+            **base,
+            "tradeChangeType": "after_hours_risk_trigger",
+            "id": 999,
+            "block": {"block": 50109520},
+        }
+    )
+    replies.append(completed)
+    if pages == "retry_split":
+        replies.append("not_yet_in_history")
+    if pages != "single":
+        first = rows.pop(0)
+        noise = [
+            {**base, "intentKey": "unrelated", "id": 3000 + index}
+            for index in range(reconcile.HISTORY_PAGE_SIZE - 1)
+        ]
+        replies.append({"data": {"perp": {"tradeHistory": [*noise, first]}}})
+    replies.append(history)
+    command = CliRunner().invoke(
+        main, ["--endpoint", endpoint, "--json", "intent", "wait", KEY]
+    )
+    assert command.exit_code == exit_code, command.output
+    result = json.loads(command.stdout)
+    assert result["outcome"] == outcome
+    execution = result["receipt"]["execution"]
+    assert execution["tradeChangeType"] == selected
+    assert execution["historyId"] == 2000 + changes.index(selected)
+    assert execution["extraEffects"] == (
+        []
+        if selected == "after_hours_risk_trigger"
+        else [
+            {
+                "tradeChangeType": "after_hours_risk_trigger",
+                "historyId": 2000 + changes.index("after_hours_risk_trigger"),
+                "block": 50109596,
+            }
+        ]
+    )
     assert status(endpoint) == "terminal"
 
 

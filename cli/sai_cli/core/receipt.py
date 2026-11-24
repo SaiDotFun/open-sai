@@ -20,28 +20,38 @@ REQUESTED_CHANGES = {
     "UPDATE_OPEN_ORDER": {"order_updated"},
     "UPDATE_TRADE": {"tp_updated", "sl_updated", "tpsl_updated", "leverage_updated"},
 }
+ADDITIONAL_EFFECTS = {"after_hours_risk_trigger"}
 
 
-def _indexed(row: dict[str, Any], history: list[dict[str, Any]]) -> dict[str, Any]:
-    # A row confirming the canonical execution block takes precedence if the
-    # same intent key happens to appear on multiple history rows.
+def _execution_rows(
+    row: dict[str, Any], history: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Keep the history rows for the execution Keeper confirmed."""
     canonical_block = (
         row.get("execBlock") if row.get("lifecycleStep") == "exec_pass" else None
     )
-    matching = [
+    return [
         item
         for item in history
         if canonical_block is None
         or (item.get("block") or {}).get("block") == canonical_block
     ]
+
+
+def _indexed(row: dict[str, Any], matching: list[dict[str, Any]]) -> dict[str, Any]:
     for item in matching:
         if item.get("tradeChangeType") == "position_liquidated":
             return item
+    confirming = None
     for item in matching:
         change = item.get("tradeChangeType")
-        if change and not _matches_action(row, item, change):
+        if not change or change in ADDITIONAL_EFFECTS:
+            continue
+        if not _matches_action(row, item, change):
             return item
-    return matching[0] if matching else {}
+        if confirming is None:
+            confirming = item
+    return confirming or (matching[0] if matching else {})
 
 
 def _action(row: dict[str, Any], indexed: dict[str, Any]) -> dict[str, Any]:
@@ -85,7 +95,7 @@ def _requests_update(patch: object) -> bool:
 def success(
     row: dict[str, Any], history: list[dict[str, Any]]
 ) -> Literal["filled", "placed", "succeeded", "liquidated", "unexpected"]:
-    indexed = _indexed(row, history)
+    indexed = _indexed(row, _execution_rows(row, history))
     action = _action(row, indexed)
     change = indexed.get("tradeChangeType")
     if change == "position_liquidated":
@@ -110,7 +120,8 @@ def build(
     request_block: int | None,
 ) -> dict[str, Any]:
     """Keep the request transaction distinct from execution and fill data."""
-    indexed = _indexed(row, history)
+    matching = _execution_rows(row, history)
+    indexed = _indexed(row, matching)
     order = indexed.get("marketOrder") or {}
     block = indexed.get("block") or {}
     change = indexed.get("tradeChangeType")
@@ -133,6 +144,16 @@ def build(
             "historyId": indexed.get("id"),
             "tradeChangeType": change,
             "marketOrderSequence": order.get("sequence"),
+            "extraEffects": [
+                {
+                    "tradeChangeType": item["tradeChangeType"],
+                    "historyId": item.get("id"),
+                    "block": (item.get("block") or {}).get("block"),
+                }
+                for item in matching
+                if item is not indexed
+                and item.get("tradeChangeType") in ADDITIONAL_EFFECTS
+            ],
         }
     fill = None
     if outcome == "filled":
