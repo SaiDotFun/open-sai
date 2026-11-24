@@ -46,6 +46,8 @@ class Position:
     quoted_max_leverage: int | None = None
     pair_leverage: str | None = "0"
     liquidation_threshold: str = "60"
+    quoted_liquidation_threshold: str | None = None
+    quote_error_height: int | None = None
     block_timestamp: int = 2_000_000_000
     oracle_base_age: int | None = None
     null_market_price: bool = False
@@ -264,6 +266,38 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     position.reported_height
                 )
                 data = {"liquidation_price": position.liquidation_threshold}
+            elif "quote_trade" in message:
+                assert not position.fill_at_next_oracle_price
+                assert self.headers.get("x-cosmos-block-height") == str(
+                    position.reported_height
+                )
+                quote = message["quote_trade"]
+                leverage = quote["action"]["update_leverage"]["new_leverage"]
+                assert quote == {
+                    "trader": TRADER,
+                    "funds": [],
+                    "action": {
+                        "update_leverage": {
+                            "trade_index": "UserTradeIndex(7)",
+                            "new_leverage": leverage,
+                        }
+                    },
+                }
+                threshold = position.quoted_liquidation_threshold
+                if threshold is not None:
+                    assert leverage == "20"
+                    if Decimal(str(position.price)) <= Decimal(threshold):
+                        self.reply(
+                            {
+                                "code": 2,
+                                "message": f"Generic error: liquidation price reached. "
+                                f"Liq price {threshold}, current price 1: query wasm contract failed",
+                            },
+                            status=500,
+                            bare_height=position.quote_error_height,
+                        )
+                        return
+                data = {"data": None, "attributes": [], "events": [], "messages": []}
             elif "get_exchange_balance" in message:
                 assert message["get_exchange_balance"] == {
                     "user": TRADER,
@@ -357,7 +391,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.reply({"data": data}, height)
 
         def reply(
-            self, value: dict[str, Any], height: int | None = None, *, status: int = 200
+            self,
+            value: dict[str, Any],
+            height: int | None = None,
+            *,
+            status: int = 200,
+            bare_height: int | None = None,
         ) -> None:
             requested_height = self.headers.get("x-cosmos-block-height")
             if requested_height is not None and height is not None:
@@ -368,6 +407,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.send_header("Content-Length", str(len(data)))
             if height is not None:
                 self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
+            if bare_height is not None:
+                self.send_header("x-cosmos-block-height", str(bare_height))
             self.end_headers()
             self.wfile.write(data)
 
@@ -1894,6 +1935,50 @@ def test_leverage_checks_stored_liquidation_before_after_hours_cap(
                     "after-hours guard"
                     in quote["estimates"]["liquidationPrice"]["reason"]
                 )
+                assert quote["previewDigest"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("price", "queued", "rejected", "quote_error_height"),
+    [
+        ("96.10", False, True, None),
+        ("96.20", False, True, 120),
+        ("96.21", False, False, None),
+        ("96.10", True, False, None),
+        ("96.10", False, False, 121),
+    ],
+)
+def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
+    position_service, price, queued, rejected, quote_error_height
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.price = price
+    position.oracle_base_age = 100
+    # The 20x position has $50 of collateral. With $2 of accrued borrowing,
+    # Perp's liquidation threshold moves from $96 to $96.20.
+    position.quoted_liquidation_threshold = "96.20"
+    position.quote_error_height = quote_error_height
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client,
+                "preview_margin",
+                {"trade_id": 7, "direction": "remove", "amount": "50"},
+            )
+            if rejected:
+                assert_rejected_preview(
+                    quote, "LiquidationReached", "prospective liquidation threshold"
+                )
+            else:
+                assert quote["estimates"]["liquidationPrice"]["price"] == "96"
                 assert quote["previewDigest"]
             assert position.submitted == []
 

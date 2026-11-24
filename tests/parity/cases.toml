@@ -536,7 +536,7 @@ wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market", "get_trade_raw", "get_market",
     "market_order_config", "get_perp_prices", "is_after_hours_market", "get_group",
-    "get_pair_custom_max_leverage", "get_fees", "get_exchange_balance",
+    "get_pair_custom_max_leverage", "get_fees", "quote_trade", "get_exchange_balance",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 

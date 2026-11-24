@@ -672,8 +672,12 @@ def _leverage_estimates(
         state.observed_at,
     )
     liq = liquidation(entry, long, collateral, target)
-    # Positive borrowing fees only move this threshold closer to liquidation.
-    if price is not None and past_liquidation(price, Decimal(liq["price"]), long):
+    # A crossing without borrowing is already conclusive. Between that
+    # threshold and the actual one, Perp's quote includes accrued borrowing.
+    if price is not None and (
+        past_liquidation(price, Decimal(liq["price"]), long)
+        or margin.quote_leverage_liquidates(lcd, state, target, height=height)
+    ):
         return rejected(
             "LiquidationReached",
             "The observed oracle price has reached the prospective liquidation threshold.",

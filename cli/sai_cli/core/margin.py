@@ -305,6 +305,57 @@ class PositionSnapshot:
     observed_at: str | None = None
 
 
+def quote_leverage_liquidates(
+    lcd: str, state: PositionSnapshot, target: Decimal, *, height: str
+) -> bool:
+    """Ask Perp to run a leverage update against discarded query storage."""
+    try:
+        smart_value(
+            lcd,
+            state.contract,
+            {
+                "quote_trade": {
+                    "trader": state.raw["user"],
+                    "funds": [],
+                    "action": {
+                        "update_leverage": {
+                            "trade_index": state.raw["user_trade_index"],
+                            "new_leverage": format(target, "f"),
+                        }
+                    },
+                }
+            },
+            height=height,
+        )
+    except QueryHeightMismatch as exc:
+        failure = exc.__cause__
+        if not isinstance(failure, httpx.HTTPStatusError):
+            return False
+        response = failure.response
+        # The gateway may omit block metadata on contract errors. The request
+        # pins the height and bypasses the LCD cache.
+        if any(
+            response.headers.get(header) not in (None, height)
+            for header in (f"grpc-metadata-{BLOCK_HEIGHT_HEADER}", BLOCK_HEIGHT_HEADER)
+        ):
+            return False
+        try:
+            body = response.json()
+        except ValueError:
+            return False
+        message = body.get("message") if isinstance(body, dict) else None
+        return (
+            isinstance(message, str)
+            and re.search(
+                r"\bliquidation price reached\. Liq price \d+(?:\.\d+)?, "
+                r"current price \d+(?:\.\d+)?\b",
+                message,
+            )
+            is not None
+        )
+    return False
+
+
 def _read_position(
     lcd: str, contract: str, trader: str, trade_id: int, timeout: float
 ) -> dict[str, Any]:

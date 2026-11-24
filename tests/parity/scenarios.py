@@ -308,6 +308,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "get_collateral_price": "1",
         "get_perp_prices": {"market": {"base_per_quote": "100"}, "collateral": "1"},
         "get_liquidation_price": {"liquidation_price": "60"},
+        "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
         "get_market": {"fee_index": "FeeIndex(0)", "group_index": "GroupIndex(0)"},
         "get_group": {"min_leverage": "1", "max_leverage": "100"},
         "get_pair_custom_max_leverage": "0",
@@ -341,6 +342,16 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "trade_id": "UserTradeIndex(7)",
             "trader": position["trader"],
             "include_borrowing_fees": True,
+        },
+        "quote_trade": {
+            "trader": position["trader"],
+            "funds": [],
+            "action": {
+                "update_leverage": {
+                    "trade_index": "UserTradeIndex(7)",
+                    "new_leverage": "1.818181818181818182",
+                }
+            },
         },
         "get_fees": {"index": "FeeIndex(0)"},
     }
