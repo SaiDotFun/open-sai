@@ -34,6 +34,24 @@ any selected case differs or fails its expectations.
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command that needs another fixture.
 
+## Compare MCP Stdio
+
+Check out Python commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` in a
+separate directory. Use CPython 3.12, which preserves the tool description
+indentation recorded in the Rust inventory.
+
+```sh
+uv sync --project /absolute/path/to/python-checkout --python 3.12 --locked
+SAI_MCP_PARITY_PYTHON=/absolute/path/to/python-checkout/.venv/bin/sai \
+SAI_PARITY_BIN=/absolute/path/to/rust/sai \
+  uv run python tests/parity/parity.py --case 'mcp-*-*'
+```
+
+The transcript checks server initialization, ordered tool metadata,
+strict argument errors, and the JSON string in each successful response's
+`content` and `structuredContent`. It also replaces a fixture session
+between calls to check the trade refusal before argument validation.
+
 ## Add a Case
 
 Each `[[case]]` table has a unique `name` and a list of CLI arguments in
@@ -99,8 +117,11 @@ object keys may appear in any order. Market, account, and watch cases also
 compare stdout and stderr byte for byte. Array entries and JSONL events retain
 their order. For the concurrent-close case, each process's events retain
 their own order, and the two streams are matched by the process outcome.
-For MCP, replies are matched by request ID and entries in `tools/list` by
-tool name.
+For MCP, each request must receive one response with the matching ID.
+The driver rejects any extra lines on stdout and compares the tool list
+in wire order. It checks that both content fields contain the same JSON
+string before comparing the decoded document. Server provenance has
+implementation-specific values and must have a valid absolute path and shape.
 
 The `SAI_HOME` snapshot compares relative paths, file types, modes, and
 contents. It parses TOML values and checks that edits preserve the existing

@@ -11,12 +11,16 @@ use crate::local::{InlineJson, ascii_json};
 
 pub(super) fn read(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     let text = if json {
-        render(value, InlineJson)?
+        inline(value)?
     } else {
         render(value, PrettyFormatter::new())?
     };
     println!("{text}");
     Ok(())
+}
+
+pub(crate) fn inline(value: &impl Serialize) -> Result<String, SaiError> {
+    render(value, InlineJson)
 }
 
 pub(super) fn line(value: &Value) -> Result<String, SaiError> {
