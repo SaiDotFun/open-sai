@@ -9,6 +9,7 @@ use crate::{
 
 const SCALE: u128 = 10u128.pow(18);
 const MICROS: u32 = 1_000_000;
+const DECIMAL_PRECISION: usize = 28;
 const MARGIN_WARNING: &str = "The request authorizes target leverage, not an amount cap; the actual margin change may differ if the position changes before execution.";
 
 pub(super) struct ContractDecimal {
@@ -173,7 +174,8 @@ pub(super) fn reduction(
         return Err(fail());
     }
     let collateral = collateral.magnitude();
-    let delta = round_decimal(collateral * percent) / 100u32;
+    let scaled = round_decimal(collateral * percent);
+    let delta = &scaled / 100u32;
     if delta == BigUint::ZERO {
         return Err(fail());
     }
@@ -182,6 +184,22 @@ pub(super) fn reduction(
     let notional = BigInt::from_biguint(leverage.0.sign(), notional);
     if notional * BigInt::from(minimum.1) < minimum.0 * BigInt::from(leverage.1) * MICROS {
         return Err(fail());
+    }
+    // Decimal division preserves the rounded product's exponent when its
+    // trailing zeroes permit it. Python's later int() rejects that notation.
+    let scaled = scaled.to_str_radix(10);
+    let trailing_zeroes = scaled.len() - scaled.trim_end_matches('0').len();
+    let exponent = scaled
+        .len()
+        .saturating_sub(DECIMAL_PRECISION)
+        .min(trailing_zeroes.saturating_sub(2));
+    if exponent > 0 {
+        let digits = delta.to_str_radix(10);
+        let (whole, fraction) = digits[..digits.len() - exponent].split_at(1);
+        return Err(invalid(&format!(
+            "invalid literal for int() with base 10: '{whole}.{fraction}E+{}'",
+            digits.len() - 1
+        )));
     }
     Ok(delta)
 }
@@ -232,10 +250,10 @@ fn integer(value: &Value) -> Result<BigInt, SaiError> {
 // applying the explicit floor in the reduction and converting margin to micros.
 fn round_decimal(value: BigUint) -> BigUint {
     let digits = value.to_str_radix(10).len();
-    if digits <= 28 {
+    if digits <= DECIMAL_PRECISION {
         return value;
     }
-    let unit = BigUint::from(10u32).pow((digits - 28) as u32);
+    let unit = BigUint::from(10u32).pow((digits - DECIMAL_PRECISION) as u32);
     let mut quotient = &value / &unit;
     let doubled = (value % &unit) * 2u32;
     if doubled > unit || (doubled == unit && quotient.bit(0)) {
@@ -285,6 +303,18 @@ mod tests {
     use super::*;
 
     const ACCOUNT: &str = "0x1111111111111111111111111111111111111111";
+
+    #[test]
+    fn reduction_refuses_only_when_decimal_would_render_an_exponent() {
+        let raw = |collateral| json!({"collateral_amount": collateral, "leverage": "2.0"});
+        let failure = reduction(&raw("1000000000000000000000000000"), 50, &json!(1)).unwrap_err();
+        assert_eq!(
+            failure.message,
+            "invalid literal for int() with base 10: '5.0000000000000000000000000E+26'"
+        );
+        let delta = reduction(&raw("10000000000000000000000000020"), 1, &json!(1)).unwrap();
+        assert_eq!(delta.to_string(), "100000000000000000000000000");
+    }
 
     #[test]
     fn margin_digest_matches_python_for_a_carried_position() {

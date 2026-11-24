@@ -502,6 +502,19 @@ state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "tr
 output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<intentKey 1>", "retry.error.code" = "INVALID_REQUEST", "retry.error.intentKey" = "<intentKey 1>" }
 
 [[case]]
+name = "trade-partial-close-scientific-reduction"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--dry-run"]
+seed = "session"
+server = "position-scientific-reduction"
+expect = 1
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "invalid literal for int() with base 10: '5.0000000000000000000000000E+28'" }
+
+[[case]]
 name = "trade-partial-close-rounding"
 args = ["--json", "trade", "partial-close", "7", "--percent", "33", "--dry-run"]
 seed = "session"

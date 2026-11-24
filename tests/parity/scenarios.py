@@ -41,6 +41,7 @@ POSITION_SCENARIOS = {
     "position-index-lag",
     "position-wrong-chain",
     "position-foreign-trader",
+    "position-scientific-reduction",
     "position-no-oracle",
     "position-wrong-height",
     "partial-preview-changed",
@@ -284,6 +285,9 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         contracts["get_collateral_price"] = "0.987654321098765432"
     if scenario == "position-index-lag":
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
+    if scenario == "position-scientific-reduction":
+        trade["collateralAmount"] = 10**29
+        contracts["get_trade_raw"]["collateral_amount"] = str(10**29)
     if scenario == "position-after-hours":
         contracts.update(
             is_after_hours_market=True,
