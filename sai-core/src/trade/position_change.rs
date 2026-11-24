@@ -2,15 +2,18 @@
 
 mod quote;
 
+const KEEPER_OWNER_MISMATCH: &str = "Keeper position belongs to a different account";
+const CONTRACT_OWNER_MISMATCH: &str = "Contract position belongs to a different account";
+
 use serde_json::{Map, Value, json};
 
 use crate::{
     errors::{Code, SaiError},
-    keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, canonical_account, truthy},
+    keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, truthy},
     settings::repr,
 };
 
-use super::position::{Lcd, PositionRoute, Read, height_error};
+use super::position::{Lcd, PositionRoute, Read, height_error, same_account};
 use super::{Confirmation, SubmitOptions, TradePreview, Trading, actions::id};
 use quote::ContractDecimal;
 
@@ -273,19 +276,19 @@ impl Trading<'_> {
             )
             .await?;
         let position = field(field(&position, "perp")?, "trade")?;
-        if !truthy(position)
-            || !truthy(field(position, "isOpen")?)
-            || field(position, "tradeType")? != "trade"
-        {
+        if !truthy(position) {
+            return Err(invalid("Position not found for this account"));
+        }
+        if !same_account(addr, position.get("trader")) {
+            return Err(invalid(KEEPER_OWNER_MISMATCH));
+        }
+        if position.get("id") != Some(trade_id) {
+            return Err(invalid("Keeper returned a different position index"));
+        }
+        if !truthy(field(position, "isOpen")?) || field(position, "tradeType")? != "trade" {
             return Err(invalid("Open position not found"));
         }
         let trader = text_field(position, "trader")?;
-        if canonical_account(trader)
-            .zip(canonical_account(addr))
-            .is_none_or(|(trader, account)| trader != account)
-        {
-            return Err(invalid("Keeper position belongs to a different account"));
-        }
         let chain_id = text_field(route, "chainId")?;
         if lcd.network().await? != chain_id {
             return Err(invalid("Keeper trading route and LCD network do not match"));
@@ -320,6 +323,17 @@ impl Trading<'_> {
             .position(contract, trader, trade_id, Read::Snapshot)
             .await?;
         require_object(&raw)?;
+        if !same_account(addr, raw.get("user")) {
+            return Err(invalid(CONTRACT_OWNER_MISMATCH));
+        }
+        if raw["user_trade_index"] != format!("UserTradeIndex({trade_id})")
+            || raw["market_index"] != format!("MarketIndex({market_id})")
+            || raw["collateral_index"] != token
+            || raw["is_open"] != true
+            || raw["trade_type"] != "trade"
+        {
+            return Err(invalid("Position changed. Review the margin change again."));
+        }
         let (funds, _) = lcd
             .smart(
                 contract,
@@ -331,15 +345,8 @@ impl Trading<'_> {
             .await?;
         require_object(&funds)?;
 
-        if raw["user"] != trader
-            || raw["user_trade_index"] != format!("UserTradeIndex({trade_id})")
-            || raw["market_index"] != format!("MarketIndex({market_id})")
-            || raw["collateral_index"] != token
-            || funds["collateral_index"] != token
-            || raw["is_open"] != true
-            || raw["trade_type"] != "trade"
-        {
-            return Err(invalid("Position changed; review the margin change again"));
+        if funds["collateral_index"] != token {
+            return Err(invalid("Position changed. Review the margin change again."));
         }
         if number_text(&raw["collateral_amount"])?
             != number_text(field(position, "collateralAmount")?)?
@@ -385,6 +392,9 @@ impl PositionQuote {
             )
             .await?;
         require_object(&latest)?;
+        if !same_account(trader, latest.get("user")) {
+            return Err(invalid(CONTRACT_OWNER_MISMATCH));
+        }
         if height.as_deref().is_some_and(|height| {
             !height.bytes().all(|byte| byte.is_ascii_digit())
                 || height.trim_start_matches('0').is_empty()
@@ -394,7 +404,6 @@ impl PositionQuote {
             ));
         }
         for key in [
-            "user",
             "user_trade_index",
             "market_index",
             "collateral_index",
@@ -545,6 +554,15 @@ fn position_changed(
     };
     let latest = match latest {
         Ok(latest) => latest,
+        Err(error)
+            if error.code == Code::InvalidRequest
+                && matches!(
+                    error.message.as_str(),
+                    KEEPER_OWNER_MISMATCH | CONTRACT_OWNER_MISMATCH
+                ) =>
+        {
+            return error;
+        }
         Err(error) => {
             return SaiError::new(
                 code,

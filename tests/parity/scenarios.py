@@ -47,6 +47,9 @@ POSITION_SCENARIOS = {
     "position-index-lag",
     "position-wrong-chain",
     "position-foreign-trader",
+    "position-foreign-contract-owner",
+    "position-equivalent-owner",
+    "position-wrong-index",
     "position-scientific-reduction",
     "position-no-oracle",
     "position-wrong-height",
@@ -288,6 +291,8 @@ def loopback(
         "trader": trader,
         "perpBorrowing": {**borrowing, "collateralToken": collateral},
     }
+    if scenario == "position-wrong-index":
+        trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
     history = {
         "id": 7,
@@ -447,6 +452,10 @@ def loopback(
         contracts["get_collateral_price"] = "0.987654321098765432"
     if scenario == "position-index-lag":
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
+    if scenario == "position-foreign-contract-owner":
+        contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
+    if scenario == "position-equivalent-owner":
+        contracts["get_trade_raw"]["user"] = position["trader"]
     if scenario == "position-scientific-reduction":
         trade["collateralAmount"] = 10**29
         contracts["get_trade_raw"]["collateral_amount"] = str(10**29)
@@ -499,7 +508,7 @@ def loopback(
         "margin-accepted": MARGIN_INTENT,
         "margin-rejected": MARGIN_INTENT,
         "margin-unknown": MARGIN_INTENT,
-        "position-foreign-trader": MARGIN_INTENT,
+        "position-equivalent-owner": MARGIN_INTENT,
         "partial-accepted": PARTIAL_INTENT,
         "partial-unknown": PARTIAL_INTENT,
     }.get(scenario)
@@ -829,7 +838,14 @@ def loopback(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        if not same_variables(query, {name: contract_args[name]}):
+                        expected = contract_args[name]
+                        if (
+                            scenario == "position-equivalent-owner"
+                            and name == "get_trade_raw"
+                        ):
+                            if "_sai_query" in parse_qs(url.query):
+                                expected = {**expected, "trader": position["trader"]}
+                        if not same_variables(query, {name: expected}):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
@@ -890,6 +906,12 @@ def loopback(
                 self.reply({}, 503)
                 return
             data = contracts[name]
+            if (
+                scenario == "position-equivalent-owner"
+                and name == "get_trade_raw"
+                and final_position
+            ):
+                data = {**data, "user": ADDRESS}
             if scenario == "partial-preview-changed" and name == "get_trade_raw":
                 data = {**data, "leverage": str(self.position_leverage())}
             served = (

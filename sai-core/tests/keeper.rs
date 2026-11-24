@@ -297,7 +297,7 @@ async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
                             "enabled": true, "chainId": "fixture-1", "contractAddress": contract,
                         }}}),
                         POSITION => json!({"data": {"perp": {"trade": {
-                            "trader": owner, "isOpen": true, "tradeType": "trade",
+                            "id": 7, "trader": owner, "isOpen": true, "tradeType": "trade",
                             "collateralAmount": 10000000, "leverage": 2.0, "perpBorrowing": market,
                         }}}}),
                         MARKET => json!({"data": {"perp": {"borrowing": market}}}),
