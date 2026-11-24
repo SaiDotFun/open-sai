@@ -1,11 +1,12 @@
 """Register `sai mcp serve` with agent clients: Claude Code, Codex, Cursor.
 
-Claude Code install and uninstall use its `mcp add` and `mcp remove`
-commands. Codex and Cursor writes and all repairs edit client config files.
+Ordinary Claude Code installs and uninstalls use its `mcp add` and
+`mcp remove` commands. Explicit Claude Code repairs edit the existing
+entry in its config file. Codex and Cursor writes also edit config files.
 
 Registration inspection keeps only Sai's command, args, and selected
-metadata. Repair retains the full entry in memory so it can preserve
-settings and restore the entry if replacement fails.
+metadata. Repair retains the full entry in memory to preserve settings
+when publishing the replacement.
 """
 
 from __future__ import annotations

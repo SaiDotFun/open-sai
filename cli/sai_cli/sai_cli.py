@@ -1129,12 +1129,13 @@ def doctor_command(
     """Check the install, config, MCP registrations, session, intent ledger,
     and endpoints.
 
-    Fixes: create $SAI_HOME/trader, make it, $SAI_HOME/logs, and their files
-    private, repair stale MCP registrations, migrate the intent ledger, and
-    reconcile unknown intents for the signed-in account with Keeper. It never
-    deletes or rewrites the session, and never prints its token. Each check
-    prints pass, fixed, warn, fail, or skipped, with a fix for the rest. Exits
-    1 if any check still fails.
+    With fixes enabled, doctor makes trader and log files private, repairs
+    stale Codex and Cursor MCP registrations, migrates the intent ledger,
+    and reconciles unknown intents for the signed-in account with Keeper.
+    It reports stale Claude Code registrations with a command to repair
+    each existing entry. It never deletes or rewrites the session, and
+    never prints its token. Each check prints pass, fixed, warn, fail, or
+    skipped. Doctor exits 1 if any check still fails.
     """
     from . import doctor
 
