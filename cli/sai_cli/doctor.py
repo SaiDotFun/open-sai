@@ -407,14 +407,16 @@ def loose_modes(paths: Sequence[Path]) -> list[tuple[Path, int, int]]:
     return loose
 
 
-def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
-    """Clear group and other bits on ROOT and each of NAMES in it.
+def tighten(
+    root: Path, names: Sequence[str], *, apply: bool = True
+) -> tuple[list[str], list[str]]:
+    """Apply or plan mode repairs on ROOT and its managed files.
 
     Every chmod goes through a descriptor opened with O_NOFOLLOW, and the
     files open relative to the directory's descriptor, so a path swapped for
     a symlink after the checks fails to open instead of redirecting the
-    chmod. Returns the changes made and the fix commands for paths it could
-    not change.
+    chmod. Return changes or safe commands, followed by paths needing manual
+    attention.
     """
     changes: list[str] = []
     failed: list[str] = []
@@ -422,7 +424,7 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
     try:
         dir_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
     except OSError:
-        return changes, [f"chmod go-rwx {root}"]
+        return changes, [f"Could not open {root} safely; inspect it by hand"]
     try:
         for name in (None, *names):
             path = root if name is None else root / name
@@ -437,26 +439,30 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
             except FileNotFoundError:
                 continue
             except OSError:
-                failed.append(f"chmod go-rwx {path}")
+                failed.append(f"Could not open {path} safely; inspect it by hand")
                 continue
             try:
                 info_ = os.fstat(fd)
-                if (
-                    name is None
-                    and hasattr(os, "getuid")
-                    and info_.st_uid != os.getuid()
-                ):
+                if hasattr(os, "getuid") and info_.st_uid != os.getuid():
                     failed.append(f"{path} belongs to another user; fix by hand")
-                    break
+                    if name is None:
+                        break
+                    continue
                 if name is not None and info_.st_nlink > 1:
                     failed.append(f"{path} has other hard links; fix by hand")
                     continue
+                if name is not None and not stat.S_ISREG(info_.st_mode):
+                    failed.append(f"{path} is not a regular file; fix by hand")
+                    continue
                 mode = stat.S_IMODE(info_.st_mode)
                 if mode & 0o077:
-                    os.fchmod(fd, mode & ~0o077)
-                    changes.append(f"chmod {path} {mode:o} -> {mode & ~0o077:o}")
+                    if apply:
+                        os.fchmod(fd, mode & ~0o077)
+                        changes.append(f"chmod {path} {mode:o} -> {mode & ~0o077:o}")
+                    else:
+                        changes.append(f"chmod go-rwx {shlex.quote(str(path))}")
             except OSError:
-                failed.append(f"chmod go-rwx {path}")
+                failed.append(f"Could not repair {path} safely; inspect it by hand")
             finally:
                 if fd != dir_fd:
                     os.close(fd)
@@ -560,39 +566,37 @@ def check_home(ctx: Context) -> Check:
             {**details, "symlinks": [str(path) for path in links]},
         )
     trader_exists = root.is_dir()
-    if loose and not ctx.fix:
-        mode_fixes = [
-            f"chmod go-rwx {shlex.quote(str(path))}" for path, _, _ in trader_loose
-        ]
-        if home_loose and (repair := repair_profile_root(sai_home, apply=False)):
-            mode_fixes.insert(0, repair)
-            home_fix = ""
-        trader_fix = "; ".join(mode_fixes)
-        return Check(
-            "home",
-            "warn",
-            f"{plural(len(loose), 'path')} in {sai_home} accessible by other users",
-            f"{home_fix} {trader_fix}".strip(),
-            details,
-        )
-    if not trader_exists and not ctx.fix:
-        return Check(
-            "home",
-            "pass",
-            f"{root} does not exist yet; sai creates it on first use",
-            None,
-            details,
-        )
     changes: list[str] = []
     failed: list[str] = []
     if trader_exists and trader_loose:
-        changes, failed = tighten(root, MANAGED)
+        changes, failed = tighten(root, MANAGED, apply=ctx.fix)
     if home_loose and not failed:
-        change = repair_profile_root(sai_home, apply=True)
+        change = repair_profile_root(sai_home, apply=ctx.fix)
         if change is not None:
-            changes.append(change)
+            if ctx.fix:
+                changes.append(change)
+            else:
+                changes.insert(0, change)
             home_fix = ""
+    if not ctx.fix and loose:
+        return Check(
+            "home",
+            "fail" if failed else "warn",
+            f"Could not make {plural(len(failed), 'path')} private"
+            if failed
+            else f"{plural(len(loose), 'path')} in {sai_home} accessible by other users",
+            f"{home_fix} {'; '.join([*failed, *changes])}".strip(),
+            details,
+        )
     if not trader_exists:
+        if not ctx.fix:
+            return Check(
+                "home",
+                "pass",
+                f"{root} does not exist yet; sai creates it on first use",
+                None,
+                details,
+            )
         home_exists = sai_home.is_dir()
         storage.directory()
         if not home_exists:
