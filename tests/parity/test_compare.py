@@ -20,6 +20,31 @@ from compare import (
 from parity import Observation, differences
 
 
+def test_log_schema_selects_volatile_fields(tmp_path: Path) -> None:
+    schema = tmp_path / "log-events.json"
+    schema.write_text(json.dumps({"volatileFields": ["ts", "durationMs"]}), "utf-8")
+    normalize = Normalize(tmp_path, log_schema=schema)
+    event = {"ts": "2026-11-24T01:00:00.000Z", "durationMs": 12, "pid": 99}
+
+    assert normalize.log_event(event) == {
+        "ts": "<ts>",
+        "durationMs": "<durationMs>",
+        "pid": 99,
+    }
+    assert normalize.log_event({**event, "durationMs": "12"})["durationMs"] == "12"
+    assert "durationMs" not in normalize.log_event({"ts": event["ts"]})
+
+
+def test_log_schema_requires_a_rule_for_each_volatile_field(tmp_path: Path) -> None:
+    schema = tmp_path / "log-events.json"
+    schema.write_text(json.dumps({"volatileFields": ["undocumentedId"]}), "utf-8")
+
+    with pytest.raises(
+        ValueError, match="Missing log normalization rule for undocumentedId"
+    ):
+        Normalize(tmp_path, log_schema=schema)
+
+
 @pytest.mark.parametrize(
     ("field", "prefix", "length"),
     [("callId", "", 12), ("commandId", "", 32), ("endpointId", "h1_", 64)],

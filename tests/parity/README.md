@@ -117,11 +117,12 @@ checked on both sides.
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
 | Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps. The latter must be stored as REAL Unix seconds within the invocation window. |
 | Log file grouping | Dated files for each surface are merged in UTC date order. Each event requires a UTC timestamp in `YYYY-MM-DDTHH:MM:SS.sssZ` format that belongs to the file's date and falls within the invocation window. |
-| Log events | `ts`, `durationMs`, `pid`, `runId`, `callId`, `commandId`, `endpointId`, generated `intentKey`, and CLI version. The `doctor.result` and `update.check` events use the same rules as their stdout reports. |
+| Log events | Fields listed under `volatileFields` in `docs/log-events.json` and generated `intentKey` values. The `doctor.result` and `update.check` events use the same rules as their stdout reports. |
 | `logs/.endpoint-key` | The randomly generated contents. The file must contain 32 bytes, and its mode is compared. |
 
 Generated IDs use the same placeholder wherever the original ID reappears
 within a run. An event with the wrong call ID or an output with a different
 intent key can therefore differ even when both IDs have valid shapes.
-`LOG_VOLATILE_FIELDS` in `compare.py` assigns normalization rules to the
-volatile fields listed in `docs/log-events.json` and to generated intent keys.
+Each field listed under `volatileFields` needs a normalization rule in
+`compare.py` that checks the value's format. Intent keys use the same
+mapping in logs, the ledger, and command output.

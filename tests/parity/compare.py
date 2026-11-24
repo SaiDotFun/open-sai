@@ -28,6 +28,7 @@ LOG_FILE = re.compile(r"logs/(?P<surface>[a-z]+)-(?P<day>\d{4}-\d{2}-\d{2})\.jso
 LOG_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
+LOG_SCHEMA = Path(__file__).resolve().parents[2] / "docs" / "log-events.json"
 LEDGER = "trader/intents.sqlite3"
 MIN_SQLITE_SCHEMA = (3, 26, 0)
 SQLITE_SCHEMA_REQUIREMENT = (
@@ -83,9 +84,8 @@ def config_text(text: str, edited_key: str) -> str:
     return "".join(lines)
 
 
-# The log schema lists volatile fields in docs/log-events.json. Intent keys
-# are also generated in parity cases and must join to the ledger and stdout.
-LOG_VOLATILE_FIELDS: Mapping[str, str] = {
+# Each rule validates the field before masking its value or mapping its ID.
+LOG_FIELD_RULES = {
     "ts": "timestamp",
     "durationMs": "duration",
     "version": "version",
@@ -94,8 +94,18 @@ LOG_VOLATILE_FIELDS: Mapping[str, str] = {
     "callId": "callId",
     "commandId": "commandId",
     "endpointId": "endpointId",
-    "intentKey": "intentKey",
 }
+
+
+@cache
+def load_log_field_rules(schema: Path) -> Mapping[str, str]:
+    fields = json.loads(schema.read_text(encoding="utf-8"))["volatileFields"]
+    if not isinstance(fields, list) or any(not isinstance(f, str) for f in fields):
+        raise ValueError(f"Expected a list of volatile field names in {schema}")
+    try:
+        return {field: LOG_FIELD_RULES[field] for field in fields}
+    except KeyError as exc:
+        raise ValueError(f"Missing log normalization rule for {exc.args[0]}") from exc
 
 
 def timestamp(value: object) -> bool:
@@ -126,14 +136,14 @@ class Normalize:
     def __init__(
         self,
         home: Path,
-        log_fields: Mapping[str, str] = LOG_VOLATILE_FIELDS,
         *,
+        log_schema: Path = LOG_SCHEMA,
         concurrent: bool = False,
         started_at: float | None = None,
         ended_at: float | None = None,
     ):
         self.home = str(home)
-        self.log_fields = log_fields
+        self.log_fields = load_log_field_rules(log_schema)
         self.concurrent = concurrent
         self.ids: dict[str, dict[int | str, str]] = {}
         self.started_at = started_at
@@ -184,13 +194,10 @@ class Normalize:
             "callId": r"[0-9a-fA-F]{12}",
             "commandId": r"[0-9a-f]{32}",
             "endpointId": r"h1_[0-9a-f]{64}",
-            "intentKey": INTENT_ID,
         }
         for field, rule in self.log_fields.items():
             item = value.get(field)
-            if rule == "timestamp" and field in value:
-                if field != "ts":
-                    parse_log_timestamp(item)
+            if rule == "timestamp":
                 result[field] = f"<{field}>"
             elif rule in predicates:
                 replace_if(result, field, predicates[rule])

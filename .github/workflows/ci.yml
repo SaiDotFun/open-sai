@@ -39,6 +39,7 @@ jobs:
             python:
               - 'cli/**'
               - 'tests/parity/**'
+              - 'docs/log-events.json'
               - 'skills/**'
               - 'scripts/**'
               - 'pyproject.toml'
