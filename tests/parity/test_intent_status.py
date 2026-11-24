@@ -18,13 +18,13 @@ from collections import deque
 from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
-from sai_cli.core import keeper, log, storage
-from sai_cli.mcp_server.tools import _reconcile_fields
+from sai_cli.core import keeper, log, reconcile, storage
 
 FIXTURE = json.loads(
     (
@@ -39,6 +39,25 @@ NIBI = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
 OTHER = "0x" + "b" * 40
 OTHER_NIBI = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 CLI = tuple[str, ...]
+# Rust C4 targets the public error codes from the pinned Python contract.
+C4_INTENT_ERROR_CODES = frozenset(
+    {
+        "SLIPPAGE",
+        "simulation_failed",
+        "admission_expired",
+        "broadcast_rejected",
+        "chain_execution_failed",
+        "market_order_expired",
+        "market_order_fill_failed",
+        "market_order_trading_paused",
+        "market_order_market_closed",
+        "market_order_trade_not_open",
+        "market_order_outcome_not_indexed",
+        "intent_already_used",
+        "below_minimum",
+        "insufficient_idle",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -222,22 +241,73 @@ class Step:
     json_output: bool = True
 
 
+def c4_timestamp_field(
+    projected: dict[str, Any], source: dict[str, Any], field: str
+) -> dict[str, Any]:
+    """Use the original C4 timezone-aware ISO parser on the pinned CLI value."""
+    value = source.get(field)
+    timestamp = None
+    if isinstance(value, str) and len(value) <= 40:
+        with suppress(ValueError):
+            if datetime.fromisoformat(value).tzinfo is not None:
+                timestamp = value
+
+    # A timestamp and its invalid flag occupy the same slot in the projection.
+    invalid = field + "Invalid"
+    return {
+        (field if name == invalid else name): (
+            timestamp if name in (field, invalid) else value
+        )
+        for name, value in projected.items()
+        if name not in (field, invalid) or timestamp is not None
+    }
+
+
 def public_intent_output(output: bytes, *, compact: bool) -> bytes:
-    """Apply the PR 69 public field projection to raw pinned CLI stdout."""
+    """Project pinned CLI stdout to the Rust C4 field contract."""
     document = json.loads(output)
-    public = _reconcile_fields(document)
-    for name, project in (
-        (
-            "userIntents",
-            lambda row: keeper.safe_intent_record(row) | _reconcile_fields(row),
-        ),
-        ("matchedTradeHistory", keeper.safe_intent_history),
-    ):
-        if isinstance(rows := document.get(name), list):
-            public[name] = [project(row) for row in rows if isinstance(row, dict)]
+    public = reconcile.status_report(document)
+    for name in ("userIntents", "matchedTradeHistory"):
+        if name not in public:
+            continue
+        rows = (row for row in document[name] if isinstance(row, dict))
+        for index, source in enumerate(rows):
+            row = public[name][index]
+            if name == "userIntents":
+                row = c4_timestamp_field(row, source, "execBlockTs")
+                if "errorCode" in row and row["errorCode"] not in C4_INTENT_ERROR_CODES:
+                    row["errorCode"] = "KEEPER_ERROR"
+                public[name][index] = row
+            elif isinstance(block := source.get("block"), dict):
+                row["block"] = c4_timestamp_field(row["block"], block, "block_ts")
     return (
         json.dumps(log.clean(public), indent=None if compact else 2) + "\n"
     ).encode()
+
+
+def test_pinned_projection_preserves_c4_timestamps():
+    c4_time = "2026-11-20 15:43:31.1234567890123456Z"
+    document = {
+        "userIntents": [
+            {"execBlockTs": c4_time, "txHash": "a" * 64},
+            {"execBlockTs": "2026-11-20T15:43:31"},
+        ],
+        "matchedTradeHistory": [
+            {"block": {"block": 123, "block_ts": c4_time}},
+            {"block": {"block_ts": "invalid"}},
+        ],
+    }
+    expected = {
+        "userIntents": [{"execBlockTs": c4_time, "txHash": "a" * 64}, {}],
+        "matchedTradeHistory": [
+            {"block": {"block": 123, "block_ts": c4_time}},
+            {"block": {}},
+        ],
+    }
+    assert (
+        public_intent_output(json.dumps(document).encode(), compact=True)
+        == (json.dumps(expected) + "\n").encode()
+    )
 
 
 def compare(
@@ -747,6 +817,47 @@ def test_public_intent_status_scrubs_keeper_payload(
                 assert public["txHashInvalid"] is True
             assert public["errorCode"] == expected
             assert public["errorMsg"] == "Keeper reported an intent error."
+
+
+def test_public_history_projects_after_raw_hash_correlation(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opaque = "synthetic-keeper-text"
+    c4_time = "2026-11-20 15:43:31.1234567890123456Z"
+    intent = RESPONSES["outcome_not_indexed"]["data"]["userIntents"][0]
+    history = {
+        "intentKey": KEY,
+        "id": opaque,
+        "tradeChangeType": opaque,
+        "txHash": opaque,
+        "evmTxHash": "0X" + "CD" * 32,
+        "trade": {"id": opaque, "trader": ADDR, "note": opaque},
+        "block": {"block": "2142-2", "block_ts": c4_time},
+        "debug": opaque,
+    }
+    compare(
+        cli_pair,
+        tmp_path,
+        monkeypatch,
+        (
+            Step(
+                (
+                    {
+                        "data": {
+                            "userIntents": [
+                                {**intent, "txHash": opaque, "execBlockTs": c4_time}
+                            ],
+                            "extra": opaque,
+                        }
+                    },
+                    {"data": {"perp": {"tradeHistory": [history]}}},
+                ),
+                "terminal",
+            ),
+        ),
+    )
 
 
 @pytest.mark.parametrize(
