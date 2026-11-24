@@ -395,6 +395,7 @@ def selection_set(
 ) -> tuple[SelectedField, ...]:
     """Parse inline field selections and resolve their supplied variables."""
     bindings = variables or {}
+    declared: set[str] = set()
     tokens = deque(
         token
         for token in re.findall(
@@ -408,15 +409,37 @@ def selection_set(
     def take_name() -> str:
         name = tokens.popleft()
         if not re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", name):
-            raise ValueError("Expected a GraphQL field name")
+            raise ValueError("Expected a GraphQL name")
         return name
 
-    def skip_variable_definitions() -> None:
-        depth = 1
-        tokens.popleft()
-        while depth:
-            token = tokens.popleft()
-            depth += (token == "(") - (token == ")")
+    def expect(token: str) -> None:
+        if tokens.popleft() != token:
+            raise ValueError(f"Expected the GraphQL token {token!r}")
+
+    def variable_type() -> None:
+        if tokens[0] == "[":
+            tokens.popleft()
+            variable_type()
+            expect("]")
+        else:
+            take_name()
+        if tokens[0] == "!":
+            tokens.popleft()
+
+    def variable_definitions() -> None:
+        expect("(")
+        while tokens[0] != ")":
+            expect("$")
+            name = take_name()
+            expect(":")
+            variable_type()
+            if tokens[0] == "=":
+                tokens.popleft()
+                value()
+            if name in declared:
+                raise ValueError("Duplicate GraphQL variable declaration")
+            declared.add(name)
+        expect(")")
 
     def named_values(end: str) -> dict[str, Any]:
         result = {}
@@ -431,7 +454,10 @@ def selection_set(
     def value() -> Any:
         token = tokens.popleft()
         if token == "$":
-            return bindings.get(take_name())
+            name = take_name()
+            if name not in declared:
+                raise ValueError("Undeclared GraphQL variable")
+            return bindings.get(name)
         if token == "{":
             return named_values("}")
         if token == "[":
@@ -446,7 +472,7 @@ def selection_set(
         return json.loads(token)
 
     def fields() -> tuple[SelectedField, ...]:
-        tokens.popleft()
+        expect("{")
         result = []
         while tokens[0] != "}":
             key = name = take_name()
@@ -463,11 +489,13 @@ def selection_set(
         return tuple(result)
 
     try:
-        while tokens[0] != "{":
-            if tokens[0] == "(":
-                skip_variable_definitions()
-            else:
+        if tokens[0] != "{":
+            if take_name() not in {"query", "mutation", "subscription"}:
+                raise ValueError("Expected a GraphQL operation")
+            if tokens[0] not in {"(", "{"}:
                 take_name()
+            if tokens[0] == "(":
+                variable_definitions()
         selected = fields()
     except IndexError as exc:
         raise ValueError("Incomplete GraphQL selection") from exc

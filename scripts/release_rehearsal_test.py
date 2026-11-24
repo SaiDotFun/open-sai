@@ -16,6 +16,7 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
 LOCK_DESCENDANT = (
@@ -496,3 +497,20 @@ query($user: String!, $key: String, $otherKey: String, $otherUser: String!) {
                 "missingKey": [],
             },
         )
+
+    def test_rejects_an_undeclared_filter_variable_even_if_supplied(self) -> None:
+        query = """
+query($user: String!, $key: String) {
+  userIntents(where: {user: $user, intentKey: $key}) { intentKey }
+  other: userIntents(where: {user: $user, intentKey: $undeclared}) { intentKey }
+}
+"""
+        with (
+            REHEARSAL["keeper_server"](self.replay.handler()) as base,
+            self.assertRaises(HTTPError) as error,
+        ):
+            self.query(
+                base, query, user=self.replay.addr, key=self.key, undeclared=self.key
+            )
+        with error.exception as response:
+            self.assertEqual(response.code, 400)
