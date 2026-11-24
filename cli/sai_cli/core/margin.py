@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from decimal import Decimal
 from typing import Any
 from urllib.parse import quote
@@ -13,6 +14,12 @@ import httpx
 from . import intents, keeper
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
+INDEX_RETRY_DELAYS = (0.25, 0.5)
+INDEX_RETRY_BUDGET = 2.0
+INDEX_LAG = (
+    "Indexed position differs from contract state. Retry after Keeper"
+    " synchronizes. No intent was submitted."
+)
 
 
 def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
@@ -28,13 +35,16 @@ def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
         raise ValueError("Unable to read contract state") from exc
 
 
-def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
+def smart(
+    lcd: str, contract: str, message: dict[str, Any], *, timeout: float = 20
+) -> dict[str, Any]:
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
     data = _get_json(
-        f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
+        f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}",
+        timeout=timeout,
     ).get("data")
     if not isinstance(data, dict):
         raise TypeError("Contract returned invalid state")
@@ -51,15 +61,51 @@ def snapshot(
         or node.get("default_node_info", {}).get("network") != route["chainId"]
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
-    position = keeper.request(
-        endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}
-    )["perp"]["trade"]
-    if not position or not position["isOpen"] or position["tradeType"] != "trade":
-        raise ValueError("Open position not found")
+    position = _position(endpoint, addr, trade_id, timeout=20)
     borrowing = position["perpBorrowing"]
     collateral = borrowing["collateralToken"]
     if collateral["symbol"] != "USDC":
         raise ValueError("Only USDC positions are supported")
+    trader = position["trader"]
+    token = f"TokenIndex({collateral['id']})"
+    contract = route["contractAddress"]
+    trade_query = {"get_trade_raw": {"trader": trader, "index": trade_id}}
+
+    def raw_trade(timeout: float) -> dict[str, Any]:
+        raw = smart(lcd, contract, trade_query, timeout=timeout)
+        if (
+            raw.get("user") != trader
+            or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+            or raw.get("market_index") != f"MarketIndex({borrowing['marketId']})"
+            or raw.get("collateral_index") != token
+            or raw.get("is_open") is not True
+            or raw.get("trade_type") != "trade"
+        ):
+            raise ValueError("Position changed; review the margin change again")
+        return raw
+
+    raw = raw_trade(20)
+    if not _same_margin(raw, position):
+        end = time.monotonic() + INDEX_RETRY_BUDGET
+        for delay in INDEX_RETRY_DELAYS:
+            if end - time.monotonic() <= delay:
+                break
+            time.sleep(delay)
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            position = _position(endpoint, addr, trade_id, timeout=left)
+            if position["trader"] != trader or position["perpBorrowing"] != borrowing:
+                raise ValueError("Position changed; review the margin change again")
+            left = end - time.monotonic()
+            if left <= 0:
+                break
+            raw = raw_trade(left)
+            if _same_margin(raw, position) and time.monotonic() < end:
+                break
+        if time.monotonic() >= end or not _same_margin(raw, position):
+            raise ValueError(INDEX_LAG)
+
     market = keeper.request(
         endpoint,
         keeper.MARKET,
@@ -72,32 +118,31 @@ def snapshot(
         or not market["isOpen"]
     ):
         raise ValueError("Open market data is unavailable")
-    trader = position["trader"]
-    token = f"TokenIndex({collateral['id']})"
-    contract = route["contractAddress"]
-    raw = smart(lcd, contract, {"get_trade_raw": {"trader": trader, "index": trade_id}})
     funds = smart(
         lcd,
         contract,
         {"get_exchange_balance": {"user": trader, "collateral_index": token}},
     )
-    if (
-        raw.get("user") != trader
-        or raw.get("user_trade_index") != f"UserTradeIndex({trade_id})"
-        or raw.get("market_index") != f"MarketIndex({borrowing['marketId']})"
-        or raw.get("collateral_index") != token
-        or funds.get("collateral_index") != token
-        or raw.get("is_open") is not True
-        or raw.get("trade_type") != "trade"
-    ):
+    if funds.get("collateral_index") != token:
         raise ValueError("Position changed; review the margin change again")
-    if str(raw.get("collateral_amount")) != str(position["collateralAmount"]) or float(
-        str(raw.get("leverage"))
-    ) != float(position["leverage"]):
-        raise ValueError(
-            "Indexed position differs from contract state; wait for synchronization and retry"
-        )
     return raw, funds, market
+
+
+def _position(
+    endpoint: str, addr: str, trade_id: int, *, timeout: float
+) -> dict[str, Any]:
+    position = keeper.request(
+        endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}, timeout=timeout
+    )["perp"]["trade"]
+    if not position or not position["isOpen"] or position["tradeType"] != "trade":
+        raise ValueError("Open position not found")
+    return position
+
+
+def _same_margin(raw: dict[str, Any], position: dict[str, Any]) -> bool:
+    return str(raw.get("collateral_amount")) == str(
+        position["collateralAmount"]
+    ) and float(str(raw.get("leverage"))) == float(position["leverage"])
 
 
 def margin_quote(

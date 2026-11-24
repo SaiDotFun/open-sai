@@ -240,8 +240,7 @@ def partial_close(
     minimum position size, and re-checked before submitting.
     """
     active = get_session()
-    # The snapshot refuses when Keeper's index differs from the contract,
-    # so the reduction is never sized from a lagging collateral amount.
+    # Size the reduction after Keeper's index and the contract agree.
     raw, _, borrowing = margin.snapshot(
         endpoint, lcd_endpoint, active["evmAddress"], trade_id
     )

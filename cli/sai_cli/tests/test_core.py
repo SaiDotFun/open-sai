@@ -457,7 +457,7 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
 
 
 def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
-    def gql(endpoint, query, variables=None, token=None):
+    def gql(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.ROUTE:
             return {
                 "oneClickTrading": {
@@ -515,7 +515,9 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
     monkeypatch.setattr(
         margin,
         "smart",
-        lambda lcd, contract, message: raw if "get_trade_raw" in message else funds,
+        lambda lcd, contract, message, **kwargs: (
+            raw if "get_trade_raw" in message else funds
+        ),
     )
     snapshot, available, market = margin.snapshot(
         keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7
