@@ -14,6 +14,7 @@ import unittest
 import urllib.request
 from contextlib import suppress
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
@@ -317,6 +318,23 @@ except entry["RehearsalInterrupted"] as exc:
 
 
 class KeeperReplayTest(unittest.TestCase):
+    def setUp(self) -> None:
+        temp = self.enterContext(tempfile.TemporaryDirectory())
+        wheel = Path(temp) / "sai_cli-0.1.1-py3-none-any.whl"
+        wheel.write_bytes(b"unused wheel")
+        self.replay = REHEARSAL["Replay"](wheel, "0.1.1")
+        self.key = "20261124T080000000Z_ABCDEFGHJKMNPQRS"
+        self.replay.submitted.append(self.key)
+
+    def query(self, base: str, text: str, **variables: str | None) -> dict[str, Any]:
+        request = urllib.request.Request(
+            f"{base}/query",
+            data=json.dumps({"query": text, "variables": variables}).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.load(response)["data"]
+
     def test_projects_nested_and_aliased_fields(self) -> None:
         fields = REHEARSAL["selection_set"](
             "query TradeStatus($key: String) {\n"
@@ -338,40 +356,51 @@ class KeeperReplayTest(unittest.TestCase):
         )
 
     def test_requires_the_original_intent_key_and_account(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
-            wheel = Path(temp) / "sai_cli-0.1.1-py3-none-any.whl"
-            wheel.write_bytes(b"unused wheel")
-            replay = REHEARSAL["Replay"](wheel, "0.1.1")
-            key = "20261124T080000000Z_ABCDEFGHJKMNPQRS"
-            replay.submitted.append(key)
-            query = (
-                "query($user:String!, $key:String) {"
-                " userIntents(where:{user:$user, intentKey:$key}) { intentKey } }"
+        addr, key = self.replay.addr, self.key
+        query = (
+            "query($user:String!, $key:String) {"
+            " userIntents(where:{user:$user, intentKey:$key}) { intentKey } }"
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            for text, user, intent, expected in (
+                (query, addr.upper(), key, [key]),
+                (query, "0x" + "b" * 40, key, []),
+                (query, addr, "wrong-key", []),
+                (query, addr, None, []),
+                (query.replace("intentKey:$key", 'intentKey:"wrong"'), addr, key, []),
+            ):
+                with self.subTest(user=user, key=intent, query=text):
+                    rows = self.query(base, text, user=user, key=intent)["userIntents"]
+                    self.assertEqual(rows, [{"intentKey": key} for key in expected])
+
+    def test_checks_filters_independently_for_each_intent_alias(self) -> None:
+        query = """
+query($user: String!, $key: String, $otherKey: String, $otherUser: String!) {
+  userIntents(where: {user: $user, intentKey: $otherKey}) { intentKey }
+  matched: userIntents(where: {user: $user, intentKey: $key}, limit: 50) {
+    id: intentKey
+  }
+  reordered: userIntents(limit: 50, where: {intentKey: $key, user: $user}) { intentKey }
+  wrongUser: userIntents(where: {user: $otherUser, intentKey: $key}) { intentKey }
+  missingKey: userIntents(where: {user: $user}) { intentKey }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            data = self.query(
+                base,
+                query,
+                user=self.replay.addr,
+                key=self.key,
+                otherKey="wrong-key",
+                otherUser="0x" + "b" * 40,
             )
-            with REHEARSAL["keeper_server"](replay.handler()) as base:
-                for text, user, intent, expected in (
-                    (query, replay.addr.upper(), key, [key]),
-                    (query, "0x" + "b" * 40, key, []),
-                    (query, replay.addr, "wrong-key", []),
-                    (query, replay.addr, None, []),
-                    (
-                        query.replace("intentKey:$key", 'intentKey:"wrong"'),
-                        replay.addr,
-                        key,
-                        [],
-                    ),
-                ):
-                    with self.subTest(user=user, key=intent, query=text):
-                        request = urllib.request.Request(
-                            f"{base}/query",
-                            data=json.dumps(
-                                {
-                                    "query": text,
-                                    "variables": {"user": user, "key": intent},
-                                }
-                            ).encode(),
-                            headers={"Content-Type": "application/json"},
-                        )
-                        with urllib.request.urlopen(request, timeout=2) as response:
-                            rows = json.load(response)["data"]["userIntents"]
-                        self.assertEqual(rows, [{"intentKey": key} for key in expected])
+        self.assertEqual(
+            data,
+            {
+                "userIntents": [],
+                "matched": [{"id": self.key}],
+                "reordered": [{"intentKey": self.key}],
+                "wrongUser": [],
+                "missingKey": [],
+            },
+        )

@@ -37,10 +37,6 @@ INSTALLER = (
 CLIENTS = ("claude", "codex")
 SYNTHETIC_TOKEN = "release-rehearsal-fixture-only"
 CHAIN = "cataclysm-1"
-INTENT_QUERY = re.compile(
-    r"\buserIntents\s*\(\s*where\s*:\s*\{\s*user\s*:\s*\$user\s*,?"
-    r"\s*intentKey\s*:\s*\$key\s*\}"
-)
 INTENT_KEY = re.compile(r"\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 TRADE = (
     "trade",
@@ -317,29 +313,64 @@ def namespace_prefix(cwd: Path, env: dict[str, str]) -> tuple[str, ...] | None:
 class SelectedField(NamedTuple):
     name: str
     key: str
+    arguments: dict[str, Any]
     children: tuple[SelectedField, ...]
 
 
-def selection_set(query: str) -> tuple[SelectedField, ...]:
-    """Parse the field selections used by the replay's inline operations."""
+def selection_set(
+    query: str, variables: dict[str, Any] | None = None
+) -> tuple[SelectedField, ...]:
+    """Parse inline field selections and resolve their supplied variables."""
+    bindings = variables or {}
     tokens = deque(
         token
-        for token in re.findall(r'#[^\n]*|"(?:\\.|[^"\\])*"|[_A-Za-z]\w*|[^\s,]', query)
+        for token in re.findall(
+            r'#[^\r\n]*|"(?:\\.|[^"\\])*"|[_A-Za-z][_0-9A-Za-z]*'
+            r"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[^\s,]",
+            query,
+        )
         if not token.startswith("#")
     )
 
     def take_name() -> str:
         name = tokens.popleft()
-        if not re.fullmatch(r"[_A-Za-z]\w*", name):
+        if not re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", name):
             raise ValueError("Expected a GraphQL field name")
         return name
 
-    def skip_arguments() -> None:
+    def skip_variable_definitions() -> None:
         depth = 1
         tokens.popleft()
         while depth:
             token = tokens.popleft()
             depth += (token == "(") - (token == ")")
+
+    def named_values(end: str) -> dict[str, Any]:
+        result = {}
+        while tokens[0] != end:
+            name = take_name()
+            if tokens.popleft() != ":" or name in result:
+                raise ValueError("Expected a unique GraphQL name followed by ':'")
+            result[name] = value()
+        tokens.popleft()
+        return result
+
+    def value() -> Any:
+        token = tokens.popleft()
+        if token == "$":
+            return bindings.get(take_name())
+        if token == "{":
+            return named_values("}")
+        if token == "[":
+            items = []
+            while tokens[0] != "]":
+                items.append(value())
+            tokens.popleft()
+            return items
+        if re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", token):
+            # Enum names do not satisfy the replay's string filters.
+            return {"true": True, "false": False}.get(token)
+        return json.loads(token)
 
     def fields() -> tuple[SelectedField, ...]:
         tokens.popleft()
@@ -349,17 +380,19 @@ def selection_set(query: str) -> tuple[SelectedField, ...]:
             if tokens[0] == ":":
                 tokens.popleft()
                 name = take_name()
+            arguments = {}
             if tokens[0] == "(":
-                skip_arguments()
+                tokens.popleft()
+                arguments = named_values(")")
             children = fields() if tokens[0] == "{" else ()
-            result.append(SelectedField(name, key, children))
+            result.append(SelectedField(name, key, arguments, children))
         tokens.popleft()
         return tuple(result)
 
     try:
         while tokens[0] != "{":
             if tokens[0] == "(":
-                skip_arguments()
+                skip_variable_definitions()
             else:
                 take_name()
         selected = fields()
@@ -399,6 +432,20 @@ class Replay:
         self.assets[f"{path}/{wheel.name}"] = payload, "application/octet-stream"
         self.assets[f"{path}/SHA256SUMS"] = sums, "text/plain"
 
+    def intent_rows(self, where: Any) -> list[dict[str, Any]]:
+        if not isinstance(where, dict) or where.keys() != {"user", "intentKey"}:
+            return []
+        user, key = where["user"], where["intentKey"]
+        if (
+            isinstance(user, str)
+            and user.lower() == self.addr
+            and self.submitted
+            and key == self.submitted[0]
+        ):
+            row = self.responses[self.lifecycle]["data"]["userIntents"][0]
+            return [{**row, "intentKey": key}]
+        return []
+
     def handler(self) -> type[KeeperHandler]:
         replay = self
 
@@ -424,7 +471,7 @@ class Replay:
                     self.send_error(400)
                     return
                 try:
-                    selected = selection_set(query)
+                    selected = selection_set(query, variables)
                 except ValueError:
                     self.send_error(400)
                     return
@@ -457,21 +504,20 @@ class Replay:
                         }
                     }
                 elif "userIntents" in roots:
-                    rows = []
-                    user = variables.get("user")
-                    key = variables.get("key")
-                    if (
-                        INTENT_QUERY.search(query)
-                        and isinstance(user, str)
-                        and user.lower() == replay.addr
-                        and replay.submitted
-                        and key == replay.submitted[0]
-                    ):
-                        row = replay.responses[replay.lifecycle]["data"]["userIntents"][
-                            0
-                        ]
-                        rows.append({**row, "intentKey": key})
-                    data = {"userIntents": rows}
+                    data = {
+                        field.key: project_fields(
+                            replay.intent_rows(field.arguments.get("where")),
+                            field.children,
+                        )
+                        if field.name == "userIntents"
+                        else None
+                        for field in selected
+                    }
+                    if len(data) != len(selected):
+                        self.send_error(400)
+                        return
+                    self.reply({"data": data})
+                    return
                 elif "tradeHistory" in perp:
                     data = {"perp": {"tradeHistory": []}}
                 elif "oneClickTrading" in roots:
