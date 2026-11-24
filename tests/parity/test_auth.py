@@ -259,6 +259,31 @@ def test_auth_summaries_hide_keeper_path(
     assert results[0] == results[1]
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("auth", "import", "--json"),
+        ("auth", "--json", "import"),
+        ("--json", "auth", "import", "--json"),
+    ],
+)
+def test_import_rejects_nonroot_json_before_reading_clipboard(
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI
+) -> None:
+    results = []
+    for env in homes(tmp_path, auth_pair):
+        env.clipboard()
+        token = fixture_token(ADDR)
+        env.clip.write_text(token)
+        result = env.run(*args)
+        assert result.returncode == 2
+        assert env.clip.read_text() == token
+        assert env.log.read_text() == ""
+        assert not session_state(env)["sessions"]
+        results.append(observed(result))
+    assert results[0] == results[1]
+
+
 def test_import_discards_clipboard_clear_output(
     tmp_path: Path, auth_pair: tuple[CLI, CLI]
 ) -> None:

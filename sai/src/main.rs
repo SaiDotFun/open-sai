@@ -48,8 +48,6 @@ struct Cli {
 enum Command {
     /// Manage local Sai sessions.
     Auth {
-        #[arg(long, global = true, help = "Print machine-readable JSON")]
-        json: bool,
         #[command(subcommand)]
         command: AuthCommand,
     },
@@ -122,11 +120,7 @@ fn main() -> process::ExitCode {
     }
     let outcome = match Cli::try_parse_from(args) {
         Ok(cli) => {
-            let json = cli.json
-                || matches!(
-                    &cli.command,
-                    Command::Auth { json: true, .. } | Command::Intent { json: true, .. }
-                );
+            let json = cli.json || matches!(&cli.command, Command::Intent { json: true, .. });
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
@@ -137,7 +131,7 @@ fn main() -> process::ExitCode {
                         lcd_endpoint: cli.lcd_endpoint,
                     };
                     match cli.command {
-                        Command::Auth { command, .. } => auth::dispatch(
+                        Command::Auth { command } => auth::dispatch(
                             command,
                             cli.account.as_deref(),
                             &flags,
@@ -167,7 +161,7 @@ fn json_requested(args: &[String]) -> bool {
                 args.next();
             }
             "--" => break,
-            "auth" | "intent" => {
+            "intent" => {
                 return args
                     .take_while(|arg| *arg != "--")
                     .any(|arg| arg == "--json");
@@ -417,8 +411,7 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
             }
             arg if options && command == "intent status" && arg.starts_with("--key=") => {}
             arg if options && command == "auth login" && arg.starts_with("--addr=") => {}
-            "--json"
-                if options && (command.starts_with("intent ") || command.starts_with("auth ")) => {}
+            "--json" if options && command.starts_with("intent ") => {}
             _ => positional.push(arg),
         }
     }
