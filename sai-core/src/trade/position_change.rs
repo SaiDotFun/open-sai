@@ -103,21 +103,6 @@ fn decimal_digit(digit: char) -> Option<char> {
     (offset < 10).then(|| char::from(b'0' + offset as u8))
 }
 
-#[cfg(test)]
-mod percent_tests {
-    use super::parse_partial_close_percent;
-
-    #[test]
-    fn percentages_use_the_python_311_decimal_digit_repertoire() {
-        assert_eq!(
-            parse_partial_close_percent("\u{0665}_\u{0660}").unwrap(),
-            50
-        );
-        // Unicode 16 added Garay digits. Python 3.11 rejects them.
-        assert!(parse_partial_close_percent("\u{10d45}\u{10d40}").is_err());
-    }
-}
-
 struct Snapshot {
     raw: Value,
     funds: Value,
@@ -698,4 +683,19 @@ fn malformed() -> SaiError {
 
 fn invalid(message: &str) -> SaiError {
     SaiError::new(Code::InvalidRequest, message)
+}
+
+#[cfg(test)]
+mod percent_tests {
+    use super::parse_partial_close_percent;
+
+    #[test]
+    fn percentages_use_the_python_311_decimal_digit_repertoire() {
+        assert_eq!(
+            parse_partial_close_percent("\u{0665}_\u{0660}").unwrap(),
+            50
+        );
+        // Unicode 16 added Garay digits. Python 3.11 rejects them.
+        assert!(parse_partial_close_percent("\u{10d45}\u{10d40}").is_err());
+    }
 }
