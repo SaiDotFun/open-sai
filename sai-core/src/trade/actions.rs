@@ -157,7 +157,7 @@ impl Trading<'_> {
     }
 }
 
-fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
+pub(super) fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
     let invalid = || {
         SaiError::usage(format!(
             "Invalid value for '{parameter}': {} is not a valid integer.",
