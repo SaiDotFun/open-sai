@@ -18,7 +18,9 @@ use crate::{
 };
 
 pub use public::public_intent_status;
-pub(crate) use public::{known_intent_field, log_intent_error_code, request_hash};
+pub(crate) use public::{
+    known_intent_field, log_intent_error_code, log_intent_record, request_hash,
+};
 pub use queries::*;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);

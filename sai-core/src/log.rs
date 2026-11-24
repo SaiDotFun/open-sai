@@ -2,6 +2,7 @@
 
 mod files;
 mod privacy;
+pub mod query;
 mod session_tokens;
 
 use std::{
@@ -167,6 +168,12 @@ fn keyed_endpoint(digest: &[u8; 32], key: &[u8; 32]) -> String {
         let _ = write!(result, "{byte:02x}");
     }
     result
+}
+
+fn endpoint_id(root: &std::path::Path, endpoint: &str) -> Option<String> {
+    let digest = endpoint_digest(endpoint)?;
+    let key = LogDir::read_only(root).ok()?.key(false)?;
+    Some(keyed_endpoint(&digest, &key))
 }
 
 /// Log events that occur while handling a CLI command or an MCP call.

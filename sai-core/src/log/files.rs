@@ -23,6 +23,10 @@ impl LogDir {
         Self::open_at(root, true)
     }
 
+    pub fn read_only(root: &Path) -> io::Result<Self> {
+        Self::open_at(root, false)
+    }
+
     fn open_at(root: &Path, create: bool) -> io::Result<Self> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
@@ -91,6 +95,42 @@ impl LogDir {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         File::open(path)
+    }
+
+    #[cfg(unix)]
+    pub fn names(&self) -> io::Result<Vec<String>> {
+        use rustix::fs::{AtFlags, Dir, FileType, statat};
+
+        let mut names = Vec::new();
+        for entry in Dir::read_from(&self.0)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            if let Ok(text) = name.to_str()
+                && parse_name(text).is_some()
+                && statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|stat| {
+                    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                })
+            {
+                names.push(text.into());
+            }
+        }
+        Ok(names)
+    }
+
+    #[cfg(not(unix))]
+    pub fn names(&self) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in fs::read_dir(&self.0)? {
+            let entry = entry?;
+            if let Ok(name) = entry.file_name().into_string()
+                && parse_name(&name).is_some()
+                && !redirected(&fs::symlink_metadata(entry.path())?)
+                && entry.file_type()?.is_file()
+            {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     #[cfg(unix)]

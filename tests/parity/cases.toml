@@ -6,10 +6,6 @@
 "auth renew" = "Requires an isolated signing program and challenge."
 "mcp install" = "Requires a client registration fixture."
 "mcp uninstall" = "Requires a client registration fixture."
-"logs intent" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
-"logs run" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
-"logs stats" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
-"skill install" = "Writes to the agents skill directory outside SAI_HOME."
 
 [[case]]
 name = "version"
@@ -244,6 +240,11 @@ name = "skill-source"
 args = ["--json","skill","source"]
 
 [[case]]
+name = "skill-install"
+args = ["--json","skill","install","--dir","sai/agent-skill"]
+state = { "agent-skill#@mode" = 0o755 }
+
+[[case]]
 name = "mcp-list"
 args = ["--json","mcp","list"]
 
@@ -263,6 +264,23 @@ args = ["--json","logs","tail","--event","keeper.request"]
 mode = "jsonl"
 setup = ["--json","market","prices"]
 wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "logs-tail-empty"
+args = ["--json","logs","tail","-n","2"]
+mode = "jsonl"
+
+[[case]]
+name = "logs-intent-offline"
+args = ["--json","logs","intent","{intent}","--offline"]
+
+[[case]]
+name = "logs-run-empty"
+args = ["--json","logs","run","test-run"]
+
+[[case]]
+name = "logs-stats-empty"
+args = ["--json","logs","stats"]
 
 [[case]]
 name = "update-check"

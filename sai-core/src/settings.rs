@@ -562,6 +562,10 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
 
 /// The writer uses file and environment settings independently of CLI flags.
 pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
+    Some(log_keep_value(env)?.as_u64().unwrap_or(u64::MAX))
+}
+
+pub(crate) fn log_keep_value(env: &Environment) -> Option<Value> {
     let file = FileSettings::read(&env.path()).ok()?;
     let flags = Flags::default();
     let value = |key: Key| {
@@ -570,7 +574,7 @@ pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
             .ok()
     };
     if value(Key::LogsEnabled)?.as_bool()? {
-        Some(value(Key::LogsKeepDays)?.as_u64().unwrap_or(u64::MAX))
+        value(Key::LogsKeepDays)
     } else {
         None
     }

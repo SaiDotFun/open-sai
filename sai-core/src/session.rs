@@ -22,6 +22,10 @@ pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionErr
 // Stored Keeper expiries follow Python's datetime.fromisoformat. Convert to
 // UTC for comparisons and retain the original text in the session.
 pub(crate) fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
+    parse_iso_timestamp(text).map(|(instant, _)| instant)
+}
+
+pub(crate) fn parse_iso_timestamp(text: &str) -> Option<(DateTime<Utc>, TimeDelta)> {
     let date_end = date_length(text.as_bytes())?;
     let date = text.get(..date_end)?;
     let tail = text.get(date_end..)?;
@@ -48,9 +52,8 @@ pub(crate) fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
         }
         _ => return None,
     };
-    local
-        .and_utc()
-        .checked_sub_signed(TimeDelta::microseconds(offset))
+    let offset = TimeDelta::microseconds(offset);
+    Some((local.and_utc().checked_sub_signed(offset)?, offset))
 }
 
 fn date_length(text: &[u8]) -> Option<usize> {

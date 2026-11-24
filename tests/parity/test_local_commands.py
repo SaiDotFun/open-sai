@@ -151,6 +151,361 @@ def test_skill_install(
         assert json.loads(repeated.stdout) == {**report, "action": "unchanged"}
 
 
+RUN = "1a" * 16
+OTHER_RUN = "2b" * 16
+COMMAND = "3c" * 16
+CALL = "4d" * 6
+ADDR = "0x" + "12" * 20
+ENDPOINT_ID = "h1_" + "5e" * 32
+STAMP = "2026-11-23T00:00:00.000Z"
+INTENT_KEY = "20261123T000000000Z_0123456789ABCDEF"
+
+
+def event(
+    name: str,
+    seq: int,
+    *,
+    surface: str = "cli",
+    run: str = RUN,
+    **fields: object,
+) -> dict[str, object]:
+    return {
+        "schema": 2,
+        "ts": STAMP,
+        "level": "info",
+        "event": name,
+        "surface": surface,
+        "pid": 42,
+        "version": "0.1.1",
+        "runId": run,
+        "seq": seq,
+        **fields,
+    }
+
+
+def seed_logs(root: Path, streams: dict[str, list[dict[str, object]]]) -> Path:
+    logs = root / "sai-home" / "logs"
+    logs.mkdir(parents=True)
+    for surface, rows in streams.items():
+        (logs / f"{surface}-{STAMP[:10]}.jsonl").write_bytes(
+            b"".join(json.dumps(row).encode() + b"\n" for row in rows)
+        )
+    return logs
+
+
+def cli_json(
+    cli: tuple[str, ...], root: Path, *args: str, logging: str = "1"
+) -> dict[str, object]:
+    result = invoke(cli, root, "--json", *args, logging=logging)
+    assert result.returncode == 0 and result.stderr == b"", result
+    return json.loads(result.stdout)
+
+
+def test_log_path_and_tail(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    outputs = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        absent = cli_json(cli, root, "logs", "path")
+        assert absent == {
+            "dir": str(root / "sai-home/logs"),
+            "enabled": True,
+            "keepDays": 14,
+            "files": [],
+        }
+        assert not (root / "sai-home").exists()
+        logs = seed_logs(
+            root,
+            {
+                "cli": [
+                    event("keeper.request", 2, keeperErrors=[{"message": "private"}])
+                ],
+                "mcp": [
+                    event("command.start", 1, surface="mcp"),
+                    event("keeper.request", 3, surface="mcp"),
+                ],
+            },
+        )
+        (logs / "update-2026-11-23.jsonl").symlink_to("cli-2026-11-23.jsonl")
+        assert cli_json(cli, root, "logs", "path", logging="0")["files"] == [
+            "cli-2026-11-23.jsonl",
+            "mcp-2026-11-23.jsonl",
+        ]
+        before = {
+            path.name: path.read_bytes()
+            for path in logs.iterdir()
+            if not path.is_symlink()
+        }
+        result = invoke(
+            cli,
+            root,
+            "--json",
+            "logs",
+            "tail",
+            "-n",
+            "2",
+            "--event",
+            "keeper",
+            logging="1",
+        )
+        assert result.returncode == 0 and result.stderr == b"", result
+        rows = [json.loads(row) for row in result.stdout.splitlines()]
+        assert [row["seq"] for row in rows] == [2, 3]
+        assert rows[0]["keeperErrors"] == [{"code": "KEEPER_ERROR"}]
+        assert rows[0]["keeperErrorCount"] == 1
+        assert invoke(cli, root, "logs", "tail", "--surface", "mcp").stdout.startswith(
+            f"{STAMP} mcp info command.start\n".encode()
+        )
+        assert {
+            path.name: path.read_bytes()
+            for path in logs.iterdir()
+            if not path.is_symlink()
+        } == before
+        outputs.append(rows)
+    assert outputs[0] == outputs[1]
+
+
+def test_logs_run_same_stamp_cursor(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    outputs = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        seed_logs(
+            root,
+            {
+                "cli": [
+                    event("command.end", seq, error="private")
+                    for seq in range(1, 161, 2)
+                ],
+                "mcp": [
+                    event("mcp.tool_result", seq, surface="mcp", callId=CALL)
+                    for seq in range(2, 161, 2)
+                ],
+            },
+        )
+        first = cli_json(cli, root, "logs", "run", RUN)
+        cursor = first["nextBefore"]
+        assert isinstance(cursor, str) and cursor.startswith(f"{STAMP}~")
+        second = cli_json(cli, root, "logs", "run", RUN, "--before", cursor)
+        assert "nextBefore" not in second
+        assert [
+            row["seq"] for page in (second, first) for row in page["events"]
+        ] == list(range(1, 161))
+        assert all("error" not in row for row in first["events"])
+        assert len(cli_json(cli, root, "logs", "run", CALL)["events"]) == 80
+        assert (
+            cli_json(cli, root, "logs", "run", RUN, "--before", STAMP)["events"] == []
+        )
+        outputs.append([first, second])
+    assert outputs[0] == outputs[1]
+
+
+def test_logs_stats_continuation_counts_each_request_once(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    outputs = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        seed_logs(
+            root,
+            {
+                "cli": [event("log.dropped", seq, count=1) for seq in range(1, 261, 2)],
+                "mcp": [
+                    event(
+                        "keeper.request",
+                        seq,
+                        surface="mcp",
+                        operation="prices",
+                        durationMs=seq,
+                        code="KEEPER_ERROR",
+                    )
+                    for seq in range(2, 261, 2)
+                ],
+            },
+        )
+        first = cli_json(cli, root, "logs", "stats")
+        cursor = first["nextBefore"]
+        assert isinstance(cursor, str)
+        second = cli_json(cli, root, "logs", "stats", "--before", cursor)
+        assert "nextBefore" not in second
+        assert [len(page["gaps"]) for page in (first, second)] == [128, 2]
+        assert [page["keeper"]["prices"]["count"] for page in (first, second)] == [
+            129,
+            1,
+        ]
+        assert [page["errors"]["KEEPER_ERROR"] for page in (first, second)] == [129, 1]
+        outputs.append([first, second])
+    assert outputs[0] == outputs[1]
+
+
+def test_logs_intent_scopes_and_projects(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    reports = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        seed_logs(
+            root,
+            {
+                "cli": [
+                    event(
+                        "command.start", 1, commandId=COMMAND, argv=["fixture-private"]
+                    ),
+                    event(
+                        "intent.status",
+                        2,
+                        commandId=COMMAND,
+                        intentKey=INTENT_KEY,
+                        addr=ADDR,
+                        endpointId=ENDPOINT_ID,
+                        status="pending",
+                    ),
+                    event("command.end", 3, commandId=COMMAND),
+                    event("log.dropped", 4, count=3),
+                    event("log.dropped", 5, run=OTHER_RUN, count=7),
+                    event(
+                        "intent.status",
+                        6,
+                        intentKey=INTENT_KEY,
+                        addr=ADDR,
+                        endpoint="https://fixture.invalid/private",
+                    ),
+                ],
+            },
+        )
+        report = cli_json(cli, root, "logs", "intent", INTENT_KEY, "--offline")
+        assert report["intentKey"] == INTENT_KEY
+        assert [row["seq"] for row in report["events"]] == [1, 2, 3]
+        assert report["gaps"][0]["count"] == 3
+        assert report["unattributedGaps"][0]["count"] == 7
+        assert "Older events" in report["scopeWarning"]
+        assert "fixture-private" not in json.dumps(report)
+        reports.append(report)
+    assert reports[0] == reports[1]
+
+
+def test_logs_intent_reads_keeper_once(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    import hashlib
+    import hmac
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from threading import Thread
+
+    requests: list[dict[str, object]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            requests.append(request)
+            response = json.dumps(
+                {
+                    "data": {
+                        "userIntents": [
+                            {"intentKey": INTENT_KEY, "evmAddress": "0x" + "34" * 20},
+                            {
+                                "intentKey": INTENT_KEY,
+                                "evmAddress": ADDR,
+                                "kind": "OPEN_TRADE",
+                                "lifecycleStep": "exec_pass",
+                                "txHash": "F0" * 32,
+                                "unused": "private fixture",
+                            },
+                        ]
+                    }
+                }
+            ).encode()
+            if request["variables"]["key"] == "missing-key":
+                response = b'{"data":{"userIntents":[]}}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(response)))
+            self.end_headers()
+            self.wfile.write(response)
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    reports = []
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for index, cli in enumerate(local_pair):
+                root = tmp_path / str(index)
+                endpoint = f"http://127.0.0.1:{server.server_port}/graphql"
+                report = cli_json(
+                    cli,
+                    root,
+                    "--endpoint",
+                    endpoint,
+                    "logs",
+                    "intent",
+                    INTENT_KEY,
+                    "--addr",
+                    ADDR,
+                )
+                assert report["txHash"] == "f0" * 32
+                assert report["keeper"]["evmAddress"] == ADDR
+                assert "unused" not in report["keeper"]
+                assert not (root / "sai-home").exists()
+                reports.append(report)
+                cli_json(
+                    cli,
+                    root,
+                    "--endpoint",
+                    endpoint,
+                    "intent",
+                    "status",
+                    ADDR,
+                    "--key",
+                    "missing-key",
+                )
+                logs = root / "sai-home/logs"
+                profile_key = logs / ".endpoint-key"
+                assert stat.S_IMODE(profile_key.stat().st_mode) == 0o600
+                assert len(profile_key.read_bytes()) == 32
+                identity = (
+                    "h1_"
+                    + hmac.digest(
+                        profile_key.read_bytes(),
+                        hashlib.sha256((endpoint + "?").encode()).digest(),
+                        "sha256",
+                    ).hex()
+                )
+                observed = cli_json(
+                    cli,
+                    root,
+                    "--endpoint",
+                    endpoint,
+                    "logs",
+                    "intent",
+                    "missing-key",
+                    "--offline",
+                )
+                events = observed["events"]
+                assert [row["event"] for row in events] == [
+                    "command.start",
+                    "keeper.request",
+                    "intent.keeper",
+                    "command.end",
+                ]
+                assert {row["commandId"] for row in events} == {events[0]["commandId"]}
+                assert all(row["schema"] == 2 for row in events)
+                assert all(
+                    row["endpointId"] == identity for row in events if "endpoint" in row
+                )
+        finally:
+            server.shutdown()
+            thread.join()
+    assert len(requests) == 4
+    assert requests[:2] == requests[2:]
+    assert requests[0]["variables"] == {"key": INTENT_KEY, "user": ADDR}
+    assert reports[0] == reports[1]
+
+
 def test_command_log_v2(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:
@@ -181,3 +536,82 @@ def test_command_log_v2(
                 row.pop(volatile, None)
         runs.append(rows)
     assert runs[0] == runs[1]
+
+
+@pytest.mark.parametrize("command", ["run", "stats"])
+def test_cursor_resumes_after_an_empty_byte_budget_page(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    command: str,
+) -> None:
+    from datetime import UTC, datetime, timedelta
+
+    start = datetime.fromisoformat(STAMP).astimezone(UTC)
+    args = ("logs", command, *((RUN,) if command == "run" else ()))
+    field = "events" if command == "run" else "keeper"
+
+    def ts(milliseconds: int) -> str:
+        return (
+            (start + timedelta(milliseconds=milliseconds))
+            .isoformat(timespec="milliseconds")
+            .replace("+00:00", "Z")
+        )
+
+    outputs = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        logs = seed_logs(root, {})
+        sample = event(
+            "keeper.request", 0, operation="prices", durationMs=7, extra="x" * 1800
+        )
+        with (logs / f"cli-{STAMP[:10]}.jsonl").open("wb") as stream:
+            stream.writelines(
+                json.dumps({**sample, "seq": seq, "ts": ts(seq)}).encode() + b"\n"
+                for seq in range(9500)
+            )
+
+        page = cli_json(cli, root, *args, "--before", ts(300))
+        assert page["truncated"] and page[field] in ([], {})
+        pages = [page]
+        while cursor := page.get("nextBefore"):
+            assert isinstance(cursor, str)
+            page = cli_json(cli, root, *args, "--before", cursor)
+            pages.append(page)
+            assert len(pages) <= 4
+
+        if command == "run":
+            assert sorted(row["seq"] for page in pages for row in page[field]) == list(
+                range(300)
+            )
+        else:
+            assert (
+                sum(page[field].get("prices", {}).get("count", 0) for page in pages)
+                == 300
+            )
+        outputs.append(pages)
+    assert outputs[0] == outputs[1]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("skill", "--help"),
+        ("skill", "install", "--help"),
+        ("logs",),
+        ("logs", "intent"),
+        ("logs", "tail", "-n", "-1"),
+        ("logs", "tail", "--surface", "wrong"),
+        ("logs", "stats", "--since", "0h"),
+        ("--json", "logs", "run", "process", "--before", "bad~cursor"),
+    ],
+)
+def test_local_usage_matches_click(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    args: tuple[str, ...],
+) -> None:
+    outputs = []
+    for index, cli in enumerate(local_pair):
+        result = invoke(cli, tmp_path / str(index), *args)
+        outputs.append((result.returncode, result.stdout, result.stderr))
+    assert outputs[0] == outputs[1]

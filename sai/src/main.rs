@@ -1,5 +1,6 @@
 mod config;
 mod local;
+mod logs;
 mod skill;
 
 use std::{env, path::Path, process, time::Instant};
@@ -70,6 +71,11 @@ enum Command {
         #[command(subcommand)]
         command: skill::SkillCommand,
     },
+    /// Read the retained JSON-lines logs.
+    Logs {
+        #[command(subcommand)]
+        command: logs::LogsCommand,
+    },
 }
 
 fn main() -> process::ExitCode {
@@ -87,7 +93,8 @@ fn main() -> process::ExitCode {
         return (complete(skill::show(None), "skill show", requested_json, home).0 as u8).into();
     }
     let started = Instant::now();
-    let writer = if matches!(command, "logs" | "skill show")
+    let writer = if command.starts_with("logs")
+        || command == "skill show"
         || argv
             .iter()
             .any(|flag| matches!(flag.as_str(), "--help" | "--version" | "--skill"))
@@ -156,6 +163,9 @@ fn main() -> process::ExitCode {
                         }
                         Command::Config { command } => command.run(&flags, env, json),
                         Command::Skill { command } => command.run(json),
+                        Command::Logs { command } => {
+                            command.run(env, &flags, cli.account.as_deref(), json)
+                        }
                     }
                 });
             complete(result, command, json, home)
@@ -235,7 +245,7 @@ fn complete(
         }
         println!("{}", local::ascii_json(&json!({"error": body}).to_string()));
     } else {
-        if error.exit_code == ExitCode::Usage {
+        if error.exit_code == ExitCode::Usage && error.show_usage {
             eprintln!(
                 "{}\nTry '{} --help' for help.\n",
                 usage(command),
@@ -253,6 +263,9 @@ fn usage(command: &str) -> String {
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" => "",
         "skill show" | "skill source" | "skill install" => "",
+        "logs path" | "logs tail" | "logs stats" => "",
+        "logs intent" => " KEY",
+        "logs run" => " ID",
         "intent status" | "intent local" | "auth use" => " ADDR",
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -330,12 +343,12 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
         }
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
-            "logs" => return ("logs", &[]),
-            "config" | "auth" | "intent" | "skill" => {
+            "config" | "auth" | "intent" | "skill" | "logs" => {
                 let group = match arg.as_str() {
                     "auth" => "auth",
                     "intent" => "intent",
                     "skill" => "skill",
+                    "logs" => "logs",
                     _ => "config",
                 };
                 let Some((index, leaf)) = args
@@ -360,6 +373,11 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("skill", "show") => "skill show",
                     ("skill", "source") => "skill source",
                     ("skill", "install") => "skill install",
+                    ("logs", "path") => "logs path",
+                    ("logs", "tail") => "logs tail",
+                    ("logs", "intent") => "logs intent",
+                    ("logs", "run") => "logs run",
+                    ("logs", "stats") => "logs stats",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);
@@ -393,7 +411,7 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
             } else {
                 let consumed = match command {
                     "config get" | "config unset" | "intent status" | "intent local"
-                    | "auth use" | "auth logout" => 1,
+                    | "auth use" | "auth logout" | "logs intent" | "logs run" => 1,
                     "config set" => 2,
                     _ => 0,
                 };
@@ -417,7 +435,20 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
         }
         ErrorKind::InvalidValue => {
             let argument = arg?.split(' ').next()?;
+            if command == "logs tail"
+                && argument == "--surface"
+                && let Some(value) =
+                    context_text(error, ContextKind::InvalidValue).filter(|value| !value.is_empty())
+            {
+                return Some(SaiError::usage(format!(
+                    "Invalid value for '--surface': {} is not one of 'cli', 'mcp', 'update'.",
+                    repr(value)
+                )));
+            }
             format!("Option {} requires an argument.", repr(argument))
+        }
+        ErrorKind::ValueValidation if command == "logs tail" => {
+            std::error::Error::source(error)?.to_string()
         }
         _ => return None,
     };
@@ -451,7 +482,8 @@ fn print_parse_error(
     home: Option<&Path>,
 ) -> (ExitCode, Option<SaiError>) {
     let help = || {
-        skill::help(command)
+        logs::help(command)
+            .or_else(|| skill::help(command))
             .map(str::to_owned)
             .or_else(|| config::help(command))
             .or_else(|| local::intent_help(command))
@@ -470,7 +502,7 @@ fn print_parse_error(
             return (ExitCode::Ok, None);
         }
         ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
-            if command == "skill"
+            if matches!(command, "logs" | "skill")
                 && let Some(help) = help()
             {
                 return complete(Err(SaiError::usage(help)), command, json, home);
@@ -485,6 +517,12 @@ fn print_parse_error(
                 eprintln!("{}", error.message);
                 return (ExitCode::Usage, Some(error));
             }
+        }
+        ErrorKind::MissingRequiredArgument
+            if !json && operands.is_empty() && matches!(command, "logs run" | "logs intent") =>
+        {
+            eprintln!("{}", help().unwrap());
+            return (ExitCode::Usage, None);
         }
         _ => {}
     }
@@ -503,7 +541,8 @@ fn print_parse_error(
         _ => command,
     };
     if let Some(usage) = usage_error(error, usage_command, operands) {
-        if !json && error.kind() == ErrorKind::InvalidValue && usage_command.is_empty() {
+        if !json && error.kind() == ErrorKind::InvalidValue && usage.message.starts_with("Option ")
+        {
             eprintln!("Error: {}", usage.message);
             return (ExitCode::Usage, Some(usage));
         }

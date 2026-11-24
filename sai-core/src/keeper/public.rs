@@ -237,6 +237,10 @@ fn intent_record(row: &Map<String, Value>) -> Value {
     project_intent_record(row, false)
 }
 
+pub(crate) fn log_intent_record(row: &Map<String, Value>) -> Value {
+    project_intent_record(row, true)
+}
+
 fn project_intent_record(row: &Map<String, Value>, logging: bool) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut record = Map::new();
