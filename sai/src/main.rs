@@ -1,8 +1,9 @@
 mod config;
+mod doctor;
 mod local;
 mod mcp_registration;
 
-use std::{env, path::Path, process, time::Instant};
+use std::{cell::Cell, env, path::Path, process, time::Instant};
 
 use clap::{
     CommandFactory, Parser, Subcommand,
@@ -66,6 +67,8 @@ enum Command {
     },
     /// Run Sai as an MCP server for agent clients.
     Mcp(mcp_registration::McpArgs),
+    /// Check the install, config, MCP registrations, session, intent ledger, and endpoints.
+    Doctor(doctor::DoctorArgs),
 }
 
 impl Cli {
@@ -75,6 +78,7 @@ impl Cli {
         json: bool,
         events: EventContext<'_>,
         operands: &[String],
+        start_log: impl FnOnce(),
     ) -> Result<(), SaiError> {
         let flags = Flags {
             endpoint: self.endpoint,
@@ -82,19 +86,13 @@ impl Cli {
             lcd_endpoint: self.lcd_endpoint,
         };
         match self.command {
-            Command::Auth { command, .. } => local::auth(
-                command,
-                self.account.as_deref(),
-                &flags,
-                env,
-                json,
-                events,
-            ),
-            Command::Intent { command, .. } => {
-                local::intent(command, &flags, env, json, events)
+            Command::Auth { command, .. } => {
+                local::auth(command, self.account.as_deref(), &flags, env, json, events)
             }
+            Command::Intent { command, .. } => local::intent(command, &flags, env, json, events),
             Command::Config { command } => command.run(&flags, env, json),
             Command::Mcp(args) => args.run(json, operands.iter().any(|arg| arg == "--")),
+            Command::Doctor(args) => args.run(flags, env, json, events, start_log),
         }
     }
 }
@@ -113,17 +111,25 @@ fn main() -> process::ExitCode {
     let requested_json = json_requested(&argv);
     let started = Instant::now();
     let writer = if command == "logs"
+        || command.starts_with("logs ")
+        || command == "doctor"
+            && (operands.iter().any(|arg| arg == "--no-fix")
+                || environment
+                    .as_ref()
+                    .is_ok_and(|env| !doctor::safe_log_path(env)))
         || argv
             .iter()
             .any(|flag| matches!(flag.as_str(), "--help" | "--version" | "--skill"))
     {
         None
     } else {
-        environment
-            .as_ref()
-            .ok()
-            .cloned()
-            .and_then(LogWriter::start)
+        environment.as_ref().ok().cloned().and_then(
+            if matches!(command, "doctor" | "mcp install" | "mcp list") {
+                LogWriter::start_command
+            } else {
+                LogWriter::start
+            },
+        )
     };
     let command_field = || {
         if command.is_empty() {
@@ -142,16 +148,24 @@ fn main() -> process::ExitCode {
         surface: Surface::Cli,
         command: (!command.is_empty()).then_some(command),
     };
-    if let Some(writer) = &writer {
-        writer.event(
-            Surface::Cli,
-            "command.start",
-            Level::Info,
-            [
-                ("command", command_field()),
-                ("argv", Field::argv(argv.iter().take(64).cloned())),
-            ],
-        );
+    let log_started = Cell::new(false);
+    let start_log = || {
+        if let Some(writer) = &writer
+            && !log_started.replace(true)
+        {
+            writer.event(
+                Surface::Cli,
+                "command.start",
+                Level::Info,
+                [
+                    ("command", command_field()),
+                    ("argv", Field::argv(argv.iter().take(64).cloned())),
+                ],
+            );
+        }
+    };
+    if command != "doctor" {
+        start_log();
     }
     let outcome = match Cli::try_parse_from(args) {
         Ok(cli) => {
@@ -163,11 +177,12 @@ fn main() -> process::ExitCode {
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
-                .and_then(|env| cli.run(env, json, events, operands));
+                .and_then(|env| cli.run(env, json, events, operands, start_log));
             complete(result, command, json, home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
+    start_log();
     finish(writer, command_field(), started, outcome)
 }
 
@@ -225,7 +240,7 @@ fn complete(
         }
         println!("{}", local::ascii_json(&json!({"error": body}).to_string()));
     } else {
-        if error.exit_code == ExitCode::Usage {
+        if error.exit_code == ExitCode::Usage && command != "doctor" {
             eprintln!(
                 "{}\nTry '{} --help' for help.\n",
                 usage(command),
@@ -241,7 +256,8 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" => "",
+        "config list" | "auth status" | "auth list" | "doctor" | "mcp list" => "",
+        "mcp install" => " [CLIENTS]...",
         "intent status" | "intent local" | "auth use" => " ADDR",
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -317,14 +333,14 @@ fn command_path(args: &[String]) -> (String, &[String]) {
             continue;
         }
         match arg.as_str() {
-            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => {
-                skip = true
-            }
-            "logs" => return ("logs".into(), &[]),
+            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             _ if arg.starts_with('-') => {}
             _ => {
                 let tree = Cli::command();
                 let Some(mut node) = tree.find_subcommand(arg) else {
+                    if arg == "logs" {
+                        return ("logs".into(), &[]);
+                    }
                     break;
                 };
                 let mut path = node.get_name().to_owned();
