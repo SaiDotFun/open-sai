@@ -18,7 +18,7 @@ import tempfile
 import time
 import unittest
 from collections.abc import Generator
-from contextlib import closing, contextmanager, suppress
+from contextlib import closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any
@@ -99,9 +99,10 @@ def require(condition: bool, message: str) -> None:
 
 
 class ReplyReader:
-    def __init__(self, stream: IO[bytes]) -> None:
+    def __init__(self, stream: IO[bytes], capture: bytearray | None = None) -> None:
         self.fd = stream.fileno()
         self.pending = bytearray()
+        self.capture = capture
         os.set_blocking(self.fd, False)
 
     def line(self, step: str, *, timeout: float = 10) -> str:
@@ -116,6 +117,8 @@ class ReplyReader:
                 continue
             if not chunk:
                 raise RehearsalError(f"{step} received no complete reply")
+            if self.capture is not None:
+                self.capture.extend(chunk)
             self.pending.extend(chunk)
         line = bytes(self.pending[:end])
         del self.pending[: end + 1]
@@ -290,7 +293,8 @@ def launcher_interpreter(name: str, launcher: Path) -> Path | None:
 
 
 class Install:
-    def __init__(self, root: Path) -> None:
+    def __init__(self, root: Path, diagnostics: Path | None = None) -> None:
+        self.diagnostics = diagnostics
         self.home = root / "home"
         self.home.mkdir(mode=0o700)
         (self.home / ".codex").mkdir(mode=0o700)
@@ -351,14 +355,21 @@ class Install:
                     out.decode(errors="replace"),
                     err.decode(errors="replace"),
                 )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise RehearsalError(f"{step} failed ({type(exc).__name__})") from exc
+        except subprocess.TimeoutExpired as exc:
+            self.log_output(step, exc.output or b"", exc.stderr or b"")
+            raise RehearsalError(f"{step} exited 124") from exc
+        except OSError as exc:
+            raise RehearsalError(f"{step} exited 127") from exc
+        self.log_output(step, out, err)
         if check and result.returncode:
-            detail = (result.stdout.strip() or result.stderr.strip()).replace(
-                SYNTHETIC_TOKEN, "<redacted>"
-            )
-            raise RehearsalError(f"{step} exited {result.returncode}\n{detail}")
+            raise RehearsalError(f"{step} exited {result.returncode}")
         return result
+
+    def log_output(self, step: str, stdout: bytes, stderr: bytes) -> None:
+        if self.diagnostics is not None:
+            with self.diagnostics.open("ab") as log:
+                log.write(f"\n[{step}] stdout\n".encode() + stdout)
+                log.write(f"\n[{step}] stderr\n".encode() + stderr)
 
     def json(self, step: str, *args: str) -> Any:
         return json.loads(self.run(step, self.sai, "--json", *args).stdout)
@@ -396,7 +407,7 @@ class Install:
                 f"{name} registration no longer points to the installed launcher",
             )
         replies = {}
-        with self.stdio(*command) as (send, receive):
+        with self.stdio("Run MCP server", *command) as (send, receive):
             for msg in MCP_REQUESTS:
                 send.write((json.dumps({"jsonrpc": "2.0", **msg}) + "\n").encode())
                 send.flush()
@@ -413,22 +424,40 @@ class Install:
 
     @contextmanager
     def stdio(
-        self, *command: str | Path
+        self, step: str, *command: str | Path
     ) -> Generator[tuple[IO[bytes], ReplyReader], None, None]:
-        with owned_process(
-            command, self.home, self.env, stderr=subprocess.DEVNULL
-        ) as process:
-            assert process.stdout is not None and process.stdin is not None
-            yield process.stdin, ReplyReader(process.stdout)
-            process.stdin.close()
+        capture = bytearray() if self.diagnostics is not None else None
+        with (
+            tempfile.TemporaryFile() if capture is not None else nullcontext(None)
+        ) as err:
             try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                pass
+                with owned_process(
+                    command, self.home, self.env, stderr=err or subprocess.DEVNULL
+                ) as process:
+                    assert process.stdout is not None and process.stdin is not None
+                    try:
+                        yield process.stdin, ReplyReader(process.stdout, capture)
+                    except (RehearsalError, BrokenPipeError) as exc:
+                        if code := process.poll():
+                            raise RehearsalError(f"{step} exited {code}") from exc
+                        raise
+                    process.stdin.close()
+                    try:
+                        code = process.wait(timeout=5)
+                    except subprocess.TimeoutExpired as exc:
+                        raise RehearsalError(f"{step} exited 124") from exc
+                    if code:
+                        raise RehearsalError(f"{step} exited {code}")
+            finally:
+                if err is not None and capture is not None:
+                    err.seek(0)
+                    self.log_output(step, bytes(capture), err.read())
 
     @contextmanager
     def websocket(self) -> Generator[str, None, None]:
-        with self.stdio(self.python, "-I", "-c", WEBSOCKET_SERVER) as (_, receive):
+        with self.stdio(
+            "Run loopback Keeper WebSocket", self.python, "-I", "-c", WEBSOCKET_SERVER
+        ) as (_, receive):
             address = receive.line("Loopback Keeper WebSocket")
             require(
                 address.startswith("ws://127.0.0.1:"), "Expected a loopback WebSocket"
@@ -493,7 +522,7 @@ def check_doctor(tool: Install, base: str, key: str, *, pending: bool) -> None:
     }
     require(
         unhealthy == ({"intents"} if pending else set()),
-        f"Unexpected doctor checks: {', '.join(sorted(unhealthy))}",
+        "Doctor reported an unexpected warning or failure",
     )
     if pending:
         require(
@@ -522,8 +551,8 @@ def probe_retry(tool: Install, replay: Replay, key: str) -> bool:
     return True
 
 
-def rehearse(root: Path, wheel: Path, version: str) -> None:
-    tool = Install(root)
+def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) -> None:
+    tool = Install(root, diagnostics)
     replay = Replay(wheel, version)
     with keeper_server(replay.handler()) as base:
         endpoint = f"{base}/query"
@@ -652,7 +681,8 @@ def rehearse(root: Path, wheel: Path, version: str) -> None:
         )
         tool.json("Reconcile with the old CLI", *args)
         blocked = probe_retry(tool, replay, key)
-        status = ledger_row(ledger, key, migrated=True)[0]
+        saved_status = ledger_row(ledger, key, migrated=True)[0]
+        status = saved_status if saved_status in ("terminal", "unknown") else "other"
         print(
             f"v{BASELINE} reconciled market_order_outcome_not_indexed as {status}. "
             f"Retry after reconciliation: {'blocked' if blocked else 'reached loopback Keeper'}."
@@ -666,6 +696,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--self-test", action="store_true", help="Run local rehearsal tests"
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Save child output in a private scratch log",
     )
     args = parser.parse_args()
     if args.self_test:
@@ -691,10 +726,22 @@ def main() -> int:
             "provide an existing sai_cli-X.Y.Z-py3-none-any.whl newer than 0.1.0"
         )
     try:
-        with tempfile.TemporaryDirectory(prefix="sai-release-rehearsal-") as scratch:
-            rehearse(Path(scratch), wheel, match[1])
-    except (RehearsalError, OSError, ValueError, KeyError, sqlite3.Error) as exc:
+        diagnostics = None
+        if args.verbose:
+            directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
+            diagnostics = directory / "child-output.log"
+            diagnostics.touch(mode=0o600)
+            print(f"Child output log: {diagnostics}", file=sys.stderr)
+        with tempfile.TemporaryDirectory(
+            prefix="sai-release-rehearsal-",
+            dir=diagnostics.parent if diagnostics else None,
+        ) as scratch:
+            rehearse(Path(scratch), wheel, match[1], diagnostics)
+    except RehearsalError as exc:
         print(f"Release rehearsal failed: {exc}", file=sys.stderr)
+        return 1
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        print(f"Release rehearsal failed ({type(exc).__name__})", file=sys.stderr)
         return 1
     return 0
 

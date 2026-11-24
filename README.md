@@ -267,3 +267,7 @@ a retry, and that `sai doctor` passes once Keeper reports a terminal outcome.
 It restores the pending ledger checkpoint before running
 `sai update --to 0.1.0` and reports whether v0.1.0 still blocks the open
 before and after reconciling it.
+
+Run `python3 scripts/release-rehearsal.py --self-test` for the local script
+checks. Add `--verbose` to a rehearsal to keep child output in a private
+scratch log. The script prints the log path and removes the temporary home.

@@ -48,6 +48,36 @@ class LauncherTest(unittest.TestCase):
             )
 
 
+class DiagnosticsTest(unittest.TestCase):
+    def test_child_exit_reports_only_step_and_code_unless_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "tools"
+            bin_dir.mkdir()
+            for name in ("uv", "claude", "codex"):
+                (bin_dir / name).symlink_to(sys.executable)
+            diagnostic = "child fixture output"
+            command = (
+                sys.executable,
+                "-c",
+                f"import sys; print({diagnostic!r}); print({diagnostic!r}, file=sys.stderr); sys.exit(17)",
+            )
+            with patch.dict(os.environ, PATH=str(bin_dir)):
+                for verbose in (False, True):
+                    scratch = root / str(verbose)
+                    scratch.mkdir()
+                    log = scratch / "child-output.log"
+                    tool = REHEARSAL["Install"](scratch, log if verbose else None)
+                    with self.assertRaisesRegex(
+                        REHEARSAL["RehearsalError"], r"\AFailing fixture exited 17\Z"
+                    ):
+                        tool.run("Failing fixture", *command)
+                    if verbose:
+                        self.assertEqual(log.read_text().count(diagnostic), 2)
+                    else:
+                        self.assertFalse(log.exists())
+
+
 class ProcessTest(unittest.TestCase):
     def test_partial_reply_times_out(self) -> None:
         read, write = os.pipe()
