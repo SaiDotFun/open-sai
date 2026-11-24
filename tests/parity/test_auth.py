@@ -1115,25 +1115,29 @@ def test_renew_matches_python_without_switching_active_account(
     assert session_state(python) == session_state(rust)
 
 
-def test_use_rejects_a_malformed_expiry_written_by_python(
-    tmp_path: Path, auth_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
+def test_use_rejects_a_malformed_stored_expiry(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    python, rust = homes(tmp_path, auth_pair)
-    python.extra_env["SAI_HOME"] = str(rust.home)
-    python.extra_env["SAI_LOG"] = "0"
+    _, rust = homes(tmp_path, cli_pair)
+    monkeypatch.setenv("SAI_HOME", str(rust.home))
     token = fixture_token(ADDR)
-    keeper_auth.update(token=token, expires_at=token)
-    fake_cast(python)
-    keystore(python, addr=ADDR)
-    args = ("--json", "--endpoint", keeper_auth["endpoint"], "auth")
-    assert python.run(*args, "login", "dev").returncode == 0
-    python.clipboard()
-    python.clip.write_text(fixture_token(OTHER))
-    assert python.run(*args, "import").returncode == 0
+    storage._save_accounts(
+        {
+            "active": OTHER,
+            "sessions": {
+                ADDR: {"token": token, "evmAddress": ADDR, "expiresAt": token},
+                OTHER: {
+                    "token": fixture_token(OTHER),
+                    "evmAddress": OTHER,
+                    "expiresAt": "2099-01-01T00:00:00+00:00",
+                },
+            },
+        }
+    )
     path = rust.home / "trader" / "sessions.json"
     before = path.read_bytes()
 
-    result = rust.run(*args, "use", ADDR)
+    result = rust.run("--json", "auth", "use", ADDR)
 
     assert_unexposed(rust, result.stdout + result.stderr, token)
     assert result.returncode == 1
