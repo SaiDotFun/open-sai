@@ -7,6 +7,7 @@ import base64
 import json
 import threading
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,6 +37,7 @@ def replay():
     recorded = json.loads((FIXTURES / "mainnet_account_overview.json").read_text())
     quotes = json.loads((FIXTURES / "mainnet_prices_http.json").read_text())
     risk_time = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=3)
+    stop_drips = threading.Event()
     state: dict[str, Any] = {
         "riskTime": risk_time.isoformat(),
         "markTime": (risk_time - timedelta(seconds=17)).isoformat(),
@@ -61,6 +63,7 @@ def replay():
         "oracleRates": {},
         "contractMarkets": {},
         "expiration": 300,
+        "lcdDisconnected": threading.Event(),
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -87,6 +90,22 @@ def replay():
 
         def do_GET(self):
             path = urlsplit(self.path).path
+            drip_path = state.get("dripPath")
+            if drip_path and drip_path in path:
+                del state["dripPath"]
+                started = time.monotonic()
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", "1000000")
+                    self.end_headers()
+                    while not stop_drips.is_set():
+                        self.wfile.write(b" ")
+                        stop_drips.wait(0.02)
+                except (BrokenPipeError, ConnectionResetError):
+                    state["lcdDripSeconds"] = time.monotonic() - started
+                    state["lcdDisconnected"].set()
+                return
             if "/smart/" in path:
                 message = json.loads(base64.b64decode(unquote(path.rsplit("/", 1)[-1])))
                 assert self.headers["x-cosmos-block-height"] == str(RISK_BLOCK)
@@ -178,6 +197,7 @@ def replay():
             )
             yield state
         finally:
+            stop_drips.set()
             for running in servers:
                 running.shutdown()
             for thread in threads:
@@ -203,7 +223,10 @@ def cli(replay: dict[str, Any], *args: str):
 
 def mcp(replay: dict[str, Any], **args: str):
     server = create_server(replay["config"])
-    result = asyncio.run(server.call_tool("account_overview", args))
+    return decode_mcp(asyncio.run(server.call_tool("account_overview", args)))
+
+
+def decode_mcp(result: Any) -> dict[str, Any]:
     content = result[0] if isinstance(result, tuple) else result
     assert isinstance(content, list)
     block = content[0]
@@ -870,6 +893,46 @@ def test_slow_lcd_stops_enrichment_and_keeps_completed_sections(replay):
     assert positions["data"]["unrealizedPnlUsd"] is None
     assert result["balances"]["data"]["balance"]["usd"] == 150.813685
     assert result["queuedMarketOrders"]["data"][0]["sequence"] == 400
+
+
+@pytest.mark.parametrize("surface", ["cli", "mcp"])
+@pytest.mark.parametrize(
+    ("drip_path", "budget", "request_timeout"),
+    [("/smart/", 1.5, 5.0), ("/latest", 5.0, 1.5)],
+    ids=["overview-deadline", "request-timeout"],
+)
+def test_trickling_lcd_disconnects_before_the_next_overview(
+    replay, monkeypatch, surface, drip_path, budget, request_timeout
+):
+    monkeypatch.setattr(overview, "LCD_BUDGET_SECONDS", budget)
+    monkeypatch.setattr(overview, "LCD_REQUEST_SECONDS", request_timeout)
+    replay["dripPath"] = drip_path
+
+    def check_recovery(invoke: Callable[[], dict[str, Any]]) -> None:
+        first = invoke()
+        assert first["positions"]["membership"]["status"] == "unavailable"
+        assert replay["lcdDisconnected"].wait(1), "LCD socket stayed open"
+        assert replay["lcdDripSeconds"] < min(budget, request_timeout) + 1.0
+        second = invoke()
+        assert second["positions"]["membership"]["status"] == "verified"
+        assert second["positions"]["data"]["unrealizedPnlUsd"] == 0
+
+    if surface == "cli":
+
+        def invoke_cli() -> dict[str, Any]:
+            result = cli(replay, "account", "overview", "--as", ADDR, "--json")
+            assert result.exit_code == 0, result.output
+            return json.loads(result.stdout)
+
+        check_recovery(invoke_cli)
+    else:
+        server = create_server(replay["config"])
+        with asyncio.Runner() as runner:
+            check_recovery(
+                lambda: decode_mcp(
+                    runner.run(server.call_tool("account_overview", {"addr": ADDR}))
+                )
+            )
 
 
 def test_overview_rejects_an_invalid_lcd_port():

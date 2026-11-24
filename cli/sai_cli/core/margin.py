@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import re
+import time
 from collections.abc import Callable
+from contextlib import closing, suppress
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -29,6 +32,32 @@ class QueryHeightMismatch(SaiError, ValueError):
     code = Code.PREVIEW_MISMATCH
 
 
+def _get_before_deadline(
+    url: str,
+    deadline: float,
+    headers: dict[str, str] | None,
+    params: dict[str, str] | None,
+) -> httpx.Response:
+    async def request() -> httpx.Response:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("LCD read deadline exceeded")
+        async with asyncio.timeout(remaining):
+            async with httpx.AsyncClient(timeout=None) as client:
+                return await client.get(url, headers=headers, params=params)
+
+    # Closing the loop avoids waiting for system DNS after the request is cancelled.
+    with closing(asyncio.new_event_loop()) as loop:
+        task = loop.create_task(request())
+        try:
+            return loop.run_until_complete(task)
+        except KeyboardInterrupt:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                loop.run_until_complete(task)
+            raise
+
+
 def _get_json(url: str, timeout: float = 20, *, fresh: bool = False) -> dict[str, Any]:
     return _get_json_at_height(url, timeout, fresh=fresh)[0]
 
@@ -40,6 +69,7 @@ def _get_json_at_height(
     height: str | None = None,
     fresh: bool = False,
     allow_unprefixed_height: bool = False,
+    deadline: float | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     keeper.check_url(url, "LCD")
     try:
@@ -47,12 +77,21 @@ def _get_json_at_height(
         # The mainnet LCD caches by URI and can omit metadata on a hit.
         # Give every confirmation read a fresh URI, including the height anchor.
         params = {"_sai_query": token_hex(16)} if fresh or height is not None else None
-        response = httpx.get(url, timeout=timeout, headers=headers, params=params)
+        if deadline is None:
+            response = httpx.get(url, timeout=timeout, headers=headers, params=params)
+        else:
+            response = _get_before_deadline(url, deadline, headers, params)
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
-    except (httpx.HTTPError, httpx.InvalidURL, ValueError, TypeError) as exc:
+    except (
+        httpx.HTTPError,
+        httpx.InvalidURL,
+        TimeoutError,
+        ValueError,
+        TypeError,
+    ) as exc:
         if height is not None or fresh:
             raise QueryHeightMismatch(
                 "Unable to verify contract state during confirmation."
@@ -94,10 +133,13 @@ def smart_value(
     return _get_json_at_height(url, height=height)[0].get("data")
 
 
-def block_header(lcd: str, height: int | str, *, timeout: float = 3) -> dict[str, Any]:
-    data = _get_json(
-        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}", timeout, fresh=height == "latest"
-    )["block"]["header"]
+def block_header(lcd: str, height: int | str, *, deadline: float) -> dict[str, Any]:
+    result, _ = _get_json_at_height(
+        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}",
+        fresh=height == "latest",
+        deadline=deadline,
+    )
+    data = result["block"]["header"]
     if not isinstance(data, dict):
         raise TypeError("Invalid LCD block header")
     return data
@@ -109,14 +151,14 @@ def smart_data(
     message: dict[str, Any],
     *,
     height: int,
-    timeout: float,
+    deadline: float,
 ) -> Any:
-    """Read overview state at the chosen block, within its request timeout."""
+    """Read overview state at the chosen block before the request deadline."""
     data, _ = _get_json_at_height(
         _smart_url(lcd, contract, message),
-        timeout,
         height=str(height),
         allow_unprefixed_height=True,
+        deadline=deadline,
     )
     return data.get("data")
 
