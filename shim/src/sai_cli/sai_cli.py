@@ -469,6 +469,11 @@ def main() -> int:
     try:
         with verified_binary() as (binary, executable):
             argv = [str(binary), *sys.argv[1:]]
+            # Match subprocess's restore_signals behavior. CPython ignores
+            # these signals on startup, and exec preserves ignored handlers.
+            for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
+                if signum := getattr(signal, name, None):
+                    signal.signal(signum, signal.SIG_DFL)
             if os.execve in os.supports_fd:
                 os.execve(executable.fileno(), argv, os.environ)
             # macOS uses the canonical path under the trusted directory

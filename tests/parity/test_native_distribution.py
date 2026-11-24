@@ -9,6 +9,7 @@ import os
 import re
 import runpy
 import shutil
+import signal
 import socket
 import stat
 import sys
@@ -114,6 +115,32 @@ def test_native_archive_initializes_mcp(distribution: SimpleNamespace) -> None:
         offline_env(d, base, proxy)
         run(d.tool, "Install the shim wheel", d.tool.uv, "tool", "install", d.wheel)
         verify_mcp_startup(d)
+
+
+def test_shim_restores_default_file_size_signal(
+    distribution: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    d = distribution
+    probe_archive = tmp_path / d.archive.name
+    with tarfile.open(probe_archive, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
+        archive.add(Path("/bin/sh").resolve(), arcname="sai")
+    d.replay.add_release(d.wheel, d.version, probe_archive)
+    command = ("-c", "ulimit -c 0; kill -s XFSZ $$")
+    direct = d.tool.run(
+        "Measure the native signal exit", "/bin/sh", *command, check=False
+    )
+    assert direct.returncode == -signal.SIGXFSZ
+    with (
+        d.rehearsal.keeper_server(d.replay.handler()) as base,
+        closing(socket.socket()) as proxy,
+    ):
+        offline_env(d, base, proxy)
+        run(d.tool, "Install the shim wheel", d.tool.uv, "tool", "install", d.wheel)
+        through_shim = d.tool.run(
+            "Measure the shim signal exit", d.tool.sai, *command, check=False
+        )
+    assert through_shim.returncode == direct.returncode
 
 
 def test_shim_repairs_digest_directory_permissions_offline(
