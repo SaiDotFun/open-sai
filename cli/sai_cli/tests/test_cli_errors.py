@@ -119,6 +119,14 @@ def test_success_and_sign_in_exit_codes():
     assert listed.exit_code == 0 and json.loads(listed.stdout) == {"accounts": []}
     storage.save_session(
         {
+            "token": "other-session-token",
+            "evmAddress": "0x" + "b" * 40,
+            "endpoint": keeper.MAINNET_HTTP,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    storage.save_session(
+        {
             "token": "test-session-token",
             "evmAddress": ADDR,
             "endpoint": keeper.MAINNET_HTTP,
@@ -126,7 +134,14 @@ def test_success_and_sign_in_exit_codes():
         }
     )
     expired = runner.invoke(main, [*args, "auth", "status"])
-    assert assert_error(expired, 6, "SESSION_EXPIRED")["hint"] == hint
+    assert (
+        assert_error(expired, 6, "SESSION_EXPIRED")["hint"] == f"{hint} --addr {ADDR}"
+    )
+    retry_trade = runner.invoke(main, [*args, "trade", "close", "7"])
+    assert (
+        assert_error(retry_trade, 6, "SESSION_EXPIRED")["hint"]
+        == f"{hint} --addr {ADDR}"
+    )
     text = runner.invoke(main, ["--endpoint", keeper.MAINNET_HTTP, "auth", "status"])
     assert text.exit_code == 6 and text.stdout == ""
     assert "Trading session expired" in text.stderr

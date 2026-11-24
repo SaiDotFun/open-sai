@@ -19,7 +19,7 @@ def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str
     try:
         return check_active(storage.load_session(addr), endpoint)
     except SessionError as exc:
-        if exc.code in (Code.SIGNED_OUT, Code.SESSION_EXPIRED):
+        if exc.code == Code.SIGNED_OUT:
             flags = ("--addr", addr) if addr is not None else ()
             exc.hint = storage.keeper_command_hint(
                 endpoint, "auth", "login", "NAME", *flags
@@ -50,7 +50,11 @@ def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:
             expiresAt=result["expiresAt"],
         )
         raise SessionError(
-            "Trading session expired; sign in again", Code.SESSION_EXPIRED
+            "Trading session expired; sign in again",
+            Code.SESSION_EXPIRED,
+            hint=storage.keeper_command_hint(
+                endpoint, "auth", "login", "NAME", "--addr", result["evmAddress"]
+            ),
         )
     return result
 

@@ -435,16 +435,18 @@ def login(ctx: click.Context, name: str, addr: str | None) -> None:
       sai auth import
           Use a session token copied from Sai Web instead of a key.
     """
+    endpoint = keeper_url(ctx)
     try:
-        result = signed_login(keeper_url(ctx), name, addr)
-        result["endpoint"] = keeper_url(ctx)
+        result = signed_login(endpoint, name, addr)
+        result["endpoint"] = endpoint
         storage.save_session(result)
         emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
-        # The same command, so the endpoint and --addr stay in force.
-        flags = forwarded_flags(ctx.find_root().obj)
-        chosen = ["--addr", addr] if addr else []
-        command = shlex.join(["sai", *flags, "auth", "login", name, *chosen])
+        json_flag = ("--json",) if ctx.obj["json"] else ()
+        chosen = ("--addr", addr) if addr else ()
+        command = storage.keeper_command_hint(
+            endpoint, *json_flag, "auth", "login", name, *chosen
+        )
         raise SaiError(
             f"{exc} Run `{command}` in a terminal.",
             Code.INVALID_REQUEST,
