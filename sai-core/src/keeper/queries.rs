@@ -23,6 +23,7 @@ pub const INTENT_HISTORY: &str = "query($trader:String!, $limit:Int!, $offset:In
   }
 }";
 pub const INTENTS: &str = "query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
+pub const WAIT_INTENTS: &str = "query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
 pub const CHALLENGE: &str = "mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }";
 pub const SESSION: &str = "mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }";
 pub const SUBMIT: &str = "mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }";
@@ -31,7 +32,7 @@ pub(super) fn operation(query: &str) -> &'static str {
     match query {
         CHALLENGE => "challenge",
         HISTORY | INTENT_HISTORY => "history",
-        INTENTS => "intents",
+        INTENTS | WAIT_INTENTS => "intents",
         MARKET => "market",
         MARKETS => "markets",
         POSITION => "position",

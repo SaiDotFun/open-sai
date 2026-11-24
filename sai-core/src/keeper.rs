@@ -8,7 +8,10 @@ mod queries;
 pub mod stream;
 mod transport;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use bech32::{Bech32, primitives::decode::CheckedHrpstring};
 use serde_json::{Map, Value, json};
@@ -20,7 +23,9 @@ use crate::{
 };
 
 pub use diagnostics::{lcd_network, websocket_handshake};
-pub(crate) use public::{intent_log_fields, request_hash};
+pub(crate) use public::{
+    intent_history, intent_log_fields, intent_record, request_hash, wait_error_code,
+};
 pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
 pub(crate) use transport::get as lcd_get;
@@ -57,8 +62,15 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, token, timeout, std::future::pending())
-            .await
+        self.request_with(
+            query,
+            variables,
+            token,
+            timeout,
+            std::future::pending(),
+            false,
+        )
+        .await
     }
 
     /// Make an interruptible public read.
@@ -69,8 +81,26 @@ impl<'a> Keeper<'a> {
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, None, timeout, interrupt)
+        self.request_with(query, variables, None, timeout, interrupt, false)
             .await
+    }
+
+    /// Bound the entire request for an intent wait. Status reads use socket inactivity timeouts.
+    pub(crate) async fn wait_request(
+        &self,
+        query: &str,
+        variables: Map<String, Value>,
+        timeout: Duration,
+    ) -> Result<Map<String, Value>, SaiError> {
+        self.request_with(
+            query,
+            variables,
+            None,
+            timeout,
+            std::future::pending(),
+            true,
+        )
+        .await
     }
 
     async fn request_with(
@@ -80,6 +110,7 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
+        bounded: bool,
     ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
@@ -90,21 +121,21 @@ impl<'a> Keeper<'a> {
             .into_iter()
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
-        let intent_key = if query == INTENTS {
-            variables.get("key").and_then(Value::as_str).filter(|key| {
-                (1..=128).contains(&key.len())
-                    && key
-                        .bytes()
-                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            })
-        } else {
-            None
-        };
         let mut response = ResponseLog::default();
+        let post = async {
+            let post = self.post(query, &variables, token, timeout, &mut response);
+            if bounded {
+                tokio::time::timeout(timeout, post)
+                    .await
+                    .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))
+            } else {
+                post.await
+            }
+        };
         let (result, interrupted) = tokio::select! {
             biased;
             error = interrupt => (Err(error), true),
-            result = self.post(query, &variables, token, timeout, &mut response) => (result, false),
+            result = post => (result, false),
         };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
@@ -125,6 +156,13 @@ impl<'a> Keeper<'a> {
                 ),
             },
         };
+        static INTENT_KEY: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"\A[A-Za-z0-9_-]{1,128}\z").expect("Keeper log key pattern")
+        });
+        let intent_key = matches!(query, INTENTS | WAIT_INTENTS)
+            .then(|| variables.get("key").and_then(Value::as_str))
+            .flatten()
+            .filter(|key| INTENT_KEY.is_match(key));
         self.events.event(
             "keeper.request",
             level,
@@ -171,8 +209,12 @@ impl<'a> Keeper<'a> {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
-            log.errors = Some(graphql_errors(errors));
             log.error_count = Some(errors.as_array().map_or(1, Vec::len));
+            log.errors = if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
+                Some(wait_graphql_errors(errors))
+            } else {
+                Some(graphql_errors(errors))
+            };
             if query == SUBMIT
                 && !result.get("data").is_some_and(truthy)
                 && errors.as_array().is_some_and(|items| {
@@ -287,6 +329,33 @@ fn graphql_errors(errors: &Value) -> Field {
             })
             .collect(),
     )
+}
+
+fn wait_graphql_errors(errors: &Value) -> Field {
+    const CODES: &[&str] = &[
+        "GRAPHQL_PARSE_FAILED",
+        "GRAPHQL_VALIDATION_FAILED",
+        "INTENT_NOT_ACCEPTED",
+        "BAD_USER_INPUT",
+        "FORBIDDEN",
+        "INTERNAL_SERVER_ERROR",
+        "UNAUTHENTICATED",
+    ];
+    let codes: Vec<_> = errors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+        .filter(|item| item.is_object())
+        .map(|item| {
+            let code = item["extensions"]["code"]
+                .as_str()
+                .filter(|code| CODES.contains(code))
+                .unwrap_or("KEEPER_ERROR");
+            json!({"code": code})
+        })
+        .collect();
+    json!(codes).into()
 }
 
 pub(crate) fn truthy(value: &Value) -> bool {
