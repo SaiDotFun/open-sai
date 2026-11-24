@@ -38,7 +38,7 @@ pub(super) struct CaCertificate {
     pub der: CertificateDer<'static>,
     pub tbs: TbsCertificate,
     pub trust: ServerTrust,
-    pub trusted_pem_validity: Option<Validity>,
+    pub anchor_validity: Option<Validity>,
 }
 
 pub(super) enum ServerTrust {
@@ -137,10 +137,9 @@ fn certificate_entry(mut der: Vec<u8>, trusted: bool) -> der::Result<CaCertifica
         _ if eligible_for_default_trust(&certificate)? => ServerTrust::Anchor,
         _ => ServerTrust::Untrusted,
     };
-    // OpenSSL's full-chain verifier skips the dates of an explicitly trusted
-    // terminal intermediate. It still checks dates on a self-issued anchor.
-    let trusted_pem_validity = (trusted
-        && matches!(trust, ServerTrust::Anchor)
+    // OpenSSL's full-chain verifier checks self-issued anchors and skips the
+    // dates of an explicitly trusted terminal intermediate.
+    let anchor_validity = (matches!(trust, ServerTrust::Anchor)
         && eligible_for_default_trust(&certificate)?)
     .then_some(certificate.tbs_certificate.validity);
     der.truncate(certificate_len);
@@ -148,7 +147,7 @@ fn certificate_entry(mut der: Vec<u8>, trusted: bool) -> der::Result<CaCertifica
         der: der.into(),
         tbs: certificate.tbs_certificate,
         trust,
-        trusted_pem_validity,
+        anchor_validity,
     })
 }
 

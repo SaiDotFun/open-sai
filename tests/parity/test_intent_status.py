@@ -1833,17 +1833,20 @@ def test_default_trust_requires_an_issuer(
 
 
 @pytest.mark.parametrize("store", ["file", "dir"])
-@pytest.mark.parametrize("terminal_intermediate", [False, True])
-def test_expired_trusted_ca_matches_httpx(
+@pytest.mark.parametrize(
+    "ca_kind", ["plain-root", "trusted-root", "trusted-intermediate"]
+)
+def test_expired_configured_ca_matches_httpx(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     keeper_certificate: tuple[ssl.SSLContext, Path],
     keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
     store: str,
-    terminal_intermediate: bool,
+    ca_kind: str,
 ) -> None:
     context, _ = keeper_certificate
     _, certs = keeper_cross_signed_ca
+    terminal_intermediate = ca_kind == "trusted-intermediate"
     ca_name, signer = (
         ("cross-signed", "other-ca")
         if terminal_intermediate
@@ -1865,20 +1868,21 @@ def test_expired_trusted_ca_matches_httpx(
     for extension in ca.extensions:
         builder = builder.add_extension(extension.value, extension.critical)
     expired = builder.sign(key, hashes.SHA256())
-    (tmp_path / "expired.pem").write_bytes(
-        expired.public_bytes(serialization.Encoding.PEM)
-    )
-    openssl_in(
-        tmp_path,
-        "x509",
-        "-in",
-        "expired.pem",
-        "-addtrust",
-        "serverAuth",
-        "-out",
-        "trusted.pem",
-    )
-    trust = ca_store_overrides(tmp_path, store, tmp_path / "trusted.pem")
+    configured_ca = tmp_path / "expired.pem"
+    configured_ca.write_bytes(expired.public_bytes(serialization.Encoding.PEM))
+    if ca_kind != "plain-root":
+        openssl_in(
+            tmp_path,
+            "x509",
+            "-in",
+            "expired.pem",
+            "-addtrust",
+            "serverAuth",
+            "-out",
+            "trusted.pem",
+        )
+        configured_ca = tmp_path / "trusted.pem"
+    trust = ca_store_overrides(tmp_path, store, configured_ca)
     assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, terminal_intermediate)
 
 

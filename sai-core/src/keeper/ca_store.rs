@@ -55,11 +55,11 @@ impl CaStore {
                 let path_len =
                     anchor_path_len(&cert.tbs).map_err(|_| CertificateError::BadEncoding)?;
                 self.roots.add(cert.der.clone())?;
-                if path_len.is_some() || cert.trusted_pem_validity.is_some() {
+                if path_len.is_some() || cert.anchor_validity.is_some() {
                     self.anchor_constraints.push((
                         index,
                         AnchorConstraints {
-                            validity: cert.trusted_pem_validity,
+                            validity: cert.anchor_validity,
                             path_len,
                         },
                     ));
