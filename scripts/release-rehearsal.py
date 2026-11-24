@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -23,7 +24,7 @@ from collections.abc import Callable, Generator
 from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, Any, NamedTuple
+from typing import IO, Any, NamedTuple, TypeVar
 
 TESTS = Path(__file__).resolve().parents[1] / "cli" / "sai_cli" / "tests"
 sys.path.insert(0, str(TESTS))
@@ -37,10 +38,6 @@ INSTALLER = (
 CLIENTS = ("claude", "codex")
 SYNTHETIC_TOKEN = "release-rehearsal-fixture-only"
 CHAIN = "cataclysm-1"
-INTENT_QUERY = re.compile(
-    r"\buserIntents\s*\(\s*where\s*:\s*\{\s*user\s*:\s*\$user\s*,?"
-    r"\s*intentKey\s*:\s*\$key\s*\}"
-)
 INTENT_KEY = re.compile(r"\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 TRADE = (
     "trade",
@@ -129,41 +126,75 @@ class RehearsalInterrupted(BaseException):
 class Cancellation:
     def __init__(self) -> None:
         self.signum: int | None = None
-        self.deferred = False
 
     def receive(self, signum: int, _frame: object) -> None:
+        # A Python handler can run before a context manager enters __exit__.
+        # Record cancellation here and raise only at explicit checkpoints.
         if self.signum is None:
             self.signum = signum
-            if not self.deferred:
-                raise RehearsalInterrupted(signum)
 
-    @contextmanager
-    def defer(self) -> Generator[None, None, None]:
-        # Register cleanup before delivering a signal received during acquisition.
-        self.deferred = True
-        try:
-            yield
-        finally:
-            self.deferred = False
-            if self.signum is not None:
-                raise RehearsalInterrupted(self.signum)
+    def check(self) -> None:
+        if self.signum is not None:
+            raise RehearsalInterrupted(self.signum)
 
 
 CANCELLATION = Cancellation()
+STOP_SIGNALS = (signal.SIGINT, signal.SIGTERM)
+CANCEL_INTERVAL = 0.1
+T = TypeVar("T")
 
 
 @contextmanager
 def cancel_on_signal() -> Generator[None, None, None]:
     previous = {}
     try:
-        for sig in (signal.SIGINT, signal.SIGTERM):
+        for sig in STOP_SIGNALS:
             previous[sig] = signal.signal(sig, CANCELLATION.receive)
         yield
     finally:
-        for sig, handler in previous.items():
-            if handler is not None:
-                signal.signal(sig, handler)
-        CANCELLATION.signum = None
+        try:
+            for sig, handler in previous.items():
+                if handler is not None:
+                    signal.signal(sig, handler)
+            CANCELLATION.check()
+        finally:
+            CANCELLATION.signum = None
+
+
+@contextmanager
+def cleanup_stack() -> Generator[ExitStack, None, None]:
+    cleanup = ExitStack()
+    try:
+        yield cleanup
+    finally:
+        previous = signal.pthread_sigmask(signal.SIG_BLOCK, STOP_SIGNALS)
+        try:
+            cleanup.close()
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+
+
+def wait_with_cancellation(operation: Callable[[float], T], timeout: float | None) -> T:
+    deadline = time.monotonic() + timeout if timeout is not None else float("inf")
+    while True:
+        CANCELLATION.check()
+        remaining = deadline - time.monotonic()
+        try:
+            return operation(max(0, min(CANCEL_INTERVAL, remaining)))
+        except subprocess.TimeoutExpired as exc:
+            if timeout is not None and remaining <= CANCEL_INTERVAL:
+                exc.timeout = timeout
+                raise
+
+
+def communicate(
+    process: subprocess.Popen[bytes],
+    *,
+    timeout: float,
+) -> tuple[bytes, bytes]:
+    return wait_with_cancellation(
+        lambda interval: process.communicate(timeout=interval), timeout
+    )
 
 
 def require(condition: bool, message: str) -> None:
@@ -181,9 +212,12 @@ class ReplyReader:
     def line(self, step: str, *, timeout: float = 10) -> str:
         deadline = time.monotonic() + timeout
         while (end := self.pending.find(b"\n")) < 0:
+            CANCELLATION.check()
             left = deadline - time.monotonic()
-            if left <= 0 or not select.select([self.fd], [], [], left)[0]:
+            if left <= 0:
                 raise RehearsalError(f"{step} timed out waiting for a complete reply")
+            if not select.select([self.fd], [], [], min(CANCEL_INTERVAL, left))[0]:
+                continue
             try:
                 chunk = os.read(self.fd, 8192)
             except BlockingIOError:
@@ -204,31 +238,95 @@ def owned_process(
     cwd: Path,
     env: dict[str, str],
     *,
+    stdin: IO[bytes] | int = subprocess.PIPE,
     stdout: int | None = subprocess.PIPE,
     stderr: int | IO[bytes] | None = subprocess.PIPE,
 ) -> Generator[subprocess.Popen[bytes], None, None]:
-    with ExitStack() as cleanup:
-        with CANCELLATION.defer():
+    CANCELLATION.check()
+    with cleanup_stack() as cleanup:
+        # Keep the group ID owned even when communicate() reaps the command.
+        leader = cleanup.enter_context(
+            subprocess.Popen(
+                (sys.executable, "-I", "-c", "import sys; sys.stdin.buffer.read(1)"),
+                cwd=cwd,
+                env=env,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                process_group=0,
+            )
+        )
+        try:
             process = cleanup.enter_context(
                 subprocess.Popen(
                     command,
                     cwd=cwd,
                     env=env,
-                    stdin=subprocess.PIPE,
+                    stdin=stdin,
                     stdout=stdout,
                     stderr=stderr,
-                    start_new_session=True,
+                    process_group=leader.pid,
                 )
             )
-            cleanup.callback(stop_process_group, process)
+        finally:
+            cleanup.callback(stop_process_group, leader)
+        CANCELLATION.check()
         yield process
+    CANCELLATION.check()
 
 
-def stop_process_group(process: subprocess.Popen[bytes]) -> None:
-    # The leader can exit while a descendant still owns a pipe or file.
+def stop_process_group(leader: subprocess.Popen[bytes]) -> None:
     with suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    process.wait()
+        os.killpg(leader.pid, signal.SIGKILL)
+
+
+def stop_adopted_children() -> None:
+    # All owned command contexts have closed. Remaining children are orphans
+    # adopted by the rehearsal, including helpers that created a new session.
+    while True:
+        try:
+            exited, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if exited:
+            continue
+        pids = set()
+        for children in Path("/proc/self/task").glob("*/children"):
+            with suppress(FileNotFoundError):
+                pids.update(map(int, children.read_text().split()))
+        for pid in pids:
+            # The PID remains owned until this process reaps the child.
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        if pids:
+            os.waitpid(-1, 0)
+
+
+@contextmanager
+def reap_detached_children() -> Generator[None, None, None]:
+    if sys.platform != "linux":
+        yield
+        return
+    require(
+        Path("/proc/thread-self/children").is_file(),
+        "Linux descendant cleanup requires the procfs children list",
+    )
+    get_subreaper, set_subreaper = 37, 36  # linux/prctl.h
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]
+
+    def set_option(option: int, value: int) -> None:
+        if prctl(option, value, 0, 0, 0) == -1:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+    previous = ctypes.c_int()
+    set_option(get_subreaper, ctypes.addressof(previous))
+    with cleanup_stack() as cleanup:
+        set_option(set_subreaper, 1)
+        cleanup.callback(set_option, set_subreaper, previous.value)
+        cleanup.callback(stop_adopted_children)
+        yield
 
 
 def loopback_env(base: str, proxy_port: int) -> dict[str, str]:
@@ -279,7 +377,7 @@ def namespace_prefix(cwd: Path, env: dict[str, str]) -> tuple[str, ...] | None:
             with owned_process(
                 (*candidate, sys.executable, "-I", "-c", CHECK_NAMESPACE), cwd, env
             ) as probe:
-                probe.communicate(timeout=5)
+                communicate(probe, timeout=5)
                 if probe.returncode == 0:
                     return candidate
         except (OSError, subprocess.TimeoutExpired):
@@ -290,51 +388,142 @@ def namespace_prefix(cwd: Path, env: dict[str, str]) -> tuple[str, ...] | None:
 class SelectedField(NamedTuple):
     name: str
     key: str
+    arguments: dict[str, Any]
     children: tuple[SelectedField, ...]
 
 
-def selection_set(query: str) -> tuple[SelectedField, ...]:
-    """Parse the field selections used by the replay's inline operations."""
+def selection_set(
+    query: str, variables: dict[str, Any] | None = None
+) -> tuple[SelectedField, ...]:
+    """Parse inline field selections and resolve their supplied variables."""
+    bindings = variables or {}
+    declared: dict[str, tuple[str | None, Any]] = {}
     tokens = deque(
         token
-        for token in re.findall(r'#[^\n]*|"(?:\\.|[^"\\])*"|[_A-Za-z]\w*|[^\s,]', query)
+        for token in re.findall(
+            r'#[^\r\n]*|"(?:\\.|[^"\\])*"|[_A-Za-z][_0-9A-Za-z]*'
+            r"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|[^\s,]",
+            query,
+        )
         if not token.startswith("#")
     )
 
     def take_name() -> str:
         name = tokens.popleft()
-        if not re.fullmatch(r"[_A-Za-z]\w*", name):
-            raise ValueError("Expected a GraphQL field name")
+        if not re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", name):
+            raise ValueError("Expected a GraphQL name")
         return name
 
-    def skip_arguments() -> None:
-        depth = 1
+    def expect(token: str) -> None:
+        if tokens.popleft() != token:
+            raise ValueError(f"Expected the GraphQL token {token!r}")
+
+    def variable_type() -> str | None:
+        if tokens[0] == "[":
+            tokens.popleft()
+            variable_type()
+            expect("]")
+            type_name = None
+        else:
+            type_name = take_name()
+        if tokens[0] == "!":
+            tokens.popleft()
+            if type_name is not None:
+                return f"{type_name}!"
+        return type_name
+
+    def variable_definitions() -> None:
+        expect("(")
+        while tokens[0] != ")":
+            expect("$")
+            name = take_name()
+            expect(":")
+            type_name = variable_type()
+            default = None
+            if tokens[0] == "=":
+                tokens.popleft()
+                if type_name in {"String", "String!"} and not (
+                    tokens[0].startswith('"')
+                    or (type_name == "String" and tokens[0] == "null")
+                ):
+                    raise ValueError("Invalid GraphQL String default")
+                default = value()
+            if name in declared:
+                raise ValueError("Duplicate GraphQL variable declaration")
+            declared[name] = type_name, default
+        expect(")")
+
+    def named_values(end: str, path: tuple[str, ...]) -> dict[str, Any]:
+        result = {}
+        while tokens[0] != end:
+            name = take_name()
+            if tokens.popleft() != ":" or name in result:
+                raise ValueError("Expected a unique GraphQL name followed by ':'")
+            result[name] = value((*path, name))
         tokens.popleft()
-        while depth:
-            token = tokens.popleft()
-            depth += (token == "(") - (token == ")")
+        return result
+
+    def value(path: tuple[str, ...] = ()) -> Any:
+        token = tokens.popleft()
+        if token == "$":
+            name = take_name()
+            if name not in declared:
+                raise ValueError("Undeclared GraphQL variable")
+            type_name, default = declared[name]
+            if type_name not in {"String", "String!"} and path in (
+                ("userIntents", "where", "user"),
+                ("userIntents", "where", "intentKey"),
+            ):
+                raise ValueError(
+                    "Expected a String variable for the userIntents filter"
+                )
+            if (
+                path == ("userIntents", "where", "user")
+                and type_name == "String"
+                and default is None
+            ):
+                raise ValueError(
+                    "Expected a non-null declaration or default for the user filter"
+                )
+            return bindings.get(name, default)
+        if token == "{":
+            return named_values("}", path)
+        if token == "[":
+            items = []
+            while tokens[0] != "]":
+                items.append(value())
+            tokens.popleft()
+            return items
+        if re.fullmatch(r"[_A-Za-z][_0-9A-Za-z]*", token):
+            # Enum names do not satisfy the replay's string filters.
+            return {"true": True, "false": False}.get(token)
+        return json.loads(token)
 
     def fields() -> tuple[SelectedField, ...]:
-        tokens.popleft()
+        expect("{")
         result = []
         while tokens[0] != "}":
             key = name = take_name()
             if tokens[0] == ":":
                 tokens.popleft()
                 name = take_name()
+            arguments = {}
             if tokens[0] == "(":
-                skip_arguments()
+                tokens.popleft()
+                arguments = named_values(")", (name,))
             children = fields() if tokens[0] == "{" else ()
-            result.append(SelectedField(name, key, children))
+            result.append(SelectedField(name, key, arguments, children))
         tokens.popleft()
         return tuple(result)
 
     try:
-        while tokens[0] != "{":
-            if tokens[0] == "(":
-                skip_arguments()
-            else:
+        if tokens[0] != "{":
+            if take_name() not in {"query", "mutation", "subscription"}:
+                raise ValueError("Expected a GraphQL operation")
+            if tokens[0] not in {"(", "{"}:
                 take_name()
+            if tokens[0] == "(":
+                variable_definitions()
         selected = fields()
     except IndexError as exc:
         raise ValueError("Incomplete GraphQL selection") from exc
@@ -372,6 +561,20 @@ class Replay:
         self.assets[f"{path}/{wheel.name}"] = payload, "application/octet-stream"
         self.assets[f"{path}/SHA256SUMS"] = sums, "text/plain"
 
+    def intent_rows(self, where: Any) -> list[dict[str, Any]]:
+        if not isinstance(where, dict) or where.keys() != {"user", "intentKey"}:
+            return []
+        user, key = where["user"], where["intentKey"]
+        if (
+            isinstance(user, str)
+            and user.lower() == self.addr
+            and self.submitted
+            and key == self.submitted[0]
+        ):
+            row = self.responses[self.lifecycle]["data"]["userIntents"][0]
+            return [{**row, "intentKey": key}]
+        return []
+
     def handler(self) -> type[KeeperHandler]:
         replay = self
 
@@ -397,7 +600,7 @@ class Replay:
                     self.send_error(400)
                     return
                 try:
-                    selected = selection_set(query)
+                    selected = selection_set(query, variables)
                 except ValueError:
                     self.send_error(400)
                     return
@@ -430,21 +633,20 @@ class Replay:
                         }
                     }
                 elif "userIntents" in roots:
-                    rows = []
-                    user = variables.get("user")
-                    key = variables.get("key")
-                    if (
-                        INTENT_QUERY.search(query)
-                        and isinstance(user, str)
-                        and user.lower() == replay.addr
-                        and replay.submitted
-                        and key == replay.submitted[0]
-                    ):
-                        row = replay.responses[replay.lifecycle]["data"]["userIntents"][
-                            0
-                        ]
-                        rows.append({**row, "intentKey": key})
-                    data = {"userIntents": rows}
+                    data = {
+                        field.key: project_fields(
+                            replay.intent_rows(field.arguments.get("where")),
+                            field.children,
+                        )
+                        if field.name == "userIntents"
+                        else None
+                        for field in selected
+                    }
+                    if len(data) != len(selected):
+                        self.send_error(400)
+                        return
+                    self.reply({"data": data})
+                    return
                 elif "tradeHistory" in perp:
                     data = {"perp": {"tradeHistory": []}}
                 elif "oneClickTrading" in roots:
@@ -556,16 +758,23 @@ class Install:
         env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            with owned_process(
-                command, self.home, self.env if env is None else env
-            ) as process:
-                out, err = process.communicate(input_text.encode(), timeout=timeout)
-                result = subprocess.CompletedProcess(
+            # File-backed input stays readable across communicate() timeouts.
+            with tempfile.TemporaryFile(dir=self.home) as source:
+                source.write(input_text.encode())
+                source.seek(0)
+                with owned_process(
                     command,
-                    process.returncode,
-                    out.decode(errors="replace"),
-                    err.decode(errors="replace"),
-                )
+                    self.home,
+                    self.env if env is None else env,
+                    stdin=source,
+                ) as process:
+                    out, err = communicate(process, timeout=timeout)
+                    result = subprocess.CompletedProcess(
+                        command,
+                        process.returncode,
+                        out.decode(errors="replace"),
+                        err.decode(errors="replace"),
+                    )
         except subprocess.TimeoutExpired as exc:
             self.log_output(step, exc.output or b"", exc.stderr or b"")
             raise RehearsalError(f"{step} exited 124") from exc
@@ -672,7 +881,7 @@ class Install:
                         raise
                     process.stdin.close()
                     try:
-                        code = process.wait(timeout=5)
+                        code = wait_with_cancellation(process.wait, 5)
                     except subprocess.TimeoutExpired as exc:
                         raise RehearsalError(f"{step} exited 124") from exc
                     if code:
@@ -803,8 +1012,15 @@ def probe_retry(
     return True
 
 
-def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) -> int:
+def rehearse(
+    root: Path, wheel: Path, version: str, diagnostics: Path | None, *, strict: bool
+) -> int:
     tool = Install(root, diagnostics)
+    prefix = namespace_prefix(tool.home, tool.env)
+    if strict and prefix is None:
+        raise RehearsalError(
+            "--strict requires a loopback-only network namespace for egress isolation"
+        )
     with keeper_server(Replay(wheel, version).handler()) as base:
         tool.run(
             "Install the published release",
@@ -826,7 +1042,6 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
         root / "dependency-cache",
         wheel,
     )
-    prefix = namespace_prefix(tool.home, tool.env)
     if prefix is None:
         print(
             "Loopback-only network namespace unavailable. Using the dead proxy for proxy-aware traffic.",
@@ -850,14 +1065,18 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
     # Only the rehearsal script's own progress reaches these streams. It keeps
     # the installed CLI and agent clients' output behind its usual capture.
     with owned_process(command, tool.home, tool.env, stdout=None, stderr=None) as stage:
-        return stage.wait()
+        return wait_with_cancellation(stage.wait, None)
 
 
 def isolated_stage(root_name: str, wheel_name: str, version: str, log_name: str) -> int:
     root, wheel = Path(root_name), Path(wheel_name)
     tool = Install(root, Path(log_name) if log_name else None, prepared=True)
-    with cancel_on_signal():
-        return report_result(lambda: rehearse_staged(tool, root, wheel, version))
+
+    def work() -> int:
+        with cancel_on_signal(), reap_detached_children():
+            return rehearse_staged(tool, root, wheel, version)
+
+    return report_result(work)
 
 
 def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int:
@@ -1052,10 +1271,17 @@ def main() -> int:
         action="store_true",
         help="Save child output in a private scratch log",
     )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="Require a loopback-only network namespace for the rehearsal",
+    )
     args = parser.parse_args()
     if args.self_test:
         if args.wheel:
             parser.error("--self-test takes no candidate wheel")
+        if args.strict:
+            parser.error("--strict requires a candidate wheel")
         suite = unittest.defaultTestLoader.discover(
             str(Path(__file__).resolve().parent), pattern="release_rehearsal_test.py"
         )
@@ -1084,15 +1310,17 @@ def main() -> int:
             diagnostics = directory / "child-output.log"
             diagnostics.touch(mode=0o600)
             print(f"Child output log: {diagnostics}", file=sys.stderr)
-        with cancel_on_signal(), ExitStack() as cleanup:
-            with CANCELLATION.defer():
-                scratch = cleanup.enter_context(
-                    tempfile.TemporaryDirectory(
-                        prefix="sai-release-rehearsal-",
-                        dir=diagnostics.parent if diagnostics else None,
-                    )
+        with cancel_on_signal(), cleanup_stack() as cleanup:
+            scratch = cleanup.enter_context(
+                tempfile.TemporaryDirectory(
+                    prefix="sai-release-rehearsal-",
+                    dir=diagnostics.parent if diagnostics else None,
                 )
-            return rehearse(Path(scratch), wheel, version, diagnostics)
+            )
+            with reap_detached_children():
+                return rehearse(
+                    Path(scratch), wheel, version, diagnostics, strict=args.strict
+                )
 
     return report_result(work)
 

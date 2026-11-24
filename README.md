@@ -258,7 +258,9 @@ Each component of this repository releases under its own tag prefix. The CLI
 uses `sai-cli/vX.Y.Z`, where `X.Y.Z` is the version in `pyproject.toml`, and
 `sai-cli/vX.Y.Z-rc.N` for a pre-release.
 
-To release, merge the version bump, then run `just release X.Y.Z` on `main`.
+To release, merge the version bump and complete the
+[upgrade and downgrade rehearsal](#rehearse-an-upgrade-and-downgrade), then
+run `just release X.Y.Z` on `main`.
 It is a dry run that checks the tree and prints the Git commands; add `--run`
 to create and push the tag. The tag starts the
 [Release workflow](.github/workflows/release.yml), which runs the tests,
@@ -268,21 +270,24 @@ GitHub Release. The install script and `sai update` look for the highest
 
 ### Rehearse an Upgrade and Downgrade
 
-After the version bump lands on `main`, build the candidate and rehearse it
-before tagging. The script needs Python 3.11 or later, `uv`, `claude`, and
-`codex` on `PATH`, and network access to GitHub and the Python package index.
-Use executables that can run with a fresh home directory.
+After the version bump lands on `main`, build the candidate and run the
+rehearsal with `--strict` before tagging. The release gate requires a Linux
+host that can create a loopback-only network namespace with `unshare` and
+`ip`. The script also needs Python 3.11 or later, `uv`, `claude`, and
+`codex` on `PATH`, and network access to GitHub and the Python package
+index. Use executables that can run with a fresh home directory.
 
 ```bash
 uv build --wheel --out-dir dist
-python3 scripts/release-rehearsal.py dist/sai_cli-0.1.1-py3-none-any.whl
+python3 scripts/release-rehearsal.py --strict dist/sai_cli-0.1.1-py3-none-any.whl
 ```
 
 The script installs the published v0.1.0 wheel through the release installer
 in a temporary home and caches the candidate's dependencies. For the
-rehearsal, it sets uv offline and pins the endpoints to loopback. On Linux,
-it uses a loopback-only network namespace when available. Otherwise it
-reports that it is using a dead proxy for proxy-aware traffic. A synthetic
+rehearsal, it sets uv offline and pins the endpoints to loopback. The
+`--strict` flag stops the run before installing anything if the namespace
+is unavailable. For a local practice run, omit `--strict` to allow the
+dead-proxy fallback, which only covers proxy-aware traffic. A synthetic
 session and loopback Keeper leave an open unresolved. The script serves both wheels
 and their checksums to `sai update`. It checks that the session, config,
 and Claude and Codex MCP registrations work through the same launcher,
@@ -291,6 +296,9 @@ Keeper reports a terminal outcome.
 It restores the pending ledger checkpoint before running
 `sai update --to 0.1.0` and reports whether v0.1.0 still blocks the open
 before and after reconciling it.
+
+The script stops its command process groups during teardown. On Linux, it
+also adopts and stops orphaned helpers that started a separate session.
 
 Run `python3 scripts/release-rehearsal.py --self-test` for the local script
 checks. Add `--verbose` to a rehearsal to keep child output in a private
