@@ -152,8 +152,6 @@ fn read(
 ) -> Result<(), SaiError> {
     let settings = load_settings(flags, env)?;
     let keeper = Keeper::new(settings.endpoint(), events);
-    // Python exposes Keeper's data object directly, with its original units
-    // and nullability. The intent-status projection applies to reconciled rows.
     let data = runtime()?.block_on(keeper.request_until(
         query,
         variables,
@@ -161,7 +159,11 @@ fn read(
         keeper::TIMEOUT,
         interrupted(),
     ))?;
-    output::read(&data, json)
+    if query == keeper::HISTORY {
+        output::read(&keeper::public_account_history(&env.home, &data), json)
+    } else {
+        output::read(&data, json)
+    }
 }
 
 #[derive(Subcommand)]

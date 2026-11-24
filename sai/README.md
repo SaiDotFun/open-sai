@@ -13,8 +13,9 @@ Session binding and ledger lookups use the full endpoint.
 Run `sai intent status ADDR --key KEY` to reconcile one intent, or omit
 `--key` to list the account's recent Keeper records. With `--json`, command
 failures use the same error codes and envelope as the Python CLI.
-The `market list`, `market prices`, `account positions`, and `account
-history` commands return Keeper's GraphQL data. The `account balances`
+The `market list`, `market prices`, and `account positions` commands
+return Keeper's GraphQL data. The `account history` command keeps the
+GraphQL envelope and projects each row to validated public fields. The `account balances`
 command reads one WebSocket snapshot. Use `watch price TOKEN_ID`, `watch
 balances ADDR`, or `watch positions ADDR` to stream JSON lines.
 
@@ -25,7 +26,7 @@ uses Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf` for
 Keeper requests, reconciliation, structured errors, and emitted events.
 Logging v2 and intent wait have their own port work. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
 C5 compares read and watch commands against Python on `main` at
-`8c6ddc0acf335853d10d2d42982cd1f1c0b9e17a`. These commands emit schema v2
+`bd6eaabf7e2b0a1fb21822a6f0f4c745c29b9444`. These commands emit schema v2
 events, including keyed endpoint IDs for Keeper HTTP reads.
 
 | Lane | Acceptance criteria |

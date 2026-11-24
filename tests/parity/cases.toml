@@ -161,6 +161,31 @@ server = "read-empty"
 wire = ["tradeHistory"]
 
 [[case]]
+name = "account-history-projection"
+args = ["--json","account","history","{addr}"]
+seed = "history-token"
+server = "history-projection"
+wire = ["tradeHistory"]
+
+[[case]]
+name = "account-history-null"
+args = ["--json","account","history","{addr}"]
+server = "history-null"
+wire = ["tradeHistory"]
+
+[[case]]
+name = "account-history-null-perp"
+args = ["--json","account","history","{addr}"]
+server = "history-null-perp"
+wire = ["tradeHistory"]
+
+[[case]]
+name = "account-history-invalid"
+args = ["--json","account","history","{addr}"]
+server = "history-invalid"
+wire = ["tradeHistory"]
+
+[[case]]
 name = "account-balances"
 args = ["--json","account","balances","{addr}"]
 wire = ["ws:init","ws:userBalances"]

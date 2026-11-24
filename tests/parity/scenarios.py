@@ -33,6 +33,7 @@ PROTOCOL = fixture("synthetic_protocol.json")
 ADDRESS = PROTOCOL["address"]
 OTHER_ADDRESS = "0x" + "2" * 40
 INTENT = "parity-close-7"
+HISTORY_SESSION_TOKEN = "e7" * 32
 CONTRACT = "nibi1syntheticfixture"
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 RELEASES = "/repos/SaiDotFun/open-sai/releases"
@@ -137,8 +138,10 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         return
     session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
     sessions = []
-    if seed in {"session", "accounts"}:
+    if seed in {"session", "accounts", "history-token"}:
         sessions.append({**session, "endpoint": endpoints.keeper})
+        if seed == "history-token":
+            sessions[0]["token"] = HISTORY_SESSION_TOKEN
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
     subprocess.run(
@@ -210,6 +213,54 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             }
         },
     }
+    if scenario == "history-projection":
+        responses["tradeHistory"] = {
+            "data": {
+                "unexpected": HISTORY_SESSION_TOKEN,
+                "perp": {
+                    "unexpected": HISTORY_SESSION_TOKEN,
+                    "tradeHistory": [
+                        {
+                            "id": "001-23:4",
+                            "intentKey": "20261120T102030123Z_0123456789ABCDEF",
+                            "tradeChangeType": "position_liquidated",
+                            "txHash": "0X" + "AB" * 32,
+                            "evmTxHash": "unvalidated",
+                            "trade": {"id": 7, "trader": ADDRESS, "unexpected": "omit"},
+                            "block": {
+                                "block": 42,
+                                "block_ts": "2026-11-20T15:43:31.123456789+23:59",
+                                "unexpected": "omit",
+                            },
+                        },
+                        {
+                            "id": 2**63,
+                            "txHash": HISTORY_SESSION_TOKEN,
+                            "tradeChangeType": "unknown",
+                            "trade": {"id": True, "trader": "invalid"},
+                            "block": {"block": -1, "block_ts": "2026-11-20 15:43:31Z"},
+                        },
+                        {"block": {"block_ts": "2026-11-20T15:43:60Z"}},
+                        {"block": {"block_ts": "0000-01-01T00:00:00Z"}},
+                        {"block": {"block_ts": None}},
+                        None,
+                        "skip non-objects",
+                        {"unexpected": "preserve the empty projected row"},
+                    ],
+                },
+            },
+        }
+    elif scenario == "history-null":
+        responses["tradeHistory"] = {
+            "data": {"perp": {"tradeHistory": None, "extra": 1}}
+        }
+    elif scenario == "history-null-perp":
+        responses["tradeHistory"] = {"data": {"perp": None, "extra": 1}}
+    elif scenario == "history-invalid":
+        responses["tradeHistory"] = {
+            "data": {"perp": {"tradeHistory": True}, "extra": 1}
+        }
+
     variables = {
         "tradeHistory": {"trader": ADDRESS},
         "trades": {"trader": ADDRESS},

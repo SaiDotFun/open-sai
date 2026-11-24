@@ -20,6 +20,14 @@ static ROW_ID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\A[0-9]{1,24}(?:[-_:][0-9]{1,24}){0,3}\z").expect("row ID pattern")
 });
 
+static HISTORY_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-5][0-9]",
+        r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])\z"
+    ))
+    .expect("history timestamp pattern")
+});
+
 const KINDS: &[&str] = &[
     "OPEN_TRADE",
     "CLOSE_POSITION",
@@ -105,6 +113,40 @@ pub fn public_intent_status(home: &Path, data: &Map<String, Value>) -> Value {
         }
     }
     log::scrubber(home)(Value::Object(result).into())
+}
+
+/// Project Keeper's public account-history rows inside their GraphQL envelope.
+pub fn public_account_history(home: &Path, data: &Map<String, Value>) -> Value {
+    let perp = match data.get("perp") {
+        Some(Value::Null) => return json!({"perp": null}),
+        Some(Value::Object(perp)) => perp,
+        _ => return json!({}),
+    };
+    let rows = match perp.get("tradeHistory") {
+        Some(Value::Null) => return json!({"perp": {"tradeHistory": null}}),
+        Some(Value::Array(rows)) => rows,
+        _ => return json!({"perp": {}}),
+    };
+
+    let scrub = log::scrubber(home);
+    let projected: Vec<_> = rows
+        .iter()
+        .filter_map(Value::as_object)
+        .map(|row| scrub(history_row(row, account_history_timestamp).into()))
+        .collect();
+    json!({"perp": {"tradeHistory": projected}})
+}
+
+fn account_history_timestamp(block: &mut Map<String, Value>, timestamp: &Value) {
+    if timestamp.as_str().is_some_and(|text| {
+        HISTORY_TIMESTAMP.is_match(text)
+            && !text.starts_with("0000-")
+            && chrono::DateTime::parse_from_rfc3339(text).is_ok()
+    }) {
+        block.insert("block_ts".into(), timestamp.clone());
+    } else if !timestamp.is_null() {
+        block.insert("block_tsInvalid".into(), json!(true));
+    }
 }
 
 fn keep(out: &mut Map<String, Value>, key: &str, value: &Value, valid: bool) {
@@ -263,6 +305,15 @@ fn intent_record(row: &Map<String, Value>) -> Value {
 }
 
 fn intent_history(row: &Map<String, Value>) -> Value {
+    history_row(row, |block, timestamp| {
+        keep(block, "block_ts", timestamp, block_time(timestamp));
+    })
+}
+
+fn history_row(
+    row: &Map<String, Value>,
+    project_timestamp: impl FnOnce(&mut Map<String, Value>, &Value),
+) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut history = Map::new();
     keep_intent_key(&mut history, value("intentKey"));
@@ -297,7 +348,7 @@ fn intent_history(row: &Map<String, Value>) -> Value {
             keep(&mut public, "block", height, row_id(height));
         }
         if let Some(timestamp) = block.get("block_ts") {
-            keep(&mut public, "block_ts", timestamp, block_time(timestamp));
+            project_timestamp(&mut public, timestamp);
         }
         history.insert("block".into(), Value::Object(public));
     }
