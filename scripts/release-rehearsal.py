@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import unittest
 from collections.abc import Generator
 from contextlib import closing, contextmanager
 from datetime import UTC, datetime, timedelta
@@ -31,6 +32,11 @@ INSTALLER = (
 CLIENTS = ("claude", "codex")
 SYNTHETIC_TOKEN = "release-rehearsal-fixture-only"
 CHAIN = "cataclysm-1"
+INTENT_QUERY = re.compile(
+    r"\buserIntents\s*\(\s*where\s*:\s*\{\s*user\s*:\s*\$user\s*,?"
+    r"\s*intentKey\s*:\s*\$key\s*\}"
+)
+INTENT_KEY = re.compile(r"\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 TRADE = (
     "trade",
     "open",
@@ -130,16 +136,24 @@ class Replay:
                     self.send_error(404)
                     return
                 request = self.read_json()
-                query = request["query"]
+                query = request.get("query")
+                variables = request.get("variables") or {}
+                if not isinstance(query, str) or not isinstance(variables, dict):
+                    self.send_error(400)
+                    return
                 if "recordUserIntent" in query:
                     if self.headers.get("Authorization") != f"Bearer {SYNTHETIC_TOKEN}":
                         self.send_error(403)
                         return
-                    submitted = request["variables"]["input"]
-                    if submitted["intent"]["kind"] != "OPEN_TRADE":
+                    submitted = variables.get("input", {})
+                    key = submitted.get("intentKey")
+                    if (
+                        submitted.get("intent", {}).get("kind") != "OPEN_TRADE"
+                        or not isinstance(key, str)
+                        or not INTENT_KEY.fullmatch(key)
+                    ):
                         self.send_error(400)
                         return
-                    key = submitted["intentKey"]
                     replay.submitted.append(key)
                     if len(replay.submitted) == 1:
                         # Keeper got the request, but the client never gets its ack.
@@ -158,19 +172,21 @@ class Replay:
                         }
                     )
                 elif "userIntents" in query:
-                    row = replay.responses[replay.lifecycle]["data"]["userIntents"][0]
-                    self.reply(
-                        {
-                            "data": {
-                                "userIntents": [
-                                    {
-                                        **row,
-                                        "intentKey": replay.submitted[0],
-                                    }
-                                ]
-                            }
-                        }
-                    )
+                    rows = []
+                    user = variables.get("user")
+                    key = variables.get("key")
+                    if (
+                        INTENT_QUERY.search(query)
+                        and isinstance(user, str)
+                        and user.lower() == replay.addr
+                        and replay.submitted
+                        and key == replay.submitted[0]
+                    ):
+                        row = replay.responses[replay.lifecycle]["data"]["userIntents"][
+                            0
+                        ]
+                        rows.append({**row, "intentKey": key})
+                    self.reply({"data": {"userIntents": rows}})
                 elif "tradeHistory" in query:
                     self.reply({"data": {"perp": {"tradeHistory": []}}})
                 elif "oneClickTrading" in query:
@@ -574,9 +590,21 @@ def rehearse(root: Path, wheel: Path, version: str) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "wheel", type=Path, help="Candidate release wheel newer than 0.1.0"
+        "wheel", type=Path, nargs="?", help="Candidate release wheel newer than 0.1.0"
+    )
+    parser.add_argument(
+        "--self-test", action="store_true", help="Run local rehearsal tests"
     )
     args = parser.parse_args()
+    if args.self_test:
+        if args.wheel:
+            parser.error("--self-test takes no candidate wheel")
+        suite = unittest.defaultTestLoader.discover(
+            str(Path(__file__).resolve().parent), pattern="release_rehearsal_test.py"
+        )
+        return int(not unittest.TextTestRunner().run(suite).wasSuccessful())
+    if args.wheel is None:
+        parser.error("a candidate wheel is required")
     wheel = args.wheel.resolve()
     match = re.fullmatch(
         r"sai_cli-((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-py3-none-any\.whl",
