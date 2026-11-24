@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import socket
 import sqlite3
 import subprocess
@@ -483,3 +484,45 @@ def test_concurrent_close_sends_once(
             assert len(endpoints.wire) == 1
             assert [row[2] for row in rows(home)] == ["accepted"]
             assert not endpoints.errors
+
+
+def test_interrupt_after_dispatch_reports_reserved_key(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("concurrent-close") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            with subprocess.Popen(
+                [*cli, "--json", *CLOSE],
+                cwd=home,
+                env={
+                    **child_env(home, endpoints),
+                    "SAI_LOG": "1",
+                    "SAI_UPDATE_AUTO": "0",
+                },
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                encoding="utf-8",
+            ) as child:
+                try:
+                    assert endpoints.admission.arrived.wait(5)
+                    [(key, _, status, *_)] = rows(home)
+                    assert status == "unknown"
+                    child.send_signal(signal.SIGINT)
+                    stdout, stderr = child.communicate(timeout=5)
+                    assert (child.returncode, stderr) == (5, "")
+                    error = json.loads(stdout)["error"]
+                    assert error["code"] == "OUTCOME_UNKNOWN"
+                    assert error["intentKey"] == key
+                    assert key in error["hint"]
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                    endpoints.admission.release.set()
+            assert rows(home)[0][2] == "unknown"
+            code, result, _ = run(cli, home, endpoints, CLOSE, python=index == 0)
+            assert code == 1
+            assert result["error"]["intentKey"] == key
+            assert len(endpoints.wire) == 1

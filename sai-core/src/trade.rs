@@ -3,6 +3,8 @@
 mod actions;
 mod confirmation;
 
+use std::future::{Future, pending};
+
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -149,17 +151,18 @@ impl<'a> Trading<'a> {
         preview: &TradePreview,
         options: SubmitOptions<'_>,
     ) -> Result<AcceptedTrade, SaiError> {
-        self.submit_with_reference_price(session, preview, options)
+        self.submit_with_reference_price(session, preview, options, pending())
             .await
             .map(|(accepted, _)| accepted)
     }
 
-    /// Submit and return the price used for a market open, when applicable.
+    /// Return the submitted market price and report an interruption during dispatch as unknown.
     pub async fn submit_with_reference_price(
         &self,
         session: &Session,
         preview: &TradePreview,
         options: SubmitOptions<'_>,
+        interrupted: impl Future<Output = ()>,
     ) -> Result<(AcceptedTrade, Option<String>), SaiError> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
@@ -232,10 +235,16 @@ impl<'a> Trading<'a> {
             hint: Some(status_hint(&key)),
             ..SaiError::new(Code::OutcomeUnknown, message)
         };
-        let response = self
-            .keeper
-            .request(SUBMIT, variables, Some(session.token()), keeper::TIMEOUT)
-            .await;
+        let unknown_send = || {
+            unknown(format!(
+                "Outcome unknown for intent {key}; reconcile before another trade"
+            ))
+        };
+        let response = tokio::select! {
+            biased;
+            () = interrupted => return Err(unknown_send()),
+            response = self.keeper.request(SUBMIT, variables, Some(session.token()), keeper::TIMEOUT) => response,
+        };
         let ack = match response {
             Ok(ref data) if valid_ack(data.get("recordUserIntent"), &key, account) => {
                 &data["recordUserIntent"]
@@ -252,11 +261,7 @@ impl<'a> Trading<'a> {
                 error.intent_key = Some(key);
                 return Err(error);
             }
-            _ => {
-                return Err(unknown(format!(
-                    "Outcome unknown for intent {key}; reconcile before another trade"
-                )));
-            }
+            _ => return Err(unknown_send()),
         };
         let (hash, invalid_hash) = keeper::request_hash(&ack["txHash"]);
         self.events.event(

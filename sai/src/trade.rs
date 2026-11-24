@@ -154,6 +154,11 @@ pub fn run(
             allow_concurrent_open,
             ..SubmitOptions::default()
         },
+        async {
+            if tokio::signal::ctrl_c().await.is_err() {
+                std::future::pending().await
+            }
+        },
     ))?;
     let mut output = json!({
         "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
