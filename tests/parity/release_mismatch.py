@@ -2,15 +2,18 @@
 
 import hashlib
 import json
+from collections.abc import Iterable
 from typing import Any
+
+
+def difference_signature(differences: Iterable[str]) -> str:
+    return hashlib.sha256("\n".join(sorted(differences)).encode()).hexdigest()
 
 
 class ReleaseMismatch(AssertionError):
     def __init__(self, differences: list[str]) -> None:
         self.differences = differences
-        self.signature = hashlib.sha256(
-            "\n".join(sorted(differences)).encode()
-        ).hexdigest()
+        self.signature = difference_signature(differences)
         super().__init__(
             f"release mismatch {self.signature}\n" + "\n".join(differences)
         )

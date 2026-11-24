@@ -20,7 +20,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -41,10 +41,12 @@ from compare import (
     stderr_category,
     stdout,
 )
+from manifest_gaps import ManifestGaps
 from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
+from release_mismatch import differing_paths
 from sai_cli.core import log
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
@@ -97,6 +99,7 @@ class Observation:
     stderr: tuple[str, ...]
     files: dict[str, Entry]
     raw: tuple[bytes, bytes] | None = None
+    checks: tuple[str, ...] = ()
 
 
 def invoke(
@@ -303,8 +306,9 @@ def check_deferred_trade_probe(result: dict[str, Any]) -> None:
     )
 
 
-def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
+def state_differences(state: dict[str, Any], files: dict[str, Entry]) -> list[str]:
     # A filename and optional dotted field path are separated with '#'.
+    differences = []
     for selector, expected in state.items():
         name, _, keys = selector.partition("#")
         absent = object()
@@ -313,7 +317,8 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
             if keys == "@mode":
                 if entry.mode == expected:
                     continue
-                raise ValueError(f"Persisted mode differs from expectation at {name}")
+                differences.append(f"Persisted mode differs from expectation at {name}")
+                continue
             actual = entry.data if keys else entry.kind
         for key in keys.split(".") if keys else ():
             if isinstance(actual, list) and key.isdecimal() and int(key) < len(actual):
@@ -326,7 +331,10 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
             else first_difference(actual, expected, selector)
         )
         if mismatch:
-            raise ValueError(f"Persisted state differs from expectation at {selector}")
+            differences.append(
+                f"Persisted state differs from expectation at {selector}"
+            )
+    return differences
 
 
 def observe(
@@ -336,7 +344,15 @@ def observe(
     endpoints: Endpoints,
     *,
     candidate: bool = False,
+    cutover: bool = False,
 ) -> Observation:
+    checks: list[str] = []
+
+    def check_failed(message: str) -> None:
+        if not cutover:
+            raise ValueError(message)
+        checks.append(message)
+
     started_at = time.time()
     seed_home(home, endpoints, case.seed)
     config = home / "sai" / "config.toml"
@@ -412,13 +428,13 @@ def observe(
     else:
         result = invoke(binary, args, home, env)
     ended_at = time.time()
-    if endpoints.errors:
-        raise ValueError(endpoints.errors[0])
+    for error in endpoints.errors:
+        check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
     if case.command == "doctor":
         actual, expected = sorted(actual), sorted(expected)
     if actual != expected:
-        raise ValueError(f"Expected wire {expected}, got {actual}")
+        check_failed(f"Expected wire {expected}, got {actual}")
     if before_config is not None:
         if config.is_symlink() or not config.is_file():
             raise ValueError("The existing config.toml was replaced or removed")
@@ -428,7 +444,7 @@ def observe(
             before_config = config_text(before_config, key)
             after_config = config_text(after_config, key)
         if before_config != after_config:
-            raise ValueError("config.toml changed text outside the edited value")
+            check_failed("config.toml changed text outside the edited value")
     normalize = Normalize(
         home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
     )
@@ -447,7 +463,8 @@ def observe(
     state = dict(case.state or {})
     if candidate and case.accepted_divergence == "codex-repair-rollback":
         state["clients/.codex/config.toml#changed"] = False
-    check_state(state, files)
+    for mismatch in state_differences(state, files):
+        check_failed(mismatch)
     try:
         output = stdout(result.stdout, case.mode, case.command, normalize)
         if contender:
@@ -464,7 +481,11 @@ def observe(
             f"Invalid {case.mode} stdout (exit {result.returncode})"
         ) from None
     if case.mode == "mcp":
-        check_mcp_calls(output, case.mcp_profile)
+        mcp_tools(output)
+        try:
+            check_mcp_calls(output, case.mcp_profile)
+        except ValueError as exc:
+            check_failed(str(exc))
     stderr = stderr_category(result.stderr)
     if contender:
         stderr += tuple(
@@ -476,7 +497,7 @@ def observe(
         "watch",
     }
     raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
-    return Observation(result.returncode, output, stderr, files, raw)
+    return Observation(result.returncode, output, stderr, files, raw, tuple(checks))
 
 
 def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
@@ -551,6 +572,59 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
     return diffs
 
 
+def cutover_differences(reference: Observation, candidate: Observation) -> list[str]:
+    left, right = asdict(reference), asdict(candidate)
+    checks = [
+        f"{side}: {mismatch}"
+        for side, observed in (("reference", left), ("candidate", right))
+        for mismatch in observed.pop("checks")
+    ]
+    # Preserve the exit codes in the signature. All other observations
+    # report paths and shape without emitting potentially private values.
+    for observed in (left, right):
+        observed["exit"] = observed.pop("exit_code")
+    return checks + differing_paths(left, right, "parity")
+
+
+def mcp_evidence(
+    case: Case,
+    reference: Observation | None,
+    candidate: Observation | None,
+    evidence: dict[str, list[str]],
+) -> None:
+    def record(tool: str, fields: list[str]) -> None:
+        if fields:
+            evidence.setdefault(tool, []).extend(fields)
+
+    prefix = case.name
+    left_tools = mcp_tools(reference.output) if reference else {}
+    right_tools = mcp_tools(candidate.output) if candidate else {}
+    for tool in left_tools.keys() | right_tools.keys():
+        record(
+            tool,
+            differing_paths(
+                left_tools.get(tool), right_tools.get(tool), f"{prefix}.tool"
+            ),
+        )
+    left_calls = (
+        {reply["id"]: reply["result"] for reply in reference.output}
+        if reference
+        else {}
+    )
+    right_calls = (
+        {reply["id"]: reply["result"] for reply in candidate.output}
+        if candidate
+        else {}
+    )
+    for id_, call in enumerate(CALLS[case.mcp_profile], 3):
+        record(
+            call.tool,
+            differing_paths(
+                left_calls.get(id_), right_calls.get(id_), f"{prefix}.call[{id_}]"
+            ),
+        )
+
+
 def matches_overview_help_difference(
     reference: Observation, candidate: Observation
 ) -> bool:
@@ -597,6 +671,7 @@ def safe_observe(
     endpoints: Endpoints,
     *,
     candidate: bool = False,
+    cutover: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
     endpoints.interrupt_ready.clear()
@@ -608,7 +683,9 @@ def safe_observe(
     outbound = unroutable_packets()
     try:
         result: tuple[Observation | None, str] = (
-            observe(case, binary, home, endpoints, candidate=candidate),
+            observe(
+                case, binary, home, endpoints, candidate=candidate, cutover=cutover
+            ),
             "",
         )
     except subprocess.TimeoutExpired:
@@ -681,14 +758,19 @@ def project_reference_lcd_origin(output: dict[str, Any]) -> None:
 
 
 def run_case(
-    case: Case, reference: list[str], candidate: list[str], *, cutover: bool = False
+    case: Case,
+    reference: list[str],
+    candidate: list[str],
+    *,
+    cutover: bool = False,
+    tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server) as endpoints,
     ):
         left, left_error = safe_observe(
-            case, reference, Path(temp) / "reference", endpoints
+            case, reference, Path(temp) / "reference", endpoints, cutover=cutover
         )
         candidate_case = (
             replace(case, wire=case.mcp_checkout_wire)
@@ -701,7 +783,10 @@ def run_case(
             Path(temp) / "candidate",
             endpoints,
             candidate=candidate != reference,
+            cutover=cutover,
         )
+    if case.mode == "mcp" and tool_evidence is not None:
+        mcp_evidence(case, left, right, tool_evidence)
     tools = {}
     if case.mode == "mcp" and left is not None:
         expected = mcp_tools(left.output)
@@ -746,7 +831,7 @@ def run_case(
             left.output,
             allow_deferred_trade=case.mcp_deferred_trade_exception,
         )
-    diffs = differences(left, right)
+    diffs = cutover_differences(left, right) if cutover else differences(left, right)
     if (
         diffs
         and case.expected_overview_help
@@ -793,7 +878,9 @@ def main() -> int:
         "--reference", help="Use this Python sai executable for every selected case"
     )
     parser.add_argument(
-        "--cutover", action="store_true", help="Require every CLI and MCP row to pass"
+        "--cutover",
+        action="store_true",
+        help="Require each release row to pass or match its reviewed signature",
     )
     args = parser.parse_args()
     if args.cutover and (
@@ -869,6 +956,8 @@ def main() -> int:
     mismatches = 0
     expected_differences = 0
     tools: dict[str, str] = {}
+    evidence: dict[str, list[str]] = {}
+    gaps = ManifestGaps(HERE / "manifest-xfails.toml") if args.cutover else None
     for case in selected:
         if args.reference is not None:
             oracle = reference
@@ -885,15 +974,30 @@ def main() -> int:
             case = replace(case, wire=case.mcp_checkout_wire)
         executable = oracle if candidate is reference else candidate
         if args.cutover:
-            case = replace(case, accepted_divergence=None, expected_overview_help=None)
+            case = replace(
+                case,
+                accepted_divergence=None,
+                expected_overview_help=None,
+                mcp_deferred_trade_exception=False,
+            )
         diffs, listed, expected = run_case(
-            case, oracle, executable, cutover=args.cutover
+            case,
+            oracle,
+            executable,
+            cutover=args.cutover,
+            tool_evidence=evidence if gaps else None,
         )
         for tool, status in listed.items():
             if status != "LISTED" or tool not in tools:
                 tools[tool] = status
         mismatches += bool(diffs)
         expected_differences += bool(expected and not diffs)
+        if gaps:
+            row(
+                f"`sai {shlex.join(case.args)}` ({case.name})",
+                *gaps.result(f"case:{case.name}", diffs),
+            )
+            continue
         row(
             f"`sai {shlex.join(case.args)}` ({case.name})",
             "DIFF" if diffs else "EXPECTED DIFF" if expected else "PASS",
@@ -908,28 +1012,39 @@ def main() -> int:
         )
     if not args.case:
         for name, reason in sorted(deferred.items()):
-            row(f"`sai {name}`", "DEFERRED", reason)
+            if gaps:
+                row(
+                    f"`sai {name}`",
+                    *gaps.result(f"cli:{name}", [f"deferred: {reason}"]),
+                )
+            else:
+                row(f"`sai {name}`", "DEFERRED", reason)
     if tools:
         print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
-        for name, status in tools.items():
-            row(f"`{name}`", status, "tools/call" if status == "PASS" else "tools/list")
+        for name in sorted(tools.keys() | evidence.keys()):
+            status = tools.get(name, "MISSING")
+            if gaps:
+                diffs = sorted(evidence.get(name, []))
+                if status != "PASS":
+                    diffs.append(
+                        f"tools/list or tools/call: {status}; no passing transcript"
+                    )
+                row(f"`{name}`", *gaps.result(f"mcp:{name}", diffs))
+            else:
+                row(
+                    f"`{name}`",
+                    status,
+                    "tools/call" if status == "PASS" else "tools/list",
+                )
     passed = len(selected) - mismatches - expected_differences
     print(f"\n{passed}/{len(selected)} cases passed.")
     if expected_differences:
         print(f"Expected differences: {expected_differences}.")
-    if args.cutover:
-        unverified_tools = sorted(
-            name for name, status in tools.items() if status != "PASS"
-        )
-        if deferred:
-            print(f"Deferred CLI commands: {len(deferred)}.")
-        if unverified_tools or not tools:
-            print(
-                "MCP tools without a passing call: "
-                + (", ".join(unverified_tools) or "no inventory")
-            )
-        if deferred or not tools or unverified_tools:
+    if gaps:
+        if not tools:
+            print("Cutover could not verify an MCP inventory.")
             return 1
+        return gaps.finish()
     return int(bool(mismatches))
 
 
