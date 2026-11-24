@@ -113,10 +113,10 @@ and ask again.
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
 
-The partial-close digest covers the close percentage, starting collateral
-and leverage, and the closed notional shown in field
-`quote.closedNotionalUsd`. A leverage-only change requires a new confirmation
-even when the collateral reduction is the same.
+The partial-close digest covers the close percentage, starting collateral and
+leverage, and the contract inputs used to quote the requested slice. The quote
+uses the applicable after-hours leverage cap, collateral/USD oracle price, and
+Perp's rounding. A change to those inputs requires a new confirmation.
 [mcp.md](mcp.md#preview-confirm-then-trade) lists what each digest covers.
 
 ## CLI Trade Commands
@@ -161,9 +161,16 @@ approval still describes the trade:
   position at submit. If the person approved "close 50%, about 50 USDC" and
   the position doubles before submit, the live command closes 100 USDC. Ask
   the person to approve the percentage of whatever the position is at submit,
-  and say so in those words. If they approve a fixed amount, use MCP tools
+  and say so in those words. To confirm a quoted slice, use MCP tools
   `preview_partial_close` and `trade_partial_close`. Show the person the
-  collateral reduction and closed notional from the preview.
+  collateral reduction and quoted notional. If
+  `quote.closedNotionalIsEstimate` is true, say the notional is an estimate.
+  If the oracle price is unavailable, show the USDC estimate from
+  `quote.closedNotionalUsdc`. Keeper sends the collateral delta to Perp.
+  Perp applies the position state and oracle price at execution, so the
+  executed notional can differ from the confirmed quote. The after-hours
+  risk guard can also reduce the position before Perp closes the requested
+  slice.
 - **Margin** takes an amount, `--direction add|remove --amount USDC`, and
   computes the target leverage from the position at submit. The dry run's
   target is a quote: adding 25 USDC to 100 USDC of collateral at 5x previews

@@ -111,8 +111,10 @@ the one the person confirmed. The digest covers:
 - `trade_margin` also binds the full margin quote, including the position's
   starting collateral and leverage.
 - `trade_partial_close` also binds the close percentage, starting collateral
-  and leverage, and quoted closed notional in field `quote.closedNotionalUsd`.
-  Show the closed notional to the person before asking for confirmation.
+  and leverage, and the contract inputs used to quote the requested slice,
+  including the applicable after-hours cap and collateral/USD oracle price.
+  Show the quoted notional and say whether `quote.closedNotionalIsEstimate`
+  is true.
 
 ### Market Opens: Quote Check and Fill Bound
 
