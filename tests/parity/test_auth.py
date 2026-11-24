@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 import json
 import os
 import shutil
@@ -15,13 +16,13 @@ import pytest
 from sai_cli.core import keeper, storage
 from sai_cli.tests.test_auth_connect import (
     ADDR,
-    NONCE,
     OTHER,
-    SIGNATURE,
     UD_SECRET,
     Env,
     fake_cast,
     fake_ud,
+    fixture_exchange,
+    fixture_signature,
     keystore,
     typed_data,
 )
@@ -109,6 +110,12 @@ def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> No
         ("unavailable", 1, 0, 0),
         ("substituted", 1, 1, 0),
         ("empty-domain", 1, 1, 0),
+        ("wrong-challenge-address", 1, 1, 0),
+        ("wrong-typed-address", 1, 1, 0),
+        ("wrong-typed-nonce", 1, 1, 0),
+        ("malformed-signature", 1, 1, 0),
+        ("keeper-rejects-signature", 1, 1, 1),
+        ("expired-challenge", 1, 1, 1),
         ("ud-locked", 3, 1, 0),
         ("terminal-fallback", 0, 2, 1),
         ("rotated-keystore", 1, 1, 0),
@@ -136,6 +143,18 @@ def test_auth_login(
         keeper_auth["typed"]["primaryType"] = "Permit"
     if case == "empty-domain":
         keeper_auth["typed"]["domain"]["chainId"] = None
+    if case == "wrong-challenge-address":
+        keeper_auth["challenge_addr"] = OTHER
+    if case == "wrong-typed-address":
+        keeper_auth["typed"]["message"]["account"] = OTHER
+    if case == "wrong-typed-nonce":
+        keeper_auth["typed"]["message"]["challenge"] = "0x" + "34" * 32
+    if case == "expired-challenge":
+        keeper_auth["challenge_expires_at"] = "2000-01-01T00:00:00Z"
+    signer_output = {
+        "malformed-signature": "0x0",
+        "keeper-rejects-signature": "0x" + "1" * 130,
+    }.get(case)
     args = ["--json", "--endpoint", keeper_auth["endpoint"], "auth", "login", "dev"]
     if case == "mismatch":
         args.extend(["--addr", OTHER])
@@ -144,7 +163,7 @@ def test_auth_login(
     results = []
     for env in (python, rust):
         if case != "missing":
-            fake_cast(env, diagnostics=case == "cast")
+            fake_cast(env, diagnostics=case == "cast", signature=signer_output)
             keystore(env, addr=None if case == "cast" else addr)
         if case in {"ud", "ud-locked", "terminal-fallback", "rotated-keystore"}:
             fake_ud(env, locked=case != "ud", rotate=case == "rotated-keystore")
@@ -172,23 +191,28 @@ def test_auth_login(
             if case in {"ud", "ud-locked", "terminal-fallback", "rotated-keystore"}
             else addr
         )
-        assert (
-            keeper_auth["requests"]
-            == [{"query": keeper.CHALLENGE, "variables": {"address": lookup_addr}}]
-            * challenges
-            + [
-                {
-                    "query": keeper.SESSION,
-                    "variables": {"challenge": NONCE, "signature": SIGNATURE},
-                }
-            ]
-            * exchanges
-        )
-        assert_unexposed(
-            env, result[1] + result[2], keeper_auth["token"], SIGNATURE, UD_SECRET
-        )
-        if case in {"substituted", "empty-domain"}:
+        expected = [
+            {"query": keeper.CHALLENGE, "variables": {"address": lookup_addr}}
+        ] * challenges
+        private = [keeper_auth["token"], UD_SECRET]
+        if exchanges:
+            exchange = fixture_exchange(keeper_auth)
+            if signer_output is not None:
+                exchange["signature"] = signer_output
+            private.append(exchange["signature"])
+            expected.append({"query": keeper.SESSION, "variables": exchange})
+        assert keeper_auth["requests"] == expected
+        assert_unexposed(env, result[1] + result[2], *private)
+        if case in {
+            "substituted",
+            "empty-domain",
+            "wrong-challenge-address",
+            "wrong-typed-address",
+            "wrong-typed-nonce",
+        }:
             assert "wallet sign" not in env.log.read_text()
+        if case in {"keeper-rejects-signature", "expired-challenge"}:
+            assert "Keeper rejected the request" in result[1]
         assert bool(session_state(env)["sessions"]) == (expected_code == 0)
     assert results[0] == results[1]
     python_state, rust_state = session_state(python), session_state(rust)
@@ -420,7 +444,7 @@ def test_renew_matches_python_without_switching_active_account(
             {"query": keeper.CHALLENGE, "variables": {"address": ADDR}},
             {
                 "query": keeper.SESSION,
-                "variables": {"challenge": NONCE, "signature": SIGNATURE},
+                "variables": fixture_exchange(keeper_auth),
             },
         ]
         after = session_state(env)
@@ -470,10 +494,11 @@ def test_renew_does_not_restore_a_concurrent_logout(
         assert env.run(*args, "login", "dev").returncode == 0
         env.tool(
             "cast",
-            "import subprocess\n"
-            f"subprocess.run({[*env.command, '--json', 'auth', 'logout', ADDR]!r},"
+            "import hashlib, json, subprocess\n"
+            + inspect.getsource(fixture_signature)
+            + f"subprocess.run({[*env.command, '--json', 'auth', 'logout', ADDR]!r},"
             " check=True, stdout=subprocess.DEVNULL)\n"
-            f"print({SIGNATURE!r})\n",
+            "print(fixture_signature(json.load(open(sys.argv[-1]))))\n",
         )
         result = env.run(*args, "renew")
         assert result.returncode == 1

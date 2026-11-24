@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import inspect
 import json
 import os
 import pty
+import secrets
 import subprocess
 import sys
 import termios
@@ -32,7 +34,7 @@ ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
 # Keeper sends the nonce as bare hex and the typed-data challenge with 0x.
 NONCE = "12" * 32
-SIGNATURE = "0x" + "1" * 130
+CHALLENGE_EXPIRY = "2099-01-01T00:05:00Z"
 
 
 def make_token(addr: str = ADDR, hours: int = 720) -> str:
@@ -515,7 +517,7 @@ def typed_data(**overrides) -> dict:
             "account": ADDR,
             "challenge": "0x" + NONCE,
             "action": "Enable Sai trading",
-            "expiresAt": "2026-11-17T00:05:00Z",
+            "expiresAt": CHALLENGE_EXPIRY,
         },
     }
     for key, value in overrides.items():
@@ -547,11 +549,28 @@ def test_check_session_typed_data_accepts_keeper_challenge() -> None:
     keeper.check_session_typed_data(typed_data(), ADDR.upper(), NONCE.upper())
 
 
+def fixture_signature(data: dict) -> str:
+    """Build a signer-shaped fixture signature bound to the typed challenge."""
+    encoded = json.dumps(data, sort_keys=True, separators=(",", ":")).encode()
+    return "0x" + hashlib.sha512(encoded).hexdigest() + "1b"
+
+
+def fixture_exchange(state: dict) -> dict[str, str]:
+    issued = state["issued"]
+    return {
+        "challenge": issued["nonce"],
+        "signature": fixture_signature(issued["typedData"]),
+    }
+
+
 @pytest.fixture
 def keeper_auth():
     """Serve Keeper's challenge and session mutations on loopback."""
     state: dict[str, Any] = {
         "typed": typed_data(),
+        "challenge_expires_at": CHALLENGE_EXPIRY,
+        "challenge_addr": None,
+        "pending": False,
         "token": make_token(),
         "expires_at": "2026-12-17T00:00:00+00:00",
         "requests": [],
@@ -564,26 +583,47 @@ def keeper_auth():
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state["requests"].append(body)
             state["paths"].append(self.path)
-            if "createUserIntentAuthChallenge" in body["query"]:
-                data = {
-                    "createUserIntentAuthChallenge": {
-                        "nonce": NONCE,
-                        "evmAddress": body["variables"]["address"],
-                        "expiresAt": "2026-11-17T00:05:00Z",
-                        "chainId": 6900,
-                        "typedData": state["typed"],
-                    }
+            query, variables = body["query"], body["variables"]
+            if query == keeper.CHALLENGE:
+                nonce = secrets.token_hex(32)
+                typed = json.loads(json.dumps(state["typed"]))
+                if typed["message"]["challenge"] == "0x" + NONCE:
+                    typed["message"]["challenge"] = "0x" + nonce
+                expiry = state["challenge_expires_at"]
+                typed["message"]["expiresAt"] = expiry
+                issued = {
+                    "nonce": nonce,
+                    "evmAddress": state["challenge_addr"] or variables["address"],
+                    "expiresAt": expiry,
+                    "chainId": 6900,
+                    "typedData": typed,
                 }
+                state.update(issued=issued, pending=True)
+                reply = {"data": {"createUserIntentAuthChallenge": issued}}
+            elif query == keeper.SESSION:
+                state["signatures"].append(variables)
+                live = state["pending"] and (
+                    datetime.fromisoformat(state["issued"]["expiresAt"])
+                    > datetime.now(UTC)
+                )
+                state["pending"] = False
+                if live and variables == fixture_exchange(state):
+                    reply = {
+                        "data": {
+                            "createUserIntentSession": {
+                                "token": state["token"],
+                                "evmAddress": ADDR,
+                                "expiresAt": state["expires_at"],
+                            }
+                        }
+                    }
+                else:
+                    reply = {
+                        "errors": [{"message": "Expired or invalid fixture challenge"}]
+                    }
             else:
-                state["signatures"].append(body["variables"])
-                data = {
-                    "createUserIntentSession": {
-                        "token": state["token"],
-                        "evmAddress": ADDR,
-                        "expiresAt": state["expires_at"],
-                    }
-                }
-            encoded = json.dumps({"data": data}).encode()
+                reply = {"errors": [{"message": "Unsupported fixture operation"}]}
+            encoded = json.dumps(reply).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(encoded)))
@@ -603,11 +643,36 @@ def keeper_auth():
     thread.join()
 
 
-def fake_cast(env: Env, *, diagnostics: bool = False) -> None:
+@pytest.mark.parametrize("fault", ["expired", "signature"])
+def test_keeper_fixture_rejects_expired_or_unbound_signatures(
+    keeper_auth, fault
+) -> None:
+    if fault == "expired":
+        keeper_auth["challenge_expires_at"] = "2000-01-01T00:00:00Z"
+    endpoint = keeper_auth["endpoint"]
+    data = keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    issued = data["createUserIntentAuthChallenge"]
+    signature = (
+        fixture_signature(issued["typedData"])
+        if fault == "expired"
+        else "0x" + "1" * 130
+    )
+    with pytest.raises(keeper.KeeperError, match="Keeper rejected the request"):
+        keeper.request(
+            endpoint,
+            keeper.SESSION,
+            {"signature": signature, "challenge": issued["nonce"]},
+        )
+
+
+def fake_cast(
+    env: Env, *, diagnostics: bool = False, signature: str | None = None
+) -> None:
     env.tool(
         "cast",
-        "import json, os, stat\n"
-        "args = sys.argv[1:]\n"
+        "import hashlib, json, os, stat\n"
+        + inspect.getsource(fixture_signature)
+        + "args = sys.argv[1:]\n"
         "if args[:2] == ['wallet', 'address']:\n"
         f"    if {diagnostics!r}: print('Fixture Cast address', file=sys.stderr)\n"
         f"    print({ADDR!r})\n"
@@ -617,7 +682,7 @@ def fake_cast(env: Env, *, diagnostics: bool = False) -> None:
         "    assert stat.S_IMODE(os.stat(args[-1]).st_mode) == 0o600\n"
         "    data = json.load(open(args[-1]))\n"
         "    assert data['primaryType'] == 'UserTradingSession'\n"
-        f"    print({SIGNATURE!r})\n"
+        f"    print(fixture_signature(data) if {signature is None!r} else {signature!r})\n"
         "else:\n"
         "    sys.exit(2)\n",
     )
@@ -651,7 +716,7 @@ def test_cast_login_derives_addr_and_signs(env: Env, keeper_auth) -> None:
     calls = env.log.read_text().splitlines()
     assert calls[0].endswith("cast wallet address --account dev")
     assert " wallet sign --account dev --data --from-file " in calls[1]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
     status = env.run("--json", "--endpoint", keeper_auth["endpoint"], "auth", "status")
     assert status.returncode == 0, status.stderr
 
@@ -764,8 +829,9 @@ def fake_ud(
     }
     env.tool(
         "ud",
-        "import json\n"
-        "args = sys.argv[1:]\n"
+        "import hashlib, json\n"
+        + inspect.getsource(fixture_signature)
+        + "args = sys.argv[1:]\n"
         f"if args[:3] == ['evm', 'wallet', 'show'] and {down!r}:\n"
         "    sys.exit('Error: gpg: decryption failed: No secret key')\n"
         f"elif args[:3] == ['evm', 'wallet', 'show'] and args[3] == {known!r}:\n"
@@ -784,7 +850,7 @@ def fake_ud(
         "    assert args[7:9] == ['--data', '--from-file']\n"
         "    data = json.load(open(args[-1]))\n"
         "    assert data['primaryType'] == 'UserTradingSession'\n"
-        f"    print({SIGNATURE!r})\n"
+        "    print(fixture_signature(data))\n"
         "elif args[:3] == ['evm', 'wallet', 'show']:\n"
         "    sys.exit(f'Error: wallet {args[3]} is not in pass entry evm/wallets')\n"
         "else:\n"
@@ -813,7 +879,7 @@ def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
     calls = env.log.read_text().splitlines()
     assert calls[0].endswith("ud evm wallet show dev")
     assert " evm wallet run dev -- wallet sign --data --from-file " in calls[1]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
     status = env.run("--json", "--endpoint", keeper_auth["endpoint"], "auth", "status")
     assert status.returncode == 0, status.stderr
 
@@ -994,7 +1060,7 @@ def test_cast_signs_in_a_terminal_when_ud_cannot_unlock_the_keystore(
     calls = env.log.read_text().splitlines()
     assert " evm wallet run dev -- wallet sign " in calls[1]
     assert " wallet sign --account dev --data --from-file " in calls[2]
-    assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
+    assert keeper_auth["signatures"] == [fixture_exchange(keeper_auth)]
 
 
 @pytest.mark.parametrize(
