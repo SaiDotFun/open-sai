@@ -128,6 +128,16 @@ fn signed_out_auth_retains_the_c4_query_hint() {
         error["hint"],
         format!("sai --endpoint {endpoint} auth login NAME")
     );
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", ENDPOINT, "auth", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(
+        error["hint"],
+        r#"sai --endpoint "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME"#
+    );
 }
 
 #[test]

@@ -10,6 +10,9 @@ use crate::{
     storage::{Session, SessionError, Storage, StorageError, StorageEvent},
 };
 
+pub(crate) const ORIGINAL_KEEPER_HINT: &str =
+    r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#;
+
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
     let expires_at = parse_expiry(session.expires_at())
         .ok_or_else(|| SessionError::new(
@@ -208,8 +211,9 @@ impl Storage<'_> {
             Regex::new(r"\Ahttps?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query\z")
                 .expect("valid Keeper URL pattern")
         });
-        let flag = if !origin_only
-            && PLAIN_KEEPER_URL.is_match(endpoint)
+        let flag = if origin_only {
+            self.keeper_hint_flag(endpoint)
+        } else if PLAIN_KEEPER_URL.is_match(endpoint)
             && self
                 .trader
                 .parent()
@@ -217,7 +221,7 @@ impl Storage<'_> {
         {
             shell_quote(endpoint)
         } else {
-            self.keeper_hint_flag(endpoint)
+            ORIGINAL_KEEPER_HINT.into()
         };
         let mut hint = format!("sai --endpoint {flag} auth login NAME");
         if let Some(addr) = addr {
