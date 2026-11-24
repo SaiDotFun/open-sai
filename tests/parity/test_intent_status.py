@@ -1090,6 +1090,48 @@ def test_cross_signed_ca_trust_matches_httpx(
     assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, not reject)
 
 
+def ca_store_overrides(
+    directory: Path, store: str, *certificates: Path
+) -> dict[str, str]:
+    if store == "file":
+        bundle = directory / "bundle.pem"
+        bundle.write_bytes(b"".join(cert.read_bytes() for cert in certificates))
+        return {"SSL_CERT_FILE": str(bundle)}
+
+    hashed = directory / "hashed"
+    hashed.mkdir()
+    for index, certificate in enumerate(certificates):
+        shutil.copyfile(certificate, hashed / f"{index}.pem")
+    openssl_in(hashed, "rehash", ".")
+    return {"SSL_CERT_DIR": str(hashed)}
+
+
+@pytest.mark.parametrize("store", ["file", "dir"])
+def test_local_neutral_intermediate_completes_leaf_only_chain(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    keeper_cross_signed_ca: tuple[ssl.SSLContext, Path],
+    store: str,
+) -> None:
+    context, _ = keeper_certificate
+    _, certs = keeper_cross_signed_ca
+    openssl_in(
+        tmp_path,
+        "x509",
+        "-in",
+        str(certs / "cross-signed.pem"),
+        "-addreject",
+        "clientAuth",
+        "-out",
+        "neutral.pem",
+    )
+    trust = ca_store_overrides(
+        tmp_path, store, certs / "other-ca.pem", tmp_path / "neutral.pem"
+    )
+    assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, True)
+
+
 def assert_keeper_tls_trust(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,

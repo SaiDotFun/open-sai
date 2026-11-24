@@ -18,6 +18,7 @@ pub(super) struct CaStore {
     seen: HashSet<CertificateDer<'static>>,
     rejected: HashSet<CertificateDer<'static>>,
     rejected_anchors: RootCertStore,
+    intermediates: Vec<CertificateDer<'static>>,
 }
 
 impl CaStore {
@@ -27,6 +28,7 @@ impl CaStore {
             seen: HashSet::new(),
             rejected: HashSet::new(),
             rejected_anchors: RootCertStore::empty(),
+            intermediates: Vec::new(),
         }
     }
 
@@ -41,7 +43,7 @@ impl CaStore {
                 self.rejected_anchors.add(cert.der.clone())?;
                 self.rejected.insert(cert.der.clone());
             }
-            ServerTrust::Untrusted => {}
+            ServerTrust::Untrusted => self.intermediates.push(cert.der.clone()),
         }
         self.seen.insert(cert.der);
         Ok(())
@@ -61,7 +63,9 @@ impl CaStore {
         let builder = ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .expect("valid Rustls protocol versions");
-        let builder = if self.rejected.is_empty() || self.roots.is_empty() {
+        let builder = if (self.rejected.is_empty() && self.intermediates.is_empty())
+            || self.roots.is_empty()
+        {
             builder.with_root_certificates(self.roots)
         } else {
             let verifier = WebPkiServerVerifier::builder_with_provider(self.roots.into(), provider)
@@ -69,9 +73,10 @@ impl CaStore {
                 .expect("nonempty root store and no CRLs");
             builder
                 .dangerous()
-                .with_custom_certificate_verifier(Arc::new(RejectCertificates {
+                .with_custom_certificate_verifier(Arc::new(StoreVerifier {
                     verifier,
                     rejected: self.rejected,
+                    intermediates: self.intermediates,
                 }))
         };
         let mut config = builder.with_no_client_auth();
@@ -81,12 +86,13 @@ impl CaStore {
 }
 
 #[derive(Debug)]
-struct RejectCertificates {
+struct StoreVerifier {
     verifier: Arc<WebPkiServerVerifier>,
     rejected: HashSet<CertificateDer<'static>>,
+    intermediates: Vec<CertificateDer<'static>>,
 }
 
-impl ServerCertVerifier for RejectCertificates {
+impl ServerCertVerifier for StoreVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -102,6 +108,7 @@ impl ServerCertVerifier for RejectCertificates {
         let intermediates: Vec<_> = intermediates
             .iter()
             .filter(|cert| !self.rejected.contains(*cert))
+            .chain(&self.intermediates)
             .cloned()
             .collect();
         self.verifier.verify_server_cert(
