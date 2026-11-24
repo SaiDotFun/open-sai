@@ -162,6 +162,11 @@ impl SaiMcp {
             "market_list" => keeper::MARKETS,
             "market_prices" => keeper::PRICES,
             "mcp_info" => return Ok(self.info(&storage).await),
+            "auth_list" | "auth_status" | "auth_use" => {
+                return self
+                    .auth(name, args.get("addr").and_then(Value::as_str), call_id)
+                    .await;
+            }
             _ => {
                 let Some(read) = AccountRead::named(name) else {
                     return Ok(json!({
@@ -198,7 +203,7 @@ impl SaiMcp {
                         let home = self.env.home.clone();
                         let endpoint = endpoint.to_owned();
                         let addr = addr.to_owned();
-                        Self::ledger_work(&self.local_ledger_slots, move || {
+                        Self::blocking_work(&self.local_ledger_slots, move || {
                             let intents = Storage::new(home).list_pending(&endpoint, &addr)?;
                             Ok(json!({"intents": intents}))
                         })
@@ -223,7 +228,31 @@ impl SaiMcp {
         ))
     }
 
-    async fn ledger_work<T: Send + 'static>(
+    async fn auth(&self, name: &str, addr: Option<&str>, call_id: &str) -> Result<Value, SaiError> {
+        let home = self.env.home.clone();
+        let endpoint = self.settings.endpoint().to_owned();
+        let writer = self.writer.clone();
+        let (name, addr, call_id) = (name.to_owned(), addr.map(str::to_owned), call_id.to_owned());
+        Self::blocking_work(&self.local_ledger_slots, move || {
+            let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
+                .with_tool(&name, &call_id);
+            let log_storage = |event: StorageEvent<'_>| crate::local::storage_event(events, event);
+            let storage = Storage::new(&home).with_event_sink(&log_storage);
+            match name.as_str() {
+                "auth_status" => session::auth_status(&storage, &endpoint, addr.as_deref()),
+                "auth_use" => session::auth_use(
+                    &storage,
+                    &endpoint,
+                    addr.as_deref().ok_or_else(SaiError::internal)?,
+                ),
+                "auth_list" => session::auth_list(&storage, &endpoint),
+                _ => Err(SaiError::internal()),
+            }
+        })
+        .await
+    }
+
+    async fn blocking_work<T: Send + 'static>(
         slots: &Arc<Semaphore>,
         work: impl FnOnce() -> Result<T, SaiError> + Send + 'static,
     ) -> Result<T, SaiError> {
@@ -254,7 +283,7 @@ impl SaiMcp {
         let runtime = tokio::runtime::Handle::current();
         let (_cancel_on_drop, cancel) = tokio::sync::oneshot::channel::<()>();
         // Reconciliation combines Keeper requests with synchronous SQLite operations.
-        Self::ledger_work(&self.reconcile_slots, move || {
+        Self::blocking_work(&self.reconcile_slots, move || {
             let events = EventContext::new(writer.as_deref(), Surface::Mcp, Some("mcp serve"))
                 .with_tool("intent_status", &call_id);
             let log_storage = |event: StorageEvent<'_>| crate::local::storage_event(events, event);

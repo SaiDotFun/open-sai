@@ -756,6 +756,28 @@ mode = "mcp"
 mcp_profile = "validation"
 
 [[case]]
+name = "mcp-auth-list"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-list"
+seed = "accounts"
+
+[[case]]
+name = "mcp-auth-status"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-status"
+seed = "doctor-near-expiry"
+
+[[case]]
+name = "mcp-auth-use"
+args = ["mcp","serve"]
+mode = "mcp"
+mcp_profile = "auth-use"
+seed = "accounts"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
+
+[[case]]
 name = "mcp-overview-validation"
 args = ["mcp","serve"]
 mode = "mcp"

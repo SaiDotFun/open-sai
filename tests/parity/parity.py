@@ -217,13 +217,15 @@ def mcp_exchange(
             deadline = time.monotonic() + 20
             try:
                 requests = [
-                    (request, None, False) for request in handshake(case.mcp_protocol)
+                    (request, None, None, False)
+                    for request in handshake(case.mcp_protocol)
                 ]
                 calls = CALLS[case.mcp_profile]
                 if probe_deferred_trade:
                     requests.append(
                         (
                             DEFERRED_TRADE_PROBE.request(3 + len(calls), endpoints),
+                            None,
                             None,
                             True,
                         )
@@ -237,11 +239,20 @@ def mcp_exchange(
                     )
                     for id_, call in enumerate(calls, 3)
                 )
-                for request, session, probe in requests:
+                for request, session, switch_active, probe in requests:
                     if session is not None:
                         write_seed(
                             home, endpoints, [session_fixture(endpoints, session)]
                         )
+                    if switch_active is not None:
+                        result = invoke(
+                            binary,
+                            ["auth", "use", endpoints.expand(switch_active)],
+                            home,
+                            env,
+                        )
+                        if result.returncode != 0:
+                            raise ValueError("External fixture account switch failed")
                     wire = json.dumps({"jsonrpc": "2.0", **request}) + "\n"
                     proc.stdin.write(wire.encode())
                     proc.stdin.flush()

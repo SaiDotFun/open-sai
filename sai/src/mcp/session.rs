@@ -116,6 +116,58 @@ impl StoredSession {
     }
 }
 
+pub(super) fn auth_status(
+    storage: &Storage<'_>,
+    endpoint: &str,
+    addr: Option<&str>,
+) -> Result<Value, SaiError> {
+    let stored = StoredSession::load(storage, endpoint, addr);
+    if let Some(error) = stored.refusal() {
+        return Err(error);
+    }
+    let StoredSession::Present { session, .. } = stored else {
+        return Err(SaiError::internal());
+    };
+    let mut report = json!(session.summary());
+    let expiry = session::session_expiry(&session)?;
+    add_expiry_notice(&mut report, storage, &session, expiry, Utc::now());
+    Ok(report)
+}
+
+pub(super) fn auth_list(storage: &Storage<'_>, endpoint: &str) -> Result<Value, SaiError> {
+    let accounts = storage
+        .load_accounts()
+        .map_err(crate::auth::account_error)?;
+    let now = Utc::now();
+    let rows = accounts
+        .iter()
+        .map(|(session, active)| {
+            let expiry = session::session_expiry(session)?;
+            let expired = expiry <= now;
+            let matches = session.endpoint() == Some(endpoint);
+            let mut row = json!(session.summary());
+            row["active"] = json!(active);
+            row["expired"] = json!(expired);
+            row["endpointMatches"] = json!(matches);
+            row["usable"] = json!(matches && !expired);
+            add_expiry_notice(&mut row, storage, session, expiry, now);
+            Ok(row)
+        })
+        .collect::<Result<Vec<_>, SaiError>>()?;
+    Ok(json!({"accounts": rows}))
+}
+
+pub(super) fn auth_use(
+    storage: &Storage<'_>,
+    endpoint: &str,
+    addr: &str,
+) -> Result<Value, SaiError> {
+    storage
+        .use_session(addr)
+        .map_err(crate::auth::account_error)?;
+    auth_list(storage, endpoint)
+}
+
 fn add_expiry_notice(
     report: &mut Value,
     storage: &Storage<'_>,

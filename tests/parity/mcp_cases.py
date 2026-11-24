@@ -47,6 +47,7 @@ class Call:
     args: dict[str, Any] = field(default_factory=dict)
     expected: str = "ok"
     session: str | None = None
+    switch_active: str | None = None
 
     def request(self, id_: int, endpoints: Endpoints) -> dict[str, Any]:
         return {
@@ -108,6 +109,28 @@ CALLS = {
         *(Call(tool, {"addr": False}, "invalid") for tool in ACCOUNT_READS),
         Call("intent_status", {"addr": "{addr}", "key": {}}, "invalid"),
     ),
+    "auth-list": (
+        Call("auth_list"),
+        Call("auth_list", {"addr": "{addr}"}, "invalid"),
+        Call("auth_list", session="expired"),
+    ),
+    "auth-status": (
+        Call("auth_status"),
+        Call("auth_status", {"addr": False}, "invalid"),
+        Call("auth_status", {"addr": "{other_addr}"}, "SESSION_UNAVAILABLE"),
+        Call("auth_status", expected="SESSION_EXPIRED", session="expired"),
+        Call("auth_status", expected="SESSION_UNAVAILABLE", session="other-endpoint"),
+    ),
+    "auth-use": (
+        Call("auth_use", expected="invalid"),
+        Call("auth_use", {"addr": "{addr}", "address": "{other_addr}"}, "invalid"),
+        Call("auth_use", {"addr": "not-connected"}, "INVALID_REQUEST"),
+        Call("auth_use", {"addr": "{addr}"}),
+        Call("auth_status"),
+        Call("auth_status", switch_active="{other_addr}"),
+        Call("auth_status", {"addr": "{addr}"}),
+        Call("auth_list"),
+    ),
     "overview-validation": (
         Call("account_overview", {"addr": False}, "invalid"),
         Call("account_overview", {"address": "{addr}"}, "invalid"),
@@ -125,6 +148,9 @@ CALLS = {
         Call("logs_intent", {"key": "{intent}", "token": True}, "invalid"),
     ),
     "refusals": (
+        Call("auth_status", {"addr": False}, "invalid"),
+        Call("auth_status", expected="SIGNED_OUT"),
+        Call("auth_list"),
         *(Call(tool, {"addr": None}, "SESSION_UNAVAILABLE") for tool in ACCOUNT_READS),
         *(
             Call(tool, {"addr": False, "unexpected": 1}, "SIGNED_OUT")

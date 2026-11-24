@@ -51,8 +51,9 @@ The transcript checks server initialization, ordered tool metadata,
 strict argument errors, and the JSON string in each successful response's
 `content` and `structuredContent`. It also replaces a fixture session
 between calls to check the trade refusal before argument validation.
-The inventory and validation cases include overview, wait, and logs while
-their cores are pending.
+Auth cases check expiry, strict arguments, and active account changes
+from both MCP and a separate CLI process. The inventory and validation
+cases include overview, wait, and logs while their cores are pending.
 
 ## Add a Case
 
