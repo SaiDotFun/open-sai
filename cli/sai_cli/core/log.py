@@ -751,6 +751,24 @@ class LogDir:
                 raise OSError("invalid log identity key")
             return key
 
+    def publish_private(self, name: str, data: bytes) -> None:
+        """Atomically replace an owner-only file in the opened directory."""
+        staged = f".staged-{uuid.uuid4().hex}"
+        try:
+            fd = self._open_file(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
+            with os.fdopen(fd, "wb") as output:
+                if hasattr(os, "fchmod"):
+                    os.fchmod(output.fileno(), FILE_MODE)
+                output.write(data)
+            source, _ = self._target(staged)
+            target, _ = self._target(name)
+            if self.fd is None:
+                os.replace(source, target)
+            else:
+                os.replace(source, target, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+        finally:
+            self.unlink(staged)
+
     def endpoint_key(self, *, create: bool = False) -> bytes | None:
         try:
             key = self._read_endpoint_key()
@@ -770,21 +788,7 @@ class LogDir:
                 if key is not None:
                     return key
                 key = os.urandom(32)
-                name = f".endpoint-key-{uuid.uuid4().hex}"
-                try:
-                    staged = self._open_file(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL)
-                    with os.fdopen(staged, "wb") as output:
-                        output.write(key)
-                    source, _ = self._target(name)
-                    destination, _ = self._target(ENDPOINT_KEY)
-                    if self.fd is None:
-                        os.replace(source, destination)
-                    else:
-                        os.replace(
-                            source, destination, src_dir_fd=self.fd, dst_dir_fd=self.fd
-                        )
-                finally:
-                    self.unlink(name)
+                self.publish_private(ENDPOINT_KEY, key)
                 return key
             finally:
                 os.close(fd)

@@ -3472,6 +3472,77 @@ def test_intent_cursor_budgets_only_replay_needed_by_the_page(home, case):
     assert sorted(seen) == list(range(total))
 
 
+@pytest.mark.parametrize("separate_windows", [False, True])
+def test_intent_cursor_stays_short_with_many_unread_invocation_links(
+    home, separate_windows
+):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    path = log.file_path("cli", day, root)
+    count = 2000 if separate_windows else 3000
+    common = {"ts": f"{day}T11:00:00.000Z", "runId": "process", "surface": "cli"}
+    with path.open("wb") as stream:
+        for seq in range(count):
+            stream.write(
+                log.encode(
+                    {
+                        **common,
+                        "event": "command.start",
+                        "commandId": f"c-{seq}",
+                        "seq": seq,
+                    }
+                )
+            )
+        if separate_windows:
+            filler = log.encode(
+                {**common, "event": "command.end", "runId": "unrelated"}
+            )
+            stream.write(filler * (log.MAX_SCAN_ROWS + 1000))
+        for seq in range(count):
+            stream.write(
+                log.encode(
+                    {
+                        **common,
+                        "event": "intent.keeper",
+                        "commandId": f"c-{seq}",
+                        "seq": seq + count,
+                        "intentKey": "KEY",
+                        "addr": ADDR,
+                        "endpointId": "h1_" + "a" * 64,
+                    }
+                )
+            )
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    seen: list[int] = []
+    before: str | None = None
+    for index in range(100):
+        flags = ("--before", before) if before else ()
+        if index == 1:
+            # Another CLI process must be able to load the same cursor.
+            result = subprocess.run(
+                [*sai_command(), *args, *flags],
+                env={"SAI_HOME": str(home), "PATH": os.defpath},
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            output = result.stdout
+        else:
+            code, output = run_cli(*args, *flags)
+            assert code == 0
+        report = json.loads(output)
+        seen.extend(row["seq"] for row in report["events"])
+        before = report.get("nextBefore")
+        if before is None:
+            break
+        assert len(before) < 256
+    else:
+        pytest.fail("Intent cursor did not finish the retained log")
+    assert sorted(seen) == list(range(count * 2))
+
+
 def test_log_stats_scan_continues_inside_one_millisecond(home):
     root = home / "logs"
     root.mkdir()

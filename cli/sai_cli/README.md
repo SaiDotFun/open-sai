@@ -659,11 +659,12 @@ Queries scan up to 128 files, 16 MiB, and 20,000 rows. Stats seek by UTC day
 and skip out-of-window rows before charging the row budget. The scan
 alternates surfaces within a day. Intent reports reserve part of the scan
 budget for finding command starts and anchors across midnight. A report contains
-up to 128 event or gap rows and uses a 96 KiB response budget. When
-`truncated` is true, use `nextBefore` with `--before` or the MCP `before`
-argument for earlier timestamps within the scan window. Use the files
-listed by `sai logs path` when the scan limit prevents reaching older rows
-or when events share the cutoff timestamp.
+up to 128 event or gap rows and uses a 96 KiB response budget. Pass the
+`nextBefore` cursor to `--before` or the MCP `before` argument to resume at
+the first unread position, including within a shared timestamp. Intent cursors
+use a private local cache of file positions that works across CLI invocations.
+If the cache is cleared, start a new query. Use the files listed by
+`sai logs path` when the scan limit prevents reaching older rows.
 
 Use `sai --json logs ...` for machine-readable output. The `intent` and
 `run` reports return arrays `events` and `gaps`. The intent report also

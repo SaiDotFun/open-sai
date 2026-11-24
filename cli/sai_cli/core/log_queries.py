@@ -5,17 +5,19 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import re
+import tempfile
 import zlib
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from contextlib import closing
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from . import keeper, log, storage
+from . import keeper, log, paths, storage
 from .errors import Code, ExitCode, SaiError
 from .log_events import COMMON_OPTIONAL, COMMON_REQUIRED, EVENTS
 
@@ -278,29 +280,102 @@ class _Cursor:
 
 
 INTENT_CURSOR_SUFFIX = "~i~"
+CURSOR_STATE_SUFFIX = "~s~"
+CURSOR_STATE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9a-f]{64})")
 MAX_INTENT_CURSOR = 48 * 1024
 MAX_INTENT_STATE = 2 * 1024 * 1024
 LinkPositions = dict[str, set[log.RowPosition]]
 LINK_TAG = re.compile(r"[0-9a-f]{16}")
 
 
+def _cursor_directories(
+    root: Path | None, *, create: bool = False
+) -> Iterator[log.LogDir]:
+    root = root or log.directory()
+    if opened := log.LogDir.open(root / ".intent-cursors", create=create):
+        yield opened
+
+    # A log directory may be readable and stored on a read-only mount.
+    location = (str(Path.home()) + "\0" + str(root.absolute())).encode(
+        errors="surrogatepass"
+    )
+    fallback = (
+        Path(tempfile.gettempdir())
+        / f"sai-intent-cursors-{hashlib.sha256(location).hexdigest()}"
+    )
+    try:
+        if create:
+            paths.private_directory(fallback)
+    except OSError:
+        return
+    if opened := log.LogDir.open(fallback):
+        yield opened
+
+
+def _read_cursor_state(root: Path | None, name: str) -> bytes:
+    match = CURSOR_STATE_NAME.fullmatch(name)
+    if match is None:
+        raise ValueError
+    for opened in _cursor_directories(root):
+        with opened:
+            try:
+                with os.fdopen(opened.read_fd(name), "rb") as stream:
+                    data = stream.read()
+            except OSError:
+                continue
+            if hashlib.sha256(data).hexdigest() == match[2]:
+                return zlib.decompress(data)
+    raise SaiError(
+        "Log cursor state is unavailable. Start a new intent log query.",
+        Code.INVALID_REQUEST,
+        exit_code=ExitCode.USAGE,
+    )
+
+
+def _write_cursor_state(root: Path | None, raw: bytes, ends: log.FileEnds) -> str:
+    data = zlib.compress(raw)
+    name = f"{max(ends).isoformat()}_{hashlib.sha256(data).hexdigest()}"
+    for opened in _cursor_directories(root, create=True):
+        with opened:
+            try:
+                opened.publish_private(name, data)
+            except OSError:
+                continue
+            # A snapshot cannot refer to a file newer than the day in its name.
+            if retained := log.snapshot_ends(root):
+                oldest = min(retained).isoformat()
+                for previous in opened.names():
+                    if previous[:10] < oldest and CURSOR_STATE_NAME.fullmatch(previous):
+                        opened.unlink(previous)
+            return name
+    raise SaiError("Could not save the intent log continuation.", Code.INTERNAL_ERROR)
+
+
 def _intent_cursor(
     value: str | None,
+    root: Path | None,
 ) -> tuple[_Cursor, list[log.RowPosition], log.FileEnds | None, LinkPositions]:
-    base, separator, payload = (value or "").partition(INTENT_CURSOR_SUFFIX)
+    base, separator, payload = (value or "").partition(CURSOR_STATE_SUFFIX)
+    if not separator:
+        base, separator, payload = (value or "").partition(INTENT_CURSOR_SUFFIX)
     if not separator:
         return _Cursor.parse(value), [], None, {}
     cursor = _Cursor.parse(base)
     try:
-        if cursor.position is None or len(payload) > MAX_INTENT_CURSOR:
+        if cursor.position is None:
             raise ValueError
-        inflater = zlib.decompressobj()
-        raw = inflater.decompress(
-            base64.b64decode(payload, altchars=b"-_", validate=True),
-            MAX_INTENT_STATE + 1,
-        )
-        if not inflater.eof or inflater.unused_data or len(raw) > MAX_INTENT_STATE:
-            raise ValueError
+        if separator == CURSOR_STATE_SUFFIX:
+            raw = _read_cursor_state(root, payload)
+        else:
+            if len(payload) > MAX_INTENT_CURSOR:
+                raise ValueError
+            inflater = zlib.decompressobj()
+            raw = inflater.decompress(
+                base64.b64decode(payload, altchars=b"-_", validate=True),
+                MAX_INTENT_STATE + 1,
+            )
+            if not inflater.eof or inflater.unused_data or len(raw) > MAX_INTENT_STATE:
+                raise ValueError
         items, days, tagged = json.loads(raw)
         if not all(isinstance(value, list) for value in (items, days, tagged)):
             raise TypeError
@@ -358,6 +433,7 @@ def _save_intent_cursor(
     positions: list[log.RowPosition],
     ends: log.FileEnds,
     links: LinkPositions,
+    root: Path | None,
 ) -> None:
     if base := report.get("nextBefore"):
 
@@ -376,11 +452,9 @@ def _save_intent_cursor(
             ),
             separators=(",", ":"),
         ).encode()
-        payload = base64.urlsafe_b64encode(zlib.compress(raw)).decode()
-        if len(raw) > MAX_INTENT_STATE or len(payload) > MAX_INTENT_CURSOR:
-            del report["nextBefore"]
-        else:
-            report["nextBefore"] = base + INTENT_CURSOR_SUFFIX + payload
+        report["nextBefore"] = (
+            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, raw, ends)
+        )
 
 
 def _anchor_group(line: LogLine) -> tuple[Any, ...]:
@@ -460,10 +534,10 @@ def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
 
 
 class _PageReport:
-    def __init__(self, report: LogLine, *, cursor_bytes: int = 0) -> None:
+    def __init__(self, report: LogLine) -> None:
         self.report = report
         self.tokens = log.known_tokens(check=True)
-        self.bytes_left = MAX_REPORT_BYTES - 8192 - cursor_bytes
+        self.bytes_left = MAX_REPORT_BYTES - 8192
         self.rows_left = MAX_REPORT_ROWS
         self.fields: set[str] = set()
 
@@ -520,7 +594,7 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    cursor, positions, ends, links = _intent_cursor(before)
+    cursor, positions, ends, links = _intent_cursor(before, root)
     log.flush(1.0)
     if ends is None:
         ends = log.snapshot_ends(root)
@@ -669,7 +743,7 @@ def intent(
                 conflicting.add(match)
         return True
 
-    page = _PageReport(report, cursor_bytes=MAX_INTENT_CURSOR)
+    page = _PageReport(report)
     last = None
     stop = None
     unattributed = []
@@ -771,7 +845,7 @@ def intent(
             ):
                 links.setdefault(_link_tag("run", run_id), set()).add(position)
         _save_intent_cursor(
-            report, [position for position, _ in summaries.values()], ends, links
+            report, [position for position, _ in summaries.values()], ends, links, root
         )
     if report.get("truncated") and "nextBefore" not in report:
         report["more"] = "Inspect the retained files from sai logs path."
