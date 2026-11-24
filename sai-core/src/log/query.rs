@@ -544,7 +544,7 @@ pub fn run(home: &Path, identifier: &str, before: Option<&str>) -> Result<Value,
         let next = scan::prefix(&root, following, |row| {
             text(row, "callId") == Some(identifier)
         });
-        if let Some(key) = next.rows.iter().rev().find_map(call_parent) {
+        if let Some(key) = next.rows.iter().rev().find_map(|(_, row)| call_parent(row)) {
             parent = key;
         }
     }
@@ -555,7 +555,7 @@ pub fn run(home: &Path, identifier: &str, before: Option<&str>) -> Result<Value,
         &root,
         Budget::RUN,
         window,
-        |row| {
+        |_, row| {
             if find_parent && let Some(key) = call_parent(row) {
                 parent = key;
             }
@@ -675,7 +675,7 @@ pub fn stats(home: &Path, since: Option<&str>, before: Option<&str>) -> Result<V
         &home.join("logs"),
         Budget::PAGE,
         window,
-        |_| {},
+        |_, _| {},
         |position, row| {
             let Some(ts) = timestamp(&row) else {
                 return true;

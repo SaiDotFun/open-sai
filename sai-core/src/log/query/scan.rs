@@ -1,16 +1,16 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     fs::File,
-    io::{self, Read, Seek, SeekFrom},
+    io::{self, BufRead, BufReader, Read, Seek, SeekFrom},
     path::Path,
 };
 
 use chrono::NaiveDate;
 use serde_json::Value;
 
-use super::{Row, decode_row, order};
+use super::{Row, day, decode_row, order};
 use crate::log::{
-    MAX_LINE,
+    MAX_LINE, Surface,
     files::{LogDir, parse_name},
 };
 
@@ -31,6 +31,61 @@ pub(super) fn files(directory: &LogDir) -> BTreeMap<NaiveDate, [Option<String>; 
 pub(super) struct Position {
     pub day: NaiveDate,
     pub offsets: Option<[u64; SURFACES]>,
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) struct Line {
+    day: NaiveDate,
+    surface: usize,
+    offset: u64,
+}
+
+impl Line {
+    pub fn parse(value: &str) -> Option<Self> {
+        let (date, position) = value.split_once(':')?;
+        let (surface, offset) = position.split_once(':')?;
+        let surface = surface.parse().ok()?;
+        (surface < SURFACES).then_some(Self {
+            day: day(date)?,
+            surface,
+            offset: offset.parse().ok()?,
+        })
+    }
+}
+
+impl std::fmt::Display for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}:{}", self.day, self.surface, self.offset)
+    }
+}
+
+pub(super) fn read_lines(root: &Path, lines: &[Line]) -> Vec<(Line, Row)> {
+    let Ok(directory) = LogDir::read_only(root) else {
+        return Vec::new();
+    };
+    lines
+        .iter()
+        .filter_map(|&line| {
+            let surface = Surface::ALL[line.surface].as_str();
+            let mut file = directory
+                .read_file(&format!("{surface}-{}.jsonl", line.day))
+                .ok()?;
+            if line.offset != 0 {
+                file.seek(SeekFrom::Start(line.offset - 1)).ok()?;
+                let mut preceding = [0];
+                file.read_exact(&mut preceding).ok()?;
+                if preceding != *b"\n" {
+                    return None;
+                }
+            }
+            let mut raw = Vec::new();
+            BufReader::new(file)
+                .take((MAX_LINE + 1) as u64)
+                .read_until(b'\n', &mut raw)
+                .ok()?;
+            decode_row(raw.strip_suffix(b"\n")?).map(|row| (line, row))
+        })
+        .collect()
 }
 
 pub(super) struct Budget {
@@ -175,7 +230,7 @@ impl Reader {
         &mut self,
         budget: &mut Budget,
         window: Window<'_>,
-        observe: &mut impl FnMut(&Row),
+        observe: &mut impl FnMut(u64, &Row),
     ) -> Result<Option<&(u64, u64, Row)>, ReadError> {
         while self.ready.is_empty() && !self.exhausted {
             let Some(block) = self.reverse.block(budget)? else {
@@ -184,7 +239,7 @@ impl Reader {
             };
             self.ready.extend(block.into_iter().filter_map(|raw| {
                 let row = decode_row(&raw.bytes)?;
-                observe(&row);
+                observe(raw.start, &row);
                 window.includes(&row).then_some((
                     raw.start,
                     raw.start + raw.bytes.len() as u64 + 1,
@@ -224,7 +279,7 @@ pub(super) fn page(
     root: &Path,
     mut budget: Budget,
     window: Window<'_>,
-    mut observe: impl FnMut(&Row),
+    mut observe: impl FnMut(Line, &Row),
     mut consume: impl FnMut(Position, Row) -> bool,
 ) -> Scan {
     let mut scan = Scan::default();
@@ -289,7 +344,17 @@ pub(super) fn page(
                 let Some(reader) = &mut readers[slot] else {
                     continue;
                 };
-                match reader.head(&mut budget, window, &mut observe) {
+                let mut observe_line = |offset, row: &Row| {
+                    observe(
+                        Line {
+                            day,
+                            surface: slot,
+                            offset,
+                        },
+                        row,
+                    );
+                };
+                match reader.head(&mut budget, window, &mut observe_line) {
                     Ok(_) => {}
                     Err(ReadError::Budget) => {
                         return Scan {
@@ -337,7 +402,7 @@ pub(super) fn page(
 }
 
 pub(super) struct Context {
-    pub rows: Vec<Row>,
+    pub rows: Vec<(Line, Row)>,
     pub truncated: bool,
 }
 
@@ -358,7 +423,8 @@ pub(super) fn prefix(root: &Path, day: NaiveDate, accept: impl Fn(&Row) -> bool)
         return result;
     }
     let max = (budget.bytes / count) as u64;
-    for name in names.into_iter().rev().flatten() {
+    for (surface, name) in names.into_iter().enumerate().rev() {
+        let Some(name) = name else { continue };
         let Ok((mut file, size)) = directory
             .read_file(&name)
             .and_then(|file| file.metadata().map(|metadata| (file, metadata.len())))
@@ -372,19 +438,31 @@ pub(super) fn prefix(root: &Path, day: NaiveDate, accept: impl Fn(&Row) -> bool)
             result.truncated = true;
             continue;
         };
-        for row in data
-            .split_inclusive(|&byte| byte == b'\n')
-            .filter_map(|row| row.strip_suffix(b"\n"))
-            .filter(|row| row.len() <= MAX_LINE)
-            .filter_map(decode_row)
-            .filter(&accept)
-        {
+        let mut next_offset = 0;
+        for raw in data.split_inclusive(|&byte| byte == b'\n') {
+            let offset = next_offset;
+            next_offset += raw.len() as u64;
+            let Some(row) = raw
+                .strip_suffix(b"\n")
+                .filter(|row| row.len() <= MAX_LINE)
+                .and_then(decode_row)
+                .filter(&accept)
+            else {
+                continue;
+            };
             if budget.rows == 0 {
                 result.truncated = true;
                 return result;
             }
             budget.rows -= 1;
-            result.rows.push(row);
+            result.rows.push((
+                Line {
+                    day,
+                    surface,
+                    offset,
+                },
+                row,
+            ));
         }
     }
     result

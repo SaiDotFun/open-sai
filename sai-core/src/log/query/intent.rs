@@ -1,10 +1,14 @@
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
+    path::Path,
+};
 
 use chrono::Days;
 use serde_json::{Value, json};
 
 use super::{
-    Budget, Cursor, Position, Report, Row, Scan, hex, order, scan, text, timestamp, token,
+    Budget, Cursor, Position, Report, Row, Scan, hex, order, scan, text, timestamp, token, usage,
 };
 use crate::{
     errors::{Code, SaiError},
@@ -56,24 +60,96 @@ fn has_intent(row: &Row, key: &str) -> bool {
     text(row, "intentKey") == Some(key) && text(row, "tool") != Some("logs_intent")
 }
 
+const ATTRIBUTION_SEPARATOR: &str = "~intent~";
+// Each extra anchor can require reopening one file and reading one log line.
+const MAX_EXTRA_ANCHORS: usize = 1024;
+const MAX_ANCHOR_CURSOR_BYTES: usize = MAX_EXTRA_ANCHORS * 34;
+
+fn parse_cursor(bound: Option<&str>) -> Result<(Cursor<'_>, Option<Vec<scan::Line>>), SaiError> {
+    let Some((bound, positions)) = bound.and_then(|bound| bound.split_once(ATTRIBUTION_SEPARATOR))
+    else {
+        return Ok((Cursor::parse(bound)?, None));
+    };
+    let bad_cursor = || usage("Pass a log cursor or a UTC timestamp to --before.");
+    let cursor = Cursor::parse(Some(bound))?;
+    if cursor.position.is_none() || positions.len() > MAX_ANCHOR_CURSOR_BYTES {
+        return Err(bad_cursor());
+    }
+    let positions = if positions.is_empty() {
+        Vec::new()
+    } else {
+        positions
+            .split(',')
+            .take(MAX_EXTRA_ANCHORS + 1)
+            .map(scan::Line::parse)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(bad_cursor)?
+    };
+    if positions.len() > MAX_EXTRA_ANCHORS {
+        return Err(bad_cursor());
+    }
+    Ok((cursor, Some(positions)))
+}
+
+#[derive(Eq, Ord, PartialEq, PartialOrd)]
+enum Attribution<'a> {
+    Warning,
+    Scoped {
+        scope: (String, &'a str),
+        run: Option<&'a str>,
+        invocation: Option<(&'a str, &'a str, &'a str)>,
+        evidence: bool,
+        hash_event: Option<&'a str>,
+    },
+}
+
+fn attribution(row: &Row) -> Option<Attribution<'_>> {
+    let Some(scope) = scope(row) else {
+        return (row
+            .get("endpoint")
+            .is_some_and(|endpoint| !endpoint.is_null())
+            || EVIDENCE.contains(&event(row)))
+        .then_some(Attribution::Warning);
+    };
+    let event = event(row);
+    Some(Attribution::Scoped {
+        scope,
+        run: text(row, "runId"),
+        invocation: invocation(row),
+        evidence: EVIDENCE.contains(&event) && row.get("found") != Some(&Value::Bool(false)),
+        hash_event: (matches!(
+            event,
+            "intent.submitted" | "intent.wait.end" | "intent.keeper"
+        ) && row.get("txHash").and_then(keeper::request_hash).is_some())
+        .then_some(event),
+    })
+}
+
 struct IntentContext {
     rows: Vec<(Position, Row)>,
     anchors: Vec<Row>,
+    extra_anchors: Vec<scan::Line>,
+    attribution_start: Option<Position>,
     scan: Scan,
 }
 
-fn read_context(root: &Path, key: &str, cursor: &Cursor<'_>) -> IntentContext {
+fn read_context(
+    root: &Path,
+    key: &str,
+    cursor: &Cursor<'_>,
+    remembered: Option<&[scan::Line]>,
+) -> IntentContext {
     let window = cursor.window();
     let anchor = |row: &Row| has_intent(row, key) && timestamp(row).is_some();
     let mut rows = Vec::new();
-    let mut anchors = Vec::new();
+    let mut anchors = BTreeMap::new();
     let mut scan = scan::page(
         root,
         Budget::RUN,
         window,
-        |row| {
+        |line, row| {
             if anchor(row) {
-                anchors.push(row.clone());
+                anchors.insert(line, row.clone());
             }
         },
         |position, row| {
@@ -84,41 +160,75 @@ fn read_context(root: &Path, key: &str, cursor: &Cursor<'_>) -> IntentContext {
         },
     );
 
-    // Replay the adjacent page's bounded scan to recover its attribution
-    // evidence, including anchors just past a UTC day or scan budget boundary.
-    if cursor.position.is_some() {
-        scan::page(
+    // Reuse the initial bounded scan for dense attribution, and carry physical
+    // references to any extra anchors discovered outside that scan.
+    let mut original = BTreeMap::new();
+    let attribution_start = if cursor.position.is_some() {
+        let replay = scan::page(
             root,
             Budget::RUN,
             scan::Window {
                 start: cursor.replay,
                 ..window
             },
-            |row| {
+            |line, row| {
                 if anchor(row) {
-                    anchors.push(row.clone());
+                    original.insert(line, row.clone());
                 }
             },
             |_, _| true,
         );
+        cursor.replay.or(replay.start)
+    } else {
+        std::mem::swap(&mut original, &mut anchors);
+        scan.start
+    };
+    if let Some(remembered) = remembered {
+        anchors.extend(
+            scan::read_lines(root, remembered)
+                .into_iter()
+                .filter(|(_, row)| anchor(row)),
+        );
+    } else {
+        // Bare timestamps (and old cursors) may need evidence from the next UTC
+        // day. For new cursors, remember those records at their exact offsets.
+        let following_days = [
+            window.last_day,
+            cursor.position.map(|position| position.day),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|day| day.checked_add_days(Days::new(1)))
+        .collect::<BTreeSet<_>>();
+        for day in following_days {
+            let next = scan::prefix(root, day, anchor);
+            anchors.extend(next.rows);
+            scan.truncated |= next.truncated;
+        }
     }
-    let following_days = [
-        window.last_day,
-        cursor.position.map(|position| position.day),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|day| day.checked_add_days(Days::new(1)))
-    .collect::<BTreeSet<_>>();
-    for day in following_days {
-        let next = scan::prefix(root, day, anchor);
-        anchors.extend(next.rows);
-        scan.truncated |= next.truncated;
+    let mut distinct = BTreeMap::new();
+    for (&line, row) in &anchors {
+        if !original.contains_key(&line)
+            && let Some(attribution) = attribution(row)
+        {
+            let candidate = (order(row), line);
+            let newest = distinct
+                .entry(attribution)
+                .or_insert_with(|| candidate.clone());
+            if candidate > *newest {
+                *newest = candidate;
+            }
+        }
     }
+    let extra_anchors = distinct.into_values().map(|(_, line)| line).collect();
+    anchors.extend(original);
+    let mut anchors: Vec<_> = anchors.into_values().collect();
     anchors.sort_by_cached_key(order);
     IntentContext {
         rows,
         anchors,
+        extra_anchors,
+        attribution_start,
         scan,
     }
 }
@@ -173,12 +283,14 @@ pub async fn intent(
     }
     let addr = addr.map(str::to_ascii_lowercase);
     let root = home.join("logs");
-    let cursor = Cursor::parse(bound)?;
+    let (cursor, remembered) = parse_cursor(bound)?;
     let IntentContext {
         rows,
         anchors,
+        extra_anchors,
+        attribution_start,
         mut scan,
-    } = read_context(&root, key, &cursor);
+    } = read_context(&root, key, &cursor, remembered.as_deref());
     let endpoint_id =
         endpoint.map(|endpoint| log::endpoint_id(&root, endpoint).unwrap_or_default());
     let mut candidates = BTreeSet::new();
@@ -343,9 +455,21 @@ pub async fn intent(
             .take(8)
             .any(|row| !report.add("unattributedGaps", row));
     }
-    let start = scan.start;
-    let mut value = report.finish(scan, &cursor, last, stop, "", start);
-    if value["truncated"] == true && value.get("nextBefore").is_none() {
+    let mut value = report.finish(scan, &cursor, last, stop, "", attribution_start);
+    if let Some(Value::String(next)) = value.get_mut("nextBefore") {
+        if extra_anchors.len() > MAX_EXTRA_ANCHORS {
+            return Err(usage(
+                "Too many intent attribution records to continue. Inspect files from sai logs path.",
+            ));
+        }
+        next.push_str(ATTRIBUTION_SEPARATOR);
+        for (index, line) in extra_anchors.iter().enumerate() {
+            if index != 0 {
+                next.push(',');
+            }
+            let _ = write!(next, "{line}");
+        }
+    } else if value["truncated"] == true {
         value["more"] = json!("Inspect the retained files from sai logs path.");
     }
     Ok(value)

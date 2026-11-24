@@ -553,6 +553,104 @@ def test_logs_intent_cursor_keeps_cross_day_attribution(
         assert sorted(seen) == [1, 3]
 
 
+@pytest.mark.parametrize("count", [127, 128, 129, 255, 256, 257, 300, 385])
+@pytest.mark.parametrize("anchors", [1, 2])
+def test_logs_intent_cursor_keeps_sparse_attribution(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    count: int,
+    anchors: int,
+) -> None:
+    # The pinned Python cursor uses an exclusive timestamp, so only Rust can
+    # traverse multiple pages when every event shares a millisecond.
+    _, rust = local_pair
+    streams: dict[str, list[dict[str, object]]] = {"cli": [], "mcp": []}
+    for seq in range(1, count + 1):
+        surface = "mcp" if anchors == 2 and seq % 2 else "cli"
+        invocation = {"commandId": COMMAND} if surface == "cli" else {"callId": CALL}
+        anchor = seq > count - anchors
+        evidence = (
+            {"intentKey": INTENT_KEY, "addr": ADDR, "endpointId": ENDPOINT_ID}
+            if anchor
+            else {}
+        )
+        streams[surface].append(
+            event(
+                "intent.status" if anchor else "keeper.request",
+                seq,
+                surface=surface,
+                **invocation,
+                **evidence,
+            )
+        )
+    seed_logs(tmp_path, streams)
+    args = ("logs", "intent", INTENT_KEY, "--offline")
+    report = cli_json(rust, tmp_path, *args)
+    for end in range(count, 0, -128):
+        assert [row["seq"] for row in report["events"]] == list(
+            range(max(1, end - 127), end + 1)
+        )
+        if end > 128:
+            report = cli_json(rust, tmp_path, *args, "--before", report["nextBefore"])
+        else:
+            assert "nextBefore" not in report
+
+
+@pytest.mark.parametrize("anchor_in_first_window", [False, True])
+def test_logs_intent_cursor_keeps_anchors_discovered_after_scan_limit(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    anchor_in_first_window: bool,
+) -> None:
+    _, rust = local_pair
+    other_command = "6f" * 16
+    scope = {"intentKey": INTENT_KEY, "addr": ADDR, "endpointId": ENDPOINT_ID}
+    initial = [
+        event(
+            "keeper.request",
+            seq,
+            commandId=other_command if anchor_in_first_window and seq % 2 else COMMAND,
+        )
+        for seq in range(1, 300)
+    ]
+    first_hash = "ab" * 32
+    latest_hash = "cd" * 32 if anchor_in_first_window else first_hash
+    initial.append(
+        event("intent.submitted", 300, commandId=COMMAND, txHash=first_hash, **scope)
+    )
+    if anchor_in_first_window:
+        initial.append(
+            event(
+                "intent.submitted", 300, commandId=COMMAND, txHash=latest_hash, **scope
+            )
+        )
+    logs = seed_logs(tmp_path, {"cli": initial})
+    filler = event("command.start", 301, run=OTHER_RUN)
+    with (logs / f"cli-{STAMP[:10]}.jsonl").open("a") as stream:
+        stream.write((json.dumps(filler) + "\n") * 20_001)
+        if anchor_in_first_window:
+            stream.write(
+                json.dumps(
+                    event("intent.status", 302, commandId=other_command, **scope)
+                )
+                + "\n"
+            )
+    args = ("logs", "intent", INTENT_KEY, "--offline")
+    report = cli_json(rust, tmp_path, *args)
+    seen = [row["seq"] for row in report["events"]]
+    assert seen == ([302] if anchor_in_first_window else [])
+    for size in (128, 128, 44 + anchor_in_first_window):
+        report = cli_json(rust, tmp_path, *args, "--before", report["nextBefore"])
+        assert len(report["events"]) == size
+        assert report["txHash"] == latest_hash
+        seen.extend(row["seq"] for row in report["events"])
+    assert "nextBefore" not in report
+    expected = list(range(1, 301))
+    if anchor_in_first_window:
+        expected.extend([300, 302])
+    assert sorted(seen) == expected
+
+
 def test_logs_intent_reads_keeper_once(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:
