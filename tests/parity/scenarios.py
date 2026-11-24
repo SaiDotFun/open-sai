@@ -345,7 +345,7 @@ def loopback(
     if scenario == "quote-wrong-position-index":
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
-    if scenario == "mcp-reads":
+    if scenario in {"mcp-reads", "mcp-wait-final"}:
         status = {**status, "txHash": TRADE_REQUEST_HASH}
     elif scenario == "mcp-pending-malformed-hash":
         status = {
