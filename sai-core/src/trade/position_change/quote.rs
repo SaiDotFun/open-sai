@@ -142,6 +142,7 @@ pub(super) fn margin(
     inputs["collateralAfter"] = json!(after.to_string());
     inputs["actualDeltaUsdc"] = json!(actual.to_string());
     inputs["marginChangeIsEstimate"] = json!(effective.units < stored_units);
+    preview.margin_change = true;
     preview.quote = Some(inputs);
     preview.warning = Some(MARGIN_WARNING);
     Ok(preview)

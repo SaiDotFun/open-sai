@@ -64,6 +64,7 @@ pub struct TradePreview {
     pub warning: Option<&'static str>,
     position_route: Option<position::PositionRoute>,
     estimates: Option<Value>,
+    margin_change: bool,
 }
 
 impl TradePreview {
@@ -75,6 +76,7 @@ impl TradePreview {
             warning: None,
             position_route: None,
             estimates: None,
+            margin_change: false,
         }
     }
 
