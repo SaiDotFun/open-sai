@@ -3436,6 +3436,40 @@ def test_intent_cursor_cache_evicts_old_states_and_refuses_oversize_reads(home):
         assert code == 2 and "Start a new intent log query" in output
 
 
+def test_logs_intent_resumes_empty_file_cap_page_through_cli_and_mcp(home, monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "0")
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    anchor = {
+        "ts": f"{day}T00:00:00.000Z",
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    log.file_path("cli", day, root).write_bytes(log.encode(anchor))
+    for offset in range(1, log.MAX_SCAN_FILES + 2):
+        log.file_path("cli", day + timedelta(days=offset), root).write_bytes(b"{}\n")
+
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0
+    empty = json.loads(output)
+    assert empty["truncated"] and empty["events"] == []
+    before = empty["nextBefore"]
+    code, output = run_cli(*args, "--before", before)
+    assert code == 0
+    resumed = json.loads(output)
+    assert resumed["events"] == [anchor]
+    assert "nextBefore" not in resumed
+
+    mcp = server.create_server(settings.load())
+    parameters = {"key": "KEY", "offline": True}
+    assert call(mcp, "logs_intent", parameters) == empty
+    assert call(mcp, "logs_intent", {**parameters, "before": before}) == resumed
+
+
 def test_intent_replay_and_page_share_one_read_budget(home, monkeypatch):
     root = home / "logs"
     root.mkdir()
