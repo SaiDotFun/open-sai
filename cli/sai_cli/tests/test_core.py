@@ -473,7 +473,11 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
         keeper,
         "request",
         lambda *args, **kwargs: {
-            "oneClickTrading": {"enabled": True, "chainId": "cataclysm-1"}
+            "oneClickTrading": {
+                "enabled": True,
+                "chainId": "cataclysm-1",
+                "contractAddress": "test-contract",
+            }
         },
     )
     monkeypatch.setattr(
@@ -481,7 +485,7 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
         "_get_json",
         lambda url: {"default_node_info": {"network": "nibiru-testnet-2"}},
     )
-    with pytest.raises(ValueError, match="network do not match"):
+    with pytest.raises(margin.TradingNetworkMismatch, match="network do not match"):
         margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 1)
 
 
@@ -592,7 +596,12 @@ def test_margin_dry_run_and_recheck(session, monkeypatch):
     monkeypatch.setattr(
         margin,
         "snapshot",
-        lambda *args: margin.PositionSnapshot(raw, funds, market, "test-contract"),
+        lambda *args: margin.PositionSnapshot(
+            raw,
+            funds,
+            market,
+            {"chainId": "test-1", "contractAddress": "test-contract"},
+        ),
     )
     result = CliRunner().invoke(
         main,
@@ -628,13 +637,13 @@ def test_margin_refuses_changed_position(session, monkeypatch):
                 {**newer, "collateral_amount": "10000000"},
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
-                "test-contract",
+                {"chainId": "test-1", "contractAddress": "test-contract"},
             ),
             margin.PositionSnapshot(
                 newer,
                 {"available_to_trade": "20000000"},
                 {"minLeverage": 1, "maxLeverage": 100},
-                "test-contract",
+                {"chainId": "test-1", "contractAddress": "test-contract"},
             ),
         ]
     )
