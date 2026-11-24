@@ -108,8 +108,13 @@ fn certificate_entry(mut der: Vec<u8>, trusted: bool) -> der::Result<CaCertifica
     let mut reader = SliceReader::new(&der)?;
     let certificate: Certificate = reader.decode()?;
     let certificate_len = usize::try_from(reader.position())?;
-    let aux: Option<CertificateAux> = if trusted { reader.decode()? } else { None };
-    reader.finish(())?;
+    let aux: Option<CertificateAux> = if trusted && !reader.is_finished() {
+        // OpenSSL reads one AUX object and leaves any padding after it unread.
+        Some(reader.decode::<CertificateAux>()?)
+    } else {
+        reader.finish(())?;
+        None
+    };
 
     let matches_server = |purposes: &[ObjectIdentifier]| {
         purposes.contains(&SERVER_AUTH) || purposes.contains(&ANY_EXTENDED_KEY_USAGE)

@@ -1362,12 +1362,53 @@ def test_expired_trusted_ca_fails_tls_handshake(
     assert_keeper_tls_trust(cli_pair, tmp_path, context, trust, False)
 
 
+@pytest.mark.parametrize("store", ["file", "dir"])
+@pytest.mark.parametrize(
+    ("aux", "trusted"),
+    [
+        pytest.param(b"\x30\x00\x00", True, id="trailing-padding"),
+        pytest.param(b"\x30\x01", False, id="truncated-aux"),
+        pytest.param(b"\x00", False, id="invalid-aux-tag"),
+    ],
+)
+def test_trusted_pem_reads_one_complete_aux_object(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    keeper_certificate: tuple[ssl.SSLContext, Path],
+    store: str,
+    aux: bytes,
+    trusted: bool,
+) -> None:
+    context, certs = keeper_certificate
+    root = certs / "keeper-ca.pem"
+    if store == "dir":
+        subject_hash = openssl_in(
+            tmp_path, "x509", "-in", str(root), "-noout", "-subject_hash"
+        ).strip()
+        write_trusted_pem(tmp_path / f"{subject_hash}.0", root, aux)
+        trust = {"SSL_CERT_DIR": str(tmp_path)}
+    else:
+        ca_file = tmp_path / "trusted.pem"
+        write_trusted_pem(ca_file, root, aux)
+        trust = {"SSL_CERT_FILE": str(ca_file)}
+    assert_keeper_tls_trust(
+        cli_pair,
+        tmp_path,
+        context,
+        trust,
+        trusted,
+        failure=(1, "INTERNAL_ERROR") if store == "file" else (4, "NOT_SENT"),
+    )
+
+
 def assert_keeper_tls_trust(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     context: ssl.SSLContext,
     trust: dict[str, str],
     trusted: bool,
+    *,
+    failure: tuple[int, str] = (4, "NOT_SENT"),
 ) -> None:
     with replay(context) as (endpoint, replies, requests):
         observed = []
@@ -1386,14 +1427,14 @@ def assert_keeper_tls_trust(
                 ADDR,
                 overrides=trust,
             )
-            assert result.returncode == (0 if trusted else 4), result.stdout
+            assert result.returncode == (0 if trusted else failure[0]), result.stdout
             assert not result.stderr
             assert not replies
             assert [request.body for request in requests] == (
                 [wire(keeper.INTENTS, user=ADDR, key=None)] if trusted else []
             )
             if not trusted:
-                assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
+                assert json.loads(result.stdout)["error"]["code"] == failure[1]
             stdout = (
                 public_intent_output(result.stdout, compact=True)
                 if index == 0 and trusted
