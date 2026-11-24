@@ -220,23 +220,27 @@ both calls, as rule 2 says; the examples leave it out to stay short.
 
 ### When It Is Safe to Drop `--dry-run`
 
-The CLI has no digest. The live command builds the trade again from current
-state and does not compare it with the dry run the person saw. Rerunning the
-command without `--dry-run` submits what the person approved only when the
-approval still describes the trade:
+For `trade partial-close` and `trade margin`, read `previewDigest` from the
+JSON dry run. After the person confirms the quote, replace `--dry-run` with
+`--preview-digest DIGEST` using the digest from that preview. The CLI
+refuses to submit if the live quote differs. If it refuses, run a fresh dry
+run and get confirmation again before submitting with the new digest.
+
+Without a digest, the CLI rebuilds the trade from current state. Drop
+`--dry-run` only when the person's approval covers what the live command
+will send.
 
 - **Limit and stop opens, `tpsl`, `leverage`, `close`, and `--cancel-order`**
   send exactly the arguments shown. Drop `--dry-run` once the person has
   confirmed the account, the network, and those arguments. For limit
   and stop opens, include the bound from rule 3 in the confirmation.
 
-- **Partial close** takes a percentage and recomputes the amount from the
-  position at submit. If the person approved "close 50%, about 50 USDC" and
-  the position doubles before submit, the live command closes 100 USDC. Ask
-  the person to approve the percentage of whatever the position is at submit,
-  and say so in those words. To confirm a quoted slice, use MCP tools
-  `preview_partial_close` and `trade_partial_close`. Show the person the
-  collateral reduction and quoted notional. If
+- **Partial close** takes a percentage. Without a digest, the CLI computes
+  the reduction from the position at submit. If the person saw "close 50%,
+  about 50 USDC" and the position doubles before submit, the live command
+  closes 100 USDC. Ask the person to approve the percentage of whatever the
+  position is at submit. For a quoted slice, show the person the collateral
+  reduction and quoted notional and submit with the confirmed digest. If
   `quote.closedNotionalIsEstimate` is true, say the notional is an estimate.
   If the oracle price is unavailable, show the USDC estimate from
   `quote.closedNotionalUsdc`. Keeper sends the collateral delta to Perp.
@@ -246,14 +250,13 @@ approval still describes the trade:
   slice.
 - **Margin** takes an amount, `--direction add|remove --amount USDC`, and
   computes the target from the effective leverage Perp will use, including
-  any applicable after-hours cap. The dry run's target is a quote: adding
-  25 USDC to 100 USDC of collateral at 5x previews
-  4x, but if the collateral doubles before submit the same command sends
-  about 4.44x. Ask the person to approve the amount, and say the CLI
-  computes the target leverage at submit. If they approve a specific target
-  leverage, use MCP tools `preview_margin` and `trade_margin`, whose digest
-  binds the whole quote, or `trade leverage ID --leverage VALUE`, which
-  sends the target they named. If `quote.marginChangeIsEstimate` is true,
+  any applicable after-hours cap. Adding 25 USDC to 100 USDC of collateral
+  at 5x previews a target of 4x. If the collateral doubles before submit,
+  the same command without a digest sends about 4.44x. When submitting
+  without a digest, ask the person to approve the amount and explain that
+  the CLI computes the target leverage at submit. To send a target the
+  person chose directly, use `trade leverage ID --leverage VALUE`.
+  If `quote.marginChangeIsEstimate` is true,
   tell the person the after-hours guard can deduct fees before Perp applies
   the target leverage. Perp determines the direction from effective leverage
   at execution.
