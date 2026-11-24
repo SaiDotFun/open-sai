@@ -47,7 +47,7 @@ def auth_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     if path is None:
         if os.environ.get("GITHUB_ACTIONS") == "true":
             pytest.fail("native parity CI must supply SAI_PARITY_AUTH_PYTHON")
-        pytest.skip("set SAI_PARITY_AUTH_PYTHON to the Python executable with PR 96")
+        pytest.skip("set SAI_PARITY_AUTH_PYTHON to the Python executable from main")
     executable = shutil.which(path)
     if executable is None:
         pytest.fail("SAI_PARITY_AUTH_PYTHON must name an executable")
@@ -240,29 +240,43 @@ def test_auth_login(
     assert results[0] == results[1]
     python_state, rust_state = session_state(python), session_state(rust)
     if expected_code == 0:
-        assert rust_state["sessions"][addr].pop("keyName") == "dev"
+        assert rust_state["sessions"][addr]["keyName"] == "dev"
     assert python_state == rust_state
 
 
-def original_keeper_argument(origin: str) -> str:
+def original_keeper_argument(origin: str | None = None) -> str:
+    location = f" at {origin}" if origin else ""
     return (
         '"${SAI_RECONCILE_ENDPOINT:?'
-        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
+        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL{location}}}"'
     )
+
+
+def reuse_keeper_suffix(origin: str) -> str:
+    return f" (reuse the Keeper endpoint at {origin} configured when this session was stored)"
 
 
 @pytest.mark.parametrize("path", ["", "/query", "/fixture-path-key/query"])
 def test_signed_out_recovery_hint_only_shows_the_keeper_origin(
-    tmp_path: Path, cli_pair: tuple[CLI, CLI], path: str
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], path: str
 ) -> None:
-    _, rust = homes(tmp_path, cli_pair)
+    python, rust = homes(tmp_path, auth_pair)
     origin = "http://127.0.0.1:9"
-    result = rust.run("--json", "--endpoint", origin + path, "auth", "status")
-    assert result.returncode == 6
-    error = json.loads(result.stdout)["error"]
-    assert error["code"] == "SIGNED_OUT"
-    endpoint = original_keeper_argument(origin) if path else origin
-    assert error["hint"] == f"sai --endpoint {endpoint} auth login NAME"
+    errors = []
+    for env in (python, rust):
+        result = env.run("--json", "--endpoint", origin + path, "auth", "status")
+        assert result.returncode == 6
+        assert result.stderr == ""
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "SIGNED_OUT"
+        option = (
+            original_keeper_argument(origin if env is rust else None)
+            if path
+            else origin
+        )
+        assert error.pop("hint") == f"sai --endpoint {option} auth login NAME"
+        errors.append(error)
+    assert errors[0] == errors[1]
 
 
 def test_auth_summaries_hide_keeper_path(
@@ -677,19 +691,6 @@ def test_import_rejects_bad_clipboard(
     assert results[0] == results[1]
 
 
-@pytest.fixture
-def renewal_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
-    path = os.environ.get("SAI_PARITY_RENEW_PYTHON")
-    if path is None:
-        if os.environ.get("GITHUB_ACTIONS") == "true":
-            pytest.fail("native parity CI must supply SAI_PARITY_RENEW_PYTHON")
-        pytest.skip("set SAI_PARITY_RENEW_PYTHON to the Python executable with PR 61")
-    executable = shutil.which(path)
-    if executable is None:
-        pytest.fail("SAI_PARITY_RENEW_PYTHON must name an executable")
-    return (executable,), cli_pair[1]
-
-
 def assert_truncated_store_parity(
     tmp_path: Path, pair: tuple[CLI, CLI], commands: list[tuple[CLI, int, str | None]]
 ) -> None:
@@ -731,19 +732,19 @@ def test_auth_commands_keep_truncated_store_error_codes(
 
 
 def test_renew_keeps_truncated_store_error_code(
-    tmp_path: Path, renewal_pair: tuple[CLI, CLI]
+    tmp_path: Path, auth_pair: tuple[CLI, CLI]
 ) -> None:
     assert_truncated_store_parity(
-        tmp_path, renewal_pair, [(("renew",), 1, "INVALID_REQUEST")]
+        tmp_path, auth_pair, [(("renew",), 1, "INVALID_REQUEST")]
     )
 
 
 def test_renew_matches_python_without_switching_active_account(
     tmp_path: Path,
-    renewal_pair: tuple[CLI, CLI],
+    auth_pair: tuple[CLI, CLI],
     keeper_auth: dict[str, Any],
 ) -> None:
-    python, rust = homes(tmp_path, renewal_pair)
+    python, rust = homes(tmp_path, auth_pair)
     results = []
     endpoint = keeper_auth["endpoint"]
     renewed_token = fixture_token(ADDR)
@@ -766,7 +767,7 @@ def test_renew_matches_python_without_switching_active_account(
         recovery = (
             f"sai --endpoint {original_keeper_argument(origin)} auth import"
             if env is rust
-            else f"sai --endpoint {endpoint} auth import"
+            else f"sai --endpoint {original_keeper_argument()} auth import{reuse_keeper_suffix(origin)}"
         )
         assert (
             error["message"]
@@ -797,9 +798,9 @@ def test_renew_matches_python_without_switching_active_account(
 
 
 def test_use_rejects_a_malformed_expiry_written_by_python(
-    tmp_path: Path, renewal_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
 ) -> None:
-    python, rust = homes(tmp_path, renewal_pair)
+    python, rust = homes(tmp_path, auth_pair)
     python.extra_env["SAI_HOME"] = str(rust.home)
     python.extra_env["SAI_LOG"] = "0"
     token = fixture_token(ADDR)
@@ -876,10 +877,10 @@ def test_renew_rejects_expired_replacement_without_replacing_the_session(
 
 
 def test_renew_does_not_restore_a_concurrent_logout(
-    tmp_path: Path, renewal_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
 ) -> None:
     results = []
-    for env in homes(tmp_path, renewal_pair):
+    for env in homes(tmp_path, auth_pair):
         fake_cast(env)
         keystore(env, addr=ADDR)
         args = ("--json", "--endpoint", keeper_auth["endpoint"], "auth")
@@ -904,13 +905,13 @@ def test_renew_does_not_restore_a_concurrent_logout(
 def test_expired_session_recovery_matches_python(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    renewal_pair: tuple[CLI, CLI],
+    auth_pair: tuple[CLI, CLI],
     keeper_auth: dict[str, Any],
     source: str,
 ) -> None:
     args = ("--endpoint", keeper_auth["endpoint"])
     results = []
-    python, rust = homes(tmp_path, renewal_pair)
+    python, rust = homes(tmp_path, auth_pair)
     for env in (python, rust):
         keeper_auth["expires_at"] = "2000-01-01T00:00:00+00:00"
         keeper_auth["token"] = fixture_token(ADDR, 0)
@@ -931,20 +932,17 @@ def test_expired_session_recovery_matches_python(
         body = json.loads(structured.stdout)["error"]
         hint = body.pop("hint")
         command = f"renew {ADDR}" if source == "keystore" else "import"
-        endpoint = keeper_auth["endpoint"]
+        origin = keeper_auth["endpoint"].removesuffix("/query")
         if env is rust and source == "imported":
-            origin = endpoint.removesuffix("/query")
             assert (
                 hint == f"sai --endpoint {original_keeper_argument(origin)} auth import"
             )
         elif env is rust:
-            origin = endpoint.removesuffix("/query")
-            assert hint == (
-                f"sai auth {command} (reuse the Keeper endpoint at {origin}"
-                " configured when this session was stored)"
-            )
+            assert hint == f"sai auth {command}{reuse_keeper_suffix(origin)}"
         else:
-            assert hint == f"sai --endpoint {endpoint} auth {command}"
+            assert hint == (
+                f"sai --endpoint {original_keeper_argument()} auth {command}{reuse_keeper_suffix(origin)}"
+            )
         results.append(
             (observed(text), (structured.returncode, body, structured.stderr))
         )
