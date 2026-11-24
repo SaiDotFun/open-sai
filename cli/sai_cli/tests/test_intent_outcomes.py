@@ -4,14 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import multiprocessing
 import subprocess
 import sys
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
 
@@ -34,7 +36,7 @@ RESPONSES = {**FIXTURE["recorded"], **FIXTURE["replays"]}
 NIBI_ADDR = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
 OTHER_ADDR = "0x" + "b" * 40
 OTHER_NIBI_ADDR = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
-Reply = str | dict[str, Any]
+Reply = str | dict[str, Any] | Callable[[], dict[str, Any]]
 MARKET = {
     "data": {
         "perp": {
@@ -105,8 +107,12 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                         }
                     }
                 }
+            elif isinstance(queued, str):
+                reply = RESPONSES[queued]
+            elif isinstance(queued, dict):
+                reply = queued
             else:
-                reply = RESPONSES[queued] if isinstance(queued, str) else queued
+                reply = queued()
             if "userIntents" in reply["data"]:
                 assert request["query"] == keeper.INTENTS
                 assert request["variables"]["user"].lower() in (ADDR, NIBI_ADDR)
@@ -434,6 +440,71 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert allowed["status"] == "accepted"
     assert allowed["intentKey"] != key
     assert submitted_keys == [key, allowed["intentKey"]]
+
+
+def _open_with_mcp(
+    endpoint: str, args: dict[str, Any], results: Queue[dict[str, Any]]
+) -> None:
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    results.put(call_mcp(mcp, "trade_open", args))
+
+
+def test_mcp_open_reservation_rechecks_after_concurrent_ack(
+    connected_replay, submitted_keys
+):
+    endpoint, replies = connected_replay
+    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    replies.append(MARKET)
+    preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
+    args = {
+        **OPEN_ARGS,
+        "preview_digest": preview["previewDigest"],
+        "reference_price": preview["referencePrice"],
+    }
+
+    # Both clients pass the ledger precheck before either gets a market price.
+    # One price reply waits until the winning process has recorded its ack.
+    both_refreshing = threading.Barrier(2, timeout=10)
+    winner_accepted = threading.Event()
+
+    def first_quote() -> dict[str, Any]:
+        both_refreshing.wait()
+        return MARKET
+
+    def second_quote() -> dict[str, Any]:
+        both_refreshing.wait()
+        assert winner_accepted.wait(timeout=10)
+        return MARKET
+
+    replies.extend((first_quote, second_quote, "admission_ack", "admission_ack"))
+    context = multiprocessing.get_context("spawn")
+    results = context.Queue()
+    workers = [
+        context.Process(target=_open_with_mcp, args=(endpoint, args, results))
+        for _ in range(2)
+    ]
+    for worker in workers:
+        worker.start()
+    try:
+        winner = results.get(timeout=15)
+        assert winner["status"] == status(endpoint) == "accepted"
+        key = winner["intentKey"]
+        winner_accepted.set()
+        loser = results.get(timeout=15)
+        assert submitted_keys == [key]
+        assert replies.pop() == "admission_ack"
+        assert loser["code"] == "RECENT_OPEN_PENDING"
+        assert loser["intentKeys"] == [key]
+        for worker in workers:
+            worker.join(timeout=5)
+            assert worker.exitcode == 0
+    finally:
+        winner_accepted.set()
+        for worker in workers:
+            if worker.is_alive():
+                worker.terminate()
+            worker.join(timeout=5)
+        results.close()
 
 
 @pytest.mark.parametrize(
