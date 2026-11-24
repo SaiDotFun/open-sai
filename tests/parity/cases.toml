@@ -257,6 +257,7 @@ state = { "update.json#latest" = "sai-cli/v0.99.0", "update.json#schema" = 1, "u
 [[case]]
 name = "trade-open-market"
 args = ["--json","trade","open","--market","3","--side","long","--type","market","--amount","20","--leverage","2","--slippage","1","--price","100","--dry-run"]
+wire = ["borrowings", "previewFees", "oneClickTrading", "node_info", "get_collateral_price"]
 
 [[case]]
 name = "trade-close"
@@ -291,7 +292,7 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price",
+    "get_collateral_price", "previewFees", "get_collateral_price",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 

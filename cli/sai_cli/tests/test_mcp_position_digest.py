@@ -112,6 +112,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                         }
                     },
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
+                    keeper.PREVIEW_FEES: {"perp": {"borrowing": market_row}},
                     keeper.MARKETS: {"perp": {"borrowings": [market_row]}},
                 }[request["query"]]
             self.reply({"data": data})

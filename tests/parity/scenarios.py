@@ -189,6 +189,18 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         },
         "borrowings": markets,
         "borrowing": {"data": {"perp": {"borrowing": market}}},
+        "previewFees": {
+            "data": {
+                "perp": {
+                    "borrowing": {
+                        "minPositionSizeUSD": market["minPositionSizeUSD"],
+                        "openFeePct": market["openFeePct"],
+                        "closeFeePct": market["closeFeePct"],
+                        "triggerOrderFeePct": 0.0,
+                    }
+                }
+            },
+        },
         "tokenPricesUsd": prices,
         "tradeHistory": {"data": {"perp": {"tradeHistory": [history]}}},
         "trades": PROTOCOL["account_positions_response"],
@@ -208,6 +220,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "trades": {"trader": ADDRESS},
         "trade": {"trader": ADDRESS, "id": 7},
         "borrowing": {"market": borrowing["marketId"], "collateral": collateral["id"]},
+        "previewFees": {
+            "market": borrowing["marketId"],
+            "collateral": collateral["id"],
+        },
         "userIntents": {"user": ADDRESS, "key": INTENT},
     }
     queue_payloads = {
@@ -227,6 +243,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "trade_type": "trade",
             "collateral_amount": str(position["collateralAmount"]),
             "leverage": str(position["leverage"]),
+            "open_price": str(position["openPrice"]),
+            "long": position["isLong"],
         },
         "get_exchange_balance": {
             "available_to_trade": "10000000",

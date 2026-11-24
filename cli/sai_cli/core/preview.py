@@ -155,6 +155,18 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
     return price_input(price, "Sai Perp collateral oracle", intents.now())
 
 
+def fee_schedule(endpoint: str, market: int, collateral: int) -> dict[str, Any]:
+    fees = keeper.request(
+        endpoint,
+        keeper.PREVIEW_FEES,
+        {"market": market, "collateral": collateral},
+        timeout=QUOTE_TIMEOUT,
+    )["perp"]["borrowing"]
+    if not isinstance(fees, dict) or any(field not in fees for field in FEE_FIELDS):
+        raise ValueError("Preview fee schedule is unavailable")
+    return fees
+
+
 def _notional(collateral: int, leverage: Decimal) -> int:
     numerator, denominator = leverage.as_integer_ratio()
     return collateral * numerator // denominator
@@ -185,15 +197,17 @@ def open_estimates(
     )
     fees = unavailable("Perp fee schedule or collateral oracle price is unavailable.")
     liq = unavailable("An entry price and opening fee estimate are required.")
-    if lcd and row is not None and all(key in row for key in FEE_FIELDS):
+    if lcd and row is not None:
         try:
+            token_id = row["collateralToken"]["id"]
+            schedule = fee_schedule(endpoint, row["marketId"], token_id)
             contract = margin.trading_contract(endpoint, lcd)
-            token = f"TokenIndex({row['collateralToken']['id']})"
+            token = f"TokenIndex({token_id})"
             collateral_price = read_collateral_price(lcd, contract, token)
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))
             leverage = Decimal(body["leverage"])
             fee, fees = base_fees(
-                row,
+                schedule,
                 collateral_price,
                 _notional(collateral, leverage),
                 opening=True,
@@ -232,6 +246,7 @@ def non_fill_estimates(*, cancels: bool, updates_triggers: bool) -> dict[str, An
 
 
 def position_estimates(
+    endpoint: str,
     lcd: str,
     state: margin.PositionSnapshot | None,
     effective: Decimal | None,
@@ -270,13 +285,18 @@ def position_estimates(
                 ),
             }
         collateral = int(raw["collateral_amount"])
-        if target is None and all(key in state.market for key in FEE_FIELDS):
+        if target is None:
             try:
+                schedule = fee_schedule(
+                    endpoint,
+                    state.market["marketId"],
+                    state.market["collateralToken"]["id"],
+                )
                 price = read_collateral_price(
                     lcd, state.contract, raw["collateral_index"]
                 )
                 _, result["fees"] = base_fees(
-                    state.market,
+                    schedule,
                     price,
                     _notional(collateral if close else reduce_by, effective),
                     opening=False,
