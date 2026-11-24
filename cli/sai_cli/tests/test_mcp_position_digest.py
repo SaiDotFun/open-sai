@@ -1179,6 +1179,42 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
     asyncio.run(scenario())
 
 
+def test_partial_close_refuses_replacement_when_pinned_cap_is_malformed(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.leverage = "10"
+    position.after_hours = True
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            assert preview["quote"]["closedNotionalUsd"] == "10"
+            # The cap becomes unreadable at the final pinned position read.
+            position.caps_on_position_read.extend([None, None, "malformed"])
+            refused = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["quoteStatus"] == "unavailable"
+            assert refused["recovery"]["action"] == "request_preview"
+            assert "effective leverage" in refused["error"]
+            assert "preview" not in refused
+            assert "previewDigest" not in refused
+            assert position.cap_query_heights.count("121") == 2
+            assert position.submitted == []
+
+            estimate = await call(client, "preview_partial_close", args)
+            assert estimate["quote"]["effectiveLeverage"] is None
+            assert estimate["quote"]["closedNotionalUsd"] == "20"
+            assert estimate["quote"]["closedNotionalIsEstimate"] is True
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("tool", "args"),
     [
