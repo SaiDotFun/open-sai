@@ -1222,10 +1222,33 @@ def test_unreadable_config_names_the_file_not_its_contents(env: Env):
     assert SECRET not in result.stdout + result.stderr
 
 
-def test_client_errors_skip_warning_lines():
-    out = "WARNING: could not create aliases\nError: config is locked\n"
-    assert mcp_install.first_line(out) == "Error: config is locked"
-    assert mcp_install.first_line("one\nlast words\n") == "last words"
+@pytest.mark.parametrize(
+    ("client", "args", "command"),
+    [
+        ("claude", ("install", "claude"), "claude mcp add"),
+        ("codex", ("install", "codex"), "codex mcp get sai --json"),
+        ("codex", ("list",), "codex mcp get sai --json"),
+    ],
+)
+def test_client_failure_keeps_config_values_out_of_output(
+    env: Env, client: str, args: tuple[str, ...], command: str
+):
+    diagnostic = f"Error: {OTHER} has invalid configuration with TOKEN={SECRET}"
+    write_exe(
+        env.bin / client,
+        f"import sys\nprint({diagnostic!r})\n"
+        f"print({diagnostic!r}, file=sys.stderr)\nsys.exit(7)\n",
+    )
+
+    result = invoke("mcp", *args)
+    if args == ("list",):
+        assert result.exit_code == 0, result.output
+        row = next(row for row in payload(result)["clients"] if row["client"] == client)
+        error = row["error"]
+    else:
+        error = failure(result)
+    assert f"`{command}` exited 7" in error
+    assert SECRET not in result.output and OTHER not in result.output
 
 
 def claude_entry(argv: list[str], env: dict[str, str] | None = None) -> dict:

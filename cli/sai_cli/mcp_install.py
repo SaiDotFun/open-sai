@@ -289,31 +289,23 @@ def server_target(
 
 
 def run(argv: list[str]) -> None:
-    """Run a client command; raise ClientError with its first stderr line."""
+    """Run a client command without relaying output that may contain config values."""
+    command = " ".join([Path(argv[0]).name, *argv[1:3]])
     try:
         done = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=SUBPROCESS_TIMEOUT,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ClientError(f"`{Path(argv[0]).name}` did not run: {type(exc).__name__}")
+        raise ClientError(f"`{command}` did not run: {type(exc).__name__}") from None
     if done.returncode != 0:
         raise ClientError(
-            f"`{Path(argv[0]).name} {' '.join(argv[1:3])}` exited"
-            f" {done.returncode}: {first_line(done.stderr or done.stdout)}"
+            f"`{command}` exited {done.returncode}. Run the client command directly for details."
         )
-
-
-def first_line(text: str) -> str:
-    """Pick the error line from client output; clients also print warnings."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    errors = [line for line in lines if "error" in line.lower()]
-    chosen = errors[0] if errors else (lines[-1] if lines else "no output")
-    return chosen[:200]
 
 
 def load_json(path: Path) -> dict[str, Any] | None:
@@ -613,6 +605,7 @@ class Codex(Client):
         exe = self.exe()
         if exe is None:
             return None
+        command = f"codex mcp get {name} --json"
         try:
             done = subprocess.run(
                 [exe, "mcp", "get", name, "--json"],
@@ -624,11 +617,15 @@ class Codex(Client):
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ClientError(f"`codex mcp get` did not run: {type(exc).__name__}")
+            raise ClientError(
+                f"`{command}` did not run: {type(exc).__name__}"
+            ) from None
         if done.returncode != 0:
             if "no mcp server" in (done.stderr + done.stdout).lower():
                 return None
-            raise ClientError(f"`codex mcp get` exited {done.returncode}")
+            raise ClientError(
+                f"`{command}` exited {done.returncode}. Run the client command directly for details."
+            )
         try:
             data = json.loads(done.stdout)
         except ValueError:
