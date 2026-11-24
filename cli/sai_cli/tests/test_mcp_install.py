@@ -1504,6 +1504,47 @@ def test_update_commands_keep_the_profile_of_a_stale_claude_entry(env: Env):
     assert env.claude_json() == original
 
 
+@pytest.mark.parametrize(
+    "profile",
+    ["${HOME}/fixture profile", "${SAI_PROFILE:-fixture-profile}", "relative profile"],
+)
+def test_update_preserves_claude_profile_expressions(env: Env, profile: str):
+    config = env.project / ".mcp.json"
+    original = {
+        "mcpServers": {"sai": claude_entry(["missing-wrapper"], {"SAI_HOME": profile})}
+    }
+    config.write_text(json.dumps(original))
+    before = config.read_bytes()
+
+    updated = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, False
+    )
+    notice = updater.mcp_notice(updated.mcp_results(), updated.mcp_notes)
+    [command] = notice.split("`")[1::2]
+    expected = profile if profile.startswith("${") else str(env.project / profile)
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "project",
+        "sai",
+        f"--env=SAI_HOME={expected}",
+        "--",
+        *serve(env),
+    ]
+    assert config.read_bytes() == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    config.write_text('{"mcpServers": {}}')
+    subprocess.run([shell, "-c", command], cwd=env.project, check=True)
+    assert json.loads(config.read_text())["mcpServers"]["sai"]["env"] == {
+        "SAI_HOME": expected
+    }
+
+
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):
     args = ("mcp", "install", "--client", "claude", "--repair-existing", OLD_COMMAND)
     config = env.home / ".claude.json"

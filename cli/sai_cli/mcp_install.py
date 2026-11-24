@@ -1566,17 +1566,16 @@ def check_claude_differences(
                 manual.append("Install a stable Sai launcher on PATH.")
             else:
                 home = expected.env.get("SAI_HOME")
-                directory = client.scope_directory(reg.scope)
+                if home is not None and "${" not in home and not os.path.isabs(home):
+                    home = absolute_sai_home(
+                        home, client.scope_directory(reg.scope) or client.cwd
+                    )
                 repairs.append(
                     ClaudeRepair(
                         reg.scope,
                         name,
                         replace_entry=True,
-                        sai_home=(
-                            absolute_sai_home(home, directory or client.cwd)
-                            if home is not None
-                            else None
-                        ),
+                        sai_home=home,
                         config_path=client.registration_path(reg.scope),
                         fields=claude_differing_fields(reg, expected) or ("command",),
                         launcher=expected.argv[0],
