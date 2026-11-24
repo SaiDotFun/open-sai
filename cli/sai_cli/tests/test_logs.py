@@ -1162,6 +1162,26 @@ def test_log_config_refreshes_after_a_same_size_rewrite(home):
     assert log.resolve_config(home, None, None)[0] is False
 
 
+@posix_only
+def test_log_writer_honors_external_disable_and_reenable(home):
+    path = home / "config.toml"
+    enabled = "[logs]\nenabled = true \n"
+    path.write_text(enabled)
+    log.event("test.before")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    rewrite_with_same_mtime(path, enabled)
+    log.event("test.resumed")
+    assert [line["event"] for line in read_logs(home)] == [
+        "test.before",
+        "test.resumed",
+    ]
+
+
 def test_log_writer_reads_unchanged_config_once(home):
     path = home / "config.toml"
     path.write_text("[logs]\nenabled = true\n")
