@@ -859,6 +859,18 @@ def read_mcp(
     raise LookupFailed("`sai mcp serve` returned an invalid initialization reply")
 
 
+def native_release(args: argparse.Namespace) -> tuple[str, str, str]:
+    tag = (
+        TAG_PREFIX + args.version
+        if args.version
+        else find_latest(args.api_base, args.web_base, args.timeout)
+    )
+    if tag is None:
+        raise LookupFailed("no stable Sai release was found")
+    version = version_of(tag)
+    return tag, version, native_asset(version)
+
+
 def install_native(args: argparse.Namespace) -> int:
     # Validate the platform before looking up a release or creating directories.
     native_asset("")
@@ -888,16 +900,8 @@ def install_native(args: argparse.Namespace) -> int:
         return 0 if args.dry_run else subprocess.run(command, check=False).returncode
     if target is not None:
         installed_directory(launcher, root)
-    tag = (
-        TAG_PREFIX + args.version
-        if args.version
-        else find_latest(args.api_base, args.web_base, args.timeout)
-    )
-    if tag is None:
-        raise LookupFailed("no stable Sai release was found")
-    version = version_of(tag)
-    asset = native_asset(version)
     if args.dry_run:
+        _, _, asset = native_release(args)
         print(f"Would verify and install {asset} at {launcher}.")
         return 0
     # A symlinked bin directory can be on a separate filesystem. Stage beside
@@ -907,6 +911,7 @@ def install_native(args: argparse.Namespace) -> int:
     with native_lock(launcher.parent / NATIVE_LOCK):
         checked_directory(root, private=True)
         old = recover_native(launcher, root)
+        tag, version, asset = native_release(args)
         with (
             tempfile.TemporaryDirectory(dir=root, prefix=".stage-") as scratch,
             tempfile.TemporaryDirectory(prefix="sai-install-profile-") as profile,

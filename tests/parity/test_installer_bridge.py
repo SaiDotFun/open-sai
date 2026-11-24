@@ -419,9 +419,9 @@ def test_standalone_recovers_an_interrupted_first_switch(
     ok(result)
     directory = install.launcher.readlink().parts[1]
     pending(install).write_text(json.dumps({"old": None, "new": directory}))
-    replay.assets.clear()
+    replay.redirects[f"/repos{REPO}/releases"] = "/unavailable"
     result = install.install(replay, "--native")
-    assert result.returncode == 1 and "HTTP 404" in result.stderr
+    assert result.returncode == 1 and "HTTP 302" in result.stderr
     assert not install.launcher.is_symlink()
     assert not pending(install).exists()
 
