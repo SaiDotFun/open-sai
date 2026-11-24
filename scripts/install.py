@@ -25,6 +25,7 @@ Usage: install.py [--native | --source] [--version VERSION] [--dry-run]
 from __future__ import annotations
 
 import argparse
+import ctypes
 import errno
 import gzip
 import hashlib
@@ -78,6 +79,7 @@ NATIVE_DIRECTORY = re.compile(rf"{NATIVE_VERSION}-{DIGEST}")
 NATIVE_ROOT = ".sai-native"
 NATIVE_LOCK = ".sai-update.lock"
 NATIVE_PENDING = "pending.json"
+LAUNCHER_SWITCH = ".launcher-switch"
 MAX_BINARY = 96 << 20
 VERIFY_TIMEOUT = 60
 PYTHON_PIN = "0.1.2"
@@ -87,6 +89,10 @@ T = TypeVar("T")
 
 class LookupFailed(Exception):
     """The latest release could not be determined or downloaded."""
+
+
+class LauncherChanged(LookupFailed):
+    """A different install now owns the launcher."""
 
 
 def parse_tag(tag: str) -> tuple[int, int, int] | None:
@@ -731,31 +737,133 @@ def installed_directory(launcher: Path, root: Path) -> str | None:
     return directory
 
 
+def launcher_entry(path: Path) -> tuple[int, int, str | None] | None:
+    try:
+        info = path.lstat()
+        link = os.fspath(path.readlink()) if stat.S_ISLNK(info.st_mode) else None
+        if os.path.samestat(info, path.lstat()):
+            return info.st_dev, info.st_ino, link
+    except FileNotFoundError:
+        return None
+    raise LauncherChanged("the Sai launcher changed while reading its owner")
+
+
+def rename_launcher(source: Path, destination: Path, *, exchange: bool) -> None:
+    """Exchange two paths, or move into an empty destination, on this filesystem."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        if sys.platform == "darwin":
+            rename = libc.renamex_np
+            args = (os.fsencode(source), os.fsencode(destination), 2 if exchange else 4)
+        else:
+            rename = libc.renameat2
+            cwd = -100  # AT_FDCWD
+            args = (
+                cwd,
+                os.fsencode(source),
+                cwd,
+                os.fsencode(destination),
+                2 if exchange else 1,
+            )
+    except AttributeError as error:
+        raise LookupFailed(
+            "this platform does not provide an atomic launcher rename"
+        ) from error
+    sys.audit("sai.launcher.rename", os.fspath(source), os.fspath(destination))
+    if rename(*args) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code), os.fspath(destination))
+    sys.audit("sai.launcher.renamed", os.fspath(source), os.fspath(destination))
+
+
+def protect_displaced_launcher(
+    displaced: Path, launcher: Path, published: tuple[int, int, str | None] | None
+) -> bool:
+    """Return a competing installer's entry to its path, or leave it recoverable."""
+    try:
+        if published is not None and launcher_entry(launcher) == published:
+            rename_launcher(displaced, launcher, exchange=True)
+            return launcher_entry(displaced) == published
+        rename_launcher(displaced, launcher, exchange=False)
+        return True
+    except (OSError, LauncherChanged):
+        return False
+
+
+def settle_launcher_switch(launcher: Path, root: Path) -> None:
+    stage = root / LAUNCHER_SWITCH
+    if not os.path.lexists(stage):
+        return
+    checked_directory(stage, private=True)
+    try:
+        with (stage / "owner.json").open("rb") as handle:
+            record = json.loads(handle.read(4096))
+        expected = tuple(record["expected"])
+        published = None if record["published"] is None else tuple(record["published"])
+    except FileNotFoundError:
+        # The switch starts only after owner.json has been published.
+        shutil.rmtree(stage)
+        sync_dir(root)
+        return
+    except (ValueError, TypeError, KeyError) as error:
+        raise LauncherChanged(
+            f"could not read the launcher switch record at {stage}"
+        ) from error
+
+    displaced = stage / "sai"
+    if launcher_entry(displaced) in (expected, published):
+        shutil.rmtree(stage)
+        sync_dir(root)
+        return
+    if protect_displaced_launcher(displaced, launcher, published):
+        shutil.rmtree(stage)
+        sync_dir(launcher.parent)
+        sync_dir(root)
+        raise LauncherChanged("the Sai launcher changed during the switch")
+    raise LauncherChanged(
+        f"the Sai launcher changed during the switch. The displaced launcher is at {displaced}"
+    )
+
+
 def switch_launcher(
     launcher: Path, root: Path, directory: str | None, *, previous: str | None
 ) -> None:
-    if directory is None:
-        if installed_directory(launcher, root) != previous:
-            raise LookupFailed("the Sai launcher changed during the switch")
-        launcher.unlink()
+    target = (
+        None
+        if directory is None
+        else native_binary(root, directory).relative_to(launcher.parent)
+    )
+    if previous is None:
+        # symlink(2) atomically fails with EEXIST, including for a dangling link.
+        assert target is not None
+        launcher.symlink_to(target)
     else:
-        target = native_binary(root, directory).relative_to(launcher.parent)
-        if previous is None:
-            # symlink(2) atomically fails with EEXIST, including for a dangling link.
-            launcher.symlink_to(target)
+        expected = launcher_entry(launcher)
+        if expected is None or installed_directory(launcher, root) != previous:
+            raise LauncherChanged("the Sai launcher changed during the switch")
+        stage = root / LAUNCHER_SWITCH
+        stage.mkdir(mode=0o700)
+        displaced = stage / "sai"
+        if target is not None:
+            displaced.symlink_to(target)
+        published = launcher_entry(displaced)
+        with (stage / "owner.tmp").open("x") as record:
+            json.dump({"expected": expected, "published": published}, record)
+            record.flush()
+            os.fsync(record.fileno())
+        (stage / "owner.tmp").replace(stage / "owner.json")
+        sync_dir(stage)
+        sync_dir(root)
+        if target is None:
+            rename_launcher(launcher, displaced, exchange=False)
         else:
-            with tempfile.TemporaryDirectory(
-                dir=launcher.parent, prefix=".sai-link-"
-            ) as stage:
-                link = Path(stage) / "sai"
-                link.symlink_to(target)
-                if installed_directory(launcher, root) != previous:
-                    raise LookupFailed("the Sai launcher changed during the switch")
-                link.replace(launcher)
+            rename_launcher(displaced, launcher, exchange=True)
+        settle_launcher_switch(launcher, root)
     sync_dir(launcher.parent)
 
 
 def recover_native(launcher: Path, root: Path) -> str | None:
+    settle_launcher_switch(launcher, root)
     active = installed_directory(launcher, root)
     pending = root / NATIVE_PENDING
     try:
@@ -952,7 +1060,6 @@ def install_native(args: argparse.Namespace) -> int:
     checked_directory(launcher.parent)
     with native_lock(launcher.parent / NATIVE_LOCK):
         check_path(launcher)
-        installed_directory(launcher, root)
         checked_directory(root, private=True)
         old = recover_native(launcher, root)
         tag, version, asset = native_release(args)
@@ -998,6 +1105,8 @@ def install_native(args: argparse.Namespace) -> int:
                         ) from error
                     raise
                 smoke_native(launcher, Path(profile), version)
+            except LauncherChanged:
+                raise
             except (LookupFailed, OSError, KeyboardInterrupt) as error:
                 if not pending.exists():
                     raise

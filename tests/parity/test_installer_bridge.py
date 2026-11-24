@@ -386,6 +386,67 @@ runpy.run_path(script, run_name='__main__')
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("phase", ["reinstall", "rollback"])
+@pytest.mark.parametrize("crash", [False, True])
+def test_standalone_preserves_an_owner_change_during_switch(
+    install: Install, replay: Replay, phase: str, crash: bool
+) -> None:
+    if phase == "reinstall":
+        native_artifact(replay)
+        ok(install.install(replay, "--native"))
+    else:
+        native_artifact(replay, "MUTANT")
+    external = install.home / "external-sai"
+    external.write_text("another installer's binary")
+    replacement = install.home / "new-owner"
+    replacement.symlink_to(external)
+    expected = replacement.lstat()
+    probe = """
+import os, runpy, signal, sys
+script, launcher, competitor, phase, crash, *args = sys.argv[1:]
+changed = False
+def race(event, values):
+    global changed
+    if changed:
+        if crash == 'True' and event == 'sai.launcher.renamed':
+            os.kill(os.getpid(), signal.SIGKILL)
+        return
+    if phase == 'reinstall':
+        switch = event in ('os.rename', 'sai.launcher.rename') and os.fsdecode(values[1]) == launcher
+    else:
+        switch = event in ('os.remove', 'sai.launcher.rename') and os.fsdecode(values[0]) == launcher
+    if switch:
+        changed = True
+        os.replace(competitor, launcher)
+sys.addaudithook(race)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        replacement,
+        phase,
+        str(crash),
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    if crash:
+        assert result.returncode == -9, (result.stdout, result.stderr)
+        result = install.install(replay, "--native")
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "launcher changed during the switch" in result.stderr
+    assert os.path.samestat(install.launcher.lstat(), expected)
+    assert install.launcher.readlink() == external
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 def test_standalone_refuses_an_indirect_managed_target(
     install: Install, replay: Replay
 ) -> None:
