@@ -627,6 +627,8 @@ class Claude(Client):
             return None
         if scope != "local":
             return self.cwd
+        if main := self.main_checkout():
+            return main
         # Claude resolves a local registration launched inside a repository
         # to the checkout root, including when invoked from a subdirectory.
         git = shutil.which("git", path=self.environ.get("PATH"))

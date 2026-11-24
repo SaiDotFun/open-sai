@@ -1353,6 +1353,55 @@ def test_claude_local_replacement_targets_git_root(
     assert projects[str(nested)]["mcpServers"]["sai"] == nested_entry
 
 
+@pytest.mark.skipif(os.name == "nt", reason="Claude uses a local key on Windows")
+@pytest.mark.parametrize("surface", ["install", "doctor"])
+def test_claude_reports_the_main_checkout_local_entry_from_a_linked_worktree(
+    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+):
+    git = shutil.which("git", path=os.defpath)
+    assert git
+    linked = env.root / "linked worktree"
+    for args in (
+        ["init", "--quiet"],
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Initial commit",
+        ],
+        ["worktree", "add", "--quiet", "--detach", str(linked)],
+    ):
+        subprocess.run([git, "-C", str(env.project), *args], check=True)
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
+    monkeypatch.chdir(linked)
+    original = {
+        "projects": {
+            str(env.project): {
+                "mcpServers": {"sai": claude_entry(["missing-wrapper"])}
+            },
+            str(linked): {"mcpServers": {"sai": claude_entry(serve(env))}},
+        }
+    }
+    (env.home / ".claude.json").write_text(json.dumps(original))
+
+    if surface == "doctor":
+        check = mcp_checks(invoke("doctor", "--offline"))["claude"]
+        assert (
+            "local sai: Sai registration points to a missing command"
+            in check["summary"]
+        )
+    else:
+        result = invoke("mcp", "install", "claude", "--scope", "local")
+        assert "differs from the requested settings" in failure(result)
+    assert env.claude_json() == original
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+
 @pytest.mark.parametrize("background", [False, True])
 def test_update_ignores_a_healthy_claude_profile_pin(env: Env, background: bool):
     config = env.home / ".claude.json"
