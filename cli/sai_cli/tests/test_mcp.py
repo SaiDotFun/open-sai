@@ -314,6 +314,59 @@ def test_signed_in_malformed_trade_still_gets_validation_errors(mcp):
     assert "trade_id" in text_of(called.content)
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments", "field", "protocol_error"),
+    [
+        *(
+            (
+                "preview_open",
+                {
+                    "market_id": 3,
+                    "side": "long",
+                    "order_type": "limit",
+                    "amount": "20",
+                    "leverage": "2",
+                    "slippage": "1",
+                    "price": "100",
+                },
+                field,
+                field == "market_id",
+            )
+            for field in (
+                "market_id",
+                "amount",
+                "leverage",
+                "slippage",
+                "price",
+                "take_profit",
+                "stop_loss",
+            )
+        ),
+        ("preview_close", {"trade_id": 7}, "trade_id", True),
+        ("preview_partial_close", {"trade_id": 7, "percent": 50}, "percent", True),
+        ("trade_close", {"trade_id": 7, "preview_digest": "0" * 64}, "trade_id", True),
+    ],
+)
+def test_trade_tools_reject_non_ascii_digits(
+    mcp, name, arguments, field, protocol_error
+):
+    storage.save_session(stored_session())
+
+    async def call() -> Any:
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            return await client.call_tool(name, {**arguments, field: "3٣"})
+
+    called = asyncio.run(call())
+    assert called.isError is protocol_error
+    message = text_of(called.content)
+    if protocol_error:
+        assert field in message
+    else:
+        assert json.loads(message)["code"] == "INVALID_REQUEST"
+
+
 def test_signed_out_trade_close_over_the_client_returns_signed_out(mcp, monkeypatch):
     fake = FakeKeeper()
     monkeypatch.setattr(keeper, "request", fake)
