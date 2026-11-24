@@ -389,8 +389,8 @@ def test_server_reads_the_config_file_and_reports_its_path(tmp_path):
         '[keeper]\nendpoint = "http://127.0.0.1:9/query"\n'
     )
     info = invoke(server.create_server(), "mcp_info")
-    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9/query"
-    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9/query"
+    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
+    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
     assert info["configFile"] == str(tmp_path / "config.toml")
 
 
@@ -1269,11 +1269,11 @@ def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")
     assert info["endpoints"] == {
-        "keeper": "https://k.example:8443/query",
-        "websocket": "wss://k.example:8443/query",
+        "keeper": "https://k.example:8443",
+        "websocket": "wss://k.example:8443",
         "lcd": "https://lcd.example/",
     }
-    assert info["session"]["endpoint"] == "https://k.example/q"
+    assert info["session"]["endpoint"] == "https://k.example"
     text = json.dumps(info)
     for secret in ("user:pw", "key=", "apikey", "u:p@", "t=s"):
         assert secret not in text
@@ -1301,12 +1301,13 @@ def test_session_reports_never_include_the_token(mcp):
     storage.save_session(stored_session())
     status = invoke(mcp, "auth_status")
     assert set(status) == {"addr", "expiresAt", "endpoint"}
-    assert (status["addr"], status["endpoint"]) == (ADDR, ENDPOINT)
+    assert status["addr"] == ADDR
+    assert status["endpoint"] == "https://sai-keeper.nibiru.fi"
     info = invoke(mcp, "mcp_info")
     assert info["session"]["addr"] == ADDR
     assert info["session"]["usable"] is True
     assert info["provenance"]["kind"] in ("source-checkout", "installed")
-    assert info["endpoints"]["keeper"] == ENDPOINT
+    assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"
 
 
 # Stdio
@@ -1373,8 +1374,8 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     assert "sai auth login" in started["instructions"]
     assert {tool["name"] for tool in listed["tools"]} == READ_TOOLS | TRADE_TOOLS
     info = json.loads(called["content"][0]["text"])
-    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9/query"
-    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9/query"
+    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
+    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
     assert info["trading"]["reason"] == "signed-out"
     assert "agent client should launch it" not in stderr
 

@@ -28,7 +28,7 @@ from ..core import log as sai_log
 from ..core import session as sessions
 from ..core.errors import Code, SaiError, SessionError
 from ..core.errors import describe as describe_error
-from ..core.settings import Settings, public_url
+from ..core.settings import Settings
 
 log = logging.getLogger("sai_cli.mcp_server")
 
@@ -302,17 +302,14 @@ def session_state(settings: Settings) -> dict[str, Any]:
         "signedIn": True,
         "connectedAccounts": connected,
         "usable": matches and not expired,
-        "addr": stored["evmAddress"],
-        "expiresAt": stored["expiresAt"],
+        **sessions.summary(stored),
         "expired": expired,
-        "endpoint": public_url(stored.get("endpoint")),
         "endpointMatches": matches,
     }
 
 
 def auth_status(settings: Settings, addr: str | None = None) -> dict[str, Any]:
-    result = sessions.summary(session_loader(settings, addr)())
-    return {**result, "endpoint": public_url(result["endpoint"])}
+    return sessions.summary(session_loader(settings, addr)())
 
 
 def account_rows(settings: Settings) -> dict[str, Any]:
@@ -325,11 +322,9 @@ def account_rows(settings: Settings) -> dict[str, Any]:
         matches = result.get("endpoint") == settings.endpoint
         rows.append(
             {
-                "addr": result["evmAddress"],
+                **sessions.summary(result),
                 "active": key == accounts["active"],
-                "expiresAt": result["expiresAt"],
                 "expired": expired,
-                "endpoint": public_url(result.get("endpoint")),
                 "endpointMatches": matches,
                 "usable": matches and not expired,
             }

@@ -86,9 +86,9 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
 
 
 def summary(result: dict[str, str]) -> dict[str, str]:
-    """Return the fields safe to show: addr, expiry, endpoint; no token."""
+    """Return the address, expiry, and Keeper origin for display."""
     return {
         "addr": result["evmAddress"],
         "expiresAt": result["expiresAt"],
-        "endpoint": result["endpoint"],
+        "endpoint": log.origin(result["endpoint"]),
     }

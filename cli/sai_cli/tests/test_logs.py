@@ -596,6 +596,42 @@ def test_no_token_or_url_credential_reaches_a_log_line(home, keeper_stub):
     )
 
 
+def test_auth_and_mcp_show_only_keeper_origins(home, keeper_stub):
+    base, state = keeper_stub
+    origin = base.removesuffix("/query")
+    endpoint = f"{origin}/{PATH_KEY}/query?api_key={URL_KEY}"
+    save_session(endpoint)
+
+    for args in (("auth", "status"), ("auth", "list"), ("auth", "use", ADDR)):
+        for flags in ((), ("--json",)):
+            code, output = run_cli(*flags, "--endpoint", endpoint, *args)
+            assert code == 0
+            assert origin in output
+            assert PATH_KEY not in output and URL_KEY not in output
+
+    code, output = run_cli("--json", "--endpoint", base, "auth", "list")
+    assert code == 0
+    assert json.loads(output)["accounts"][0]["endpointMatches"] is False
+
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    info = call(mcp, "mcp_info")
+    assert info["session"]["endpoint"] == origin
+    assert info["session"]["endpointMatches"] is True
+    assert info["endpoints"]["keeper"] == origin
+    assert info["endpoints"]["websocket"] == origin.replace("http:", "ws:", 1)
+    status = call(mcp, "auth_status")
+    accounts = call(mcp, "auth_list")
+    assert status["endpoint"] == accounts["accounts"][0]["endpoint"] == origin
+    for report in (info, status, accounts):
+        output = json.dumps(report)
+        assert PATH_KEY not in output and URL_KEY not in output
+
+    assert "oracle" in call(mcp, "market_prices")
+    assert state.paths == [f"/{PATH_KEY}/query?api_key={URL_KEY}"]
+    output = raw_logs(home)
+    assert PATH_KEY not in output and URL_KEY not in output
+
+
 # What each event records
 
 

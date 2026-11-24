@@ -161,7 +161,7 @@ def assert_connected(env: Env, token: str, result_stdout: str) -> None:
     assert output == {
         "addr": ADDR,
         "expiresAt": output["expiresAt"],
-        "endpoint": keeper.MAINNET_HTTP,
+        "endpoint": "https://sai-keeper.nibiru.fi",
     }
     assert token.encode() not in env.stored_bytes()
     status = env.run("--json", "auth", "status")
