@@ -195,14 +195,24 @@ jobs:
           path: .parity-trade-python
           persist-credentials: false
 
+      - name: Check out main for shipped Rust trade capabilities
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .parity-main
+          persist-credentials: false
+
       - name: Replay shared-state trade scenarios
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_MAIN_BIN: ${{ github.workspace }}/target/parity-main/debug/sai
           SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-trade-python
         shell: bash
         run: |
           uv sync --project "$SAI_PYTHON_REFERENCE" --locked
+          cargo build --locked --bin sai --manifest-path .parity-main/Cargo.toml --target-dir target/parity-main
           SAI_PARITY_RESERVE_BIN="$(cargo test --locked -p sai-core --test storage --no-run --message-format=json | jq -er '
             select(.reason == "compiler-artifact" and .target.name == "storage" and .profile.test)
             | .executable | select(. != null)

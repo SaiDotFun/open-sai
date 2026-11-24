@@ -104,10 +104,17 @@ def python_reference() -> Path | None:
 class Runtime:
     name: str
     cli: tuple[str, ...]
+    main_cli: tuple[str, ...] | None = None
 
     @property
     def rust(self) -> bool:
         return self.name == "rust"
+
+    @property
+    def main(self) -> Runtime | None:
+        if self.main_cli is not None:
+            return Runtime("rust", self.main_cli)
+        return None
 
 
 def runtime(name: str, request: pytest.FixtureRequest, python: Path | None) -> Runtime:
@@ -115,7 +122,15 @@ def runtime(name: str, request: pytest.FixtureRequest, python: Path | None) -> R
         if python is None:
             pytest.skip(f"set SAI_PYTHON_REFERENCE to a checkout of {REFERENCE}")
         _, native = request.getfixturevalue("cli_pair")
-        return Runtime(name, native)
+        main = os.environ.get("SAI_PARITY_MAIN_BIN")
+        if main is None:
+            assert os.environ.get("GITHUB_ACTIONS") != "true", (
+                "Missing Rust main baseline"
+            )
+            return Runtime(name, native)
+        executable = shutil.which(main)
+        assert executable is not None, "SAI_PARITY_MAIN_BIN must name an executable"
+        return Runtime(name, native, (executable,))
     return Runtime(name, (str(python or sys.executable), "-m", "sai_cli.sai_cli"))
 
 
@@ -171,6 +186,13 @@ class Home:
             (key, self.endpoints.keeper, ADDRESS, kind, entity, stored, outcome, "real")
         ]
         assert (self.path / LEDGER).stat().st_mode & 0o777 == 0o600
+
+    def ledger_rows(self) -> list[tuple[Any, ...]] | None:
+        path = self.path / LEDGER
+        if not path.exists():
+            return None
+        with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True)) as db:
+            return db.execute("SELECT * FROM intents ORDER BY id").fetchall()
 
     def events(self, key: str) -> list[dict[str, Any]]:
         events = []
@@ -369,7 +391,9 @@ ACTION_REASONS = {
 REPO_URL = "https://github.com/SaiDotFun/open-sai"
 
 
-def command_help(home: Home, runner: Runtime, group: str, command: str) -> str | None:
+def command_help(
+    home: Home, runner: Runtime, group: str, command: str, flag: str | None = None
+) -> str | None:
     result = home.invoke(runner, group, command, "--help")
     if (
         runner.rust
@@ -380,17 +404,24 @@ def command_help(home: Home, runner: Runtime, group: str, command: str) -> str |
             for name in (group, command)
         )
     ):
-        return None
-    assert result.returncode == 0 and result.stdout, (result.stdout, result.stderr)
-    return result.stdout
+        help_text = None
+    else:
+        assert result.returncode == 0 and result.stdout, (result.stdout, result.stderr)
+        help_text = result.stdout
+    if help_text is not None and (flag is None or flag in help_text):
+        return help_text
+    if (main := runner.main) is not None:
+        assert command_help(home, main, group, command, flag) is None, (
+            f"Rust candidate dropped shipped {group} {command} {flag or ''}".rstrip()
+        )
+    return None
 
 
 def trade_help(home: Home, runner: Runtime, action_name: str) -> str:
     action = ACTIONS[action_name]
-    help_text = command_help(home, runner, "trade", action.args[0])
-    if help_text is None or (
-        action_name == "cancel" and "--cancel-order" not in help_text
-    ):
+    flag = "--cancel-order" if action_name == "cancel" else None
+    help_text = command_help(home, runner, "trade", action.args[0], flag)
+    if help_text is None:
         assert runner.rust
         pytest.skip(
             f"Rust trade {action_name} awaits {REPO_URL}/{ACTION_REASONS[action_name]}"
@@ -489,9 +520,10 @@ def test_trade_wait_replays_pending_then_receipt(
     with loopback(action.server, trade_replay=replay) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
-        if "--wait" not in trade_help(home, writer, action_name):
+        trade_help(home, writer, action_name)
+        if command_help(home, writer, "trade", action.args[0], "--wait") is None:
             assert writer.rust
-            pytest.skip("Rust trade --wait awaits #122")
+            pytest.skip(f"Rust trade --wait awaits {REPO_URL}/pull/122")
         result = home.json(writer, "trade", *action.args, "--wait")
         key = result["intentKey"]
         assert result["outcome"] == action.outcome
@@ -550,7 +582,7 @@ def test_wait_deadline_then_restart(
         seed_home(home.path, endpoints, "session")
         trade_help(home, writer, "close")
         if command_help(home, reader, "intent", "wait") is None:
-            pytest.skip("Rust intent wait awaits #122")
+            pytest.skip(f"Rust intent wait awaits {REPO_URL}/pull/122")
         first = home.json(writer, "trade", *action.args)
         key = first["intentKey"]
         wait = ("intent", "wait", key, "--timeout", "1")
@@ -644,7 +676,65 @@ def rust_mcp_stub(runner: Runtime, name: str, result: dict[str, Any]) -> bool:
 
 def require_mcp(home: Home, runner: Runtime) -> None:
     if command_help(home, runner, "mcp", "serve") is None:
-        pytest.skip("Rust MCP stdio awaits #120 and the signed-in trade handlers")
+        pytest.skip(f"Rust MCP stdio awaits {REPO_URL}/pull/120")
+
+
+async def tool_names(session: ClientSession) -> set[str]:
+    async with asyncio.timeout(10):
+        return {item.name for item in (await session.list_tools()).tools}
+
+
+async def assert_mcp_pending(
+    home: Home,
+    runner: Runtime,
+    names: set[str],
+    *,
+    stub_args: dict[str, Any] | None = None,
+) -> None:
+    main = runner.main
+    if main is None or command_help(home, main, "mcp", "serve") is None:
+        return
+    async with mcp_session(home, main) as baseline:
+        shipped = names & await tool_names(baseline)
+        if stub_args is None:
+            assert not shipped, (
+                f"Rust candidate dropped shipped MCP tools {sorted(shipped)}"
+            )
+        elif shipped:
+            [name] = shipped
+            safe_args = stub_args.copy()
+            if "preview_digest" in safe_args:
+                # A bad digest probes whether the handler is live without authorizing a trade.
+                safe_args["preview_digest"] = "0" * 64
+            result = await tool(baseline, name, **safe_args)
+            assert rust_mcp_stub(main, name, result), (
+                f"Rust candidate stubbed shipped MCP tool {name}"
+            )
+
+
+def mutation_state(home: Home, replay: TradeReplay) -> tuple[object, ...]:
+    return replay.attempts(), replay.admitted_keys(), home.ledger_rows()
+
+
+async def trade_tool(
+    session: ClientSession,
+    home: Home,
+    replay: TradeReplay,
+    runner: Runtime,
+    name: str,
+    **params: Any,
+) -> dict[str, Any]:
+    before = mutation_state(home, replay)
+    result = await tool(session, name, **params)
+    if rust_mcp_stub(runner, name, result):
+        assert mutation_state(home, replay) == before, (
+            f"MCP stub {name} changed trade state"
+        )
+        await assert_mcp_pending(home, runner, {name}, stub_args=params)
+        assert mutation_state(home, replay) == before, (
+            f"MCP baseline probe for {name} changed trade state"
+        )
+    return result
 
 
 MCP_ARGS: dict[str, dict[str, Any]] = {
@@ -670,15 +760,24 @@ def mcp_action(action_name: str) -> str:
 
 
 async def mcp_preview(
-    session: ClientSession, runner: Runtime, action_name: str
+    session: ClientSession,
+    home: Home,
+    replay: TradeReplay,
+    runner: Runtime,
+    action_name: str,
 ) -> dict[str, Any] | None:
     name = mcp_action(action_name)
     preview_name = f"preview_{name}"
-    async with asyncio.timeout(10):
-        tools = {item.name for item in (await session.list_tools()).tools}
-    if runner.rust and not {preview_name, f"trade_{name}"} <= tools:
+    before = mutation_state(home, replay)
+    missing = {preview_name, f"trade_{name}"} - await tool_names(session)
+    if missing:
+        assert runner.rust, f"Python MCP tools missing: {sorted(missing)}"
+        await assert_mcp_pending(home, runner, missing)
+        assert mutation_state(home, replay) == before
         return None
-    preview = await tool(session, preview_name, **MCP_ARGS[action_name])
+    preview = await trade_tool(
+        session, home, replay, runner, preview_name, **MCP_ARGS[action_name]
+    )
     if rust_mcp_stub(runner, preview_name, preview):
         return None
     assert preview["addr"] == ADDRESS and preview["dryRun"] is True
@@ -715,10 +814,12 @@ def test_cli_and_mcp_overlap(
         seed_home(home.path, endpoints, "session")
         trade_help(home, cli, action_name)
         require_mcp(home, mcp)
+        admitted_by_cli: str | None = None
 
         async def overlap() -> str | None:
+            nonlocal admitted_by_cli
             async with mcp_session(home, mcp) as session:
-                preview = await mcp_preview(session, mcp, action_name)
+                preview = await mcp_preview(session, home, replay, mcp, action_name)
                 if preview is None:
                     return None
                 params = {
@@ -737,7 +838,9 @@ def test_cli_and_mcp_overlap(
                     return data["error"] if result.returncode else data
 
                 async def mcp_trade() -> dict[str, Any]:
-                    return await tool(session, tool_name, **params)
+                    return await trade_tool(
+                        session, home, replay, mcp, tool_name, **params
+                    )
 
                 start, contend = (
                     (cli_trade, mcp_trade)
@@ -759,6 +862,8 @@ def test_cli_and_mcp_overlap(
                         )
                     assert arrived.result(), f"{first_surface} did not reach Keeper"
                     [key] = replay.admitted_keys()
+                    if first_surface == "cli":
+                        admitted_by_cli = key
                     home.row(key, replay.kind, replay.entity, "unknown")
                     sent = replay.intent(key).copy()
                     del sent["intentSchemaVersion"], sent["tsIntentInit"]
@@ -794,7 +899,14 @@ def test_cli_and_mcp_overlap(
 
         key = asyncio.run(overlap())
         if key is None:
-            pytest.skip(f"Rust MCP {mcp_action(action_name)} awaits signed-in handlers")
+            expected = {admitted_by_cli: 1} if admitted_by_cli is not None else {}
+            assert replay.attempts() == expected and replay.admitted_keys() == set(
+                expected
+            )
+            assert not endpoints.errors
+            pytest.skip(
+                f"Rust MCP {mcp_action(action_name)} awaits {REPO_URL}/issues/176"
+            )
         home.row(key, replay.kind, replay.entity, "accepted")
         replay.phase = "pending"
         home.json(reconciler, "intent", "status", ADDRESS, "--key", key)
@@ -826,12 +938,15 @@ def test_mcp_confirmation_rechecks_active_account(
 
         async def confirm() -> bool:
             async with mcp_session(home, mcp) as session:
-                preview = await mcp_preview(session, mcp, "close")
+                preview = await mcp_preview(session, home, replay, mcp, "close")
                 if preview is None:
                     return False
                 await asyncio.to_thread(home.json, cli, "auth", "use", OTHER_ADDRESS)
-                refused = await tool(
+                refused = await trade_tool(
                     session,
+                    home,
+                    replay,
+                    mcp,
                     "trade_close",
                     trade_id=7,
                     preview_digest=preview["previewDigest"],
@@ -843,10 +958,9 @@ def test_mcp_confirmation_rechecks_active_account(
                 assert refused["preview"]["previewDigest"] != preview["previewDigest"]
                 return True
 
-        if not asyncio.run(confirm()):
-            pytest.skip(
-                "Rust MCP preview_close and trade_close await signed-in handlers"
-            )
+        confirmed = asyncio.run(confirm())
         assert replay.attempts() == {} and replay.admitted_keys() == set()
         assert not endpoints.errors
         assert not (home.path / LEDGER).exists()
+        if not confirmed:
+            pytest.skip(f"Rust MCP close confirmation awaits {REPO_URL}/issues/176")

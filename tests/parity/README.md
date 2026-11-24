@@ -163,10 +163,11 @@ reply to exercise contention, transport timeouts, and reconciliation. The
 wait cases replay pending and final results and check the receipt against
 the original request and the indexed execution.
 
-Native trade and wait cases report the missing command, flag, or signed-in
-MCP handler in their skip reason. The cases run when their adapters are
-available. The Python subprocess cases also run in a checkout with no Rust
-binary or pinned reference configured.
+Native trade, wait, and MCP skips link to their tracking issue or PR. CI
+also builds the PR base on `main` and checks its CLI and MCP capabilities
+before skipping. For the same check locally, set `SAI_PARITY_MAIN_BIN` to
+the executable built from `main`. A missing shipped adapter or an MCP
+stub that changes the ledger or touches Keeper's mutation fails the case.
 
 ## Doctor and MCP Registration Reference
 
