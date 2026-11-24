@@ -87,7 +87,6 @@ def assert_unexposed(env: Env, output: str, *secrets: str) -> None:
         ("--json", "auth", "login"),
         ("--json", "auth", "login", "--addr"),
         ("--json", "auth", "login", "--account", "dev"),
-        ("--json", "auth", "import", "unexpected"),
     ],
 )
 def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> None:
@@ -257,6 +256,35 @@ def test_auth_summaries_hide_keeper_path(
         )
         results.append(outputs)
     assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("form", ["operand", "escaped", "option-value"])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_import_usage_keeps_rejected_token_private(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI], json_output: bool, form: str
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    token = fixture_token(ADDR)
+    args = ("--json",) if json_output else ()
+    operands = {
+        "operand": (token,),
+        "escaped": ("--", f"--{token}"),
+        "option-value": (f"--help={token}",),
+    }[form]
+    result = rust.run(*args, "auth", "import", *operands)
+    assert result.returncode == 2
+    assert_unexposed(rust, result.stdout + result.stderr, token)
+    assert not session_state(rust)["sessions"]
+    if json_output:
+        assert json.loads(result.stdout)["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": "Unexpected arguments to auth import.",
+            "retryable": False,
+        }
+        assert result.stderr == ""
+    else:
+        assert "Error: Unexpected arguments to auth import." in result.stderr
+        assert result.stdout == ""
 
 
 @pytest.mark.parametrize(

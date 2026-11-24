@@ -108,13 +108,19 @@ fn main() -> process::ExitCode {
         command: (!command.is_empty()).then_some(command),
     };
     if let Some(writer) = &writer {
+        // Import accepts no operands, and a stray argument can contain a token.
+        let logged_argv = if command == "auth import" {
+            &argv[..argv.len() - operands.len()]
+        } else {
+            &argv
+        };
         writer.event(
             Surface::Cli,
             "command.start",
             Level::Info,
             [
                 ("command", command_field()),
-                ("argv", Field::argv(argv.iter().take(64).cloned())),
+                ("argv", Field::argv(logged_argv.iter().take(64).cloned())),
             ],
         );
     }
@@ -353,6 +359,13 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
 
 fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<SaiError> {
     let arg = context_text(error, ContextKind::InvalidArg);
+    if command == "auth import"
+        && !(error.kind() == ErrorKind::UnknownArgument
+            && arg == Some("--json")
+            && operands.first().is_some_and(|arg| arg == "--json"))
+    {
+        return Some(SaiError::usage("Unexpected arguments to auth import."));
+    }
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
             let command = context_text(error, ContextKind::InvalidSubcommand)?;
