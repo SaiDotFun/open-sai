@@ -992,7 +992,7 @@ def test_public_history_projects_after_raw_hash_correlation(
                     {
                         "data": {
                             "userIntents": [
-                                {**intent, "txHash": opaque, "execBlockTs": c4_time}
+                                {**intent, "txHash": "cd" * 32, "execBlockTs": c4_time}
                             ],
                             "extra": opaque,
                         }
@@ -1037,7 +1037,9 @@ def test_public_history_preserves_liquidation_label(
             replies.clear()
             replies.extend(
                 [
-                    response({"data": {"userIntents": [{**intent, "txHash": opaque}]}}),
+                    response(
+                        {"data": {"userIntents": [{**intent, "txHash": "cd" * 32}]}}
+                    ),
                     response({"data": {"perp": {"tradeHistory": [history]}}}),
                 ]
             )
@@ -1055,9 +1057,6 @@ def test_public_history_preserves_liquidation_label(
             )
             assert result.returncode == 0, (result.stdout, result.stderr)
             [row] = json.loads(result.stdout)["matchedTradeHistory"]
-            if index == 0:
-                # The pinned Python CLI returns raw rows. Apply its public projection.
-                row = keeper.safe_intent_history(row)
             assert row.get("tradeChangeType") == projected
 
 
