@@ -175,7 +175,7 @@ jobs:
       - run: |
           uv sync --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
-          uv sync --project .parity-overview-python --locked --all-groups
+          uv sync --project .parity-overview-python --locked --all-groups --python 3.13
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'

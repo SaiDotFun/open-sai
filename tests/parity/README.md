@@ -121,7 +121,10 @@ volatile fields listed in `docs/log-events.json` and to generated intent keys.
 
 The `account-overview-*` and `account-bare` cases use Python main at
 `53ef4fb70f30bd8c340749b131f509d65ab86ed4` (v0.1.2 plus the LCD
-deadline fix in PR #119). Rust CI installs that reference separately.
+deadline fix in PR #119). Rust CI installs that reference on Python 3.13.
+The three-position case compares gross PnL against the compensated
+`sum()` in Python 3.12 and later. Both implementations use the same
+summation on Python 3.11, the package's minimum supported interpreter.
 Set `SAI_PARITY_OVERVIEW_PYTHON` to its `sai` executable for local runs.
 The cases validate height-pinned requests and compare section errors,
 source timestamps, risk values, and persisted state. Fetch timestamps and

@@ -40,7 +40,7 @@ class OverviewReplay:
             "contractMarkets": {},
             "http": {},
         }
-        long, _ = populate_trades(self.state)
+        long, short = populate_trades(self.state)
         if scenario == "overview-stale":
             rate = self.state["oracleRates"][
                 long["perpBorrowing"]["baseToken"]["id"], 0
@@ -56,6 +56,19 @@ class OverviewReplay:
             }
             install_contract_trade(self.state, long, mark=100, liquidation=100)
             install_oracle_quote(self.state, collateral["id"], 0, mark="0.04")
+        if scenario == "overview-pnl-total":
+            extra = {**long, "id": 4}
+            for amount, row in enumerate((long, short, extra), 1):
+                row.update(
+                    isLong=True,
+                    leverage=1,
+                    openPrice=100,
+                    collateralAmount=amount * 1_000_000,
+                )
+                install_contract_trade(self.state, row, mark=110, liquidation=50)
+            self.state["http"][keeper.OVERVIEW_TRADES]["data"]["perp"]["trades"].append(
+                extra
+            )
         self.balances = recorded["balances"]
         self.balances["data"]["userBalances"].append(
             {

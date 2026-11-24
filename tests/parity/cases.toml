@@ -199,6 +199,34 @@ wire = [
 state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
 
 [[case]]
+name = "account-overview-pnl-total"
+args = ["account", "overview", "--json"]
+seed = "overview-session"
+server = "overview-pnl-total"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "get_trade",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
 name = "account-overview-liquidation-json"
 args = ["account", "overview", "--json"]
 seed = "overview-session"

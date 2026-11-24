@@ -129,9 +129,7 @@ pub(super) async fn read(view: &Overview<'_>) -> TradeSections {
             ));
         }
         let total = if snapshot.complete && membership_complete {
-            rows.iter().try_fold(0.0, |sum, row| {
-                Some(sum + row["unrealizedPnlUsd"].as_f64()?)
-            })
+            total_pnl(rows)
         } else {
             None
         };
@@ -148,6 +146,27 @@ pub(super) async fn read(view: &Overview<'_>) -> TradeSections {
         orders,
         prices,
     }
+}
+
+fn total_pnl(rows: &[Value]) -> Option<f64> {
+    // Neumaier summation matches Python 3.12+ sum() for per-position floats.
+    let mut sum = 0.0_f64;
+    let mut correction = 0.0;
+    for row in rows {
+        let pnl = row["unrealizedPnlUsd"].as_f64()?;
+        let next = sum + pnl;
+        correction += if sum.abs() >= pnl.abs() {
+            (sum - next) + pnl
+        } else {
+            (pnl - next) + sum
+        };
+        sum = next;
+    }
+    Some(if correction != 0.0 && correction.is_finite() {
+        sum + correction
+    } else {
+        sum
+    })
 }
 
 async fn fill_awaits_indexing(view: &Overview<'_>) -> bool {
