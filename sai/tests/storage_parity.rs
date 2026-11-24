@@ -97,6 +97,24 @@ fn missing_home_status_and_list_have_no_side_effects() {
 }
 
 #[test]
+fn signed_out_trade_hides_keeper_query_path_in_hint() {
+    let home = tempdir().unwrap();
+    let endpoint = format!("{ENDPOINT}/query");
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", &endpoint, "trade", "close", "7"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stderr.is_empty());
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "SIGNED_OUT");
+    assert_eq!(
+        error["hint"],
+        r#"sai --endpoint "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME"#
+    );
+}
+
+#[test]
 fn auth_output_shows_only_the_origin_but_checks_the_full_endpoint() {
     let home = tempdir().unwrap();
     let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture#secret";

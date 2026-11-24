@@ -188,22 +188,26 @@ impl<'a> Storage<'a> {
     pub fn intent_status_hint(&self, endpoint: &str, account: &str, key: &str) -> String {
         use crate::session::shell_quote;
 
-        let flag = if endpoint_origin(endpoint) == endpoint
-            && self
-                .trader
-                .parent()
-                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
-        {
-            shell_quote(endpoint)
-        } else {
-            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-                .into()
-        };
+        let flag = self.keeper_hint_flag(endpoint);
         format!(
             "sai --endpoint {flag} intent status {} --key {}",
             shell_quote(account),
             shell_quote(key)
         )
+    }
+
+    pub(crate) fn keeper_hint_flag(&self, endpoint: &str) -> String {
+        if endpoint_origin(endpoint) == endpoint
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
+        {
+            crate::session::shell_quote(endpoint)
+        } else {
+            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
+                .into()
+        }
     }
 
     pub(crate) fn emit(&self, event: StorageEvent<'_>) {
