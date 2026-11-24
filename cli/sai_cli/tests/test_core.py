@@ -242,6 +242,21 @@ def test_sign_in_and_logout_recover_from_an_unreadable_store(session):
     assert not storage.session_exists()
 
 
+@pytest.mark.parametrize("explicit", [False, True])
+def test_logout_without_a_matching_session_does_not_create_a_lock(session, explicit):
+    storage.save_session(session)
+    other = {**session, "evmAddress": "0x" + "c" * 40}
+    storage.save_session(other)
+    assert storage.delete_session() == other["evmAddress"]
+    lock = storage.home() / "sessions.lock"
+    lock.unlink()
+
+    missing = other["evmAddress"] if explicit else None
+    assert storage.delete_session(missing) is None
+    assert not lock.exists()
+    assert storage.load_session(session["evmAddress"]) == session
+
+
 @pytest.mark.parametrize("failure", ["expired", "wrong_endpoint"])
 def test_session_refuses_expired_or_wrong_network(session, failure):
     if failure == "expired":

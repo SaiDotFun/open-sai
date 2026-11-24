@@ -336,7 +336,13 @@ def use_session(addr: str) -> dict[str, str]:
 
 def session_exists() -> bool:
     """Report whether any session file is stored, without reading it."""
-    return (home() / "sessions.json").is_file() or _v2_path().is_file()
+    # Sign-in writes the new file before unlinking the legacy file.
+    return _v2_path().is_file() or _sessions_path().is_file()
+
+
+def _logout_key(accounts: dict[str, Any], addr: str | None) -> str | None:
+    key = accounts["active"] if addr is None else addr.lower()
+    return key if key in accounts["sessions"] else None
 
 
 def delete_session(addr: str | None = None) -> str | None:
@@ -346,6 +352,17 @@ def delete_session(addr: str | None = None) -> str | None:
     Removing the active account leaves no account active. Without ADDR, a
     store that cannot be read is deleted and reported as removed.
     """
+    if not session_exists():
+        return None
+    if not (home() / "sessions.lock").exists():
+        # A legacy or copied store may have no lock yet. Leave it alone if
+        # this logout is a no-op, and re-read under the lock before writing.
+        try:
+            if _logout_key(load_accounts(), addr) is None:
+                return None
+        except ValueError:
+            if addr is not None:
+                raise
     with _locked():
         # Checked under the lock: a sign-in may be migrating the old file.
         if not session_exists():
@@ -363,14 +380,9 @@ def delete_session(addr: str | None = None) -> str | None:
                 reason="unreadable session file",
             )
             return UNREADABLE_REMOVED
-        if addr is None:
-            key = accounts["active"]
-            if key is None:
-                return None
-        else:
-            key = addr.lower()
-            if key not in accounts["sessions"]:
-                return None
+        key = _logout_key(accounts, addr)
+        if key is None:
+            return None
         removed = accounts["sessions"].pop(key)["evmAddress"]
         if accounts["active"] == key:
             accounts["active"] = None

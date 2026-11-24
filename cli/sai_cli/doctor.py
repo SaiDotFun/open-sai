@@ -508,7 +508,11 @@ def profile_has_data(
             or (directory == "cache/wheels" and update.is_wheel_name(name))
         ):
             return None
-        elif directory == "trader":
+        elif (
+            directory == "trader"
+            and name in ("intents.sqlite3", "sessions.json", "session.json")
+            and info.st_size > 0
+        ):
             has_data = True
     return has_data
 

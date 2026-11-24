@@ -322,15 +322,18 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
 @pytest.mark.parametrize("default_home", [False, True])
 @pytest.mark.parametrize("trader_mode", [0o700, 0o775])
+@pytest.mark.parametrize("evidence", ["sessions", "ledger"])
 def test_doctor_repairs_a_dedicated_existing_sai_home(
-    isolated_home, default_home, trader_mode, monkeypatch
+    isolated_home, default_home, trader_mode, evidence, monkeypatch
 ):
     if default_home:
         monkeypatch.setenv("HOME", str(isolated_home))
         isolated_home = isolated_home / ".sai"
         monkeypatch.delenv("SAI_HOME")
-    save()
-    storage.db().close()
+    if evidence == "sessions":
+        save()
+    else:
+        storage.db().close()
     wheels = updater.private_cache()
     (wheels / update.wheel_name("0.1.0")).touch()
     isolated_home.chmod(0o755)
@@ -377,6 +380,42 @@ def test_doctor_leaves_a_home_with_only_foreign_config_at_0755(isolated_home):
         assert "moving the profile to a dedicated directory" in check["fix"]
         assert isolated_home.stat().st_mode & 0o777 == 0o755
         assert config.read_text() == "[foreign]\nsetting = true\n"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize(
+    ("filename", "content"),
+    [
+        ("sessions.lock", b""),
+        ("sessions.lock", b"\0"),
+        ("sessions.json", b""),
+        ("session.json", b""),
+        ("intents.sqlite3", b""),
+        ("history", b"config list\n"),
+    ],
+)
+def test_doctor_needs_more_than_trader_artifacts(
+    isolated_home, monkeypatch, filename, content
+):
+    (isolated_home / "config.toml").write_text("[foreign]\nsetting = true\n")
+    isolated_home.chmod(0o755)
+    monkeypatch.setenv("SAI_LOG", "0")
+    trader = isolated_home / "trader"
+
+    code, output = run_cli("--json", "auth", "logout")
+    assert code == 0 and json.loads(output)["removed"] is False
+    assert not trader.exists()
+
+    trader.mkdir(mode=0o700)
+    artifact = trader / filename
+    artifact.write_bytes(content)
+    artifact.chmod(0o600)
+    for fix in (False, True):
+        check = one(doctor.check_home, ctx(fix=fix))
+        assert check.status == "warn"
+        assert check.fix == doctor.SAI_HOME_MODE_FIX
+        assert check.changes == []
+        assert isolated_home.stat().st_mode & 0o777 == 0o755
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
