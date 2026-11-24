@@ -986,6 +986,50 @@ def test_local_usage_matches_click(
 
 
 @pytest.mark.parametrize(
+    "args, mode",
+    [
+        (("logs", "tail", "--surface"), "text"),
+        (("--json", "logs", "tail", "-n"), "json"),
+        (("logs", "tail"), "text"),
+        (("--json", "skill", "source"), "json"),
+        (("config", "get"), "text"),
+        ((), "text"),
+    ],
+)
+def test_usage_errors_hide_rejected_endpoint_credentials(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    args: tuple[str, ...],
+    mode: str,
+) -> None:
+    # Accepted divergence: Python v0.1.2 prints the rejected URL.
+    endpoint = (
+        "https://fixture-user:fixture-password@fixture.invalid/"
+        "fixture-private?api_key=fixture-key#fixture-fragment"
+    )
+    markers = (
+        b"fixture-password",
+        b"fixture-private",
+        b"fixture-key",
+        b"fixture-fragment",
+    )
+    for index, cli in enumerate(local_pair):
+        result = invoke(cli, tmp_path / str(index), *args, endpoint)
+        assert result.returncode == 2
+        if mode == "json":
+            assert result.stderr == b""
+            assert json.loads(result.stdout)["error"]["message"]
+        else:
+            assert result.stdout == b""
+            assert b"Error:" in result.stderr
+        output = result.stdout + result.stderr
+        if index:
+            assert all(marker not in output for marker in markers)
+        else:
+            assert all(marker in output for marker in markers)
+
+
+@pytest.mark.parametrize(
     "args",
     [
         ("--json", "config", "set", "keeper.endpoint", "https://fixture.invalid:abc"),

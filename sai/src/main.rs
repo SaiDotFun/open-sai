@@ -287,6 +287,16 @@ fn load_settings(flags: &Flags, env: &Environment) -> Result<Settings, SettingsE
     Ok(settings)
 }
 
+const INVALID_ARGUMENTS: &str = "Invalid command arguments.";
+
+fn usage_diagnostic(text: &str) -> &str {
+    if log::contains_url(text) {
+        INVALID_ARGUMENTS
+    } else {
+        text
+    }
+}
+
 fn complete(
     result: Result<(), SaiError>,
     command: &str,
@@ -303,7 +313,14 @@ fn complete(
         eprintln!("Interrupted");
         return (error.exit_code, Some(error));
     }
-    let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
+    let redact = |text: &str| {
+        let text = if error.exit_code == ExitCode::Usage {
+            usage_diagnostic(text)
+        } else {
+            text
+        };
+        home.map_or_else(|| text.to_owned(), |home| log::redact(home, text))
+    };
     let message = redact(&error.message);
     let interrupted = error.code == Code::InvalidRequest && error.message == "Aborted";
     // Auth import emits its own newline on cancellation.
@@ -314,7 +331,7 @@ fn complete(
         let mut body =
             json!({"code": error.code, "message": message, "retryable": error.retryable()});
         if let Some(key) = &error.intent_key {
-            body["intentKey"] = json!(key);
+            body["intentKey"] = json!(redact(key));
         }
         if let Some(hint) = &error.hint {
             body["hint"] = json!(redact(hint));
@@ -671,7 +688,7 @@ fn print_parse_error(
     if let Some(usage) = usage_error(error, usage_command, operands) {
         if !json && error.kind() == ErrorKind::InvalidValue && usage.message.starts_with("Option ")
         {
-            eprintln!("Error: {}", usage.message);
+            eprintln!("Error: {}", usage_diagnostic(&usage.message));
             return (ExitCode::Usage, Some(usage));
         }
         return complete(Err(usage), usage_command, json, home);
@@ -681,9 +698,17 @@ fn print_parse_error(
             ErrorKind::MissingSubcommand if command.is_empty() => {
                 "Pass a command when using --json."
             }
-            _ => "Invalid command arguments.",
+            _ => INVALID_ARGUMENTS,
         };
         return complete(Err(SaiError::usage(message)), usage_command, true, home);
+    }
+    if log::contains_url(&error.to_string()) {
+        return complete(
+            Err(SaiError::usage(INVALID_ARGUMENTS)),
+            usage_command,
+            false,
+            home,
+        );
     }
     let _ = error.print();
     (ExitCode::Usage, None)

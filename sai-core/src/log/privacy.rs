@@ -31,6 +31,16 @@ fn regex(pattern: &str) -> Regex {
     Regex::new(pattern).expect("valid log redaction pattern")
 }
 
+/// Detect URL-shaped values, including malformed ones rejected by the CLI.
+pub fn contains_url(text: &str) -> bool {
+    URL.find_iter(text).any(|matched| {
+        let (_, value) = matched.as_str().split_once("://").unwrap();
+        !value
+            .trim_end_matches(['.', ',', ':', ';', ')', ']', '}', '\'', '"'])
+            .is_empty()
+    })
+}
+
 /// A log field with its text redaction policy.
 pub enum Field {
     Text(String),
