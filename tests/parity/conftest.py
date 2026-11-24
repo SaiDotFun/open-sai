@@ -50,6 +50,11 @@ def wait_cli_pair(
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
     reference = os.environ.get("SAI_PARITY_WAIT_PYTHON")
     if reference is None:
+        if (
+            os.environ.get("GITHUB_ACTIONS") == "true"
+            and "SAI_PARITY_BIN" in os.environ
+        ):
+            pytest.fail("native parity CI requires SAI_PARITY_WAIT_PYTHON")
         pytest.skip("set SAI_PARITY_WAIT_PYTHON to the pinned Python sai launcher")
     monkeypatch.setenv("SAI_PARITY_PYTHON", reference)
     return request.getfixturevalue("cli_pair")
