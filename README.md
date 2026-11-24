@@ -40,6 +40,11 @@ Before tagging the bridge, set that same version in `pyproject.toml` so the
 existing release workflow builds the matching wheel. The first native tag
 must use a higher version.
 
+If uv installed Sai from Git, run `uv tool uninstall sai-cli` and use the
+pinned installer above with the published full-Python bridge version. Then
+run `sai update`. The bridge keeps a verified Python wheel for offline
+recovery. Your Sai profile stays in place when you replace the uv tool.
+
 To build from source instead, install from Git:
 
 ```bash

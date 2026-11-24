@@ -1136,6 +1136,13 @@ def _install(
                 f"Keep sai {installed}. The supported Python pin is `sai-cli=={PRE_BRIDGE_PIN}`."
             )
             return Outcome(UNSUPPORTED, message, installed, target), False
+        if native and current.install.kind == update.UV_TOOL_GIT:
+            return unchanged(
+                "this uv Git install needs a verified full-Python bridge wheel first."
+                " Run `uv tool uninstall sai-cli`, then"
+                f" `{update.INSTALL_COMMAND} --version VERSION` with the published"
+                " full-Python bridge version. Then run `sai update`"
+            )
 
     trial = wheel_error(wheel) or preverify(
         spec, target, prefix, uv, options, native=native

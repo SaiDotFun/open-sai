@@ -828,6 +828,42 @@ main()
     assert not (install.tools / ".sai-cli-native-pending.json").exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_explains_how_to_convert_an_official_uv_git_install(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    version = wheel_version(python_wheel)
+    profile, contents = save_profile(install, replay)
+    prefix = install.tools / "sai-cli"
+    (direct_url,) = prefix.glob(
+        "lib/python*/site-packages/sai_cli-*.dist-info/direct_url.json"
+    )
+    # Replay PEP 610 metadata from an official Git install without fetching GitHub.
+    direct_url.write_text(
+        json.dumps(
+            {
+                "url": "https://github.com/SaiDotFun/open-sai",
+                "vcs_info": {"vcs": "git", "commit_id": PRE_BRIDGE_COMMIT},
+            }
+        )
+    )
+    candidate = add_shim(replay, artifact("SHIM"), artifact("RUST"))
+    result = install.update(replay)
+    assert result.returncode == 1
+    instruction = json.loads(result.stdout)["error"]["message"]
+    assert "uv tool uninstall sai-cli" in instruction
+    assert "scripts/install.py --version VERSION" in instruction
+    assert not any(path.endswith(asset_name(candidate)) for path in replay.requests)
+    install.pin(version)
+
+    ok(install.run("uv", "tool", "uninstall", "sai-cli"))
+    ok(install.install(replay, "--version", version))
+    install.pin(version)
+    assert profile.read_bytes() == contents
+
+
 def test_python_bridge_rejects_cross_origin_manifest_redirect(
     install: Install, replay: Replay
 ) -> None:
