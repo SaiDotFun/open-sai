@@ -45,11 +45,12 @@ from typing import Any
 import httpx
 
 from . import log, update
+from .errors import ExitCode
 
-EXIT_OK = 0
-EXIT_FAILED = 1
+EXIT_OK = ExitCode.OK
+EXIT_FAILED = ExitCode.ERROR
 # The install is one `sai update` does not change.
-EXIT_UNSUPPORTED = 3
+EXIT_UNSUPPORTED = ExitCode.UNSUPPORTED
 
 MAX_WHEEL = 64 << 20
 MAX_SUMS = 1 << 16
@@ -562,7 +563,7 @@ class Outcome:
     rolled_back: bool = False
 
     @property
-    def exit_code(self) -> int:
+    def exit_code(self) -> ExitCode:
         if self.status == UNSUPPORTED:
             return EXIT_UNSUPPORTED
         return EXIT_FAILED if self.status == FAILED else EXIT_OK

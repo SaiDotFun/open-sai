@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from secrets import choice
@@ -184,16 +185,19 @@ def submit(
             or ack["evmAddress"].lower() != account.lower()
         ):
             raise keeper.KeeperError("Acknowledgement does not match submitted intent")
-    except keeper.AdmissionRejected:
+    except keeper.AdmissionRejected as exc:
+        exc.intent_key = key
         storage.set_status(key, endpoint, account, "rejected")
         raise
-    except keeper.NotSent:
+    except keeper.NotSent as exc:
+        exc.intent_key = key
         storage.set_status(key, endpoint, account, "not_sent")
         raise
     except (keeper.KeeperError, KeyError, TypeError, AttributeError) as exc:
         raise keeper.OutcomeUnknown(
             f"Outcome unknown for intent {key}; reconcile before another trade",
             key,
+            hint=shlex.join(["sai", "intent", "status", account, "--key", key]),
         ) from exc
     storage.set_status(key, endpoint, account, "accepted")
     return {

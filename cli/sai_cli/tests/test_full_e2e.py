@@ -273,17 +273,26 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
 
     try:
         first = invoke("trade", "close", "7")
-        assert first.returncode != 0
-        assert "Outcome unknown" in first.stderr
         assert len(recorded) == 1
         key = recorded[0]["intentKey"]
+        assert first.returncode == 5 and first.stderr == ""
+        error = json.loads(first.stdout)["error"]
+        assert error == {
+            "code": "OUTCOME_UNKNOWN",
+            "message": f"Outcome unknown for intent {key}; reconcile before another trade",
+            "retryable": False,
+            "intentKey": key,
+            "hint": f"sai intent status {addr} --key {key}",
+        }
         saved = json.loads(invoke("intent", "local", addr).stdout)
         assert saved[0]["intentKey"] == key
         assert saved[0]["status"] == "unknown"
 
         duplicate = invoke("trade", "close", "7")
-        assert duplicate.returncode != 0
-        assert "Reconcile" in duplicate.stderr
+        assert duplicate.returncode == 1
+        blocked = json.loads(duplicate.stdout)["error"]
+        assert blocked["intentKey"] == key and blocked["retryable"] is False
+        assert "Reconcile" in blocked["message"]
         assert len(recorded) == 1
 
         status = invoke("intent", "status", addr, "--key", key)
@@ -303,8 +312,11 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
             == "terminal"
         )
         after_reconciliation = invoke("trade", "close", "7")
-        assert after_reconciliation.returncode != 0
-        assert "Outcome unknown" in after_reconciliation.stderr
+        assert after_reconciliation.returncode == 5
+        assert (
+            json.loads(after_reconciliation.stdout)["error"]["code"]
+            == "OUTCOME_UNKNOWN"
+        )
         assert len(recorded) == 2
         assert recorded[1]["intentKey"] != key
     finally:
@@ -418,6 +430,53 @@ def test_watch_reconnects_and_emits_a_fresh_snapshot():
         server_thread.join()
 
 
+def test_watch_prints_a_final_error_after_streamed_rows():
+    payload = fixture("mainnet_price_ws_payload.json")
+
+    def handler(connection):
+        assert json.loads(connection.recv())["type"] == "connection_init"
+        connection.send(json.dumps({"type": "connection_ack"}))
+        assert json.loads(connection.recv())["type"] == "subscribe"
+        connection.send(json.dumps({"id": "1", "type": "next", "payload": payload}))
+        connection.send(json.dumps({"id": "1", "type": "complete"}))
+
+    with serve(
+        handler, "127.0.0.1", 0, subprotocols=[Subprotocol("graphql-transport-ws")]
+    ) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.socket.getsockname()[1]
+            result = subprocess.run(
+                [
+                    *_resolve_cli(),
+                    "--json",
+                    "watch",
+                    "price",
+                    "1",
+                    "--ws-endpoint",
+                    f"ws://127.0.0.1:{port}/query",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=10,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+    assert result.returncode == 1
+    row, final = map(json.loads, result.stdout.splitlines())
+    assert row == payload
+    assert final == {
+        "error": {
+            "code": "STREAM_ERROR",
+            "message": "Keeper subscription ended",
+            "retryable": False,
+        }
+    }
+
+
 def test_balance_snapshot_fails_on_graphql_errors():
     def handler(connection):
         assert json.loads(connection.recv())["type"] == "connection_init"
@@ -458,9 +517,10 @@ def test_balance_snapshot_fails_on_graphql_errors():
             text=True,
             timeout=10,
         )
-        assert result.returncode != 0
-        assert "incomplete data" in result.stderr
-        assert not result.stdout.strip()
+        assert result.returncode == 1
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "STREAM_ERROR" and error["retryable"] is False
+        assert "incomplete data" in error["message"]
     finally:
         server.shutdown()
         thread.join()
@@ -517,14 +577,15 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
 
     try:
         first = invoke("trade", "tpsl", "7", "--take-profit", "100")
-        assert "Outcome unknown" in first.stderr
+        assert first.returncode == 5
+        assert json.loads(first.stdout)["error"]["code"] == "OUTCOME_UNKNOWN"
         key = recorded[0]["intentKey"]
 
         # Inside Keeper's admission window the key still blocks trading.
         fresh = invoke("intent", "status", addr, "--key", key)
         assert json.loads(fresh.stdout)["localStatus"] == "unknown"
         blocked = invoke("trade", "close", "7")
-        assert "Reconcile" in blocked.stderr
+        assert "Reconcile" in json.loads(blocked.stdout)["error"]["message"]
         assert len(recorded) == 1
 
         # Age the reservation past the admission expiry plus margin.
@@ -538,7 +599,7 @@ def test_unrecorded_intent_expires_and_unblocks_close(tmp_path, monkeypatch):
         assert json.loads(expired.stdout)["localStatus"] == "absent"
 
         allowed = invoke("trade", "close", "7")
-        assert "Reconcile" not in allowed.stderr
+        assert allowed.returncode == 5
         assert len(recorded) == 2
         assert recorded[1]["intent"]["kind"] == "CLOSE_POSITION"
     finally:
