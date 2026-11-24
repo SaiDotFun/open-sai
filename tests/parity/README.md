@@ -34,6 +34,21 @@ any selected case differs or fails its expectations.
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command that needs another fixture.
 
+## Native Distribution
+
+The Native Distribution workflow installs the built shim wheel with uv on
+each native target and serves the matching archive over loopback. Set
+`SAI_NATIVE_WHEEL` and `SAI_NATIVE_ARCHIVE` to their local paths to run
+`uv run --locked pytest tests/parity/test_native_distribution.py`. If uv
+is exposed through a version manager, set `UV` to the uv executable itself.
+
+The Linux x86_64 job also tests upgrade and offline rollback against the
+published Python release `sai-cli/v0.1.1` at commit
+`9ee5a356fd41a22697483e467652d367035909bd`. To run that case locally, set
+`SAI_NATIVE_BASELINE` to a directory with the published wheel and
+`SHA256SUMS`, `scripts/install.py` from the pinned commit as `install.py`,
+and the commit SHA in a file named `commit`.
+
 ## Add a Case
 
 Each `[[case]]` table has a unique `name` and a list of CLI arguments in
