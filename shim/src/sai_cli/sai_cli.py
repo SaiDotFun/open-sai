@@ -493,18 +493,19 @@ def main() -> int:
     try:
         with verified_binary() as (binary, executable):
             argv = [str(binary), *sys.argv[1:]]
+            env = {**os.environ, "SAI_NATIVE_UV_PREFIX": sys.prefix}
             # Match subprocess's restore_signals behavior. CPython ignores
             # these signals on startup, and exec preserves ignored handlers.
             for name in ("SIGPIPE", "SIGXFZ", "SIGXFSZ"):
                 if signum := getattr(signal, name, None):
                     signal.signal(signum, signal.SIG_DFL)
             if os.execve in os.supports_fd:
-                os.execve(executable.fileno(), argv, os.environ)
+                os.execve(executable.fileno(), argv, env)
             # macOS uses the canonical path under the trusted directory
             # chain. Retain the verified inode until exec replaces us.
             if not os.path.samestat(os.fstat(executable.fileno()), binary.lstat()):
                 raise ShimError("The verified Sai binary changed before launch")
-            os.execv(binary, argv)
+            os.execve(binary, argv, env)
     except ShimError as exc:
         print(f"sai: {exc}", file=sys.stderr)
     except (

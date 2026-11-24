@@ -118,12 +118,7 @@ def test_native_archive_initializes_mcp(distribution: SimpleNamespace) -> None:
         verify_mcp_startup(d)
 
 
-def test_shim_restores_default_file_size_signal(
-    distribution: SimpleNamespace,
-    tmp_path: Path,
-) -> None:
-    d = distribution
-    probe_archive = tmp_path / d.archive.name
+def write_shell_probe_archive(probe_archive: Path) -> None:
     shell = Path("/bin/sh")
     member = tarfile.TarInfo("sai")
     member.size = shell.stat().st_size
@@ -131,6 +126,66 @@ def test_shim_restores_default_file_size_signal(
         archive.write(member.tobuf(format=tarfile.USTAR_FORMAT))
         shutil.copyfileobj(binary, archive)
         archive.write(bytes(-member.size % tarfile.BLOCKSIZE + 2 * tarfile.BLOCKSIZE))
+
+
+@pytest.mark.parametrize("launcher", ["uv-tool", "uvx"])
+def test_shim_passes_the_launching_uv_prefix(
+    distribution: SimpleNamespace, tmp_path: Path, launcher: str
+) -> None:
+    d = distribution
+    tool = d.tool
+    probe_archive = tmp_path / d.archive.name
+    write_shell_probe_archive(probe_archive)
+    d.replay.add_release(d.wheel, d.version, probe_archive)
+    with (
+        d.rehearsal.keeper_server(d.replay.handler()) as base,
+        closing(socket.socket()) as proxy,
+    ):
+        offline_env(d, base, proxy)
+        run(tool, "Install the shim wheel", tool.uv, "tool", "install", d.wheel)
+        persistent_prefix = tool.python.parent.parent
+        if launcher == "uv-tool":
+            tool.env["SAI_NATIVE_UV_PREFIX"] = str(tmp_path / "stale-prefix")
+            command = (tool.sai,)
+            probe = 'test "$SAI_NATIVE_UV_PREFIX" = "$1"'
+        else:
+            tool.env["SAI_NATIVE_UV_PREFIX"] = str(persistent_prefix)
+            command = (
+                tool.uv,
+                "tool",
+                "run",
+                "--isolated",
+                "--no-index",
+                "--find-links",
+                d.wheel.parent,
+                "--from",
+                f"sai-cli=={d.version}",
+                "sai",
+            )
+            probe = (
+                'test "$SAI_NATIVE_UV_PREFIX" != "$1" && '
+                'test ! -e "$SAI_NATIVE_UV_PREFIX/uv-receipt.toml" && '
+                '"$SAI_NATIVE_UV_PREFIX/bin/python" -I -c '
+                "'import os, sys; sys.exit(os.environ[\"SAI_NATIVE_UV_PREFIX\"] != sys.prefix)'"
+            )
+        run(
+            tool,
+            "Check the prefix in the exec environment",
+            *command,
+            "-c",
+            probe,
+            "check-prefix",
+            persistent_prefix,
+        )
+
+
+def test_shim_restores_default_file_size_signal(
+    distribution: SimpleNamespace,
+    tmp_path: Path,
+) -> None:
+    d = distribution
+    probe_archive = tmp_path / d.archive.name
+    write_shell_probe_archive(probe_archive)
     d.replay.add_release(d.wheel, d.version, probe_archive)
     command = ("-c", "ulimit -c 0; kill -s XFSZ $$")
     direct = d.tool.run(
