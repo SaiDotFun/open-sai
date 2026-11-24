@@ -149,9 +149,11 @@ confirmation if it has a `previewDigest`. If the quote is unavailable,
 follow the result's recovery instructions.
 
 For a partial close, ask for confirmation when the preview has a digest
-and `quote.collateralPriceUsd` has a value. If the collateral price is
-missing, wait for it and get a fresh preview. An estimated preview can
-carry a digest while the price is `null`.
+and both `quote.effectiveLeverage` and `quote.collateralPriceUsd` have
+values. When effective leverage is unreadable, the preview gives a fallback
+estimate and omits the digest. An estimate may still carry a digest while
+the collateral price is `null`. If either value is missing, wait until it
+is readable and request a fresh preview.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.

@@ -1443,6 +1443,35 @@ def test_partial_close_marks_incomplete_quotes_as_estimates(
     asyncio.run(scenario())
 
 
+def test_partial_close_preview_omits_digest_until_effective_leverage_is_readable(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.leverage = "10"
+    position.after_hours = True
+    position.cap = "malformed"
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            estimate = await call(client, "preview_partial_close", args)
+            assert estimate["addr"] == ADDR
+            assert estimate["quote"]["effectiveLeverage"] is None
+            assert estimate["quote"]["collateralPriceUsd"] == "1"
+            assert estimate["quote"]["closedNotionalUsd"] == "20"
+            assert estimate["quote"]["closedNotionalIsEstimate"] is True
+            assert "previewDigest" not in estimate
+
+            position.cap = "5"
+            fresh = await call(client, "preview_partial_close", args)
+            assert fresh["quote"]["effectiveLeverage"] == "5"
+            assert fresh["quote"]["closedNotionalUsd"] == "10"
+            assert len(fresh["previewDigest"]) == 64
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
 def test_partial_close_keeps_leverage_for_risk_updated_position(
     position_service: tuple[Position, str],
 ) -> None:
