@@ -1672,7 +1672,7 @@ def config_file() -> Path:
 def config_list(ctx: click.Context) -> None:
     """Show every setting with its value and source.
 
-    The source is flag, env, file, default, or derived. Keeper URLs are
+    The source is flag, env, file, default, or derived. Endpoint URLs are
     shown as origins. `sai config get` prints the exact value.
     """
     shown = sai_settings.public(settings(ctx))
@@ -1722,7 +1722,15 @@ def config_set(ctx: click.Context, key: str, value: str) -> None:
         )
     except sai_settings.UneditableSection as exc:
         raise click.UsageError(str(exc)) from exc
-    report_change(ctx, spec, {"key": spec.key, "value": parsed, "path": str(path)})
+    report_change(
+        ctx,
+        spec,
+        {
+            "key": spec.key,
+            "value": sai_settings.public_value(spec, parsed),
+            "path": str(path),
+        },
+    )
 
 
 @config_group.command("unset")
