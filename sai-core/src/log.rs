@@ -164,15 +164,30 @@ impl EventContext<'_> {
 impl LogWriter {
     /// Start a writer for one Sai home. Filesystem work stays on its thread.
     pub fn start(env: Environment) -> Option<Self> {
-        Self::start_bound(env, None)
+        Self::start_bound(env, None, settings::log_keep_days)
     }
 
     /// Start a writer with the v2 CLI command envelope.
     pub fn start_command(env: Environment) -> Option<Self> {
-        Self::start_bound(env, Some(Uuid::new_v4().simple().to_string()))
+        Self::start_bound(
+            env,
+            Some(Uuid::new_v4().simple().to_string()),
+            settings::log_keep_days,
+        )
     }
 
-    fn start_bound(env: Environment, command_id: Option<String>) -> Option<Self> {
+    pub fn start_diagnostic_command(env: Environment) -> Option<Self> {
+        Self::start_bound(env, Some(Uuid::new_v4().simple().to_string()), |env| {
+            let (enabled, days) = settings::doctor_log_settings(env);
+            enabled.then(|| days.as_u64().unwrap_or(u64::MAX))
+        })
+    }
+
+    fn start_bound(
+        env: Environment,
+        command_id: Option<String>,
+        log_days: fn(&Environment) -> Option<u64>,
+    ) -> Option<Self> {
         if settings::log_disabled_in_env(&env) {
             return None;
         }
@@ -184,7 +199,7 @@ impl LogWriter {
         thread::Builder::new()
             .name("sai-log".into())
             .spawn(move || {
-                drain(env, pending, &worker_queue, command_id.as_deref());
+                drain(env, pending, &worker_queue, command_id.as_deref(), log_days);
                 let _ = done_signal.send(());
             })
             .ok()?;
@@ -227,10 +242,18 @@ impl LogWriter {
                         && matches!(name, "keeper.request" | "intent.keeper")
                         && *key == "endpoint"
                         && let Field::Endpoint(url) = field
+                        && let Field::EndpointIdentity(digest) = Field::endpoint_identity(url)
                     {
-                        endpoint_digest = endpoint_digest_for(url);
+                        endpoint_digest = Some(digest);
+                    }
+                    if self.command_schema
+                        && *key == "endpointId"
+                        && let Field::EndpointIdentity(digest) = field
+                    {
+                        endpoint_digest = Some(*digest);
                     }
                 })
+                .filter(|(_, field)| !matches!(field, Field::EndpointIdentity(_)))
                 .collect(),
         )
         .snapshot(&mut budget, known.as_deref().unwrap_or_default(), 0);
@@ -280,7 +303,13 @@ enum QueueItem {
     Flush(mpsc::Sender<()>),
 }
 
-fn drain(env: Environment, events: Receiver<QueueItem>, queue: &Queue, command_id: Option<&str>) {
+fn drain(
+    env: Environment,
+    events: Receiver<QueueItem>,
+    queue: &Queue,
+    command_id: Option<&str>,
+    log_days: fn(&Environment) -> Option<u64>,
+) {
     let config_path = env.path();
     let log_path = env.home.join("logs");
     let mut config: Option<(Option<FileStamp>, Option<u64>)> = None;
@@ -299,12 +328,7 @@ fn drain(env: Environment, events: Receiver<QueueItem>, queue: &Queue, command_i
         let keep = match config {
             Some((previous, keep)) if previous == current_stamp => keep,
             _ => {
-                let keep = if command_id.is_some() {
-                    let (enabled, days) = settings::doctor_log_settings(&env);
-                    enabled.then(|| days.as_u64().unwrap_or(u64::MAX))
-                } else {
-                    settings::log_keep_days(&env)
-                };
+                let keep = log_days(&env);
                 config = Some((current_stamp, keep));
                 keep
             }
@@ -356,7 +380,7 @@ fn write(
         }
     }
     if let Some(digest) = event.endpoint_digest
-        && let Some(key) = directory.endpoint_key()
+        && let Ok(key) = directory.endpoint_key()
     {
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key);
         let signature = ring::hmac::sign(&key, &digest);
@@ -388,25 +412,6 @@ fn write(
         event.timestamp.date_naive()
     );
     let _ = directory.append(&name, &data);
-}
-
-fn endpoint_digest_for(endpoint: &str) -> Option<[u8; 32]> {
-    let parsed = crate::endpoint::Endpoint::split(endpoint.trim())?;
-    let site = origin(endpoint);
-    if site == "[redacted url]" {
-        return None;
-    }
-    let path = if parsed.path.is_empty() {
-        "/"
-    } else {
-        &parsed.path
-    };
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    digest.update(site.as_bytes());
-    digest.update(path.as_bytes());
-    digest.update(b"?");
-    digest.update(parsed.query.as_bytes());
-    digest.finish().as_ref().try_into().ok()
 }
 
 fn json_ascii(value: &Map<String, Value>) -> String {

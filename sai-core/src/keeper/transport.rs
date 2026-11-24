@@ -106,7 +106,7 @@ async fn send(
     exchange(socket, request, timeout).await
 }
 
-pub(super) async fn websocket_socket(
+pub(super) async fn doctor_websocket_socket(
     endpoint: &str,
     timeout: Duration,
 ) -> Result<SocketBox, SaiError> {
@@ -147,35 +147,103 @@ async fn open_socket(
         if forward {
             Ok(socket)
         } else {
-            let mut socket = Some(with_inactivity(socket, timeout).await);
-            let connector = service_fn(move |_| {
-                ready(Ok::<_, io::Error>(
-                    socket.take().expect("one proxy connection"),
-                ))
-            });
-            let mut tunnel = Tunnel::new(proxy.uri().clone(), connector);
-            if let Some(auth) = proxy.basic_auth() {
-                tunnel = tunnel.with_auth(auth.clone());
-            }
-            let tunnel = tunnel
-                .oneshot(destination.clone())
-                .await
-                .map_err(|_| request_failed())?;
+            let socket =
+                tunnel(with_inactivity(socket, timeout).await, &proxy, destination).await?;
             if destination.scheme_str() == Some("https") {
-                start_tls(Box::new(TokioIo::new(tunnel)), destination, tls, timeout).await
+                start_tls(socket, destination, tls, timeout)
+                    .await
+                    .map_err(Into::into)
             } else {
-                Ok(Box::new(TokioIo::new(tunnel)))
+                Ok(socket)
             }
         }
     } else {
-        connect(destination, &tls, timeout).await
+        connect(destination, &tls, timeout)
+            .await
+            .map_err(Into::into)
     }
 }
 
-fn host(destination: &Uri) -> Result<&str, SaiError> {
+pub(super) enum ConnectError {
+    InvalidRequest,
+    NotSent,
+    CertificateVerification,
+}
+
+impl From<ConnectError> for SaiError {
+    fn from(error: ConnectError) -> Self {
+        match error {
+            ConnectError::InvalidRequest => request_failed(),
+            ConnectError::NotSent | ConnectError::CertificateVerification => not_sent(),
+        }
+    }
+}
+
+pub(super) async fn websocket_socket(
+    url: &Url,
+    timeout: Duration,
+) -> Result<SocketBox, ConnectError> {
+    let secure = url.scheme() == "wss";
+    // CONNECT and the shared TCP/TLS connector use HTTP scheme names.
+    let mut target = url.clone();
+    target
+        .set_scheme(if secure { "https" } else { "http" })
+        .map_err(|_| ConnectError::InvalidRequest)?;
+    let destination = target
+        .as_str()
+        .parse::<Uri>()
+        .map_err(|_| ConnectError::InvalidRequest)?;
+    let proxy =
+        proxy::for_websocket(url, &destination).map_err(|_| ConnectError::InvalidRequest)?;
+    let mut roots = RootCertStore::empty();
+    if secure
+        || proxy
+            .as_ref()
+            .is_some_and(|proxy| proxy.uri().scheme_str() == Some("https"))
+    {
+        roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    }
+    let tls = Arc::new(tls_config(roots));
+    let Some(proxy) = proxy else {
+        return connect(&destination, &tls, timeout).await;
+    };
+    let socket = connect(proxy.uri(), &tls, timeout).await?;
+    let socket = tunnel(TokioIo::new(socket), &proxy, &destination)
+        .await
+        .map_err(|_| ConnectError::InvalidRequest)?;
+    if secure {
+        start_tls(socket, &destination, tls, timeout).await
+    } else {
+        Ok(socket)
+    }
+}
+
+async fn tunnel(
+    socket: impl hyper::rt::Read + hyper::rt::Write + Send + Unpin + 'static,
+    proxy: &hyper_util::client::proxy::matcher::Intercept,
+    destination: &Uri,
+) -> Result<SocketBox, SaiError> {
+    let mut socket = Some(socket);
+    let connector = service_fn(move |_| {
+        ready(Ok::<_, io::Error>(
+            socket.take().expect("one proxy connection"),
+        ))
+    });
+    let mut tunnel = Tunnel::new(proxy.uri().clone(), connector);
+    if let Some(auth) = proxy.basic_auth() {
+        tunnel = tunnel.with_auth(auth.clone());
+    }
+    let tunneled = tunnel
+        .oneshot(destination.clone())
+        .await
+        .map_err(|_| request_failed())?;
+    Ok(Box::new(TokioIo::new(tunneled)))
+}
+
+fn host(destination: &Uri) -> Result<&str, ConnectError> {
     Ok(destination
         .host()
-        .ok_or_else(request_failed)?
+        .ok_or(ConnectError::InvalidRequest)?
         .trim_matches(['[', ']']))
 }
 
@@ -183,15 +251,17 @@ async fn connect(
     destination: &Uri,
     tls: &Arc<ClientConfig>,
     timeout: Duration,
-) -> Result<SocketBox, SaiError> {
+) -> Result<SocketBox, ConnectError> {
     let default_port = match destination.scheme_str() {
         Some("https") => 443,
         Some("http") => 80,
-        _ => return Err(request_failed()),
+        _ => return Err(ConnectError::InvalidRequest),
     };
     let port = destination.port_u16().unwrap_or(default_port);
     let socket = connect_tcp(host(destination)?, port, timeout).await?;
-    socket.set_nodelay(true).map_err(|_| not_sent())?;
+    socket
+        .set_nodelay(true)
+        .map_err(|_| ConnectError::NotSent)?;
     if default_port == 443 {
         start_tls(Box::new(socket), destination, Arc::clone(tls), timeout).await
     } else {
@@ -199,17 +269,17 @@ async fn connect(
     }
 }
 
-async fn connect_tcp(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, SaiError> {
+async fn connect_tcp(host: &str, port: u16, timeout: Duration) -> Result<TcpStream, ConnectError> {
     let addresses = time::timeout(timeout, lookup_host((host, port)))
         .await
-        .map_err(|_| not_sent())?
-        .map_err(|_| not_sent())?;
+        .map_err(|_| ConnectError::NotSent)?
+        .map_err(|_| ConnectError::NotSent)?;
     for address in addresses {
         if let Ok(Ok(socket)) = time::timeout(timeout, TcpStream::connect(address)).await {
             return Ok(socket);
         }
     }
-    Err(not_sent())
+    Err(ConnectError::NotSent)
 }
 
 async fn start_tls(
@@ -217,13 +287,19 @@ async fn start_tls(
     destination: &Uri,
     config: Arc<ClientConfig>,
     timeout: Duration,
-) -> Result<SocketBox, SaiError> {
-    let name = ServerName::try_from(host(destination)?.to_owned()).map_err(|_| not_sent())?;
+) -> Result<SocketBox, ConnectError> {
+    let name =
+        ServerName::try_from(host(destination)?.to_owned()).map_err(|_| ConnectError::NotSent)?;
     let handshake = TlsConnector::from(config).connect(name, socket);
     let socket = time::timeout(timeout, handshake)
         .await
-        .map_err(|_| not_sent())?
-        .map_err(|_| not_sent())?;
+        .map_err(|_| ConnectError::NotSent)?
+        .map_err(
+            |error| match error.get_ref().and_then(|cause| cause.downcast_ref()) {
+                Some(rustls::Error::InvalidCertificate(_)) => ConnectError::CertificateVerification,
+                _ => ConnectError::NotSent,
+            },
+        )?;
     Ok(Box::new(socket))
 }
 

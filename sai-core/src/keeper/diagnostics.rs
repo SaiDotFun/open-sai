@@ -48,7 +48,7 @@ pub async fn websocket_handshake(endpoint: &str, timeout: Duration) -> Result<()
             "Sec-WebSocket-Protocol",
             HeaderValue::from_static("graphql-transport-ws"),
         );
-        let socket = transport::websocket_socket(endpoint, timeout)
+        let socket = transport::doctor_websocket_socket(endpoint, timeout)
             .await
             .map_err(|_| "OSError")?;
         let config = WebSocketConfig::default()
