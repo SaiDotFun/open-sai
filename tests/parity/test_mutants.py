@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import socket
 import subprocess
 import sys
@@ -12,6 +13,9 @@ import pytest
 
 HERE = Path(__file__).parent
 ROOT = HERE.parents[1]
+pytestmark = pytest.mark.skipif(
+    sys.platform != "linux", reason="Parity candidates require Linux network namespaces"
+)
 
 
 def run_driver(case: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
@@ -101,9 +105,16 @@ def test_equivalent_candidate_passes(tmp_path: Path, mutant: str, case: str) -> 
 
 def test_reference_uses_real_uv_with_home_dependent_shim(tmp_path: Path) -> None:
     fake = tmp_path / "uv"
-    fake.write_text("#!/bin/sh\nexit 71\n", encoding="utf-8")
+    home = tmp_path / "original-home"
+    home.mkdir()
+    (home / ".configured-uv").touch()
+    native = shlex.quote(os.environ["UV"])
+    fake.write_text(
+        f'#!/bin/sh\ntest -f "$HOME/.configured-uv" || exit 71\nexec {native} "$@"\n',
+        encoding="utf-8",
+    )
     fake.chmod(0o700)
-    env = {**os.environ, "PATH": str(tmp_path)}
+    env = {**os.environ, "HOME": str(home), "PATH": str(tmp_path)}
     env.pop("SAI_PARITY_BIN", None)
     real = run_driver("version", env)
     assert real.returncode == 0, real.stdout + real.stderr
