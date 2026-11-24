@@ -447,6 +447,50 @@ runpy.run_path(script, run_name='__main__')
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_native_updater_returns_a_competing_launcher_after_killed_reinstall(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay, "RECOVERY_RUST")
+    ok(install.install(replay, "--native"))
+    external = install.home / "competing-sai"
+    external.write_text("competing installer's binary")
+    competitor = install.home / "competing-launcher"
+    competitor.symlink_to(external)
+    expected = competitor.lstat()
+    probe = """
+import os, runpy, signal, sys
+script, launcher, competitor, *args = sys.argv[1:]
+def kill_after_exchange(event, values):
+    if event == 'sai.launcher.rename' and values[1] == launcher:
+        os.replace(competitor, launcher)
+    if event == 'sai.launcher.renamed' and values[1] == launcher:
+        os.kill(os.getpid(), signal.SIGKILL)
+sys.addaudithook(kill_after_exchange)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        competitor,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert result.returncode == -9, (result.stdout, result.stderr)
+    result = install.update(replay)
+    assert "launcher changed during the switch" in (result.stdout + result.stderr)
+    assert os.path.samestat(install.launcher.lstat(), expected)
+    assert install.launcher.readlink() == external
+    assert not pending(install).exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 def test_standalone_refuses_an_indirect_managed_target(
     install: Install, replay: Replay
 ) -> None:

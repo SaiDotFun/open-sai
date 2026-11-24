@@ -79,7 +79,7 @@ NATIVE_DIRECTORY = re.compile(rf"{NATIVE_VERSION}-{DIGEST}")
 NATIVE_ROOT = ".sai-native"
 NATIVE_LOCK = ".sai-update.lock"
 NATIVE_PENDING = "pending.json"
-LAUNCHER_SWITCH = ".launcher-switch"
+LAUNCHER_SWITCH = ".launcher-switch/sai"
 MAX_BINARY = 96 << 20
 VERIFY_TIMEOUT = 60
 PYTHON_PIN = "0.1.2"
@@ -790,34 +790,77 @@ def protect_displaced_launcher(
         return False
 
 
-def settle_launcher_switch(launcher: Path, root: Path) -> None:
-    stage = root / LAUNCHER_SWITCH
+def write_native_pending(root: Path, record: dict[str, Any]) -> None:
+    with tempfile.NamedTemporaryFile(mode="w", dir=root, delete=False) as handle:
+        json.dump(record, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    Path(handle.name).replace(root / NATIVE_PENDING)
+    sync_dir(root)
+
+
+def read_native_pending(root: Path) -> dict[str, Any] | None:
+    try:
+        with (root / NATIVE_PENDING).open("rb") as handle:
+            record = json.loads(handle.read(4096))
+    except FileNotFoundError:
+        return None
+    except ValueError as error:
+        raise LookupFailed("could not read the pending Sai install record") from error
+    if (
+        not isinstance(record, dict)
+        or not {"old", "new"} <= record.keys() <= {"old", "new", "launcher_switch"}
+        or not isinstance(record["new"], str)
+        or (record["old"] is not None and not isinstance(record["old"], str))
+    ):
+        raise LookupFailed("the pending Sai install record is invalid")
+    return record
+
+
+def settle_launcher_switch(
+    launcher: Path, root: Path, pending: dict[str, Any] | None
+) -> None:
+    displaced = root / LAUNCHER_SWITCH
+    stage = displaced.parent
     if not os.path.lexists(stage):
         return
     checked_directory(stage, private=True)
+    switch = pending.get("launcher_switch") if pending else None
+    if switch is None:
+        # Older installers recorded the switch beside the staged launcher.
+        try:
+            with (stage / "owner.json").open("rb") as handle:
+                switch = json.loads(handle.read(4096))
+            switch["staged"] = LAUNCHER_SWITCH
+        except FileNotFoundError:
+            # No launcher can have been displaced before the record was written.
+            shutil.rmtree(stage)
+            sync_dir(root)
+            return
+        except (TypeError, ValueError) as error:
+            raise LauncherChanged(
+                f"could not read the launcher switch at {stage}"
+            ) from error
     try:
-        with (stage / "owner.json").open("rb") as handle:
-            record = json.loads(handle.read(4096))
-        expected = tuple(record["expected"])
-        published = None if record["published"] is None else tuple(record["published"])
-    except FileNotFoundError:
-        # The switch starts only after owner.json has been published.
-        shutil.rmtree(stage)
-        sync_dir(root)
-        return
+        if switch["staged"] != LAUNCHER_SWITCH:
+            raise ValueError("unexpected staging path")
+        expected = tuple(switch["expected"])
+        published = None if switch["published"] is None else tuple(switch["published"])
     except (ValueError, TypeError, KeyError) as error:
         raise LauncherChanged(
-            f"could not read the launcher switch record at {stage}"
+            f"could not read the launcher switch at {stage}"
         ) from error
 
-    displaced = stage / "sai"
-    if launcher_entry(displaced) in (expected, published):
+    if launcher_entry(displaced) in (None, expected, published):
+        sync_dir(launcher.parent)
         shutil.rmtree(stage)
         sync_dir(root)
         return
     if protect_displaced_launcher(displaced, launcher, published):
-        shutil.rmtree(stage)
         sync_dir(launcher.parent)
+        shutil.rmtree(stage)
+        if pending is not None:
+            (root / NATIVE_PENDING).unlink()
         sync_dir(root)
         raise LauncherChanged("the Sai launcher changed during the switch")
     raise LauncherChanged(
@@ -841,43 +884,36 @@ def switch_launcher(
         expected = launcher_entry(launcher)
         if expected is None or installed_directory(launcher, root) != previous:
             raise LauncherChanged("the Sai launcher changed during the switch")
-        stage = root / LAUNCHER_SWITCH
+        displaced = root / LAUNCHER_SWITCH
+        stage = displaced.parent
         stage.mkdir(mode=0o700)
-        displaced = stage / "sai"
         if target is not None:
             displaced.symlink_to(target)
-        published = launcher_entry(displaced)
-        with (stage / "owner.tmp").open("x") as record:
-            json.dump({"expected": expected, "published": published}, record)
-            record.flush()
-            os.fsync(record.fileno())
-        (stage / "owner.tmp").replace(stage / "owner.json")
+        pending = read_native_pending(root)
+        assert pending is not None
+        pending["launcher_switch"] = {
+            "staged": LAUNCHER_SWITCH,
+            "expected": expected,
+            "published": launcher_entry(displaced),
+        }
         sync_dir(stage)
-        sync_dir(root)
+        write_native_pending(root, pending)
         if target is None:
             rename_launcher(launcher, displaced, exchange=False)
         else:
             rename_launcher(displaced, launcher, exchange=True)
-        settle_launcher_switch(launcher, root)
+        settle_launcher_switch(launcher, root, pending)
     sync_dir(launcher.parent)
 
 
 def recover_native(launcher: Path, root: Path) -> str | None:
-    settle_launcher_switch(launcher, root)
+    record = read_native_pending(root)
+    settle_launcher_switch(launcher, root, record)
     active = installed_directory(launcher, root)
-    pending = root / NATIVE_PENDING
-    try:
-        with pending.open("rb") as handle:
-            record = json.loads(handle.read(4096))
-    except FileNotFoundError:
+    if record is None:
         return active
-    except ValueError as error:
-        raise LookupFailed("could not read the pending Sai install record") from error
-    if not isinstance(record, dict) or set(record) != {"old", "new"}:
-        raise LookupFailed("the pending Sai install record is invalid")
+    pending = root / NATIVE_PENDING
     old, new = record["old"], record["new"]
-    if not isinstance(new, str) or (old is not None and not isinstance(old, str)):
-        raise LookupFailed("the pending Sai install record is invalid")
     native_binary(root, new)
     if old is not None:
         native_binary(root, old)
@@ -1081,16 +1117,9 @@ def install_native(args: argparse.Namespace) -> int:
                 staging.rename(published)
                 sync_dir(root)
             pending = root / NATIVE_PENDING
-            with tempfile.NamedTemporaryFile(
-                mode="w", dir=root, delete=False
-            ) as record:
-                # The native updater also reads this record. null means the
-                # first install had no launcher to restore.
-                json.dump({"old": old, "new": new}, record)
-                record.flush()
-                os.fsync(record.fileno())
-            Path(record.name).replace(pending)
-            sync_dir(root)
+            # The native updater reads this record too. null means the first
+            # install had no launcher to restore.
+            write_native_pending(root, {"old": old, "new": new})
             try:
                 if installed_directory(launcher, root) != old:
                     raise LookupFailed("the Sai launcher changed during the install")

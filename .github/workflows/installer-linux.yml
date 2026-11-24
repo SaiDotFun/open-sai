@@ -33,7 +33,7 @@ jobs:
           git fetch --depth=1 --no-tags origin \
             8557a7e13dceab0accc369191182c8e01423c91b \
             df224a3477c1151636cd2ac90fece7d38e4b4c07 \
-            a2e0f94ff2cce7799ddc1f1322c5400cb37908bb \
+            94ef0928583d8e670500487e6bf7d7fd310c62b2 \
             4bd968eb956c154f0a0ab53ccc288ceb78dd8713
       - name: Build the release fixture artifacts
         run: uv run --locked python scripts/build-installer-fixtures.py "$RUNNER_TEMP/sai-installer"

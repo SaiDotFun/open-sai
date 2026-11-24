@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 BASELINE = "8557a7e13dceab0accc369191182c8e01423c91b"
 MCP = "df224a3477c1151636cd2ac90fece7d38e4b4c07"
-UPDATE = "a2e0f94ff2cce7799ddc1f1322c5400cb37908bb"
+UPDATE = "94ef0928583d8e670500487e6bf7d7fd310c62b2"
 DIST = "4bd968eb956c154f0a0ab53ccc288ceb78dd8713"
 NATIVE = "0.2.0"
 BRIDGE_FIXTURE = "0.1.3"
