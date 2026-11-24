@@ -151,22 +151,13 @@ def test_ping_during_exclusive_ledger_lock(native: Path, tmp_path: Path) -> None
         assert json.loads(response["result"]["content"][0]["text"])["intents"]
 
 
-@pytest.mark.parametrize(
-    ("tool", "arguments"),
-    [
-        ("market_list", {}),
-        ("intent_wait", {"key": INTENT, "addr": ADDRESS}),
-    ],
-)
-def test_cancelling_read_closes_keeper_connection(
-    native: Path, tmp_path: Path, tool: str, arguments: dict[str, Any]
-) -> None:
+def test_cancelling_read_closes_keeper_connection(native: Path, tmp_path: Path) -> None:
     with (
         loopback("mcp-cancel") as endpoints,
         server(native, tmp_path / "home", endpoints) as stdio,
     ):
-        stdio.send("tools/call", id_=2, name=tool, arguments=arguments)
-        assert endpoints.interrupt_ready.wait(3), f"Keeper did not receive {tool}"
+        stdio.send("tools/call", id_=2, name="market_list", arguments={})
+        assert endpoints.interrupt_ready.wait(3), "Keeper did not receive market_list"
         stdio.send("notifications/cancelled", requestId=2, reason="fixture")
         assert stdio.receive() == {
             "jsonrpc": "2.0",
@@ -176,6 +167,36 @@ def test_cancelling_read_closes_keeper_connection(
         assert endpoints.interrupt_closed.wait(3), "Keeper connection remained open"
         stdio.send("ping", id_=3)
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+@pytest.mark.parametrize("interrupt", ["cancel", "eof"])
+def test_interrupting_intent_wait_preserves_the_ledger(
+    native: Path, tmp_path: Path, interrupt: str
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("mcp-cancel") as endpoints,
+        server(native, home, endpoints, seed="ledger") as stdio,
+        closing(sqlite3.connect(home / "sai/trader/intents.sqlite3")) as database,
+    ):
+        original = database.execute("SELECT * FROM intents").fetchall()
+        assert len(original) == 1
+        stdio.send("tools/call", id_=2, name="intent_wait", arguments={"key": INTENT})
+        assert endpoints.interrupt_ready.wait(3), "Keeper did not receive intent_wait"
+        if interrupt == "eof":
+            assert stdio.proc.stdin is not None
+            stdio.proc.stdin.close()
+            assert stdio.proc.wait(timeout=1.5) == 0
+        else:
+            stdio.send("notifications/cancelled", requestId=2, reason="fixture")
+            assert stdio.receive(timeout=1.5) == {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "error": {"code": 0, "message": "Request cancelled"},
+            }
+        assert endpoints.interrupt_closed.wait(1.5), "Keeper connection remained open"
+        assert database.execute("SELECT * FROM intents").fetchall() == original
+        assert [request.label for request in endpoints.wire] == ["waitUserIntents"]
 
 
 def test_auth_status_omits_a_rejected_address(native: Path, tmp_path: Path) -> None:
