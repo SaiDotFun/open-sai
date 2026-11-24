@@ -313,7 +313,7 @@ def endpoint_id(value: str) -> str | None:
     if site == REDACTED_URL:
         return None
     path = urlsplit(value.strip()).path or "/"
-    return hashlib.sha256((site + path).encode()).hexdigest()
+    return hashlib.sha256((site + path).encode(errors="surrogatepass")).hexdigest()
 
 
 # Session tokens this process has seen. Tokens are only added: one that was

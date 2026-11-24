@@ -318,12 +318,16 @@ def intent(
             if ambiguous
             else "Older events without sufficient attribution were omitted."
         )
-    if endpoint is not None and not offline and not ambiguous:
+    if endpoint is not None and not offline:
         account = scope[0] if scope else chosen_addr or _active_address(endpoint)
-        if account is None:
+        if ambiguous or account is None:
             report["keeperError"] = {
                 "code": Code.INVALID_REQUEST,
-                "message": "Pass an address for the Keeper lookup or use offline mode.",
+                "message": (
+                    "Several accounts match this key. Pass an address for the Keeper lookup."
+                    if ambiguous
+                    else "Pass an address for the Keeper lookup or use offline mode."
+                ),
             }
         else:
             try:

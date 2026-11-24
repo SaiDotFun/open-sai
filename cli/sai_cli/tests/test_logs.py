@@ -1875,6 +1875,14 @@ def test_intent_scope_separates_accounts_paths_and_repl_invocations(home, keeper
     assert "opaque-path-secret" not in raw_logs(home)
     assert "opaque-query-secret" not in raw_logs(home)
 
+    state.intents = [{**base, "evmAddress": OTHER, "txHash": hash_b}]
+    assert status(endpoint, OTHER, key)[0] == 0
+    request_count = len(state.requests)
+    code, output = run_cli("--endpoint", endpoint, "logs", "intent", key)
+    assert code == 0 and "Several accounts match this key" in output
+    assert "Keeper has no record" not in output
+    assert len(state.requests) == request_count
+
 
 def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keeper_stub):
     endpoint, state = keeper_stub
