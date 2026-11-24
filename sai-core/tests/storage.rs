@@ -207,16 +207,21 @@ fn reservation_subprocess() {
         return;
     };
     let home = std::env::var_os("SAI_HOME").unwrap();
+    let endpoint = std::env::var("SAI_TEST_RESERVE_ENDPOINT").unwrap_or_else(|_| ENDPOINT.into());
+    let account = std::env::var("SAI_TEST_RESERVE_ACCOUNT").unwrap_or_else(|_| ADDR.into());
     let mut input = io::stdin().lock();
     input.read_exact(&mut [0]).unwrap();
-    match Storage::new(home).pending(&key, ENDPOINT, ADDR, KIND, "7") {
+    match Storage::new(home).pending(&key, &endpoint, &account, KIND, "7") {
         Ok(()) => {
             io::stderr().write_all(b"reserved\n").unwrap();
             if std::env::var_os("SAI_TEST_RESERVE_WAIT").is_some() {
                 let _ = input.read_exact(&mut [0]);
             }
         }
-        Err(StorageError::UncertainIntent(_)) => process::exit(4),
+        Err(StorageError::UncertainIntent(key)) => {
+            writeln!(io::stderr(), "blocked by {key}").unwrap();
+            process::exit(4);
+        }
         Err(error) => panic!("Reserve failed: {error}"),
     }
 }
@@ -227,6 +232,8 @@ fn child(home: &std::path::Path, key: &str, wait: bool) -> Child {
         .args(["--exact", "reservation_subprocess", "--nocapture"])
         .env("SAI_HOME", home)
         .env("SAI_TEST_RESERVE_KEY", key)
+        .env_remove("SAI_TEST_RESERVE_ENDPOINT")
+        .env_remove("SAI_TEST_RESERVE_ACCOUNT")
         .env_remove("SAI_TEST_RESERVE_WAIT")
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
