@@ -1,11 +1,14 @@
 use std::{fmt::Write as _, io, path::Path};
 
 use clap::Subcommand;
-use sai_core::settings::{self, Environment, Flags, KEYS, Key, SettingsError};
+use sai_core::{
+    errors::SaiError,
+    settings::{self, Environment, Flags, KEYS, Key},
+};
 use serde::Serialize;
 use serde_json::{Map, Value, json, ser::Formatter};
 
-use crate::load_settings;
+use crate::{load_settings, usage};
 
 #[derive(Subcommand)]
 pub enum ConfigCommand {
@@ -20,13 +23,13 @@ pub enum ConfigCommand {
 }
 
 impl ConfigCommand {
-    pub fn run(self, flags: &Flags, env: &Environment, json: bool) -> Result<(), Error> {
+    pub fn run(self, flags: &Flags, env: &Environment, json: bool) -> Result<(), SaiError> {
         let path = env.path();
         let path = path.as_path();
         let json_path = json.then(|| format_path_json(path));
         match self {
             Self::List => {
-                let resolved = load_settings(flags, env).map_err(Error::settings)?;
+                let resolved = load_settings(flags, env)?;
                 if let Some(path) = json_path {
                     let entries: Map<String, Value> = KEYS
                         .into_iter()
@@ -59,7 +62,7 @@ impl ConfigCommand {
             }
             Self::Get { key } => {
                 let key = parse_key(&key)?;
-                let resolved = load_settings(flags, env).map_err(Error::settings)?;
+                let resolved = load_settings(flags, env)?;
                 let value = resolved.value(key);
                 if json {
                     println!(
@@ -79,9 +82,9 @@ impl ConfigCommand {
             Self::Set { key, value } => {
                 let key = parse_key(&key)?;
                 let value = key.parse_value(&value).map_err(|error| {
-                    Error::usage(format!("{error}. Valid keys: {}", settings::valid_keys()))
+                    SaiError::usage(format!("{error}. Valid keys: {}", settings::valid_keys()))
                 })?;
-                settings::set(path, key, &value).map_err(Error::settings)?;
+                settings::set(path, key, &value)?;
                 if let Some(path) = json_path {
                     println!(
                         "{{\"key\": {}, \"value\": {}, \"path\": {path}}}",
@@ -95,7 +98,7 @@ impl ConfigCommand {
             }
             Self::Unset { key } => {
                 let key = parse_key(&key)?;
-                let removed = settings::unset(path, key).map_err(Error::settings)?;
+                let removed = settings::unset(path, key)?;
                 if let Some(path) = json_path {
                     println!(
                         "{{\"key\": {}, \"removed\": {removed}, \"path\": {path}}}",
@@ -112,8 +115,8 @@ impl ConfigCommand {
     }
 }
 
-fn parse_key(name: &str) -> Result<Key, Error> {
-    Key::parse(name).map_err(|error| Error::usage(error.to_string()))
+fn parse_key(name: &str) -> Result<Key, SaiError> {
+    Key::parse(name).map_err(|error| SaiError::usage(error.to_string()))
 }
 
 fn warn_override(env: &Environment, key: Key) {
@@ -126,63 +129,7 @@ fn warn_override(env: &Environment, key: Key) {
     }
 }
 
-pub struct Error {
-    pub code: u8,
-    pub message: String,
-}
-
-impl Error {
-    pub fn settings(error: SettingsError) -> Self {
-        if error.is_uneditable() {
-            Self::usage(error.to_string())
-        } else {
-            Self {
-                code: 1,
-                message: error.to_string(),
-            }
-        }
-    }
-
-    pub fn usage(message: String) -> Self {
-        Self { code: 2, message }
-    }
-
-    pub fn print(&self, command: &str) {
-        if self.code == 2 {
-            eprintln!(
-                "{}\nTry '{}' for help.\n",
-                usage(command),
-                help_command(command)
-            );
-        }
-        eprintln!("Error: {}", self.message);
-    }
-}
-
-fn usage(command: &str) -> String {
-    let args = match command {
-        "config get" | "config unset" => " KEY",
-        "config set" => " KEY VALUE",
-        "config list" => "",
-        "" => " [COMMAND] [ARGS]...",
-        _ => " COMMAND [ARGS]...",
-    };
-    format!("Usage: {} [OPTIONS]{args}", command_line(command))
-}
-
-fn command_line(command: &str) -> String {
-    if command.is_empty() {
-        "sai".into()
-    } else {
-        format!("sai {command}")
-    }
-}
-
-fn help_command(command: &str) -> String {
-    format!("{} --help", command_line(command))
-}
-
-pub fn print_help(command: &str, stderr: bool) -> bool {
+pub fn help(command: &str) -> Option<String> {
     let description = match command {
         "config" => {
             "Show and change settings in $SAI_HOME/config.toml.\n\n  Keys: keeper.endpoint, keeper.ws_endpoint, lcd.endpoint, update.auto. A flag\n  or SAI_* environment variable still overrides the file."
@@ -193,23 +140,21 @@ pub fn print_help(command: &str, stderr: bool) -> bool {
         }
         "config set" => "Set KEY to VALUE in the config file, keeping its comments.",
         "config unset" => "Remove KEY from the config file so the default applies again.",
-        _ => return false,
+        _ => return None,
     };
     let commands = if command == "config" {
         "\nCommands:\n  get    Print the exact value of KEY as resolved now.\n  list   Show every setting with its value and source.\n  set    Set KEY to VALUE in the config file, keeping its comments.\n  unset  Remove KEY from the config file so the default applies again.\n"
     } else {
         ""
     };
-    let text = format!(
-        "{}\n\n  {description}\n\nOptions:\n  --help  Show this message and exit.\n{commands}",
-        usage(command)
-    );
-    if stderr {
-        eprint!("{text}");
-    } else {
-        print!("{text}");
-    }
-    true
+    Some(
+        format!(
+            "{}\n\n  {description}\n\nOptions:\n  --help  Show this message and exit.\n{commands}",
+            usage(command)
+        )
+        .trim_end()
+        .to_owned(),
+    )
 }
 
 struct Spaced;

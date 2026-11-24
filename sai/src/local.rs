@@ -1,5 +1,4 @@
 use std::{
-    error::Error,
     fmt::Write as _,
     io::{self, Write},
 };
@@ -7,11 +6,14 @@ use std::{
 use chrono::Utc;
 use clap::Subcommand;
 use sai_core::{
+    errors::{Code, SaiError},
+    log::{EventContext, Level},
     session::expired,
     settings::{Environment, Flags},
-    storage::{RemovedSession, SessionSummary, Storage},
+    storage::{RemovedSession, SessionSummary, Storage, StorageEvent},
 };
 use serde::Serialize;
+use serde_json::json;
 use serde_json::ser::{Formatter, PrettyFormatter};
 
 use crate::load_settings;
@@ -64,8 +66,10 @@ pub fn auth(
     flags: &Flags,
     env: &Environment,
     json: bool,
-) -> Result<(), Box<dyn Error>> {
-    let storage = Storage::new(&env.home);
+    events: EventContext<'_>,
+) -> Result<(), SaiError> {
+    let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
+    let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     match command {
         AuthCommand::Status => {
             let settings = load_settings(flags, env)?;
@@ -124,13 +128,27 @@ pub fn intent(
     flags: &Flags,
     env: &Environment,
     json: bool,
-) -> Result<(), Box<dyn Error>> {
+) -> Result<(), SaiError> {
     let storage = Storage::new(&env.home);
     let settings = load_settings(flags, env)?;
     match command {
         IntentCommand::Local { addr } => {
             emit(&storage.list_pending(settings.endpoint(), &addr)?, json)
         }
+    }
+}
+
+fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
+    if let StorageEvent::SessionExpired { addr, expires_at } = event {
+        events.event(
+            "session.expired",
+            Level::Warn,
+            [
+                ("code", json!(Code::SessionExpired).into()),
+                ("addr", json!(addr).into()),
+                ("expiresAt", json!(expires_at).into()),
+            ],
+        );
     }
 }
 
@@ -162,33 +180,37 @@ impl Formatter for InlineJson {
     }
 }
 
-fn emit(value: &impl Serialize, json: bool) -> Result<(), Box<dyn Error>> {
+fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     let mut bytes = Vec::new();
     if json {
         value.serialize(&mut serde_json::Serializer::with_formatter(
             &mut bytes, InlineJson,
-        ))?;
+        ))
     } else {
         value.serialize(&mut serde_json::Serializer::with_formatter(
             &mut bytes,
             PrettyFormatter::new(),
-        ))?;
+        ))
     }
-    let text = String::from_utf8(bytes)?;
+    .map_err(|_| SaiError::internal())?;
+    let text = String::from_utf8(bytes).map_err(|_| SaiError::internal())?;
+    println!("{}", ascii_json(&text));
+    Ok(())
+}
+
+pub fn ascii_json(text: &str) -> std::borrow::Cow<'_, str> {
     if text.bytes().all(|byte| byte < 0x7f) {
-        println!("{text}");
-    } else {
-        let mut escaped = String::new();
-        for ch in text.chars() {
-            if ch < '\u{7f}' {
-                escaped.push(ch);
-            } else {
-                for unit in ch.encode_utf16(&mut [0; 2]) {
-                    write!(escaped, "\\u{unit:04x}")?;
-                }
+        return text.into();
+    }
+    let mut escaped = String::new();
+    for ch in text.chars() {
+        if ch < '\u{7f}' {
+            escaped.push(ch);
+        } else {
+            for unit in ch.encode_utf16(&mut [0; 2]) {
+                write!(escaped, "\\u{unit:04x}").expect("writing to a string");
             }
         }
-        println!("{escaped}");
     }
-    Ok(())
+    escaped.into()
 }

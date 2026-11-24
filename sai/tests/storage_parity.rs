@@ -85,11 +85,13 @@ fn missing_home_status_and_list_have_no_side_effects() {
         .args(["--json", "auth", "status"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stderr.is_empty());
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "SIGNED_OUT");
     assert_eq!(
-        output.stderr,
-        b"Error: No Sai session; run `sai auth import` or `sai auth login NAME`\n"
+        error["message"],
+        "No Sai session; run `sai auth import` or `sai auth login NAME`"
     );
     assert!(!home.exists());
 }

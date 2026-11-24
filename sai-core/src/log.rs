@@ -90,6 +90,13 @@ pub fn remember(tokens: impl IntoIterator<Item = String>) {
     }
 }
 
+/// Redact stored session tokens from text shown to the user.
+pub fn redact(home: &std::path::Path, text: &str) -> String {
+    Tokens::default().refresh(home);
+    let known = KNOWN.lock().unwrap_or_else(|error| error.into_inner());
+    privacy::replace_tokens(text, &known)
+}
+
 #[derive(Default)]
 struct Queue {
     chars: AtomicUsize,
@@ -108,8 +115,31 @@ struct Event {
 
 pub struct LogWriter {
     events: SyncSender<Event>,
-    done: Receiver<()>,
+    done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
+}
+
+/// Log events that occur while handling a CLI command or an MCP call.
+#[derive(Clone, Copy)]
+pub struct EventContext<'a> {
+    pub writer: Option<&'a LogWriter>,
+    pub surface: Surface,
+    pub command: Option<&'a str>,
+}
+
+impl EventContext<'_> {
+    pub fn event<'a>(
+        self,
+        name: &str,
+        level: Level,
+        fields: impl IntoIterator<Item = (&'a str, Field)>,
+    ) {
+        let Some(writer) = self.writer else { return };
+        let command = self
+            .command
+            .map(|command| ("command", Field::Text(command.into())));
+        writer.event(self.surface, name, level, command.into_iter().chain(fields));
+    }
 }
 
 impl LogWriter {
@@ -131,7 +161,7 @@ impl LogWriter {
             .ok()?;
         Some(Self {
             events,
-            done,
+            done: Mutex::new(done),
             queue,
         })
     }
@@ -187,7 +217,9 @@ impl LogWriter {
     /// Close the queue and allow the writer up to `timeout` to finish.
     pub fn finish(self, timeout: Duration) -> bool {
         drop(self.events);
-        self.done.recv_timeout(timeout).is_ok()
+        self.done
+            .into_inner()
+            .is_ok_and(|done| done.recv_timeout(timeout).is_ok())
     }
 }
 

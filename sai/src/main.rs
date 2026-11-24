@@ -1,17 +1,18 @@
 mod config;
 mod local;
 
-use std::{env, process::ExitCode, time::Instant};
+use std::{env, path::Path, process, time::Instant};
 
 use clap::{
     Parser, Subcommand,
     error::{ContextKind, ContextValue, ErrorKind},
 };
-use sai_core::log::{EXIT_FLUSH, Field, Level, LogWriter, Surface};
+use sai_core::errors::{ExitCode, SaiError};
+use sai_core::log::{self, EXIT_FLUSH, EventContext, Field, Level, LogWriter, Surface};
 use sai_core::settings::{Environment, Flags, Settings, SettingsError, repr};
 use serde_json::{Value, json};
 
-use config::{ConfigCommand, Error};
+use config::ConfigCommand;
 use local::{AuthCommand, IntentCommand};
 
 #[derive(Parser)]
@@ -64,7 +65,7 @@ enum Command {
     },
 }
 
-fn main() -> ExitCode {
+fn main() -> process::ExitCode {
     let args: Vec<_> = env::args_os().collect();
     let argv: Vec<_> = args
         .iter()
@@ -73,6 +74,13 @@ fn main() -> ExitCode {
         .collect();
     let (command, operands) = command_path(&argv);
     let environment = Environment::from_process();
+    let home = environment.as_ref().ok().map(|env| env.home.as_path());
+    let requested_json = json_requested(&argv)
+        || (matches!(command.split(' ').next(), Some("auth" | "intent"))
+            && operands
+                .iter()
+                .take_while(|arg| *arg != "--")
+                .any(|arg| arg == "--json"));
     let started = Instant::now();
     let writer = if command == "logs"
         || argv
@@ -99,6 +107,11 @@ fn main() -> ExitCode {
         }
         .into()
     };
+    let events = EventContext {
+        writer: writer.as_ref(),
+        surface: Surface::Cli,
+        command: (!command.is_empty()).then_some(command),
+    };
     if let Some(writer) = &writer {
         writer.event(
             Surface::Cli,
@@ -110,48 +123,53 @@ fn main() -> ExitCode {
             ],
         );
     }
-    let result = match Cli::try_parse_from(args) {
-        Ok(cli) => environment
-            .as_ref()
-            .map_err(|error| Error {
-                code: 1,
-                message: error.to_string(),
-            })
-            .and_then(|env| {
-                let flags = Flags {
-                    endpoint: cli.endpoint,
-                    ws_endpoint: cli.ws_endpoint,
-                    lcd_endpoint: cli.lcd_endpoint,
-                };
-                let result = match cli.command {
-                    Command::Auth { command, json } => local::auth(
-                        command,
-                        cli.account.as_deref(),
-                        &flags,
-                        env,
-                        cli.json || json,
-                    ),
-                    Command::Intent { command, json } => {
-                        local::intent(command, &flags, env, cli.json || json)
+    let outcome = match Cli::try_parse_from(args) {
+        Ok(cli) => {
+            let json = cli.json
+                || matches!(
+                    &cli.command,
+                    Command::Auth { json: true, .. } | Command::Intent { json: true, .. }
+                );
+            let result = environment
+                .as_ref()
+                .map_err(|error| SaiError::from(error.clone()))
+                .and_then(|env| {
+                    let flags = Flags {
+                        endpoint: cli.endpoint,
+                        ws_endpoint: cli.ws_endpoint,
+                        lcd_endpoint: cli.lcd_endpoint,
+                    };
+                    match cli.command {
+                        Command::Auth { command, .. } => {
+                            local::auth(command, cli.account.as_deref(), &flags, env, json, events)
+                        }
+                        Command::Intent { command, .. } => {
+                            local::intent(command, &flags, env, json)
+                        }
+                        Command::Config { command } => command.run(&flags, env, json),
                     }
-                    Command::Config { command } => return command.run(&flags, env, cli.json),
-                };
-                result.map_err(|error| Error {
-                    code: 1,
-                    message: error.to_string(),
-                })
-            }),
-        Err(error) => {
-            let context = if command == "logs" { "" } else { command };
-            return finish(
-                writer,
-                command_field(),
-                started,
-                print_parse_error(&error, context, operands),
-            );
+                });
+            complete(result, command, json, home)
         }
+        Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
-    finish(writer, command_field(), started, complete(result, command))
+    finish(writer, command_field(), started, outcome)
+}
+
+fn json_requested(args: &[String]) -> bool {
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--json" => return true,
+            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => {
+                args.next();
+            }
+            "--" => break,
+            arg if !arg.starts_with('-') => break,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn load_settings(flags: &Flags, env: &Environment) -> Result<Settings, SettingsError> {
@@ -162,13 +180,80 @@ fn load_settings(flags: &Flags, env: &Environment) -> Result<Settings, SettingsE
     Ok(settings)
 }
 
-fn complete(result: Result<(), Error>, command: &str) -> (u8, Option<String>) {
-    match result {
-        Ok(()) => (0, None),
-        Err(error) => {
-            error.print(command);
-            (error.code, Some(error.message))
+fn complete(
+    result: Result<(), SaiError>,
+    command: &str,
+    json_output: bool,
+    home: Option<&Path>,
+) -> (ExitCode, Option<SaiError>) {
+    let Err(error) = result else {
+        return (ExitCode::Ok, None);
+    };
+    let redact = |text: &str| home.map_or_else(|| text.to_owned(), |home| log::redact(home, text));
+    let message = redact(&error.message);
+    if json_output {
+        let mut body =
+            json!({"code": error.code, "message": message, "retryable": error.retryable()});
+        if let Some(key) = &error.intent_key {
+            body["intentKey"] = json!(key);
         }
+        if let Some(hint) = &error.hint {
+            body["hint"] = json!(redact(hint));
+        }
+        if let Some(details) = &error.details {
+            body["details"] = redact_details(&Value::Object((**details).clone()), &redact);
+        }
+        println!("{}", local::ascii_json(&json!({"error": body}).to_string()));
+    } else {
+        if error.exit_code == ExitCode::Usage {
+            eprintln!(
+                "{}\nTry '{} --help' for help.\n",
+                usage(command),
+                command_line(command)
+            );
+        }
+        eprintln!("Error: {message}");
+    }
+    (error.exit_code, Some(error))
+}
+
+fn usage(command: &str) -> String {
+    let args = match command {
+        "config get" | "config unset" => " KEY",
+        "config set" => " KEY VALUE",
+        "config list" | "auth status" | "auth list" => "",
+        "intent local" | "auth use" => " ADDR",
+        "auth logout" => " [ADDR]",
+        "" => " [COMMAND] [ARGS]...",
+        _ => " COMMAND [ARGS]...",
+    };
+    format!("Usage: {} [OPTIONS]{args}", command_line(command))
+}
+
+fn command_line(command: &str) -> String {
+    if command.is_empty() {
+        "sai".into()
+    } else {
+        format!("sai {command}")
+    }
+}
+
+fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
+    match value {
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, item)| (redact(key), redact_details(item, redact)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| redact_details(item, redact))
+                .collect(),
+        ),
+        Value::String(text) => Value::String(redact(text)),
+        other => other.clone(),
     }
 }
 
@@ -176,23 +261,31 @@ fn finish(
     writer: Option<LogWriter>,
     command: Field,
     started: Instant,
-    (code, error): (u8, Option<String>),
-) -> ExitCode {
+    (code, error): (ExitCode, Option<SaiError>),
+) -> process::ExitCode {
     if let Some(writer) = writer {
-        let duration_ms = (started.elapsed().as_secs_f64() * 1_000.0).round() as u64;
-        let level = if code == 0 { Level::Info } else { Level::Warn };
+        let duration_ms = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
+        let level = if code == ExitCode::Ok {
+            Level::Info
+        } else {
+            Level::Warn
+        };
         let mut fields = vec![
             ("command", command),
             ("durationMs", json!(duration_ms).into()),
-            ("exitCode", json!(code).into()),
+            ("exitCode", json!(code as u8).into()),
         ];
         if let Some(error) = error {
-            fields.push(("error", Field::Untrusted(error)));
+            fields.push(("code", json!(error.code).into()));
+            fields.push(("error", Field::Untrusted(error.message)));
+            if let Some(key) = error.intent_key {
+                fields.push(("intentKey", Field::Text(key)));
+            }
         }
         writer.event(Surface::Cli, "command.end", level, fields);
         writer.finish(EXIT_FLUSH);
     }
-    code.into()
+    (code as u8).into()
 }
 
 fn command_path(args: &[String]) -> (&'static str, &[String]) {
@@ -248,7 +341,7 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
     }
 }
 
-fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<Error> {
+fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<SaiError> {
     let arg = context_text(error, ContextKind::InvalidArg);
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
@@ -261,18 +354,15 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
                 format!("No such option {}.", repr(argument))
             } else {
                 let consumed = match command {
-                    "config get" | "config unset" => 1,
+                    "config get" | "config unset" | "intent local" | "auth use" | "auth logout" => {
+                        1
+                    }
                     "config set" => 2,
                     _ => 0,
                 };
-                let separator = operands.iter().position(|operand| operand == "--");
-                let extra = operands
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| Some(*index) != separator)
-                    .map(|(_, arg)| arg)
+                let extra = positional(operands, command)
+                    .into_iter()
                     .skip(consumed)
-                    .cloned()
                     .collect::<Vec<_>>();
                 if extra.len() > 1 {
                     format!("Got unexpected extra arguments ({})", extra.join(" "))
@@ -294,52 +384,89 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
         }
         _ => return None,
     };
-    Some(Error::usage(message))
+    Some(SaiError::usage(message))
+}
+
+fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
+    let mut operands = operands.iter().map(String::as_str);
+    let mut options = true;
+    let mut positional = Vec::new();
+    while let Some(arg) = operands.next() {
+        match arg {
+            "--" if options => options = false,
+            "--json"
+                if options && (command.starts_with("intent ") || command.starts_with("auth ")) => {}
+            _ => positional.push(arg),
+        }
+    }
+    positional
 }
 
 fn print_parse_error(
     error: &clap::Error,
     command: &str,
     operands: &[String],
-) -> (u8, Option<String>) {
-    if matches!(command.split_whitespace().next(), Some("auth" | "intent")) {
-        let _ = error.print();
-        return (error.exit_code() as u8, None);
-    }
+    json: bool,
+    home: Option<&Path>,
+) -> (ExitCode, Option<SaiError>) {
+    let help = || config::help(command);
     match error.kind() {
-        ErrorKind::DisplayHelp if config::print_help(command, false) => (0, None),
-        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
-            if command == "config" =>
-        {
-            config::print_help(command, true);
-            (2, None)
-        }
-        _ => {
-            let usage_command = match error.get(ContextKind::Usage) {
-                Some(ContextValue::StyledStr(usage)) => {
-                    let usage = usage.to_string();
-                    let path = usage.trim_start_matches("Usage: sai").trim();
-                    if path == "config" || path.starts_with("config ") {
-                        if path == command || path.starts_with(&format!("{command} ")) {
-                            command
-                        } else {
-                            "config"
-                        }
-                    } else {
-                        ""
-                    }
-                }
-                _ => command,
-            };
-            if let Some(usage) = usage_error(error, usage_command, operands) {
-                if error.kind() == ErrorKind::InvalidValue && usage_command.is_empty() {
-                    eprintln!("Error: {}", usage.message);
-                    return (usage.code, None);
-                }
-                return complete(Err(usage), usage_command);
+        ErrorKind::DisplayHelp => {
+            if let Some(help) = help() {
+                println!("{help}");
+            } else {
+                let _ = error.print();
             }
-            let _ = error.print();
-            (error.exit_code() as u8, None)
+            return (ExitCode::Ok, None);
         }
+        ErrorKind::DisplayVersion => {
+            let _ = error.print();
+            return (ExitCode::Ok, None);
+        }
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
+            if command == "config"
+                && let Some(help) = help()
+            {
+                let error = SaiError::usage(help);
+                if json {
+                    return complete(Err(error), command, true, home);
+                }
+                eprintln!("{}", error.message);
+                return (ExitCode::Usage, Some(error));
+            }
+        }
+        _ => {}
     }
+    let usage_command = match error.get(ContextKind::Usage) {
+        Some(ContextValue::StyledStr(usage)) => {
+            let usage = usage.to_string();
+            let path = usage.trim_start_matches("Usage: sai").trim();
+            if path == command || path.starts_with(&format!("{command} ")) {
+                command
+            } else if path == "config" || path.starts_with("config ") {
+                "config"
+            } else {
+                ""
+            }
+        }
+        _ => command,
+    };
+    if let Some(usage) = usage_error(error, usage_command, operands) {
+        if !json && error.kind() == ErrorKind::InvalidValue && usage_command.is_empty() {
+            eprintln!("Error: {}", usage.message);
+            return (ExitCode::Usage, Some(usage));
+        }
+        return complete(Err(usage), usage_command, json, home);
+    }
+    if json {
+        let message = match error.kind() {
+            ErrorKind::MissingSubcommand if command.is_empty() => {
+                "Pass a command when using --json."
+            }
+            _ => "Invalid command arguments.",
+        };
+        return complete(Err(SaiError::usage(message)), usage_command, true, home);
+    }
+    let _ = error.print();
+    (ExitCode::Usage, None)
 }

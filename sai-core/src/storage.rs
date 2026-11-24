@@ -9,6 +9,8 @@ use std::{
 
 use thiserror::Error;
 
+use crate::errors::{Code, SaiError};
+
 mod ledger;
 mod sessions;
 
@@ -31,17 +33,35 @@ pub enum StorageError {
 
 #[derive(Debug, Error)]
 #[error("{0}")]
-pub struct SessionError(String);
+pub struct SessionError(pub SaiError);
 
 impl SessionError {
     pub(crate) fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self(SaiError::new(Code::SessionUnavailable, message))
+    }
+}
+
+impl From<SessionError> for SaiError {
+    fn from(error: SessionError) -> Self {
+        error.0
+    }
+}
+
+impl From<StorageError> for SaiError {
+    fn from(error: StorageError) -> Self {
+        match error {
+            StorageError::Session(error) => error.into(),
+            StorageError::NewerLedger | StorageError::UncertainIntent(_) => {
+                Self::new(Code::InvalidRequest, error.to_string())
+            }
+            _ => Self::internal(),
+        }
     }
 }
 
 /// Persisted account sessions and trade reservations under a single Sai home.
 pub struct Storage<'a> {
-    trader: PathBuf,
+    pub(crate) trader: PathBuf,
     busy_timeout: Duration,
     events: Option<&'a (dyn Fn(StorageEvent<'_>) + Sync)>,
 }
