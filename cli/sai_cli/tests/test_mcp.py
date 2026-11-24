@@ -8,12 +8,19 @@ import json
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, TextIO
 
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.server.fastmcp import FastMCP
@@ -139,6 +146,11 @@ class FakeKeeper:
                     "evmAddress": ADDR,
                 }
             }
+        if query == keeper.POSITION and query not in self.answers:
+            assert variables is not None
+            return position_data(variables)
+        if query == keeper.ROUTE and query not in self.answers:
+            return POSITION_ROUTE
         return json.loads(json.dumps(self.answers[query]))
 
     def intent(self) -> dict[str, Any]:
@@ -150,8 +162,9 @@ class FakeKeeper:
 
 
 @pytest.fixture
-def mcp() -> FastMCP:
-    return server.create_server()
+def mcp() -> Iterator[FastMCP]:
+    with keeper_server(PositionKeeperHandler) as lcd:
+        yield server.create_server(settings.load(flags={"lcd.endpoint": lcd}))
 
 
 # Schema and listing
@@ -547,7 +560,7 @@ def snapshots(monkeypatch, *collaterals: str) -> None:
         for amount in collaterals
     )
 
-    def snapshot(*args: Any) -> margin.PositionSnapshot:
+    def snapshot(*args: Any, **kwargs: Any) -> margin.PositionSnapshot:
         nonlocal current
         current = next(states)
         return current
@@ -666,7 +679,8 @@ def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     storage.save_session(stored_session())
     fake = FakeKeeper({keeper.MARKETS: markets()})
     monkeypatch.setattr(keeper, "request", fake)
-    snapshots(monkeypatch, "4000000")
+    if name in ("preview_margin", "preview_partial_close"):
+        snapshots(monkeypatch, "4000000")
     preview = invoke(mcp, name, arguments)
     assert preview["dryRun"] is True
     assert len(preview["previewDigest"]) == 64
@@ -1059,10 +1073,12 @@ def test_errors_redact_every_connected_token():
     assert tools.redact(text) == f"failed with {tools.REDACTED} and {tools.REDACTED}"
 
 
-def test_preview_without_a_session_names_no_account(mcp, monkeypatch):
-    monkeypatch.setattr(keeper, "request", FakeKeeper())
+def test_position_preview_requires_a_session(mcp, monkeypatch):
+    fake = FakeKeeper()
+    monkeypatch.setattr(keeper, "request", fake)
     preview = invoke(mcp, "preview_close", {"trade_id": 7})
-    assert preview["addr"] is None
+    assert preview["code"] == "SIGNED_OUT"
+    assert fake.calls == []
 
 
 def test_reference_price_is_only_for_market_orders(mcp, monkeypatch):
