@@ -18,11 +18,29 @@ from typing import Any
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
+SCRIPT = Path(__file__).with_name("release-rehearsal.py").resolve()
+REHEARSAL = runpy.run_path(str(SCRIPT))
+RUN_WITH_RELEASE_API = (
+    "import runpy, sys; script, api = sys.argv[1:3]; "
+    "sys.argv = [script, *sys.argv[3:]]; "
+    "sys.exit(runpy.run_path(script)['main'](api_base=api))"
+)
 LOCK_DESCENDANT = (
     "import fcntl, os, sys, time; file = open(sys.argv[1], 'w'); "
     "fcntl.flock(file, fcntl.LOCK_EX); print('locked', os.getpid(), flush=True); time.sleep(30)"
 )
+
+
+def published_release(version: str) -> dict[str, Any]:
+    return {
+        "tag_name": f"sai-cli/v{version}",
+        "draft": False,
+        "prerelease": False,
+        "assets": [
+            {"name": f"sai_cli-{version}-py3-none-any.whl", "state": "uploaded"},
+            {"name": "SHA256SUMS", "state": "uploaded"},
+        ],
+    }
 
 
 class RetryBlockTest(unittest.TestCase):
@@ -216,6 +234,61 @@ class BaselineTest(unittest.TestCase):
             "Candidate sai 0.1.9 must be newer than baseline sai 0.1.10", result.stderr
         )
 
+    def test_explicit_baseline_requires_the_exact_stable_release_and_assets(
+        self,
+    ) -> None:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class Releases(keeper_handler):
+            def do_GET(self) -> None:
+                if self.path.endswith("/releases/tags/sai-cli%2Fv0.1.0"):
+                    self.reply(published_release("0.1.0"))
+                elif self.path.endswith("/releases/tags/sai-cli%2Fv0.1.1"):
+                    self.reply({**published_release("0.1.1"), "prerelease": True})
+                elif self.path.endswith("/releases/tags/sai-cli%2Fv0.1.2"):
+                    release = published_release("0.1.2")
+                    release["assets"].pop()
+                    self.reply(release)
+                else:
+                    self.send_error(404)
+
+        with (
+            REHEARSAL["keeper_server"](Releases) as base,
+            tempfile.TemporaryDirectory() as temp,
+        ):
+            REHEARSAL["verify_published_baseline"]("0.1.0", base)
+            wheel = Path(temp) / "sai_cli-0.1.3-py3-none-any.whl"
+            wheel.touch()
+            for version, detail in (
+                ("0.0.999", "release not found on GitHub"),
+                ("0.1.1", "expected a stable release"),
+                ("0.1.2", "missing release assets SHA256SUMS"),
+            ):
+                with self.subTest(version=version):
+                    result = subprocess.run(
+                        [
+                            sys.executable,
+                            "-c",
+                            RUN_WITH_RELEASE_API,
+                            str(SCRIPT),
+                            base,
+                            "--from",
+                            version,
+                            str(wheel),
+                        ],
+                        env={"HOME": temp, "TMPDIR": temp, "PATH": ""},
+                        timeout=5,
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 1)
+                    self.assertIn(
+                        f"Could not verify published sai-cli release {version}: {detail}",
+                        result.stderr,
+                    )
+                    self.assertCountEqual(Path(temp).iterdir(), [wheel])
+
 
 class SessionTest(unittest.TestCase):
     def test_changed_or_missing_session_file_fails_without_exposing_token(self) -> None:
@@ -243,7 +316,16 @@ class SessionTest(unittest.TestCase):
 
 class NetworkTest(unittest.TestCase):
     def test_strict_requires_a_namespace_before_installing(self) -> None:
-        with tempfile.TemporaryDirectory() as temp:
+        keeper_handler = REHEARSAL["KeeperHandler"]
+
+        class Release(keeper_handler):
+            def do_GET(self) -> None:
+                self.reply(published_release("0.1.0"))
+
+        with (
+            tempfile.TemporaryDirectory() as temp,
+            REHEARSAL["keeper_server"](Release) as base,
+        ):
             root = Path(temp)
             bin_dir = root / "tools"
             bin_dir.mkdir()
@@ -251,11 +333,13 @@ class NetworkTest(unittest.TestCase):
                 (bin_dir / name).symlink_to(sys.executable)
             wheel = root / "sai_cli-0.1.1-py3-none-any.whl"
             wheel.write_bytes(b"unused wheel")
-            script = Path(__file__).with_name("release-rehearsal.py").resolve()
             result = subprocess.run(
                 [
                     sys.executable,
-                    str(script),
+                    "-c",
+                    RUN_WITH_RELEASE_API,
+                    str(SCRIPT),
+                    base,
                     "--strict",
                     "--from",
                     "0.1.0",

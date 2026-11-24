@@ -25,6 +25,7 @@ from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any, NamedTuple, TypeVar
+from urllib.parse import quote
 
 SCRIPTS = Path(__file__).resolve().parent
 TESTS = SCRIPTS.parent / "cli" / "sai_cli" / "tests"
@@ -214,6 +215,57 @@ def resolve_baseline(
     if tag is None:
         raise RehearsalError("No sai-cli release is published yet")
     return release_install.version_of(tag)
+
+
+def verify_published_baseline(version: str, api_base: str) -> None:
+    tag = f"{release_install.TAG_PREFIX}{version}"
+    url = f"{api_base.rstrip('/')}/repos/{REPO}/releases/tags/{quote(tag, safe='')}"
+    error = f"Could not verify published sai-cli release {version}"
+    try:
+        status, _, body = release_install.within(
+            release_install.TOTAL_TIMEOUT,
+            f"checking release {tag}",
+            lambda deadline: release_install.request(url, "GET", deadline),
+        )
+    except release_install.LookupFailed as exc:
+        raise RehearsalError(f"{error}: {exc}") from exc
+    if status == 404:
+        raise RehearsalError(f"{error}: release not found on GitHub")
+    if status != 200:
+        raise RehearsalError(f"{error}: GitHub API answered HTTP {status}")
+    require(
+        len(body) <= release_install.MAX_BODY,
+        f"{error}: GitHub API answer is too large",
+    )
+    try:
+        release = json.loads(body)
+    except ValueError as exc:
+        raise RehearsalError(
+            f"{error}: GitHub API answered with malformed JSON"
+        ) from exc
+    require(
+        isinstance(release, dict)
+        and release.get("tag_name") == tag
+        and release.get("draft") is False
+        and release.get("prerelease") is False,
+        f"{error}: expected a stable release tagged {tag}",
+    )
+    assets = release.get("assets")
+    uploaded = (
+        [
+            asset.get("name")
+            for asset in assets
+            if isinstance(asset, dict) and asset.get("state") == "uploaded"
+        ]
+        if isinstance(assets, list)
+        else []
+    )
+    missing = [
+        name
+        for name in (release_install.wheel_name(version), "SHA256SUMS")
+        if name not in uploaded
+    ]
+    require(not missing, f"{error}: missing release assets {', '.join(missing)}")
 
 
 class ReplyReader:
@@ -1384,7 +1436,7 @@ def report_result(work: Callable[[], int]) -> int:
     return 1
 
 
-def main() -> int:
+def main(*, api_base: str = release_install.API_BASE) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "wheel",
@@ -1434,11 +1486,15 @@ def main() -> int:
     version = match[1]
 
     def work() -> int:
-        baseline = args.baseline if args.baseline is not None else resolve_baseline()
+        baseline = (
+            args.baseline if args.baseline is not None else resolve_baseline(api_base)
+        )
         require(
             tuple(map(int, version.split("."))) > tuple(map(int, baseline.split("."))),
             f"Candidate sai {version} must be newer than baseline sai {baseline}",
         )
+        if args.baseline is not None:
+            verify_published_baseline(baseline, api_base)
         diagnostics = None
         if args.verbose:
             directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
