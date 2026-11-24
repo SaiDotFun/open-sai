@@ -492,11 +492,11 @@ def snapshot(
 def exchange_balance(
     lcd: str, contract: str, trader: str, token: str, *, height: str | None = None
 ) -> dict[str, Any]:
-    funds = smart_value(
-        lcd,
-        contract,
-        {"get_exchange_balance": {"user": trader, "collateral_index": token}},
-        height=height,
+    message = {"get_exchange_balance": {"user": trader, "collateral_index": token}}
+    funds = (
+        smart(lcd, contract, message)
+        if height is None
+        else smart_value(lcd, contract, message, height=height)
     )
     if not isinstance(funds, dict):
         raise TypeError("Contract returned invalid exchange balance")
