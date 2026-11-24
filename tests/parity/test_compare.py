@@ -143,6 +143,73 @@ def test_ledger_schema_ignores_only_insignificant_formatting(tmp_path: Path) -> 
     )
 
 
+def test_ledger_detects_added_or_changed_check_constraints(tmp_path: Path) -> None:
+    ddl = """
+        CREATE TABLE intents (
+            id TEXT PRIMARY KEY,
+            status TEXT NOT NULL,
+            [CHECK] TEXT DEFAULT 'CHECK(''not a constraint'')' /* CHECK(fake) */
+        )
+    """
+
+    def read(name: str, schema: str) -> dict:
+        path = tmp_path / name
+        with sqlite3.connect(path) as db:
+            db.execute(schema)
+            db.execute("INSERT INTO intents (id, status) VALUES ('saved', 'unknown')")
+        return ledger(path, Normalize(tmp_path))
+
+    reference = read("reference.sqlite3", ddl)
+    constraint = ", CHECK ((status <> 'rejected') AND [CHECK] <> 'CHECK()')"
+    checked = read(
+        "checked.sqlite3", ddl.replace("\n        )", constraint + "\n        )")
+    )
+    assert reference["tables"] == checked["tables"]
+    assert reference["schema"]["tables"]["intents"]["checks"] == []
+    assert first_difference(reference, checked, "ledger") == (
+        "ledger.schema.tables.intents.checks length"
+    )
+
+    formatted = (
+        ", check /* retain comments */ ( (STATUS<>'rejected') and [CHECK]<>'CHECK()' )"
+    )
+    equivalent = read(
+        "formatted.sqlite3", ddl.replace("\n        )", formatted + "\n        )")
+    )
+    assert checked == equivalent
+    try:
+        bom = read(
+            "bom.sqlite3",
+            ddl.replace(
+                "\n        )",
+                constraint.replace("CHECK ", "CHECK \ufeff ") + "\n        )",
+            ),
+        )
+    except sqlite3.OperationalError:
+        legacy_bom = read(
+            "legacy-bom.sqlite3",
+            ddl.replace(
+                "\n        )", ", \ufeff INTEGER, CHECK (\ufeff > 0)\n        )"
+            ),
+        )
+        assert legacy_bom["schema"]["tables"]["intents"]["checks"] == [
+            ["\ufeff", ">", "0"]
+        ]
+    else:
+        assert checked == bom
+
+    changed = read(
+        "changed.sqlite3",
+        ddl.replace(
+            "\n        )", constraint.replace("'rejected'", "'failed'") + "\n        )"
+        ),
+    )
+    difference = first_difference(checked, changed, "ledger")
+    assert difference is not None and difference.startswith(
+        "ledger.schema.tables.intents.checks"
+    )
+
+
 def log_snapshot(
     home: Path,
     files: dict[str, list[tuple[int, str]]],

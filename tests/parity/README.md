@@ -84,8 +84,9 @@ config text outside the edited value, including its inline comment. It
 authenticates and decrypts session envelopes. It reads SQLite's parsed column
 types, defaults, nullability, primary keys, foreign keys, table options, and
 index metadata from a copy with its journal files. The snapshot also compares
-the user version and typed rows. Formatting of the CREATE statements, row
-order, and physical page layout may vary.
+`CHECK` expressions in the stored table definitions, the user version, and
+typed rows. Formatting of the CREATE statements, row order, and physical
+page layout may vary.
 The runner parses `update.json` as JSON and compares other files byte for
 byte. The report names differing paths and fields.
 

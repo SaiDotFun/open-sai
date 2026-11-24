@@ -11,8 +11,10 @@ import tempfile
 import time
 import tomllib
 from collections.abc import Callable, Iterator, Mapping
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -31,6 +33,14 @@ SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
+SQLITE_TRIVIA = r"[ \t\n\f\r]+|--[^\n]*|/\*[\s\S]*?(?:\*/|$)"
+SQLITE_SYNTAX = (
+    r"""|(?:[xX])?'(?:''|[^'])*'|"(?:""|[^"])*"|`(?:``|[^`])*`|\[[^\]]*\]"""
+    r"|(?P<name>[a-zA-Z_\x80-\U0010ffff][a-zA-Z_0-9$\x80-\U0010ffff]*)"
+    r"|0[xX][0-9a-fA-F_]+|(?:[0-9][0-9_]*(?:\.[0-9_]*)?|\.[0-9][0-9_]*)(?:[eE][+-]?[0-9][0-9_]*)?"
+    r"|->>|->|<=|>=|<>|!=|==|\|\||<<|>>|."
+)
+ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz", "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 
 
 class InvalidReservationTime(ValueError):
@@ -340,12 +350,59 @@ def paths(root: Path) -> Iterator[Path]:
             yield from paths(child)
 
 
+@cache
+def sqlite_tokenizer() -> re.Pattern[str]:
+    trivia = SQLITE_TRIVIA
+    with closing(sqlite3.connect(":memory:")) as conn:
+        try:
+            conn.execute("SELECT \ufeff 1")
+        except sqlite3.OperationalError:
+            pass  # Older SQLite versions tokenize this BOM as an identifier.
+        else:
+            trivia += r"|\ufeff"
+    return re.compile(rf"(?P<trivia>{trivia}){SQLITE_SYNTAX}", re.DOTALL)
+
+
+def table_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
+    """Read CHECK expressions and trailing table options from stored DDL."""
+    # SQLite treats high-byte characters as identifier characters, except
+    # when its tokenizer skips a BOM. Quoted tokens can contain parentheses.
+    tokens = [
+        token[0].translate(ASCII_UPPER) if token.lastgroup == "name" else token[0]
+        for token in sqlite_tokenizer().finditer(sql)
+        if token.lastgroup != "trivia"
+    ]
+    if tokens[:2] != ["CREATE", "TABLE"]:
+        return [], []
+    opening = tokens.index("(")
+    checks: list[list[str]] = []
+    depth = 0
+    check_start = None
+    for i in range(opening, len(tokens)):
+        token = tokens[i]
+        if token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+            if depth == 1 and check_start is not None:
+                checks.append(tokens[check_start:i])
+                check_start = None
+            if depth == 0:
+                return checks, tokens[i + 1 :]
+        elif depth == 1 and tokens[i : i + 2] == ["CHECK", "("]:
+            check_start = i + 2
+    raise ValueError("Unbalanced CREATE TABLE definition")
+
+
 def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     tables = {}
-    for name, kind, without_rowid, strict in conn.execute(
-        "SELECT name, type, wr, strict FROM pragma_table_list"
-        " WHERE schema = 'main' AND name != 'sqlite_schema' ORDER BY name"
+    for name, kind, without_rowid, strict, sql in conn.execute(
+        "SELECT info.name, info.type, info.wr, info.strict, definition.sql"
+        " FROM pragma_table_list AS info JOIN sqlite_master AS definition"
+        " ON info.name = definition.name AND definition.type IN ('table', 'view')"
+        " WHERE info.schema = 'main' ORDER BY info.name"
     ):
+        checks, _ = table_ddl(sql)
         # The PRAGMA reports parsed defaults, nullability, PK order, and
         # hidden or generated columns, including when the table is empty.
         columns = [
@@ -380,6 +437,7 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
             "without_rowid": without_rowid,
             "strict": strict,
             "columns": columns,
+            "checks": checks,
             "indexes": indexes,
             "foreign_keys": conn.execute(
                 "SELECT * FROM pragma_foreign_key_list(?) ORDER BY id, seq", (name,)
