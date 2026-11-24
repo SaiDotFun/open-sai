@@ -97,6 +97,52 @@ fn missing_home_status_and_list_have_no_side_effects() {
 }
 
 #[test]
+fn signed_out_trade_hides_keeper_query_path_in_hint() {
+    let home = tempdir().unwrap();
+    let endpoint = format!("{ENDPOINT}/query");
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", &endpoint, "trade", "close", "7"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stderr.is_empty());
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "SIGNED_OUT");
+    assert_eq!(
+        error["hint"],
+        r#"sai --endpoint "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME"#
+    );
+}
+
+#[test]
+fn signed_out_auth_hint_shows_only_the_keeper_origin() {
+    let home = tempdir().unwrap();
+    let endpoint = format!("{ENDPOINT}/query");
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", &endpoint, "auth", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(
+        error["hint"],
+        format!(
+            r#"sai --endpoint "${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {ENDPOINT}}}" auth login NAME"#
+        )
+    );
+    let output = rust(home.path())
+        .args(["--json", "--endpoint", ENDPOINT, "auth", "status"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(6));
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(
+        error["hint"],
+        format!("sai --endpoint {ENDPOINT} auth login NAME")
+    );
+}
+
+#[test]
 fn auth_output_shows_only_the_origin_but_checks_the_full_endpoint() {
     let home = tempdir().unwrap();
     let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture#secret";
@@ -547,9 +593,12 @@ sys.stdout.flush()
 sys.stdin.buffer.read(1)
 try:
     storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
-except ValueError as error:
-    if "Reconcile uncertain intent rust " not in str(error):
-        raise
+except storage.UnresolvedIntent as error:
+    if hasattr(storage, "RecentOpenPending"):
+        assert isinstance(error, storage.RecentOpenPending)
+        assert error.intent_key == "rust"
+    else:
+        assert "Reconcile uncertain intent rust " in str(error)
     sys.exit(4)
 "#,
             ENDPOINT,
@@ -575,7 +624,7 @@ except ValueError as error:
     let python_status = python.wait().unwrap().code();
     match reserved {
         Ok(()) => assert_eq!(python_status, Some(4)),
-        Err(StorageError::UncertainIntent(key)) => {
+        Err(StorageError::RecentOpenPending { key, .. }) => {
             assert_eq!(key, "python");
             assert_eq!(python_status, Some(0));
         }
@@ -641,8 +690,12 @@ from sai_cli.core import storage
 endpoint, addr = sys.argv[1:]
 try:
     storage.pending("python", endpoint, addr, "OPEN_TRADE", "")
-except ValueError as error:
-    assert "Reconcile uncertain intent rust " in str(error)
+except storage.UnresolvedIntent as error:
+    if hasattr(storage, "RecentOpenPending"):
+        assert isinstance(error, storage.RecentOpenPending)
+        assert error.intent_key == "rust"
+    else:
+        assert "Reconcile uncertain intent rust " in str(error)
 else:
     raise AssertionError("Python reserved a second intent")
 "#,
