@@ -448,6 +448,7 @@ def change_margin(
             inputs,
             {
                 "dryRun": True,
+                "positionRoute": state.route,
                 "quote": {
                     **quote,
                     **inputs,
@@ -529,6 +530,7 @@ def partial_close(
             {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
             {
                 "dryRun": True,
+                "positionRoute": state.route,
                 "intent": payload,
                 "quote": {
                     "percent": percent,

@@ -1,4 +1,4 @@
-"""Confirm position quotes through MCP against loopback Keeper and LCD routes."""
+"""Confirm position quotes through CLI and MCP against loopback Keeper and LCD."""
 
 from __future__ import annotations
 
@@ -22,6 +22,7 @@ from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 from sai_cli.core import keeper, settings, storage
+from sai_cli.core.errors import ExitCode
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
 
@@ -33,6 +34,8 @@ TRADER = "nibi1trader"
 
 @dataclass
 class Position:
+    chain_id: str = CHAIN_ID
+    contract_address: str = "nibi1contract"
     collateral: int = 4_000_000
     trade_type: str = "trade"
     keeper_market_open: bool = True
@@ -119,8 +122,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     keeper.ROUTE: {
                         "oneClickTrading": {
                             "enabled": True,
-                            "chainId": CHAIN_ID,
-                            "contractAddress": "nibi1contract",
+                            "chainId": position.chain_id,
+                            "contractAddress": position.contract_address,
                         }
                     },
                     keeper.POSITION: {
@@ -147,7 +150,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     {
                         "default_node_info": None
                         if position.malformed_node_info
-                        else {"network": CHAIN_ID}
+                        else {"network": position.chain_id}
                     }
                 )
                 return
@@ -168,7 +171,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     }
                 )
                 return
-            prefix = "/cosmwasm/wasm/v1/contract/nibi1contract/smart/"
+            prefix = f"/cosmwasm/wasm/v1/contract/{position.contract_address}/smart/"
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
@@ -398,6 +401,89 @@ async def call(
     block = result.content[0]
     assert isinstance(block, TextContent)
     return json.loads(block.text)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "route_key"),
+    [
+        ("chain_id", "test-2", "chainId"),
+        ("contract_address", "nibi1replacement", "contractAddress"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("tool", "args", "command"),
+    [
+        (
+            "margin",
+            {"trade_id": 7, "direction": "add", "amount": "1"},
+            ["margin", "7", "--direction", "add", "--amount", "1"],
+        ),
+        (
+            "partial_close",
+            {"trade_id": 7, "percent": 50},
+            ["partial-close", "7", "--percent", "50"],
+        ),
+    ],
+)
+def test_position_confirmation_binds_keeper_route(
+    position_service: tuple[Position, str],
+    field: str,
+    value: str,
+    route_key: str,
+    tool: str,
+    args: dict[str, Any],
+    command: list[str],
+) -> None:
+    position, base_url = position_service
+    cli = CliRunner()
+    cli_args = [
+        "--json",
+        "--endpoint",
+        f"{base_url}/query",
+        "--lcd-endpoint",
+        base_url,
+        "trade",
+        *command,
+    ]
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{tool}", args)
+            cli_preview = cli.invoke(main, [*cli_args, "--dry-run"])
+            assert cli_preview.exit_code == 0, cli_preview.output
+            digest = preview["previewDigest"]
+            assert json.loads(cli_preview.stdout)["previewDigest"] == digest
+
+            setattr(position, field, value)
+            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            assert json.loads(cli_refusal.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
+            mcp_refusal = await call(
+                client, f"trade_{tool}", {**args, "preview_digest": digest}
+            )
+            assert mcp_refusal["code"] == "PREVIEW_MISMATCH", mcp_refusal
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+            fresh = mcp_refusal["preview"]
+            assert fresh["intent"] == preview["intent"]
+            assert fresh["quote"] == preview["quote"]
+            assert fresh["positionRoute"] == {
+                **preview["positionRoute"],
+                route_key: value,
+            }
+            assert fresh["previewDigest"] != digest
+            assert fresh == await call(client, f"preview_{tool}", args)
+
+            accepted = cli.invoke(
+                main, [*cli_args, "--preview-digest", fresh["previewDigest"]]
+            )
+            assert accepted.exit_code == 0, accepted.output
+            assert json.loads(accepted.stdout)["status"] == "accepted"
+            (submitted,) = position.submitted
+            assert {key: submitted[key] for key in fresh["intent"]} == fresh["intent"]
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
