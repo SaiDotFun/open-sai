@@ -603,6 +603,29 @@ def test_use_rejects_malformed_expiry_before_switching(
         assert result.stderr == f"Error: {message}\n"
 
 
+@pytest.mark.parametrize("same_account", [True, False])
+def test_use_redacts_known_credentials_in_endpoint(
+    env: Env, monkeypatch: pytest.MonkeyPatch, same_account: bool
+) -> None:
+    marker = "Synthetic-Cli-Origin-Credential"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    selected = session_for(marker if same_account else make_token())
+    selected["endpoint"] = f"https://{marker}.example.invalid/query"
+    other = session_for(make_token(OTHER) if same_account else marker)
+    other["evmAddress"] = OTHER
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: selected, OTHER: other}}
+    )
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 0 and result.stderr == ""
+    assert json.loads(result.stdout)["endpoint"] == log.REDACTED
+    assert marker.lower() not in result.stdout.lower()
+    assert marker.lower().encode() not in env.stored_bytes().lower()
+    assert storage.load_accounts()["active"] == ADDR
+
+
 @pytest.mark.parametrize("corruption", ["endpoint", "address", "address-mismatch"])
 def test_use_refuses_malformed_session_before_switching(
     env: Env, monkeypatch: pytest.MonkeyPatch, corruption: str

@@ -1490,12 +1490,17 @@ def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
         }
 
 
-def stdio_auth_use(tmp_path: Path, addr: object) -> tuple[CallToolResult, str]:
+def stdio_auth_use(
+    tmp_path: Path, addr: object, *, endpoint: str | None = None
+) -> tuple[CallToolResult, str]:
     command, *args = sai_command()
+    env = {"SAI_HOME": str(tmp_path), "SAI_LOG": "1"}
+    if endpoint is not None:
+        env["SAI_ENDPOINT"] = endpoint
     params = StdioServerParameters(
         command=command,
         args=[*args, "mcp", "serve"],
-        env={"SAI_HOME": str(tmp_path), "SAI_LOG": "1"},
+        env=env,
     )
 
     async def switch(errlog: TextIO) -> CallToolResult:
@@ -1513,6 +1518,42 @@ def stdio_auth_use(tmp_path: Path, addr: object) -> tuple[CallToolResult, str]:
         file.read_text() for _, _, file in sai_log.log_files(tmp_path / "logs")
     )
     return result, logs + stderr.read_text()
+
+
+@pytest.mark.parametrize("same_account", [True, False])
+def test_stdio_auth_use_redacts_known_credentials_in_session_fields(
+    tmp_path: Path, same_account: bool
+) -> None:
+    marker = "synthetic-mcp-origin-credential"
+    endpoint = f"https://{marker}.example.invalid"
+    selected = {
+        **stored_session(endpoint=endpoint),
+        "token": marker if same_account else TOKEN,
+    }
+    other = {
+        **stored_session(),
+        "evmAddress": OTHER,
+        "token": selected["expiresAt"] if same_account else marker,
+    }
+    storage._save_accounts(
+        {"active": OTHER, "sessions": {ADDR: selected, OTHER: other}}
+    )
+
+    result, logs = stdio_auth_use(tmp_path, ADDR, endpoint=endpoint)
+
+    assert not result.isError
+    response = json.loads(text_of(result.content))
+    active = next(row for row in response["accounts"] if row["active"])
+    assert active["addr"] == ADDR
+    assert active["endpoint"] == sai_log.REDACTED
+    assert active["expiresAt"] == (
+        sai_log.REDACTED if same_account else selected["expiresAt"]
+    )
+    assert "SAI_RECONCILE_ENDPOINT" in active["renewalCommand"]
+    assert marker not in result.model_dump_json() + logs
+    if same_account:
+        assert selected["expiresAt"] not in result.model_dump_json()
+    assert storage.load_accounts()["active"] == ADDR
 
 
 @pytest.mark.parametrize("as_object", [False, True])

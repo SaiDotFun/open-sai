@@ -14,6 +14,20 @@ from .errors import Code, SessionError
 EXPIRY_WARNING = timedelta(days=3)
 
 
+def _redact_field(result: dict[str, str], value: str) -> str:
+    secrets = (result.get("token"), *log.known_tokens())
+    return (
+        log.REDACTED if any(secret and secret in value for secret in secrets) else value
+    )
+
+
+def _display_origin(result: dict[str, str], endpoint: str) -> str:
+    # Compare the stored value before parsing, which can change its spelling.
+    if _redact_field(result, endpoint) == log.REDACTED:
+        return log.REDACTED
+    return _redact_field(result, log.origin(endpoint))
+
+
 def expiry_time(result: dict[str, str]) -> datetime:
     try:
         expiry = datetime.fromisoformat(result["expiresAt"])
@@ -27,23 +41,32 @@ def expiry_time(result: dict[str, str]) -> datetime:
 def renewal_command(result: dict[str, str]) -> str:
     """Return recovery instructions scoped to the session's Keeper."""
     endpoint = result.get("endpoint")
+    origin = _display_origin(result, endpoint) if endpoint else None
 
     def command(*args: str) -> str:
         if endpoint:
-            return storage.keeper_command_hint(endpoint, "auth", *args)
+            url = log.REDACTED if origin == log.REDACTED else endpoint
+            return storage.keeper_command_hint(url, "auth", *args)
         return shlex.join(["sai", "auth", *args])
 
-    origin = log.origin(endpoint) if endpoint else None
     suffix = ""
     if not endpoint or endpoint != origin:
-        where = f" at {origin}" if origin not in (None, log.REDACTED_URL) else ""
+        where = (
+            f" at {origin}"
+            if origin not in (None, log.REDACTED, log.REDACTED_URL)
+            else ""
+        )
         suffix = f" (reuse the Keeper endpoint{where} configured when this session was stored)"
     if result.get("keyName"):
-        return command("renew", result["evmAddress"]) + suffix
-    browser = command("import")
-    if result.get("source") == "imported":
-        return browser + suffix
-    return f"{command('login', 'NAME')} or {browser}{suffix}"
+        recovery = command("renew", result["evmAddress"])
+    else:
+        browser = command("import")
+        recovery = (
+            browser
+            if result.get("source") == "imported"
+            else f"{command('login', 'NAME')} or {browser}"
+        )
+    return _redact_field(result, recovery + suffix)
 
 
 def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
@@ -58,7 +81,9 @@ def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
         if minutes < 120
         else f"{minutes // 60} h"
     )
-    return f"Sai session for {result['evmAddress']} expires in {when}."
+    return _redact_field(
+        result, f"Sai session for {result['evmAddress']} expires in {when}."
+    )
 
 
 def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str]:
@@ -158,12 +183,15 @@ def summary(
         raise SessionError(
             f"Stored session has an invalid endpoint; {storage.SIGN_IN_AGAIN}"
         )
-    return {
-        "addr": result["evmAddress"]
+    addr = (
+        result["evmAddress"]
         if account_key is None
-        else session_address(result, account_key),
-        "expiresAt": result["expiresAt"],
-        "endpoint": log.origin(endpoint) if endpoint is not None else None,
+        else session_address(result, account_key)
+    )
+    return {
+        "addr": _redact_field(result, addr),
+        "expiresAt": _redact_field(result, result["expiresAt"]),
+        "endpoint": _display_origin(result, endpoint) if endpoint is not None else None,
     }
 
 
