@@ -29,16 +29,25 @@ sai config unset keeper.endpoint
 
 `sai --json config list` returns `path` and `settings`. Each setting has
 `value`, `source`, `env`, and `default` fields. The `source` is `flag`,
-`env`, `file`, `default`, `derived`, or `invalid`. Sai marks an unreadable
-log setting `invalid` and turns logging off.
+`env`, `file`, `default`, `derived`, or `invalid`.
 
 The list shows Keeper URLs as origins. The LCD URL can include a path.
 `sai config get KEY` prints the exact resolved value. With the global
 `--json` flag, it returns `key`, `value`, and `source`. An unknown key or
 an invalid value passed to `config set` is a usage error. Sai lists the
-valid keys and exits 2 with code `INVALID_REQUEST`. An invalid override,
-such as `SAI_UPDATE_AUTO=maybe`, makes `config list` exit 1 with code
-`INVALID_REQUEST` and a validation message.
+valid keys and exits 2 with code `INVALID_REQUEST`.
+
+In v0.1.2, the exit status of `sai --json config list` depends on which
+override is invalid.
+
+| Invalid Override | Exit | Result |
+| --- | --- | --- |
+| `SAI_UPDATE_AUTO=maybe` | 1 | `INVALID_REQUEST` with a validation message. |
+| Malformed Keeper URL in `--endpoint` or `SAI_ENDPOINT` | 2 | `INVALID_REQUEST` with an endpoint validation message. |
+| Invalid logging value, such as `SAI_LOG=maybe` | 0 | The settings report marks the logging setting's `source` as `invalid` and Sai turns logging off. |
+
+Issue [#188](https://github.com/SaiDotFun/open-sai/issues/188) tracks making
+these results consistent.
 
 The first `set`, or an `unset` that removes a value, writes the whole file
 with every key commented out and explained, at mode 0600 in a 0700
