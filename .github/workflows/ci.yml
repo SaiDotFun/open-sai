@@ -230,4 +230,16 @@ jobs:
           SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
           SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
-        run: uv run --locked pytest tests/parity
+        run: |
+          uv run --locked pytest tests/parity
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          uv run --locked python tests/parity/parity.py --case market-prices-epoch-spellings
