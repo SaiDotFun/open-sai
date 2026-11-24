@@ -755,8 +755,25 @@ def test_trade_tool_integer_positions_reject_coercion(mcp, malformed):
     asyncio.run(check())
 
 
-def test_trade_tool_accepts_a_plain_digit_string(mcp):
-    preview = invoke(mcp, "preview_close", {"trade_id": "007"})
+def test_trade_tool_accepts_a_plain_digit_string(monkeypatch):
+    class Keeper(PositionKeeperHandler):
+        def do_POST(self):
+            request = self.read_json()
+            if request["query"] == keeper.POSITION:
+                data = position_data(request["variables"])
+            elif request["query"] == keeper.ROUTE:
+                data = POSITION_ROUTE
+            else:
+                self.send_error(503)
+                return
+            self.reply({"data": data})
+
+    with keeper_server(Keeper) as base:
+        endpoint = f"{base}/query"
+        monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        monkeypatch.setenv("SAI_LCD_ENDPOINT", base)
+        storage.save_session(stored_session(endpoint=endpoint))
+        preview = invoke(server.create_server(), "preview_close", {"trade_id": "007"})
     assert preview["intent"]["target"]["userTradeId"] == "7"
 
 
