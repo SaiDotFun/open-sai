@@ -6,12 +6,11 @@ import math
 import sqlite3
 import time
 from collections.abc import Callable, Mapping
-from concurrent.futures import Future
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from decimal import Decimal, DecimalException
 from functools import cache
-from threading import BoundedSemaphore, Thread
+from threading import BoundedSemaphore
 from typing import Any
 
 from . import keeper, margin, reconcile, session, storage, stream
@@ -24,7 +23,7 @@ MAX_PAGES = 20
 LCD_BUDGET_SECONDS = 8.0
 LCD_REQUEST_SECONDS = 2.0
 MEMBERSHIP_MAX_AGE_SECONDS = 60
-_LCD_WORKERS = BoundedSemaphore(8)
+_LCD_SLOTS = BoundedSemaphore(8)
 BALANCE_KEYS = {
     "USDC on Sai": "balance",
     "USDC Credits on Sai": "credits",
@@ -104,31 +103,16 @@ def _age(at: datetime | None, fetched: str) -> dict[str, Any]:
 
 
 def _lcd_read(read: Callable[[float], Any], deadline: float) -> Any:
-    """Stop waiting at the shared deadline even if an HTTP response trickles."""
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise ValueError("LCD read deadline exceeded")
-    if not _LCD_WORKERS.acquire(blocking=False):
+    """Hold a shared slot until the HTTP request finishes or is cancelled."""
+    now = time.monotonic()
+    if now >= deadline:
+        raise margin.LCDTimeout("LCD read deadline exceeded")
+    if not _LCD_SLOTS.acquire(blocking=False):
         raise ValueError("LCD reads are busy")
-    result: Future[Any] = Future()
-
-    def run() -> None:
-        try:
-            result.set_result(read(min(remaining, LCD_REQUEST_SECONDS)))
-        except Exception as exc:  # noqa: BLE001 - forward the worker's exception
-            result.set_exception(exc)
-        finally:
-            _LCD_WORKERS.release()
-
     try:
-        Thread(target=run, daemon=True).start()
-    except RuntimeError as exc:
-        _LCD_WORKERS.release()
-        raise ValueError("Could not start LCD read") from exc
-    try:
-        return result.result(timeout=max(0, deadline - time.monotonic()))
-    except TimeoutError as exc:
-        raise ValueError("LCD read deadline exceeded") from exc
+        return read(min(deadline, now + LCD_REQUEST_SECONDS))
+    finally:
+        _LCD_SLOTS.release()
 
 
 @dataclass(frozen=True)
@@ -142,12 +126,12 @@ class ChainRead:
 
     def query(self, message: dict[str, Any], *, contract: str | None = None) -> Any:
         return _lcd_read(
-            lambda timeout: margin.smart_data(
+            lambda deadline: margin.smart_data(
                 self.lcd,
                 contract or self.contract,
                 message,
                 height=self.height,
-                timeout=timeout,
+                deadline=deadline,
             ),
             self.deadline,
         )
@@ -157,7 +141,9 @@ class ChainRead:
             return self.time
         try:
             header = _lcd_read(
-                lambda timeout: margin.block_header(self.lcd, height, timeout=timeout),
+                lambda deadline: margin.block_header(
+                    self.lcd, height, deadline=deadline
+                ),
                 self.deadline,
             )
             if header["chain_id"] == self.chain_id and int(header["height"]) == height:
@@ -185,8 +171,8 @@ def _chain_read(settings: Settings) -> ChainRead | None:
         ]
         deadline = time.monotonic() + LCD_BUDGET_SECONDS
         header = _lcd_read(
-            lambda timeout: margin.block_header(
-                settings.lcd_endpoint, "latest", timeout=timeout
+            lambda deadline: margin.block_header(
+                settings.lcd_endpoint, "latest", deadline=deadline
             ),
             deadline,
         )
@@ -396,15 +382,23 @@ class ContractReads:
 
     def __init__(self, chain: ChainRead) -> None:
         self.chain = chain
+        self.timed_out = False
         self.groups: dict[str, int | None] = {}
         self.rates: dict[tuple[int, int], tuple[dict[str, Any], str] | None] = {}
         self.markets: dict[int, dict[str, Any] | None] = {}
         self.oracle: str | None = None
 
+    def query(self, message: dict[str, Any], *, contract: str | None = None) -> Any:
+        try:
+            return self.chain.query(message, contract=contract)
+        except margin.LCDTimeout:
+            self.timed_out = True
+            raise
+
     def group_expiration(self, index: str) -> int | None:
         if index not in self.groups:
             try:
-                value = self.chain.query({"get_group": {"index": index}})
+                value = self.query({"get_group": {"index": index}})
                 expiration = value["stale_price_expiration_secs"]
                 self.groups[index] = (
                     expiration
@@ -418,7 +412,7 @@ class ContractReads:
     def market(self, market_id: int) -> dict[str, Any] | None:
         if market_id not in self.markets:
             try:
-                self.markets[market_id] = self.chain.query(
+                self.markets[market_id] = self.query(
                     {"get_market": {"index": f"MarketIndex({market_id})"}}
                 )
             except (TypeError, ValueError):
@@ -430,11 +424,11 @@ class ContractReads:
         if key not in self.rates:
             try:
                 if self.oracle is None:
-                    address = self.chain.query({"get_oracle_address": {}})
+                    address = self.query({"get_oracle_address": {}})
                     self.oracle = address if _is_contract(address) else ""
                 if not self.oracle:
                     raise ValueError("Oracle contract is unavailable")
-                data = self.chain.query(
+                data = self.query(
                     {"get_exchange_rate_stamped": {"base": base, "quote": quote}},
                     contract=self.oracle,
                 )
@@ -454,7 +448,7 @@ def _contract_risk(
     market = trade["perpBorrowing"]
     risk: dict[str, Any] = {"riskStatus": "unavailable"}
     try:
-        result = chain.query({"get_trade": {"trader": addr, "index": trade["id"]}})
+        result = reads.query({"get_trade": {"trader": addr, "index": trade["id"]}})
         fetched = datetime.now(UTC).isoformat()
         raw = result["trade"]
         if not _agrees(trade, raw):
@@ -839,13 +833,16 @@ def _trade_sections(
             positions["error"] = _failure(Code.INCOMPLETE_DATA, message)
         elif (
             "error" not in positions
-            and chain is not None
-            and time.monotonic() >= chain.deadline
+            and contract_reads is not None
+            and (
+                contract_reads.timed_out
+                or time.monotonic() >= contract_reads.chain.deadline
+            )
             and any(row["riskStatus"] != "verified" for row in items)
         ):
             positions["error"] = _failure(
                 Code.INCOMPLETE_DATA,
-                "The LCD deadline expired. Position risk is partial.",
+                "An LCD deadline expired. Position risk is partial.",
             )
         pnls = [row["unrealizedPnlUsd"] for row in items]
         positions["data"] = {
