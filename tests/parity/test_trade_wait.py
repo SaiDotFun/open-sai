@@ -403,10 +403,16 @@ def test_trade_wait_recovers_when_stdout_closes(
                 )
             finally:
                 os.close(write)
-            assert result.returncode == 1, result
+            stderr = result.stderr
+            if index == 0 and result.returncode == 120:
+                # CPython can override the exit code when its final stdout flush fails.
+                stderr, flush_error = stderr.split(b"\n", 1)
+                assert b"BrokenPipeError" in flush_error
+            else:
+                assert result.returncode == 1, result
             assert len(requests) == 3
             key = submitted_key(requests[0], kind)
-            document = json.loads(result.stderr)
+            document = json.loads(stderr)
             assert document["intentKey"] == key
             assert document["localStatus"] == document["outcome"] == "terminal"
             assert document["receipt"] is None
