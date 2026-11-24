@@ -207,11 +207,23 @@ def open_trade(
     if order_type == "market":
         preview["requiresMarketPriceRefresh"] = True
         if not dry_run:
+            mismatch = False
             if before_price_refresh is not None:
-                before_price_refresh(preview)
+                try:
+                    before_price_refresh(preview)
+                except PreviewRefused:
+                    mismatch = True
             if price is not None and (before_submit is None or mcp_market):
                 notify(MARKET_PRICE_NOTICE)
-            read_market()
+            try:
+                read_market()
+            except estimates.READ_ERRORS as exc:
+                if mismatch:
+                    raise PositionChanged(
+                        "The market open no longer matches the confirmed preview."
+                        " Request a new preview before submitting."
+                    ) from exc
+                raise
             assert reference is not None
             payload["body"]["intentPrice"] = reference["price"]
         elif mcp_market:

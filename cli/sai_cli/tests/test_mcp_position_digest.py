@@ -865,6 +865,53 @@ def test_trade_confirmation_binds_verified_route(
     asyncio.run(scenario())
 
 
+def test_market_open_refuses_changed_route_without_a_current_price(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    args = {**OPEN_ARGS, "order_type": "market"}
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, [*OPEN_COMMAND, "--type", "market"])
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_open", args)
+            digest = preview["previewDigest"]
+            reference = preview["referencePrice"]
+            cli_submit_args = [
+                *cli_args,
+                "--preview-digest",
+                digest,
+                "--price",
+                reference,
+            ]
+            trade_args = {
+                **args,
+                "preview_digest": digest,
+                "reference_price": reference,
+            }
+
+            position.contract_address = "nibi1replacement"
+            position.keeper_market_open = False
+            cli_result = cli.invoke(main, cli_submit_args)
+            assert cli_result.exit_code == ExitCode.REJECTED, cli_result.output
+            cli_error = json.loads(cli_result.stdout)["error"]
+            mcp_error = await call(client, "trade_open", trade_args)
+            assert cli_error["code"] == mcp_error["code"] == "PREVIEW_MISMATCH"
+            assert "details" not in cli_error and "preview" not in mcp_error
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+            position.contract_address = "nibi1contract"
+            cli_result = cli.invoke(main, cli_submit_args)
+            assert json.loads(cli_result.stdout)["error"]["code"] == "INVALID_REQUEST"
+            assert (await call(client, "trade_open", trade_args))[
+                "code"
+            ] == "INVALID_REQUEST"
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize("reference", [None, "100"])
 def test_cli_confirms_market_open_with_reference_and_slippage(
     position_service, reference

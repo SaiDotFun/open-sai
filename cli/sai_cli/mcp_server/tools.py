@@ -588,12 +588,7 @@ def open_trade(
     )
 
     def check_pending(preview: dict[str, Any]) -> None:
-        # Use the caller's reference to check the route before the ledger.
-        # A mismatch needs the refreshed price before it can offer a preview.
-        try:
-            bound(load, preview_digest, reference_price)(preview)
-        except Refused:
-            return
+        bound(load, preview_digest, reference_price)(preview)
         storage.check_open_pending(
             settings.endpoint,
             load()["evmAddress"],

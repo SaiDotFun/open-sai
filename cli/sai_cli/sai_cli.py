@@ -1327,6 +1327,13 @@ def trade_open(
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 notify=warn,
+                before_price_refresh=(
+                    trade_submit_check(
+                        loader(ctx), preview_digest, reference_price=price
+                    )
+                    if market_confirmation
+                    else None
+                ),
                 before_submit=trade_submit_check(
                     loader(ctx),
                     preview_digest,
