@@ -114,32 +114,26 @@ pub async fn reconcile(
     let Some(rows) = data.get_mut("userIntents").filter(|rows| !rows.is_null()) else {
         return Ok(data);
     };
-    let absent = rows.as_array().is_some_and(Vec::is_empty);
+    let Some(items) = rows.as_array_mut() else {
+        *rows = Value::Null;
+        return Ok(data);
+    };
+    let absent = items.is_empty();
     let account = canonical_account(addr);
-    let original = rows.take();
+    let items = std::mem::take(items);
     let mut matching = Vec::new();
-    match (original, &account) {
-        (Value::Array(items), Some(account)) => {
-            for row in items {
-                if !row.is_object() {
-                    return Err(SaiError::internal());
-                }
-                if account_matches(&row["evmAddress"], account)
-                    && (row["nibiAddress"].is_null()
-                        || account_matches(&row["nibiAddress"], account))
-                    && key.is_none_or(|key| row["intentKey"] == key)
-                {
-                    matching.push(row);
-                }
+    if let Some(account) = &account {
+        for row in items {
+            if !row.is_object() {
+                return Err(SaiError::internal());
+            }
+            if account_matches(&row["evmAddress"], account)
+                && (row["nibiAddress"].is_null() || account_matches(&row["nibiAddress"], account))
+                && key.is_none_or(|key| row["intentKey"] == key)
+            {
+                matching.push(row);
             }
         }
-        (Value::Array(_), None) => {}
-        (other, _) if !truthy(&other) => {}
-        (Value::String(_) | Value::Object(_), None) => {}
-        (Value::String(_) | Value::Object(_), Some(_)) => {
-            return Err(SaiError::internal());
-        }
-        _ => return Err(incomplete_data("TypeError")),
     }
     let Some(account) = account else {
         *rows = Value::Array(matching);
@@ -395,13 +389,6 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Vec<Value> {
         }
     }
     found
-}
-
-fn incomplete_data(kind: &str) -> SaiError {
-    SaiError::new(
-        Code::IncompleteData,
-        format!("Keeper or contract data was missing or malformed ({kind})"),
-    )
 }
 
 fn log_keeper(
