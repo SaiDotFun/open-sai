@@ -1069,6 +1069,7 @@ def trade_open(
             stop_loss=stop_loss,
             allow_concurrent_open=allow_concurrent_open,
             dry_run=dry_run,
+            lcd_endpoint=settings(ctx).lcd_endpoint,
             notify=warn,
         ),
     )
@@ -1095,6 +1096,7 @@ def trade_close(
             trade_id=trade_id,
             cancel_order=cancel_order,
             dry_run=dry_run,
+            lcd_endpoint=settings(ctx).lcd_endpoint,
         ),
     )
 
@@ -1128,6 +1130,7 @@ def trade_tpsl(
             clear_take_profit=clear_take_profit,
             clear_stop_loss=clear_stop_loss,
             dry_run=dry_run,
+            lcd_endpoint=settings(ctx).lcd_endpoint,
         ),
     )
 
@@ -1149,6 +1152,7 @@ def trade_leverage(
             trade_id=trade_id,
             leverage=leverage,
             dry_run=dry_run,
+            lcd_endpoint=settings(ctx).lcd_endpoint,
         ),
     )
 

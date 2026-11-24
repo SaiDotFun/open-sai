@@ -99,8 +99,8 @@ for the token and never returns it.
    every preview and trade. Without `addr` a tool acts on whichever account
    is active at that moment, and another terminal or client can switch it.
 2. Show the person the preview, the `addr` it names, and the network from
-   `mcp_info`. For a market open, also give the worst-case fill described
-   below. Wait for explicit confirmation.
+   `mcp_info`. Give the fees, liquidation price, and worst-case fill from
+   `estimates` where available. Wait for explicit confirmation.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
@@ -130,6 +130,9 @@ the one the person confirmed. The digest covers:
   Show the quoted notional and say whether `quote.closedNotionalIsEstimate`
   is true.
 
+The `estimates` object is informational. The price sources, time fields,
+and fee exclusions are in [Reading the Estimates](trading-safety.md#reading-the-estimates).
+
 ### Market Opens: Quote Check and Fill Bound
 
 A market `trade_open` makes two different price comparisons:
@@ -153,11 +156,10 @@ reference `R`, choose a slippage with `R × (1 + s)² ≤ C`, so
 `s ≤ 0.498%`: 0.49% gives a worst case of 60,589.44, and 0.5% allows
 60,601.50. For a short with a floor `F`, use `s ≤ 1 − sqrt(F / R)`.
 
-A limit order's `price` is a trigger, not a cap. The contract applies the
-slippage after the trigger check, so its worst fill is `trigger × (1 + s)`
-for a long and `trigger × (1 − s)` for a short. A stop order has no advance
-fill bound: the slippage applies to the oracle price when the stop triggers,
-which can sit well past the stop price after a gap.
+Limit and stop order prices are triggers. Perp applies the slippage around
+the stored trigger after checking that the order can fill. The worst fill is
+`trigger × (1 + s)` for a long and `trigger × (1 − s)` for a short.
+A stop can miss its fill when a gap takes the price outside that bound.
 [trading-safety.md](trading-safety.md) rule 3 has the full rule.
 
 On `PREVIEW_MISMATCH` or `PRICE_MOVED` nothing was submitted. The result
@@ -165,7 +167,8 @@ holds a fresh preview. Show it, get confirmation again, and retry with the
 new `preview_digest` and `reference_price`.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
-`trade_close`. Without it the tools close a position.
+`trade_close`. Both check that the order is pending. If it fills after the
+submit-time check, Perp can close the filled position at market.
 
 Call `auth_use` only when the person asks to switch accounts.
 

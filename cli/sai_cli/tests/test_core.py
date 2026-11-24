@@ -140,10 +140,19 @@ def test_cli_dry_run_does_not_create_session_or_send():
 
 
 def test_cli_dry_run_names_the_account_it_would_use(session):
+    session = {**session, "endpoint": "http://127.0.0.1:1/query"}
     other = {**session, "evmAddress": "0x" + "c" * 40, "token": "other-token"}
     storage.save_session(session)
     storage.save_session(other)
-    args = ["--json", "trade", "close", "4", "--dry-run"]
+    args = [
+        "--endpoint",
+        session["endpoint"],
+        "--json",
+        "trade",
+        "close",
+        "4",
+        "--dry-run",
+    ]
     active = CliRunner().invoke(main, args)
     assert json.loads(active.output)["addr"] == other["evmAddress"]
     chosen = CliRunner().invoke(main, ["--as", session["evmAddress"], *args])
@@ -337,6 +346,8 @@ def test_market_dry_run_needs_no_price_and_marks_refresh():
         main,
         [
             "--json",
+            "--endpoint",
+            "http://127.0.0.1:1/query",
             "trade",
             "open",
             "--market",

@@ -307,9 +307,10 @@ async def preview_open(
     """Preview opening a market, limit, or stop trade without submitting.
 
     Show the user the result and get confirmation; trade_open then needs its
-    previewDigest. A market order preview sets requiresMarketPriceRefresh
-    and reports Keeper's current price as referencePrice: the submit uses
-    the price current at that time, and trade_open needs referencePrice too.
+    previewDigest. Use estimates for execution fees, liquidation price, and
+    the worst-case fill. A market order reports Keeper's current price as
+    referencePrice. Submit refreshes the price and checks it against the
+    referencePrice from the preview.
 
     Args:
         market_id: Market id from market_list.

@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from decimal import Decimal
 from secrets import token_hex
 from typing import Any
@@ -126,12 +128,57 @@ def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
+def pair_leverage_cap(
+    lcd: str, contract: str, market_id: int, *, height: str | None = None
+) -> Decimal:
+    """Read Perp's custom cap, where an absent map entry means no override."""
+    try:
+        value = smart_value(
+            lcd,
+            contract,
+            {"get_pair_custom_max_leverage": {"index": market_id}},
+            height=height,
+        )
+    except ValueError as exc:
+        failure = exc.__cause__
+        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+            r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found",
+            failure.response.text,
+        ):
+            return Decimal(0)
+        raise
+    return contract_decimal(value)
+
+
+def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> Any:
+    """Read the live order and distinguish Perp's missing-target error from a quote mismatch."""
+    try:
+        return smart_value(
+            lcd,
+            contract,
+            {"get_trade_raw": {"trader": trader, "index": trade_id}},
+            fresh=True,
+        )
+    except QueryHeightMismatch as exc:
+        failure = exc.__cause__
+        # The wasm gRPC gateway can wrap Perp query errors in HTTP 500.
+        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+            rf"Trade not found for trader \S+ with index {trade_id}\b",
+            failure.response.text,
+        ):
+            raise ValueError(
+                f"Trade {trade_id} was not found for this account."
+            ) from exc
+        raise ValueError(f"Unable to read pending order {trade_id} from Perp.") from exc
+
+
 @dataclass(frozen=True)
 class PositionSnapshot:
     raw: dict[str, Any]
     funds: dict[str, Any]
     market: dict[str, Any]
     contract: str
+    observed_at: str | None = None
 
 
 def _read_position(
@@ -176,6 +223,18 @@ def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
     return all(latest.get(key) == prior[key] for key in fields)
 
 
+def verified_position_height(lcd: str, state: PositionSnapshot, trade_id: int) -> str:
+    latest, height = _latest_position(lcd, state, trade_id)
+    if (
+        height is None
+        or not _same_position(state.raw, latest)
+        or latest.get("long") is not state.raw.get("long")
+        or latest.get("open_price") != state.raw.get("open_price")
+    ):
+        raise ValueError("Cannot verify the quoted position at the LCD query height")
+    return height
+
+
 def position_unchanged(
     lcd: str, state: PositionSnapshot, trade_id: int, quoted_inputs: dict[str, Any]
 ) -> bool:
@@ -204,14 +263,36 @@ def position_unchanged(
     )
 
 
-def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
+def block_timestamp(lcd: str, height: str) -> int:
+    """Read the UTC timestamp of a specific LCD block."""
+    result = _get_json(
+        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/blocks/{height}"
+    )
+    block = result.get("sdk_block") or result.get("block")
+    if not isinstance(block, dict):
+        raise TypeError("LCD block header is unavailable")
+    header = block["header"]
+    time = datetime.fromisoformat(header["time"])
+    if header["height"] != height or time.tzinfo is None:
+        raise ValueError("Cannot verify the timestamp of the quoted LCD block")
+    return int(time.timestamp())
+
+
+def trading_contract(endpoint: str, lcd: str) -> str:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
     node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
+    info = node.get("default_node_info")
     if (
         not route["enabled"]
-        or node.get("default_node_info", {}).get("network") != route["chainId"]
+        or not isinstance(info, dict)
+        or info.get("network") != route["chainId"]
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
+    return route["contractAddress"]
+
+
+def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
+    contract = trading_contract(endpoint, lcd)
     position = keeper.request(
         endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}
     )["perp"]["trade"]
@@ -235,8 +316,8 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         raise ValueError("Open market data is unavailable")
     trader = position["trader"]
     token = f"TokenIndex({collateral['id']})"
-    contract = route["contractAddress"]
     raw = _read_position(lcd, contract, trader, trade_id)
+    observed_at = intents.now()
     funds = smart(
         lcd,
         contract,
@@ -258,7 +339,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         raise ValueError(
             "Indexed position differs from contract state; wait for synchronization and retry"
         )
-    return PositionSnapshot(raw, funds, market, contract)
+    return PositionSnapshot(raw, funds, market, contract, observed_at)
 
 
 def contract_decimal(value: Any) -> Decimal:

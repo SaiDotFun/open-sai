@@ -266,6 +266,7 @@ state = { "update.json#latest" = "sai-cli/v0.99.0", "update.json#schema" = 1, "u
 [[case]]
 name = "trade-open-market"
 args = ["--json","trade","open","--market","3","--side","long","--type","market","--amount","20","--leverage","2","--slippage","1","--price","100","--dry-run"]
+wire = ["borrowings", "oneClickTrading", "node_info", "get_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "get_collateral_price"]
 
 [[case]]
 name = "trade-close"
@@ -274,6 +275,9 @@ args = ["--json","trade","close","7","--dry-run"]
 [[case]]
 name = "trade-cancel"
 args = ["--json","trade","close","7","--cancel-order","--dry-run"]
+seed = "session"
+server = "pending-order"
+wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 
 [[case]]
 name = "trade-tpsl"
@@ -289,7 +293,8 @@ args = ["--json","trade","margin","7","--direction","add","--amount","1","--dry-
 seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "is_after_hours_market",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
@@ -300,7 +305,8 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price",
+    "get_collateral_price", "get_trade_raw", "get_perp_prices", "get_liquidation_price",
+    "is_after_hours_market", "get_market", "get_fees",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
