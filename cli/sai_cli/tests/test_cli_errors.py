@@ -46,7 +46,11 @@ def assert_error(result: Result, exit_code: int, code: str) -> dict:
         (("config", "set", "update.auto", "bad"), 2, "INVALID_REQUEST"),
         (("skill", "show", "--page", "missing"), 1, "INVALID_REQUEST"),
         (("mcp", "serve", "--endpoint", "ftp://invalid"), 2, "INVALID_REQUEST"),
-        (("watch", "price", "1", "--ws-endpoint", "http://invalid"), 2, "INVALID_REQUEST"),
+        (
+            ("watch", "price", "1", "--ws-endpoint", "http://invalid"),
+            2,
+            "INVALID_REQUEST",
+        ),
         (("trade", "close", "-1"), 2, "INVALID_REQUEST"),
     ],
 )
