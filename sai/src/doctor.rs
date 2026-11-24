@@ -228,13 +228,7 @@ impl DoctorArgs {
         if self.offline {
             checks.extend(NETWORK.map(|id| Check::new(id, "skipped", "Skipped with --offline")));
         } else if let Some(settings) = &settings {
-            checks.extend(network_checks(
-                settings,
-                EventContext {
-                    command: None,
-                    ..events
-                },
-            ));
+            checks.extend(network_checks(settings, events.without_command()));
         } else {
             checks.extend(NETWORK.map(skipped));
         }
