@@ -8,6 +8,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -269,6 +270,25 @@ class Replay:
         return Handler
 
 
+def launcher_interpreter(name: str, launcher: Path) -> Path | None:
+    with launcher.open("rb") as file:
+        header = file.readline(4096)
+    if not header.startswith(b"#!"):
+        return None
+    interpreter = shlex.split(header[2:].decode())
+    if Path(interpreter[0]).name != "env":
+        return Path(interpreter[0])
+    words = interpreter[1:]
+    if words and words[0] == "-S":
+        words = words[1:]
+    executable = shutil.which(words[0]) if words else None
+    require(
+        executable is not None, f"{name}'s launcher interpreter was not found on PATH"
+    )
+    assert executable is not None
+    return Path(executable)
+
+
 class Install:
     def __init__(self, root: Path) -> None:
         self.home = root / "home"
@@ -280,15 +300,32 @@ class Install:
         self.sai = bin_dir / "sai"
         self.uv = bin_dir / "uv"
         self.python = self.home / ".local/share/uv/tools/sai-cli/bin/python"
+        runtime_dirs = []
         for name in ("uv", *CLIENTS):
             tool = shutil.which(name)
             if tool is None:
                 raise RehearsalError(f"{name} is required on PATH")
-            (bin_dir / name).symlink_to(Path(tool).resolve())
+            launcher = Path(tool).resolve()
+            interpreter = launcher_interpreter(name, launcher)
+            if interpreter is None:
+                (bin_dir / name).symlink_to(launcher)
+            else:
+                runtime = interpreter.resolve()
+                runtime_dirs.append(str(runtime.parent))
+                if runtime.name != interpreter.name:
+                    runtime_dirs.append(str(interpreter.parent))
+                # Run scripts at their real path so their sibling files resolve.
+                entry = bin_dir / name
+                entry.write_text(f'#!/bin/sh\nexec {shlex.quote(str(launcher))} "$@"\n')
+                entry.chmod(0o700)
         self.env = {
             "HOME": str(self.home),
             "SAI_HOME": str(self.sai_home),
-            "PATH": f"{bin_dir}{os.pathsep}{os.defpath}",
+            "PATH": os.pathsep.join(
+                dict.fromkeys(
+                    [str(bin_dir), *runtime_dirs, *os.defpath.split(os.pathsep)]
+                )
+            ),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "XDG_DATA_HOME": str(self.home / ".local/share"),
             "XDG_CACHE_HOME": str(self.home / ".cache"),

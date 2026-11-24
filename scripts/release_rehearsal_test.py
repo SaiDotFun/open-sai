@@ -11,8 +11,41 @@ import time
 import unittest
 import urllib.request
 from pathlib import Path
+from unittest.mock import patch
 
 REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
+
+
+class LauncherTest(unittest.TestCase):
+    def test_env_launcher_finds_its_runtime_in_a_fresh_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "launchers"
+            bin_dir.mkdir()
+            runtime_dir = root / "outside-system-path"
+            runtime_dir.mkdir()
+            (runtime_dir / "fixture-python").symlink_to(sys.executable)
+            for tool in ("uv", "claude"):
+                (bin_dir / tool).symlink_to(sys.executable)
+            app_dir = root / "real app"
+            app_dir.mkdir()
+            launcher = app_dir / "codex"
+            launcher.write_text(
+                "#!/usr/bin/env -S fixture-python -I\n"
+                "from pathlib import Path\n"
+                "print(Path(__file__).with_name('sibling').read_text())\n"
+                "print(Path.home())\n"
+            )
+            launcher.chmod(0o700)
+            (app_dir / "sibling").write_text("runtime started")
+            (bin_dir / "codex").symlink_to(launcher)
+            path = os.pathsep.join((str(bin_dir), str(runtime_dir)))
+            with patch.dict(os.environ, PATH=path):
+                tool = REHEARSAL["Install"](root)
+                result = tool.run("Run client fixture", tool.sai.with_name("codex"))
+            self.assertEqual(
+                result.stdout.splitlines(), ["runtime started", str(tool.home)]
+            )
 
 
 class ProcessTest(unittest.TestCase):
