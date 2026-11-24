@@ -149,19 +149,31 @@ impl<'a> Trading<'a> {
         preview: &TradePreview,
         options: SubmitOptions<'_>,
     ) -> Result<AcceptedTrade, SaiError> {
+        self.submit_with_reference_price(session, preview, options)
+            .await
+            .map(|(accepted, _)| accepted)
+    }
+
+    /// Submit and return the price used for a market open, when applicable.
+    pub async fn submit_with_reference_price(
+        &self,
+        session: &Session,
+        preview: &TradePreview,
+        options: SubmitOptions<'_>,
+    ) -> Result<(AcceptedTrade, Option<String>), SaiError> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
         self.storage.check_active(session, endpoint)?;
         let mut prepared;
         let preview = if preview.requires_market_price_refresh() {
-            let price = preview.reference_price.as_deref().ok_or_else(|| {
-                SaiError::new(
-                    Code::InvalidRequest,
-                    "Current open USDC market data is unavailable",
-                )
-            })?;
-            positive_decimal(price, "Current price")?;
             prepared = preview.clone();
+            self.refresh_market_open(&mut prepared).await?;
+            self.storage.check_active(session, endpoint)?;
+            let price = prepared
+                .reference_price
+                .as_deref()
+                .ok_or_else(SaiError::internal)?;
+            positive_decimal(price, "Current price")?;
             prepared.intent.body["intentPrice"] = json!(price);
             &prepared
         } else {
@@ -264,11 +276,17 @@ impl<'a> Trading<'a> {
                 "Keeper accepted intent {key}, but the local ledger update failed; reconcile before another trade"
             )));
         }
-        Ok(AcceptedTrade {
-            intent_key: key,
-            status: "accepted",
-            message: "Accepted by Keeper; execution is not yet confirmed",
-        })
+        Ok((
+            AcceptedTrade {
+                intent_key: key,
+                status: "accepted",
+                message: "Accepted by Keeper; execution is not yet confirmed",
+            },
+            preview
+                .requires_market_price_refresh()
+                .then(|| preview.reference_price.clone())
+                .flatten(),
+        ))
     }
 
     fn record_status(&self, key: &str, account: &str, status: IntentStatus) -> bool {

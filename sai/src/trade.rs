@@ -110,7 +110,7 @@ pub fn run(
     let log_storage = |event: StorageEvent<'_>| local::storage_event(events, event);
     let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let trading = Trading::new(settings.endpoint(), &storage, events);
-    let (mut preview, dry_run, allow_concurrent_open, supplied_price) = match command {
+    let (preview, dry_run, allow_concurrent_open, supplied_price) = match command {
         TradeCommand::Open(open) => (
             open.preview()?,
             open.dry_run,
@@ -144,29 +144,22 @@ pub fn run(
         .enable_all()
         .build()
         .map_err(|_| SaiError::internal())?;
-    let result = runtime.block_on(async {
-        if preview.requires_market_price_refresh() {
-            if supplied_price {
-                eprintln!("{}", trade::MARKET_PRICE_NOTICE);
-            }
-            trading.refresh_market_open(&mut preview).await?;
-        }
-        trading
-            .submit(
-                &session,
-                &preview,
-                SubmitOptions {
-                    allow_concurrent_open,
-                    ..SubmitOptions::default()
-                },
-            )
-            .await
-    })?;
+    if preview.requires_market_price_refresh() && supplied_price {
+        eprintln!("{}", trade::MARKET_PRICE_NOTICE);
+    }
+    let (result, reference_price) = runtime.block_on(trading.submit_with_reference_price(
+        &session,
+        &preview,
+        SubmitOptions {
+            allow_concurrent_open,
+            ..SubmitOptions::default()
+        },
+    ))?;
     let mut output = json!({
         "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
         "message": result.message,
     });
-    if let Some(price) = preview.reference_price {
+    if let Some(price) = reference_price {
         output["referencePrice"] = json!(price);
     }
     local::emit(&output, json)
