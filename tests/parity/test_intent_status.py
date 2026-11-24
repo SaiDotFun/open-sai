@@ -190,6 +190,7 @@ def invoke(
         "http-config-space",
         "http-flag-control",
         "http-flag-leading-space",
+        "http-flag-ipvfuture",
         "ws-fragment",
         "ws-global-empty",
         "ws-local-empty",
@@ -227,7 +228,13 @@ def test_c11_rejects_endpoints_before_network_io(
                 detail = "Invalid value for keeper.endpoint: remove the URL fragment"
                 layer, _, malformed = source.removeprefix("http-").partition("-")
                 value = http + ("#" if layer == "env" else "#client")
-                if malformed:
+                if malformed == "ipvfuture":
+                    value = "https://[v1.foo]/query"
+                    detail = (
+                        "Invalid value for keeper.endpoint: expected a URL "
+                        "starting with https:// or http://"
+                    )
+                elif malformed:
                     detail = (
                         "Invalid value for keeper.endpoint: URL contains whitespace "
                         "or control characters"
