@@ -385,6 +385,35 @@ def test_cancel_refuses_non_pending_target(
             assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
 
 
+def test_cancel_refuses_an_lcd_response_for_another_owner(
+    cancel_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    python, rust = cancel_pair
+    with loopback("trade-accepted", cancel_target="foreign-owner") as endpoints:
+        home = tmp_path / "rust"
+        seed_home(home, endpoints, "session")
+        code, output, stderr = run(rust, home, endpoints, CANCEL, python=False)
+        assert (code, stderr) == (1, "")
+        assert output["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": "Trade 7 was not found for this account.",
+            "retryable": False,
+        }
+        assert [request.label for request in endpoints.wire] == CANCEL_READS
+        assert not endpoints.errors
+        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+    # The pinned Python guard accepts an order returned for a different owner.
+    with loopback("trade-accepted", cancel_target="foreign-owner") as endpoints:
+        home = tmp_path / "python"
+        seed_home(home, endpoints, "session")
+        assert run(python, home, endpoints, CANCEL, python=True)[0] == 0
+        assert [request.label for request in endpoints.wire] == [
+            *CANCEL_READS,
+            "recordUserIntent",
+        ]
+
+
 def test_cancel_rechecks_the_pinned_account_after_reading(
     cancel_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:

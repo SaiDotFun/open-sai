@@ -231,15 +231,30 @@ def loopback(
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
     cancel_trader = OTHER_ADDRESS if cancel_target == "other-account" else ADDRESS
-    pending_order = scenario == "pending-order" or cancel_target == "pending"
+    pending_order = scenario == "pending-order" or cancel_target in {
+        "pending",
+        "foreign-owner",
+    }
     contracts = {
         "get_trade_raw": {
-            "user": ADDRESS if cancel_target is not None else position["trader"],
+            "user": (
+                OTHER_ADDRESS
+                if cancel_target == "foreign-owner"
+                else ADDRESS
+                if cancel_target is not None or pending_order
+                else position["trader"]
+            ),
             "user_trade_index": "UserTradeIndex(7)",
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
-            "trade_type": "limit" if pending_order else "trade",
+            "trade_type": (
+                "stop"
+                if cancel_target == "foreign-owner"
+                else "limit"
+                if pending_order
+                else "trade"
+            ),
             "collateral_amount": str(position["collateralAmount"]),
             "leverage": str(position["leverage"]),
             "open_price": str(position["openPrice"]),
