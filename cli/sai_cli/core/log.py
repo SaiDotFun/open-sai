@@ -79,7 +79,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import paths
-from .errors import Code
+from .errors import Code, ExitCode, SaiError
 from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
 
 DIR_NAME = "logs"
@@ -799,8 +799,22 @@ class LogDir:
         except OSError:
             return None
 
-    def read_fd(self, name: str) -> int:
-        return self._open_file(name, os.O_RDONLY)
+    def read_fd(self, name: str, extent: FileExtent | None = None) -> int:
+        try:
+            fd = self._open_file(name, os.O_RDONLY)
+        except OSError:
+            if extent is not None:
+                raise stale_snapshot() from None
+            raise
+        if extent is not None:
+            try:
+                matches = extent.matches(os.fstat(fd))
+            except OSError:
+                matches = False
+            if not matches:
+                os.close(fd)
+                raise stale_snapshot()
+        return fd
 
     def modified(self, name: str) -> float | None:
         target, extra = self._target(name)
@@ -820,13 +834,13 @@ class LogDir:
         finally:
             os.close(fd)
 
-    def file_size(self, name: str) -> int | None:
+    def file_info(self, name: str) -> os.stat_result | None:
         target, extra = self._target(name)
         try:
             info = os.stat(target, follow_symlinks=False, **extra)
         except OSError:
             return None
-        return info.st_size if stat.S_ISREG(info.st_mode) else None
+        return info if stat.S_ISREG(info.st_mode) else None
 
     def unlink(self, name: str) -> bool:
         target, extra = self._target(name)
@@ -864,7 +878,7 @@ class LogDir:
         found: list[tuple[date, str, str]] = []
         for name in self.names():
             parsed = parse_name(name)
-            if parsed is not None and self.file_size(name) is not None:
+            if parsed is not None and self.file_info(name) is not None:
                 found.append((*parsed, name))
         return sorted(found)
 
@@ -1425,28 +1439,87 @@ class RowPosition:
     size: int
 
 
-FileEnds = dict[date, tuple[int, ...]]
-NO_FILES = (0,) * len(SURFACES)
+@dataclass(frozen=True)
+class FileExtent:
+    size: int
+    device: int
+    inode: int
+    modified: int
+
+    def matches(self, info: os.stat_result | None) -> bool:
+        return (
+            info is not None
+            and (info.st_dev, info.st_ino) == (self.device, self.inode)
+            and (
+                info.st_size > self.size
+                or (info.st_size == self.size and info.st_mtime_ns == self.modified)
+            )
+        )
 
 
-def snapshot_ends(root: Path | None) -> FileEnds:
-    """Record the extent of each daily file without reading its contents."""
+FileSnapshot = dict[tuple[date, int], FileExtent]
+
+
+def stale_snapshot() -> SaiError:
+    return SaiError(
+        "Retained log files changed. Start a new intent log query.",
+        Code.INVALID_REQUEST,
+        exit_code=ExitCode.USAGE,
+    )
+
+
+def snapshot_files(root: Path | None) -> FileSnapshot:
+    """Record the identity and extent of each daily file."""
     opened = LogDir.open(root or directory())
     if opened is None:
         return {}
-    ends: dict[date, list[int]] = {}
+    snapshot: FileSnapshot = {}
     with opened:
         for name in opened.names():
-            if (parsed := parse_name(name)) and (size := opened.file_size(name)):
+            if (
+                (parsed := parse_name(name))
+                and (info := opened.file_info(name))
+                and info.st_size
+            ):
                 day, surface = parsed
-                ends.setdefault(day, list(NO_FILES))[SURFACES.index(surface)] = size
-    return {day: tuple(offsets) for day, offsets in ends.items()}
+                snapshot[day, SURFACES.index(surface)] = FileExtent(
+                    info.st_size, info.st_dev, info.st_ino, info.st_mtime_ns
+                )
+    return snapshot
+
+
+def check_snapshot(
+    root: Path | None, snapshot: FileSnapshot, required: set[tuple[date, int]]
+) -> None:
+    if not required:
+        return
+    opened = LogDir.open(root or directory())
+    if opened is None:
+        raise stale_snapshot()
+    with opened:
+        for day, slot in required:
+            expected = snapshot.get((day, slot))
+            if expected is None or not expected.matches(
+                opened.file_info(file_name(SURFACES[slot], day))
+            ):
+                raise stale_snapshot()
+
+
+def _scan_files(
+    opened: LogDir, snapshot: FileSnapshot | None
+) -> list[tuple[date, str, str]]:
+    if snapshot is None:
+        return opened.files()
+    return [
+        (day, SURFACES[slot], file_name(SURFACES[slot], day))
+        for day, slot in sorted(snapshot)
+    ]
 
 
 def read_rows_at(
     root: Path | None,
     positions: list[RowPosition],
-    ends: FileEnds,
+    snapshot: FileSnapshot,
     budget: ScanBudget,
 ) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
     """Read the individual lines that supplied attribution on earlier pages."""
@@ -1455,21 +1528,24 @@ def read_rows_at(
         return rows, False
     opened = LogDir.open(root or directory())
     if opened is None:
-        return rows, False
+        raise stale_snapshot()
     with opened:
         for (day, slot), group in itertools.groupby(
             sorted(set(positions)), key=lambda position: (position.day, position.slot)
         ):
+            extent = snapshot.get((day, slot))
+            if extent is None:
+                raise stale_snapshot()
             if budget.files_left == 0:
                 return rows, True
             budget.files_left -= 1
             try:
-                fd = opened.read_fd(file_name(SURFACES[slot], day))
+                fd = opened.read_fd(file_name(SURFACES[slot], day), extent)
             except OSError:
                 continue
             try:
                 for position in group:
-                    if position.offset + position.size > ends.get(day, NO_FILES)[slot]:
+                    if position.offset + position.size > extent.size:
                         continue
                     if position.size > budget.bytes_left or budget.rows_left == 0:
                         return rows, True
@@ -1498,7 +1574,7 @@ def read_prefix(
     *,
     max_bytes: int,
     max_rows: int,
-    ends: tuple[int, ...] | None = None,
+    snapshot: FileSnapshot | None = None,
     budget: ScanBudget | None = None,
 ) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
     """Read bounded attribution context from the start of one day's files."""
@@ -1512,9 +1588,9 @@ def read_prefix(
     with opened:
         files = [
             (slot, name)
-            for found, surface, name in reversed(opened.files())
+            for found, surface, name in reversed(_scan_files(opened, snapshot))
             for slot in (SURFACES.index(surface),)
-            if found == day and (ends is None or ends[slot] > 0)
+            if found == day
         ]
         for slot, name in files:
             if (
@@ -1525,11 +1601,10 @@ def read_prefix(
                 return rows, True
             budget.files_left -= 1
             try:
-                fd = opened.read_fd(name)
+                extent = snapshot[day, slot] if snapshot is not None else None
+                fd = opened.read_fd(name, extent)
                 try:
-                    size = os.fstat(fd).st_size
-                    if ends is not None:
-                        size = min(size, ends[slot])
+                    size = extent.size if extent is not None else os.fstat(fd).st_size
                     data = budget.read(fd, min(size, max_bytes // len(files)))
                     truncated |= len(data) < size
                 finally:
@@ -1572,7 +1647,7 @@ class PageScan:
         last_day: date | None = None,
         since: str | None = None,
         before: str | None = None,
-        ends: FileEnds | None = None,
+        snapshot: FileSnapshot | None = None,
         budget: ScanBudget | None = None,
         reserve: ScanBudget | None = None,
         observe: Callable[[RowPosition, dict[str, Any]], None] | None = None,
@@ -1581,6 +1656,8 @@ class PageScan:
         """Merge reverse file reads one day at a time and checkpoint each file."""
         opened = LogDir.open(root or directory())
         if opened is None:
+            if snapshot:
+                raise stale_snapshot()
             return
         if budget is None:
             budget = ScanBudget(self.max_bytes, self.max_rows, self.max_files)
@@ -1669,12 +1746,16 @@ class PageScan:
         with opened:
             files = (
                 (day, surface, name)
-                for day, surface, name in reversed(opened.files())
+                for day, surface, name in reversed(_scan_files(opened, snapshot))
                 if (first_day is None or day >= first_day)
                 and (last_day is None or day <= last_day)
                 and (start is None or day <= start.day)
                 and (
-                    ends is None or ends.get(day, NO_FILES)[SURFACES.index(surface)] > 0
+                    snapshot is None
+                    or start is None
+                    or day != start.day
+                    or start.offsets is None
+                    or start.offsets[SURFACES.index(surface)] > 0
                 )
             )
             for day, daily in itertools.groupby(files, key=lambda item: item[0]):
@@ -1691,11 +1772,16 @@ class PageScan:
                     for _, surface, name in names:
                         slot = SURFACES.index(surface)
                         try:
-                            fd = opened.read_fd(name)
+                            extent = (
+                                snapshot[day, slot] if snapshot is not None else None
+                            )
+                            fd = opened.read_fd(name, extent)
                             active.callback(os.close, fd)
-                            end = os.fstat(fd).st_size
-                            if ends is not None:
-                                end = min(end, ends[day][slot])
+                            end = (
+                                extent.size
+                                if extent is not None
+                                else os.fstat(fd).st_size
+                            )
                             if (
                                 start is not None
                                 and day == start.day

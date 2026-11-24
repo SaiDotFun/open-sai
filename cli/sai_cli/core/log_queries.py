@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import base64
 import hashlib
 import json
 import os
@@ -177,7 +176,7 @@ def _prefix(
     root: Path | None,
     day: date,
     accept: Callable[[LogLine], bool],
-    ends: tuple[int, ...] | None = None,
+    snapshot: log.FileSnapshot | None = None,
     *,
     budget: log.ScanBudget | None = None,
 ) -> tuple[list[tuple[log.RowPosition, LogLine]], bool]:
@@ -187,7 +186,7 @@ def _prefix(
         accept,
         max_bytes=CONTEXT_BYTES,
         max_rows=CONTEXT_ROWS,
-        ends=ends,
+        snapshot=snapshot,
         budget=budget,
     )
 
@@ -279,11 +278,8 @@ class _Cursor:
         )
 
 
-INTENT_CURSOR_SUFFIX = "~i~"
-CURSOR_STATE_SUFFIX = "~s~"
+CURSOR_STATE_SUFFIX = "~s2~"
 CURSOR_STATE_NAME = re.compile(r"([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9a-f]{64})")
-MAX_INTENT_CURSOR = 48 * 1024
-MAX_INTENT_STATE = 2 * 1024 * 1024
 LinkPositions = dict[str, set[log.RowPosition]]
 LINK_TAG = re.compile(r"[0-9a-f]{16}")
 
@@ -332,9 +328,11 @@ def _read_cursor_state(root: Path | None, name: str) -> bytes:
     )
 
 
-def _write_cursor_state(root: Path | None, raw: bytes, ends: log.FileEnds) -> str:
+def _write_cursor_state(
+    root: Path | None, raw: bytes, snapshot: log.FileSnapshot
+) -> str:
     data = zlib.compress(raw)
-    name = f"{max(ends).isoformat()}_{hashlib.sha256(data).hexdigest()}"
+    name = f"{max(snapshot)[0].isoformat()}_{hashlib.sha256(data).hexdigest()}"
     for opened in _cursor_directories(root, create=True):
         with opened:
             try:
@@ -342,8 +340,8 @@ def _write_cursor_state(root: Path | None, raw: bytes, ends: log.FileEnds) -> st
             except OSError:
                 continue
             # A snapshot cannot refer to a file newer than the day in its name.
-            if retained := log.snapshot_ends(root):
-                oldest = min(retained).isoformat()
+            if retained := log.snapshot_files(root):
+                oldest = min(retained)[0].isoformat()
                 for previous in opened.names():
                     if previous[:10] < oldest and CURSOR_STATE_NAME.fullmatch(previous):
                         opened.unlink(previous)
@@ -354,30 +352,21 @@ def _write_cursor_state(root: Path | None, raw: bytes, ends: log.FileEnds) -> st
 def _intent_cursor(
     value: str | None,
     root: Path | None,
-) -> tuple[_Cursor, list[log.RowPosition], log.FileEnds | None, LinkPositions]:
+) -> tuple[_Cursor, list[log.RowPosition], log.FileSnapshot | None, LinkPositions]:
     base, separator, payload = (value or "").partition(CURSOR_STATE_SUFFIX)
     if not separator:
-        base, separator, payload = (value or "").partition(INTENT_CURSOR_SUFFIX)
-    if not separator:
-        return _Cursor.parse(value), [], None, {}
+        if "~s~" in base or "~i~" in base:
+            raise log.stale_snapshot()
+        cursor = _Cursor.parse(value)
+        if cursor.position is not None:
+            raise log.stale_snapshot()
+        return cursor, [], None, {}
     cursor = _Cursor.parse(base)
     try:
         if cursor.position is None:
             raise ValueError
-        if separator == CURSOR_STATE_SUFFIX:
-            raw = _read_cursor_state(root, payload)
-        else:
-            if len(payload) > MAX_INTENT_CURSOR:
-                raise ValueError
-            inflater = zlib.decompressobj()
-            raw = inflater.decompress(
-                base64.b64decode(payload, altchars=b"-_", validate=True),
-                MAX_INTENT_STATE + 1,
-            )
-            if not inflater.eof or inflater.unused_data or len(raw) > MAX_INTENT_STATE:
-                raise ValueError
-        items, days, tagged = json.loads(raw)
-        if not all(isinstance(value, list) for value in (items, days, tagged)):
+        items, files, tagged = json.loads(_read_cursor_state(root, payload))
+        if not all(isinstance(value, list) for value in (items, files, tagged)):
             raise TypeError
 
         def position(item: Any) -> log.RowPosition:
@@ -397,18 +386,20 @@ def _intent_cursor(
             return log.RowPosition(date.fromordinal(day), slot, offset, size)
 
         positions = [position(item) for item in items]
-        ends = {}
-        for row in days:
+        snapshot: log.FileSnapshot = {}
+        for row in files:
             if (
                 not isinstance(row, list)
-                or len(row) != len(log.SURFACES) + 1
-                or any(
-                    type(value) is not int or not 0 <= value < 2**63 for value in row
-                )
+                or len(row) != 6
+                or any(type(value) is not int for value in row)
             ):
                 raise ValueError
-            day, *offsets = row
-            ends[date.fromordinal(day)] = tuple(offsets)
+            day, slot, size, device, inode, modified = row
+            if not (0 <= slot < len(log.SURFACES) and 0 < size < 2**63):
+                raise ValueError
+            snapshot[date.fromordinal(day), slot] = log.FileExtent(
+                size, device, inode, modified
+            )
         links: LinkPositions = defaultdict(set)
         for entry in tagged:
             if (
@@ -419,7 +410,7 @@ def _intent_cursor(
             ):
                 raise ValueError
             links[entry[0]].add(position(entry[1:]))
-        return cursor, positions, ends, links
+        return cursor, positions, snapshot, links
     except (TypeError, ValueError, OverflowError, RecursionError, zlib.error):
         raise SaiError(
             "Pass a log cursor or a UTC timestamp to --before.",
@@ -431,7 +422,7 @@ def _intent_cursor(
 def _save_intent_cursor(
     report: LogLine,
     positions: list[log.RowPosition],
-    ends: log.FileEnds,
+    snapshot: log.FileSnapshot,
     links: LinkPositions,
     root: Path | None,
 ) -> None:
@@ -443,7 +434,17 @@ def _save_intent_cursor(
         raw = json.dumps(
             (
                 list(map(fields, positions)),
-                [(day.toordinal(), *ends[day]) for day in sorted(ends)],
+                [
+                    (
+                        day.toordinal(),
+                        slot,
+                        extent.size,
+                        extent.device,
+                        extent.inode,
+                        extent.modified,
+                    )
+                    for (day, slot), extent in sorted(snapshot.items())
+                ],
                 [
                     (tag, *fields(row))
                     for tag, refs in links.items()
@@ -453,7 +454,7 @@ def _save_intent_cursor(
             separators=(",", ":"),
         ).encode()
         report["nextBefore"] = (
-            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, raw, ends)
+            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, raw, snapshot)
         )
 
 
@@ -594,10 +595,24 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    cursor, positions, ends, links = _intent_cursor(before, root)
+    cursor, positions, snapshot, links = _intent_cursor(before, root)
     log.flush(1.0)
-    if ends is None:
-        ends = log.snapshot_ends(root)
+    if snapshot is None:
+        snapshot = log.snapshot_files(root)
+    elif start := cursor.position:
+        required = {
+            (day, slot)
+            for day, slot in snapshot
+            if (cursor.last_day is None or day <= cursor.last_day)
+            and (
+                day < start.day
+                or (day == start.day and (start.offsets is None or start.offsets[slot]))
+            )
+        }
+        required.update((ref.day, ref.slot) for ref in positions)
+        for refs in links.values():
+            required.update((ref.day, ref.slot) for ref in refs)
+        log.check_snapshot(root, snapshot, required)
     evidence: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
 
     def is_anchor(line: LogLine) -> bool:
@@ -612,7 +627,7 @@ def intent(
 
     budget = log.ScanBudget()
     scan = log.PageScan()
-    previous, scan.truncated = log.read_rows_at(root, positions, ends, budget)
+    previous, scan.truncated = log.read_rows_at(root, positions, snapshot, budget)
     checked = set(positions)
     rows = []
     if not scan.truncated:
@@ -628,7 +643,7 @@ def intent(
                 root,
                 following_day,
                 is_anchor,
-                ends.get(following_day, log.NO_FILES),
+                snapshot,
                 budget=budget,
             )
             for position, line in following:
@@ -648,7 +663,7 @@ def intent(
                 start=cursor.position,
                 last_day=cursor.last_day,
                 before=cursor.upper,
-                ends=ends,
+                snapshot=snapshot,
                 budget=budget,
                 reserve=reserved,
                 observe=remember_anchor,
@@ -725,7 +740,7 @@ def intent(
 
     def resolve_link(tag: str) -> bool:
         pending = links.get(tag, set()) - checked
-        previous, truncated = log.read_rows_at(root, list(pending), ends, budget)
+        previous, truncated = log.read_rows_at(root, list(pending), snapshot, budget)
         if truncated:
             return False
         checked.update(pending)
@@ -845,7 +860,11 @@ def intent(
             ):
                 links.setdefault(_link_tag("run", run_id), set()).add(position)
         _save_intent_cursor(
-            report, [position for position, _ in summaries.values()], ends, links, root
+            report,
+            [position for position, _ in summaries.values()],
+            snapshot,
+            links,
+            root,
         )
     if report.get("truncated") and "nextBefore" not in report:
         report["more"] = "Inspect the retained files from sai logs path."

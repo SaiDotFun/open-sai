@@ -3348,6 +3348,49 @@ def test_intent_cursor_bounds_following_day_to_original_files(home, before):
     assert code == 0 and "ambiguous" in json.loads(output)["scopeWarning"]
 
 
+@pytest.mark.parametrize("change", ["delete", "replace", "truncate"])
+def test_intent_cursor_rejects_changed_unread_files(home, change):
+    root = home / "logs"
+    root.mkdir()
+    older = date(2026, 11, 24)
+    newer = older + timedelta(days=1)
+
+    def records(day, sequences):
+        row = {
+            "ts": f"{day}T00:00:00.000Z",
+            "event": "intent.keeper",
+            "intentKey": "KEY",
+            "addr": ADDR,
+            "endpointId": "h1_" + "a" * 64,
+        }
+        return b"".join(log.encode({**row, "seq": seq}) for seq in sequences)
+
+    raw = records(older, range(100, 130))
+    path = log.file_path("cli", older, root)
+    path.write_bytes(raw)
+    log.file_path("cli", newer, root).write_bytes(records(newer, range(200, 328)))
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0
+    continuation = ("--before", json.loads(output)["nextBefore"])
+    code, output = run_cli(*args, *continuation)
+    assert code == 0 and len(json.loads(output)["events"]) == 30
+
+    if change == "delete":
+        path.unlink()
+    elif change == "replace":
+        replacement = root / "replacement"
+        replacement.write_bytes(raw.replace(b'"seq":100', b'"seq":200', 1))
+        assert replacement.stat().st_size == path.stat().st_size
+        replacement.replace(path)
+    else:
+        path.write_bytes(raw.splitlines(keepends=True)[0])
+
+    code, output = run_cli(*args, *continuation)
+    assert code == 2 and "Start a new intent log query" in output
+    assert "events" not in json.loads(output)
+
+
 def test_intent_replay_and_page_share_one_read_budget(home, monkeypatch):
     root = home / "logs"
     root.mkdir()
