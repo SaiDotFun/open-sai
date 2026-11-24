@@ -3,8 +3,8 @@ fix the rest.
 
 Each check returns pass, warn, fail, skipped, or fixed. A fixed check lists
 what it changed in `changes`. Doctor fixes only what it can from inspection:
-it creates private Sai directories, tightens modes on managed files,
-repairs stale MCP registrations, migrates the intent ledger,
+it creates private Sai directories, tightens modes on dedicated profiles and
+managed files, repairs stale MCP registrations, migrates the intent ledger,
 and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
@@ -346,6 +346,19 @@ MANAGED = (
     "intents.sqlite3-journal",
     "history",
 )
+PROFILE_FILES = {
+    "": (
+        settings.FILE_NAME,
+        settings.LOCK_NAME,
+        "update.json",
+        "update.lock",
+        "update-cache.lock",
+    ),
+    "trader": (*MANAGED, "sessions.lock"),
+    "logs": (log.PRUNE_MARKER, log.ENDPOINT_KEY, log.ENDPOINT_KEY_LOCK),
+}
+PROFILE_DIRS = {"": ("trader", "logs", "cache"), "cache": ("wheels",)}
+PROFILE_SHARED_MODE = stat.S_ISGID | stat.S_ISVTX | 0o022
 SYMLINK_FIX = "Replace the symlink with a real file or directory by hand"
 SAI_HOME_MODE_FIX = (
     "Sai preserves the permissions of existing directories because they may be shared."
@@ -441,6 +454,66 @@ def tighten(root: Path, names: Sequence[str]) -> tuple[list[str], list[str]]:
     return changes, failed
 
 
+def profile_has_data(fd: int, owner: int, directory: str = "") -> bool | None:
+    """Check for Sai data. Return None if the layout contains an unfamiliar entry."""
+    has_data = False
+    for name in os.listdir(fd):
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        if info.st_uid != owner:
+            return None
+        if name in PROFILE_DIRS.get(directory, ()) and stat.S_ISDIR(info.st_mode):
+            if info.st_mode & PROFILE_SHARED_MODE:
+                return None
+            child = os.open(
+                name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd
+            )
+            try:
+                relative = f"{directory}/{name}" if directory else name
+                if not os.path.samestat(info, os.fstat(child)):
+                    return None
+                child_has_data = profile_has_data(child, owner, relative)
+                if child_has_data is None:
+                    return None
+                has_data |= child_has_data
+            finally:
+                os.close(child)
+        elif not stat.S_ISREG(info.st_mode) or not (
+            name in PROFILE_FILES.get(directory, ())
+            or (directory == "logs" and log.parse_name(name) is not None)
+            or (directory == "cache/wheels" and update.is_wheel_name(name))
+        ):
+            return None
+        elif directory != "logs":
+            # Doctor creates diagnostics when it runs. Those alone do not
+            # establish that the user had a Sai profile here.
+            has_data = True
+    return has_data
+
+
+def tighten_profile_root(path: Path) -> str | None:
+    """Repair a dedicated, user-owned profile during an explicit doctor fix."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            info = os.fstat(fd)
+            mode = stat.S_IMODE(info.st_mode)
+            if (
+                info.st_uid != os.getuid()
+                or mode & PROFILE_SHARED_MODE
+                or not mode & 0o077
+                or not profile_has_data(fd, info.st_uid)
+                or os.fstat(fd).st_mode != info.st_mode
+            ):
+                return None
+            private_mode = mode & ~0o077
+            os.fchmod(fd, private_mode)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    return f"chmod {path} {mode:o} -> {private_mode:o}"
+
+
 def check_home(ctx: Context) -> Check:
     """Check the modes on `$SAI_HOME`, `trader`, and its managed files."""
     root = storage.home()
@@ -484,14 +557,19 @@ def check_home(ctx: Context) -> Check:
         )
     changes: list[str] = []
     failed: list[str] = []
+    if trader_exists and trader_loose:
+        changes, failed = tighten(root, MANAGED)
+    if home_loose and not failed:
+        change = tighten_profile_root(sai_home)
+        if change is not None:
+            changes.append(change)
+            home_fix = ""
     if not trader_exists:
         home_exists = sai_home.is_dir()
         storage.directory()
         if not home_exists:
             changes.append(f"created {sai_home} with mode {paths.PRIVATE_MODE:o}")
         changes.append(f"created {root} with mode {paths.PRIVATE_MODE:o}")
-    elif trader_loose:
-        changes, failed = tighten(root, MANAGED)
     if failed:
         return Check(
             "home",
@@ -501,7 +579,7 @@ def check_home(ctx: Context) -> Check:
             details,
             changes=changes,
         )
-    if home_loose:
+    if home_fix:
         return Check(
             "home",
             "warn",

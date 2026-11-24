@@ -278,17 +278,18 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
-@pytest.mark.parametrize("with_trader", [False, True])
-def test_doctor_reports_and_preserves_loose_sai_home(
-    isolated_home, with_trader, monkeypatch
+@pytest.mark.parametrize("default_home", [False, True])
+def test_doctor_repairs_a_dedicated_existing_sai_home(
+    isolated_home, default_home, monkeypatch
 ):
-    if with_trader:
-        storage.db().close()
-    else:
+    if default_home:
         monkeypatch.setenv("HOME", str(isolated_home))
         isolated_home = isolated_home / ".sai"
-        monkeypatch.setenv("SAI_HOME", str(isolated_home))
-        isolated_home.mkdir()
+        monkeypatch.delenv("SAI_HOME")
+    save()
+    storage.db().close()
+    wheels = updater.private_cache()
+    (wheels / update.wheel_name("0.1.0")).touch()
     isolated_home.chmod(0o755)
 
     code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
@@ -303,18 +304,37 @@ def test_doctor_reports_and_preserves_loose_sai_home(
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 0
     check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
-    assert check["status"] == "warn"
-    assert [change for change in check["changes"] if change.startswith("chmod")] == []
-    assert isolated_home.stat().st_mode & 0o777 == 0o755
+    assert check["status"] == "fixed"
+    assert check["changes"] == [f"chmod {isolated_home} 755 -> 700"]
+    assert isolated_home.stat().st_mode & 0o777 == 0o700
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
-@pytest.mark.parametrize("mode", [0o2770, 0o0770, 0o0755])
+@pytest.mark.parametrize(
+    ("mode", "layout"),
+    [
+        (0o2770, "ledger"),
+        (0o2755, "ledger"),
+        (0o0770, "ledger"),
+        (0o0757, "ledger"),
+        (0o0755, "mixed-cache"),
+        (0o0755, "setgid-cache"),
+        (0o0755, "empty"),
+    ],
+)
 def test_doctor_reports_and_preserves_an_existing_shared_or_ambiguous_root(
-    isolated_home, mode
+    isolated_home, mode, layout
 ):
-    if mode != 0o0755:
+    if layout != "empty":
         storage.db().close()
+    if layout == "mixed-cache":
+        other_app = isolated_home / "cache" / "other-app.db"
+        other_app.parent.mkdir()
+        other_app.write_text("unrelated data")
+    if layout == "setgid-cache":
+        cache = isolated_home / "cache"
+        cache.mkdir()
+        cache.chmod(0o2755)
     isolated_home.chmod(mode)
 
     code, output = run_cli("--json", "doctor", "--offline")
@@ -326,6 +346,15 @@ def test_doctor_reports_and_preserves_an_existing_shared_or_ambiguous_root(
         "mode": f"{mode:o}",
     }
     assert isolated_home.stat().st_mode & 0o7777 == mode
+    if layout == "empty":
+        # Doctor creates an empty trader directory on its first run. That
+        # directory and diagnostic logs still leave the root ambiguous.
+        code, output = run_cli("--json", "doctor", "--offline")
+        assert code == 0
+        check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+        assert check["status"] == "warn"
+        assert check["changes"] == []
+        assert isolated_home.stat().st_mode & 0o7777 == mode
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
@@ -619,7 +648,7 @@ def user_version(path: Path) -> int:
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
-def test_doctor_reports_loose_root_without_changing_it_during_ledger_migration(
+def test_doctor_reports_root_repair_before_ledger_migration(
     isolated_home,
 ):
     path = old_ledger(isolated_home)
@@ -629,11 +658,14 @@ def test_doctor_reports_loose_root_without_changing_it_during_ledger_migration(
     code, output = run_cli("--json", "doctor", "--offline")
     assert code == 0
     checks = {c["id"]: c for c in json.loads(output)["checks"]}
-    assert checks["home"]["status"] == "warn"
-    assert checks["home"]["changes"] == [f"chmod {path.parent} 770 -> 700"]
+    assert checks["home"]["status"] == "fixed"
+    assert checks["home"]["changes"] == [
+        f"chmod {path.parent} 770 -> 700",
+        f"chmod {isolated_home} 755 -> 700",
+    ]
     assert checks["intents"]["status"] == "fixed"
     assert user_version(path) == storage.SCHEMA_VERSION
-    assert isolated_home.stat().st_mode & 0o777 == 0o755
+    assert isolated_home.stat().st_mode & 0o777 == 0o700
 
 
 def test_no_fix_warns_about_an_old_ledger(isolated_home):
