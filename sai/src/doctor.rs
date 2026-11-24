@@ -228,13 +228,7 @@ impl DoctorArgs {
         if self.offline {
             checks.extend(NETWORK.map(|id| Check::new(id, "skipped", "Skipped with --offline")));
         } else if let Some(settings) = &settings {
-            checks.extend(network_checks(
-                settings,
-                EventContext {
-                    command: None,
-                    ..events
-                },
-            ));
+            checks.extend(network_checks(settings, events.without_command()));
         } else {
             checks.extend(NETWORK.map(skipped));
         }
@@ -538,12 +532,16 @@ fn session_check(home: &Path, settings: &Settings, now: DateTime<Utc>) -> (Check
     let matches = session.endpoint() == Some(settings.endpoint());
     let details = json!({"addr": session.addr(), "expiresAt": session.expires_at(), "endpoint": endpoint, "endpointMatches": matches});
     let check = if expiry <= now {
-        Check::new(
-            "session",
-            "fail",
-            format!("Session for {addr} expired at {}", session.expires_at()),
+        let (command, guidance) = storage.renewal_fields(&session);
+        session_recovery(
+            Check::new(
+                "session",
+                "fail",
+                format!("Session for {addr} expired at {}", session.expires_at()),
+            ),
+            command,
+            guidance,
         )
-        .fix(renewal_hint(home, &session))
     } else if !matches {
         let login = keeper_hint(home, settings.endpoint(), &["auth", "login", "NAME"]);
         match endpoint {
@@ -551,21 +549,12 @@ fn session_check(home: &Path, settings: &Settings, now: DateTime<Utc>) -> (Check
                 .fix(format!("{login}, or restore the Keeper URL used to sign in")),
             None => Check::new("session", "fail", format!("Session for {addr} has no stored Keeper endpoint")).fix(login),
         }
-    } else if expiry - now < chrono::TimeDelta::days(3) {
-        let minutes = (expiry - now).num_minutes();
-        let when = if minutes == 0 {
-            "under 1 min".into()
-        } else if minutes < 120 {
-            format!("{minutes} min")
-        } else {
-            format!("{} h", minutes / 60)
-        };
-        Check::new(
-            "session",
-            "warn",
-            format!("Sai session for {} expires in {when}.", session.addr()),
+    } else if let Some(notice) = storage.expiry_notice(&session, expiry - now) {
+        session_recovery(
+            Check::new("session", "warn", notice.expiry_warning),
+            notice.renewal_command,
+            notice.renewal_guidance,
         )
-        .fix(renewal_hint(home, &session))
     } else {
         Check::new(
             "session",
@@ -576,39 +565,16 @@ fn session_check(home: &Path, settings: &Settings, now: DateTime<Utc>) -> (Check
     (check.details(details), Some(session))
 }
 
-fn renewal_hint(home: &Path, session: &Session) -> String {
-    let endpoint = session.endpoint();
-    let origin = endpoint.map(log::origin);
-    let suffix = if endpoint.is_none() || endpoint != origin.as_deref() {
-        let at = origin
-            .filter(|origin| origin != "[redacted url]")
-            .map_or_else(String::new, |origin| format!(" at {origin}"));
-        format!(" (reuse the Keeper endpoint{at} configured when this session was stored)")
-    } else {
-        String::new()
-    };
-    let command = |args: &[&str]| match endpoint {
-        Some(endpoint) => keeper_hint(home, endpoint, args),
-        None => format!(
-            "sai {}",
-            args.iter()
-                .map(|arg| shell_quote(arg))
-                .collect::<Vec<_>>()
-                .join(" ")
-        ),
-    };
-    let next = if session.has_named_signer() {
-        command(&["auth", "renew", session.addr()])
-    } else if session.is_imported() {
-        command(&["auth", "import"])
-    } else {
-        format!(
-            "{} or {}",
-            command(&["auth", "login", "NAME"]),
-            command(&["auth", "import"])
-        )
-    };
-    format!("{next}{suffix}")
+fn session_recovery(mut check: Check, command: Option<String>, guidance: Option<String>) -> Check {
+    if let Some(guidance) = guidance {
+        if check.status == "fail" {
+            check.summary.push('.');
+        }
+        check.summary.push(' ');
+        check.summary.push_str(&guidance);
+    }
+    check.fix = command;
+    check
 }
 
 fn shell_quote(arg: &str) -> String {

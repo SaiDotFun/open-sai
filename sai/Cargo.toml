@@ -14,6 +14,7 @@ flate2.workspace = true
 libc.workspace = true
 percent-encoding = "2"
 reqwest.workspace = true
+rmcp = { version = "3.11", default-features = false, features = ["local", "server", "transport-io"] }
 rusqlite = { version = "0.38", features = ["bundled"] }
 rustix = { workspace = true, features = ["termios"] }
 sai-core = { path = "../sai-core" }
@@ -26,6 +27,7 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["io-util", "process", "signal"] }
 toml_edit = { workspace = true, features = ["display"] }
 url.workspace = true
+uuid.workspace = true
 zeroize.workspace = true
 zmij = "1"
 

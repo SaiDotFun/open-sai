@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import queue
+import re
 import select
 import shlex
 import shutil
@@ -35,40 +36,27 @@ from compare import (
     config_text,
     first_difference,
     ledger,
+    rewrite_mcp_fields,
     snapshot,
     stderr_category,
     stdout,
 )
+from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
 from sai_cli.core import log
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
-from scenarios import HERE, ROOT, Endpoints, child_env, loopback, seed_home
-
-MCP_REQUESTS = (
-    {
-        "id": 1,
-        "method": "initialize",
-        "params": {
-            "protocolVersion": "2025-11-25",
-            "capabilities": {},
-            "clientInfo": {"name": "sai-parity", "version": "1.0.0"},
-        },
-    },
-    {"method": "notifications/initialized"},
-    {"id": 2, "method": "tools/list"},
-    {
-        "id": 3,
-        "method": "tools/call",
-        "params": {"name": "market_list", "arguments": {}},
-    },
-    {
-        "id": 4,
-        "method": "tools/call",
-        "params": {"name": "market_prices", "arguments": {}},
-    },
+from scenarios import (
+    HERE,
+    ROOT,
+    Endpoints,
+    child_env,
+    loopback,
+    seed_home,
+    session_fixture,
+    write_seed,
 )
 
 
@@ -78,6 +66,11 @@ class Case:
     args: list[str]
     expect: int = 0
     mode: str = "json"
+    mcp_profile: str = ""
+    mcp_protocol: str = "2025-11-25"
+    mcp_logs: bool = False
+    mcp_deferred_trade_exception: bool = False
+    mcp_checkout_wire: list[str] | None = None
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -187,7 +180,14 @@ def interrupt_command(
 
 
 def mcp_exchange(
-    binary: list[str], args: list[str], home: Path, env: dict[str, str]
+    binary: list[str],
+    args: list[str],
+    home: Path,
+    env: dict[str, str],
+    endpoints: Endpoints,
+    case: Case,
+    *,
+    probe_deferred_trade: bool,
 ) -> subprocess.CompletedProcess[str]:
     # Keep stdin open until the server replies. Closing it while a request is
     # still running can cancel the MCP server's pending work.
@@ -199,12 +199,11 @@ def mcp_exchange(
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=stderr,
-            encoding="utf-8",
             start_new_session=True,
             umask=0o022,
         ) as proc:
             assert proc.stdin is not None and proc.stdout is not None
-            lines: queue.Queue[str | None] = queue.Queue()
+            lines: queue.Queue[bytes | None] = queue.Queue()
             stream = proc.stdout
 
             def read() -> None:
@@ -219,30 +218,57 @@ def mcp_exchange(
             received: list[str] = []
             deadline = time.monotonic() + 20
             try:
-                for request in MCP_REQUESTS:
-                    proc.stdin.write(json.dumps({"jsonrpc": "2.0", **request}) + "\n")
+                requests = [
+                    (request, None, False) for request in handshake(case.mcp_protocol)
+                ]
+                calls = CALLS[case.mcp_profile]
+                if probe_deferred_trade:
+                    requests.append(
+                        (
+                            DEFERRED_TRADE_PROBE.request(3 + len(calls), endpoints),
+                            None,
+                            True,
+                        )
+                    )
+                requests.extend(
+                    (call.request(id_, endpoints), call.session, False)
+                    for id_, call in enumerate(calls, 3)
+                )
+                for request, session, probe in requests:
+                    if session is not None:
+                        write_seed(
+                            home, endpoints, [session_fixture(endpoints, session)]
+                        )
+                    wire = json.dumps({"jsonrpc": "2.0", **request}) + "\n"
+                    proc.stdin.write(wire.encode())
                     proc.stdin.flush()
                     if "id" not in request:
                         continue
-                    while True:
-                        line = lines.get(timeout=max(0, deadline - time.monotonic()))
-                        if line is None:
-                            check_sandbox_exit(
-                                proc.wait(timeout=max(0, deadline - time.monotonic()))
-                            )
-                            raise ValueError("MCP server closed stdout before replying")
+                    raw = lines.get(timeout=max(0, deadline - time.monotonic()))
+                    if raw is None:
+                        check_sandbox_exit(
+                            proc.wait(timeout=max(0, deadline - time.monotonic()))
+                        )
+                        raise ValueError("MCP server closed stdout before replying")
+                    if not raw.endswith(b"\n"):
+                        raise ValueError("MCP stdout frame is missing its newline")
+                    line = raw.decode("utf-8")
+                    message = json.loads(line)
+                    if (
+                        not isinstance(message, dict)
+                        or message.get("jsonrpc") != "2.0"
+                        or message.get("id") != request["id"]
+                        or not isinstance(message.get("result"), dict)
+                    ):
+                        label = request.get("params", {}).get("name", request["method"])
+                        raise ValueError(f"Unexpected MCP frame for {label}")
+                    if probe:
+                        check_deferred_trade_probe(message["result"])
+                    else:
                         received.append(line)
-                        message = json.loads(line)
-                        if (
-                            isinstance(message, dict)
-                            and message.get("id") == request["id"]
-                        ):
-                            break
                 proc.stdin.close()
-                while (
-                    line := lines.get(timeout=max(0, deadline - time.monotonic()))
-                ) is not None:
-                    received.append(line)
+                if lines.get(timeout=max(0, deadline - time.monotonic())) is not None:
+                    raise ValueError("Unexpected MCP stdout after the last response")
                 code = proc.wait(timeout=max(0, deadline - time.monotonic()))
                 check_sandbox_exit(code)
             except queue.Empty:
@@ -257,6 +283,24 @@ def mcp_exchange(
         return subprocess.CompletedProcess(
             [*binary, *args], code, "".join(received), stderr.read()
         )
+
+
+def check_deferred_trade_probe(result: dict[str, Any]) -> None:
+    blocks = result.get("content")
+    if (
+        result.get("isError") is False
+        and isinstance(blocks, list)
+        and len(blocks) == 1
+        and blocks[0].get("type") == "text"
+        and isinstance(text := blocks[0].get("text"), str)
+        and result.get("structuredContent") == {"result": text}
+        and isinstance(value := json.loads(text), dict)
+        and value.get("code") == DEFERRED_TRADE_PROBE.expected
+    ):
+        return
+    raise ValueError(
+        "Temporary trading availability exception expired. Remove it once trade_open is implemented"
+    )
 
 
 def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
@@ -308,7 +352,6 @@ def observe(
         if setup.returncode:
             raise ValueError(f"Setup exited {setup.returncode}")
     args = [endpoints.expand(arg) for arg in case.args]
-    run = mcp_exchange if case.mode == "mcp" else invoke
     contender = None
     concurrent = case.server == "concurrent-close"
     if concurrent:
@@ -354,8 +397,20 @@ def observe(
         result = interrupt_command(
             binary, args, home, env, snapshots=case.interrupt_after
         )
+    elif case.mode == "mcp":
+        if not case.mcp_logs:
+            env["SAI_LOG"] = "0"
+        result = mcp_exchange(
+            binary,
+            args,
+            home,
+            env,
+            endpoints,
+            case,
+            probe_deferred_trade=candidate and case.mcp_deferred_trade_exception,
+        )
     else:
-        result = run(binary, args, home, env)
+        result = invoke(binary, args, home, env)
     ended_at = time.time()
     if endpoints.errors:
         raise ValueError(endpoints.errors[0])
@@ -409,7 +464,7 @@ def observe(
             f"Invalid {case.mode} stdout (exit {result.returncode})"
         ) from None
     if case.mode == "mcp":
-        mcp_tools(output)
+        check_mcp_calls(output, case.mcp_profile)
     stderr = stderr_category(result.stderr)
     if contender:
         stderr += tuple(
@@ -438,6 +493,31 @@ def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
         raise ValueError(
             "MCP response did not include initialize and tools/list"
         ) from None
+
+
+def check_mcp_calls(output: Any, profile: str) -> None:
+    mcp_tools(output)
+    replies = {reply["id"]: reply["result"] for reply in output}
+    for id_, call in enumerate(CALLS[profile], 3):
+        payload = replies[id_]
+        blocks = payload.get("content")
+        if (
+            not isinstance(blocks, list)
+            or len(blocks) != 1
+            or blocks[0]["type"] != "text"
+        ):
+            raise ValueError(f"{call.tool} did not return one MCP text block")
+        text = blocks[0]["text"]
+        invalid = call.expected == "invalid"
+        if payload.get("isError") is not invalid:
+            raise ValueError(f"{call.tool} returned the wrong MCP isError")
+        if invalid:
+            if not isinstance(text, str) or "structuredContent" in payload:
+                raise ValueError(f"{call.tool} did not return an MCP validation error")
+        elif not isinstance(text, dict) or text.get("code") != (
+            None if call.expected == "ok" else call.expected
+        ):
+            raise ValueError(f"{call.tool} expected MCP result {call.expected}")
 
 
 def differences(reference: Observation, candidate: Observation) -> list[str]:
@@ -544,6 +624,45 @@ def safe_observe(
     return result
 
 
+def expect_native_mcp_info(
+    output: list[dict[str, Any]], *, allow_deferred_trade: bool
+) -> str | None:
+    reasons: dict[str, None] = {}
+    for frame in output:
+        result = frame["result"]
+        value = result.get("structuredContent", {}).get("result")
+        if not isinstance(value, dict) or value.get("name") != "sai":
+            continue
+        updates = {}
+        lcd = urlsplit(value["endpoints"]["lcd"])
+        # All replay URLs contain a per-run path. The explicit privacy case
+        # appends a synthetic credential to that path.
+        if re.fullmatch(r"/parity/[0-9a-f]{32}(?:/fixture-lcd-private)?", lcd.path):
+            updates["endpoints"] = {
+                **value["endpoints"],
+                "lcd": f"{lcd.scheme}://{lcd.netloc}",
+            }
+            reasons["Native MCP reports the LCD origin without the private path"] = None
+        trading = value["trading"]
+        if (
+            allow_deferred_trade
+            and trading["available"] is True
+            and trading["reason"] == "signed-in"
+        ):
+            updates["trading"] = {
+                **trading,
+                "available": False,
+                "reason": "not-implemented",
+            }
+            reasons[
+                "Temporary native trading deferral until trade_open is implemented"
+            ] = None
+        value.update(updates)
+        result["content"][0]["text"].update(updates)
+        result["_toolText"] = rewrite_mcp_fields(result["_toolText"], updates)
+    return ", ".join(reasons) or None
+
+
 def project_reference_lcd_origin(output: dict[str, Any]) -> None:
     """The pinned Python reference still displays the LCD URL path."""
     error = output.get("error")
@@ -616,8 +735,13 @@ def run_case(
             )
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
-    diffs = differences(left, right)
     expected = None
+    if case.mode == "mcp" and reference != candidate:
+        expected = expect_native_mcp_info(
+            left.output,
+            allow_deferred_trade=case.mcp_deferred_trade_exception,
+        )
+    diffs = differences(left, right)
     if (
         diffs
         and case.expected_overview_help
@@ -630,13 +754,9 @@ def run_case(
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
         diffs.insert(0, "expected reference JSON output")
     if case.mode == "mcp":
-        calls = {reply.get("id"): reply.get("result", {}) for reply in left.output}
-        for request_id, tool in [(3, "market_list"), (4, "market_prices")]:
-            call = calls.get(request_id, {})
-            if not call.get("content") or call.get("isError"):
-                diffs.append(f"reference MCP call failed for {tool}")
-            elif not diffs:
-                tools[tool] = "PASS"
+        for call in CALLS[case.mcp_profile]:
+            if call.expected == "ok" and not diffs:
+                tools[call.tool] = "PASS"
     return diffs, tools, expected
 
 
@@ -712,6 +832,15 @@ def main() -> int:
         if not executable:
             parser.error("SAI_PARITY_BIN must name an executable file or command")
         candidate = [str(Path(executable).absolute())]
+    mcp_reference = reference
+    if any(case.mode == "mcp" for case in selected):
+        if override := os.getenv("SAI_MCP_PARITY_PYTHON"):
+            executable = shutil.which(override)
+            if not executable:
+                parser.error("SAI_MCP_PARITY_PYTHON must name an executable Python sai")
+            mcp_reference = [str(Path(executable).absolute())]
+        elif candidate is not reference:
+            parser.error("Set SAI_MCP_PARITY_PYTHON to sai from the pinned C8 checkout")
     print("# Sai CLI Parity\n")
     print(
         "Python vs Python (self-check).\n"
@@ -723,15 +852,24 @@ def main() -> int:
     expected_differences = 0
     tools: dict[str, str] = {}
     for case in selected:
-        # uv run prepends its own bin directory to PATH. Launch the Python
-        # entry point directly so both CLIs inspect the fixture launcher.
-        if case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
-            case_reference = [c9a_python]
+        if case.mode == "mcp":
+            oracle = mcp_reference
+        elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
+            # Launch directly so uv cannot shadow the fixture launcher on PATH.
+            oracle = [c9a_python]
         else:
-            case_reference = reference
-        case_candidate = case_reference if candidate is reference else candidate
-        diffs, listed, expected = run_case(case, case_reference, case_candidate)
-        tools.update(listed)
+            oracle = reference
+        if (
+            candidate is reference
+            and oracle is reference
+            and case.mcp_checkout_wire is not None
+        ):
+            case = replace(case, wire=case.mcp_checkout_wire)
+        executable = oracle if candidate is reference else candidate
+        diffs, listed, expected = run_case(case, oracle, executable)
+        for tool, status in listed.items():
+            if status != "LISTED" or tool not in tools:
+                tools[tool] = status
         mismatches += bool(diffs)
         expected_differences += bool(expected and not diffs)
         row(
