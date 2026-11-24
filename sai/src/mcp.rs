@@ -330,13 +330,8 @@ impl SaiMcp {
         let slot =
             match tokio::time::timeout(remaining, self.wait_slots.clone().acquire_owned()).await {
                 Ok(slot) => slot.map_err(|_| SaiError::internal())?,
-                Err(_) => {
-                    let mut receipt = wait::unknown_result(&key);
-                    if let Some(addr) = addr {
-                        receipt.body["addr"] = json!(addr);
-                    }
-                    return Ok(wait_result(Map::new(), receipt));
-                }
+                // Admission expired before the worker could resolve an account.
+                Err(_) => return Ok(wait_result(Map::new(), wait::unknown_result(&key))),
             };
         let home = self.env.home.clone();
         let endpoint = self.settings.endpoint().to_owned();
@@ -662,4 +657,39 @@ fn latest_version(home: &Path) -> Option<String> {
     }
     let version = cache["latest"].as_str()?.strip_prefix("sai-cli/v")?;
     install::is_version(version).then(|| version.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queued_timeout_omits_an_unresolved_address() {
+        let home = tempfile::tempdir().unwrap();
+        let env = Environment::new(home.path().to_owned(), |_| None);
+        let server = SaiMcp {
+            settings: Settings::load(&Flags::default(), &env).unwrap(),
+            env,
+            writer: None,
+            install: install::Installation::detect(),
+            local_ledger_slots: Arc::new(Semaphore::new(2)),
+            reconcile_slots: Arc::new(Semaphore::new(8)),
+            wait_slots: Arc::new(Semaphore::new(0)),
+        };
+        let args = json!({
+            "addr": "https://keeper.invalid/?key=fixture-wait-addr",
+            "key": "fixture-wait",
+            "timeout": 0.01,
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let result = runtime
+            .block_on(server.wait_for_intent(args.as_object().unwrap(), "fixture-call"))
+            .unwrap();
+        assert_eq!(result["code"], "OUTCOME_UNKNOWN");
+        assert_eq!(result["intentKey"], "fixture-wait");
+        assert_eq!(result["addr"], Value::Null);
+    }
 }
