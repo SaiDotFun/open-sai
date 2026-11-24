@@ -25,17 +25,17 @@ from contextvars import copy_context
 from functools import partial
 from queue import SimpleQueue
 from threading import BoundedSemaphore, Thread
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from anyio import AsyncFile, BrokenResourceError
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.server.stdio import stdio_server
 from mcp.types import ContentBlock, TextContent, ToolAnnotations
-from pydantic import ConfigDict, ValidationError
+from pydantic import BeforeValidator, ConfigDict, ValidationError
 
 from ..core import log as sai_log
-from ..core import log_queries, wait
+from ..core import intents, log_queries, wait
 from ..core import settings as sai_settings
 from ..core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from ..core.settings import Settings
@@ -87,6 +87,17 @@ mcp_info instead.
 Side = Literal["long", "short"]
 OrderType = Literal["market", "limit", "stop"]
 Direction = Literal["add", "remove"]
+
+
+def validate_trade_integer(value: object) -> object:
+    if type(value) is int and value >= 0:
+        return value
+    if isinstance(value, str) and intents.is_trade_integer(value):
+        return value
+    raise ValueError("Expected a nonnegative integer or a string of ASCII digits")
+
+
+TradeInteger = Annotated[int, BeforeValidator(validate_trade_integer)]
 
 
 def read_only(title: str, *, open_world: bool = True) -> ToolAnnotations:
@@ -322,7 +333,7 @@ async def intent_wait(
 
 
 async def preview_open(
-    market_id: int,
+    market_id: TradeInteger,
     side: Side,
     order_type: OrderType,
     amount: str,
@@ -372,7 +383,7 @@ async def preview_open(
 
 
 async def trade_open(
-    market_id: int,
+    market_id: TradeInteger,
     side: Side,
     order_type: OrderType,
     amount: str,
@@ -440,7 +451,7 @@ async def trade_open(
 
 
 async def preview_close(
-    trade_id: int, cancel_order: bool = False, addr: str | None = None
+    trade_id: TradeInteger, cancel_order: bool = False, addr: str | None = None
 ) -> str:
     """Preview closing a position or cancelling a pending order. Show the
     user the result; trade_close needs its previewDigest.
@@ -461,7 +472,7 @@ async def preview_close(
 
 
 async def trade_close(
-    trade_id: int,
+    trade_id: TradeInteger,
     preview_digest: str,
     cancel_order: bool = False,
     addr: str | None = None,
@@ -488,7 +499,7 @@ async def trade_close(
 
 
 async def preview_tpsl(
-    trade_id: int,
+    trade_id: TradeInteger,
     take_profit: str | None = None,
     stop_loss: str | None = None,
     clear_take_profit: bool = False,
@@ -520,7 +531,7 @@ async def preview_tpsl(
 
 
 async def trade_tpsl(
-    trade_id: int,
+    trade_id: TradeInteger,
     preview_digest: str,
     take_profit: str | None = None,
     stop_loss: str | None = None,
@@ -556,7 +567,7 @@ async def trade_tpsl(
 
 
 async def preview_leverage(
-    trade_id: int, leverage: str, addr: str | None = None
+    trade_id: TradeInteger, leverage: str, addr: str | None = None
 ) -> str:
     """Preview setting target leverage without changing TP or SL. Show the
     user the result; trade_leverage needs its previewDigest.
@@ -577,7 +588,7 @@ async def preview_leverage(
 
 
 async def trade_leverage(
-    trade_id: int, leverage: str, preview_digest: str, addr: str | None = None
+    trade_id: TradeInteger, leverage: str, preview_digest: str, addr: str | None = None
 ) -> str:
     """Submit a target-leverage change. Call preview_leverage, show the user
     the preview, and get confirmation first. Refuses with PREVIEW_MISMATCH
@@ -601,7 +612,7 @@ async def trade_leverage(
 
 
 async def preview_margin(
-    trade_id: int, direction: Direction, amount: str, addr: str | None = None
+    trade_id: TradeInteger, direction: Direction, amount: str, addr: str | None = None
 ) -> str:
     """Quote adding or removing margin from exact contract state.
 
@@ -630,7 +641,7 @@ async def preview_margin(
 
 
 async def trade_margin(
-    trade_id: int,
+    trade_id: TradeInteger,
     direction: Direction,
     amount: str,
     preview_digest: str,
@@ -663,7 +674,7 @@ async def trade_margin(
 
 
 async def preview_partial_close(
-    trade_id: int, percent: int, addr: str | None = None
+    trade_id: TradeInteger, percent: TradeInteger, addr: str | None = None
 ) -> str:
     """Preview reducing an open USDC position by a whole percentage.
 
@@ -689,7 +700,10 @@ async def preview_partial_close(
 
 
 async def trade_partial_close(
-    trade_id: int, percent: int, preview_digest: str, addr: str | None = None
+    trade_id: TradeInteger,
+    percent: TradeInteger,
+    preview_digest: str,
+    addr: str | None = None,
 ) -> str:
     """Submit a partial close. Call preview_partial_close, show the user the
     preview, and get confirmation first.

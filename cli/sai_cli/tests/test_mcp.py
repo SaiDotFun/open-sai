@@ -716,6 +716,32 @@ TRADES = (
 )
 
 
+@pytest.mark.parametrize("malformed", ["3_0", " 7 ", "+7", True, 7.0, -1])
+def test_trade_tool_integer_positions_reject_coercion(mcp, malformed):
+    storage.save_session(stored_session())
+
+    async def check() -> None:
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            for name, arguments in (*PREVIEWS, *TRADES):
+                if name.startswith("trade_"):
+                    arguments = {**arguments, "preview_digest": "0" * 64}
+                for field in arguments.keys() & {"market_id", "trade_id", "percent"}:
+                    called = await client.call_tool(
+                        name, {**arguments, field: malformed}
+                    )
+                    assert called.isError, (name, field, malformed)
+                    assert field in text_of(called.content)
+
+    asyncio.run(check())
+
+
+def test_trade_tool_accepts_a_plain_digit_string(mcp):
+    preview = invoke(mcp, "preview_close", {"trade_id": "007"})
+    assert preview["intent"]["target"]["userTradeId"] == "7"
+
+
 @pytest.mark.parametrize(("name", "arguments"), PREVIEWS)
 def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     storage.save_session(stored_session())
