@@ -224,6 +224,27 @@ def safe_intent_history(row: Mapping[str, Any]) -> dict[str, Any]:
     return log.clean(history)
 
 
+def safe_history_response(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the account-history response while keeping its GraphQL envelope."""
+    perp = data.get("perp")
+    if not isinstance(perp, dict):
+        return {"perp": None} if perp is None and "perp" in data else {}
+    rows = perp.get("tradeHistory")
+    if isinstance(rows, list):
+        return {
+            "perp": {
+                "tradeHistory": [
+                    safe_intent_history(row) for row in rows if isinstance(row, dict)
+                ]
+            }
+        }
+    return {
+        "perp": {"tradeHistory": None}
+        if rows is None and "tradeHistory" in perp
+        else {}
+    }
+
+
 # Names for the log; a query not listed here is logged as `custom`.
 OPERATIONS = {
     MARKETS: "markets",

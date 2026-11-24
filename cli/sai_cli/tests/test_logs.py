@@ -2005,6 +2005,57 @@ def test_keeper_lifecycle_codes_and_user_actor_survive_mcp_and_audit(home, keepe
     assert "opaque-upstream-error" not in raw_logs(home)
 
 
+def test_cli_intent_status_keeps_keeper_code_without_echoing_session(home, keeper_stub):
+    endpoint, state = keeper_stub
+    token = save_session(endpoint, token=OPAQUE_TOKEN)
+    key = "20260101T000000000Z_0123456789ABCDEF"
+    state.intents = [
+        {
+            "intentKey": key,
+            "evmAddress": ADDR,
+            "kind": "OPEN_TRADE",
+            "execActor": "server",
+            "lifecycleStep": "exec_req_fail",
+            "errorCode": "simulation_failed",
+            "errorMsg": f"upstream diagnostic with credential {token}",
+            "txHash": None,
+        }
+    ]
+    result = subprocess.run(
+        [
+            *sai_command(),
+            "--json",
+            "--endpoint",
+            endpoint,
+            "intent",
+            "status",
+            ADDR,
+            "--key",
+            key,
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=10,
+    )
+    assert all(
+        token not in output for output in (result.stdout, result.stderr, raw_logs(home))
+    )
+    cli = json.loads(result.stdout)
+    mcp = server.create_server(settings.load({"keeper.endpoint": endpoint}))
+    status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
+    assert cli == {
+        name: value
+        for name, value in status.items()
+        if name not in ("addr", "addrSource")
+    }
+    row = cli["userIntents"][0]
+    assert row["errorCode"] == "simulation_failed"
+    assert row["errorMsg"] == "Keeper reported an intent error."
+    assert "txHash" not in row
+    assert events(home, "intent.keeper")[0]["errorCode"] == "simulation_failed"
+
+
 @pytest.mark.parametrize(
     "error_code",
     [
@@ -2090,7 +2141,7 @@ def test_mcp_audit_validation_names_types_without_rejected_values(
     assert secret not in raw_logs(home)
 
 
-def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keeper_stub):
+def test_invalid_hash_and_keeper_text_are_excluded_from_reports(home, keeper_stub):
     endpoint, state = keeper_stub
     save_session(endpoint)
     secret = "some-opaque-credential-unrelated-to-the-active-session"
@@ -2149,7 +2200,7 @@ def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keepe
         }
     ]
     status = call(mcp, "intent_status", {"addr": ADDR, "key": key})
-    assert status["matchedTradeHistory"] == [
+    expected = [
         {
             "intentKey": key,
             "trade": {"id": 7, "trader": ADDR},
@@ -2157,7 +2208,25 @@ def test_invalid_hash_and_keeper_text_are_excluded_from_logs_and_mcp(home, keepe
             "evmTxHash": "0x" + "a" * 64,
         }
     ]
+    assert status["matchedTradeHistory"] == expected
     assert secret not in json.dumps(status)
+    code, output = run_cli(
+        "--json", "--endpoint", endpoint, "intent", "status", ADDR, "--key", key
+    )
+    assert code == 0
+    assert json.loads(output)["matchedTradeHistory"] == expected
+    assert all(secret not in value for value in (output, raw_logs(home)))
+
+    code, output = run_cli("--json", "--endpoint", endpoint, "account", "history", ADDR)
+    assert code == 0
+    assert json.loads(output) == {"perp": {"tradeHistory": expected}}
+    history = call(mcp, "account_history", {"addr": ADDR})
+    assert history == {
+        "addr": ADDR,
+        "addrSource": "argument",
+        "perp": {"tradeHistory": expected},
+    }
+    assert secret not in raw_logs(home)
 
 
 def test_intent_reports_unattributed_gaps_and_skips_nonfinite_rows(home):

@@ -288,10 +288,16 @@ def test_unindexed_sweep_then_filled_through_cli_and_mcp(keeper_replay):
     replies.extend(("filled", "not_yet_in_history", "filled_history"))
     result = cli()
     assert result["userIntents"][0]["lifecycleStep"] == "exec_pass"
-    assert (
-        result["matchedTradeHistory"]
-        == RESPONSES["filled_history"]["data"]["perp"]["tradeHistory"]
-    )
+    assert result["matchedTradeHistory"] == [
+        {
+            "id": 1007,
+            "intentKey": KEY,
+            "tradeChangeType": "position_opened",
+            "txHash": "a" * 64,
+            "block": {"block": 50109596, "block_ts": "2026-11-20T15:43:31.000Z"},
+            "trade": {"id": 7, "trader": NIBI_ADDR},
+        }
+    ]
     assert status(endpoint) == "terminal"
 
     replies.append("pending_exec")
