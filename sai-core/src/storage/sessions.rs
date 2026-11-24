@@ -382,6 +382,7 @@ impl Storage<'_> {
         let lock = self.lock_sessions()?;
         let mut accounts = self.load_accounts()?;
         let key = accounts.find(addr)?;
+        crate::session::session_expiry(&accounts.sessions[&key].0)?;
         accounts.active = Some(key.clone());
         self.save_accounts(&accounts)?;
         drop(lock);

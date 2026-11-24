@@ -13,11 +13,15 @@ use crate::{
 };
 
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
-    let expires_at = parse_expiry(session.expires_at())
-        .ok_or_else(|| SessionError::new(
+    Ok(session_expiry(session)? <= now)
+}
+
+pub(crate) fn session_expiry(session: &Session) -> Result<DateTime<Utc>, SessionError> {
+    parse_expiry(session.expires_at()).ok_or_else(|| {
+        SessionError::new(
             "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again",
-        ))?;
-    Ok(expires_at <= now)
+        )
+    })
 }
 
 // Stored Keeper expiries follow Python's datetime.fromisoformat. Convert to

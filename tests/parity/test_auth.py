@@ -557,6 +557,33 @@ def test_renew_matches_python_without_switching_active_account(
     assert session_state(python) == session_state(rust)
 
 
+def test_use_rejects_a_malformed_expiry_written_by_python(
+    tmp_path: Path, renewal_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
+) -> None:
+    python, rust = homes(tmp_path, renewal_pair)
+    python.extra_env["SAI_HOME"] = str(rust.home)
+    python.extra_env["SAI_LOG"] = "0"
+    token = fixture_token(ADDR)
+    keeper_auth.update(token=token, expires_at=token)
+    fake_cast(python)
+    keystore(python, addr=ADDR)
+    args = ("--json", "--endpoint", keeper_auth["endpoint"], "auth")
+    assert python.run(*args, "login", "dev").returncode == 0
+    python.clipboard()
+    python.clip.write_text(fixture_token(OTHER))
+    assert python.run(*args, "import").returncode == 0
+    path = rust.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    result = rust.run(*args, "use", ADDR)
+
+    assert_unexposed(rust, result.stdout + result.stderr, token)
+    assert result.returncode == 1
+    assert json.loads(result.stdout)["error"]["code"] == "SESSION_UNAVAILABLE"
+    assert path.read_bytes() == before
+    assert session_state(rust)["active"] == OTHER
+
+
 def test_renew_rejects_malformed_expiry_without_replacing_the_session(
     tmp_path: Path, cli_pair: tuple[CLI, CLI], keeper_auth: dict[str, Any]
 ) -> None:
