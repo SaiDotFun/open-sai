@@ -74,7 +74,8 @@ def run(
         stdin=subprocess.DEVNULL,
         capture_output=True,
         encoding="utf-8",
-        timeout=20,
+        # Keeper may wait 20 seconds for a response after dispatch.
+        timeout=30,
         check=False,
     )
     assert result.stdout, f"Exit {result.returncode}: {result.stderr}"
@@ -628,3 +629,47 @@ def test_interrupt_after_dispatch_reports_reserved_key(
             assert code == 1
             assert result["error"]["intentKey"] == key
             assert len(endpoints.wire) == 1
+
+
+@pytest.mark.parametrize("first", [0, 1], ids=["python-sends", "rust-sends"])
+def test_mixed_clients_reconcile_a_post_dispatch_timeout(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path, first: int
+) -> None:
+    sender, peer = trade_pair[first], trade_pair[1 - first]
+    args = (*OPEN, "--type", "limit")
+    with loopback("trade-timeout") as endpoints:
+        home = tmp_path / "shared"
+        seed_home(home, endpoints, "session")
+        try:
+            code, result, stderr = run(sender, home, endpoints, args, python=first == 0)
+        finally:
+            endpoints.admission.release.set()
+        assert (code, stderr) == (5, "")
+        key = result["error"]["intentKey"]
+        assert result["error"]["code"] == "OUTCOME_UNKNOWN"
+        assert key == endpoints.admission.key
+        assert [row[2] for row in rows(home)] == ["unknown"]
+
+        code, result, _ = run(peer, home, endpoints, args, python=first == 1)
+        assert code == 1
+        assert result["error"]["code"] == "RECENT_OPEN_PENDING"
+        assert result["error"]["intentKey"] == key
+        assert [request.label for request in endpoints.wire] == ["recordUserIntent"]
+
+        code, _, _ = run(
+            peer,
+            home,
+            endpoints,
+            ("intent", "status", ADDRESS, "--key", key),
+            python=first == 1,
+        )
+        assert code == 0
+        assert [row[2] for row in rows(home)] == ["terminal"]
+        assert run(sender, home, endpoints, args, python=first == 0)[0] == 0
+        assert [request.label for request in endpoints.wire] == [
+            "recordUserIntent",
+            "userIntents",
+            "recordUserIntent",
+        ]
+        assert [row[2] for row in rows(home)] == ["terminal", "accepted"]
+        assert not endpoints.errors

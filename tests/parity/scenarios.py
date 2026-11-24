@@ -345,6 +345,12 @@ def loopback(
                 self.reject("Wrong fixture authorization")
                 return
             key = variables["input"]["intentKey"]
+            if scenario == "trade-timeout" and not admission.arrived.is_set():
+                admission.key = key
+                admission.arrived.set()
+                admission.release.wait(35)
+                self.close_connection = True
+                return
             if scenario == "trade-disconnect":
                 self.close_connection = True
                 return
@@ -391,6 +397,23 @@ def loopback(
                     return
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
                     self.admit_trade(request.variables)
+                    return
+                if name == "userIntents" and scenario == "trade-timeout":
+                    if not admission.arrived.is_set() or not same_variables(
+                        request.variables, {"user": ADDRESS, "key": admission.key}
+                    ):
+                        self.reject("Wrong timed-out intent lookup")
+                    else:
+                        row = {
+                            **status,
+                            "intentKey": admission.key,
+                            "kind": "OPEN_TRADE",
+                            "lifecycleStep": "exec_fail",
+                            "execActor": "server",
+                            "nibiAddress": None,
+                            "errorCode": "chain_execution_failed",
+                        }
+                        self.reply({"data": {"userIntents": [row]}})
                     return
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):

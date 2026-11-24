@@ -179,6 +179,11 @@ jobs:
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+      - name: Race the Rust and Python intent reservations
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-python-c7
+        run: cargo test --locked -p sai --test storage_parity -- --ignored python_and_rust_can_only_reserve_one_intent_at_a_time opening_a_second_rust_connection_keeps_the_reservation_locked
       - name: Compare the Rust and Python CLIs
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         env:
