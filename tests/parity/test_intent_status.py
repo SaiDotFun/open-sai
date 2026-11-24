@@ -758,8 +758,19 @@ def test_cli_errors_share_one_envelope(
         assert result.returncode == exit_code
         assert not result.stderr
         assert len(result.stdout.splitlines()) == 1
-        assert json.loads(result.stdout)["error"]["code"] == code
-        outputs.append(result.stdout)
+        payload = json.loads(result.stdout)
+        assert payload["error"]["code"] == code
+        if code == "SIGNED_OUT":
+            endpoint = keeper.MAINNET_HTTP
+            expected_hint = (
+                f"sai --endpoint {endpoint} auth login NAME"
+                if index == 0
+                else origin_login_hint(endpoint.removesuffix("/query"))
+            )
+            assert payload["error"].pop("hint") == expected_hint
+            outputs.append(payload)
+        else:
+            outputs.append(result.stdout)
     assert outputs[0] == outputs[1]
 
 
@@ -778,6 +789,14 @@ def test_intent_help(
     assert outputs[0] == outputs[1]
 
 
+def origin_login_hint(origin: str) -> str:
+    return (
+        'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
+        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
+        " auth login NAME"
+    )
+
+
 @pytest.mark.parametrize("path", ["/query", "/private/query"])
 def test_expired_auth_status(
     cli_pair: tuple[CLI, CLI],
@@ -785,7 +804,8 @@ def test_expired_auth_status(
     monkeypatch: pytest.MonkeyPatch,
     path: str,
 ) -> None:
-    endpoint = f"http://127.0.0.1:9{path}"
+    origin = "http://127.0.0.1:9"
+    endpoint = origin + path
     fixture = tmp_path / "fixture"
     monkeypatch.setenv("SAI_HOME", str(fixture))
     with log.silenced():
@@ -804,10 +824,19 @@ def test_expired_auth_status(
         result = invoke(cli, home, "--json", "--endpoint", endpoint, "auth", "status")
         assert result.returncode == 6
         assert result.stderr == b""
-        error = json.loads(result.stdout)["error"]
-        assert error["code"] == "SESSION_EXPIRED"
-        assert error["hint"].endswith(f"auth login NAME --addr {ADDR}")
-        observed.append((result.stdout, read_events(home)))
+        payload = json.loads(result.stdout)
+        assert payload["error"]["code"] == "SESSION_EXPIRED"
+        if index == 1:
+            login = origin_login_hint(origin)
+        elif path == "/query":
+            login = f"sai --endpoint {endpoint} auth login NAME"
+        else:
+            login = (
+                'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
+                'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
+            )
+        assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
+        observed.append((payload, read_events(home)))
     assert observed[0] == observed[1]
 
 
@@ -1166,9 +1195,11 @@ def test_watch_reports_rejected_upgrade(
         for value in values:
             response.headers[header] = value
 
-    with graphql_ws(
-        lambda connection: connection.close(), process_response=replace_header
-    ) as ws:
+    def wait_for_client_disconnect(connection: ServerConnection) -> None:
+        # A server close frame can race with Python's failed handshake cleanup.
+        connection.wait_closed()
+
+    with graphql_ws(wait_for_client_disconnect, process_response=replace_header) as ws:
         for index, cli in enumerate(cli_pair):
             assert_watch_disconnect(cli, tmp_path / str(index), ws, error_type)
 
