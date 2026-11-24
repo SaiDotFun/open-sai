@@ -335,9 +335,13 @@ endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 Put `--json` before the command to read errors on stdout. A failed command
 writes one JSON object with `error.code`, `error.message`, and
 `error.retryable`. The error includes `intentKey` when it refers to a
-recorded intent and `hint` when a command can help. If a stream such as
-`watch` has already emitted JSON lines, the error object is its final line.
-Without `--json`, error text goes to stderr.
+recorded intent and `hint` when a command can help. Failed doctor checks and
+MCP registration commands include their structured reports in
+`error.details`. The registration report includes `changed` per client and
+the aggregate `reconnectNeeded` flag. If a stream such as `watch` has already
+emitted JSON lines, the error object is its final line. Once `sai mcp serve`
+starts the stdio transport, stdout carries MCP protocol traffic. Without
+`--json`, error text goes to stderr.
 
 | Exit | Meaning | What to Do |
 | --- | --- | --- |
@@ -350,9 +354,10 @@ Without `--json`, error text goes to stderr.
 | 6 | Signed out or session expired | Sign in with `sai auth login NAME` or `sai auth import`. |
 
 `ADMISSION_REJECTED` and `NOT_SENT` have exit 4 and `retryable: true`.
-`OUTCOME_UNKNOWN` has exit 5 and `retryable: false`. Use the same Keeper
-endpoint and account as the original command when running
-`sai --json intent status ADDR --key KEY`. Exit 6 covers `SIGNED_OUT` and
+`OUTCOME_UNKNOWN` has exit 5 and `retryable: false`. The reconciliation
+hint pins the original Keeper endpoint and account. If the URL may contain
+credentials, set `SAI_RECONCILE_ENDPOINT` to the original URL before running
+the hint. Exit 6 covers `SIGNED_OUT` and
 `SESSION_EXPIRED`. `SESSION_UNAVAILABLE` has exit 1 and describes a local
 session the command could not use, for example one for another Keeper
 endpoint.

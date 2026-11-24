@@ -5,12 +5,16 @@ from __future__ import annotations
 import json
 import os
 import queue
+import select
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import threading
 import time
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,10 +26,65 @@ from websockets.sync.server import serve
 from websockets.typing import Subprotocol
 
 FIXTURES = Path(__file__).parent / "fixtures"
+TRADE_ADDR = "0x" + "a" * 40
 
 
 def fixture(name: str) -> dict:
     return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
+
+
+def save_trade_session(endpoint: str) -> None:
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": TRADE_ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+
+
+@contextmanager
+def submission_keeper(reply: Callable[[str], dict | None]) -> Generator[str]:
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            assert body["query"] == keeper.SUBMIT
+            response = reply(body["variables"]["input"]["intentKey"])
+            if response is not None:
+                payload = json.dumps(response).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+        def log_message(self, format, *args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        thread = threading.Thread(
+            target=server.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True
+        )
+        thread.start()
+        try:
+            yield f"http://127.0.0.1:{server.server_port}/query"
+        finally:
+            server.shutdown()
+            thread.join()
+
+
+def close_trade_args(endpoint: str) -> list[str]:
+    return [*_resolve_cli(), "--endpoint", endpoint, "--json", "trade", "close", "7"]
+
+
+@pytest.fixture
+def fail_ledger_updates() -> None:
+    with storage.db() as connection:
+        connection.execute(
+            "CREATE TRIGGER reject_status_write BEFORE UPDATE OF status ON intents "
+            "BEGIN SELECT RAISE(ABORT, 'ledger write failed'); END"
+        )
 
 
 def _resolve_cli() -> list[str]:
@@ -282,7 +341,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
             "message": f"Outcome unknown for intent {key}; reconcile before another trade",
             "retryable": False,
             "intentKey": key,
-            "hint": f"sai intent status {addr} --key {key}",
+            "hint": f"sai --endpoint {endpoint} intent status {addr} --key {key}",
         }
         saved = json.loads(invoke("intent", "local", addr).stdout)
         assert saved[0]["intentKey"] == key
@@ -292,6 +351,7 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         assert duplicate.returncode == 1
         blocked = json.loads(duplicate.stdout)["error"]
         assert blocked["intentKey"] == key and blocked["retryable"] is False
+        assert blocked["hint"] == error["hint"]
         assert "Reconcile" in blocked["message"]
         assert len(recorded) == 1
 
@@ -323,6 +383,173 @@ def test_lost_admission_survives_restart_and_reconciles(tmp_path, monkeypatch):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+@pytest.mark.parametrize("acknowledged", [True, False])
+def test_keeper_result_survives_a_failed_ledger_write(
+    fail_ledger_updates, acknowledged
+):
+    requests = []
+
+    def reply(key: str) -> dict:
+        requests.append(key)
+        if not acknowledged:
+            return {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+        return {
+            "data": {
+                "recordUserIntent": {
+                    "intentKey": key,
+                    "lifecycleStep": "jwt_pass",
+                    "execActor": "server",
+                    "evmAddress": TRADE_ADDR,
+                }
+            }
+        }
+
+    with submission_keeper(reply) as endpoint:
+        save_trade_session(endpoint)
+        result = subprocess.run(
+            close_trade_args(endpoint),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    [key] = requests
+    assert result.returncode == (5 if acknowledged else 4), (
+        result.stderr or result.stdout
+    )
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == (
+        "OUTCOME_UNKNOWN" if acknowledged else "ADMISSION_REJECTED"
+    )
+    assert error["retryable"] is (not acknowledged)
+    assert error["intentKey"] == key
+    assert (
+        error["hint"]
+        == f"sai --endpoint {endpoint} intent status {TRADE_ADDR} --key {key}"
+    )
+    assert storage.list_pending(endpoint, TRADE_ADDR)[0]["status"] == "unknown"
+
+
+def test_connect_refusal_survives_a_failed_ledger_write(fail_ledger_updates):
+    with socket.socket() as unavailable:
+        unavailable.bind(("127.0.0.1", 0))
+        endpoint = f"http://127.0.0.1:{unavailable.getsockname()[1]}/query"
+        save_trade_session(endpoint)
+        result = subprocess.run(
+            close_trade_args(endpoint),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    assert result.returncode == 4, result.stderr
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "NOT_SENT" and error["retryable"] is True
+    [entry] = storage.list_pending(endpoint, TRADE_ADDR)
+    assert entry["intentKey"] == error["intentKey"] and entry["status"] == "unknown"
+
+
+def test_reconciliation_hints_keep_endpoint_query_credentials_private():
+    with submission_keeper(lambda _key: None) as base:
+        secret = "fixture-endpoint-secret"
+        endpoint = f"{base}?api_key={secret}"
+        save_trade_session(endpoint)
+        attempts = [
+            subprocess.run(
+                close_trade_args(endpoint),
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            for _ in range(2)
+        ]
+    received, blocked = attempts
+    assert (received.returncode, blocked.returncode) == (5, 1)
+    for result in attempts:
+        assert secret not in result.stdout + result.stderr
+    error, block = [json.loads(result.stdout)["error"] for result in attempts]
+    assert error["hint"] == block["hint"]
+    assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error["hint"]
+    assert error["hint"].endswith(
+        f"intent status {TRADE_ADDR} --key {error['intentKey']}"
+    )
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+def test_sigint_after_keeper_receives_intent_reports_unknown():
+    requests = queue.Queue()
+    release = threading.Event()
+
+    def reply(key: str) -> None:
+        requests.put(key)
+        release.wait(timeout=15)
+
+    with submission_keeper(reply) as endpoint:
+        save_trade_session(endpoint)
+        with subprocess.Popen(
+            close_trade_args(endpoint),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as process:
+            try:
+                key = requests.get(timeout=10)
+                process.send_signal(signal.SIGINT)
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                release.set()
+                if process.poll() is None:
+                    process.kill()
+    assert process.returncode == 5 and stderr == ""
+    error = json.loads(stdout)["error"]
+    assert error["code"] == "OUTCOME_UNKNOWN" and error["intentKey"] == key
+    assert (
+        error["hint"]
+        == f"sai --endpoint {endpoint} intent status {TRADE_ADDR} --key {key}"
+    )
+    [entry] = storage.list_pending(endpoint, TRADE_ADDR)
+    assert entry["intentKey"] == key and entry["status"] == "unknown"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+def test_mcp_stdio_sigint_after_initialize_exits_without_cli_output():
+    with subprocess.Popen(
+        [*_resolve_cli(), "--json", "mcp", "serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        assert process.stdin is not None and process.stdout is not None
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "test", "version": "0"},
+            },
+        }
+        try:
+            process.stdin.write(json.dumps(request) + "\n")
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0]
+            assert "result" in json.loads(process.stdout.readline())
+            process.stdin.write(
+                '{"jsonrpc":"2.0","method":"notifications/initialized"}\n'
+            )
+            process.stdin.flush()
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=10)
+        finally:
+            if process.poll() is None:
+                process.kill()
+    assert process.returncode == 0, stderr
+    assert stdout == stderr == ""
 
 
 def test_two_processes_cannot_reserve_same_position(tmp_path, monkeypatch):

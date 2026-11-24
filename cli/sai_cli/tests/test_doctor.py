@@ -1160,6 +1160,12 @@ def test_json_report_shape_and_exit_code():
     assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
     assert "expired" in error["message"]
     assert "sai auth login NAME" in error["message"]
+    details = error["details"]
+    assert details["schemaVersion"] == 1 and details["overall"] == "fail"
+    checks = {check["id"]: check for check in details["checks"]}
+    assert checks["session"]["status"] == "fail"
+    assert "sai auth login NAME" in checks["session"]["fix"]
+    assert checks["keeper"]["status"] == "skipped"
 
 
 def test_overall_ignores_skipped():
