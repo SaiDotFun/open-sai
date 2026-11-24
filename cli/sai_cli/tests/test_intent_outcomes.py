@@ -56,7 +56,14 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self) -> None:
             nonlocal active_key, offset
-            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            length = int(self.headers["Content-Length"])
+            try:
+                payload = self.rfile.read(length)
+            except ConnectionResetError:
+                return
+            if len(payload) != length:
+                return
+            request = json.loads(payload)
             replay = replies.popleft()
             slow = replay if isinstance(replay, SlowBody) else None
             if isinstance(replay, SlowBody):
@@ -119,7 +126,8 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             if slow is None:
-                self.wfile.write(body)
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    self.wfile.write(body)
                 return
             slow.started.set()
             try:
@@ -838,6 +846,7 @@ def test_wait_times_out_during_a_slow_mcp_response(keeper_replay):
         elapsed = time.monotonic() - started
     finally:
         slow.release.set()
+    assert slow.finished.wait(2)
     assert slow.started.is_set()
     assert elapsed < 0.5
     assert result["outcome"] == "unknown"

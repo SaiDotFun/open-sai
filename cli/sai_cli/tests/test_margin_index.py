@@ -184,7 +184,7 @@ def test_remove_margin_when_index_lags_or_changes(scenario):
     assert indexed_reads == 3
     if scenario == "catches_up":
         assert result.exit_code == 0, result.output
-        assert json.loads(result.output)["quote"]["collateralBefore"] == "11000000"
+        assert json.loads(result.stdout)["quote"]["collateralBefore"] == "11000000"
         assert len(submitted) == 1
         assert submitted[0]["intent"]["body"]["requestedLeverage"] == "5.5"
     elif scenario == "lags":
@@ -194,6 +194,6 @@ def test_remove_margin_when_index_lags_or_changes(scenario):
         assert storage.list_pending(endpoint, ADDR) == []
     else:
         assert result.exit_code == 1, result.output
-        assert json.loads(result.output)["code"] == "PREVIEW_MISMATCH"
+        assert json.loads(result.stdout)["code"] == "PREVIEW_MISMATCH"
         assert submitted == []
         assert storage.list_pending(endpoint, ADDR) == []
