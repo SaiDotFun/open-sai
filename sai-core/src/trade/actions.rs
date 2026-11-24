@@ -121,6 +121,7 @@ impl Trading<'_> {
             .as_str()
             .and_then(|text| text.strip_prefix("MarketIndex(")?.strip_suffix(')'))
             .ok_or_else(SaiError::internal)?;
+        let market: Value = serde_json::from_str(market).map_err(|_| SaiError::internal())?;
         let data = self
             .keeper
             .request(MARKETS, Map::new(), None, TIMEOUT)
@@ -133,7 +134,7 @@ impl Trading<'_> {
         let mut price = None;
         for row in borrowings {
             let market_id = row.get("marketId").ok_or_else(|| incomplete("KeyError"))?;
-            if !market_id.is_number() || market_id.to_string() != market {
+            if *market_id != market {
                 continue;
             }
             let symbol = row
