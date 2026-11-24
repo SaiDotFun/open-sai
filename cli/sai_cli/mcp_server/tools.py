@@ -20,11 +20,12 @@ import logging
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal
+from decimal import Decimal, localcontext
 from typing import Any
 
 from ..core import intents, keeper, reconcile, storage, stream, trading
 from ..core import log as sai_log
+from ..core import preview as estimates
 from ..core import session as sessions
 from ..core.errors import Code, SaiError, SessionError
 from ..core.errors import describe as describe_error
@@ -450,7 +451,8 @@ def intent_status(
 
 def canonical_price(value: object) -> str:
     """Write a price so equal amounts give equal text: 100, 100.0 -> 100."""
-    return format(Decimal(str(value)).normalize(), "f")
+    price = format(Decimal(str(value)), "f")
+    return price.rstrip("0").rstrip(".") if "." in price else price
 
 
 def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
@@ -531,12 +533,17 @@ def bound(
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
-        moved = abs(current - reference) / reference * 100
-        if moved > Decimal(slippage):
-            message = PRICE_MOVED.format(
-                moved=format(moved.quantize(Decimal("0.0001")), "f"),
-                slippage=slippage,
-            )
+        fraction = Decimal(slippage).scaleb(-2)
+        lower = estimates.slippage_price(reference, fraction, False)
+        upper = estimates.slippage_price(reference, fraction, True)
+        if not lower <= current <= upper:
+            with localcontext() as context:
+                context.prec = 90
+                moved = abs(current - reference) / reference * 100
+                message = PRICE_MOVED.format(
+                    moved=format(moved.quantize(Decimal("0.0001")), "f"),
+                    slippage=slippage,
+                )
             raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check

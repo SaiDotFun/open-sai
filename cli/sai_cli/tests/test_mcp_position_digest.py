@@ -45,7 +45,7 @@ class Position:
     collateral_price: str | None = "1"
     preview_inputs: bool = False
     malformed_node_info: bool = False
-    price: float = 100.5
+    price: float | str = 100.5
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
     )
@@ -871,5 +871,41 @@ def test_malformed_lcd_keeps_the_limit_preview_and_digest_refusal(position_servi
                 ]
             )
             assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_mcp_market_refuses_first_step_excess_of_one_price_atom(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.price = "100.00000000000001"
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "0.9999999999999999",
+    }
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, "preview_open", args)
+            assert (
+                quote["estimates"]["worstCaseFill"]["price"] == "102.010000000000009997"
+            )
+            trade = {
+                **args,
+                "preview_digest": quote["previewDigest"],
+                "reference_price": quote["referencePrice"],
+            }
+            position.price = "101.00000000000001"
+            result = await call(client, "trade_open", trade)
+            assert result["code"] == "PRICE_MOVED"
+            assert position.submitted == []
+            position.price = "101.000000000000009999"
+            result = await call(client, "trade_open", trade)
+            assert result["status"] == "accepted"
+            assert len(position.submitted) == 1
 
     asyncio.run(scenario())
