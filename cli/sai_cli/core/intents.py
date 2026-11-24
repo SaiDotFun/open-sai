@@ -80,14 +80,14 @@ def open_intent(
     try:
         valid_slippage = (
             positive(slippage, "Slippage") <= 100
-            and len(slippage.partition(".")[2]) <= 16
+            and len(slippage.partition(".")[2].rstrip("0")) <= 16
         )
     except ValueError:
         valid_slippage = False
     if not valid_slippage:
         raise SaiError(
             "Slippage must be greater than 0 and at most 100 percent,"
-            " with at most 16 decimal places",
+            " with at most 18 decimal places and only zeros after the 16th place",
             Code.INVALID_REQUEST,
             exit_code=ExitCode.USAGE,
         )

@@ -346,7 +346,8 @@ async def preview_open(
         amount: Collateral in USD as a decimal string, at most 6 decimals.
         leverage: Leverage as a decimal string, such as "5".
         slippage: Maximum slippage percentage as a decimal string. Must be
-            greater than 0 and at most 100, with at most 16 decimal places.
+            greater than 0 and at most 100. Use at most 18 decimal places.
+            Any digits after the 16th decimal place must be zero.
         price: Trigger price, required for limit and stop. A market order
             submits Keeper's current price instead.
         take_profit: Optional take-profit price.
@@ -404,7 +405,8 @@ async def trade_open(
         amount: Collateral in USD as a decimal string, at most 6 decimals.
         leverage: Leverage as a decimal string, such as "5".
         slippage: Maximum slippage percentage as a decimal string. Must be
-            greater than 0 and at most 100, with at most 16 decimal places.
+            greater than 0 and at most 100. Use at most 18 decimal places.
+            Any digits after the 16th decimal place must be zero.
         price: Trigger price, required for limit and stop. A market order
             submits Keeper's current price instead.
         take_profit: Optional take-profit price.

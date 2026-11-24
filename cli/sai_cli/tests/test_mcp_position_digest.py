@@ -1151,16 +1151,21 @@ def test_cli_preview_text_and_json_use_the_order_trigger(
         ("0.0", False),
         ("0.00000000000000001", False),
         ("0.0000000000000001", True),
+        ("0.000000000000000100", True),
         ("100", True),
+        ("100.00000000000000000", True),
+        ("100.0000000000000000000", False),
         ("100.0000000000000001", False),
     ],
 )
+@pytest.mark.parametrize("order_type", ["market", "limit", "stop"])
 def test_open_checks_slippage_before_preview(
     position_service: tuple[Position, str],
     tmp_path,
     monkeypatch,
     slippage: str,
     accepted: bool,
+    order_type: str,
 ) -> None:
     position, base_url = position_service
     position.preview_inputs = True
@@ -1168,11 +1173,18 @@ def test_open_checks_slippage_before_preview(
     args = {
         "market_id": 0,
         "side": "long",
-        "order_type": "market",
+        "order_type": order_type,
         "amount": "10",
         "leverage": "2",
         "slippage": slippage,
     }
+    price_options = []
+    trade_args = {"preview_digest": "0" * 64}
+    if order_type == "market":
+        trade_args["reference_price"] = "100.5"
+    else:
+        args["price"] = "100"
+        price_options = ["--price", "100"]
     cli = CliRunner().invoke(
         main,
         [
@@ -1188,13 +1200,14 @@ def test_open_checks_slippage_before_preview(
             "--side",
             "long",
             "--type",
-            "market",
+            order_type,
             "--amount",
             "10",
             "--leverage",
             "2",
             "--slippage",
             slippage,
+            *price_options,
             "--dry-run",
         ],
     )
@@ -1208,7 +1221,8 @@ def test_open_checks_slippage_before_preview(
                     slippage
                 )
                 assert preview["intent"]["body"]["maxSlippagePct"] == slippage
-                assert preview["referencePrice"] == "100.5"
+                if order_type == "market":
+                    assert preview["referencePrice"] == "100.5"
             else:
                 assert cli.exit_code == 2, cli.output
                 error = json.loads(cli.output)["error"]
@@ -1219,7 +1233,7 @@ def test_open_checks_slippage_before_preview(
                 trade = await call(
                     client,
                     "trade_open",
-                    {**args, "preview_digest": "0" * 64, "reference_price": "100.5"},
+                    {**args, **trade_args},
                 )
                 assert trade == preview
                 assert position.market_reads == 0
