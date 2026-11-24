@@ -802,11 +802,15 @@ def test_trade_confirmation_binds_verified_route(
                 "contractAddress": "nibi1contract",
             }
             trade_args = {**args, "preview_digest": digest}
+            cli_submit_args = cli_args
             if args.get("order_type") == "market":
                 trade_args["reference_price"] = preview["referencePrice"]
+                cli_submit_args = [*cli_args, "--price", preview["referencePrice"]]
 
             setattr(position, field, value)
-            cli_refusal = cli.invoke(main, [*cli_args, "--preview-digest", digest])
+            cli_refusal = cli.invoke(
+                main, [*cli_submit_args, "--preview-digest", digest]
+            )
             assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
             cli_error = json.loads(cli_refusal.stdout)["error"]
             mcp_error = await call(client, f"trade_{tool}", trade_args)
@@ -845,7 +849,7 @@ def test_trade_confirmation_binds_verified_route(
                     "contractAddress": position.contract_address,
                 }
                 accepted = cli.invoke(
-                    main, [*cli_args, "--preview-digest", fresh["previewDigest"]]
+                    main, [*cli_submit_args, "--preview-digest", fresh["previewDigest"]]
                 )
                 assert accepted.exit_code == 0, accepted.output
                 assert json.loads(accepted.stdout)["status"] == "accepted"
@@ -859,6 +863,47 @@ def test_trade_confirmation_binds_verified_route(
             assert len(position.submitted) == 1
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("reference", [None, "100"])
+def test_cli_confirms_market_open_with_reference_and_slippage(
+    position_service, reference
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.price = "100"
+    save_session(f"{base_url}/query")
+    cli = CliRunner()
+    cli_args = position_cli_args(base_url, [*OPEN_COMMAND, "--type", "market"])
+    price_flag = [] if reference is None else ["--price", reference]
+    quoted = cli.invoke(main, [*cli_args, *price_flag, "--dry-run"])
+    assert quoted.exit_code == 0, quoted.output
+    preview = json.loads(quoted.stdout)
+    fill = preview["estimates"]["worstCaseFill"]
+    assert preview["referencePrice"] == fill["reference"]["price"] == "100"
+    assert fill["status"] == "bound"
+    assert fill["price"] == "102.01"
+
+    submit_args = [
+        *cli_args,
+        "--preview-digest",
+        preview["previewDigest"],
+        "--price",
+        preview["referencePrice"],
+    ]
+    position.price = "101.000000000000000001"
+    refused = cli.invoke(main, submit_args)
+    assert refused.exit_code == ExitCode.REJECTED, refused.output
+    assert json.loads(refused.stdout)["error"]["code"] == "PRICE_MOVED"
+    assert position.submitted == []
+    assert not (storage.home() / "intents.sqlite3").exists()
+
+    position.price = "100.01"
+    accepted = cli.invoke(main, submit_args)
+    assert accepted.exit_code == 0, accepted.output
+    assert json.loads(accepted.stdout)["referencePrice"] == "100.01"
+    (submitted,) = position.submitted
+    assert submitted["body"]["intentPrice"] == "100.01"
 
 
 @pytest.mark.parametrize(

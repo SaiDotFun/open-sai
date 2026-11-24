@@ -179,14 +179,23 @@ def open_trade(
                 read_market(estimates.QUOTE_TIMEOUT)
             except estimates.READ_ERRORS:
                 pass
-        return estimates.open_estimates(
+        market_reference = reference
+        if order_type == "market" and dry_run and price is not None and not mcp_market:
+            market_reference = estimates.price_input(
+                Decimal(price), "CLI --price", None
+            )
+        quote = estimates.open_estimates(
             lcd_endpoint,
             preview.get("positionRoute", {}).get("contractAddress"),
             payload["body"],
             row,
-            reference,
-            mcp_market=mcp_market,
+            market_reference,
+            market_bound=mcp_market or "positionRoute" in preview,
         )
+        fill = quote["worstCaseFill"]
+        if order_type == "market" and not mcp_market and fill["status"] == "bound":
+            fill["assumption"] = "Submit with --preview-digest and the quoted --price."
+        return quote
 
     active = None if dry_run else get_session()
     preview: dict[str, Any] = {"dryRun": True, "intent": payload}
@@ -200,7 +209,7 @@ def open_trade(
         if not dry_run:
             if before_price_refresh is not None:
                 before_price_refresh(preview)
-            if price is not None:
+            if price is not None and (before_submit is None or mcp_market):
                 notify(MARKET_PRICE_NOTICE)
             read_market()
             assert reference is not None

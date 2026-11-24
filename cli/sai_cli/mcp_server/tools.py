@@ -19,7 +19,7 @@ import sqlite3
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from typing import Any
 
 from ..core import (
@@ -511,17 +511,9 @@ def bound(
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
-        fraction = Decimal(slippage).scaleb(-2)
-        lower = estimates.slippage_price(reference, fraction, False)
-        upper = estimates.slippage_price(reference, fraction, True)
-        if not lower <= current <= upper:
-            with localcontext() as context:
-                context.prec = 90
-                moved = abs(current - reference) / reference * 100
-                message = PRICE_MOVED.format(
-                    moved=format(moved.quantize(Decimal("0.0001")), "f"),
-                    slippage=slippage,
-                )
+        moved = estimates.market_price_move(reference, current, slippage)
+        if moved is not None:
+            message = PRICE_MOVED.format(moved=moved, slippage=slippage)
             raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check

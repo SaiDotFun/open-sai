@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
+from decimal import Decimal
 from functools import wraps
 from importlib import metadata
 from pathlib import Path
@@ -37,6 +38,7 @@ from .core import (
     updater,
     wait,
 )
+from .core import preview as estimates
 from .core import session as sessions
 from .core import settings as sai_settings
 from .core.errors import Code, ExitCode, McpStdioError, SaiError, SessionError, describe
@@ -1211,17 +1213,39 @@ def warn(message: str) -> None:
 
 
 def trade_submit_check(
-    load: PinnedSession, digest: str | None
+    load: PinnedSession,
+    digest: str | None,
+    *,
+    reference_price: str | None = None,
+    slippage: str | None = None,
 ) -> trading.SubmitCheck | None:
     if digest is None:
         return None
+    reference = (
+        intents.positive(reference_price, "Reference price")
+        if reference_price is not None
+        else None
+    )
 
     def check(preview: dict[str, Any]) -> None:
-        if digest != confirmation.preview_digest({**preview, "addr": load.addr}):
+        confirmed = {**preview, "addr": load.addr}
+        if reference is not None:
+            confirmed["referencePrice"] = format(reference, "f")
+        if digest != confirmation.preview_digest(confirmed):
             raise trading.PositionChanged(
                 "The trade no longer matches the confirmed preview. Run with"
                 " --dry-run to review a new preview before submitting."
             )
+        if reference is not None and slippage is not None:
+            current = Decimal(str(preview["referencePrice"]))
+            moved = estimates.market_price_move(reference, current, slippage)
+            if moved is not None:
+                raise SaiError(
+                    f"The market price moved {moved}% from the confirmed reference,"
+                    f" more than the {slippage}% slippage. Run with --dry-run to"
+                    " review a new preview before submitting.",
+                    Code.PRICE_MOVED,
+                )
 
     return check
 
@@ -1244,7 +1268,8 @@ preview_digest_option = click.option(
 @click.option("--leverage", required=True)
 @click.option(
     "--price",
-    help="Required trigger for limit/stop; optional dry-run reference for market orders. Live market orders use a refreshed price.",
+    help="Trigger for limit and stop orders. For market orders, pass the preview's"
+    " reference price when submitting with --preview-digest.",
 )
 @click.option("--slippage", required=True, help="Maximum slippage percentage.")
 @click.option("--take-profit")
@@ -1277,6 +1302,13 @@ def trade_open(
 ) -> None:
     """Open a market, limit, or stop trade."""
     try:
+        market_confirmation = (
+            order_type == "market" and not dry_run and preview_digest is not None
+        )
+        if market_confirmation and price is None:
+            raise ValueError(
+                "Pass the confirmed market preview's referencePrice via --price"
+            )
         emit_trade(
             ctx,
             trading.open_trade(
@@ -1295,7 +1327,12 @@ def trade_open(
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 notify=warn,
-                before_submit=trade_submit_check(loader(ctx), preview_digest),
+                before_submit=trade_submit_check(
+                    loader(ctx),
+                    preview_digest,
+                    reference_price=price if market_confirmation else None,
+                    slippage=slippage if market_confirmation else None,
+                ),
             ),
         )
     except (ValueError, KeyError, keeper.KeeperError) as exc:
