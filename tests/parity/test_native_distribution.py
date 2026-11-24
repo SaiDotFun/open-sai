@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import hashlib
 import io
 import json
@@ -123,8 +124,13 @@ def test_shim_restores_default_file_size_signal(
 ) -> None:
     d = distribution
     probe_archive = tmp_path / d.archive.name
-    with tarfile.open(probe_archive, "w:gz", format=tarfile.USTAR_FORMAT) as archive:
-        archive.add(Path("/bin/sh").resolve(), arcname="sai")
+    shell = Path("/bin/sh")
+    member = tarfile.TarInfo("sai")
+    member.size = shell.stat().st_size
+    with gzip.open(probe_archive, "wb") as archive, shell.open("rb") as binary:
+        archive.write(member.tobuf(format=tarfile.USTAR_FORMAT))
+        shutil.copyfileobj(binary, archive)
+        archive.write(bytes(-member.size % tarfile.BLOCKSIZE + 2 * tarfile.BLOCKSIZE))
     d.replay.add_release(d.wheel, d.version, probe_archive)
     command = ("-c", "ulimit -c 0; kill -s XFSZ $$")
     direct = d.tool.run(
