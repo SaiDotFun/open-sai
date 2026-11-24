@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File},
     io::{self, Read, Write},
-    os::unix::fs::{PermissionsExt, symlink},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
 
@@ -19,6 +19,7 @@ use super::{Change, Result, io as io_error, remove_record};
 
 const ROOT: &str = ".sai-native";
 const RECORD: &str = "pending.json";
+const LAUNCHER_STAGE: &str = ".launcher-switch/sai";
 const LOCK: &str = ".sai-update.lock";
 const MAX_BINARY: usize = 96 << 20;
 const MAX_TAR: usize = MAX_BINARY + (1 << 20);
@@ -35,6 +36,48 @@ struct Pending {
     #[serde(deserialize_with = "Option::deserialize")]
     old: Option<String>,
     new: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    launcher_switch: Option<LauncherSwitch>,
+}
+
+type LauncherEntry = (u64, u64, Option<PathBuf>);
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LauncherSwitch {
+    staged: String,
+    expected: LauncherEntry,
+    published: Option<LauncherEntry>,
+}
+
+fn launcher_entry(path: &Path) -> io::Result<Option<LauncherEntry>> {
+    let info = match path.symlink_metadata() {
+        Ok(info) => info,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    let link = info.is_symlink().then(|| fs::read_link(path)).transpose()?;
+    let checked = path.symlink_metadata()?;
+    if (info.dev(), info.ino()) != (checked.dev(), checked.ino()) {
+        return Err(io::Error::other(
+            "the Sai launcher changed while reading its owner",
+        ));
+    }
+    Ok(Some((info.dev(), info.ino(), link)))
+}
+
+// Keep the staged name until the destination entry is durable. The caller
+// clears the private staging directory after checking who owns the launcher.
+fn publish_displaced(source: &Path, launcher: &Path) -> io::Result<()> {
+    use rustix::fs::{AtFlags, CWD, linkat};
+
+    if launcher_entry(launcher)?.is_some()
+        && launcher_entry(launcher)? == launcher_entry(source)?
+    {
+        return Ok(());
+    }
+    linkat(CWD, source, CWD, launcher, AtFlags::empty())?;
+    Ok(())
 }
 
 fn dir_version(name: &str) -> Option<Version> {
@@ -128,18 +171,102 @@ impl Standalone {
             .map(|active| dir_version(&active).expect("validated managed target"))
     }
 
+    fn settle_launcher_switch(&self, switch: &LauncherSwitch) -> Result<bool> {
+        if switch.staged != LAUNCHER_STAGE {
+            return Err(
+                "the pending Sai launcher switch names an invalid staging path"
+                    .into(),
+            );
+        }
+        let displaced = self.root.join(LAUNCHER_STAGE);
+        let stage = displaced.parent().expect("staged launcher has a parent");
+        let info = match stage.symlink_metadata() {
+            Ok(info) => info,
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                return Ok(false);
+            }
+            Err(err) => return Err(io_error(err)),
+        };
+        if !info.is_dir()
+            || info.uid() != rustix::process::geteuid().as_raw()
+            || info.mode() & 0o077 != 0
+        {
+            return Err(
+                "the pending Sai launcher staging directory is not private"
+                    .into(),
+            );
+        }
+        let entry = launcher_entry(&displaced).map_err(io_error)?;
+        let external = entry.is_some()
+            && entry.as_ref() != Some(&switch.expected)
+            && entry != switch.published;
+        if external {
+            self.restore_displaced(switch, &displaced, stage)
+                .map_err(|error| format!(
+                    "The Sai launcher changed during the switch. The displaced launcher is at {}: {error}",
+                    displaced.display()
+                ))?;
+            state::sync_dir(
+                self.launcher.parent().expect("launcher has a parent"),
+            )
+            .map_err(io_error)?;
+        }
+        fs::remove_dir_all(stage).map_err(io_error)?;
+        state::sync_dir(&self.root).map_err(io_error)?;
+        Ok(external)
+    }
+
+    fn restore_displaced(
+        &self,
+        switch: &LauncherSwitch,
+        displaced: &Path,
+        stage: &Path,
+    ) -> io::Result<()> {
+        let withdrawn = stage.join("public");
+        let active = launcher_entry(&self.launcher)?;
+        if active.is_some() && active == launcher_entry(displaced)? {
+            return Ok(());
+        }
+        let Some(ours) = switch.published.as_ref() else {
+            return publish_displaced(displaced, &self.launcher);
+        };
+        if launcher_entry(&withdrawn)?.is_none() && active.as_ref() == Some(ours)
+        {
+            fs::rename(&self.launcher, &withdrawn)?;
+        }
+        match launcher_entry(&withdrawn)?.as_ref() {
+            Some(entry) if entry == ours => {
+                publish_displaced(displaced, &self.launcher)
+            }
+            Some(_) => {
+                publish_displaced(&withdrawn, &self.launcher)?;
+                Err(io::Error::other("a newer launcher owns the public path"))
+            }
+            None => {
+                Err(io::Error::other("the public launcher is no longer ours"))
+            }
+        }
+    }
+
     pub(super) fn recover(&self) -> Result<Version> {
-        let active = self.active()?;
         let record = self.root.join(RECORD);
         let bytes = match fs::read(&record) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(dir_version(&active).expect("validated managed target"));
+                return self.version();
             }
             Err(err) => return Err(io_error(err)),
         };
-        let pending: Pending = serde_json::from_slice(&bytes)
-            .map_err(|_| "could not read the pending Sai install record".to_owned())?;
+        let pending: Pending = serde_json::from_slice(&bytes).map_err(|_| {
+            "could not read the pending Sai install record".to_owned()
+        })?;
+        if let Some(switch) = &pending.launcher_switch
+            && self.settle_launcher_switch(switch)?
+        {
+            remove_record(&record)?;
+            return Err("the Sai launcher changed during the switch".into());
+        }
+        let active = self.active()?;
         let invalid =
             || "the pending Sai install record names a missing or invalid binary".to_owned();
         self.target(&pending.new).ok_or_else(invalid)?;
@@ -227,6 +354,7 @@ impl Standalone {
             let pending = Pending {
                 old: Some(old.clone()),
                 new,
+                launcher_switch: None,
             };
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let switched = async {

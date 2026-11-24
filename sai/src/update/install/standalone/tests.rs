@@ -35,6 +35,65 @@ fn recovery_rolls_back_a_first_install_without_an_old_target() {
     assert!(binary.is_file());
 }
 
+#[test]
+fn recovery_returns_a_competing_launcher_displaced_by_the_installer() {
+    use std::os::unix::fs::MetadataExt;
+
+    fn entry(path: &Path) -> (u64, u64, Option<PathBuf>) {
+        let info = path.symlink_metadata().unwrap();
+        (info.dev(), info.ino(), fs::read_link(path).ok())
+    }
+
+    let temp = TempDir::new().unwrap();
+    let bin = temp.path().canonicalize().unwrap();
+    let root = bin.join(ROOT);
+    let old = format!("0.1.0-{}", "a".repeat(64));
+    let new = format!("0.2.0-{}", "b".repeat(64));
+    for name in [&old, &new] {
+        let version = root.join(name);
+        state::private_dir(&version).unwrap();
+        fs::write(version.join("sai"), "managed binary").unwrap();
+    }
+    let launcher = bin.join("sai");
+    symlink(root.join(&old).join("sai"), &launcher).unwrap();
+    let expected = entry(&launcher);
+    fs::rename(&launcher, bin.join("previous")).unwrap();
+    let binary = root.join(&new).join("sai");
+    symlink(&binary, &launcher).unwrap();
+    let published = entry(&launcher);
+    let staged_name = ".launcher-switch/sai";
+    let staged = root.join(staged_name);
+    let stage = staged.parent().unwrap();
+    state::private_dir(stage).unwrap();
+    fs::write(&staged, "competing launcher").unwrap();
+    let competitor = entry(&staged);
+    let record = root.join(RECORD);
+    state::atomic_json(
+        &record,
+        &serde_json::json!({
+            "old": old,
+            "new": new,
+            "launcher_switch": {
+                "staged": staged_name,
+                "expected": expected,
+                "published": published,
+            },
+        }),
+    )
+    .unwrap();
+
+    let install = Standalone::discover(&binary).unwrap();
+    assert!(
+        install
+            .recover()
+            .unwrap_err()
+            .contains("launcher changed during the switch")
+    );
+    assert_eq!(entry(&launcher), competitor);
+    assert!(!stage.exists());
+    assert!(!record.exists());
+}
+
 #[tokio::test(start_paused = true)]
 async fn download_deadline_leaves_the_launcher_untouched() {
     let temp = TempDir::new().unwrap();
