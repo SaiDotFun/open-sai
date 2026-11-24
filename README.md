@@ -103,9 +103,17 @@ one, `sai --as ADDR ...` runs one command as another, and `sai auth logout
 
 Run `sai auth renew [ADDR]` to sign a fresh session with the key saved by
 `sai auth login NAME`. Renewal keeps the active account selected. For a
-browser session, copy a fresh Sai Web token and run `sai auth import`.
+browser session, copy a fresh Sai Web token for the same account. In v0.1.2,
+run `sai auth import` with the original Keeper endpoint.
 `sai auth status`, `sai auth list`, `sai doctor`, and the MCP tool
 `mcp_info` warn when a session has less than three days left.
+
+On `main`, run `renewalCommand` when the session report includes it. Browser
+renewal uses `auth import --addr` to check the account. Read any
+`renewalGuidance` separately. If the command references
+`SAI_RECONCILE_ENDPOINT`, supply the original Keeper URL privately in the
+same shell.
+See [Renewing Sessions](cli/sai_cli/README.md#renewing-sessions).
 
 After connecting, commands run without prompts until the session expires. Know
 what the token is:

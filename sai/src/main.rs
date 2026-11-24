@@ -4,6 +4,7 @@ mod doctor;
 mod local;
 mod mcp_registration;
 mod reads;
+mod trade;
 
 use std::{cell::Cell, env, path::Path, process, time::Instant};
 
@@ -87,6 +88,11 @@ enum Command {
     Mcp(mcp_registration::McpArgs),
     /// Check the install, config, MCP registrations, session, intent ledger, and endpoints.
     Doctor(doctor::DoctorArgs),
+    /// Submit authenticated trading intents.
+    Trade {
+        #[command(subcommand)]
+        command: trade::TradeCommand,
+    },
 }
 
 impl Cli {
@@ -114,6 +120,9 @@ impl Cli {
             Command::Market { command } => command.run(&flags, env, json, events),
             Command::Account { command } => command.run(&flags, env, json, events),
             Command::Watch { command } => command.run(&flags, env, events),
+            Command::Trade { command } => {
+                trade::run(command, self.account.as_deref(), &flags, env, json, events)
+            }
         }
     }
 }
@@ -146,9 +155,10 @@ fn main() -> process::ExitCode {
     } else {
         let start = match command {
             "doctor" | "mcp install" | "mcp list" => LogWriter::start_diagnostic_command,
+            "intent status" => LogWriter::start_command,
             _ if matches!(
                 command.split(' ').next(),
-                Some("market" | "account" | "watch")
+                Some("market" | "account" | "watch" | "trade")
             ) =>
             {
                 LogWriter::start_command
@@ -179,7 +189,7 @@ fn main() -> process::ExitCode {
         if let Some(writer) = &writer
             && !log_started.replace(true)
         {
-            // Import accepts no operands, and a stray argument can contain a token.
+            // A stray argument to import can contain a token.
             let logged_argv = if command == "auth import" {
                 &argv[..argv.len() - operands.len()]
             } else {
@@ -295,12 +305,13 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
-        | "market list" | "market prices" => "",
+        | "market list" | "market prices" | "trade open" => "",
         "mcp install" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
         "watch price" => " TOKEN_ID",
+        "trade close" | "trade cancel" => " TRADE_ID",
         "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
