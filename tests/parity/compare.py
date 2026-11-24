@@ -379,8 +379,17 @@ def sqlite_tokenizer() -> re.Pattern[str]:
     return re.compile(rf"(?P<trivia>{trivia}){SQLITE_SYNTAX}", re.DOTALL)
 
 
-def table_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
-    """Read CHECK expressions and trailing table options from stored DDL."""
+def sqlite_identifier(token: str) -> str:
+    quote = token[0]
+    if quote == "[":
+        token = token[1:-1]
+    elif quote in {'"', "'", "`"}:
+        token = token[1:-1].replace(quote * 2, quote)
+    return token.translate(ASCII_UPPER)
+
+
+def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
+    """Read CHECK expressions, table options, and column collations from stored DDL."""
     # SQLite treats high-byte characters as identifier characters, except
     # when its tokenizer skips a BOM. Quoted tokens can contain parentheses.
     tokens = [
@@ -389,9 +398,11 @@ def table_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
         if token.lastgroup != "trivia"
     ]
     if tokens[:2] != ["CREATE", "TABLE"]:
-        return [], []
+        return [], [], {}
     opening = tokens.index("(")
     checks: list[list[str]] = []
+    collations: dict[str, str] = {}
+    column = None
     depth = 0
     check_start = None
     for i in range(opening, len(tokens)):
@@ -404,9 +415,18 @@ def table_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
                 checks.append(tokens[check_start:i])
                 check_start = None
             if depth == 0:
-                return checks, tokens[i + 1 :]
-        elif depth == 1 and tokens[i : i + 2] == ["CHECK", "("]:
-            check_start = i + 2
+                return checks, tokens[i + 1 :], collations
+        elif depth == 1:
+            if tokens[i - 1] in {"(", ","}:
+                column = (
+                    None
+                    if token in {"CONSTRAINT", "PRIMARY", "UNIQUE", "CHECK", "FOREIGN"}
+                    else sqlite_identifier(token)
+                )
+            if tokens[i : i + 2] == ["CHECK", "("]:
+                check_start = i + 2
+            elif token == "COLLATE" and column is not None:
+                collations[column] = sqlite_identifier(tokens[i + 1])
     raise ValueError("Unbalanced CREATE TABLE definition")
 
 
@@ -420,7 +440,7 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     for kind, name, _, sql in catalog:
         if kind not in {"table", "view"}:
             continue
-        checks, options = table_ddl(sql)
+        checks, options, collations = table_ddl(sql)
         # The PRAGMA reports parsed defaults, nullability, PK order, and
         # hidden or generated columns, including when the table is empty.
         columns = [
@@ -432,6 +452,7 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                 "default": default,
                 "pk": primary_key,
                 "hidden": hidden,
+                "collation": collations.get(column.translate(ASCII_UPPER), "BINARY"),
             }
             for cid, column, datatype, notnull, default, primary_key, hidden in conn.execute(
                 "SELECT * FROM pragma_table_xinfo(?) ORDER BY cid", (name,)
@@ -446,9 +467,22 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                 "unique": unique,
                 "origin": origin,
                 "partial": partial,
-                "columns": conn.execute(
-                    "SELECT * FROM pragma_index_xinfo(?) ORDER BY seqno", (index,)
-                ).fetchall(),
+                "columns": [
+                    (
+                        seqno,
+                        cid,
+                        index_column,
+                        descending,
+                        "BINARY"
+                        if collation is None
+                        else collation.translate(ASCII_UPPER),
+                        is_key,
+                    )
+                    for seqno, cid, index_column, descending, collation, is_key in conn.execute(
+                        'SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?) ORDER BY seqno',
+                        (index,),
+                    )
+                ],
             }
         tables[name] = {
             "type": kind,
