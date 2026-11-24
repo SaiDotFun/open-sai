@@ -85,6 +85,40 @@ class DiagnosticsTest(unittest.TestCase):
 
 
 class NetworkTest(unittest.TestCase):
+    def test_namespace_isolates_direct_connections_from_the_host(self) -> None:
+        with tempfile.TemporaryDirectory() as temp, socket.socket() as host:
+            root = Path(temp)
+            env = {"HOME": temp, "PATH": os.defpath}
+            prefix = REHEARSAL["namespace_prefix"](root, env)
+            if prefix is None:
+                self.skipTest("loopback-only network namespace unavailable")
+            host.bind(("127.0.0.1", 0))
+            host.listen()
+            script = """
+import errno, socket, sys
+for address, expected in (
+    (("127.0.0.1", int(sys.argv[1])), errno.ECONNREFUSED),
+    (("192.0.2.1", 9), errno.ENETUNREACH),
+):
+    try:
+        with socket.create_connection(address, timeout=2):
+            sys.exit(1)
+    except OSError as exc:
+        if exc.errno != expected:
+            sys.exit(1)
+"""
+            command = (
+                *prefix,
+                sys.executable,
+                "-I",
+                "-c",
+                script,
+                str(host.getsockname()[1]),
+            )
+            with REHEARSAL["owned_process"](command, root, env) as process:
+                process.communicate(timeout=10)
+                self.assertEqual(process.returncode, 0)
+
     def test_direct_loopback_works_and_external_http_uses_the_dead_proxy(self) -> None:
         class Handler(REHEARSAL["KeeperHandler"]):
             def do_GET(self) -> None:

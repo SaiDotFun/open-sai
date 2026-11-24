@@ -260,9 +260,10 @@ python3 scripts/release-rehearsal.py dist/sai_cli-0.1.1-py3-none-any.whl
 
 The script installs the published v0.1.0 wheel through the release installer
 in a temporary home and caches the candidate's dependencies. For the
-rehearsal, it sets uv offline, pins the endpoints to loopback, and checks
-that the proxy refuses other HTTP requests. It uses a synthetic session
-and a loopback Keeper to leave an open unresolved, then serves both wheels
+rehearsal, it sets uv offline and pins the endpoints to loopback. On Linux,
+it uses a loopback-only network namespace when available. Otherwise it
+reports that it is using a dead proxy for proxy-aware traffic. A synthetic
+session and loopback Keeper leave an open unresolved. The script serves both wheels
 and their checksums to `sai update`. It checks that the session, config,
 and Claude and Codex MCP registrations work through the same launcher,
 that the migrated ledger blocks a retry, and that `sai doctor` passes once

@@ -19,7 +19,7 @@ import tempfile
 import time
 import unittest
 from collections import deque
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -106,6 +106,14 @@ for scheme in ("http", "https"):
     except URLError as error:
         if not isinstance(error.reason, ConnectionRefusedError):
             sys.exit(1)
+"""
+ISOLATED_STAGE = """
+import runpy, sys
+sys.exit(runpy.run_path(sys.argv[1])["isolated_stage"](*sys.argv[2:]))
+"""
+CHECK_NAMESPACE = """
+import socket, sys
+sys.exit([name for _, name in socket.if_nameindex()] != ["lo"])
 """
 
 
@@ -196,7 +204,8 @@ def owned_process(
     cwd: Path,
     env: dict[str, str],
     *,
-    stderr: int | IO[bytes] = subprocess.PIPE,
+    stdout: int | None = subprocess.PIPE,
+    stderr: int | IO[bytes] | None = subprocess.PIPE,
 ) -> Generator[subprocess.Popen[bytes], None, None]:
     with ExitStack() as cleanup:
         with CANCELLATION.defer():
@@ -206,7 +215,7 @@ def owned_process(
                     cwd=cwd,
                     env=env,
                     stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
+                    stdout=stdout,
                     stderr=stderr,
                     start_new_session=True,
                 )
@@ -236,6 +245,46 @@ def loopback_env(base: str, proxy_port: int) -> dict[str, str]:
         "NO_PROXY": "127.0.0.1",
         "UV_OFFLINE": "1",
     }
+
+
+def namespace_prefix(cwd: Path, env: dict[str, str]) -> tuple[str, ...] | None:
+    unshare = shutil.which("unshare")
+    ip = shutil.which("ip")
+    if not (sys.platform == "linux" and unshare and ip):
+        return None
+    # A PID namespace makes Linux kill every member when its init exits,
+    # including children the rehearsal ran in separate process groups.
+    prefix = (
+        unshare,
+        "--user",
+        "--map-root-user",
+        "--net",
+        "--pid",
+        "--fork",
+        "--kill-child",
+        "--mount-proc",
+        "--",
+        "/bin/sh",
+        "-c",
+        '"$1" link set dev lo up 2>/dev/null || exit 1; shift; exec "$@"',
+        "release-rehearsal",
+        ip,
+    )
+    apparmor = shutil.which("aa-exec")
+    candidates = [prefix]
+    if apparmor:
+        candidates.append((apparmor, "-p", "rootlesskit", "--", *prefix))
+    for candidate in candidates:
+        try:
+            with owned_process(
+                (*candidate, sys.executable, "-I", "-c", CHECK_NAMESPACE), cwd, env
+            ) as probe:
+                probe.communicate(timeout=5)
+                if probe.returncode == 0:
+                    return candidate
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+    return None
 
 
 class SelectedField(NamedTuple):
@@ -447,17 +496,22 @@ def launcher_interpreter(name: str, launcher: Path) -> Path | None:
 
 
 class Install:
-    def __init__(self, root: Path, diagnostics: Path | None = None) -> None:
+    def __init__(
+        self, root: Path, diagnostics: Path | None = None, *, prepared: bool = False
+    ) -> None:
         self.diagnostics = diagnostics
         self.home = root / "home"
-        self.home.mkdir(mode=0o700)
-        (self.home / ".codex").mkdir(mode=0o700)
         self.sai_home = self.home / ".sai"
         bin_dir = self.home / ".local" / "bin"
-        bin_dir.mkdir(parents=True)
         self.sai = bin_dir / "sai"
         self.uv = bin_dir / "uv"
         self.python = self.home / ".local/share/uv/tools/sai-cli/bin/python"
+        if prepared:
+            self.env = dict(os.environ)
+            return
+        self.home.mkdir(mode=0o700)
+        (self.home / ".codex").mkdir(mode=0o700)
+        bin_dir.mkdir(parents=True)
         runtime_dirs = []
         for name in ("uv", *CLIENTS):
             tool = shutil.which(name)
@@ -728,14 +782,9 @@ def probe_retry(tool: Install, replay: Replay, key: str) -> bool:
     return True
 
 
-def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) -> None:
+def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) -> int:
     tool = Install(root, diagnostics)
-    replay = Replay(wheel, version)
-    with (
-        keeper_server(replay.handler()) as base,
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as dead_proxy,
-    ):
-        endpoint = f"{base}/query"
+    with keeper_server(Replay(wheel, version).handler()) as base:
         tool.run(
             "Install the published release",
             tool.uv,
@@ -744,22 +793,63 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
             "--api-base",
             base,
         )
-        baseline_wheel = (
-            tool.sai_home / "cache/wheels" / f"sai_cli-{BASELINE}-py3-none-any.whl"
+    # uv caches the candidate's dependencies without running candidate commands.
+    tool.run(
+        "Cache candidate dependencies",
+        tool.uv,
+        "pip",
+        "install",
+        "--python",
+        tool.python,
+        "--target",
+        root / "dependency-cache",
+        wheel,
+    )
+    prefix = namespace_prefix(tool.home, tool.env)
+    if prefix is None:
+        print(
+            "Loopback-only network namespace unavailable. Using the dead proxy for proxy-aware traffic.",
+            file=sys.stderr,
+            flush=True,
         )
-        replay.add_release(baseline_wheel, BASELINE)
-        # uv caches the candidate's dependencies without running candidate commands.
-        tool.run(
-            "Cache candidate dependencies",
-            tool.uv,
-            "pip",
-            "install",
-            "--python",
-            tool.python,
-            "--target",
-            root / "dependency-cache",
-            wheel,
-        )
+        return rehearse_staged(tool, root, wheel, version)
+    print("Using a loopback-only network namespace for the rehearsal.", flush=True)
+    command = (
+        *prefix,
+        sys.executable,
+        "-I",
+        "-c",
+        ISOLATED_STAGE,
+        Path(__file__).resolve(),
+        root,
+        wheel,
+        version,
+        str(diagnostics) if diagnostics else "",
+    )
+    # Only the rehearsal script's own progress reaches these streams. It keeps
+    # the installed CLI and agent clients' output behind its usual capture.
+    with owned_process(command, tool.home, tool.env, stdout=None, stderr=None) as stage:
+        return stage.wait()
+
+
+def isolated_stage(root_name: str, wheel_name: str, version: str, log_name: str) -> int:
+    root, wheel = Path(root_name), Path(wheel_name)
+    tool = Install(root, Path(log_name) if log_name else None, prepared=True)
+    with cancel_on_signal():
+        return report_result(lambda: rehearse_staged(tool, root, wheel, version))
+
+
+def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int:
+    replay = Replay(wheel, version)
+    baseline_wheel = (
+        tool.sai_home / "cache/wheels" / f"sai_cli-{BASELINE}-py3-none-any.whl"
+    )
+    replay.add_release(baseline_wheel, BASELINE)
+    with (
+        keeper_server(replay.handler()) as base,
+        socket.socket(socket.AF_INET, socket.SOCK_STREAM) as dead_proxy,
+    ):
+        endpoint = f"{base}/query"
         dead_proxy.bind(("127.0.0.1", 0))
         tool.env.update(loopback_env(base, dead_proxy.getsockname()[1]))
         tool.run(
@@ -906,6 +996,23 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
             f"v{BASELINE} reconciled market_order_outcome_not_indexed as {status}. "
             f"Retry after reconciliation: {'blocked' if blocked else 'reached loopback Keeper'}."
         )
+    return 0
+
+
+def report_result(work: Callable[[], int]) -> int:
+    try:
+        return work()
+    except RehearsalInterrupted as exc:
+        print(
+            f"Release rehearsal interrupted by {signal.Signals(exc.signum).name}",
+            file=sys.stderr,
+        )
+        return 128 + exc.signum
+    except RehearsalError as exc:
+        print(f"Release rehearsal failed: {exc}", file=sys.stderr)
+    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
+        print(f"Release rehearsal failed ({type(exc).__name__})", file=sys.stderr)
+    return 1
 
 
 def main() -> int:
@@ -944,7 +1051,9 @@ def main() -> int:
         parser.error(
             "provide an existing sai_cli-X.Y.Z-py3-none-any.whl newer than 0.1.0"
         )
-    try:
+    version = match[1]
+
+    def work() -> int:
         diagnostics = None
         if args.verbose:
             directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
@@ -959,20 +1068,9 @@ def main() -> int:
                         dir=diagnostics.parent if diagnostics else None,
                     )
                 )
-            rehearse(Path(scratch), wheel, match[1], diagnostics)
-    except RehearsalInterrupted as exc:
-        print(
-            f"Release rehearsal interrupted by {signal.Signals(exc.signum).name}",
-            file=sys.stderr,
-        )
-        return 128 + exc.signum
-    except RehearsalError as exc:
-        print(f"Release rehearsal failed: {exc}", file=sys.stderr)
-        return 1
-    except (OSError, ValueError, KeyError, TypeError, sqlite3.Error) as exc:
-        print(f"Release rehearsal failed ({type(exc).__name__})", file=sys.stderr)
-        return 1
-    return 0
+            return rehearse(Path(scratch), wheel, version, diagnostics)
+
+    return report_result(work)
 
 
 if __name__ == "__main__":
