@@ -219,19 +219,6 @@ def open_estimates(
     return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
 
 
-def non_fill_estimates(*, updates_triggers: bool) -> dict[str, Any]:
-    return {
-        "fees": {"status": "exact", "amountUsdc": "0", "excludes": ["Network fees"]},
-        "liquidationPrice": {
-            "status": "unchanged" if updates_triggers else "unavailable",
-            "reason": "This action changes only TP/SL triggers."
-            if updates_triggers
-            else "A current position and effective leverage are required.",
-        },
-        "worstCaseFill": not_applicable("This action has no price fill."),
-    }
-
-
 def position_estimates(
     endpoint: str,
     lcd: str,
@@ -241,10 +228,16 @@ def position_estimates(
     close: bool = False,
     reduce_by: int = 0,
     target: Decimal | None = None,
+    updates_triggers: bool = False,
 ) -> dict[str, Any]:
     """Quote a close or a surviving position from the same snapshot as the intent."""
-    if target is not None:
-        result = non_fill_estimates(updates_triggers=False)
+    if target is not None or updates_triggers:
+        unknown_guard = unavailable(
+            "Cannot verify that the Perp after-hours guard is inactive."
+        )
+        result = dict.fromkeys(
+            ("fees", "liquidationPrice", "worstCaseFill"), unknown_guard
+        )
     else:
         result = {
             "fees": unavailable("Current position or Perp fee inputs are unavailable."),
@@ -262,15 +255,23 @@ def position_estimates(
         raw = state.raw
         stored = margin.contract_decimal(raw["leverage"])
         if effective != stored:
-            return {
-                **result,
-                "fees": unavailable(
-                    "The after-hours guard can change or close this position."
-                ),
-                "liquidationPrice": unavailable(
-                    "The after-hours guard can change or close this position."
-                ),
+            risk = unavailable(
+                "The after-hours guard can change or close this position."
+            )
+            return dict.fromkeys(result, risk)
+        if target is not None or updates_triggers:
+            result["fees"] = {
+                "status": "exact",
+                "amountUsdc": "0",
+                "excludes": ["Network fees"],
             }
+            result["worstCaseFill"] = not_applicable("This action has no price fill.")
+        if updates_triggers:
+            result["liquidationPrice"] = {
+                "status": "unchanged",
+                "reason": "This action changes only TP/SL triggers.",
+            }
+            return result
         collateral = int(raw["collateral_amount"])
         if target is None:
             try:

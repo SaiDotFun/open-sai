@@ -292,6 +292,7 @@ def set_tpsl(
     clear_take_profit: bool,
     clear_stop_loss: bool,
     dry_run: bool,
+    lcd_endpoint: str | None = None,
     before_submit: SubmitCheck = _accept,
 ) -> dict[str, Any]:
     """Set or clear take-profit and stop-loss prices."""
@@ -304,7 +305,9 @@ def set_tpsl(
         payload,
         dry_run,
         before_submit,
-        lambda _: estimates.non_fill_estimates(updates_triggers=True),
+        lambda _: _estimate_position(
+            endpoint, lcd_endpoint, get_session, trade_id, updates_triggers=True
+        ),
     )
 
 
@@ -338,6 +341,7 @@ def _estimate_position(
     trade_id: int,
     *,
     target: Decimal | None = None,
+    updates_triggers: bool = False,
 ) -> dict[str, Any]:
     state, effective = None, None
     if lcd is not None:
@@ -348,7 +352,13 @@ def _estimate_position(
         except estimates.READ_ERRORS:
             pass
     return estimates.position_estimates(
-        endpoint, lcd or "", state, effective, close=target is None, target=target
+        endpoint,
+        lcd or "",
+        state,
+        effective,
+        close=target is None and not updates_triggers,
+        target=target,
+        updates_triggers=updates_triggers,
     )
 
 

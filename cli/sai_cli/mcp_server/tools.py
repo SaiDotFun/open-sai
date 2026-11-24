@@ -688,6 +688,7 @@ def set_tpsl(
         clear_take_profit=clear_take_profit,
         clear_stop_loss=clear_stop_loss,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)

@@ -938,3 +938,30 @@ def test_cancel_checks_live_order_type_and_refuses_after_fill(position_service):
             assert position.submitted[0]["kind"] == "CANCEL_PENDING_TRADE"
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("cap", ["5", None])
+def test_position_mutations_show_no_zero_fee_without_an_inactive_guard(
+    position_service, cap
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.after_hours = True
+    position.leverage = "20"
+    position.cap = cap
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            for tool, args in (
+                ("preview_tpsl", {"clear_stop_loss": True}),
+                ("preview_leverage", {"leverage": "3"}),
+            ):
+                quote = await call(client, tool, {"trade_id": 7, **args})
+                for field in ("fees", "liquidationPrice"):
+                    item = quote["estimates"][field]
+                    assert item["status"] == "unavailable"
+                    assert "guard" in item["reason"]
+                    assert "amountUsdc" not in item
+            assert position.submitted == []
+
+    asyncio.run(scenario())

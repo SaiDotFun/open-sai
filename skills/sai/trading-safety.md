@@ -156,9 +156,10 @@ price. Oracle publication can predate that read. User-supplied references
 and triggers have no observation timestamp.
 
 Show `unavailable` when a required input is missing. An `unbounded` fill has
-no advance price limit. A full close leaves no liquidation price. TP/SL
-changes leave the liquidation price unchanged, and margin and leverage
-updates have no fill price. For partial closes, the liquidation estimate
+no advance price limit. A full close leaves no liquidation price. When the after-hours guard is inactive,
+TP/SL changes leave the liquidation price unchanged, and margin and leverage
+updates have no fill price. With an active or unverified guard, the preview
+reports fees and liquidation as unavailable. For partial closes, the liquidation estimate
 assumes the closed slice covers its own losses and fees. An after-hours
 leverage adjustment can change that projection or close the position.
 
