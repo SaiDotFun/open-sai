@@ -90,13 +90,12 @@ def session(ctx: click.Context) -> dict[str, str]:
     return sessions.load_active_session(keeper_url(ctx), ctx.obj["as_addr"])
 
 
-def command_path(group: click.Group, args: list[str]) -> tuple[list[str], int]:
-    """Return the command names and the index where their operands begin."""
+def command_path(group: click.Group, args: list[str]) -> list[str]:
+    """Return the known command names before the leaf's arguments."""
     names: list[str] = []
-    operands_at = 0
     current: click.Command = group
     skip = False
-    for index, token in enumerate(args):
+    for token in args:
         if skip:
             skip = False
             continue
@@ -117,9 +116,13 @@ def command_path(group: click.Group, args: list[str]) -> tuple[list[str], int]:
         if found is None:
             break
         names.append(token)
-        operands_at = index + 1
         current = found
-    return names, operands_at
+    return names
+
+
+def auth_attempt(names: list[str], argv: list[str]) -> bool:
+    """Also recognize auth after an unrecognized root option or operand."""
+    return names[:1] == ["auth"] or (not names and "auth" in argv)
 
 
 # Options that print something and exit before any command runs.
@@ -225,23 +228,21 @@ class HelpOnMissingInput(click.Command):
             ctx.exit(ExitCode.USAGE)
 
 
-class AuthImportCommand(click.Command):
-    """Keep rejected arguments out of usage errors for token import."""
-
-    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
-        first = args[0] if args else None
-        try:
-            return super().parse_args(ctx, args)
-        except click.UsageError as exc:
-            if (
-                first == "--json"
-                and isinstance(exc, click.NoSuchOption)
-                and exc.option_name == "--json"
-            ):
-                raise
-            raise click.UsageError(
-                "Unexpected arguments to auth import.", ctx
-            ) from None
+def auth_usage_error(exc: click.UsageError, command: str | None) -> click.UsageError:
+    """Keep Click's diagnostics for auth independent of supplied values."""
+    if isinstance(exc, click.NoSuchOption) and exc.option_name == "--json":
+        message = "No such option: --json"
+    elif command == "auth import":
+        message = "Unexpected arguments to auth import."
+    elif isinstance(exc, click.NoSuchOption):
+        message = "No such option for auth."
+    elif isinstance(exc, click.MissingParameter) and isinstance(
+        exc.param, click.Argument
+    ):
+        message = f"Missing argument '{exc.param.human_readable_name}'."
+    else:
+        message = "Invalid arguments to auth."
+    return click.UsageError(message, exc.ctx)
 
 
 class SaiGroup(click.Group):
@@ -268,11 +269,12 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names, operands_at = command_path(self, argv)
+        names = command_path(self, argv)
+        private_args = auth_attempt(names, argv)
         quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
-        # Import takes no operands. A rejected value can be a session token.
-        logged_argv = argv[:operands_at] if command == "auth import" else argv
+        # Keep only command words for auth, even if a parent parser fails.
+        logged_argv = names if private_args else argv
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
         started = time.monotonic()
         exit_code: int = ExitCode.OK
@@ -309,11 +311,18 @@ class LoggedGroup(SaiGroup):
                     **extra,
                 )
             except Exception as exc:
-                failure = cli_failure(exc)
+                safe_usage = (
+                    auth_usage_error(exc, command)
+                    if private_args and isinstance(exc, click.UsageError)
+                    else None
+                )
+                failure = cli_failure(safe_usage or exc)
                 exit_code = failure.exit_code
                 if not standalone_mode:
+                    if safe_usage is not None:
+                        raise safe_usage from None
                     raise
-                show_failure(exc, failure, json_requested(argv))
+                show_failure(safe_usage or exc, failure, json_requested(argv))
             else:
                 # With standalone mode disabled, Click returns explicit exit codes.
                 if isinstance(result, int):
@@ -790,7 +799,7 @@ def read_token() -> str:
     return copied[0]
 
 
-@auth.command("import", cls=AuthImportCommand)
+@auth.command("import")
 @click.pass_context
 def import_token(ctx: click.Context) -> None:
     """Connect with a session token copied from Sai Web.

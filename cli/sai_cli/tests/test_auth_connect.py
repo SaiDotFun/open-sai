@@ -301,6 +301,35 @@ def test_import_usage_omits_rejected_operands(env: Env, json_output: bool, form:
         assert f"Error: {message}" in result.stderr
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize("form", ["root", "group", "root-value", "leaf", "subcommand"])
+def test_auth_usage_and_logs_omit_values(
+    env: Env, json_output: bool, form: str
+) -> None:
+    marker = "synthetic-auth-parser-credential-marker"
+    args = {
+        "root": (f"--{marker}", "auth", "import"),
+        "group": ("auth", f"--{marker}", "import"),
+        "root-value": ("--as", marker, "auth", "import", "extra"),
+        "leaf": ("auth", "login", f"--{marker}"),
+        "subcommand": ("auth", marker),
+    }[form]
+    flags = ("--json",) if json_output else ()
+    result = env.run(*flags, *args)
+
+    assert result.returncode == 2
+    assert marker not in result.stdout + result.stderr
+    records = env.stored_bytes()
+    assert marker.encode() not in records
+    assert b"command.start" in records and b"command.end" in records
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"]["code"] == "INVALID_REQUEST"
+    else:
+        assert not result.stdout
+        assert "Usage:" in result.stderr and "Error:" in result.stderr
+
+
 def test_invalid_clipboard_is_not_echoed_or_cleared(env: Env) -> None:
     secret = "not-a-jwt-but-maybe-a-password"
     expired = make_token(hours=-1)
