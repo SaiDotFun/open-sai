@@ -116,10 +116,11 @@ impl Install {
         };
         let pending = match self {
             Self::Uv(install) => install.authorized(recover)?,
+            Self::Standalone(install) if recover => install.interrupted_withdrawal()?,
             _ => false,
         };
-        // When the launcher is missing, PATH may fall through to another
-        // install. The recorded launcher and uv destination guard recovery.
+        // When a recorded launcher is missing, PATH may fall through to
+        // another install. The pending record limits which path can be restored.
         let missing = pending
             && launcher
                 .metadata()
@@ -135,6 +136,7 @@ impl Install {
             ));
         }
         match self {
+            Self::Standalone(_) if pending => Ok(()),
             Self::Standalone(install) => install.active().map(|_| ()),
             Self::Uv(install) => install.owner(pending),
             Self::Other(..) => unreachable!(),

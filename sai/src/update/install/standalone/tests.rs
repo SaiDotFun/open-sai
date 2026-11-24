@@ -37,6 +37,15 @@ fn recovery_rolls_back_a_first_install_without_an_old_target() {
 
 #[test]
 fn recovery_returns_a_competing_launcher_displaced_by_the_installer() {
+    recovery_returns_competitor(false);
+}
+
+#[test]
+fn recovery_can_resume_after_withdrawing_the_public_candidate() {
+    recovery_returns_competitor(true);
+}
+
+fn recovery_returns_competitor(withdrawn: bool) {
     use std::os::unix::fs::MetadataExt;
 
     fn entry(path: &Path) -> (u64, u64, Option<PathBuf>) {
@@ -83,6 +92,10 @@ fn recovery_returns_a_competing_launcher_displaced_by_the_installer() {
     .unwrap();
 
     let install = Standalone::discover(&binary).unwrap();
+    if withdrawn {
+        fs::rename(&launcher, stage.join("public")).unwrap();
+    }
+    assert_eq!(install.interrupted_withdrawal().unwrap(), withdrawn);
     assert!(
         install
             .recover()
