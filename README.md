@@ -45,6 +45,13 @@ pinned installer above with the published full-Python bridge version. Then
 run `sai update`. The bridge keeps a verified Python wheel for offline
 recovery. Your Sai profile stays in place when you replace the uv tool.
 
+If the uv switch is interrupted, run the saved recovery binary with the same
+uv settings:
+
+```bash
+"$(uv tool dir)/.sai-cli-recover" update --recover
+```
+
 To build from source instead, install from Git:
 
 ```bash

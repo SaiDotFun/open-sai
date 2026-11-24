@@ -828,6 +828,61 @@ main()
 
 
 @pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
+def test_bridge_recovers_when_uv_removed_the_environment_and_launcher(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    profile, contents = save_profile(install, replay)
+    candidate = add_shim(replay, artifact("SHIM"), artifact("RECOVERY_RUST"))
+    original_env = install.env.copy()
+    uv = shutil.which("uv", path=original_env["PATH"])
+    assert uv is not None
+    interceptor = install.home / "interrupt"
+    interceptor.mkdir()
+    wrapper = interceptor / "uv"
+    wrapper.write_text(
+        f"#!{sys.executable}\n"
+        "import os, signal, subprocess, sys\n"
+        f"uv = {uv!r}\n"
+        "if sys.argv[1:4] == ['tool', 'install', '--force']:\n"
+        "    subprocess.run([uv, 'tool', 'uninstall', 'sai-cli'], check=True)\n"
+        "    os.kill(os.getppid(), signal.SIGKILL)\n"
+        "else:\n"
+        "    os.execv(uv, [uv, *sys.argv[1:]])\n"
+    )
+    wrapper.chmod(0o700)
+    install.env["PATH"] = str(interceptor) + os.pathsep + original_env["PATH"]
+    result = install.update(replay)
+    install.env = original_env
+    assert result.returncode == -9, (result.stdout, result.stderr)
+    assert not (install.tools / "sai-cli").exists()
+    assert not os.path.lexists(install.launcher)
+
+    record = install.tools / ".sai-cli-native-pending.json"
+    recovery = Path(json.loads(record.read_text())["recovery"])
+    assert recovery.parent == install.tools
+    assert str(recovery) in result.stderr and "update --recover" in result.stderr
+    del replay.assets[
+        f"{REPO}/releases/download/sai-cli/v{candidate}/{asset_name(candidate)}"
+    ]
+    result = install.run(
+        recovery,
+        "--json",
+        "update",
+        "--recover",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert json.loads(ok(result))["status"] == "recovered"
+    install.pin(wheel_version(python_wheel))
+    assert profile.read_bytes() == contents
+    assert not record.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="native uv recovery runs on POSIX")
 def test_bridge_requires_an_offline_rollback_install(
     install: Install, replay: Replay
 ) -> None:

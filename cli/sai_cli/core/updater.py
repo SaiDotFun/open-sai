@@ -32,6 +32,7 @@ import ipaddress
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -79,6 +80,7 @@ RETRY_INTERVAL = 15 * 60
 TOOL_LOCK_NAME = ".sai-cli-update.lock"
 NATIVE_PENDING = ".sai-cli-native-pending.json"
 NATIVE_WHEELS = ".sai-cli-native-wheels"
+NATIVE_RECOVERY = ".sai-cli-recover"
 PRE_BRIDGE_PIN = "0.1.2"
 # A copy of the tool's environment, kept beside it while an update that has
 # no verified wheel to go back to replaces it.
@@ -563,8 +565,12 @@ def preverify(
         if failure is None and native:
             # The new shim must be able to launch the recovery command if uv
             # is interrupted before we can start the installed-path probes.
-            failure = native_bridge.smoke(
-                sai, version, update.sai_home(), VERIFY_TIMEOUT, version_only=True
+            failure = native_bridge.keep_recovery(
+                python,
+                version,
+                update.sai_home(),
+                prefix.parent / NATIVE_RECOVERY,
+                VERIFY_TIMEOUT,
             )
         return failure
 
@@ -964,6 +970,9 @@ def record_bridge(
     original = update.installed_files_hash(current.prefix)
     if original is None:
         raise UpdateFailed("could not identify the current Python installation")
+    recovery = tools / NATIVE_RECOVERY
+    if recovery.resolve(strict=True) != recovery or not recovery.is_file():
+        raise UpdateFailed("the offline recovery binary is missing or changed")
     rollback, old = publish_bridge_wheel(tools, previous)
     path, new = publish_bridge_wheel(tools, candidate)
     pending = tools / NATIVE_PENDING
@@ -975,6 +984,7 @@ def record_bridge(
             "launcher": str(current.launcher),
             "python": str(python),
             "original_record": original,
+            "recovery": str(recovery),
         },
     )
     with pending.open("rb") as handle:
@@ -986,6 +996,7 @@ def record_bridge(
 def clear_bridge_record(prefix: Path) -> None:
     pending = prefix.parent / NATIVE_PENDING
     pending.unlink()
+    (pending.parent / NATIVE_RECOVERY).unlink(missing_ok=True)
     sync_directory(pending.parent)
 
 
@@ -1096,6 +1107,9 @@ def _install(
         if wheel is not None and created and target != installed:
             with contextlib.suppress(OSError):
                 wheel[2].unlink(missing_ok=True)
+        if native and not (prefix.parent / NATIVE_PENDING).exists():
+            with contextlib.suppress(OSError):
+                (prefix.parent / NATIVE_RECOVERY).unlink(missing_ok=True)
 
     def unchanged(reason: str) -> tuple[Outcome, bool]:
         discard()
@@ -1212,6 +1226,15 @@ def _install(
                 # The tool-local wheel is the durable recovery source.
                 created = False
             if error is None:
+                if native and not options.background:
+                    recovery = shlex.join(
+                        [str(prefix.parent / NATIVE_RECOVERY), "update", "--recover"]
+                    )
+                    print(
+                        f"If the uv switch is interrupted, run {recovery}.",
+                        file=sys.stderr,
+                        flush=True,
+                    )
                 error = install_spec(uv, spec, runner)
             if error is None:
                 error = verify(

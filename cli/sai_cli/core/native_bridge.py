@@ -19,6 +19,14 @@ INITIALIZE = (
     b'{"protocolVersion":"2025-11-25","capabilities":{},'
     b'"clientInfo":{"name":"sai-update","version":"1.0.0"}}}\n'
 )
+COPY_VERIFIED = """
+import shutil
+import sys
+from sai_cli.sai_cli import verified_binary
+with verified_binary() as (_, executable), open(sys.argv[1], "wb") as output:
+    executable.seek(0)
+    shutil.copyfileobj(executable, output)
+"""
 
 
 def is_shim(wheel: Path) -> bool:
@@ -123,3 +131,46 @@ def smoke(
     return "`sai mcp serve` did not initialize" + (
         f": {diagnostic}" if diagnostic else ""
     )
+
+
+def keep_recovery(
+    python: Path, version: str, home: Path, destination: Path, timeout: float
+) -> str | None:
+    """Copy the bytes opened and checked by the shim to a tool-local path."""
+    env = {**os.environ, "SAI_HOME": str(home), "SAI_LOG": "false", "CI": "1"}
+    fd, name = tempfile.mkstemp(dir=destination.parent, prefix=".sai-recover-")
+    path = Path(name)
+    try:
+        with os.fdopen(fd, "rb") as saved:
+            done = subprocess.run(
+                [python, "-I", "-c", COPY_VERIFIED, path],
+                cwd=home,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                timeout=timeout,
+                check=False,
+            )
+            if done.returncode != 0:
+                return "could not retain the shim's verified recovery binary"
+            os.fchmod(saved.fileno(), 0o700)
+            os.fsync(saved.fileno())
+        if problem := smoke(path, version, home, timeout, version_only=True):
+            return f"the recovery binary failed verification: {problem}"
+        help_text = subprocess.run(
+            [path, "update", "--help"],
+            cwd=home,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=timeout,
+            check=False,
+        )
+        if help_text.returncode or b"--recover" not in help_text.stdout:
+            return "the native release does not support offline uv recovery"
+        path.replace(destination)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return f"could not prepare the recovery binary: {type(error).__name__}"
+    finally:
+        path.unlink(missing_ok=True)
+    return None
