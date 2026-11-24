@@ -13,19 +13,13 @@ import threading
 import time
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 
 import pytest
 from sai_cli.core import keeper, storage
+from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
 from websockets.sync.server import serve
 from websockets.typing import Subprotocol
-
-FIXTURES = Path(__file__).parent / "fixtures"
-
-
-def fixture(name: str) -> dict:
-    return json.loads((FIXTURES / name).read_text(encoding="utf-8"))
 
 
 def _resolve_cli() -> list[str]:
@@ -57,13 +51,8 @@ def keeper_server():
         def log_message(self, format, *args):
             pass
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    yield f"http://127.0.0.1:{server.server_port}/query"
-    server.shutdown()
-    server.server_close()
-    thread.join()
+    with http_server(Handler) as base:
+        yield f"{base}/query"
 
 
 def test_installed_sai_command_help():
@@ -109,13 +98,7 @@ def test_installed_cli_receives_balance_snapshot():
             )
         )
 
-    server = serve(
-        handler, "127.0.0.1", 0, subprotocols=[Subprotocol("graphql-transport-ws")]
-    )
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        port = server.socket.getsockname()[1]
+    with graphql_ws(handler) as endpoint:
         result = subprocess.run(
             [
                 *_resolve_cli(),
@@ -124,7 +107,7 @@ def test_installed_cli_receives_balance_snapshot():
                 "balances",
                 "0xabc",
                 "--ws-endpoint",
-                f"ws://127.0.0.1:{port}/query",
+                endpoint,
             ],
             capture_output=True,
             text=True,
@@ -135,9 +118,6 @@ def test_installed_cli_receives_balance_snapshot():
         assert [
             row["token_info"]["name"] for row in golden["data"]["userBalances"]
         ] == ["USDC on Sai", "USDC Credits on Sai"]
-    finally:
-        server.shutdown()
-        thread.join()
 
 
 def test_installed_watch_replays_observed_btc_websocket_snapshot():
