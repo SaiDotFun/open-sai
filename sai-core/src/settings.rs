@@ -508,9 +508,16 @@ impl Settings {
                 Err(error) if key.is_log() => {
                     let already_off = resolved.value(Key::LogsEnabled).as_bool() == Some(false);
                     let source = if already_off { source } else { Source::Invalid };
-                    if source == Source::Invalid && env.is_set(key) {
+                    if source == Source::Invalid
+                        && let Some(raw) = env.raw(key)
+                    {
+                        let detail = if raw.to_str().is_none() {
+                            format!("invalid value for {}", key.spec().name)
+                        } else {
+                            error.to_string()
+                        };
                         resolved.warnings.push(format!(
-                            "{}: {error}; logging is off until it is fixed",
+                            "{}: {detail}; logging is off until it is fixed",
                             key.spec().env
                         ));
                     }
