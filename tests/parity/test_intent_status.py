@@ -11,6 +11,7 @@ import socket
 import sqlite3
 import ssl
 import subprocess
+import tempfile
 import threading
 import time
 from collections import deque
@@ -18,11 +19,13 @@ from collections.abc import Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
+from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
+from compare import is_version
 from sai_cli.core import keeper, log, reconcile, storage
 
 FIXTURE = json.loads(
@@ -159,14 +162,27 @@ def invoke(
     )
 
 
-def read_events(home: Path) -> list[dict[str, Any]]:
+@cache
+def cli_version(cli: CLI) -> str:
+    with tempfile.TemporaryDirectory(prefix="sai-parity-version-") as directory:
+        result = invoke(cli, Path(directory) / "sai", "--version")
+    assert result.returncode == 0, result.stderr
+    version = result.stdout.decode().split()[-1]
+    assert is_version(version)
+    return version
+
+
+def read_events(home: Path, cli: CLI) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
         for line in path.read_bytes().splitlines()
     ]
     groups: dict[str, list[int]] = {}
+    version = cli_version(cli)
     for event in events:
+        assert event["version"] == version
+        event["version"] = "<version>"
         run = event["runId"]
         event["runId"] = list(groups).index(run) if run in groups else len(groups)
         seq = groups.setdefault(run, [])
@@ -363,7 +379,7 @@ def compare(
                 if index == 0 and step.code == 0:
                     stdout = public_intent_output(stdout, compact=step.json_output)
                 runs.append((stdout, result.stderr, list(requests), state))
-            observed.append((runs, read_events(home)))
+            observed.append((runs, read_events(home, cli)))
         assert observed[0] == observed[1]
 
 
@@ -637,7 +653,7 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert result.stderr == b""
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
-            outputs.append((result.stdout, read_events(home)))
+            outputs.append((result.stdout, read_events(home, cli)))
         assert outputs[0] == outputs[1]
 
 
@@ -744,7 +760,7 @@ def test_expired_auth_status(
         error = json.loads(result.stdout)["error"]
         assert error["code"] == "SESSION_EXPIRED"
         assert error["hint"].endswith(f"auth login NAME --addr {ADDR}")
-        observed.append((result.stdout, read_events(home)))
+        observed.append((result.stdout, read_events(home, cli)))
     assert observed[0] == observed[1]
 
 
