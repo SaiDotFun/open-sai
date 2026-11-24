@@ -757,20 +757,15 @@ fn writable(path: &Path, metadata: &Metadata) -> Result<()> {
 }
 
 fn remove_codex(source: &[u8], name: &str, old: &Registration) -> Result<String> {
-    use toml_edit::{DocumentMut, Item};
+    use toml_edit::{Document, Item};
 
     let bad = "Could not edit Codex config.toml";
     let source = std::str::from_utf8(source).map_err(|_| bad)?;
-    let mut doc = source.parse::<DocumentMut>().map_err(|_| bad)?;
-    let original = doc.clone();
-    let entries = doc
-        .get_mut("mcp_servers")
-        .and_then(Item::as_table_like_mut)
-        .ok_or("The Sai registration changed concurrently")?;
-    let entry = entries
-        .get(name)
-        .and_then(Item::as_table_like)
-        .ok_or("The Sai registration changed concurrently")?;
+    let doc = Document::parse(source).map_err(|_| bad)?;
+    let changed = "The Sai registration changed concurrently";
+    let servers = doc.get("mcp_servers").ok_or(changed)?;
+    let item = servers.get(name).ok_or(changed)?;
+    let entry = item.as_table_like().ok_or(changed)?;
     let matches = if old.stdio {
         codex_argv_matches(entry, old)
     } else {
@@ -778,10 +773,128 @@ fn remove_codex(source: &[u8], name: &str, old: &Registration) -> Result<String>
         url.is_some() && entry.get("url").and_then(Item::as_str) == url
     };
     if !matches {
-        return Err("The Sai registration changed concurrently".into());
+        return Err(changed.into());
     }
-    entries.remove(name);
-    render_codex(original, doc, name)
+
+    // The parser's spans exclude trivia. Expand only the statements we
+    // delete to whole lines; separate table comments and endings stay intact.
+    let line = |span: std::ops::Range<usize>| {
+        let start = source[..span.start].rfind('\n').map_or(0, |at| at + 1);
+        let end = source[span.end..]
+            .find('\n')
+            .map_or(source.len(), |at| span.end + at + 1);
+        start..end
+    };
+    let mut removed = Vec::new();
+    if let Some(inline) = servers.as_inline_table() {
+        let mut parts = inline
+            .get_values()
+            .into_iter()
+            .map(|(keys, value)| {
+                let leaf = keys.last().ok_or(bad)?;
+                Ok((
+                    leaf.span().ok_or(bad)?.start..value.span().ok_or(bad)?.end,
+                    keys[0].get() == name,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        parts.sort_by_key(|(span, _)| span.start);
+        let mut offset = 0;
+        for group in parts.chunk_by(|left, right| left.1 == right.1) {
+            if group[0].1 {
+                let leaf = group[0].0.start;
+                let end = group.last().expect("nonempty group").0.end;
+                let comma = |start, end| source[start..end].find(',').map(|at| start + at);
+                // A repeated dotted prefix can reuse its first key's span.
+                // Find this assignment's start from the preceding delimiter.
+                let delimiter = if offset == 0 {
+                    inline.span().ok_or(bad)?.start
+                } else {
+                    comma(parts[offset - 1].0.end, leaf).ok_or(bad)?
+                };
+                let gap = &source[delimiter + 1..leaf];
+                let start = leaf - gap.trim_start().len();
+                let span = if let Some(next) = parts.get(offset + group.len()) {
+                    start..comma(end, next.0.start).ok_or(bad)? + 1
+                } else if offset != 0 {
+                    delimiter..end
+                } else {
+                    let close = inline.span().ok_or(bad)?.end;
+                    start..comma(end, close).map_or(end, |at| at + 1)
+                };
+                removed.push(span);
+            }
+            offset += group.len();
+        }
+    } else {
+        // Dotted assignments may share the root or an explicit parent table
+        // with other servers and may be interleaved with their assignments.
+        let dotted = |table: &toml_edit::Table, parent: &[&str]| {
+            table
+                .get_values()
+                .into_iter()
+                .filter_map(|(keys, value)| {
+                    let path = keys.iter().map(|key| key.get()).take(parent.len());
+                    if !path.eq(parent.iter().copied()) {
+                        return None;
+                    }
+                    Some(line(keys.last()?.span()?.start..value.span()?.end))
+                })
+                .collect::<Vec<_>>()
+        };
+        removed.extend(dotted(doc.as_table(), &["mcp_servers", name]));
+        if let Some(table) = servers.as_table().filter(|table| !table.is_implicit()) {
+            removed.extend(dotted(table, &[name]));
+        }
+        let mut tables = vec![item];
+        while let Some(item) = tables.pop() {
+            let mut visit = |table: &toml_edit::Table| {
+                if !table.is_implicit()
+                    && let Some(span) = table.span()
+                {
+                    let end = table
+                        .get_values()
+                        .iter()
+                        .filter_map(|(_, value)| value.span())
+                        .map(|span| span.end)
+                        .max()
+                        .unwrap_or(span.end);
+                    removed.push(line(span.start..end));
+                }
+            };
+            match item {
+                Item::Table(table) => {
+                    visit(table);
+                    tables.extend(table.iter().map(|(_, item)| item));
+                }
+                Item::ArrayOfTables(array) => {
+                    for table in array.iter() {
+                        visit(table);
+                        tables.extend(table.iter().map(|(_, item)| item));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    removed.sort_by_key(|span| span.start);
+    let mut rendered = String::new();
+    let mut offset = 0;
+    for span in removed {
+        rendered.push_str(source.get(offset..span.start).ok_or(bad)?);
+        offset = span.end;
+    }
+    rendered.push_str(&source[offset..]);
+    let after = Document::parse(rendered.as_str()).map_err(|_| bad)?;
+    if after
+        .get("mcp_servers")
+        .and_then(|servers| servers.get(name))
+        .is_some()
+    {
+        return Err(bad.into());
+    }
+    check_preserved_codex(doc.as_table(), after.as_table(), name)?;
+    Ok(rendered)
 }
 
 fn codex_argv_matches(entry: &dyn toml_edit::TableLike, old: &Registration) -> bool {
@@ -882,31 +995,40 @@ fn edit_codex(
 }
 
 fn render_codex(
-    mut before: toml_edit::DocumentMut,
+    before: toml_edit::DocumentMut,
     doc: toml_edit::DocumentMut,
     name: &str,
 ) -> Result<String> {
-    use toml_edit::{DocumentMut, Item};
+    use toml_edit::DocumentMut;
 
     let rendered = doc.to_string();
     // Reparse so changes to TOML table boundaries cannot move unrelated keys.
-    let mut after = rendered
+    let after = rendered
         .parse::<DocumentMut>()
         .map_err(|_| "Could not edit Codex config.toml")?;
-    let without_entry = |doc: &mut DocumentMut| {
-        if let Some(entries) = doc.get_mut("mcp_servers").and_then(Item::as_table_like_mut) {
+    check_preserved_codex(before.as_table(), after.as_table(), name)?;
+    Ok(rendered)
+}
+
+fn check_preserved_codex(
+    before: &toml_edit::Table,
+    after: &toml_edit::Table,
+    name: &str,
+) -> Result<()> {
+    let without_entry = |doc: &toml_edit::Table| {
+        let mut values = semantic_table(doc);
+        if let Some(Value::Object(entries)) = values.get_mut("mcp_servers") {
             entries.remove(name);
             if entries.is_empty() {
-                doc.remove("mcp_servers");
+                values.remove("mcp_servers");
             }
         }
+        values
     };
-    without_entry(&mut before);
-    without_entry(&mut after);
-    if semantic_table(before.as_table()) != semantic_table(after.as_table()) {
+    if without_entry(before) != without_entry(after) {
         return Err("Could not preserve settings outside the Sai registration".into());
     }
-    Ok(rendered)
+    Ok(())
 }
 
 fn semantic_table(table: &dyn toml_edit::TableLike) -> std::collections::BTreeMap<String, Value> {

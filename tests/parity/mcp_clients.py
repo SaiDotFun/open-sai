@@ -159,7 +159,17 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
         f"url = {json.dumps(unrelated['url'])}",
         f"headers = {{ Authorization = {json.dumps(SECRET)} }}",
     ]
-    write(home / ".codex/config.toml", "\n".join(lines) + "\n", 0o640)
+    config = "\n".join(lines) + "\n"
+    if scenario == "uninstall-crlf":
+        config = (
+            '# Keep this comment\r\nmodel = "before"\r\n\r\n'
+            "[mcp_servers.sai]\r\n"
+            f"command = {json.dumps(str(saved))}\r\n"
+            'args = ["mcp", "serve"]\r\n\r\n'
+            '# Other server\r\n[mcp_servers.other-server]\r\nurl = "https://fixture.invalid/mcp"\r\n\r\n'
+            '[profiles.demo]\r\nmodel =    "after"\r\n'
+        )
+    write(home / ".codex/config.toml", config, 0o640)
     return {
         relative: (home / relative).read_bytes()
         for relative in CLIENT_CONFIGS
@@ -188,6 +198,8 @@ def client_state(
                     if "#" in line
                 ],
             }
+            if b"\r\n" in previous.get(relative, b""):
+                data["source"] = source
         else:
             data = json.loads(raw)
             if relative == ".claude.json" and isinstance(data.get("projects"), dict):
