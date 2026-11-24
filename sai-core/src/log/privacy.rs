@@ -188,7 +188,7 @@ fn copy_text(text: &str, budget: &mut Budget, tokens: &[String]) -> String {
     copied
 }
 
-fn replace_tokens(text: &str, tokens: &[String]) -> String {
+pub(super) fn replace_tokens(text: &str, tokens: &[String]) -> String {
     let mut text = text.to_owned();
     for token in tokens {
         if text.contains(token.as_str()) {

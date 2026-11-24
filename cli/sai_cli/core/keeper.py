@@ -45,7 +45,8 @@ INTENT_HISTORY = """query($trader:String!, $limit:Int!, $offset:Int!) {
     }
   }
 }"""
-INTENTS = """query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
+INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
+WAIT_INTENTS = """query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
 SESSION = """mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }"""
 SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }"""
@@ -53,6 +54,11 @@ SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$in
 INTENT_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}")
 GENERATED_INTENT_KEY = re.compile(r"[0-9]{8}T[0-9]{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 REQUEST_HASH = re.compile(r"(?:0[xX])?[0-9a-fA-F]{64}")
+# gqlgen's Time scalar emits RFC3339Nano for block and execution timestamps.
+BLOCK_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
 INTENT_KINDS = frozenset(
     {
         "OPEN_TRADE",
@@ -116,9 +122,34 @@ INTENT_ERROR_CODES = frozenset(
         "market_order_market_closed",
         "market_order_trade_not_open",
         "market_order_outcome_not_indexed",
+        "withdraw_evm_unconfigured",
+        "invalid_withdraw",
         "intent_already_used",
         "below_minimum",
         "insufficient_idle",
+        # Browser intent lifecycle and authentication diagnostics.
+        "intent_validation_failed",
+        "chain_switch_failed",
+        "gas_estimation_failed",
+        "wallet_rejected",
+        "wallet_sign_failed",
+        "chain_mismatch",
+        "request_pending",
+        "rpc_submission_failed",
+        "sign_failed_unknown",
+        "intent_auth_rejected",
+        "jwt_failed",
+    }
+)
+GRAPHQL_ERROR_CODES = frozenset(
+    {
+        "GRAPHQL_PARSE_FAILED",
+        "GRAPHQL_VALIDATION_FAILED",
+        "INTENT_NOT_ACCEPTED",
+        "BAD_USER_INPUT",
+        "FORBIDDEN",
+        "INTERNAL_SERVER_ERROR",
+        "UNAUTHENTICATED",
     }
 )
 
@@ -149,12 +180,13 @@ def intent_error_code(row: Mapping[str, Any]) -> str | None:
 
 
 def _block_time(value: object) -> str | None:
-    if isinstance(value, str) and len(value) <= 40:
+    if isinstance(value, str) and BLOCK_TIMESTAMP.fullmatch(value):
         try:
-            if datetime.fromisoformat(value).tzinfo is not None:
-                return value
+            datetime.fromisoformat(value)
         except ValueError:
             pass
+        else:
+            return value
     return None
 
 
@@ -193,8 +225,11 @@ def safe_intent_record(row: Mapping[str, Any]) -> dict[str, Any]:
     block = row.get("execBlock")
     if type(block) is int and 0 <= block < 2**63:
         record["execBlock"] = block
-    if ts := _block_time(row.get("execBlockTs")):
-        record["execBlockTs"] = ts
+    timestamp = row.get("execBlockTs")
+    if valid := _block_time(timestamp):
+        record["execBlockTs"] = valid
+    elif timestamp is not None:
+        record["execBlockTsInvalid"] = True
     tx_hash, invalid = request_hash(row.get("txHash"))
     if tx_hash:
         record["txHash"] = tx_hash
@@ -234,9 +269,33 @@ def safe_intent_history(row: Mapping[str, Any]) -> dict[str, Any]:
         history["block"] = {}
         if (height := _row_id(block.get("block"))) is not None:
             history["block"]["block"] = height
-        if ts := _block_time(block.get("block_ts")):
-            history["block"]["block_ts"] = ts
+        timestamp = block.get("block_ts")
+        if valid := _block_time(timestamp):
+            history["block"]["block_ts"] = valid
+        elif timestamp is not None:
+            history["block"]["block_tsInvalid"] = True
     return log.clean(history)
+
+
+def safe_history_response(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the account-history response while keeping its GraphQL envelope."""
+    perp = data.get("perp")
+    if not isinstance(perp, dict):
+        return {"perp": None} if perp is None and "perp" in data else {}
+    rows = perp.get("tradeHistory")
+    if isinstance(rows, list):
+        return {
+            "perp": {
+                "tradeHistory": [
+                    safe_intent_history(row) for row in rows if isinstance(row, dict)
+                ]
+            }
+        }
+    return {
+        "perp": {"tradeHistory": None}
+        if rows is None and "tradeHistory" in perp
+        else {}
+    }
 
 
 # Names for the log; a query not listed here is logged as `custom`.
@@ -250,6 +309,7 @@ OPERATIONS = {
     HISTORY: "history",
     INTENT_HISTORY: "history",
     INTENTS: "intents",
+    WAIT_INTENTS: "intents",
     CHALLENGE: "challenge",
     SESSION: "session",
     SUBMIT: "submit",
@@ -337,8 +397,8 @@ def request(
 
     Logs one `keeper.request` event with the operation, the endpoint's
     origin, the outcome, and the duration. For an intent lookup, it also
-    records the key. Audit calls disable `trace_intent` so a pasted key
-    or echoed GraphQL diagnostic stays out of the log.
+    records the key unless an audit call disables `trace_intent`.
+    Intent and history reads log only known GraphQL codes and an error count.
     """
     started = time.monotonic()
     outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
@@ -388,7 +448,9 @@ def _log_request(
             None,
         )
         intent_key = (
-            (variables or {}).get("key") if query == INTENTS and trace_intent else None
+            (variables or {}).get("key")
+            if query in (INTENTS, WAIT_INTENTS) and trace_intent
+            else None
         )
         log.event(
             "keeper.request",
@@ -406,14 +468,17 @@ def _log_request(
             code=outcome.get("code"),
             error=outcome.get("error") if trace_intent else None,
             httpStatus=outcome.get("httpStatus"),
-            keeperErrors=outcome.get("keeperErrors") if trace_intent else None,
+            keeperErrors=outcome.get("keeperErrors")
+            if trace_intent or query in (INTENTS, WAIT_INTENTS, HISTORY, INTENT_HISTORY)
+            else None,
+            keeperErrorCount=outcome.get("keeperErrorCount"),
         )
     except Exception:  # noqa: BLE001, S110 - logging must not change the outcome
         pass
 
 
-def _graphql_errors(errors: Any) -> list[dict[str, Any]]:
-    """The code and message of the first few GraphQL errors, for the log.
+def _graphql_errors(errors: Any, *, codes_only: bool) -> list[dict[str, Any]]:
+    """Keep at most three GraphQL errors for the log.
 
     Keeper's message can echo input, such as the signature sent to the
     session mutation, so it is marked untrusted: the log writer cuts it
@@ -425,6 +490,11 @@ def _graphql_errors(errors: Any) -> list[dict[str, Any]]:
             continue
         extensions = item.get("extensions")
         code = extensions.get("code") if isinstance(extensions, dict) else None
+        if codes_only:
+            found.append(
+                {"code": known_text(code, GRAPHQL_ERROR_CODES) or Code.KEEPER_ERROR}
+            )
+            continue
         found.append(
             {
                 "code": log.untrusted(str(code)) if code is not None else None,
@@ -502,7 +572,10 @@ def _response_data(query: str, result: Any, outcome: dict[str, Any]) -> dict[str
         raise KeeperError("Keeper returned an invalid response")
     if result.get("errors"):
         errors = result["errors"]
-        outcome["keeperErrors"] = _graphql_errors(errors)
+        codes_only = query in (INTENTS, WAIT_INTENTS, HISTORY, INTENT_HISTORY)
+        outcome["keeperErrors"] = _graphql_errors(errors, codes_only=codes_only)
+        if codes_only:
+            outcome["keeperErrorCount"] = len(errors) if isinstance(errors, list) else 1
         if (
             query == SUBMIT
             and not result.get("data")

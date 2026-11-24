@@ -137,16 +137,18 @@ Each preview returns `previewDigest`. A `trade_*` call must send it back as
 input `preview_digest`, and a market `trade_open` must also send the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
-the intent, the margin quote, or the quoted price no longer match. Nothing is
-submitted on a refusal. Show the fresh preview from the result and ask again.
+intent, position quote, or quoted price fails the confirmation check.
+Nothing is submitted on a refusal. Show the fresh preview from the result
+and ask again.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
 
-The digest of a partial close covers the computed collateral reduction, not
-the position's leverage. Preview again right before submitting if the
-position may have changed. [mcp.md](mcp.md#preview-confirm-then-trade) lists
-what each digest covers.
+The partial-close digest covers the close percentage, starting collateral and
+leverage, and the contract inputs used to quote the requested slice. The quote
+uses the applicable after-hours leverage cap, collateral/USD oracle price, and
+Perp's rounding. A change to those inputs requires a new confirmation.
+[mcp.md](mcp.md#preview-confirm-then-trade) lists what each digest covers.
 
 ## CLI Trade Commands
 
@@ -190,18 +192,29 @@ approval still describes the trade:
   position at submit. If the person approved "close 50%, about 50 USDC" and
   the position doubles before submit, the live command closes 100 USDC. Ask
   the person to approve the percentage of whatever the position is at submit,
-  and say so in those words. If they approve a fixed amount, use MCP tools
-  `preview_partial_close` and `trade_partial_close`, whose digest binds the
-  computed reduction.
+  and say so in those words. To confirm a quoted slice, use MCP tools
+  `preview_partial_close` and `trade_partial_close`. Show the person the
+  collateral reduction and quoted notional. If
+  `quote.closedNotionalIsEstimate` is true, say the notional is an estimate.
+  If the oracle price is unavailable, show the USDC estimate from
+  `quote.closedNotionalUsdc`. Keeper sends the collateral delta to Perp.
+  Perp applies the position state and oracle price at execution, so the
+  executed notional can differ from the confirmed quote. The after-hours
+  risk guard can also reduce the position before Perp closes the requested
+  slice.
 - **Margin** takes an amount, `--direction add|remove --amount USDC`, and
-  computes the target leverage from the position at submit. The dry run's
-  target is a quote: adding 25 USDC to 100 USDC of collateral at 5x previews
+  computes the target from the effective leverage Perp will use, including
+  any applicable after-hours cap. The dry run's target is a quote: adding
+  25 USDC to 100 USDC of collateral at 5x previews
   4x, but if the collateral doubles before submit the same command sends
   about 4.44x. Ask the person to approve the amount, and say the CLI
   computes the target leverage at submit. If they approve a specific target
   leverage, use MCP tools `preview_margin` and `trade_margin`, whose digest
   binds the whole quote, or `trade leverage ID --leverage VALUE`, which
-  sends the target they named.
+  sends the target they named. If `quote.marginChangeIsEstimate` is true,
+  tell the person the after-hours guard can deduct fees before Perp applies
+  the target leverage. Perp determines the direction from effective leverage
+  at execution.
 - **Market open** fills from the price at submit. Give the worst case from
   rule 3 before asking.
 

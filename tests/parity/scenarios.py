@@ -124,9 +124,10 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         for name in ("config.toml", "trader/sessions.json"):
             (sai_home / name).chmod(0o600)
         return
-    if seed == "config":
+    if seed in {"config", "config-logs-disabled"}:
         path = sai_home / "config.toml"
-        path.write_text(CONFIG, encoding="utf-8")
+        text = CONFIG if seed == "config" else "[logs]\nenabled = false\n"
+        path.write_text(text, encoding="utf-8")
         path.chmod(0o600)
         return
     session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
@@ -203,8 +204,12 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             }
         },
     }
+    responses["intentTradeHistory"] = responses["tradeHistory"]
+    responses["waitUserIntents"] = responses["userIntents"]
     variables = {
         "tradeHistory": {"trader": ADDRESS},
+        "intentTradeHistory": {"trader": ADDRESS, "limit": 25, "offset": 0},
+        "waitUserIntents": {"user": ADDRESS, "key": INTENT, "includeAction": True},
         "trades": {"trader": ADDRESS},
         "trade": {"trader": ADDRESS, "id": 7},
         "borrowing": {"market": borrowing["marketId"], "collateral": collateral["id"]},
@@ -215,12 +220,13 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "perpTrades": {"data": {"perpTrades": [position]}},
         "tokenPricesUsd": fixture("mainnet_price_ws_payload.json"),
     }
+    market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
     contracts = {
         "get_trade_raw": {
             "user": position["trader"],
             "user_trade_index": "UserTradeIndex(7)",
-            "market_index": f"MarketIndex({borrowing['marketId']})",
+            "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
             "trade_type": "trade",
@@ -231,6 +237,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "available_to_trade": "10000000",
             "collateral_index": token_index,
         },
+        "is_after_hours_market": False,
+        "get_collateral_price": "1",
     }
     contract_args = {
         "get_trade_raw": {"trader": position["trader"], "index": 7},
@@ -238,6 +246,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "user": position["trader"],
             "collateral_index": token_index,
         },
+        "is_after_hours_market": {"market_index": market_index},
+        "get_collateral_price": {"collateral_index": token_index},
     }
 
     class Handler(BaseHTTPRequestHandler):

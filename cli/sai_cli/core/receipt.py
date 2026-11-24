@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import math
+import re
 from typing import Any, Literal
+
+from . import keeper
 
 TRADE_FILLS = {
     "position_opened",
@@ -20,7 +24,6 @@ REQUESTED_CHANGES = {
     "UPDATE_OPEN_ORDER": {"order_updated"},
     "UPDATE_TRADE": {"tp_updated", "sl_updated", "tpsl_updated", "leverage_updated"},
 }
-ADDITIONAL_EFFECTS = {"after_hours_risk_trigger"}
 
 
 def _execution_rows(
@@ -45,7 +48,7 @@ def _indexed(row: dict[str, Any], matching: list[dict[str, Any]]) -> dict[str, A
     confirming = None
     for item in matching:
         change = item.get("tradeChangeType")
-        if not change or change in ADDITIONAL_EFFECTS:
+        if change is None or change == "after_hours_risk_trigger":
             continue
         if not _matches_action(row, item, change):
             return item
@@ -62,8 +65,13 @@ def _action(row: dict[str, Any], indexed: dict[str, Any]) -> dict[str, Any]:
         if kind == "OPEN_TRADE" and isinstance(body, dict)
         else None
     )
-    if order_type is None and kind in ("OPEN_TRADE", None):
-        order_type = PLACEMENTS.get(indexed.get("tradeChangeType"))
+    if order_type not in ("market", "limit", "stop"):
+        change = indexed.get("tradeChangeType")
+        order_type = (
+            PLACEMENTS.get(change)
+            if isinstance(change, str) and kind in ("OPEN_TRADE", None)
+            else None
+        )
     return {"kind": kind, "orderType": order_type}
 
 
@@ -85,7 +93,7 @@ def _matches_action(row: dict[str, Any], indexed: dict[str, Any], change: str) -
             "sl_updated": sl,
             "tpsl_updated": tp or sl,
         }.get(change, False)
-    return change in REQUESTED_CHANGES.get(kind, ())
+    return isinstance(kind, str) and change in REQUESTED_CHANGES.get(kind, ())
 
 
 def _requests_update(patch: object) -> bool:
@@ -101,7 +109,7 @@ def success(
     if change == "position_liquidated":
         return "liquidated"
     if change:
-        if not _matches_action(row, indexed, change):
+        if not isinstance(change, str) or not _matches_action(row, indexed, change):
             return "unexpected"
         if change in PLACEMENTS:
             return "placed"
@@ -109,6 +117,54 @@ def success(
     if action["orderType"] in ("limit", "stop"):
         return "placed"
     return "succeeded"
+
+
+def _number(value: object) -> int | float | str | None:
+    if type(value) is int and -(2**63) <= value < 2**63:
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    if isinstance(value, str) and re.fullmatch(
+        r"-?[0-9]{1,24}(?:\.[0-9]{1,24})?", value
+    ):
+        return value
+    return None
+
+
+def _position(row: dict[str, Any], public: dict[str, Any]) -> dict[str, Any] | None:
+    trade = row.get("trade")
+    if not isinstance(trade, dict):
+        return None
+    result = dict(public.get("trade", {}))
+    for field in ("isOpen", "isLong"):
+        if isinstance(value := trade.get(field), bool):
+            result[field] = value
+    if trade.get("tradeType") in ("trade", "limit", "stop"):
+        result["tradeType"] = trade["tradeType"]
+    for field in (
+        "collateralAmount",
+        "openCollateralAmount",
+        "leverage",
+        "openPrice",
+        "closePrice",
+        "tp",
+        "sl",
+    ):
+        if field in trade:
+            result[field] = _number(trade[field])
+    for field in ("openBlock", "closeBlock"):
+        if isinstance(block := trade.get(field), dict):
+            result[field] = {"block": _number(block.get("block"))}
+        elif field in trade:
+            result[field] = None
+    if isinstance(borrowing := trade.get("perpBorrowing"), dict):
+        market: dict[str, Any] = {"marketId": _number(borrowing.get("marketId"))}
+        result["perpBorrowing"] = market
+        if isinstance(token := borrowing.get("collateralToken"), dict):
+            symbol = token.get("symbol")
+            if isinstance(symbol, str) and re.fullmatch(r"[A-Z0-9]{1,12}", symbol):
+                market["collateralToken"] = {"symbol": symbol}
+    return result
 
 
 def build(
@@ -122,9 +178,14 @@ def build(
     """Keep the request transaction distinct from execution and fill data."""
     matching = _execution_rows(row, history)
     indexed = _indexed(row, matching)
-    order = indexed.get("marketOrder") or {}
-    block = indexed.get("block") or {}
-    change = indexed.get("tradeChangeType")
+    public = keeper.safe_intent_history(indexed)
+    intent = keeper.safe_intent_record(row)
+    order = indexed.get("marketOrder")
+    order = order if isinstance(order, dict) else {}
+    block = public.get("block", {})
+    change = public.get("tradeChangeType")
+    if indexed.get("tradeChangeType") == "order_updated":
+        change = "order_updated"
     execution = None
     if outcome in (
         "filled",
@@ -137,22 +198,23 @@ def build(
         execution = {
             "source": "trade_history" if indexed else "keeper_intent",
             "block": block.get("block")
-            or order.get("orderExecBlock")
-            or row.get("execBlock"),
+            or _number(order.get("orderExecBlock"))
+            or intent.get("execBlock"),
             "blockTs": block.get("block_ts")
-            or (row.get("execBlockTs") if not indexed else None),
-            "historyId": indexed.get("id"),
+            or (intent.get("execBlockTs") if not indexed else None),
+            "historyId": public.get("id"),
             "tradeChangeType": change,
-            "marketOrderSequence": order.get("sequence"),
+            "marketOrderSequence": _number(order.get("sequence")),
             "extraEffects": [
                 {
-                    "tradeChangeType": item["tradeChangeType"],
-                    "historyId": item.get("id"),
-                    "block": (item.get("block") or {}).get("block"),
+                    "tradeChangeType": extra["tradeChangeType"],
+                    "historyId": extra.get("id"),
+                    "block": extra.get("block", {}).get("block"),
                 }
                 for item in matching
                 if item is not indexed
-                and item.get("tradeChangeType") in ADDITIONAL_EFFECTS
+                and item.get("tradeChangeType") == "after_hours_risk_trigger"
+                for extra in [keeper.safe_intent_history(item)]
             ],
         }
     fill = None
@@ -163,23 +225,23 @@ def build(
         fill = {
             "price": None,
             "sizeCollateralBaseUnits": None,
-            "oraclePrice": order.get("execPrice"),
-            "escrowedCollateralBaseUnits": order.get("collateralAmount"),
+            "oraclePrice": _number(order.get("execPrice")),
+            "escrowedCollateralBaseUnits": _number(order.get("collateralAmount")),
         }
     fees = {
-        "opening": indexed.get("openingFeeUsd"),
-        "closing": indexed.get("closingFeeUsd"),
-        "borrowing": indexed.get("borrowingFeeUsd"),
+        "opening": _number(indexed.get("openingFeeUsd")),
+        "closing": _number(indexed.get("closingFeeUsd")),
+        "borrowing": _number(indexed.get("borrowingFeeUsd")),
     }
     return {
-        "requestTxHash": request_tx_hash
-        or order.get("orderReqTxHash")
-        or indexed.get("txHash"),
-        "requestBlock": request_block or order.get("orderReqBlock"),
-        "action": _action(row, indexed),
+        "requestTxHash": keeper.request_hash(request_tx_hash)[0]
+        or keeper.request_hash(order.get("orderReqTxHash"))[0]
+        or public.get("txHash"),
+        "requestBlock": _number(request_block) or _number(order.get("orderReqBlock")),
+        "action": {**_action(row, indexed), "kind": intent.get("kind")},
         "execution": execution,
         "fill": fill,
-        "positionNow": indexed.get("trade"),
+        "positionNow": _position(indexed, public),
         "positionFeesUsd": fees
         if any(value is not None for value in fees.values())
         else None,

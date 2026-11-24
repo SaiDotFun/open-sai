@@ -521,16 +521,47 @@ def markets(price: float = 100.5) -> dict[str, Any]:
 
 
 def snapshots(monkeypatch, *collaterals: str) -> None:
-    """Make margin.snapshot return one position state per call, in order."""
+    """Supply each indexed snapshot and repeat its contract state on recheck."""
+    current: margin.PositionSnapshot | None = None
     states = iter(
-        (
-            {"collateral_amount": amount, "leverage": "2"},
+        margin.PositionSnapshot(
+            {
+                "user": "nibi1trader",
+                "user_trade_index": "UserTradeIndex(7)",
+                "is_open": True,
+                "trade_type": "trade",
+                "collateral_amount": amount,
+                "leverage": "2",
+                "market_index": "MarketIndex(0)",
+                "collateral_index": "TokenIndex(1)",
+            },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
+            "test-contract",
         )
         for amount in collaterals
     )
-    monkeypatch.setattr(margin, "snapshot", lambda *args: next(states))
+
+    def snapshot(*args: Any) -> margin.PositionSnapshot:
+        nonlocal current
+        current = next(states)
+        return current
+
+    def contract_reply(
+        lcd: str, contract: str, query: dict[str, Any], **kwargs: Any
+    ) -> Any:
+        if "get_trade_raw" in query:
+            assert current is not None
+            return current.raw
+        return "1" if "get_collateral_price" in query else False
+
+    monkeypatch.setattr(margin, "snapshot", snapshot)
+    monkeypatch.setattr(margin, "smart_value", contract_reply)
+    monkeypatch.setattr(
+        margin,
+        "_latest_position",
+        lambda *args: (contract_reply("", "", {"get_trade_raw": {}}), "120"),
+    )
 
 
 def confirm(
@@ -1265,7 +1296,7 @@ def test_logged_and_returned_errors_redact_the_session_token(mcp, monkeypatch, c
 
 
 def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
-    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s#f")
+    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s")
     monkeypatch.setenv("SAI_LCD_ENDPOINT", "https://lcd.example/?apikey=s")
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")
@@ -1326,7 +1357,8 @@ def rpc(message_id: int | None, method: str, params: dict[str, Any]) -> str:
     return json.dumps(message) + "\n"
 
 
-def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path):
+@pytest.mark.parametrize("global_flags", [[], ["--json", "--as", "another-account"]])
+def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     """initialize and tools/list over a real `sai mcp serve` process; every
     stdout line is a JSON-RPC message."""
     initialize = {
@@ -1334,7 +1366,14 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path):
         "capabilities": {},
         "clientInfo": {"name": "test", "version": "0"},
     }
-    command = [*sai_command(), "mcp", "serve", "--endpoint", "http://127.0.0.1:9/query"]
+    command = [
+        *sai_command(),
+        *global_flags,
+        "mcp",
+        "serve",
+        "--endpoint",
+        "http://127.0.0.1:9/query",
+    ]
     with subprocess.Popen(
         command,
         stdin=subprocess.PIPE,

@@ -27,6 +27,10 @@ sai mcp uninstall codex
 - `--scope project` writes the project's shared config (Claude Code
   `.mcp.json`, Cursor `.cursor/mcp.json`) instead of the user's. Codex is
   user only.
+- When doctor or an update reports a stale Claude Code launcher, use the
+  exact repair command it prints. For example, `sai mcp install --client
+  claude --scope user --repair-existing sai` edits the existing user entry
+  in place. Keep the name and scope from the report.
 - From a checkout, give the server command after `--`:
   `sai mcp install claude -- uv run --directory /path/to/open-sai sai mcp serve`.
 - The client must restart or reconnect to load a change. Cursor may also ask
@@ -109,15 +113,15 @@ the one the person confirmed. The digest covers:
 
 - Every trade: the account and the intent the arguments produce.
 - `trade_open` for a market order: also the confirmed `reference_price`.
-- `trade_margin`: also the whole margin quote computed from the position. If
-  the position changed, the quote changes and the digest no longer matches.
-- `trade_partial_close`: the collateral reduction computed from the position.
-  It does not cover the position's leverage. If leverage changes after the
-  preview and the same reduction is still valid, the digest matches and the
-  trade submits. The server also reads the position twice during the live
-  call and refuses when collateral or leverage differ between those two
-  reads, which catches a change during the call, not one since the preview.
-  Preview again right before submitting when the position may have changed.
+- `trade_margin` also binds the full margin quote, including starting
+  collateral, stored leverage, and the inputs that determine effective
+  leverage. If `quote.marginChangeIsEstimate` is true, say that after-hours
+  guard fees can change the amount.
+- `trade_partial_close` also binds the close percentage, starting collateral
+  and leverage, and the contract inputs used to quote the requested slice,
+  including the applicable after-hours cap and collateral/USD oracle price.
+  Show the quoted notional and say whether `quote.closedNotionalIsEstimate`
+  is true.
 
 ### Market Opens: Quote Check and Fill Bound
 

@@ -7,7 +7,7 @@ import json
 import threading
 from datetime import UTC, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit
 
 import pytest
 from click.testing import CliRunner
@@ -28,20 +28,24 @@ def test_remove_margin_when_index_lags_or_changes(scenario):
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, data):
+            height = self.headers.get("x-cosmos-block-height")
             body = json.dumps(
                 {"data": data} if self.command == "POST" else data
             ).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if self.command == "GET":
+                self.send_header("grpc-metadata-x-cosmos-block-height", height or "900")
             self.end_headers()
             self.wfile.write(body)
 
         def do_GET(self):
-            if self.path.endswith("/node_info"):
+            path = urlsplit(self.path).path
+            if path.endswith("/node_info"):
                 self.reply({"default_node_info": {"network": NETWORK}})
                 return
-            encoded = unquote(self.path.rsplit("/", 1)[-1])
+            encoded = unquote(path.rsplit("/", 1)[-1])
             query = json.loads(base64.b64decode(encoded))
             if "get_trade_raw" in query:
                 assert query["get_trade_raw"] == {"trader": TRADER, "index": 7}
@@ -59,6 +63,11 @@ def test_remove_margin_when_index_lags_or_changes(scenario):
                         }
                     }
                 )
+            elif "is_after_hours_market" in query:
+                assert query["is_after_hours_market"] == {
+                    "market_index": "MarketIndex(0)"
+                }
+                self.reply({"data": False})
             else:
                 assert query["get_exchange_balance"] == {
                     "user": TRADER,

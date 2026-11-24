@@ -16,6 +16,7 @@ use super::{
     SessionError, Storage, StorageError, StorageEvent, endpoint_origin, private_file,
     remove_if_exists,
 };
+use crate::errors::{Code, SaiError};
 
 const SESSIONS: &str = "sessions.json";
 const LEGACY_SESSION: &str = "session.json";
@@ -129,9 +130,12 @@ impl Accounts {
         if self.sessions.contains_key(&key) {
             Ok(key)
         } else {
-            Err(SessionError::new(format!(
-                "{addr} is not connected; run `sai auth list` to see connected \
+            Err(SessionError(SaiError::new(
+                Code::InvalidRequest,
+                format!(
+                    "{addr} is not connected; run `sai auth list` to see connected \
                  accounts, or sign in with `sai auth login NAME` or `sai auth import`"
+                ),
             )))
         }
     }
@@ -290,14 +294,21 @@ impl Storage<'_> {
     pub fn load_session(&self, addr: Option<&str>) -> Result<Session, StorageError> {
         let mut accounts = self.load_accounts()?;
         let key = if let Some(addr) = addr {
-            accounts.find(addr)?
+            accounts
+                .find(addr)
+                .map_err(|error| SessionError(SaiError::new(Code::SignedOut, error.0.message)))?
         } else {
             accounts.active.take().ok_or_else(|| {
-                SessionError::new(if accounts.sessions.is_empty() {
-                    NO_SESSION
+                if accounts.sessions.is_empty() {
+                    SessionError(SaiError::new(Code::SignedOut, NO_SESSION))
                 } else {
-                    "No active Sai account; run `sai auth use ADDR` with an addr from `sai auth list`"
-                })
+                    let mut error = SaiError::new(
+                        Code::SessionUnavailable,
+                        "No active Sai account; run `sai auth use ADDR` with an addr from `sai auth list`",
+                    );
+                    error.hint = Some("sai auth list".into());
+                    SessionError(error)
+                }
             })?
         };
         Ok(accounts.sessions.remove(&key).expect("connected account").0)

@@ -49,6 +49,54 @@ HISTORY_HINT = "Waiting for matching trade history. Do not resubmit."
 LOCAL_PENDING_HINT = "This intent is still pending locally. Do not resubmit."
 
 
+def _reconcile_fields(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep the outcome and guidance Sai derives while reconciling."""
+    result = {}
+    if data.get("outcome") in (
+        "accepted",
+        "pending",
+        "terminal-filled",
+        "terminal-failed",
+        "unknown",
+    ):
+        result["outcome"] = data["outcome"]
+    if data.get("localStatus") in (
+        "unknown",
+        "accepted",
+        "pending",
+        "terminal",
+        "rejected",
+        "not_sent",
+        "absent",
+    ):
+        result["localStatus"] = data["localStatus"]
+    if data.get("hint") in (
+        PENDING_HINT,
+        UNINDEXED_HINT,
+        HISTORY_HINT,
+        LOCAL_PENDING_HINT,
+    ):
+        result["hint"] = data["hint"]
+    return result
+
+
+def status_report(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project a reconciliation result for CLI and MCP output."""
+    report = _reconcile_fields(data)
+    for name, sanitize in (
+        ("userIntents", keeper.safe_intent_record),
+        ("matchedTradeHistory", keeper.safe_intent_history),
+    ):
+        if isinstance(rows := data.get(name), list):
+            report[name] = [
+                sanitize(row)
+                | (_reconcile_fields(row) if name == "userIntents" else {})
+                for row in rows
+                if isinstance(row, dict)
+            ]
+    return report
+
+
 def classify_outcome(row: Mapping[str, Any]) -> IntentOutcome:
     """Classify one Keeper row using the contract in intent-outcomes.md.
 
@@ -294,9 +342,11 @@ def poll_steps(
         if timeout <= 0:
             raise TimeoutError
     variables: dict[str, Any] = {"user": addr, "key": key}
+    query = keeper.INTENTS
     if include_action:
+        query = keeper.WAIT_INTENTS
         variables["includeAction"] = True
-    data = (yield Read(keeper.INTENTS, variables, timeout)) or {}
+    data = (yield Read(query, variables, timeout)) or {}
     rows = data.get("userIntents")
     if rows is None:
         return data

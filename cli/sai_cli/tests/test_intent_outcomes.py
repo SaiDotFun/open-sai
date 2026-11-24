@@ -17,13 +17,13 @@ from contextlib import suppress
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import KeeperHandler, keeper_server
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from sai_cli.core import keeper, log, reconcile, settings, storage, wait
@@ -104,17 +104,13 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
     active_key = KEY
     offset = 0
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(KeeperHandler):
         def do_POST(self) -> None:
             nonlocal active_key, offset
-            length = int(self.headers["Content-Length"])
             try:
-                payload = self.rfile.read(length)
-            except ConnectionResetError:
+                request = self.read_json()
+            except (ConnectionResetError, json.JSONDecodeError):
                 return
-            if len(payload) != length:
-                return
-            request = json.loads(payload)
             replay = replies.popleft()
             slow = replay if isinstance(replay, SlowBody) else None
             if isinstance(replay, SlowBody):
@@ -146,7 +142,7 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                     reply = deepcopy(replay())
             data: dict[str, Any] = reply.get("data", {})
             if "userIntents" in data:
-                assert request["query"] == keeper.INTENTS
+                assert request["query"] in (keeper.INTENTS, keeper.WAIT_INTENTS)
                 assert request["variables"]["user"].lower() in (ADDR, NIBI_ADDR)
                 key = request["variables"]["key"]
                 assert key in (KEY, None, *submitted_keys)
@@ -172,15 +168,15 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                     offset = 0
             elif "borrowings" in data.get("perp", {}):
                 assert request["query"] == keeper.MARKETS
+            if slow is None:
+                with suppress(BrokenPipeError, ConnectionResetError):
+                    self.reply(reply)
+                return
             body = json.dumps(reply).encode()
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            if slow is None:
-                with suppress(BrokenPipeError, ConnectionResetError):
-                    self.wfile.write(body)
-                return
             slow.started.set()
             try:
                 with suppress(BrokenPipeError, ConnectionResetError):
@@ -193,18 +189,9 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
             finally:
                 slow.finished.set()
 
-        def log_message(self, format: str, *args: Any) -> None:
-            pass
-
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as http:
-        thread = threading.Thread(target=http.serve_forever, args=(0.01,), daemon=True)
-        thread.start()
-        try:
-            yield f"http://127.0.0.1:{http.server_port}/query", replies
-            assert not replies
-        finally:
-            http.shutdown()
-            thread.join()
+    with keeper_server(Handler) as base:
+        yield f"{base}/query", replies
+        assert not replies
 
 
 def status(endpoint: str) -> str:
@@ -352,10 +339,16 @@ def test_unindexed_sweep_then_filled_through_cli_and_mcp(keeper_replay):
     replies.extend(("filled", "not_yet_in_history", "filled_history"))
     result = cli()
     assert result["userIntents"][0]["lifecycleStep"] == "exec_pass"
-    assert (
-        result["matchedTradeHistory"]
-        == RESPONSES["filled_history"]["data"]["perp"]["tradeHistory"]
-    )
+    assert result["matchedTradeHistory"] == [
+        {
+            "id": 1007,
+            "intentKey": KEY,
+            "tradeChangeType": "position_opened",
+            "txHash": "a" * 64,
+            "block": {"block": 50109596, "block_ts": "2026-11-20T15:43:31.000Z"},
+            "trade": {"id": 7, "trader": NIBI_ADDR},
+        }
+    ]
     assert status(endpoint) == "terminal"
 
     replies.append("pending_exec")
@@ -1115,7 +1108,7 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert result["outcome"] == "filled"
     assert "code" not in result
     receipt = result["receipt"]
-    assert receipt["requestTxHash"] == "A" * 64
+    assert receipt["requestTxHash"] == "a" * 64
     assert receipt["requestBlock"] == 50109595
     assert receipt["execution"]["block"] == 50109596
     assert receipt["execution"]["historyId"] == 1007
@@ -1139,6 +1132,26 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert start["intentKey"] == end["intentKey"] == KEY
 
 
+def test_wait_projects_receipt_fields_from_keeper(keeper_replay):
+    endpoint, replies = keeper_replay
+    reserve(endpoint)
+    opaque = "opaque upstream value"
+    history = fill_history()
+    row = history["data"]["perp"]["tradeHistory"][0]
+    row["marketOrder"]["execPrice"] = opaque
+    row["trade"].update(openPrice=opaque, unrelated=opaque)
+    row["openingFeeUsd"] = opaque
+    replies.extend(("filled", history))
+
+    outcome = wait.for_intent(endpoint, ADDR, KEY)
+    assert outcome["outcome"] == "filled"
+    receipt = outcome["receipt"]
+    assert receipt["execution"]["historyId"] == 1007
+    assert receipt["fill"]["oraclePrice"] is None
+    assert receipt["positionNow"]["openPrice"] is None
+    assert opaque not in json.dumps(outcome)
+
+
 def test_wait_times_out_with_unknown_and_keeps_pending_ledger(keeper_replay):
     endpoint, replies = keeper_replay
     replies.extend(("pending_exec", "pending_exec"))
@@ -1159,7 +1172,9 @@ def test_wait_times_out_with_unknown_and_keeps_pending_ledger(keeper_replay):
 def test_intent_wait_cli_returns_confirmed_failure(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)
-    replies.extend(("pending_exec", "market_order_fill_failed"))
+    failed = deepcopy(RESPONSES["market_order_fill_failed"])
+    failed["data"]["userIntents"][0]["errorMsg"] = "opaque upstream error details"
+    replies.extend(("pending_exec", failed))
     result = CliRunner().invoke(
         main, ["--endpoint", endpoint, "--json", "intent", "wait", KEY]
     )
@@ -1167,6 +1182,7 @@ def test_intent_wait_cli_returns_confirmed_failure(keeper_replay):
     value = json.loads(result.output)
     assert value["outcome"] == "failed"
     assert value["keeperErrorCode"] == "market_order_fill_failed"
+    assert "opaque upstream error details" not in result.output
     assert value["receipt"]["fill"] is None
     assert status(endpoint) == "terminal"
 

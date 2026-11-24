@@ -135,6 +135,16 @@ def describe(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.PositionChanged):
+        if exc.preview is None:
+            return error(failure.message, Code.PREVIEW_MISMATCH)
+        return error(
+            "The position or quote changed during confirmation, so nothing was"
+            " submitted. Show the user the latest preview, get their confirmation"
+            " again, then retry with its previewDigest.",
+            Code.PREVIEW_MISMATCH,
+            preview=with_digest(exc.preview),
+        )
     if failure.code == Code.INTERNAL_ERROR:
         trace = "".join(traceback.format_exception(exc))
         log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
@@ -367,7 +377,8 @@ def account_positions(settings: Settings, addr: str | None) -> dict[str, Any]:
 def account_history(settings: Settings, addr: str | None) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
     variables = {"trader": account["addr"]}
-    return {**account, **keeper.request(settings.endpoint, keeper.HISTORY, variables)}
+    data = keeper.request(settings.endpoint, keeper.HISTORY, variables)
+    return {**account, **keeper.safe_history_response(data)}
 
 
 def account_balances(settings: Settings, addr: str | None) -> dict[str, Any]:
@@ -385,55 +396,12 @@ def intent_local(settings: Settings, addr: str | None) -> dict[str, Any]:
     return {**account, "intents": pending}
 
 
-def _reconcile_fields(data: dict[str, Any]) -> dict[str, Any]:
-    """Keep the outcome and guidance Sai derives while reconciling."""
-    result = {}
-    if data.get("outcome") in (
-        "accepted",
-        "pending",
-        "terminal-filled",
-        "terminal-failed",
-        "unknown",
-    ):
-        result["outcome"] = data["outcome"]
-    if data.get("localStatus") in (
-        "unknown",
-        "accepted",
-        "pending",
-        "terminal",
-        "rejected",
-        "not_sent",
-        "absent",
-    ):
-        result["localStatus"] = data["localStatus"]
-    if data.get("hint") in (
-        reconcile.PENDING_HINT,
-        reconcile.UNINDEXED_HINT,
-        reconcile.HISTORY_HINT,
-        reconcile.LOCAL_PENDING_HINT,
-    ):
-        result["hint"] = data["hint"]
-    return result
-
-
 def intent_status(
     settings: Settings, addr: str | None, key: str | None
 ) -> dict[str, Any]:
     account = resolve_addr(settings, addr)
     data = reconcile.reconcile(settings.endpoint, account["addr"], key)
-    report: dict[str, Any] = {**account, **_reconcile_fields(data)}
-    for name, sanitize in (
-        ("userIntents", keeper.safe_intent_record),
-        ("matchedTradeHistory", keeper.safe_intent_history),
-    ):
-        if isinstance(rows := data.get(name), list):
-            report[name] = [
-                sanitize(row)
-                | (_reconcile_fields(row) if name == "userIntents" else {})
-                for row in rows
-                if isinstance(row, dict)
-            ]
-    return report
+    return {**account, **reconcile.status_report(data)}
 
 
 async def intent_wait(
@@ -481,7 +449,7 @@ def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
     """Return the parts of PREVIEW the user confirms.
 
     That is the account the trade would be submitted under, the intent, and
-    the margin quote when there is one. A market open leaves out its intent
+    the position quote when there is one. A market open leaves out its intent
     price, which is refreshed at submit, and binds the referencePrice the
     user confirmed instead.
     """

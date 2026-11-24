@@ -45,8 +45,23 @@ def change_http() -> None:
 def change_reservation_clock() -> None:
     reserve = storage.pending
 
-    def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> None:
-        reserve(key, endpoint, account, kind, entity)
+    def pending(
+        key: str,
+        endpoint: str,
+        account: str,
+        kind: str,
+        entity: str,
+        *,
+        allow_concurrent_open: bool = False,
+    ) -> None:
+        reserve(
+            key,
+            endpoint,
+            account,
+            kind,
+            entity,
+            allow_concurrent_open=allow_concurrent_open,
+        )
         with storage.db() as conn:
             conn.execute(
                 "UPDATE intents SET created_at = created_at * 1000 WHERE id = ?", (key,)

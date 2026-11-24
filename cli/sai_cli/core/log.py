@@ -76,12 +76,13 @@ from types import MappingProxyType
 from typing import Any, Self
 from urllib.parse import urlsplit
 
+from . import paths
 from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
 
 DIR_NAME = "logs"
 SURFACES = ("cli", "mcp", "update")
 LEVELS = ("info", "warn", "error")
-DIR_MODE, FILE_MODE = 0o700, 0o600
+FILE_MODE = 0o600
 DEFAULT_KEEP_DAYS = 14
 PRUNE_MARKER = ".pruned"
 ENDPOINT_KEY = ".endpoint-key"
@@ -152,8 +153,7 @@ _silenced = 0
 
 
 def home(env: Mapping[str, str] | None = None) -> Path:
-    values = os.environ if env is None else env
-    return Path(values.get("SAI_HOME", Path.home() / ".sai"))
+    return paths.sai_home(env)
 
 
 def directory(env: Mapping[str, str] | None = None) -> Path:
@@ -197,7 +197,26 @@ def _off(raw: str | None) -> bool:
     return bool(text) and text not in _TRUE
 
 
-_config_cache: dict[tuple[Any, ...], tuple[bool, int]] = {}
+_ConfigStat = tuple[int, int, int, int, int]
+_config_cache: dict[tuple[Any, ...], tuple[float, tuple[bool, int]]] = {}
+_config_generation = object()
+
+
+def _config_stat(path: Path) -> _ConfigStat | None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
+
+
+def invalidate_config() -> None:
+    """Refresh the writer after a successful config edit."""
+    global _config_generation
+    # An in-flight read or write can still finish under its previous generation.
+    _config_generation = object()
+    _config_cache.clear()
+    _skip.clear()
 
 
 def resolve_config(
@@ -209,15 +228,31 @@ def resolve_config(
     Each key resolves on its own, environment first. With logging turned
     off, `logs.keep_days` is not validated. Otherwise any logs value that is
     invalid, or a config file that cannot be read or parsed, turns logging
-    off. The answer is cached until the file or the values change.
+    off. The answer is cached by file metadata and environment values.
     """
+    value, _ = _resolve_config(root, raw_enabled, raw_keep)
+    return value
+
+
+def _resolve_config(
+    root: Path, raw_enabled: str | None, raw_keep: str | None
+) -> tuple[tuple[bool, int], _ConfigStat | None]:
+    """Return the settings and the file metadata they were checked against."""
     from . import settings
 
+    generation = _config_generation
     path = root / settings.FILE_NAME
-    key = (str(path), _stat_key(path), raw_enabled, raw_keep)
+    try:
+        signature = _config_stat(path)
+    except OSError:
+        return (False, DEFAULT_KEEP_DAYS), None
+    key = (str(path), signature, raw_enabled, raw_keep, generation)
+    checked_at = time.monotonic()
     cached = _config_cache.get(key)
-    if cached is not None:
-        return cached
+    # Expire unchanged entries too, for filesystems with coarse timestamps
+    # and Windows versions that report creation time as ctime.
+    if cached is not None and checked_at - cached[0] < RECHECK_SECONDS:
+        return cached[1], signature
 
     def pick(name: str, raw: str | None, file: Mapping[str, Any]) -> Any:
         if raw is not None and raw.strip():
@@ -237,8 +272,8 @@ def resolve_config(
         value = (False, DEFAULT_KEEP_DAYS)
     if len(_config_cache) > 64:
         _config_cache.clear()
-    _config_cache[key] = value
-    return value
+    _config_cache[key] = (checked_at, value)
+    return value, signature
 
 
 def config() -> tuple[bool, int]:
@@ -588,10 +623,12 @@ class LogDir:
         directory, or owned by someone else. With CREATE, make it first, and
         remove group and other access from a directory this user owns."""
         try:
-            if create and not root.is_symlink() and not root.exists():
-                root.parent.mkdir(mode=DIR_MODE, parents=True, exist_ok=True)
-                with suppress(FileExistsError):
-                    root.mkdir(mode=DIR_MODE)
+            if create:
+                paths.private_directory(root.parent, profile_root=True)
+                # Preserve owner access on existing log directories. The
+                # descriptor below is used to clear group and other access.
+                if not root.exists():
+                    paths.private_directory(root)
             if not _DIR_FD:
                 if redirected(root) or not root.is_dir():
                     return None
@@ -889,8 +926,10 @@ _dropped = 0
 # Characters of text in the queue, under _size_lock.
 _queued_chars = 0
 _size_lock = threading.Lock()
-# Homes whose logging is off or failing, with when the writer last looked.
-_skip: dict[tuple[str, str | None, str | None], float] = {}
+# Homes whose logging is off or failing, with the config the writer checked.
+_skip: dict[
+    tuple[str, str | None, str | None], tuple[object, float, _ConfigStat | None]
+] = {}
 # The UTC day each home was last checked for old files.
 _pruned: dict[str, date] = {}
 
@@ -911,13 +950,14 @@ def _write(item: _Item) -> None:
     global _dropped
     key = (item.root, item.on, item.keep)
     root = Path(item.root)
-    on, keep_days = resolve_config(root, item.on, item.keep)
+    generation = _config_generation
+    (on, keep_days), signature = _resolve_config(root, item.on, item.keep)
     if not on:
-        _skip[key] = time.monotonic()
+        _skip[key] = (generation, time.monotonic(), signature)
         return
     opened = LogDir.open(root / DIR_NAME, create=True)
     if opened is None:
-        _skip[key] = time.monotonic()
+        _skip[key] = (generation, time.monotonic(), signature)
         return
     with opened:
         _skip.pop(key, None)
@@ -988,9 +1028,19 @@ def _target() -> tuple[str, str | None, str | None] | None:
     if _off(raw_on):
         return None
     key = (str(home()), raw_on, os.environ.get("SAI_LOG_KEEP_DAYS"))
-    skipped = _skip.get(key)
-    if skipped is not None and time.monotonic() - skipped < RECHECK_SECONDS:
-        return None
+    if skipped := _skip.get(key):
+        generation, checked_at, signature = skipped
+        if (
+            generation is _config_generation
+            and time.monotonic() - checked_at < RECHECK_SECONDS
+        ):
+            from . import settings
+
+            try:
+                if _config_stat(Path(key[0]) / settings.FILE_NAME) == signature:
+                    return None
+            except OSError:
+                return None
     return key
 
 
@@ -1004,12 +1054,12 @@ def active() -> bool:
 
 
 def event(name: str, level: str = "info", /, **fields: Any) -> None:
-    """Queue one event for the writer. Never blocks and never raises; with
-    logging off it returns before looking at FIELDS.
+    """Queue one event for the writer without waiting for the writer.
 
-    The work is bounded and does no I/O: FIELDS are copied within a fixed
-    budget and cleared of the session tokens this process has seen. The
-    writer thread reads the session store and scrubs again.
+    During a retry delay, check the config's metadata before deciding to
+    skip. FIELDS are copied within a fixed budget and cleared of the session
+    tokens this process has seen. The writer reads the session store and
+    scrubs again.
     """
     global _dropped, _queued_chars
     try:
@@ -1084,8 +1134,7 @@ def reset() -> None:
     _token_key = None
     with _token_lock:
         _known.clear()
-    _config_cache.clear()
-    _skip.clear()
+    invalidate_config()
     _pruned.clear()
 
 
@@ -1102,7 +1151,24 @@ def _line_blocks(
     complete_end: bool = True,
 ) -> Iterator[list[bytes]]:
     """Read a snapshot backwards, yielding once per disk chunk."""
+    for _, block in _positioned_blocks(
+        fd, chunk, end=end, read=read, max_line=max_line, complete_end=complete_end
+    ):
+        yield [raw for _, raw in block]
+
+
+def _positioned_blocks(
+    fd: int,
+    chunk: int,
+    *,
+    end: int,
+    read: Callable[[int, int], bytes],
+    max_line: int | None,
+    complete_end: bool,
+) -> Iterator[tuple[int, list[tuple[int, bytes]]]]:
+    """Yield each row's start and a safe resume offset after each chunk."""
     position = end
+    resume = end
     rest: bytes | None = b"" if complete_end else None
     while position:
         size = min(chunk, position)
@@ -1118,17 +1184,28 @@ def _line_blocks(
                 rest = (
                     combined if max_line is None or len(combined) <= max_line else None
                 )
-            yield []
+            if rest is None:
+                resume = position
+            if position == 0:
+                yield 0, [(0, rest)] if rest else []
+                return
+            yield resume, []
             continue
-        tail = pieces[-1] + rest if rest is not None else b""
+        offset = position + size
+        block = []
+        for index, piece in enumerate(reversed(pieces[1:])):
+            offset -= len(piece)
+            raw = piece if index else (piece + rest if rest is not None else b"")
+            if raw and (max_line is None or len(raw) <= max_line):
+                block.append((offset, raw))
+            offset -= 1
         rest = pieces[0] if max_line is None or len(pieces[0]) <= max_line else None
-        yield [
-            piece
-            for piece in (tail, *reversed(pieces[1:-1]))
-            if piece and (max_line is None or len(piece) <= max_line)
-        ]
-    if rest:
-        yield [rest]
+        resume = position + len(pieces[0]) + 1
+        if position == 0:
+            if rest:
+                block.append((0, rest))
+            resume = 0
+        yield resume, block
 
 
 def _last_lines(fd: int, chunk: int) -> Iterator[bytes]:
@@ -1360,6 +1437,180 @@ class LogScan:
                                     pending[name] = min(current, ts) if current else ts
                                 yield line
                         readers = next_readers
+
+
+@dataclass(frozen=True)
+class ScanPosition:
+    day: date
+    # Exclusive byte endpoints in SURFACES order. None starts a fresh day.
+    offsets: tuple[int, ...] | None = None
+
+
+@dataclass
+class PageScan:
+    max_bytes: int = MAX_SCAN_BYTES
+    max_rows: int = MAX_SCAN_ROWS
+    max_files: int = MAX_SCAN_FILES
+    truncated: bool = False
+    resume: ScanPosition | None = None
+
+    def rows(
+        self,
+        root: Path | None = None,
+        *,
+        start: ScanPosition | None = None,
+        first_day: date | None = None,
+        last_day: date | None = None,
+        since: str | None = None,
+        before: str | None = None,
+        observe: Callable[[dict[str, Any]], None] | None = None,
+    ) -> Generator[tuple[ScanPosition, dict[str, Any]]]:
+        """Merge reverse file reads one day at a time and checkpoint each file."""
+        opened = LogDir.open(root or directory())
+        if opened is None:
+            return
+        bytes_left, rows_left, files_left = (
+            self.max_bytes,
+            self.max_rows,
+            self.max_files,
+        )
+        byte_limit = False
+
+        def read(fd: int, size: int) -> bytes:
+            nonlocal bytes_left, byte_limit
+            if size > bytes_left:
+                self.truncated = byte_limit = True
+                return b""
+            data = os.read(fd, size)
+            bytes_left -= len(data)
+            return data
+
+        def decode_block(
+            block: list[tuple[int, bytes]],
+        ) -> Iterator[tuple[int, int, dict[str, Any]]]:
+            for offset, raw in block:
+                if (
+                    observe is None
+                    and (since or before)
+                    and (header := _TS_HEADER.match(raw))
+                ):
+                    ts = header[1].decode()
+                    if (since and ts < since) or (before and ts >= before):
+                        continue
+                try:
+                    line = decode_row(raw)
+                except (ValueError, RecursionError):
+                    continue
+                if not isinstance(line, dict):
+                    continue
+                if observe is not None:
+                    observe(line)
+                ts = line.get("ts")
+                if isinstance(ts, str) and (
+                    (since is None or ts >= since) and (before is None or ts < before)
+                ):
+                    yield offset, offset + len(raw) + 1, line
+
+        def read_rows(
+            slot: int, fd: int, end: int, offsets: list[int]
+        ) -> Iterator[tuple[int, dict[str, Any]]]:
+            os.lseek(fd, end - 1, os.SEEK_SET)
+            complete = read(fd, 1) == b"\n"
+            for resume, block in _positioned_blocks(
+                fd,
+                TAIL_CHUNK,
+                end=end,
+                read=read,
+                max_line=MAX_LINE,
+                complete_end=complete,
+            ):
+                # Observe the whole chunk before choosing its first merge candidate.
+                # A call in the chunk can identify gaps from other files.
+                candidates = decode_block(block)
+                for offset, row_end, line in (
+                    list(candidates) if observe is not None else candidates
+                ):
+                    offsets[slot] = row_end
+                    yield offset, line
+                offsets[slot] = resume
+
+        def advance(
+            slot: int,
+            readers: dict[int, Iterator[tuple[int, dict[str, Any]]]],
+            heads: dict[int, tuple[int, dict[str, Any]]],
+            offsets: list[int],
+        ) -> None:
+            try:
+                heads[slot] = next(readers[slot])
+            except StopIteration:
+                heads.pop(slot, None)
+                if not byte_limit:
+                    offsets[slot] = 0
+            except OSError:
+                heads.pop(slot, None)
+                self.truncated = True
+
+        with opened:
+            files = (
+                (day, surface, name)
+                for day, surface, name in reversed(opened.files())
+                if (first_day is None or day >= first_day)
+                and (last_day is None or day <= last_day)
+                and (start is None or day <= start.day)
+            )
+            for day, daily in itertools.groupby(files, key=lambda item: item[0]):
+                names = list(daily)
+                if len(names) > files_left:
+                    self.truncated = True
+                    self.resume = ScanPosition(day)
+                    return
+                files_left -= len(names)
+                offsets = [0] * len(SURFACES)
+                with ExitStack() as active:
+                    readers: dict[int, Iterator[tuple[int, dict[str, Any]]]] = {}
+
+                    for _, surface, name in names:
+                        slot = SURFACES.index(surface)
+                        try:
+                            fd = opened.read_fd(name)
+                            active.callback(os.close, fd)
+                            end = os.fstat(fd).st_size
+                            if (
+                                start is not None
+                                and day == start.day
+                                and start.offsets is not None
+                            ):
+                                end = min(end, start.offsets[slot])
+                            offsets[slot] = end
+                            if end:
+                                readers[slot] = read_rows(slot, fd, end, offsets)
+                        except OSError:
+                            self.truncated = True
+
+                    heads: dict[int, tuple[int, dict[str, Any]]] = {}
+
+                    for slot in readers:
+                        advance(slot, readers, heads, offsets)
+                        if byte_limit:
+                            self.resume = ScanPosition(day, tuple(offsets))
+                            return
+                    while heads:
+                        if rows_left == 0:
+                            self.truncated = True
+                            self.resume = ScanPosition(day, tuple(offsets))
+                            return
+                        slot = max(
+                            heads, key=lambda key: (event_order(heads[key][1]), key)
+                        )
+                        offset, line = heads[slot]
+                        position = ScanPosition(day, tuple(offsets))
+                        offsets[slot] = offset
+                        rows_left -= 1
+                        yield position, line
+                        advance(slot, readers, heads, offsets)
+                        if byte_limit:
+                            self.resume = ScanPosition(day, tuple(offsets))
+                            return
 
 
 def tail(

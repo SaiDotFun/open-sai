@@ -328,13 +328,18 @@ def _result(
         ),
     }
     if outcome == "failed":
-        result.update(keeperErrorCode=row.get("errorCode"), message=row.get("errorMsg"))
+        result.update(
+            keeperErrorCode=keeper.intent_error_code(row),
+            message="Keeper reported an intent error.",
+        )
     if outcome == "liquidated":
         result["message"] = "Keeper recorded liquidation while processing the intent."
     if outcome == "unexpected":
         change = result["receipt"]["execution"]["tradeChangeType"]
         result["message"] = (
             f"Keeper recorded {change} for this intent. Review the receipt."
+            if change
+            else "Keeper recorded an unexpected outcome. Review the receipt."
         )
     if outcome == "rejected":
         result["message"] = "Keeper rejected admission for this intent."

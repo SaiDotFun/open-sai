@@ -99,7 +99,7 @@ def partial_close(monkeypatch, indexed: int, contract: int, *args: str):
     monkeypatch.setattr(
         margin,
         "_get_json",
-        lambda url: {"default_node_info": {"network": "cataclysm-1"}},
+        lambda url, **kwargs: {"default_node_info": {"network": "cataclysm-1"}},
     )
     monkeypatch.setattr(
         margin,
