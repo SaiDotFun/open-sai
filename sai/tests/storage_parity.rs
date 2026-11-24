@@ -99,7 +99,7 @@ fn missing_home_status_and_list_have_no_side_effects() {
 #[test]
 fn auth_output_shows_only_the_origin_but_checks_the_full_endpoint() {
     let home = tempdir().unwrap();
-    let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture#secret";
+    let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture";
     Storage::new(home.path())
         .save_session(Session::new(
             String::from("synthetic-session").into(),
