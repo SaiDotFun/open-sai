@@ -569,6 +569,34 @@ def test_use_rejects_malformed_expiry_before_switching(
         assert result.stderr == f"Error: {message}\n"
 
 
+def test_use_refuses_endpoint_object_before_switching(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = "synthetic-cli-endpoint-credential-marker"
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    storage._save_accounts(
+        {
+            "active": OTHER,
+            "sessions": {
+                ADDR: {**session_for(make_token()), "endpoint": {"value": marker}},
+                OTHER: {**session_for(make_token(OTHER)), "evmAddress": OTHER},
+            },
+        }
+    )
+    path = env.home / "trader" / "sessions.json"
+    before = path.read_bytes()
+
+    result = env.run("--json", "auth", "use", ADDR)
+
+    assert result.returncode == 1
+    assert marker not in result.stdout + result.stderr
+    assert json.loads(result.stdout)["error"]["code"] == "SESSION_UNAVAILABLE"
+    assert "invalid endpoint" in result.stdout
+    assert marker.encode() not in env.stored_bytes()
+    assert b"session.active" not in env.stored_bytes()
+    assert path.read_bytes() == before
+
+
 def test_tampered_session_cannot_be_unlocked(env: Env) -> None:
     write_envelope(
         env.home,

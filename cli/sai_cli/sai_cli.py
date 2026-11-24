@@ -879,7 +879,14 @@ def auth_use(ctx: click.Context, addr: str) -> None:
     Commands without `--as` act on the active account. Sign in again to
     connect a new one: `sai auth login NAME` and `sai auth import` add accounts.
     """
-    emit(ctx, {**sessions.summary(storage.use_session(addr)), "active": True})
+
+    def response(accounts: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **sessions.summary(accounts["sessions"][accounts["active"]]),
+            "active": True,
+        }
+
+    emit(ctx, storage.use_session(addr, response))
 
 
 @auth.command("status")

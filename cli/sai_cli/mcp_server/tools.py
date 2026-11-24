@@ -343,9 +343,8 @@ def auth_status(settings: Settings, addr: str | None = None) -> dict[str, Any]:
     }
 
 
-def account_rows(settings: Settings) -> dict[str, Any]:
+def account_rows(settings: Settings, accounts: dict[str, Any]) -> dict[str, Any]:
     """Describe every connected account without its token."""
-    accounts = storage.load_accounts()
     now = datetime.now(UTC)
     rows = []
     for key, result in sorted(accounts["sessions"].items()):
@@ -365,12 +364,11 @@ def account_rows(settings: Settings) -> dict[str, Any]:
 
 
 def auth_list(settings: Settings) -> dict[str, Any]:
-    return account_rows(settings)
+    return account_rows(settings, storage.load_accounts())
 
 
 def auth_use(settings: Settings, addr: str) -> dict[str, Any]:
-    storage.use_session(addr)
-    return account_rows(settings)
+    return storage.use_session(addr, lambda accounts: account_rows(settings, accounts))
 
 
 # Reads

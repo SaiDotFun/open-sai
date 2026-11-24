@@ -1475,13 +1475,24 @@ def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
         }
 
 
-def test_stdio_auth_use_keeps_malformed_expiry_private(tmp_path: Path) -> None:
-    secret = "synthetic-mcp-expiry-credential-marker"
-    with sai_log.silenced():
-        storage.save_session({**stored_session(), "expiresAt": secret})
-        storage.save_session(
-            {**stored_session(), "evmAddress": OTHER, "token": OTHER_TOKEN}
-        )
+@pytest.mark.parametrize("corruption", ["selected-expiry", "other-expiry", "endpoint"])
+def test_stdio_auth_use_refuses_malformed_response_before_switching(
+    tmp_path: Path, corruption: str
+) -> None:
+    secret = "synthetic-mcp-switch-credential-marker"
+    third = "0x" + "d" * 40
+    records: dict[str, dict[str, Any]] = {
+        ADDR: stored_session(),
+        OTHER: {**stored_session(), "evmAddress": OTHER, "token": OTHER_TOKEN},
+        third: {**stored_session(), "evmAddress": third},
+    }
+    if corruption == "endpoint":
+        records[ADDR]["endpoint"] = {"value": secret}
+        field = "endpoint"
+    else:
+        records[third if corruption == "other-expiry" else ADDR]["expiresAt"] = secret
+        field = "expiry"
+    storage._save_accounts({"active": OTHER, "sessions": records})
     path = tmp_path / "trader" / "sessions.json"
     before = path.read_bytes()
     command, *args = sai_command()
@@ -1500,7 +1511,7 @@ def test_stdio_auth_use_keeps_malformed_expiry_private(tmp_path: Path) -> None:
             result = await client.call_tool("auth_use", {"addr": ADDR})
             assert secret not in result.model_dump_json()
             assert json.loads(text_of(result.content)) == {
-                "error": f"Stored session has an invalid expiry; {storage.SIGN_IN_AGAIN}",
+                "error": f"Stored session has an invalid {field}; {storage.SIGN_IN_AGAIN}",
                 "code": "SESSION_UNAVAILABLE",
             }
 

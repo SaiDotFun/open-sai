@@ -13,7 +13,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from datetime import UTC, datetime
@@ -323,8 +323,10 @@ def load_session(addr: str | None = None) -> dict[str, str]:
     return accounts["sessions"][accounts["active"]]
 
 
-def use_session(addr: str) -> dict[str, str]:
-    """Make the connected ADDR the active account and return its session."""
+def use_session(
+    addr: str, prepare: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+) -> dict[str, Any]:
+    """Select ADDR, preparing its response from the candidate state before saving."""
     from .session import expiry_time
 
     with _locked():
@@ -333,9 +335,10 @@ def use_session(addr: str) -> dict[str, str]:
         session = accounts["sessions"][key]
         expiry_time(session)
         accounts["active"] = key
+        response = session if prepare is None else prepare(accounts)
         _save_accounts(accounts)
         log.event("session.active", addr=session["evmAddress"])
-        return session
+        return response
 
 
 def session_exists() -> bool:

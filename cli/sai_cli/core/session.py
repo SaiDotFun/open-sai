@@ -145,6 +145,10 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
 def summary(result: dict[str, str]) -> dict[str, str | None]:
     """Return the address, expiry, and Keeper origin for display."""
     endpoint = result.get("endpoint")
+    if endpoint is not None and not isinstance(endpoint, str):
+        raise SessionError(
+            f"Stored session has an invalid endpoint; {storage.SIGN_IN_AGAIN}"
+        )
     return {
         "addr": result["evmAddress"],
         "expiresAt": result["expiresAt"],
