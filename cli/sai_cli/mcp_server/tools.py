@@ -146,6 +146,18 @@ def describe(exc: Exception) -> dict[str, Any]:
             Code.PREVIEW_MISMATCH,
             preview=with_digest(exc.preview),
         )
+    if isinstance(exc, storage.IntentReservationError):
+        if key := failure.intent_key:
+            return error(
+                failure.message,
+                failure.code,
+                intentKey=key,
+                next=(
+                    f"Call intent_status with key {key} and addr {exc.account}"
+                    " to check the local reservation."
+                ),
+            )
+        return error(failure.message, failure.code)
     if failure.code == Code.INTERNAL_ERROR:
         trace = "".join(traceback.format_exception(exc))
         log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))

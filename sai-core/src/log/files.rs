@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     path::Path,
     time::SystemTime,
 };
@@ -10,6 +10,8 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use super::Surface;
 
 const PRUNE_MARKER: &str = ".pruned";
+const ENDPOINT_KEY: &str = ".endpoint-key";
+const ENDPOINT_KEY_LOCK: &str = ".endpoint-key.lock";
 
 #[cfg(unix)]
 pub(super) struct LogDir(File);
@@ -100,68 +102,88 @@ impl LogDir {
         }
     }
 
-    #[cfg(unix)]
     pub fn endpoint_key(&self) -> io::Result<[u8; 32]> {
-        use ring::rand::{SecureRandom, SystemRandom};
-        use rustix::fs::{AtFlags, renameat, unlinkat};
-
-        const KEY: &str = ".endpoint-key";
-
-        if let Some(key) = self.read_endpoint_key(KEY)? {
-            return Ok(key);
+        match self.read_endpoint_key() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => return result,
         }
-        // Python writers use this same lock and publish the key by rename.
-        let lock = self.private_file(".endpoint-key.lock", false)?;
+        let lock = self.private_file(ENDPOINT_KEY_LOCK, false)?;
         lock.lock()?;
-        if let Some(key) = self.read_endpoint_key(KEY)? {
-            return Ok(key);
+        match self.read_endpoint_key() {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            result => return result,
         }
         let mut key = [0; 32];
-        SystemRandom::new()
+        use ring::rand::SecureRandom;
+        ring::rand::SystemRandom::new()
             .fill(&mut key)
-            .map_err(|_| io::Error::other("log endpoint identity key generation failed"))?;
+            .map_err(|_| io::Error::other("could not generate log identity key"))?;
         let staged = format!(".endpoint-key-{}", uuid::Uuid::new_v4().simple());
-        let mut output = self.private_file(&staged, true)?;
-        let result = output.write_all(&key).and_then(|()| {
-            renameat(&self.0, staged.as_str(), &self.0, KEY).map_err(io::Error::from)
-        });
-        if result.is_err() {
-            let _ = unlinkat(&self.0, staged.as_str(), AtFlags::empty());
-        }
-        result.map(|()| key)
+        let mut file = self.private_file(&staged, true)?;
+        let result = file.write_all(&key);
+        drop(file);
+        self.publish_endpoint_key(&staged, result)?;
+        Ok(key)
     }
 
     #[cfg(unix)]
-    fn read_endpoint_key(&self, name: &str) -> io::Result<Option<[u8; 32]>> {
-        use rustix::{
-            fs::{Mode, OFlags, openat},
-            process::geteuid,
-        };
-        use std::{io::Read, os::unix::fs::MetadataExt};
-
-        let file = match openat(
-            &self.0,
-            name,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
-            Mode::empty(),
-        ) {
-            Ok(fd) => File::from(fd),
-            Err(rustix::io::Errno::NOENT) => return Ok(None),
-            Err(error) => return Err(error.into()),
-        };
-        let info = file.metadata()?;
-        if !info.is_file()
-            || info.nlink() != 1
-            || info.uid() != geteuid().as_raw()
-            || info.mode() & 0o077 != 0
-        {
-            return Err(io::ErrorKind::PermissionDenied.into());
+    fn publish_endpoint_key(&self, staged: &str, written: io::Result<()>) -> io::Result<()> {
+        use rustix::fs::{AtFlags, renameat, unlinkat};
+        let result = written
+            .and_then(|()| renameat(&self.0, staged, &self.0, ENDPOINT_KEY).map_err(Into::into));
+        if result.is_err() {
+            let _ = unlinkat(&self.0, staged, AtFlags::empty());
         }
+        result
+    }
+
+    #[cfg(not(unix))]
+    fn publish_endpoint_key(&self, staged: &str, written: io::Result<()>) -> io::Result<()> {
+        let staged = self.0.join(staged);
+        let result = written.and_then(|()| fs::rename(&staged, self.0.join(ENDPOINT_KEY)));
+        if result.is_err() {
+            let _ = fs::remove_file(staged);
+        }
+        result
+    }
+
+    fn read_endpoint_key(&self) -> io::Result<[u8; 32]> {
+        #[cfg(unix)]
+        let file = {
+            use rustix::{
+                fs::{Mode, OFlags, openat},
+                process::geteuid,
+            };
+            use std::os::unix::fs::MetadataExt;
+            let file = File::from(openat(
+                &self.0,
+                ENDPOINT_KEY,
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+                Mode::empty(),
+            )?);
+            let metadata = file.metadata()?;
+            if !metadata.is_file()
+                || metadata.nlink() > 1
+                || metadata.uid() != geteuid().as_raw()
+                || metadata.mode() & 0o077 != 0
+            {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            file
+        };
+        #[cfg(not(unix))]
+        let file = {
+            let target = self.0.join(ENDPOINT_KEY);
+            let metadata = fs::symlink_metadata(&target)?;
+            if !metadata.is_file() || redirected(&metadata) {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            File::open(target)?
+        };
         let mut bytes = Vec::with_capacity(33);
         file.take(33).read_to_end(&mut bytes)?;
         bytes
             .try_into()
-            .map(Some)
             .map_err(|_| io::ErrorKind::InvalidData.into())
     }
 

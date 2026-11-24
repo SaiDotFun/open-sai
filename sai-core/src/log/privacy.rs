@@ -77,6 +77,23 @@ impl Field {
         Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Arg).collect())
     }
 
+    pub fn endpoint_identity(value: &str) -> Self {
+        let site = origin(value);
+        if site == REDACTED_URL {
+            return Self::Scalar(Value::Null);
+        }
+        let Some(endpoint) = Endpoint::split(value.trim()) else {
+            return Self::Scalar(Value::Null);
+        };
+        let path = if endpoint.path.is_empty() {
+            "/"
+        } else {
+            &endpoint.path
+        };
+        let digest = Sha256::digest(format!("{site}{path}?{}", endpoint.query));
+        Self::EndpointIdentity(digest.into())
+    }
+
     pub(super) fn snapshot(self, budget: &mut Budget, tokens: &[String], depth: usize) -> Self {
         budget.chars = budget.chars.saturating_sub(16);
         budget.nodes = budget.nodes.saturating_sub(1);
@@ -84,6 +101,7 @@ impl Field {
             Self::Text(text) => Self::Text(copy_text(&text, budget, tokens)),
             Self::Untrusted(text) => Self::Untrusted(copy_text(&text, budget, tokens)),
             Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
+            Self::EndpointIdentity(_) => self,
             Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
             Self::EndpointIdentity(_) => self,
             Self::Scalar(Value::Number(number))

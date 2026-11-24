@@ -268,7 +268,7 @@ pub(crate) fn storage_event_with_endpoint(
 }
 
 // Match the spaces Python emits with json.dumps(indent=None).
-struct InlineJson;
+pub(crate) struct InlineJson;
 
 impl Formatter for InlineJson {
     fn begin_array_value<W: Write + ?Sized>(
