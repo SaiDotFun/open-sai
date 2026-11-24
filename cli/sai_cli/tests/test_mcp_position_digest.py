@@ -778,6 +778,51 @@ def position_cli_args(base_url: str, command: list[str]) -> list[str]:
     ]
 
 
+@pytest.mark.parametrize("source", ["env", "file", "root-flag"])
+@pytest.mark.parametrize(
+    "command",
+    [args for args in CLI_POSITION_ACTIONS if args[0] in {"margin", "partial-close"}],
+    ids=["margin", "partial-close"],
+)
+def test_position_preview_applies_local_lcd_before_validation(
+    position_service, tmp_path, monkeypatch, source, command
+):
+    position, base_url = position_service
+    keeper_url = f"{base_url}/query"
+    for spec in settings.SETTINGS:
+        monkeypatch.delenv(spec.env, raising=False)
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    save_session(keeper_url)
+    inherited = "https://[invalid-lcd"
+    flags = []
+    if source == "env":
+        monkeypatch.setenv("SAI_LCD_ENDPOINT", inherited)
+    elif source == "file":
+        (tmp_path / "config.toml").write_text(f'[lcd]\nendpoint = "{inherited}"\n')
+    else:
+        flags = ["--lcd-endpoint", inherited]
+
+    result = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            keeper_url,
+            *flags,
+            "trade",
+            *command,
+            "--dry-run",
+            "--lcd-endpoint",
+            base_url,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["dryRun"] is True
+    assert position.position_reads > 0
+    assert not position.submitted
+
+
 @pytest.mark.parametrize(
     ("field", "value", "route_key"),
     [

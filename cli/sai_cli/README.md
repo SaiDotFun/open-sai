@@ -48,12 +48,12 @@ override is invalid.
 | Malformed Keeper URL in `--endpoint` or `SAI_ENDPOINT` | 2 | `INVALID_REQUEST` with an endpoint validation message. |
 | `SAI_LOG=maybe` | 0 | Sai marks the `logs.enabled` source as `invalid` and turns logging off. |
 
-When logging is already disabled, Sai ignores an invalid `logs.keep_days`
-value. The command still exits 0 and reports the retention setting's
-source as `env` or `file`, depending on where it was set.
-
-Issue [#188](https://github.com/SaiDotFun/open-sai/issues/188) tracks making
-these results consistent.
+In v0.1.2, a bad `logs.keep_days` value has source `env` or `file`
+when logging is already disabled. On `main`, an invalid log setting has
+source `invalid` and disables logging while the command continues. Other
+invalid settings exit 2 with JSON code `INVALID_REQUEST`. The diagnostic
+names the key and the flag, environment variable, or config file path.
+It omits the invalid value.
 
 The first `set`, or an `unset` that removes a value, writes the whole file
 with every key commented out and explained, at mode 0600 in a 0700
@@ -81,8 +81,9 @@ With no address, the command uses the active account on the configured
 Keeper endpoint. Pass `--as ADDR` to read any EVM account without signing
 in. For scripts, use `sai --json account overview` so failures return JSON
 on stdout. If Sai cannot select an account, it exits 1 with code
-`SESSION_UNAVAILABLE`. The local flag in `sai account overview --json`
-formats successful results as JSON. Its errors are text on stderr.
+`SESSION_UNAVAILABLE`. In v0.1.2, `sai account overview --json` formats
+successful results as JSON and prints errors on stderr. On `main`, the
+local flag also formats errors as JSON on stdout.
 The MCP tool `account_overview` takes an optional `addr` and returns the
 same overview fields.
 
@@ -564,7 +565,8 @@ may include a fix. `sai --json doctor` returns `schemaVersion`,
 `generatedAt`, `sai`, `overall`, and `checks`. A warning, including a
 signed-out session, can still exit 0. Failed checks put the report in
 `error.details` and normally exit 1. An invalid endpoint exits 2 with code
-`INVALID_REQUEST`. Use `--no-fix` to inspect without writing or
+`INVALID_REQUEST`. On `main`, that status also applies to other invalid
+settings that fail the check. Use `--no-fix` to inspect without writing or
 `--offline` to skip the network checks, which
 otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
@@ -615,7 +617,7 @@ starts the stdio transport, stdout carries MCP protocol traffic. Without
 | --- | --- | --- |
 | 0 | Success | Read the result. |
 | 1 | Other failure | Read `error.code` and the message before deciding what to do. |
-| 2 | Command usage error | Check the command's `--help`. |
+| 2 | Command usage error or invalid settings | Correct the indicated setting or check the command's `--help`. |
 | 3 | Unsupported install or environment | Follow the error's installation or terminal instructions. |
 | 4 | Request rejected or never sent | The request executed nothing. Review the error before retrying. |
 | 5 | Outcome unknown | Keep the intent key and reconcile it. Do not resubmit. |
@@ -773,10 +775,10 @@ Sai logs allowlisted fields such as the account, intent key, and request
 transaction hash. It omits session tokens, signatures, clipboard text, and
 Keeper request and response payloads. The logger also scrubs every string.
 
-- A URL anywhere, including in `argv` and `endpoint`, is cut to its scheme,
-  host, and port, so an API key in a path or query is not written. In
-  running text a URL runs to the next space; in a command-line token or a
-  tool argument it runs to the end of the value.
+- `command.start` records command and option names. Options that accept
+  values end in `=`. The event omits option values and positional arguments.
+- URLs in fields such as `endpoint` are reduced to their scheme, host, and
+  port, which keeps path and query credentials out of the log.
 - Session tokens this process has seen are replaced when the event is
   made, so signing out afterwards cannot leave one in a line that was
   still waiting to be written. The background writer rereads the session
