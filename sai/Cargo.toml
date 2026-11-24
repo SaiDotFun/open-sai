@@ -1,0 +1,16 @@
+[package]
+name = "sai"
+description = "Command-line access to Sai trading and market data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+clap.workspace = true
+sai-core = { path = "../sai-core" }
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
