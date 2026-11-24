@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +28,20 @@ from sai_cli.tests.test_auth_connect import (
 from sai_cli.tests.test_auth_connect import keeper_auth as keeper_auth  # noqa: PLC0414
 
 CLI = tuple[str, ...]
+
+
+@pytest.fixture
+def auth_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
+    # Keeper's CI reference predates the current auth command help.
+    path = os.environ.get("SAI_PARITY_AUTH_PYTHON")
+    executable = (
+        shutil.which(path)
+        if path is not None
+        else shutil.which("sai", path=str(Path(sys.executable).parent))
+    )
+    if executable is None:
+        pytest.fail("Install the Python CLI or set SAI_PARITY_AUTH_PYTHON")
+    return (executable,), cli_pair[1]
 
 
 def homes(root: Path, commands: tuple[CLI, CLI]) -> tuple[Env, Env]:
@@ -75,8 +90,8 @@ def assert_unexposed(env: Env, output: str, *secrets: str) -> None:
         ("--json", "auth", "import", "unexpected"),
     ],
 )
-def test_auth_usage(tmp_path: Path, cli_pair: tuple[CLI, CLI], args: CLI) -> None:
-    python, rust = homes(tmp_path, cli_pair)
+def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> None:
+    python, rust = homes(tmp_path, auth_pair)
     expected = observed(python.run(*args))
     assert expected[0] == (0 if "--help" in args else 2)
     assert observed(rust.run(*args)) == expected
@@ -102,14 +117,14 @@ def test_auth_usage(tmp_path: Path, cli_pair: tuple[CLI, CLI], args: CLI) -> Non
 )
 def test_auth_login(
     tmp_path: Path,
-    cli_pair: tuple[CLI, CLI],
+    auth_pair: tuple[CLI, CLI],
     keeper_auth: dict[str, Any],
     case: str,
     expected_code: int,
     challenges: int,
     exchanges: int,
 ) -> None:
-    python, rust = homes(tmp_path, cli_pair)
+    python, rust = homes(tmp_path, auth_pair)
     addr = OTHER if case == "wrong-session-address" else ADDR
     keeper_auth["typed"] = typed_data(message__account=addr)
     if case == "substituted":
@@ -171,9 +186,9 @@ def test_auth_login(
 
 @pytest.mark.parametrize("entry", ["clipboard", "hidden", "enter", "changed"])
 def test_auth_import_and_account_selection(
-    tmp_path: Path, cli_pair: tuple[CLI, CLI], entry: str
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], entry: str
 ) -> None:
-    python, rust = homes(tmp_path, cli_pair)
+    python, rust = homes(tmp_path, auth_pair)
     endpoint = "http://127.0.0.1:9/query"
     token = fixture_token(ADDR, 4070908800.125)
     other = fixture_token(OTHER)
@@ -222,10 +237,10 @@ def test_auth_import_and_account_selection(
     ("case", "code"), [("unavailable", 3), ("empty", 1), ("invalid", 1), ("expired", 6)]
 )
 def test_import_rejects_bad_clipboard(
-    tmp_path: Path, cli_pair: tuple[CLI, CLI], case: str, code: int
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], case: str, code: int
 ) -> None:
     results = []
-    for env in homes(tmp_path, cli_pair):
+    for env in homes(tmp_path, auth_pair):
         if case != "unavailable":
             token = {
                 "empty": "",

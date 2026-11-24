@@ -66,7 +66,8 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
 ## Auth Subprocess Cases
 
 Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.
-Set `SAI_PARITY_PYTHON` to the Python `sai` executable from `main`.
+Set `SAI_PARITY_AUTH_PYTHON` to the Python `sai` executable from `main`,
+or use the Python CLI installed in the pytest environment.
 Until PR 61 lands, set `SAI_PARITY_RENEW_PYTHON` to the executable from that
 branch to include renewal and expiry recovery. The test runs use private
 temporary homes, fixture clipboard and signing commands, and loopback Keeper.
