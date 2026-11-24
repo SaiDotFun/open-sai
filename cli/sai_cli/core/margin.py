@@ -18,7 +18,7 @@ from datetime import datetime
 from decimal import Decimal
 from secrets import token_hex
 from threading import BoundedSemaphore, Thread
-from typing import Any, Literal
+from typing import Any, Literal, TypedDict
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
@@ -71,6 +71,10 @@ class PositionUnavailable(ValueError):
 
 class MarketUnavailable(ValueError):
     """Keeper has no open market for the position."""
+
+
+class TradingNetworkMismatch(ValueError):
+    """Keeper and the LCD reported different valid chain IDs."""
 
 
 class QueryHeightMismatch(SaiError, ValueError):
@@ -331,13 +335,22 @@ def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> A
         raise ValueError(f"Unable to read pending order {trade_id} from Perp.") from exc
 
 
+class PositionRoute(TypedDict):
+    chainId: str
+    contractAddress: str
+
+
 @dataclass(frozen=True)
 class PositionSnapshot:
     raw: dict[str, Any]
     funds: dict[str, Any]
     market: dict[str, Any]
-    contract: str
+    route: PositionRoute
     observed_at: str | None = None
+
+    @property
+    def contract(self) -> str:
+        return self.route["contractAddress"]
 
 
 def _read_position(
@@ -438,21 +451,37 @@ def block_timestamp(lcd: str, height: str) -> int:
     return int(time.timestamp())
 
 
-def trading_contract(endpoint: str, lcd: str) -> str:
+def trading_route(endpoint: str, lcd: str) -> PositionRoute:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
     node = _get_json(lcd_url(lcd, NODE_INFO_PATH))
     info = node.get("default_node_info")
+    chain_id = route.get("chainId")
+    network = info.get("network") if isinstance(info, dict) else None
     if (
-        not route["enabled"]
-        or not isinstance(info, dict)
-        or info.get("network") != route["chainId"]
+        route["enabled"] is not True
+        or not isinstance(chain_id, str)
+        or not chain_id
+        or not isinstance(network, str)
+        or not network
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
-    return route["contractAddress"]
+    contract = route.get("contractAddress")
+    if not isinstance(contract, str) or not contract:
+        raise ValueError("Keeper trading route has no contract address")
+    if network != chain_id:
+        raise TradingNetworkMismatch(
+            "Keeper trading route and LCD network do not match"
+        )
+    return {"chainId": chain_id, "contractAddress": contract}
+
+
+def trading_contract(endpoint: str, lcd: str) -> str:
+    return trading_route(endpoint, lcd)["contractAddress"]
 
 
 def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
-    contract = trading_contract(endpoint, lcd)
+    route = trading_route(endpoint, lcd)
+    contract = route["contractAddress"]
     position = _position(endpoint, addr, trade_id, timeout=20)
     borrowing = position["perpBorrowing"]
     collateral = borrowing["collateralToken"]
@@ -518,7 +547,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
     )
     if funds.get("collateral_index") != token:
         raise PositionChanged("Position changed. Review the margin change again.")
-    return PositionSnapshot(raw, funds, market, contract, observed_at)
+    return PositionSnapshot(raw, funds, market, route, observed_at)
 
 
 def contract_decimal(value: Any) -> Decimal:
