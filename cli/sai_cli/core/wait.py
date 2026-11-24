@@ -79,25 +79,18 @@ def for_intent(
     clock: Clock = Clock(),
 ) -> dict[str, Any]:
     """Run the CLI wait with the same polling logic as MCP."""
-    try:
-        return asyncio.run(
-            for_intent_async(
-                endpoint, addr, key, timeout=timeout, started=started, clock=clock
-            )
+    return asyncio.run(
+        for_intent_async(
+            endpoint, addr, key, timeout=timeout, started=started, clock=clock
         )
-    except KeyboardInterrupt:
-        try:
-            recorded = _recorded_outcome(endpoint, addr, key)
-        except (sqlite3.Error, OSError, ValueError):
-            recorded = None
-        return {
-            **_result(key, addr, recorded or "unknown", {}, [], None, None),
-            "interrupted": True,
-            "hint": storage.intent_status_hint(endpoint, addr, key),
-        }
+    )
 
 
 def _recorded_outcome(endpoint: str, addr: str, key: str) -> Outcome | None:
+    return RECORDED_OUTCOMES.get(_local_status(endpoint, addr, key) or "")
+
+
+def _local_status(endpoint: str, addr: str, key: str) -> str | None:
     """Read a definitive disposition without waiting on a locked ledger."""
     with storage.busy_timeout(0):
         try:
@@ -107,7 +100,7 @@ def _recorded_outcome(endpoint: str, addr: str, key: str) -> Outcome | None:
                 raise
             return None
     if local is not None and local[0] == keeper.canonical_account(addr):
-        return RECORDED_OUTCOMES.get(local[1])
+        return local[1]
     return None
 
 
@@ -285,6 +278,32 @@ def unknown_result(key: str, addr: str | None) -> dict[str, Any]:
 
 def rejected_result(key: str, addr: str, message: str) -> dict[str, Any]:
     return {**_result(key, addr, "rejected", {}, [], None, None), "message": message}
+
+
+def recovery_result(
+    endpoint: str,
+    addr: str,
+    key: str,
+    *,
+    interrupted: bool,
+    confirmed: Outcome = "unknown",
+) -> dict[str, Any]:
+    """Return the durable state after the caller stopped waiting."""
+    try:
+        status = _local_status(endpoint, addr, key)
+    except (sqlite3.Error, OSError, ValueError):
+        status = None
+    outcome = RECORDED_OUTCOMES.get(status or "", confirmed)
+    return {
+        "intentKey": key,
+        "addr": addr,
+        "outcome": outcome,
+        "localStatus": status,
+        "code": OUTCOME_CODES.get(outcome, Code.KEEPER_ERROR),
+        "receipt": None,
+        "interrupted": interrupted,
+        "hint": storage.intent_status_hint(endpoint, addr, key),
+    }
 
 
 def _result(

@@ -808,6 +808,173 @@ def test_sigint_during_trade_wait_preserves_original_key(
         assert result["error"]["code"] == "OUTCOME_UNKNOWN"
 
 
+# Inject in the child at function entry or return. Keeper traffic and SQLite
+# writes still run through the installed CLI code with a disposable SAI_HOME.
+WAIT_FAULT_DRIVER = """
+import signal
+import sys
+
+from sai_cli.core import keeper
+from sai_cli.sai_cli import main
+
+module, name, event, selector, failure = sys.argv[1:6]
+sys.argv[1:6] = []
+
+def inject(frame, what, arg):
+    if what != event or frame.f_code.co_name != name:
+        return
+    if frame.f_globals.get("__name__") != module:
+        return
+    if selector == "history" and frame.f_locals.get("query") != keeper.INTENT_HISTORY:
+        return
+    if selector.startswith("caller:") and frame.f_back.f_code.co_name != selector[7:]:
+        return
+    sys.setprofile(None)
+    if failure == "sigint":
+        signal.raise_signal(signal.SIGINT)
+    else:
+        raise RuntimeError("Injected failure")
+
+sys.setprofile(inject)
+main()
+"""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+@pytest.mark.parametrize("failure", ["sigint", "exception"])
+@pytest.mark.parametrize(
+    ("module", "name", "event", "selector", "phase"),
+    [
+        ("sai_cli.core.keeper", "request_hash", "call", "", "submit"),
+        ("sai_cli.core.intents", "_record_submission_status", "call", "", "submit"),
+        (
+            "sai_cli.core.intents",
+            "_record_submission_status",
+            "return",
+            "",
+            "submit_return",
+        ),
+        ("sai_cli.core.intents", "submit", "return", "", "submit_return"),
+        ("sai_cli.sai_cli", "emit_trade", "call", "", "waiting"),
+        ("sai_cli.core.wait", "for_intent", "call", "", "both"),
+        ("sai_cli.core.wait", "for_intent_async", "call", "", "both"),
+        ("asyncio.tasks", "sleep", "call", "caller:for_intent_async", "waiting"),
+        ("sai_cli.core.storage", "intent_record", "call", "", "both"),
+        ("httpx._client", "__aenter__", "call", "", "waiting"),
+        ("sai_cli.core.wait", "_reconcile", "call", "", "both"),
+        ("asyncio.tasks", "sleep", "call", "caller:_reconcile", "waiting"),
+        ("sai_cli.core.reconcile", "poll_steps", "call", "", "waiting"),
+        ("sai_cli.core.keeper", "read_async", "call", "", "both"),
+        ("sai_cli.core.wait", "pause", "call", "", "backoff"),
+        ("sai_cli.core.keeper", "read_async", "call", "history", "history"),
+        ("sai_cli.core.wait", "pause", "call", "", "history_backoff"),
+        ("sai_cli.core.receipt", "success", "call", "", "terminal"),
+        ("httpx._client", "__aexit__", "call", "", "terminal"),
+        ("sai_cli.core.receipt", "build", "call", "", "terminal"),
+        ("sai_cli.core.wait", "for_intent", "return", "", "terminal"),
+        ("sai_cli.sai_cli", "emit_wait", "call", "", "terminal"),
+        ("sai_cli.sai_cli", "emit_wait", "call", "", "lost_terminal"),
+        ("sai_cli.sai_cli", "emit", "call", "", "terminal"),
+        ("json", "dumps", "call", "caller:emit", "terminal"),
+        ("click.utils", "echo", "call", "caller:emit", "terminal"),
+        ("click.utils", "echo", "return", "caller:emit", "terminal"),
+    ],
+    ids=lambda value: value if value else None,
+)
+def test_trade_wait_keeps_key_through_final_print(
+    keeper_replay, module, name, event, selector, phase, failure
+):
+    endpoint, replies = keeper_replay
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    market = {
+        "data": {
+            "perp": {
+                "borrowings": [
+                    {
+                        "marketId": 0,
+                        "collateralToken": {"symbol": "USDC"},
+                        "isOpen": True,
+                        "price": 100,
+                    }
+                ]
+            }
+        }
+    }
+    replies.extend(
+        (market, "drop_ack" if phase in ("both", "lost_terminal") else "admission_ack")
+    )
+    if phase == "backoff":
+        replies.append("accepted")
+    if phase in ("history", "history_backoff", "terminal", "lost_terminal"):
+        replies.append("filled")
+    if phase == "history_backoff":
+        replies.append("not_yet_in_history")
+    if phase in ("terminal", "lost_terminal"):
+        replies.append(fill_history())
+    command = [
+        sys.executable,
+        "-c",
+        WAIT_FAULT_DRIVER,
+        module,
+        name,
+        event,
+        selector,
+        failure,
+        "--endpoint",
+        endpoint,
+        "--json",
+        "trade",
+        "open",
+        "--market",
+        "0",
+        "--side",
+        "long",
+        "--type",
+        "market",
+        "--amount",
+        "10",
+        "--leverage",
+        "2",
+        "--slippage",
+        "1",
+        "--wait",
+    ]
+    process = subprocess.run(
+        command, capture_output=True, text=True, timeout=10, check=False
+    )
+    [entry] = storage.list_pending(endpoint, ADDR)
+    recorded = (
+        "terminal"
+        if phase in ("history", "history_backoff", "terminal", "lost_terminal")
+        else ("unknown" if phase in ("submit", "both") else "accepted")
+    )
+    outcome = "terminal" if recorded == "terminal" else "unknown"
+    assert entry["status"] == recorded
+    assert process.returncode == (1 if outcome == "terminal" else 5), process
+    if name == "echo":
+        result = json.loads(process.stderr)
+        if event == "return":
+            assert json.loads(process.stdout)["intentKey"] == entry["intentKey"]
+        else:
+            assert process.stdout == ""
+    else:
+        result = json.loads(process.stdout)
+    assert result["outcome"] == outcome
+    assert result["localStatus"] == recorded
+    assert result["interrupted"] == (failure == "sigint")
+    assert result["error"]["intentKey"] == entry["intentKey"]
+    assert result["error"]["hint"] == storage.intent_status_hint(
+        endpoint, ADDR, entry["intentKey"]
+    )
+
+
 def fill_history() -> dict:
     response = deepcopy(RESPONSES["filled_history"])
     history = response["data"]["perp"]["tradeHistory"][0]

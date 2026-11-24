@@ -11,9 +11,10 @@ import sqlite3
 import sys
 import time
 import uuid
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
+from functools import wraps
 from importlib import metadata
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ import click
 from . import mcp_install, skill
 from .core import (
     clipboard,
+    intents,
     keeper,
     log,
     log_queries,
@@ -55,8 +57,11 @@ def print_skill(ctx: click.Context, _param: click.Parameter, value: bool) -> Non
     ctx.exit()
 
 
-def emit(ctx: click.Context, value: Any) -> None:
-    click.echo(json.dumps(value, indent=None if ctx.obj["json"] else 2, default=str))
+def emit(ctx: click.Context, value: Any, *, wait_receipt: bool = False) -> None:
+    encoded = json.dumps(value, indent=None if ctx.obj["json"] else 2, default=str)
+    if wait_receipt:
+        ctx.meta["wait_output_started"] = True
+    click.echo(encoded)
 
 
 # Global flags that override a setting: option name, setting key.
@@ -163,6 +168,15 @@ def redact_error(value: Any) -> Any:
 
 
 def show_failure(exc: Exception, failure: SaiError, json_output: bool) -> None:
+    if isinstance(exc, WaitRecovery):
+        result = exc.result.copy()
+        if json_output:
+            result["error"] = redact_error(failure.as_dict())
+        click.echo(
+            json.dumps(result, indent=None if json_output else 2, default=str),
+            err=exc.output_started,
+        )
+        return
     if json_output and not isinstance(failure, McpStdioError):
         error = failure.as_dict()
         for key in ("message", "hint", "details"):
@@ -867,9 +881,11 @@ def intent_wait(ctx: click.Context, key: str, addr: str | None, timeout: float) 
                 account = stored["evmAddress"]
     if account is None:
         raise ValueError("Pass --addr with the account that submitted this intent")
-    emit_wait(
-        ctx, wait.for_intent(endpoint, account, key, timeout=timeout, started=started)
-    )
+    with protect_wait(ctx, lambda: (endpoint, account, key)):
+        emit_wait(
+            ctx,
+            wait.for_intent(endpoint, account, key, timeout=timeout, started=started),
+        )
 
 
 @intent.command("local")
@@ -910,9 +926,69 @@ def loader(ctx: click.Context) -> PinnedSession:
     return ctx.obj.setdefault("loader", PinnedSession(ctx))
 
 
+class WaitRecovery(SaiError):
+    """Render recovery independently of the normal receipt output."""
+
+    def __init__(self, result: dict[str, Any], *, output_started: bool) -> None:
+        self.result = result
+        self.output_started = output_started
+        super().__init__(
+            "The receipt did not finish. Check the intent status before retrying.",
+            result["code"],
+            hint=result["hint"],
+            intent_key=result["intentKey"],
+        )
+
+
+@contextlib.contextmanager
+def protect_wait(
+    ctx: click.Context,
+    identity: Callable[[], intents.IntentIdentity | None],
+) -> Generator[None]:
+    ctx.meta["wait_output_started"] = False
+    try:
+        yield
+    except (click.exceptions.Exit, storage.UnresolvedIntent):
+        # A completed receipt has already printed. A reservation refusal
+        # carries the existing key, if any, and the new key was never sent.
+        raise
+    except (KeyboardInterrupt, Exception) as exc:
+        submission = identity()
+        if submission is None:
+            raise
+        confirmed: wait.Outcome = "unknown"
+        if isinstance(exc, keeper.AdmissionRejected):
+            confirmed = "rejected"
+        elif isinstance(exc, keeper.NotSent):
+            confirmed = "not_sent"
+        result = wait.recovery_result(
+            *submission,
+            interrupted=isinstance(exc, KeyboardInterrupt)
+            or isinstance(exc.__cause__, KeyboardInterrupt),
+            confirmed=confirmed,
+        )
+        # The normal receipt may already occupy stdout. Keep recovery on
+        # stderr once printing began so consumers see one JSON per stream.
+        raise WaitRecovery(
+            result, output_started=ctx.meta["wait_output_started"]
+        ) from exc
+
+
 def wait_option(action: Callable[..., None]) -> Callable[..., None]:
     def record(ctx: click.Context, _param: click.Parameter, enabled: bool) -> None:
         ctx.meta["wait_for_trade"] = enabled
+
+    @wraps(action)
+    def run(*args: Any, **kwargs: Any) -> None:
+        ctx = click.get_current_context()
+        if ctx.meta.get("wait_for_trade"):
+            with (
+                intents.track_submission() as trace,
+                protect_wait(ctx, lambda: trace.identity),
+            ):
+                action(*args, **kwargs)
+        else:
+            action(*args, **kwargs)
 
     return click.option(
         "--wait",
@@ -920,13 +996,13 @@ def wait_option(action: Callable[..., None]) -> Callable[..., None]:
         expose_value=False,
         callback=record,
         help=f"Wait up to {wait.DEFAULT_TIMEOUT:g} seconds for the intent outcome.",
-    )(action)
+    )(run)
 
 
 def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
     exit_code = ExitCode.OK
-    if outcome == "unknown" and not result.get("interrupted"):
+    if outcome == "unknown":
         addr_args = ["--addr", result["addr"]] if result.get("addr") else []
         result["hint"] = storage.keeper_command_hint(
             keeper_url(ctx),
@@ -947,7 +1023,7 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
         exit_code = failure.exit_code
         if ctx.obj["json"]:
             result["error"] = redact_error(failure.as_dict())
-    emit(ctx, result)
+    emit(ctx, result, wait_receipt=True)
     if exit_code != ExitCode.OK:
         ctx.exit(exit_code)
 
