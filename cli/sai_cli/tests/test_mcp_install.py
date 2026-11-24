@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -18,6 +19,7 @@ from sai_cli import mcp_install
 from sai_cli import sai_cli as cli
 from sai_cli.core import log
 from sai_cli.sai_cli import main
+from test_update import GIT, make_prefix
 
 # Built from parts so the retired-names test does not match this file.
 OLD_COMMAND = "sai" + "-mcp"
@@ -389,11 +391,16 @@ def test_mcp_list_and_uninstall_all_include_repaired_legacy_entries(
     assert repaired.exit_code == 0, repaired.output
     assert invoke("doctor", "--offline").exit_code == 0
     if canonical_exists:
-        assert invoke("mcp", "install", "codex", "cursor").exit_code == 0
-        claude_config = env.home / ".claude.json"
-        data = env.claude_json()
-        data["mcpServers"]["sai"] = claude_entry(serve(env), {})
-        claude_config.write_text(json.dumps(data))
+        entries = doctor_entries(env)
+        canonical = claude_entry(serve(env))
+        for client in entries:
+            entries[client]["sai"] = canonical
+        env.write_codex(entries["codex"])
+        for path, client in (
+            (env.home / ".claude.json", "claude"),
+            (env.cursor_path(), "cursor"),
+        ):
+            path.write_text(json.dumps({"mcpServers": entries[client]}))
 
     listed = invoke("mcp", "list")
     for row in payload(listed)["clients"]:
@@ -829,6 +836,42 @@ def test_doctor_reports_same_stale_codex_project_entry_after_repairing_user(env:
     assert config["mcp_servers"]["sai"]["command"] == str(env.sai)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uv launcher symlink")
+def test_doctor_repairs_codex_with_a_normalized_stable_launcher(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    prefix = make_prefix(env.root / "uv-tool", GIT, receipt=True)
+    executable = prefix / "sai"
+    env.sai.rename(executable)
+    env.sai.symlink_to(executable)
+    intermediate = env.root / "share"
+    intermediate.mkdir()
+    receipt_launcher = intermediate / ".." / "bin" / "sai"
+    with (prefix / "uv-receipt.toml").open("a") as receipt:
+        receipt.write(
+            f'entrypoints = [{{ name = "sai", install-path = {json.dumps(str(receipt_launcher))} }}]\n'
+        )
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    env.write_codex({"sai": claude_entry([OLD_COMMAND])})
+
+    repaired = invoke("doctor", "--offline")
+
+    assert mcp_checks(repaired)["codex"]["status"] == "fixed", repaired.output
+    entries = tomlkit.parse(env.codex_path().read_text()).unwrap()["mcp_servers"]
+    assert entries["sai"]["command"] == str(env.sai)
+    for launcher in (env.sai, receipt_launcher):
+        if launcher == receipt_launcher:
+            env.write_codex({"sai": claude_entry([str(launcher), "mcp", "serve"])})
+        listed = invoke("mcp", "list")
+        assert listed.exit_code == 0, listed.output
+        codex = next(
+            row for row in payload(listed)["clients"] if row["client"] == "codex"
+        )
+        assert codex["current"] and codex["registrations"][0]["current"]
+        assert codex["registeredCommand"] == serve(env)
+        assert mcp_checks(invoke("doctor", "--offline"))["codex"]["status"] == "pass"
+
+
 def test_install_uses_each_clients_registration_backend(env: Env):
     result = invoke("mcp", "install", "claude", "codex", "cursor")
     assert result.exit_code == 0, result.output
@@ -842,6 +885,7 @@ def test_install_uses_each_clients_registration_backend(env: Env):
     assert env.calls() == [
         ["mcp", "add", "--scope", "user", "sai", "--", sai, "mcp", "serve"],
         *GETS,
+        *LEGACY_GETS,
         *CHECK,
     ]
     assert env.claude_json()["mcpServers"]["sai"]["command"] == sai
@@ -876,24 +920,296 @@ def test_install_replaces_an_old_entry(env: Env):
     ]
 
 
-def test_explicit_claude_install_keeps_the_existing_legacy_name(env: Env):
-    config = env.home / ".claude.json"
-    config.write_text(
-        json.dumps({"mcpServers": {OLD_COMMAND: claude_entry([OLD_COMMAND])}})
+@pytest.mark.parametrize("repair_first", [False, True])
+def test_install_preserves_working_codex_and_cursor_aliases(
+    env: Env, repair_first: bool
+):
+    routing = ["--endpoint", f"https://private.example/{SECRET}"]
+    argv = [OLD_COMMAND, *routing] if repair_first else [*serve(env), *routing]
+    write_doctor_entries(env, OLD_COMMAND, claude_entry(argv, {"SAI_HOME": SECRET}))
+    if repair_first:
+        report = invoke("doctor", "--offline")
+        assert mcp_checks(report)["claude"]["status"] == "fail"
+        entries = doctor_entries(env)
+        for client in ("codex", "cursor"):
+            assert entries[client][OLD_COMMAND]["command"] == str(env.sai)
+
+    paths = (env.codex_path(), env.cursor_path())
+    before = [path.read_bytes() for path in paths]
+    env.clear()
+    for flags in ((), ("--dry-run",)):
+        result = invoke("mcp", "install", "codex", "cursor", *flags)
+        assert result.exit_code == 0, result.output
+        summary = payload(result)
+        assert not summary["reconnectNeeded"]
+        assert [
+            (row["client"], row["name"], row["scope"], row["action"])
+            for row in summary["results"]
+        ] == [
+            (client, OLD_COMMAND, "user", "unchanged") for client in ("codex", "cursor")
+        ]
+        assert SECRET not in result.output
+        assert [path.read_bytes() for path in paths] == before
+    assert env.calls() == (GETS + LEGACY_GETS) * 2
+
+
+def test_user_install_reports_the_cursor_project_alias(env: Env):
+    project = env.project / ".cursor" / "mcp.json"
+    project.parent.mkdir()
+    project.write_text(
+        json.dumps({"mcpServers": {OLD_COMMAND: claude_entry(serve(env))}})
     )
 
-    result = invoke("mcp", "install", "--client", "claude")
+    result = invoke("mcp", "install", "cursor")
+
     assert result.exit_code == 0, result.output
-    assert actions(result) == {"claude": "replaced"}
-    assert env.claude_json()["mcpServers"] == {
-        OLD_COMMAND: claude_entry(serve(env), {})
-    }
-    again = invoke("mcp", "install", "--client", "claude")
-    assert actions(again) == {"claude": "unchanged"}
-    assert env.calls() == [
-        ["mcp", "remove", "--scope", "user", OLD_COMMAND],
-        ["mcp", "add", "--scope", "user", OLD_COMMAND, "--", *serve(env)],
-    ]
+    [row] = payload(result)["results"]
+    assert (row["action"], row["name"], row["scope"]) == (
+        "unchanged",
+        OLD_COMMAND,
+        "project",
+    )
+    assert not env.cursor_path().exists()
+
+
+@pytest.mark.parametrize(
+    "settings_path",
+    [
+        "home/.claude/settings.json",
+        "project/.claude/settings.json",
+        "project/.claude/settings.local.json",
+    ],
+)
+def test_claude_install_reports_a_disabled_project_alias(env: Env, settings_path: str):
+    subprocess.run(
+        [
+            str(env.bin / "claude"),
+            "mcp",
+            "add",
+            "--scope",
+            "project",
+            OLD_COMMAND,
+            f"--env=CUSTOM={SECRET}",
+            "--",
+            *serve(env),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    config = env.project / ".mcp.json"
+    original = config.read_bytes()
+    policy = env.root / settings_path
+    policy.parent.mkdir(exist_ok=True)
+    policy.write_text(
+        json.dumps(
+            {
+                "enabledMcpjsonServers": [OLD_COMMAND],
+                "disabledMcpjsonServers": [OLD_COMMAND],
+            }
+        )
+    )
+    policy_before = policy.read_bytes()
+    env.clear()
+
+    result = invoke("mcp", "install", "claude")
+
+    message = failure(result)
+    assert "claude (project): failed" in message
+    assert f"{OLD_COMMAND} registration is disabled in claude" in message
+    assert "Review MCP approvals" in message
+    [row] = payload(result)["error"]["details"]["results"]
+    assert row["name"] == OLD_COMMAND and not row["changed"]
+    assert SECRET not in result.output
+    assert config.read_bytes() == original
+    assert policy.read_bytes() == policy_before
+    assert not (env.home / ".claude.json").exists()
+    assert not env.calls()
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_claude_install_leaves_a_disabled_canonical_project_entry_in_place(
+    env: Env, dry_run: bool
+):
+    config = env.project / ".mcp.json"
+    entry = claude_entry(
+        [*serve(env), "--endpoint", f"https://private.example/{SECRET}"]
+    )
+    config.write_text(json.dumps({"mcpServers": {"sai": entry}}))
+    policy = env.project / ".claude" / "settings.local.json"
+    policy.parent.mkdir()
+    policy.write_text(json.dumps({"disabledMcpjsonServers": ["sai"]}))
+    before = config.read_bytes(), policy.read_bytes()
+    flags = ("--dry-run",) if dry_run else ()
+
+    result = invoke("mcp", "install", "claude", "--scope", "project", *flags)
+
+    assert "Claude Code has disabled the project sai registration" in failure(result)
+    details = payload(result)["error"]["details"]
+    assert not details["reconnectNeeded"]
+    [row] = details["results"]
+    assert row["scope"] == "project" and not row["changed"] and "argv" not in row
+    assert (config.read_bytes(), policy.read_bytes()) == before
+    assert not env.calls()
+    assert SECRET not in result.output
+
+
+@pytest.mark.skipif(
+    os.name == "nt", reason="Claude uses worktree-local settings on Windows"
+)
+@pytest.mark.parametrize("name", [OLD_COMMAND, "sai"])
+def test_claude_install_honors_settings_from_the_main_checkout(
+    env: Env, monkeypatch: pytest.MonkeyPatch, name: str
+):
+    git = shutil.which("git", path=os.defpath)
+    assert git is not None
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), str(Path(git).parent)]))
+    linked = env.root / "linked worktree"
+    commands = (
+        ["init", "--quiet"],
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Initial commit",
+        ],
+        ["worktree", "add", "--quiet", "--detach", str(linked)],
+    )
+    for args in commands:
+        subprocess.run(
+            [git, "-C", str(env.project), *args], check=True, capture_output=True
+        )
+    policy = env.project / ".claude" / "settings.local.json"
+    policy.parent.mkdir()
+    policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
+    config = linked / ".mcp.json"
+    config.write_text(json.dumps({"mcpServers": {name: claude_entry(serve(env))}}))
+    before = config.read_bytes(), policy.read_bytes()
+    monkeypatch.chdir(linked)
+    scope = "user" if name == OLD_COMMAND else "project"
+
+    result = invoke("mcp", "install", "claude", "--scope", scope)
+
+    message = failure(result)
+    assert "claude (project): failed" in message and "disabled" in message
+    assert name in message and "Review MCP approvals" in message
+    assert (config.read_bytes(), policy.read_bytes()) == before
+    assert not (env.home / ".claude.json").exists()
+    assert not env.calls()
+
+
+def test_claude_install_honors_the_project_toggle_for_a_user_alias(env: Env):
+    config = env.home / ".claude.json"
+    config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    OLD_COMMAND: claude_entry(serve(env), {"CUSTOM": SECRET})
+                },
+                "projects": {str(env.project): {"disabledMcpServers": [OLD_COMMAND]}},
+            }
+        )
+    )
+    before = config.read_bytes()
+
+    result = invoke("mcp", "install", "claude")
+
+    message = failure(result)
+    assert "claude (user): failed" in message
+    assert f"{OLD_COMMAND} registration is disabled in claude" in message
+    assert config.read_bytes() == before
+    assert SECRET not in result.output
+    assert not env.calls()
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_ordinary_claude_install_preserves_the_legacy_entry(env: Env, stale: bool):
+    config = env.home / ".claude.json"
+    routing = ["--endpoint", f"https://private.example/{SECRET}"]
+    argv = [OLD_COMMAND, *routing] if stale else [*serve(env), *routing]
+    overrides = {"SAI_HOME": str(env.root / "other-profile"), "CUSTOM": SECRET}
+    config.write_text(
+        json.dumps({"mcpServers": {OLD_COMMAND: claude_entry(argv, overrides)}})
+    )
+    original = config.read_bytes()
+    fails_add = FAKE_CLAUDE.replace(
+        "args = sys.argv[1:]\n",
+        "args = sys.argv[1:]\nif args[1] == 'add':\n    sys.exit(3)\n",
+    )
+    write_exe(env.bin / "claude", fails_add)
+
+    result = invoke("mcp", "install", "--client", "claude")
+
+    if stale:
+        assert "Run `sai doctor` for repair instructions" in failure(result)
+        summary = payload(result)["error"]["details"]
+    else:
+        assert result.exit_code == 0, result.output
+        summary = payload(result)
+    [row] = summary["results"]
+    assert row["name"] == OLD_COMMAND and row["scope"] == "user"
+    assert row["action"] == ("failed" if stale else "unchanged")
+    assert not summary["reconnectNeeded"]
+    assert SECRET not in result.output
+    assert config.read_bytes() == original
+    assert env.calls() == []
+
+    if stale:
+        repaired = invoke(
+            "mcp", "install", "--client", "claude", "--repair-existing", OLD_COMMAND
+        )
+        assert repaired.exit_code == 0, repaired.output
+        assert env.claude_json()["mcpServers"] == {
+            OLD_COMMAND: claude_entry([*serve(env), *routing], overrides)
+        }
+        again = invoke("mcp", "install", "--client", "claude")
+        assert actions(again) == {"claude": "unchanged"}
+        assert env.calls() == []
+
+
+@pytest.mark.parametrize("different", [True, False])
+def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
+    env: Env, different: bool
+):
+    config = env.home / ".claude.json"
+    config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    OLD_COMMAND: claude_entry(serve(env), {"CUSTOM": SECRET})
+                },
+            }
+        )
+    )
+    before = config.read_bytes()
+    command = ["uv", "run", "--directory", f"/src/{SECRET}", "sai", "mcp", "serve"]
+    if not different:
+        command = serve(env)
+
+    result = invoke("mcp", "install", "claude", "--", *command)
+
+    if different:
+        error = failure(result)
+        assert f"Kept the existing {OLD_COMMAND} registration" in error
+        assert "skipped the requested server command" in error
+        summary = payload(result)["error"]["details"]
+    else:
+        assert result.exit_code == 0, result.output
+        summary = payload(result)
+    [row] = summary["results"]
+    assert (row["name"], row["scope"], row["action"]) == (
+        OLD_COMMAND,
+        "user",
+        "failed" if different else "unchanged",
+    )
+    assert not summary["reconnectNeeded"]
+    assert SECRET not in result.output
+    assert config.read_bytes() == before
+    assert not env.calls()
 
 
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):
@@ -975,7 +1291,7 @@ def test_dry_run_runs_no_client_and_writes_nothing(env: Env):
     ]
     assert payload(result)["reconnectNeeded"] is False
     # Only Codex's read-only `get`s ran.
-    assert env.calls() == GETS
+    assert env.calls() == GETS + LEGACY_GETS
     assert not (env.home / ".claude.json").exists()
     assert not env.cursor_path().exists()
 
@@ -1147,6 +1463,24 @@ def test_missing_client_cli_fails_that_client_only(env: Env):
     assert "cursor (user): added" in message
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory symlink")
+def test_list_hides_the_saved_directory_for_a_normalized_match(env: Env):
+    private_dir = env.root / f"deployment-{SECRET}"
+    private_dir.symlink_to(env.bin, target_is_directory=True)
+    env.write_codex({"sai": claude_entry([str(private_dir / "sai"), "mcp", "serve"])})
+    before = env.codex_path().read_bytes()
+
+    result = invoke("mcp", "list")
+
+    assert result.exit_code == 0
+    assert SECRET not in result.output
+    codex = next(row for row in payload(result)["clients"] if row["client"] == "codex")
+    assert codex["current"] and codex["registeredCommand"] == serve(env)
+    [registration] = codex["registrations"]
+    assert registration["current"] and registration["command"] == serve(env)
+    assert env.codex_path().read_bytes() == before
+
+
 def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
     other = {
         "type": "http",
@@ -1222,10 +1556,127 @@ def test_unreadable_config_names_the_file_not_its_contents(env: Env):
     assert SECRET not in result.stdout + result.stderr
 
 
-def test_client_errors_skip_warning_lines():
-    out = "WARNING: could not create aliases\nError: config is locked\n"
-    assert mcp_install.first_line(out) == "Error: config is locked"
-    assert mcp_install.first_line("one\nlast words\n") == "last words"
+@pytest.mark.parametrize(
+    ("client", "args", "command"),
+    [
+        ("claude", ("install", "claude"), "claude mcp add"),
+        ("codex", ("install", "codex"), "codex mcp get sai --json"),
+        ("codex", ("list",), "codex mcp get sai --json"),
+    ],
+)
+def test_client_failure_keeps_config_values_out_of_output(
+    env: Env, client: str, args: tuple[str, ...], command: str
+):
+    diagnostic = f"Error: {OTHER} has invalid configuration with TOKEN={SECRET}"
+    write_exe(
+        env.bin / client,
+        f"import sys\nprint({diagnostic!r})\n"
+        f"print({diagnostic!r}, file=sys.stderr)\nsys.exit(7)\n",
+    )
+
+    result = invoke("mcp", *args)
+    if args == ("list",):
+        assert result.exit_code == 0, result.output
+        row = next(row for row in payload(result)["clients"] if row["client"] == client)
+        error = row["error"]
+    else:
+        error = failure(result)
+    assert f"`{command}` exited 7" in error
+    assert SECRET not in result.output and OTHER not in result.output
+
+
+def test_codex_first_install_accepts_a_startup_warning_before_not_found(env: Env):
+    warning = (
+        "WARNING: proceeding, even though we could not create PATH aliases: "
+        "Read-only file system (os error 30)"
+    )
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "    if entry is None:\n",
+            f"    if entry is None:\n        print({warning!r}, file=sys.stderr)\n",
+        ),
+    )
+
+    result = invoke("mcp", "install", "codex")
+
+    assert result.exit_code == 0, result.output
+    assert actions(result) == {"codex": "added"}
+    entries = tomlkit.parse(env.codex_path().read_text())["mcp_servers"]
+    assert set(entries) == {"sai"}
+    assert entries["sai"]["command"] == str(env.sai)
+    assert env.calls() == GETS + LEGACY_GETS + CHECK
+    assert warning not in result.output
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "stdout", "stderr"),
+    [
+        (7, "", f"Config I/O error: no MCP server could be read. TOKEN={SECRET}"),
+        (1, "", "Error: No MCP server named 'sai' found."),
+        (7, "", f"Error: No MCP server named '{OLD_COMMAND}' found."),
+        (1, "Config I/O error", f"Error: No MCP server named '{OLD_COMMAND}' found."),
+        (1, "", f"I/O error\nError: No MCP server named '{OLD_COMMAND}' found."),
+        (1, "", f"WARNING: I/O diagnostic contains no MCP server text. TOKEN={SECRET}"),
+        (0, "{}", ""),
+    ],
+)
+def test_codex_install_refuses_to_write_after_an_uncertain_alias_lookup(
+    env: Env, exit_code: int, stdout: str, stderr: str
+):
+    env.write_codex({OLD_COMMAND: claude_entry(serve(env))})
+    original = env.codex_path().read_bytes()
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "name = args[2]\n",
+            f"name = args[2]\nif name == {OLD_COMMAND!r}:\n"
+            f"    print({stdout!r})\n    print({stderr!r}, file=sys.stderr)\n"
+            f"    sys.exit({exit_code})\n",
+        ),
+    )
+
+    result = invoke("mcp", "install", "codex")
+
+    diagnostic = (
+        f"exited {exit_code}" if exit_code else "returned an invalid registration"
+    )
+    assert f"`codex mcp get {OLD_COMMAND} --json` {diagnostic}" in failure(result)
+    assert SECRET not in result.output
+    assert env.codex_path().read_bytes() == original
+    assert env.calls() == GETS + LEGACY_GETS[:1]
+
+
+@pytest.mark.parametrize("args", [("install", "codex"), ("list",)])
+@pytest.mark.parametrize("exit_code", [7, 0])
+def test_codex_lookup_hides_invalid_utf8(
+    env: Env, args: tuple[str, ...], exit_code: int
+):
+    stream = "stderr" if exit_code else "stdout"
+    private = bytes([255]) + SECRET.encode()
+    write_exe(
+        env.bin / "codex",
+        f"import sys\nsys.{stream}.buffer.write({private!r})\nsys.exit({exit_code})\n",
+    )
+
+    result = invoke("mcp", *args)
+
+    if args == ("list",):
+        assert result.exit_code == 0, result.output
+        error = next(
+            row["error"]
+            for row in payload(result)["clients"]
+            if row["client"] == "codex"
+        )
+    else:
+        error = failure(result)
+    diagnostic = "exited 7" if exit_code else "printed invalid JSON"
+    assert f"`codex mcp get sai --json` {diagnostic}" in error
+    assert log.flush()
+    logs = "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
+    for value in (SECRET, "0xff", "position 0", "UnicodeDecodeError"):
+        assert value not in result.output + logs
+    assert not env.codex_path().exists()
 
 
 def claude_entry(argv: list[str], env: dict[str, str] | None = None) -> dict:

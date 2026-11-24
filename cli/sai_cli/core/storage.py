@@ -8,7 +8,6 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import shlex
 import sqlite3
 import sys
@@ -24,12 +23,8 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import log
+from . import log, paths
 from .errors import Code, SaiError, SessionError
-
-PLAIN_KEEPER_URL = re.compile(
-    r"https?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query"
-)
 
 
 class UnresolvedIntent(SaiError, ValueError):
@@ -56,14 +51,13 @@ class RecentOpenPending(UnresolvedIntent):
 
 
 def home() -> Path:
-    return Path(os.environ.get("SAI_HOME", Path.home() / ".sai")) / "trader"
+    return paths.sai_home() / "trader"
 
 
 def directory() -> Path:
     path = home()
-    path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    path.chmod(0o700)
-    return path
+    paths.private_directory(path.parent, profile_root=True)
+    return paths.private_directory(path)
 
 
 # Sessions are encrypted with this fixed key, which ships in the source, like
@@ -253,12 +247,30 @@ def save_session(session: dict[str, str]) -> None:
         accounts["sessions"][addr] = session
         accounts["active"] = addr
         _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def replace_session(previous: dict[str, str], session: dict[str, str]) -> None:
+    """Renew the same stored session without switching the active account."""
+    with _locked():
+        accounts = load_accounts()
+        addr = previous["evmAddress"].lower()
+        if accounts["sessions"].get(addr) != previous:
+            raise ValueError(
+                "Stored session changed during renewal. Run sai auth status."
+            )
+        accounts["sessions"][addr] = session
+        _save_accounts(accounts)
+    _log_saved(session, len(accounts["sessions"]))
+
+
+def _log_saved(session: dict[str, str], count: int) -> None:
     log.event(
         "session.saved",
         addr=session["evmAddress"],
         expiresAt=session["expiresAt"],
         endpoint=log.endpoint(session.get("endpoint")),
-        connectedAccounts=len(accounts["sessions"]),
+        connectedAccounts=count,
     )
 
 
@@ -395,21 +407,25 @@ def busy_timeout(seconds: float) -> Generator[None]:
 
 def db() -> sqlite3.Connection:
     path = directory() / "intents.sqlite3"
-    fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
-    os.close(fd)
-    path.chmod(0o600)
     connection = sqlite3.connect(path, timeout=_BUSY_TIMEOUT.get())
-    _migrate(connection)
+    try:
+        # Closing a separate file descriptor would release any POSIX locks
+        # that another connection in this process holds on the ledger.
+        path.chmod(0o600)
+        _migrate(connection)
+    except BaseException:
+        connection.close()
+        raise
     return connection
 
 
 def keeper_command_hint(endpoint: str, *args: str) -> str:
     """Pin the selected Keeper in a recovery command.
 
-    Only the standard /query path is safe to echo. Custom gateway paths
-    can carry credentials.
+    Ask the caller to supply the original URL when the origin is insufficient.
     """
-    if PLAIN_KEEPER_URL.fullmatch(endpoint) and log.redact(endpoint) == endpoint:
+    origin = log.origin(endpoint)
+    if origin != log.REDACTED_URL and origin == endpoint == log.redact(endpoint):
         flag = shlex.quote(endpoint)
     else:
         flag = (
@@ -587,6 +603,19 @@ def list_pending(endpoint: str, account: str) -> list[dict[str, Any]]:
     return [{"intentKey": row[0], "kind": row[1], "status": row[2]} for row in rows]
 
 
+def intent_record(endpoint: str, key: str) -> tuple[str, str] | None:
+    """Return the recorded account and status for KEY on this endpoint."""
+    if not (home() / "intents.sqlite3").exists():
+        return None
+    with db() as connection:
+        row = connection.execute(
+            "SELECT account, COALESCE(keeper_status,status) FROM intents"
+            " WHERE id=? AND endpoint=?",
+            (key, endpoint),
+        ).fetchone()
+    return (row[0], row[1]) if row else None
+
+
 def _key_time(key: str) -> float | None:
     """Read the reservation time embedded in an intent key, if it has one."""
     try:
@@ -594,6 +623,45 @@ def _key_time(key: str) -> float | None:
     except ValueError:
         return None
     return stamp.replace(tzinfo=UTC).timestamp()
+
+
+def unresolved_intents(endpoint: str, account: str) -> list[dict[str, Any]]:
+    """Read unknown, accepted, and pending intents without migrating a ledger."""
+    path = home() / "intents.sqlite3"
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return []
+    with contextlib.closing(
+        sqlite3.connect(
+            f"{path.absolute().as_uri()}?mode=ro", uri=True, timeout=_BUSY_TIMEOUT.get()
+        )
+    ) as connection:
+        version = connection.execute("PRAGMA user_version").fetchone()[0]
+        if version > SCHEMA_VERSION:
+            raise ValueError("Intent database was written by a newer sai version")
+        created_column = "created_at" if version >= 1 else "NULL"
+        status = (
+            "COALESCE(keeper_status,status)"
+            if "keeper_status" in _intent_columns(connection)
+            else "status"
+        )
+        rows = connection.execute(
+            f"SELECT id, kind, {status}, entity, {created_column} FROM intents"
+            f" WHERE endpoint=? AND account=? AND {status} IN ('unknown', 'accepted', 'pending')"
+            " ORDER BY rowid DESC",
+            (endpoint, account.lower()),
+        ).fetchall()
+    return [
+        {
+            "intentKey": key,
+            "kind": kind,
+            "status": status,
+            "entity": entity,
+            "createdAt": created,
+        }
+        for key, kind, status, entity, created in rows
+    ]
 
 
 def mark_absent(

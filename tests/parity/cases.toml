@@ -1,7 +1,9 @@
 # List uncovered commands explicitly so adding a command requires a decision.
 [deferred]
+"account overview" = "Requires pinned LCD and trade replay fixtures."
 "auth import" = "Requires an isolated clipboard input."
 "auth login" = "Requires an isolated signing program and challenge."
+"auth renew" = "Requires an isolated signing program and challenge."
 "mcp install" = "Requires a client registration fixture."
 "mcp uninstall" = "Requires a client registration fixture."
 "logs intent" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
@@ -68,6 +70,13 @@ name = "config-invalid-value"
 args = ["--json","config","set","logs.keep_days","0"]
 expect = 2
 state = { "config.toml" = "<absent>" }
+
+[[case]]
+name = "config-invalid-endpoint"
+args = ["--json","config","set","keeper.endpoint","https://[::1]suffix/path"]
+expect = 2
+seed = "config-logs-disabled"
+state = { "config.toml#keeper.endpoint" = "<absent>", "config.toml#logs.enabled" = false, ".config.lock" = "<absent>", "logs" = "<absent>" }
 
 [[case]]
 name = "config-unknown-key"
@@ -162,7 +171,7 @@ state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.inte
 name = "intent-status"
 args = ["--json","intent","status","{addr}","--key","{intent}"]
 seed = "ledger"
-wire = ["userIntents","tradeHistory"]
+wire = ["userIntents","intentTradeHistory"]
 state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
 
 [[case]]
@@ -172,6 +181,13 @@ seed = "ledger"
 server = "absent"
 wire = ["userIntents"]
 state = { "trader/intents.sqlite3" = "file", "trader/intents.sqlite3#tables.intents.rows.0.status" = "absent" }
+
+[[case]]
+name = "intent-wait"
+args = ["--json","intent","wait","{intent}","--timeout","5"]
+seed = "ledger"
+wire = ["waitUserIntents","intentTradeHistory"]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
 
 [[case]]
 name = "doctor-offline"
@@ -257,6 +273,7 @@ state = { "update.json#latest" = "sai-cli/v0.99.0", "update.json#schema" = 1, "u
 [[case]]
 name = "trade-open-market"
 args = ["--json","trade","open","--market","3","--side","long","--type","market","--amount","20","--leverage","2","--slippage","1","--price","100","--dry-run"]
+wire = ["borrowings", "oneClickTrading", "node_info", "get_market", "get_group", "get_pair_custom_max_leverage", "get_fees", "get_collateral_price"]
 
 [[case]]
 name = "trade-close"
@@ -265,6 +282,9 @@ args = ["--json","trade","close","7","--dry-run"]
 [[case]]
 name = "trade-cancel"
 args = ["--json","trade","close","7","--cancel-order","--dry-run"]
+seed = "session"
+server = "pending-order"
+wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 
 [[case]]
 name = "trade-tpsl"
@@ -278,14 +298,23 @@ args = ["--json","trade","leverage","7","--leverage","5","--dry-run"]
 name = "trade-margin"
 args = ["--json","trade","margin","7","--direction","add","--amount","1","--dry-run"]
 seed = "session"
-wire = ["oneClickTrading","node_info","trade","borrowing","get_trade_raw","get_exchange_balance"]
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_group",
+    "get_pair_custom_max_leverage", "get_fees",
+]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
 [[case]]
 name = "trade-partial-close"
 args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
 seed = "session"
-wire = ["oneClickTrading","node_info","trade","borrowing","get_trade_raw","get_exchange_balance","borrowings"]
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market",
+    "get_collateral_price", "get_trade_raw", "get_perp_prices", "get_liquidation_price",
+    "is_after_hours_market", "get_market", "get_fees",
+]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
 [[case]]

@@ -1,11 +1,8 @@
 """Trading actions that preview or submit one intent.
 
-Each action builds its intent once. With `dry_run`, it returns that intent as
-a preview; otherwise it submits the same intent, so a preview is exactly what
-would be submitted. A `before_submit` check sees the preview of the exact
-intent object about to be submitted and can refuse it by raising. Actions take a session loader and call it only when they
-need the session, so validation errors come first and a dry run that needs no
-account never reads the stored session.
+With `dry_run`, an action returns the intent it would submit. The
+`before_submit` check receives the final preview and may refuse submission.
+Actions take a session loader and call it only when they need the session.
 """
 
 from __future__ import annotations
@@ -14,13 +11,17 @@ from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
 
-from . import intents, keeper, margin
+from . import intents, keeper, margin, partial
+from . import preview as estimates
+from .errors import Code, SaiError
 
 SessionLoader = Callable[[], dict[str, str]]
 Notify = Callable[[str], None]
 # Called with the preview of the exact intent about to be submitted, after
 # every refresh and recheck; raising stops the submission.
 SubmitCheck = Callable[[dict[str, Any]], None]
+PositionPreview = tuple[margin.PositionSnapshot, dict[str, Any], dict[str, Any]]
+Estimate = Callable[[dict[str, Any]], dict[str, Any]]
 
 MARGIN_WARNING = (
     "The request authorizes target leverage, not an amount cap; the actual"
@@ -29,6 +30,37 @@ MARGIN_WARNING = (
 MARKET_PRICE_NOTICE = (
     "Market orders use the refreshed Keeper price; --price is a dry-run reference."
 )
+
+
+class PreviewRefused(ValueError):
+    """A pre-submit check refused the intent and may return a fresh preview."""
+
+    def __init__(self, message: str, preview: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.preview = preview
+
+
+class PositionChanged(SaiError, PreviewRefused):
+    """A live recheck found a different position quote."""
+
+    code = Code.PREVIEW_MISMATCH
+
+    def __init__(self, message: str, preview: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.preview = preview
+
+
+def _checked(
+    before_submit: SubmitCheck,
+    preview: dict[str, Any],
+    estimate: Estimate | None,
+) -> None:
+    try:
+        before_submit(preview)
+    except PreviewRefused as exc:
+        if exc.preview is not None and estimate is not None:
+            exc.preview["estimates"] = estimate(exc.preview)
+        raise
 
 
 def _ignore(_message: str) -> None:
@@ -45,29 +77,36 @@ def preview_or_submit(
     payload: dict[str, Any],
     dry_run: bool,
     before_submit: SubmitCheck = _accept,
+    estimate: Estimate | None = None,
     *,
     allow_concurrent_open: bool = False,
 ) -> dict[str, Any]:
     """Return the dry-run preview of PAYLOAD, or check and submit it."""
     preview = {"dryRun": True, "intent": payload}
     if dry_run:
+        if estimate is not None:
+            preview["estimates"] = estimate(preview)
         return preview
     active = get_session()
-    before_submit(preview)
+    _checked(before_submit, preview, estimate)
     return intents.submit(
         endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
     )
 
 
-def open_usdc_market(endpoint: str, market_id: int) -> dict[str, Any]:
-    """Return Keeper's open USDC borrowing row for MARKET_ID."""
-    markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
+def open_usdc_market(
+    endpoint: str, market_id: int, *, timeout: float = 20, require_open: bool = True
+) -> dict[str, Any]:
+    """Return Keeper's USDC borrowing row for MARKET_ID."""
+    markets = keeper.request(endpoint, keeper.MARKETS, timeout=timeout)["perp"][
+        "borrowings"
+    ]
     candidates = [
         item
         for item in markets
         if item["marketId"] == market_id
         and item["collateralToken"]["symbol"] == "USDC"
-        and item["isOpen"]
+        and (not require_open or item["isOpen"])
     ]
     if len(candidates) != 1:
         raise ValueError("Current open USDC market data is unavailable")
@@ -88,6 +127,8 @@ def open_trade(
     take_profit: str | None,
     stop_loss: str | None,
     dry_run: bool,
+    lcd_endpoint: str | None = None,
+    mcp_market: bool = False,
     notify: Notify = _ignore,
     before_submit: SubmitCheck = _accept,
     allow_concurrent_open: bool = False,
@@ -95,8 +136,8 @@ def open_trade(
     """Open a market, limit, or stop trade.
 
     A live market order replaces the intent price with Keeper's current price
-    for an open USDC market and reports it as `referencePrice`. Its dry run
-    sets `requiresMarketPriceRefresh` because that price is not fetched yet.
+    for an open USDC market and reports it as `referencePrice`. A dry run
+    reports a price from Keeper when available. MCP requires one to bind it.
     """
     payload = intents.open_intent(
         market_id,
@@ -109,6 +150,33 @@ def open_trade(
         take_profit,
         stop_loss,
     )
+    row: dict[str, Any] | None = None
+    reference: dict[str, Any] | None = None
+
+    def read_market(timeout: float = 20) -> None:
+        nonlocal row, reference
+        row = open_usdc_market(
+            endpoint, market_id, timeout=timeout, require_open=order_type == "market"
+        )
+        reference = estimates.price_input(
+            estimates.market_price(row), "Sai Keeper market price", intents.now()
+        )
+
+    def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
+        if order_type != "market" and lcd_endpoint is not None:
+            try:
+                read_market(estimates.QUOTE_TIMEOUT)
+            except estimates.READ_ERRORS:
+                pass
+        return estimates.open_estimates(
+            endpoint,
+            lcd_endpoint,
+            payload["body"],
+            row,
+            reference,
+            mcp_market=mcp_market,
+        )
+
     if order_type != "market":
         return preview_or_submit(
             endpoint,
@@ -116,24 +184,44 @@ def open_trade(
             payload,
             dry_run,
             before_submit,
+            estimate,
             allow_concurrent_open=allow_concurrent_open,
         )
     if dry_run:
-        return {"dryRun": True, "requiresMarketPriceRefresh": True, "intent": payload}
+        if mcp_market:
+            read_market()
+        elif lcd_endpoint is not None:
+            try:
+                read_market(estimates.QUOTE_TIMEOUT)
+            except estimates.READ_ERRORS:
+                pass
+        preview = {
+            "dryRun": True,
+            "requiresMarketPriceRefresh": True,
+            "intent": payload,
+            "estimates": estimate({}),
+        }
+        if price is not None and not mcp_market:
+            preview["referencePrice"] = price
+        elif reference is not None:
+            preview["referencePrice"] = reference["price"]
+        return preview
     active = get_session()
     if price is not None:
         notify(MARKET_PRICE_NOTICE)
-    current = open_usdc_market(endpoint, market_id)
-    current_price = format(Decimal(str(current["price"])), "f")
-    intents.positive(current_price, "Current price")
+    read_market()
+    assert reference is not None
+    current_price = reference["price"]
     payload["body"]["intentPrice"] = current_price
-    before_submit(
+    _checked(
+        before_submit,
         {
             "dryRun": True,
             "requiresMarketPriceRefresh": True,
             "intent": payload,
             "referencePrice": current_price,
-        }
+        },
+        estimate,
     )
     result = intents.submit(
         endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
@@ -149,11 +237,52 @@ def close_trade(
     trade_id: int,
     cancel_order: bool,
     dry_run: bool,
+    lcd_endpoint: str | None = None,
     before_submit: SubmitCheck = _accept,
 ) -> dict[str, Any]:
     """Close a position or cancel a pending order."""
     payload = intents.close_intent(trade_id, cancel_order)
-    return preview_or_submit(endpoint, get_session, payload, dry_run, before_submit)
+
+    if cancel_order:
+
+        def pending_order(addr: str) -> None:
+            if lcd_endpoint is None:
+                raise ValueError("Cannot verify the pending order without an LCD")
+            contract = margin.trading_contract(endpoint, lcd_endpoint)
+            trade = margin.read_cancel_target(lcd_endpoint, contract, addr, trade_id)
+            if (
+                not isinstance(trade, dict)
+                or trade.get("user_trade_index") != f"UserTradeIndex({trade_id})"
+                or trade.get("is_open") is not True
+                or trade.get("trade_type") not in ("limit", "stop")
+            ):
+                raise ValueError(
+                    "Target is not an open pending order. Preview a market close for a filled position."
+                )
+
+        def cancel_estimate(_preview: dict[str, Any]) -> dict[str, Any]:
+            reason = "A pending order can fill before cancellation executes. Perp may close a filled position at market."
+            return {
+                key: estimates.unavailable(reason)
+                for key in ("fees", "liquidationPrice", "worstCaseFill")
+            }
+
+        preview = {"dryRun": True, "intent": payload}
+        active = get_session()
+        pending_order(active["evmAddress"])
+        if dry_run:
+            return {**preview, "estimates": cancel_estimate(preview)}
+        _checked(before_submit, preview, cancel_estimate)
+        return intents.submit(endpoint, get_session(), payload)
+
+    return preview_or_submit(
+        endpoint,
+        get_session,
+        payload,
+        dry_run,
+        before_submit,
+        lambda _: _estimate_position(endpoint, lcd_endpoint, get_session, trade_id),
+    )
 
 
 def set_tpsl(
@@ -166,13 +295,23 @@ def set_tpsl(
     clear_take_profit: bool,
     clear_stop_loss: bool,
     dry_run: bool,
+    lcd_endpoint: str | None = None,
     before_submit: SubmitCheck = _accept,
 ) -> dict[str, Any]:
     """Set or clear take-profit and stop-loss prices."""
     payload = intents.tpsl_intent(
         trade_id, take_profit, stop_loss, clear_take_profit, clear_stop_loss
     )
-    return preview_or_submit(endpoint, get_session, payload, dry_run, before_submit)
+    return preview_or_submit(
+        endpoint,
+        get_session,
+        payload,
+        dry_run,
+        before_submit,
+        lambda _: _estimate_position(
+            endpoint, lcd_endpoint, get_session, trade_id, updates_triggers=True
+        ),
+    )
 
 
 def set_leverage(
@@ -182,11 +321,94 @@ def set_leverage(
     trade_id: int,
     leverage: str,
     dry_run: bool,
+    lcd_endpoint: str | None = None,
     before_submit: SubmitCheck = _accept,
 ) -> dict[str, Any]:
     """Set target leverage without changing TP or SL."""
     payload = intents.leverage_intent(trade_id, leverage)
-    return preview_or_submit(endpoint, get_session, payload, dry_run, before_submit)
+
+    def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
+        return _estimate_position(
+            endpoint, lcd_endpoint, get_session, trade_id, target=Decimal(leverage)
+        )
+
+    return preview_or_submit(
+        endpoint, get_session, payload, dry_run, before_submit, estimate
+    )
+
+
+def _estimate_position(
+    endpoint: str,
+    lcd: str | None,
+    get_session: SessionLoader,
+    trade_id: int,
+    *,
+    target: Decimal | None = None,
+    updates_triggers: bool = False,
+) -> dict[str, Any]:
+    state, effective, height = None, None, None
+    if lcd is not None:
+        try:
+            addr = get_session()["evmAddress"]
+            state = margin.snapshot(endpoint, lcd, addr, trade_id)
+            if target is not None or updates_triggers:
+                height = margin.verified_position_height(lcd, state, trade_id)
+                effective, _ = margin.leverage_inputs(
+                    lcd, state, trade_id, height=height
+                )
+        except estimates.READ_ERRORS:
+            pass
+    if target is None and not updates_triggers:
+        return estimates.close_estimates(lcd or "", state, trade_id, None)
+    return estimates.position_estimates(
+        lcd or "",
+        state,
+        effective,
+        target=target,
+        updates_triggers=updates_triggers,
+        height=height,
+    )
+
+
+def _position_preview(
+    build: Callable[[], PositionPreview],
+    *,
+    lcd_endpoint: str,
+    addr: str,
+    trade_id: int,
+    dry_run: bool,
+    before_submit: SubmitCheck,
+    changed_message: str,
+    estimate: Callable[
+        [margin.PositionSnapshot, dict[str, Any], dict[str, Any]], dict[str, Any]
+    ],
+) -> dict[str, Any]:
+    state, inputs, preview = build()
+    if dry_run:
+        preview["estimates"] = estimate(state, inputs, preview)
+        return preview
+
+    try:
+        state, inputs, fresh = build()
+    except (
+        margin.IndexLag,
+        margin.PositionUnavailable,
+        margin.MarketUnavailable,
+    ) as exc:
+        raise PositionChanged(f"{changed_message}. {exc}") from exc
+    changed = not margin.position_unchanged(lcd_endpoint, state, trade_id, inputs)
+    if changed:
+        try:
+            state, inputs, fresh = build()
+        except (ValueError, keeper.KeeperError, KeyError, TypeError) as exc:
+            raise PositionChanged(
+                f"{changed_message}. Could not quote the latest position. {exc}"
+            ) from exc
+    if changed or fresh != preview:
+        fresh["estimates"] = estimate(state, inputs, fresh)
+        raise PositionChanged(changed_message, {**fresh, "addr": addr})
+    _checked(before_submit, fresh, lambda _: estimate(state, inputs, fresh))
+    return fresh
 
 
 def change_margin(
@@ -206,34 +428,56 @@ def change_margin(
     must match the first, or the change is refused for review.
     """
     active = get_session()
-    raw, funds, market = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
+    addr = active["evmAddress"]
+
+    def build_preview() -> PositionPreview:
+        state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
+        leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
+        if leverage is None:
+            raise ValueError("Cannot verify effective leverage for this margin change")
+        quote = margin.margin_quote(
+            state.raw,
+            state.funds,
+            state.market,
+            direction,
+            amount,
+            effective_leverage=leverage,
+        )
+        return (
+            state,
+            inputs,
+            {
+                "dryRun": True,
+                "quote": {
+                    **quote,
+                    **inputs,
+                    "marginChangeIsEstimate": leverage
+                    < Decimal(quote["leverageBefore"]),
+                },
+                "intent": intents.leverage_intent(trade_id, quote["requestedLeverage"]),
+                "warning": MARGIN_WARNING,
+            },
+        )
+
+    preview = _position_preview(
+        build_preview,
+        lcd_endpoint=lcd_endpoint,
+        addr=addr,
+        trade_id=trade_id,
+        dry_run=dry_run,
+        before_submit=before_submit,
+        changed_message="Position changed; review the margin change again",
+        estimate=lambda state, inputs, fresh: estimates.position_estimates(
+            lcd_endpoint,
+            state,
+            _quoted_leverage(inputs),
+            target=Decimal(fresh["quote"]["requestedLeverage"]),
+        ),
     )
-    quoted = margin.margin_quote(raw, funds, market, direction, amount)
-    payload = intents.leverage_intent(trade_id, quoted["requestedLeverage"])
-    preview = {
-        "dryRun": True,
-        "quote": quoted,
-        "intent": payload,
-        "warning": MARGIN_WARNING,
-    }
     if dry_run:
         return preview
-    fresh_raw, fresh_funds, fresh_market = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
-    )
-    fresh_quote = margin.margin_quote(
-        fresh_raw, fresh_funds, fresh_market, direction, amount
-    )
-    if (
-        fresh_raw["collateral_amount"] != raw["collateral_amount"]
-        or fresh_raw["leverage"] != raw["leverage"]
-        or fresh_quote != quoted
-    ):
-        raise ValueError("Position changed; review the margin change again")
-    before_submit(preview)
-    result = intents.submit(endpoint, active, payload)
-    result["quote"] = quoted
+    result = intents.submit(endpoint, active, preview["intent"])
+    result["quote"] = preview["quote"]
     result["warning"] = MARGIN_WARNING
     return result
 
@@ -254,38 +498,68 @@ def partial_close(
     minimum position size, and re-checked before submitting.
     """
     active = get_session()
-    # The snapshot refuses when Keeper's index differs from the contract,
-    # so the reduction is never sized from a lagging collateral amount.
-    raw, _, borrowing = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
+    addr = active["evmAddress"]
+
+    def build_preview() -> PositionPreview:
+        state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
+        raw = state.raw
+        market_id = state.market["marketId"]
+        markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
+        candidates = [
+            item
+            for item in markets
+            if item["marketId"] == market_id
+            and item["collateralToken"]["symbol"] == "USDC"
+        ]
+        if len(candidates) != 1 or not candidates[0]["isOpen"]:
+            raise ValueError("Open market data not available")
+        position = {
+            "id": trade_id,
+            "collateralAmount": raw["collateral_amount"],
+            "leverage": raw["leverage"],
+        }
+        payload = intents.partial_intent(
+            position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
+        )
+        delta = int(payload["body"]["collateral"]["amountUsdc"])
+        leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
+        notional = partial.notional_quote(lcd_endpoint, state, delta, leverage)
+        return (
+            state,
+            {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
+            {
+                "dryRun": True,
+                "intent": payload,
+                "quote": {
+                    "percent": percent,
+                    "collateralBefore": str(raw["collateral_amount"]),
+                    "leverageBefore": str(raw["leverage"]),
+                    **inputs,
+                    **notional,
+                },
+            },
+        )
+
+    preview = _position_preview(
+        build_preview,
+        lcd_endpoint=lcd_endpoint,
+        addr=addr,
+        trade_id=trade_id,
+        dry_run=dry_run,
+        before_submit=before_submit,
+        changed_message="Position changed; review the reduction again",
+        estimate=lambda state, inputs, fresh: estimates.close_estimates(
+            lcd_endpoint,
+            state,
+            trade_id,
+            int(fresh["intent"]["body"]["collateral"]["amountUsdc"]),
+        ),
     )
-    market_id = borrowing["marketId"]
-    markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
-    candidates = [
-        item
-        for item in markets
-        if item["marketId"] == market_id and item["collateralToken"]["symbol"] == "USDC"
-    ]
-    if len(candidates) != 1 or not candidates[0]["isOpen"]:
-        raise ValueError("Open market data not available")
-    position = {
-        "id": trade_id,
-        "collateralAmount": raw["collateral_amount"],
-        "leverage": raw["leverage"],
-    }
-    payload = intents.partial_intent(
-        position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
-    )
-    preview = {"dryRun": True, "intent": payload}
     if dry_run:
         return preview
-    latest, _, _ = margin.snapshot(
-        endpoint, lcd_endpoint, active["evmAddress"], trade_id
-    )
-    if (
-        latest["collateral_amount"] != raw["collateral_amount"]
-        or latest["leverage"] != raw["leverage"]
-    ):
-        raise ValueError("Position changed; review the reduction again")
-    before_submit(preview)
-    return intents.submit(endpoint, active, payload)
+    return intents.submit(endpoint, active, preview["intent"])
+
+
+def _quoted_leverage(inputs: dict[str, Any]) -> Decimal | None:
+    value = inputs["effectiveLeverage"]
+    return Decimal(value) if value is not None else None

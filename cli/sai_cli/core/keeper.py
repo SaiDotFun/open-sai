@@ -27,10 +27,50 @@ MARKETS = """query { perp { borrowings { marketId price isOpen visible minLevera
 MARKET = """query($market:Int!, $collateral:Int!) { perp { borrowing(marketId:$market,collateralId:$collateral) { marketId isOpen minLeverage maxLeverage collateralToken { id symbol } } } }"""
 PRICES = """query { oracle { tokenPricesUsd(limit: 100) { priceUsd token { id symbol name } lastUpdatedBlock { block block_ts } } } }"""
 POSITIONS = """query($trader:String!) { perp { trades(where:{trader:$trader,isOpen:true}, limit:100) { id trader isOpen isLong tradeType collateralAmount leverage openPrice tp sl state { liquidationPrice pnlCollateral pnlPct positionValue } perpBorrowing { marketId baseToken { symbol } collateralToken { symbol } } } } }"""
+OVERVIEW_TRADES = """
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    trades(where:{trader:$trader,isOpen:true}, order_by:sequence, order_desc:false, limit:$limit, offset:$offset) {
+      id trader isLong tradeType collateralAmount leverage openPrice tp sl
+      state { liquidationPrice }
+      perpBorrowing {
+        marketId baseToken { id symbol } quoteToken { id symbol name } collateralToken { id symbol }
+      }
+      lastUpdatedBlock { block block_ts }
+    }
+  }
+}
+"""
+PENDING_MARKET_ORDERS = """
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    marketOrders(where:{trader:$trader,status:pending_exec}, limit:$limit, offset:$offset) {
+      sequence tradeId side perpMarketId status collateralAmount orderReqBlock orderReqBlockTs
+      orderReqTxHash orderReqEvmTxHash
+    }
+  }
+}
+"""
 POSITION = """query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }"""
 ROUTE = """query { oneClickTrading { enabled chainId contractAddress } }"""
 HISTORY = """query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }"""
+INTENT_HISTORY = """query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) {
+      id intentKey tradeChangeType txHash evmTxHash block { block block_ts }
+      marketOrder { orderReqBlock orderReqTxHash orderExecBlock sequence execPrice collateralAmount }
+      openingFeeUsd closingFeeUsd borrowingFeeUsd
+      trade {
+        id trader tradeType isOpen isLong collateralAmount openCollateralAmount
+        leverage openPrice closePrice tp sl openBlock { block } closeBlock { block }
+        perpBorrowing { marketId collateralToken { symbol } }
+      }
+    }
+  }
+}"""
 INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
+WAIT_INTENTS = """query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
 SESSION = """mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }"""
 SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }"""
@@ -38,6 +78,11 @@ SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$in
 INTENT_KEY = re.compile(r"[A-Za-z0-9_-]{1,128}")
 GENERATED_INTENT_KEY = re.compile(r"[0-9]{8}T[0-9]{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 REQUEST_HASH = re.compile(r"(?:0[xX])?[0-9a-fA-F]{64}")
+# gqlgen's Time scalar emits RFC3339Nano for block and execution timestamps.
+BLOCK_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
+    r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])"
+)
 INTENT_KINDS = frozenset(
     {
         "OPEN_TRADE",
@@ -101,9 +146,23 @@ INTENT_ERROR_CODES = frozenset(
         "market_order_market_closed",
         "market_order_trade_not_open",
         "market_order_outcome_not_indexed",
+        "withdraw_evm_unconfigured",
+        "invalid_withdraw",
         "intent_already_used",
         "below_minimum",
         "insufficient_idle",
+        # Browser intent lifecycle and authentication diagnostics.
+        "intent_validation_failed",
+        "chain_switch_failed",
+        "gas_estimation_failed",
+        "wallet_rejected",
+        "wallet_sign_failed",
+        "chain_mismatch",
+        "request_pending",
+        "rpc_submission_failed",
+        "sign_failed_unknown",
+        "intent_auth_rejected",
+        "jwt_failed",
     }
 )
 
@@ -134,12 +193,13 @@ def intent_error_code(row: Mapping[str, Any]) -> str | None:
 
 
 def _block_time(value: object) -> str | None:
-    if isinstance(value, str) and len(value) <= 40:
+    if isinstance(value, str) and BLOCK_TIMESTAMP.fullmatch(value):
         try:
-            if datetime.fromisoformat(value).tzinfo is not None:
-                return value
+            datetime.fromisoformat(value)
         except ValueError:
             pass
+        else:
+            return value
     return None
 
 
@@ -178,8 +238,11 @@ def safe_intent_record(row: Mapping[str, Any]) -> dict[str, Any]:
     block = row.get("execBlock")
     if type(block) is int and 0 <= block < 2**63:
         record["execBlock"] = block
-    if ts := _block_time(row.get("execBlockTs")):
-        record["execBlockTs"] = ts
+    timestamp = row.get("execBlockTs")
+    if valid := _block_time(timestamp):
+        record["execBlockTs"] = valid
+    elif timestamp is not None:
+        record["execBlockTsInvalid"] = True
     tx_hash, invalid = request_hash(row.get("txHash"))
     if tx_hash:
         record["txHash"] = tx_hash
@@ -219,9 +282,33 @@ def safe_intent_history(row: Mapping[str, Any]) -> dict[str, Any]:
         history["block"] = {}
         if (height := _row_id(block.get("block"))) is not None:
             history["block"]["block"] = height
-        if ts := _block_time(block.get("block_ts")):
-            history["block"]["block_ts"] = ts
+        timestamp = block.get("block_ts")
+        if valid := _block_time(timestamp):
+            history["block"]["block_ts"] = valid
+        elif timestamp is not None:
+            history["block"]["block_tsInvalid"] = True
     return log.clean(history)
+
+
+def safe_history_response(data: Mapping[str, Any]) -> dict[str, Any]:
+    """Project the account-history response while keeping its GraphQL envelope."""
+    perp = data.get("perp")
+    if not isinstance(perp, dict):
+        return {"perp": None} if perp is None and "perp" in data else {}
+    rows = perp.get("tradeHistory")
+    if isinstance(rows, list):
+        return {
+            "perp": {
+                "tradeHistory": [
+                    safe_intent_history(row) for row in rows if isinstance(row, dict)
+                ]
+            }
+        }
+    return {
+        "perp": {"tradeHistory": None}
+        if rows is None and "tradeHistory" in perp
+        else {}
+    }
 
 
 # Names for the log; a query not listed here is logged as `custom`.
@@ -230,10 +317,14 @@ OPERATIONS = {
     MARKET: "market",
     PRICES: "prices",
     POSITIONS: "positions",
+    OVERVIEW_TRADES: "overview_trades",
+    PENDING_MARKET_ORDERS: "pending_market_orders",
     POSITION: "position",
     ROUTE: "route",
     HISTORY: "history",
+    INTENT_HISTORY: "history",
     INTENTS: "intents",
+    WAIT_INTENTS: "intents",
     CHALLENGE: "challenge",
     SESSION: "session",
     SUBMIT: "submit",
@@ -321,8 +412,8 @@ def request(
 
     Logs one `keeper.request` event with the operation, the endpoint's
     origin, the outcome, and the duration. For an intent lookup, it also
-    records the key. Audit calls disable `trace_intent` so a pasted key
-    or echoed GraphQL diagnostic stays out of the log.
+    records the key unless an audit call disables `trace_intent`.
+    GraphQL errors contribute validated codes and the total error count.
     """
     started = time.monotonic()
     outcome: dict[str, Any] = {"status": "error", "code": Code.INTERNAL_ERROR}
@@ -372,7 +463,9 @@ def _log_request(
             None,
         )
         intent_key = (
-            (variables or {}).get("key") if query == INTENTS and trace_intent else None
+            (variables or {}).get("key")
+            if query in (INTENTS, WAIT_INTENTS) and trace_intent
+            else None
         )
         log.event(
             "keeper.request",
@@ -390,32 +483,11 @@ def _log_request(
             code=outcome.get("code"),
             error=outcome.get("error") if trace_intent else None,
             httpStatus=outcome.get("httpStatus"),
-            keeperErrors=outcome.get("keeperErrors") if trace_intent else None,
+            keeperErrors=outcome.get("keeperErrors"),
+            keeperErrorCount=outcome.get("keeperErrorCount"),
         )
     except Exception:  # noqa: BLE001, S110 - logging must not change the outcome
         pass
-
-
-def _graphql_errors(errors: Any) -> list[dict[str, Any]]:
-    """The code and message of the first few GraphQL errors, for the log.
-
-    Keeper's message can echo input, such as the signature sent to the
-    session mutation, so it is marked untrusted: the log writer cuts it
-    short and removes long hex strings and tokens.
-    """
-    found: list[dict[str, Any]] = []
-    for item in errors[:3] if isinstance(errors, list) else []:
-        if not isinstance(item, dict):
-            continue
-        extensions = item.get("extensions")
-        code = extensions.get("code") if isinstance(extensions, dict) else None
-        found.append(
-            {
-                "code": log.untrusted(str(code)) if code is not None else None,
-                "message": log.untrusted(str(item.get("message", ""))),
-            }
-        )
-    return found
 
 
 def _request(
@@ -446,11 +518,47 @@ def _request(
         raise NotSent("Could not connect to Keeper; the request was not sent") from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise KeeperError("Keeper request failed or returned invalid JSON") from exc
+    return _response_data(query, result, outcome)
+
+
+async def read_async(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    query: str,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    """Read Keeper without a worker thread or an authentication token."""
+    started = time.monotonic()
+    outcome: dict[str, Any] = {"status": "error", "code": Code.KEEPER_ERROR}
+    try:
+        check_url(endpoint, "Keeper")
+        response = await client.post(
+            endpoint, json={"query": query, "variables": variables}
+        )
+        outcome["httpStatus"] = response.status_code
+        response.raise_for_status()
+        data = _response_data(query, response.json(), outcome)
+        outcome["status"] = "ok"
+        del outcome["code"]
+        return data
+    except (httpx.HTTPError, ValueError) as exc:
+        outcome["error"] = "Keeper request failed or returned invalid JSON"
+        raise KeeperError(outcome["error"]) from exc
+    except KeeperError as exc:
+        outcome["error"] = str(exc)
+        raise
+    finally:
+        _log_request(
+            endpoint, query, variables, None, started, outcome, trace_intent=True
+        )
+
+
+def _response_data(query: str, result: Any, outcome: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise KeeperError("Keeper returned an invalid response")
     if result.get("errors"):
         errors = result["errors"]
-        outcome["keeperErrors"] = _graphql_errors(errors)
+        outcome.update(log.keeper_error_fields(errors))
         if (
             query == SUBMIT
             and not result.get("data")

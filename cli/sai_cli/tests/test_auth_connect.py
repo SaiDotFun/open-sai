@@ -161,7 +161,7 @@ def assert_connected(env: Env, token: str, result_stdout: str) -> None:
     assert output == {
         "addr": ADDR,
         "expiresAt": output["expiresAt"],
-        "endpoint": keeper.MAINNET_HTTP,
+        "endpoint": "https://sai-keeper.nibiru.fi",
     }
     assert token.encode() not in env.stored_bytes()
     status = env.run("--json", "auth", "status")
@@ -775,6 +775,142 @@ def login_error(result: subprocess.CompletedProcess[str]) -> str:
     return json.loads(result.stdout)["error"]["message"]
 
 
+def test_renew_uses_saved_name_and_preserves_active_account(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, name="saved-key", addr=ADDR)
+    endpoint = keeper_auth["endpoint"]
+    assert login(env, keeper_auth, "saved-key").returncode == 0
+    env.clipboard()
+    env.clip.write_text(make_token(OTHER))
+    assert env.run("--endpoint", endpoint, "auth", "import").returncode == 0
+
+    keeper_auth["token"] = make_token(hours=1440)
+    renewed = env.run("--json", "--endpoint", endpoint, "auth", "renew", ADDR)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["addr"] == ADDR
+    assert keeper_auth["token"] not in renewed.stdout + renewed.stderr
+    assert env.log.read_text().count(" wallet sign --account saved-key ") == 2
+    status = env.run("--json", "--endpoint", endpoint, "auth", "status")
+    assert json.loads(status.stdout)["addr"] == OTHER
+
+    refused = env.run("--endpoint", endpoint, "auth", "renew")
+    assert refused.returncode == 1
+    assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in refused.stderr
+    assert "auth import" in refused.stderr
+    assert endpoint not in refused.stderr
+    assert len(keeper_auth["signatures"]) == 2
+
+
+def test_renew_refuses_a_key_that_changed_address(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    assert login(env, keeper_auth, "dev").returncode == 0
+    keystore(env, addr=OTHER)
+    result = env.run("--endpoint", keeper_auth["endpoint"], "auth", "renew")
+    assert result.returncode == 1
+    assert "does not match the wallet addr" in result.stderr
+    assert len(keeper_auth["signatures"]) == 1
+
+
+def test_cli_status_and_list_report_expiry_warnings(env: Env):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    status = env.run("--json", "auth", "status")
+    result = env.run("--json", "auth", "list")
+    row = json.loads(result.stdout)["accounts"][0]
+    assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
+    renewal = row["renewalCommand"]
+    assert renewal.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert "auth import" in renewal
+    assert keeper.MAINNET_HTTP not in renewal
+    assert status.stderr == result.stderr == ""
+
+
+@pytest.mark.parametrize("json_output", [False, True])
+def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    primary, secondary = pty.openpty()
+    flags = ["--json"] if json_output else []
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "sai_cli",
+                *flags,
+                "config",
+                "get",
+                "keeper.endpoint",
+            ],
+            env={**env.vars(), "CI": "1"},
+            stdin=secondary,
+            stderr=secondary,
+            stdout=subprocess.PIPE,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        os.set_blocking(primary, False)
+        try:
+            error = os.read(primary, 4096).decode()
+        except BlockingIOError:
+            error = ""
+    finally:
+        os.close(primary)
+        os.close(secondary)
+    assert "expires in" not in result.stdout
+    if json_output:
+        assert error == ""
+    else:
+        assert len(error.splitlines()) == 1
+        assert "expires in" in error
+        assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error
+        assert "auth import" in error
+        assert keeper.MAINNET_HTTP not in error
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["/query?api_key=synthetic-test-credential", "/synthetic-test-credential/query"],
+)
+def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
+    env: Env, suffix: str
+):
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    origin = "http://127.0.0.1:9876"
+    endpoint = origin + suffix
+    args = ("--json", "--endpoint", endpoint, "auth")
+    assert env.run(*args, "import").returncode == 0
+    status = env.run(*args, "status")
+    row = json.loads(status.stdout)
+    assert row["endpoint"] == origin
+    assert f"reuse the Keeper endpoint at {origin}" in row["renewalCommand"]
+    refused = env.run(*args, "renew")
+    assert refused.returncode == 1
+    assert "reuse the Keeper endpoint" in login_error(refused)
+    assert (
+        "synthetic-test-credential"
+        not in status.stdout + refused.stdout + refused.stderr
+    )
+
+
+def test_renew_json_shows_only_the_keeper_origin(env: Env, keeper_auth):
+    fake_cast(env)
+    keystore(env, addr=ADDR)
+    origin = keeper_auth["endpoint"].removesuffix("/query")
+    endpoint = f"{origin}/synthetic-test-credential/query"
+    args = ("--json", "--endpoint", endpoint, "auth")
+    assert env.run(*args, "login", "dev").returncode == 0
+    result = env.run(*args, "renew")
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["endpoint"] == origin
+    assert "synthetic-test-credential" not in result.stdout
+
+
 def test_wallet_login_reads_addr_from_ud(env: Env, keeper_auth) -> None:
     fake_ud(env)
     result = login(env, keeper_auth, "dev")
@@ -987,15 +1123,12 @@ def test_ud_signing_failure_without_a_terminal_says_to_use_one(
     )
     assert result.returncode == 3
     # The whole command, so a retry keeps the endpoint and --addr.
-    if private_path:
-        assert secret not in result.stdout + result.stderr
-        assert endpoint not in result.stdout + result.stderr
-        endpoint_arg = (
-            '"${SAI_RECONCILE_ENDPOINT:?'
-            'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
-        )
-    else:
-        endpoint_arg = endpoint
+    assert secret not in result.stdout + result.stderr
+    assert endpoint not in result.stdout + result.stderr
+    endpoint_arg = (
+        '"${SAI_RECONCILE_ENDPOINT:?'
+        'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
+    )
     command = f"sai --endpoint {endpoint_arg} --json auth login dev --addr {ADDR}"
     assert f"Run `{command}` in a terminal." in login_error(result)
     assert json.loads(result.stdout)["error"]["hint"] == command

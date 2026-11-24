@@ -61,6 +61,7 @@ class Target:
 
     argv: list[str]
     env: dict[str, str] = field(default_factory=dict)
+    explicit_command: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,7 +69,7 @@ class Registration:
     """The `sai` entry found in a client.
 
     Keeps argv, the SAI_HOME value (a path), and only the names of any other
-    environment settings, which `install` does not carry and so replaces.
+    environment settings. Install writes only SAI_HOME to canonical entries.
     """
 
     argv: list[str]
@@ -86,13 +87,13 @@ class Registration:
     stdio: bool = True
 
     def shown(self, target: Target | None) -> dict[str, Any]:
-        """The argv to print: in full only when it is the expected command.
+        """Show the expected argv when the saved command matches.
 
-        Any other entry's args may hold a token or a credential URL, so only
-        the command's file name is shown.
+        Saved directories and args can contain private values. An unmatched
+        entry shows only the command's file name.
         """
-        if target is not None and self.argv == target.argv:
-            return {"command": self.argv}
+        if target is not None and self.matches_command(target):
+            return {"command": target.argv}
         if not self.argv:
             return {"command": []}
         out: dict[str, Any] = {"command": [Path(self.argv[0]).name]}
@@ -102,11 +103,21 @@ class Registration:
 
     def matches(self, target: Target) -> bool:
         return (
-            self.argv == target.argv
+            self.matches_command(target)
             and self.matches_sai_home(target.env)
             and not self.stale_env
             and not self.extra_settings
             and not self.disabled
+        )
+
+    def matches_command(self, target: Target) -> bool:
+        if self.argv == target.argv:
+            return True
+        return bool(
+            self.argv
+            and target.argv
+            and self.argv[1:] == target.argv[1:]
+            and normalize_launcher(self.argv[0]) == normalize_launcher(target.argv[0])
         )
 
     def matches_sai_home(self, env: Mapping[str, str]) -> bool:
@@ -237,6 +248,14 @@ def inside(path: Path, roots: list[Path]) -> bool:
     return False
 
 
+def normalize_launcher(command: str) -> str:
+    """Resolve the directory of an absolute launcher and keep uv's executable link."""
+    if not os.path.isabs(command):
+        return command
+    directory, name = os.path.split(command)
+    return os.path.join(os.path.realpath(directory), name)
+
+
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
     return Target([launcher, "mcp", "serve"], server_env(environ))
 
@@ -258,7 +277,7 @@ def server_target(
     `~/.local/bin/sai` link that `uv tool` keeps across updates.
     """
     if override:
-        return Target(list(override), server_env(environ)), []
+        return Target(list(override), server_env(environ), explicit_command=True), []
     found = shutil.which("sai", path=environ.get("PATH"))
     if found is None:
         raise InstallError(
@@ -289,31 +308,23 @@ def server_target(
 
 
 def run(argv: list[str]) -> None:
-    """Run a client command; raise ClientError with its first stderr line."""
+    """Run a client command without relaying output that may contain config values."""
+    command = " ".join([Path(argv[0]).name, *argv[1:3]])
     try:
         done = subprocess.run(
             argv,
             stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
             timeout=SUBPROCESS_TIMEOUT,
             check=False,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
-        raise ClientError(f"`{Path(argv[0]).name}` did not run: {type(exc).__name__}")
+        raise ClientError(f"`{command}` did not run: {type(exc).__name__}") from None
     if done.returncode != 0:
         raise ClientError(
-            f"`{Path(argv[0]).name} {' '.join(argv[1:3])}` exited"
-            f" {done.returncode}: {first_line(done.stderr or done.stdout)}"
+            f"`{command}` exited {done.returncode}. Run the client command directly for details."
         )
-
-
-def first_line(text: str) -> str:
-    """Pick the error line from client output; clients also print warnings."""
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
-    errors = [line for line in lines if "error" in line.lower()]
-    chosen = errors[0] if errors else (lines[-1] if lines else "no output")
-    return chosen[:200]
 
 
 def load_json(path: Path) -> dict[str, Any] | None:
@@ -532,21 +543,77 @@ class Claude(Client):
     def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
+        projects = (data or {}).get("projects")
+        project = (
+            projects.get(str(self.cwd))
+            if self.cwd is not None and isinstance(projects, dict)
+            else None
+        )
+        project = project if isinstance(project, dict) else None
+        toggled_off = (project or {}).get("disabledMcpServers")
+        disabled = isinstance(toggled_off, list) and name in toggled_off
         found = []
         user = servers(data).get(name)
         if user is not None:
-            found.append(entry_registration(user, "user"))
+            found.append(entry_registration(user, "user", disabled))
         if self.cwd is None:
             return self.ordered([r for r in found if r is not None])
-        projects = (data or {}).get("projects")
-        project = projects.get(str(self.cwd)) if isinstance(projects, dict) else None
-        local = servers(project if isinstance(project, dict) else None).get(name)
+        local = servers(project).get(name)
         if local is not None:
-            found.append(entry_registration(local, "local"))
+            found.append(entry_registration(local, "local", disabled))
         shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
         if shared is not None:
-            found.append(entry_registration(shared, "project"))
+            found.append(
+                entry_registration(shared, "project", self.project_disabled(name))
+            )
         return self.ordered([r for r in found if r is not None])
+
+    def project_disabled(self, name: str) -> bool:
+        assert self.cwd is not None
+        settings_paths = [
+            self.home_dir() / "settings.json",
+            self.cwd / ".claude" / "settings.json",
+            self.cwd / ".claude" / "settings.local.json",
+        ]
+        main = self.main_checkout()
+        if main is not None and main != self.cwd:
+            settings_paths.append(main / ".claude" / "settings.local.json")
+        for path in settings_paths:
+            rejected = (load_json(path) or {}).get("disabledMcpjsonServers")
+            if isinstance(rejected, list) and name in rejected:
+                return True
+        return False
+
+    def main_checkout(self) -> Path | None:
+        """Find the Git checkout Claude uses for project-local settings."""
+        if self.cwd is None or os.name == "nt":
+            return None
+        try:
+            result = subprocess.run(
+                ["git", "worktree", "list", "--porcelain", "-z"],
+                cwd=self.cwd,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+            first = result.stdout.partition(b"\0\0")[0].split(b"\0")
+            if (
+                result.returncode
+                or not first[0].startswith(b"worktree ")
+                or b"bare" in first
+            ):
+                return None
+            root = Path(os.fsdecode(first[0].removeprefix(b"worktree ")))
+            if not root.is_absolute() or root == self.home:
+                return None
+            for path in (root, root / ".git", root / ".claude"):
+                if path.exists() and path.stat().st_uid != os.getuid():
+                    return None
+            return root
+        except (OSError, subprocess.TimeoutExpired):
+            return None
 
     def add_steps(
         self, scope: str, target: Target, name: str = NAME
@@ -613,27 +680,43 @@ class Codex(Client):
         exe = self.exe()
         if exe is None:
             return None
+        command = f"codex mcp get {name} --json"
         try:
             done = subprocess.run(
                 [exe, "mcp", "get", name, "--json"],
                 cwd=cwd,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
-                text=True,
                 timeout=SUBPROCESS_TIMEOUT,
                 check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
-            raise ClientError(f"`codex mcp get` did not run: {type(exc).__name__}")
+            raise ClientError(
+                f"`{command}` did not run: {type(exc).__name__}"
+            ) from None
         if done.returncode != 0:
-            if "no mcp server" in (done.stderr + done.stdout).lower():
+            missing = f"Error: No MCP server named '{name}' found.".encode()
+            # Codex can warn about PATH alias initialization before the lookup.
+            diagnostics = [
+                line
+                for line in done.stderr.splitlines()
+                if line.strip() and not line.startswith(b"WARNING: ")
+            ]
+            if (
+                done.returncode == 1
+                and not done.stdout.strip()
+                and diagnostics == [missing]
+            ):
                 return None
-            raise ClientError(f"`codex mcp get` exited {done.returncode}")
+            raise ClientError(
+                f"`{command}` exited {done.returncode}. Run the client command directly for details."
+            )
         try:
-            data = json.loads(done.stdout)
+            data = json.loads(done.stdout.decode("utf-8"))
         except ValueError:
-            raise ClientError("`codex mcp get` printed something other than JSON")
-        data = data if isinstance(data, dict) else {}
+            raise ClientError(f"`{command}` printed invalid JSON") from None
+        if not isinstance(data, dict) or not isinstance(data.get("transport"), dict):
+            raise ClientError(f"`{command}` returned an invalid registration")
         disabled = data.get("enabled") is False
         extras = tuple(k for k in CODEX_TOOL_FILTERS if data.get(k) is not None)
         return entry_registration(
@@ -791,10 +874,38 @@ def list_clients(
 
 
 def replacement_steps(
-    client: Client, scope: str, target: Target, name: str, exists: bool
+    client: Client, scope: str, target: Target, exists: bool
 ) -> list[list[str]]:
-    remove = client.remove_steps(scope, name) if exists else []
-    return [*remove, *client.add_steps(scope, target, name)]
+    remove = client.remove_steps(scope) if exists else []
+    return [*remove, *client.add_steps(scope, target)]
+
+
+def report_legacy_install(client: Client, reg: Registration, target: Target) -> Result:
+    result = Result(
+        client.name,
+        "unchanged",
+        scope=reg.scope,
+        name=RETIRED_NAME,
+        **reg.shown(target),
+    )
+    if reg.disabled:
+        result.error = (
+            f"The existing {RETIRED_NAME} registration is disabled in {client.name}. "
+            "Review MCP approvals and settings in the client."
+        )
+    elif stale := stale_registration(client, RETIRED_NAME, reg):
+        result.error = (
+            f"The existing {RETIRED_NAME} registration needs repair. {stale.reason}. "
+            "Run `sai doctor` for repair instructions."
+        )
+    elif target.explicit_command and reg.argv != target.argv:
+        result.error = (
+            f"Kept the existing {RETIRED_NAME} registration and skipped the requested "
+            "server command. Edit the existing registration in the client to change it."
+        )
+    if result.error is not None:
+        result.action = "failed"
+    return result
 
 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
@@ -805,12 +916,15 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             client.require_exe()
         found = client.registrations()
         existing = next((r for r in found if r.scope == scope), None)
-        name = NAME
-        if existing is None and isinstance(client, Claude):
-            existing = client.registration(scope, RETIRED_NAME)
-            if existing is not None:
-                name = RETIRED_NAME
-                result.name = name
+        if existing is None:
+            legacy = client.effective(client.registrations(RETIRED_NAME))
+            if legacy is not None:
+                return report_legacy_install(client, legacy, target)
+        elif isinstance(client, Claude) and existing.disabled:
+            raise ClientError(
+                f"Claude Code has disabled the {existing.scope} sai registration. "
+                "Review MCP approvals and settings in the client."
+            )
         winner = client.effective(found)
         if (
             winner is not None
@@ -828,7 +942,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = replacement_steps(client, scope, target, name, existing is not None)
+            steps = replacement_steps(client, scope, target, existing is not None)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", action
@@ -842,7 +956,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
                 # changed the client.
                 result.changed = True
         result.changed = True
-        client.verify(scope, target, name=name)
+        client.verify(scope, target)
         result.action = action
     except (ClientError, OSError) as exc:
         result.action, result.error = "failed", str(exc)
@@ -1183,11 +1297,11 @@ def replace_registration(
     if stale.args is None or scope in client.read_only_scopes:
         raise ClientError("This registration needs a manual edit")
     if isinstance(client, Codex):
-        expected = Target([target.argv[0], *stale.args])
+        expected = Target([normalize_launcher(target.argv[0]), *stale.args])
         path = client.config_path(scope)
         edit_codex_config(path, expected, stale=stale)
         actual = client.get(client.neutral_dir(), "user", name)
-        if actual is None or actual.argv != expected.argv:
+        if actual is None or not actual.matches_command(expected):
             raise ClientError("Codex did not load the repaired Sai registration")
         return
     if not isinstance(client, Cursor):
@@ -1205,7 +1319,8 @@ def replace_json_registration(
         entry = config.entries.get(name)
         if (
             not isinstance(entry, MutableMapping)
-            or entry_registration(entry, scope) != stale.registration
+            or entry_registration(entry, scope, stale.registration.disabled)
+            != stale.registration
         ):
             raise ClientError("The Sai registration changed concurrently")
     else:

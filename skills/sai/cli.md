@@ -10,6 +10,8 @@ plus `skill` on versions that have it. Global options go before the command:
 
 ```bash
 sai --json market prices
+sai account overview
+sai account overview --as 0xYOUR_ADDR --json
 sai --as 0xOTHER_ADDR --json account positions 0xOTHER_ADDR
 ```
 
@@ -30,6 +32,10 @@ sai --json watch price 3
 
 - `market list` returns Keeper's borrowing markets, and `market prices` the
   current indexed prices.
+- `account overview` reads the active account unless you pass `--as ADDR`.
+  Check each section's fetch time, source age, and any error before using
+  the funds, position risk, orders, or local intent data. Queued market
+  orders are waiting for the next oracle price.
 - `account positions ADDR` lists positions and pending orders.
   `account balances ADDR` reads one balance snapshot. `account history
   ADDR` reads trade history. These reads need no sign-in.
@@ -40,24 +46,64 @@ sai --json watch price 3
 The CLI does not deposit or bridge funds. The person funds the Sai account in
 Sai Web.
 
+### Intent and History JSON
+
+`intent status` returns Keeper intent rows in `userIntents` and any matching
+trade history in `matchedTradeHistory`. Sai can add `outcome`,
+`localStatus`, and `hint`. `account history` returns trade-history rows in
+`perp.tradeHistory`. The CLI and MCP use the same Keeper fields.
+
+| Rows | Keeper Fields |
+| --- | --- |
+| Intent | `intentKey`, `kind`, `lifecycleStep`, `execActor`, `evmAddress`, `nibiAddress`, `txHash`, `execBlock`, `execBlockTs`, `errorCode`, `errorMsg` |
+| Trade history | `id`, `intentKey`, `tradeChangeType`, `txHash`, `evmTxHash`, `block.block`, `block.block_ts`, `trade.id`, `trade.trader` |
+
+Sai omits null, unrecognized, and invalid row fields and lowercases valid
+transaction hashes. A malformed hash or timestamp adds the corresponding
+flag with value `true`. The flags are `txHashInvalid`,
+`evmTxHashInvalid`, `execBlockTsInvalid`, and `block.block_tsInvalid`.
+
+Use `outcome` and `localStatus` when present. If both are absent, read the
+latest row's `lifecycleStep` and `execActor` together. A server `exec_pass`
+confirms the intent succeeded. Matching trade history can arrive later.
+[Keeper lifecycle and actor mapping](https://github.com/SaiDotFun/open-sai/blob/main/cli/sai_cli/core/intent-outcomes.md#keeper-intent-outcomes)
+
+On an intent error, `errorCode` keeps recognized codes such as
+`wallet_rejected` and `rpc_submission_failed`. Sai uses `KEEPER_ERROR`
+when the code is missing or unrecognized. The `errorMsg` field says
+`Keeper reported an intent error.`.
+
 ## Connect an Account
 
 Trading needs a Sai session. When the person asks you to connect Sai:
 
-1. Ask them to copy their session token with the **Connect Sai CLI / MCP**
-   button in Sai Web. If their Sai Web has no such button, ask them to run
-   `sai auth login NAME` in their own terminal (below).
-2. Run `sai --json auth import`. Without a terminal it reads the clipboard,
-   stores the token, clears the clipboard, and prints `addr`, `expiresAt`,
-   and `endpoint`.
+1. Ask them to open the wallet menu on Sai Web Mainnet and select **Connect
+   Sai CLI / MCP** beside **Send to phone**. The button appears for the
+   selected, connected wallet with an active trading session. Ask them to
+   check the expiry and click **Copy session token**. If they can't use the
+   button, they can sign in with a Foundry keystore as described below.
+2. Run `sai --json --endpoint https://sai-keeper.nibiru.fi/query auth import`
+   without a terminal. The command reads the clipboard, stores the token,
+   and prints `addr`, `expiresAt`, and `endpoint`. It tries to clear the
+   clipboard if it still holds the token.
 3. If your commands run in a pseudo-terminal, `auth import` shows a hidden
    prompt instead. Send only an empty line, which makes it read the
    clipboard.
 4. If it reports that no clipboard command works, as over SSH, ask the person
-   to run `sai auth import` in their own terminal, then continue.
+   to run the dialog's `sai auth import` command in their own terminal. They
+   can paste the token at the hidden prompt or press Enter to read the
+   clipboard.
 
 Never ask the person to paste the token into the chat. `auth import` does not
 accept the token as an argument, environment variable, or piped input.
+
+The import command pins Mainnet for that invocation only. Check the session
+with `sai --endpoint https://sai-keeper.nibiru.fi/query auth status`. Later CLI
+commands and any MCP server using the session must target the same Keeper
+endpoint. To save Mainnet as the default, run
+`sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query`.
+Update any conflicting `--endpoint` or `SAI_ENDPOINT` overrides and restart
+running MCP servers to pick up the change.
 
 A person with a Foundry keystore can run `sai auth login NAME` in their own
 terminal instead. `NAME` is a keystore in `~/.foundry/keystores`, and `cast`
@@ -73,15 +119,24 @@ Once connected, commands need no prompt until the session expires.
 | `sai auth list` | Every connected account, its expiry, and which is active. |
 | `sai auth use ADDR` | Switch the active account. Only when the person asks. |
 | `sai --as ADDR ...` | Run one command as another connected account. |
+| `sai auth renew [ADDR]` | Renew a keystore session with its saved key name. Keeps the active account selected. |
 | `sai auth logout [ADDR]` | Remove one account, by default the active one. |
+
+Status, list, doctor, and the overview warn with less than three days left.
+Ask the person to renew in their terminal if the key prompts for a
+password. For an imported session, ask them to copy a fresh Sai Web token
+and run `sai auth import`. For an older keystore session without a saved key
+name, ask them to run `sai auth login NAME` once.
 
 Each sign-in adds an account and makes it active. If the person asks what the
 token is, tell them:
 
 - It is the same session token Sai Web keeps in the browser.
 - It lasts as long as Keeper issues it, 30 days in production.
-- It authorizes all trading on the funds deposited in their Sai account.
-  Withdrawals still need their wallet.
+- Anyone with the token can trade with their Sai Balance and request
+  one-click withdrawals of idle funds. Those withdrawals can only go to
+  the wallet that owns the session. Keep the token out of clipboard sync,
+  chats, and shared notes.
 - Keeper cannot revoke it. `sai auth logout` deletes only the local copy, and
   signing out of Sai Web does not sign out the CLI.
 
@@ -179,7 +234,7 @@ sai logs path
 ```
 
 - `tail` shows the most recent events, oldest first. `-n` sets how many.
-  With `--json` each line is the stored JSON object.
+  With `--json`, each line is a JSON object.
 - `--surface` is `cli`, `mcp`, or `update`. Each surface has its own file
   per UTC day.
 - `--event NAME` matches one event or a family by prefix: `intent`,
@@ -262,6 +317,8 @@ If `sai skill` answers "No such command", the installed CLI predates it. Use
 ## Trade Commands
 
 `trade open`, `trade close`, `trade partial-close`, `trade tpsl`, `trade
-leverage`, and `trade margin` submit intents, and `intent local` and `intent
-status` follow them. [trading-safety.md](trading-safety.md) has the commands,
-the dry-run examples, and the rules.
+leverage`, and `trade margin` submit intents. Add `--wait` to a live trade
+to wait for its outcome, or run `sai intent wait KEY --timeout 30` with an
+existing key. The commands `intent local` and `intent status` show the
+local ledger and Keeper's latest records. [Trading safety](trading-safety.md)
+has the approval, dry-run, and follow-up steps.

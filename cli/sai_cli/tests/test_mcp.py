@@ -49,6 +49,7 @@ READ_TOOLS = {
     "account_positions",
     "account_history",
     "account_balances",
+    "account_overview",
     "intent_local",
     "intent_status",
     "preview_open",
@@ -58,6 +59,7 @@ READ_TOOLS = {
     "preview_margin",
     "preview_partial_close",
     "logs_intent",
+    "intent_wait",
 }
 LOCAL_TOOLS = {"mcp_info", "auth_status", "auth_list", "auth_use", "intent_local"}
 # Changes only which connected account is active on this machine.
@@ -389,8 +391,8 @@ def test_server_reads_the_config_file_and_reports_its_path(tmp_path):
         '[keeper]\nendpoint = "http://127.0.0.1:9/query"\n'
     )
     info = invoke(server.create_server(), "mcp_info")
-    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9/query"
-    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9/query"
+    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
+    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
     assert info["configFile"] == str(tmp_path / "config.toml")
 
 
@@ -520,16 +522,47 @@ def markets(price: float = 100.5) -> dict[str, Any]:
 
 
 def snapshots(monkeypatch, *collaterals: str) -> None:
-    """Make margin.snapshot return one position state per call, in order."""
+    """Supply each indexed snapshot and repeat its contract state on recheck."""
+    current: margin.PositionSnapshot | None = None
     states = iter(
-        (
-            {"collateral_amount": amount, "leverage": "2"},
+        margin.PositionSnapshot(
+            {
+                "user": "nibi1trader",
+                "user_trade_index": "UserTradeIndex(7)",
+                "is_open": True,
+                "trade_type": "trade",
+                "collateral_amount": amount,
+                "leverage": "2",
+                "market_index": "MarketIndex(0)",
+                "collateral_index": "TokenIndex(1)",
+            },
             {"available_to_trade": "10000000"},
             {"marketId": 0, "minLeverage": 1.1, "maxLeverage": 100},
+            "test-contract",
         )
         for amount in collaterals
     )
-    monkeypatch.setattr(margin, "snapshot", lambda *args: next(states))
+
+    def snapshot(*args: Any) -> margin.PositionSnapshot:
+        nonlocal current
+        current = next(states)
+        return current
+
+    def contract_reply(
+        lcd: str, contract: str, query: dict[str, Any], **kwargs: Any
+    ) -> Any:
+        if "get_trade_raw" in query:
+            assert current is not None
+            return current.raw
+        return "1" if "get_collateral_price" in query else False
+
+    monkeypatch.setattr(margin, "snapshot", snapshot)
+    monkeypatch.setattr(margin, "smart_value", contract_reply)
+    monkeypatch.setattr(
+        margin,
+        "_latest_position",
+        lambda *args: (contract_reply("", "", {"get_trade_raw": {}}), "120"),
+    )
 
 
 def confirm(
@@ -603,7 +636,6 @@ PREVIEWS = (
     ("preview_open", OPEN_ARGS),
     ("preview_open", {**OPEN_ARGS, "order_type": "market", "price": None}),
     ("preview_close", {"trade_id": 7}),
-    ("preview_close", {"trade_id": 7, "cancel_order": True}),
     ("preview_tpsl", {"trade_id": 7, "take_profit": "120"}),
     ("preview_leverage", {"trade_id": 7, "leverage": "3"}),
     ("preview_margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
@@ -642,7 +674,6 @@ def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     ("name", "preview_args", "trade_args"),
     [
         ("close", {"trade_id": 7}, {"trade_id": 8}),
-        ("close", {"trade_id": 7}, {"trade_id": 7, "cancel_order": True}),
         (
             "leverage",
             {"trade_id": 7, "leverage": "3"},
@@ -959,7 +990,7 @@ def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
     assert preview["addr"] is None
     storage.save_session(stored_session())
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)
@@ -990,7 +1021,7 @@ def test_logout_during_the_refresh_refuses_a_confirmed_signed_in_trade(
     preview = invoke(mcp, "preview_open", MARKET_OPEN)
     assert preview["addr"] == ADDR
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)
@@ -1169,7 +1200,7 @@ def test_lost_ack_reports_unknown_then_intent_status_reconciles(mcp, monkeypatch
     }
     fake.answers = {
         keeper.INTENTS: {"userIntents": [row]},
-        keeper.HISTORY: {"perp": {"tradeHistory": [trade]}},
+        keeper.INTENT_HISTORY: {"perp": {"tradeHistory": [trade]}},
     }
     status = invoke(mcp, "intent_status", {"key": key})
     assert status["matchedTradeHistory"] == [trade]
@@ -1264,16 +1295,16 @@ def test_logged_and_returned_errors_redact_the_session_token(mcp, monkeypatch, c
 
 
 def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
-    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s#f")
+    monkeypatch.setenv("SAI_ENDPOINT", "https://user:pw@k.example:8443/query?key=s")
     monkeypatch.setenv("SAI_LCD_ENDPOINT", "https://lcd.example/?apikey=s")
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")
     assert info["endpoints"] == {
-        "keeper": "https://k.example:8443/query",
-        "websocket": "wss://k.example:8443/query",
+        "keeper": "https://k.example:8443",
+        "websocket": "wss://k.example:8443",
         "lcd": "https://lcd.example/",
     }
-    assert info["session"]["endpoint"] == "https://k.example/q"
+    assert info["session"]["endpoint"] == "https://k.example"
     text = json.dumps(info)
     for secret in ("user:pw", "key=", "apikey", "u:p@", "t=s"):
         assert secret not in text
@@ -1300,13 +1331,41 @@ def test_mcp_info_reports_versions_without_network(mcp, monkeypatch):
 def test_session_reports_never_include_the_token(mcp):
     storage.save_session(stored_session())
     status = invoke(mcp, "auth_status")
-    assert set(status) == {"addr", "expiresAt", "endpoint"}
-    assert (status["addr"], status["endpoint"]) == (ADDR, ENDPOINT)
+    assert set(status) == {
+        "addr",
+        "expiresAt",
+        "endpoint",
+        "expiryWarning",
+        "renewalCommand",
+    }
+    assert (status["addr"], status["endpoint"]) == (
+        ADDR,
+        ENDPOINT.removesuffix("/query"),
+    )
     info = invoke(mcp, "mcp_info")
     assert info["session"]["addr"] == ADDR
     assert info["session"]["usable"] is True
+    assert "expires in" in info["session"]["expiryWarning"]
+    assert info["session"]["renewalCommand"] == status["renewalCommand"]
+    assert "expiryWarning" in invoke(mcp, "auth_list")["accounts"][0]
     assert info["provenance"]["kind"] in ("source-checkout", "installed")
-    assert info["endpoints"]["keeper"] == ENDPOINT
+    assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"
+
+
+def test_session_reports_keep_an_account_without_an_endpoint(mcp):
+    stored = stored_session()
+    del stored["endpoint"]
+    storage.save_session(stored)
+
+    info = invoke(mcp, "mcp_info")
+    [account] = invoke(mcp, "auth_list")["accounts"]
+    assert info["session"]["signedIn"] is True
+    assert account["active"] is True
+    for report in (info["session"], account):
+        assert report["addr"] == ADDR
+        assert report["endpoint"] is None
+        assert report["endpointMatches"] is False
+        assert report["usable"] is False
 
 
 # Stdio
@@ -1373,8 +1432,8 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     assert "sai auth login" in started["instructions"]
     assert {tool["name"] for tool in listed["tools"]} == READ_TOOLS | TRADE_TOOLS
     info = json.loads(called["content"][0]["text"])
-    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9/query"
-    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9/query"
+    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
+    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
     assert info["trading"]["reason"] == "signed-out"
     assert "agent client should launch it" not in stderr
 

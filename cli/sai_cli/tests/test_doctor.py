@@ -11,8 +11,9 @@ import socket
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,7 @@ from click.testing import CliRunner
 from sai_cli import doctor
 from sai_cli.core import keeper, margin, settings, storage, stream, update, updater
 from sai_cli.sai_cli import main
+from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
 
@@ -50,7 +52,7 @@ def isolated_home(tmp_path, monkeypatch) -> Path:
     return tmp_path
 
 
-def save(hours: float = 48, endpoint: str = ENDPOINT, addr: str = ADDR) -> None:
+def save(hours: float = 96, endpoint: str = ENDPOINT, addr: str = ADDR) -> None:
     storage.save_session(
         {
             "token": TOKEN,
@@ -110,25 +112,36 @@ def run_cli(*args: str) -> tuple[int, str]:
 
 
 @pytest.mark.parametrize(
-    ("content", "expected", "summary"),
+    ("content", "expected", "exit_code", "summary"),
     [
-        (b"[update]\nauto = false\n", "pass", "Config file settings are valid"),
-        (b"[future]\nprivate_setting = 'private_value'\n", "warn", "unknown settings"),
-        (b"[update\n", "fail", "not valid TOML"),
-        (b"[keeper]\nendpoint = 'https://[private_value'\n", "fail", "keeper.endpoint"),
-        (b"[update]\nauto = 'private_value'\n", "fail", "update.auto"),
-        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", "logs.keep_days"),
-        (b"\xff", "fail", "UTF-8"),
+        (b"[update]\nauto = false\n", "pass", 0, "Config file settings are valid"),
+        (
+            b"[future]\nprivate_setting = 'private_value'\n",
+            "warn",
+            0,
+            "unknown settings",
+        ),
+        (b"[update\n", "fail", 1, "not valid TOML"),
+        (
+            b"[keeper]\nendpoint = 'https://[private_value'\n",
+            "fail",
+            2,
+            "keeper.endpoint",
+        ),
+        (b"[update]\nauto = 'private_value'\n", "fail", 1, "update.auto"),
+        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", 1, "logs.keep_days"),
+        (b"\xff", "fail", 1, "UTF-8"),
         pytest.param(
             b"[logs]\nkeep_days = " + b"9" * 5000,
             "fail",
+            1,
             "not valid TOML",
             id="oversized-TOML-integer",
         ),
     ],
 )
 def test_config_check_reports_file_errors_without_echoing_values(
-    isolated_home, monkeypatch, content, expected, summary
+    isolated_home, monkeypatch, content, expected, exit_code, summary
 ):
     path = isolated_home / "config.toml"
     path.write_bytes(content)
@@ -143,7 +156,7 @@ def test_config_check_reports_file_errors_without_echoing_values(
     assert checks["config"]["status"] == expected
     assert summary in checks["config"]["summary"]
     assert "home" in checks
-    assert code == (1 if expected == "fail" else 0)
+    assert code == exit_code
     assert "private_setting" not in output and "private_value" not in output
     assert path.read_bytes() == content
 
@@ -213,22 +226,50 @@ def test_expired_session_fails():
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
     assert "expired" in check.summary
-    assert check.fix and "sai auth login" in check.fix
+    assert check.fix and check.fix.startswith(
+        'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
+    )
+    assert "auth login NAME" in check.fix
+    assert ENDPOINT not in check.fix
 
 
 def test_session_for_other_endpoint_fails():
     save(endpoint="https://user:pw@other.example/query?key=abc")
     check = one(doctor.check_session, ctx())
     assert check.status == "fail"
-    assert "https://other.example/query" in check.summary
+    assert check.details["endpoint"] == "https://other.example"
+    assert "https://other.example" in check.summary
+    assert "/query" not in check.summary
     assert "pw" not in check.summary and "key=abc" not in check.summary
 
 
-def test_session_expiring_within_a_day_warns():
-    save(hours=0.5)
+def test_session_without_an_endpoint_reports_a_missing_endpoint():
+    storage.save_session(
+        {
+            "token": TOKEN,
+            "evmAddress": ADDR,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        }
+    )
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 1
+    checks = json.loads(output)["error"]["details"]["checks"]
+    check = next(check for check in checks if check["id"] == "session")
+    assert check["status"] == "fail"
+    assert "has no stored Keeper endpoint" in check["summary"]
+    assert "auth login NAME" in check["fix"]
+    assert check["details"]["addr"] == ADDR
+    assert check["details"]["endpoint"] is None
+    assert check["details"]["endpointMatches"] is False
+
+
+@pytest.mark.parametrize(("hours", "unit"), [(0.5, "min"), (48, " h")])
+def test_session_expiring_within_three_days_warns(hours, unit):
+    save(hours=hours)
     check = one(doctor.check_session, ctx())
     assert check.status == "warn"
-    assert "expires in" in check.summary and "min" in check.summary
+    assert "expires in" in check.summary and unit in check.summary
 
 
 @pytest.mark.parametrize(
@@ -275,6 +316,117 @@ def test_no_fix_reports_loose_modes_without_changing_them(isolated_home):
         f" chmod go-rwx {root / 'intents.sqlite3'}"
     )
     assert snapshot(isolated_home) == before
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize("default_home", [False, True])
+def test_doctor_repairs_a_dedicated_existing_sai_home(
+    isolated_home, default_home, monkeypatch
+):
+    if default_home:
+        monkeypatch.setenv("HOME", str(isolated_home))
+        isolated_home = isolated_home / ".sai"
+        monkeypatch.delenv("SAI_HOME")
+    save()
+    storage.db().close()
+    wheels = updater.private_cache()
+    (wheels / update.wheel_name("0.1.0")).touch()
+    isolated_home.chmod(0o755)
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["details"]["looseModes"] == [
+        {"path": str(isolated_home), "mode": "755"}
+    ]
+    assert isolated_home.stat().st_mode & 0o777 == 0o755
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "fixed"
+    assert check["changes"] == [f"chmod {isolated_home} 755 -> 700"]
+    assert isolated_home.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+@pytest.mark.parametrize(
+    ("mode", "layout"),
+    [
+        (0o2770, "ledger"),
+        (0o2755, "ledger"),
+        (0o0770, "ledger"),
+        (0o0757, "ledger"),
+        (0o0755, "mixed-cache"),
+        (0o0755, "setgid-cache"),
+        (0o0755, "empty"),
+    ],
+)
+def test_doctor_reports_and_preserves_an_existing_shared_or_ambiguous_root(
+    isolated_home, mode, layout
+):
+    if layout != "empty":
+        storage.db().close()
+    if layout == "mixed-cache":
+        other_app = isolated_home / "cache" / "other-app.db"
+        other_app.parent.mkdir()
+        other_app.write_text("unrelated data")
+    if layout == "setgid-cache":
+        cache = isolated_home / "cache"
+        cache.mkdir()
+        cache.chmod(0o2755)
+    isolated_home.chmod(mode)
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["details"]["looseModes"][0] == {
+        "path": str(isolated_home),
+        "mode": f"{mode:o}",
+    }
+    assert isolated_home.stat().st_mode & 0o7777 == mode
+    if layout == "empty":
+        # Doctor creates an empty trader directory on its first run. That
+        # directory and diagnostic logs still leave the root ambiguous.
+        code, output = run_cli("--json", "doctor", "--offline")
+        assert code == 0
+        check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+        assert check["status"] == "warn"
+        assert check["changes"] == []
+        assert isolated_home.stat().st_mode & 0o7777 == mode
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
+    storage.db().close()
+    history = isolated_home / "trader" / "history"
+    history.touch()
+    history.chmod(0o644)
+    isolated_home.chmod(0o2770)
+    root_advice = (
+        "This Sai home may be shared. Stop all Sai CLI and MCP processes before moving"
+        " the profile to a dedicated directory. Keep the trader data, including the intent"
+        " ledger. Set SAI_HOME to the new directory for the CLI and in every MCP client"
+        " configuration before restarting clients or resuming trading."
+    )
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["fix"] == f"{root_advice} chmod go-rwx {history}"
+    assert history.stat().st_mode & 0o777 == 0o644
+    assert isolated_home.stat().st_mode & 0o7777 == 0o2770
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["fix"] == root_advice
+    assert history.stat().st_mode & 0o777 == 0o600
+    assert isolated_home.stat().st_mode & 0o7777 == 0o2770
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
@@ -340,6 +492,34 @@ def test_symlinked_ledger_is_not_migrated(isolated_home, tmp_path_factory):
     assert "symlink" in check.summary
     assert user_version(target) == 0
     assert one(doctor.check_home, ctx(fix=True)).status == "fail"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes and symlinks")
+@pytest.mark.parametrize("mode", [0o755, 0o2770])
+def test_doctor_checks_root_independently_of_a_symlinked_history(
+    isolated_home, tmp_path_factory, mode
+):
+    storage.db().close()
+    target = tmp_path_factory.mktemp("elsewhere") / "history"
+    target.write_text("outside history")
+    target.chmod(0o644)
+    history = isolated_home / "trader" / "history"
+    history.symlink_to(target)
+    isolated_home.chmod(mode)
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 1
+    checks = json.loads(output)["error"]["details"]["checks"]
+    check = next(c for c in checks if c["id"] == "home")
+    assert check["status"] == "fail"
+    assert check["details"]["symlinks"] == [str(history)]
+    assert check["details"]["looseModes"] == [
+        {"path": str(isolated_home), "mode": f"{mode:o}"}
+    ]
+    assert check["changes"] == []
+    assert isolated_home.stat().st_mode & 0o7777 == mode
+    assert history.is_symlink()
+    assert target.stat().st_mode & 0o777 == 0o644
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX symlinks")
@@ -449,7 +629,9 @@ def test_unknown_intent_for_signed_in_account_fails():
     check = one(doctor.check_intents, ctx())
     assert check.status == "fail"
     assert check.summary == "1 unknown intent blocks trading for 0x4803…"
-    assert check.fix == (f"sai intent status {ADDR} --key 20261118T000000000000-a")
+    assert check.fix is not None
+    assert check.fix.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert check.fix.endswith(f"intent status {ADDR} --key 20261118T000000000000-a")
     assert check.details["otherAccounts"] == {"unknown": 1, "accounts": 1}
 
 
@@ -507,6 +689,27 @@ def user_version(path: Path) -> int:
         version = connection.execute("PRAGMA user_version").fetchone()[0]
     connection.close()
     return version
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+def test_doctor_reports_root_repair_before_ledger_migration(
+    isolated_home,
+):
+    path = old_ledger(isolated_home)
+    path.parent.chmod(0o770)
+    isolated_home.chmod(0o755)
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    checks = {c["id"]: c for c in json.loads(output)["checks"]}
+    assert checks["home"]["status"] == "fixed"
+    assert checks["home"]["changes"] == [
+        f"chmod {path.parent} 770 -> 700",
+        f"chmod {isolated_home} 755 -> 700",
+    ]
+    assert checks["intents"]["status"] == "fixed"
+    assert user_version(path) == storage.SCHEMA_VERSION
+    assert isolated_home.stat().st_mode & 0o777 == 0o700
 
 
 def test_no_fix_warns_about_an_old_ledger(isolated_home):
@@ -749,6 +952,7 @@ class Stub:
         # Called before each userIntents reply.
         self.on_intents: Any = None
         self.queries: list[str] = []
+        self.paths: list[str] = []
 
 
 @pytest.fixture
@@ -784,6 +988,7 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
         def do_POST(self):
             body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             state.queries.append(body["query"])
+            state.paths.append(self.path)
             if "userIntents" in body["query"]:
                 if state.on_intents:
                     state.on_intents()
@@ -817,17 +1022,31 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
     thread.join()
 
 
-def ws_stub(ack: bool) -> tuple[str, Any]:
+def ws_stub(
+    ack: bool,
+    *,
+    close_with_target: bool = False,
+    process_response: Callable[[ServerConnection, Request, Response], Response]
+    | None = None,
+) -> tuple[str, Any]:
     release = threading.Event()
 
     def handler(connection: ServerConnection) -> None:
         connection.recv()
+        if close_with_target:
+            assert connection.request is not None
+            connection.close(code=1008, reason=connection.request.path)
+            return
         if ack:
             connection.send(json.dumps({"type": "connection_ack"}))
         release.wait(10)
 
     server = serve(
-        handler, "127.0.0.1", 0, subprotocols=[Subprotocol("graphql-transport-ws")]
+        handler,
+        "127.0.0.1",
+        0,
+        subprotocols=[Subprotocol("graphql-transport-ws")],
+        process_response=process_response,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -1022,6 +1241,75 @@ def test_silent_websocket_fails_within_the_timeout():
     assert "connection_ack" in check.summary
 
 
+def test_doctor_omits_peer_websocket_close_reason(http_stub):
+    base, _state = http_stub
+    ws, stop = ws_stub(ack=False, close_with_target=True)
+    path_key, query_key = "fixture-relative-path", "fixture-relative-query"
+    origin = ws.removesuffix("/query")
+    endpoint = f"{origin}/{path_key}?key={query_key}"
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                f"{base}/query",
+                "doctor",
+                "--no-fix",
+                "--ws-endpoint",
+                endpoint,
+                "--lcd-endpoint",
+                base,
+            )
+            assert code == 1
+            assert f"{origin} sent no connection_ack" in output
+            assert "ConnectionClosedError (close code 1008)" in output
+            assert path_key not in output and query_key not in output
+    finally:
+        stop()
+
+
+@pytest.mark.parametrize(
+    ("status", "diagnostic"),
+    [
+        (HTTPStatus.SWITCHING_PROTOCOLS, "InvalidHeaderFormat"),
+        (HTTPStatus.FORBIDDEN, "InvalidStatus (HTTP status 403)"),
+    ],
+)
+def test_doctor_omits_peer_websocket_handshake_text(http_stub, status, diagnostic):
+    base, _state = http_stub
+    path_key, query_key = "fixture-handshake-path", "fixture-handshake-query"
+
+    def respond(
+        connection: ServerConnection, request: Request, reply: Response
+    ) -> Response:
+        if status == HTTPStatus.FORBIDDEN:
+            return connection.respond(status, request.path)
+        del reply.headers["Sec-WebSocket-Protocol"]
+        reply.headers["Sec-WebSocket-Protocol"] = request.path
+        return reply
+
+    ws, stop = ws_stub(ack=False, process_response=respond)
+    origin = ws.removesuffix("/query")
+    try:
+        for flags in ((), ("--json",)):
+            code, output = run_cli(
+                *flags,
+                "--endpoint",
+                f"{base}/query",
+                "doctor",
+                "--no-fix",
+                "--ws-endpoint",
+                f"{origin}/{path_key}?key={query_key}",
+                "--lcd-endpoint",
+                base,
+            )
+            assert code == 1
+            assert f"{origin} sent no connection_ack: {diagnostic}" in output
+            assert path_key not in output and query_key not in output
+    finally:
+        stop()
+
+
 def test_unreachable_endpoints_fail_and_exit_1():
     dead = f"http://127.0.0.1:{free_port()}"
     code, output = run_cli(
@@ -1072,6 +1360,59 @@ KEY = "20261118T000000000000-r"
 def blocked_on(endpoint: str) -> None:
     save(endpoint=endpoint)
     ledger([(KEY, endpoint, ADDR, "unknown")])
+
+
+@pytest.mark.parametrize(
+    "matches", [False, True], ids=["same-origin-mismatch", "match"]
+)
+def test_doctor_shows_only_keeper_origins_in_reports_and_hints(
+    http_stub, matches, request
+):
+    base, state = http_stub
+    path_key, query_key = "fixture-keeper-path", "fixture-keeper-query"
+    stored_path_key = "fixture-stored-path"
+    route = f"/{path_key}/query?key={query_key}"
+    endpoint = base + route
+    if matches:
+        blocked_on(endpoint)
+    else:
+        save(endpoint=f"{base}/{stored_path_key}/query?key={query_key}")
+    ws, stop = ws_stub(ack=True)
+    request.addfinalizer(stop)
+    ws_origin = ws.removesuffix("/query")
+    for flags in ((), ("--json",)):
+        code, output = run_cli(
+            *flags,
+            "--endpoint",
+            endpoint,
+            "doctor",
+            "--no-fix",
+            "--ws-endpoint",
+            ws_origin + route,
+            "--lcd-endpoint",
+            base,
+        )
+        assert code == 1
+        assert ws_origin in output
+        assert path_key not in output and query_key not in output
+        assert stored_path_key not in output
+        assert "${SAI_RECONCILE_ENDPOINT:?" in output
+        if flags:
+            checks = {
+                check["id"]: check
+                for check in json.loads(output)["error"]["details"]["checks"]
+            }
+            assert checks["keeper"]["details"]["endpoint"] == base
+            session = checks["session"]["details"]
+            assert session["endpoint"] == base and session["endpointMatches"] is matches
+            assert checks["websocket"]["status"] == "pass"
+            assert checks["websocket"]["details"]["endpoint"] == ws_origin
+            fix = checks["intents" if matches else "session"]["fix"]
+            command = (
+                f"intent status {ADDR} --key {KEY}" if matches else "auth login NAME"
+            )
+            assert command in fix
+    assert state.paths == [route, route]
 
 
 def ledger_status(key: str) -> str:
@@ -1222,12 +1563,15 @@ def test_json_report_shape_and_exit_code():
     error = json.loads(output)["error"]
     assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
     assert "expired" in error["message"]
-    assert "sai auth login NAME" in error["message"]
+    assert "auth login NAME" in error["message"]
     details = error["details"]
     assert details["schemaVersion"] == 1 and details["overall"] == "fail"
     checks = {check["id"]: check for check in details["checks"]}
     assert checks["session"]["status"] == "fail"
-    assert "sai auth login NAME" in checks["session"]["fix"]
+    recovery = checks["session"]["fix"]
+    assert recovery.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert "auth login NAME" in recovery
+    assert ENDPOINT not in recovery
     assert checks["keeper"]["status"] == "skipped"
 
 
@@ -1306,6 +1650,9 @@ def test_request_and_get_json_pass_the_timeout(monkeypatch):
 
     class Response:
         status_code = 200
+
+        def __init__(self) -> None:
+            self.headers: dict[str, str] = {}
 
         def raise_for_status(self) -> None:
             return None

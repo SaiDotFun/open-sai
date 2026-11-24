@@ -175,7 +175,7 @@ def test_template_lists_every_key_unset_and_explained():
 
 
 def test_set_and_unset_round_trip_from_no_file():
-    text, value = settings.set_value(None, "keeper.endpoint", " https://k.example/q ")
+    text, value = settings.set_value(None, "keeper.endpoint", "https://k.example/q")
     assert value == "https://k.example/q"
     assert tomllib.loads(text)["keeper"] == {"endpoint": "https://k.example/q"}
     # The key takes the place of its commented-out line.
@@ -343,12 +343,12 @@ def test_public_view_redacts_urls():
     shown = settings.public(result)
     assert list(shown) == list(settings.KEYS)
     assert shown["keeper.endpoint"] == {
-        "value": "https://k.example/q",
+        "value": "https://k.example",
         "source": "flag",
         "env": "SAI_ENDPOINT",
-        "default": keeper.MAINNET_HTTP,
+        "default": "https://sai-keeper.nibiru.fi",
     }
-    assert shown["keeper.ws_endpoint"]["value"] == "wss://k.example/q"
+    assert shown["keeper.ws_endpoint"]["value"] == "wss://k.example"
     assert shown["keeper.ws_endpoint"]["default"] is None
     assert shown["lcd.endpoint"]["value"] == "https://lcd.example/"
     assert shown["update.auto"] == {

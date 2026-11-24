@@ -48,6 +48,68 @@ and the CLI derives the WebSocket from the Keeper endpoint instead. So
 file. The per-command `--ws-endpoint` and `--lcd-endpoint` options still
 work and override the setting for that command.
 
+## Account Overview
+
+```bash
+sai account overview
+sai account overview --as 0xYOUR_ADDR --json
+```
+
+The command uses the active account on the configured Keeper endpoint.
+Pass `--as ADDR` to read another EVM account, including one you have never
+connected. The MCP tool `account_overview` takes an optional `addr` and
+returns the same fields as the CLI's JSON output.
+
+- **Sai funds.** Backed deposits, credits, and unsettled Teller funds that
+  are available to trade are separate USD amounts. An omitted balance is
+  unknown. If Keeper returns no Sai funds rows, the section reports an error.
+- **Positions.** Size is collateral in USD multiplied by leverage. USDC
+  collateral is valued at par. Gross unrealized PnL is before fees and uses
+  the contract's range of -100% to +900% of collateral. Legacy stNIBI PnL
+  uses the collateral price at the same pinned block. The total requires
+  agreement with the contract's live positions, a USD PnL value for every
+  position, and no fill that Keeper reports as awaiting indexing. The
+  positions section shows the membership check's block and age. The total
+  is unavailable when that block is more than 60 seconds old at the check.
+- **Risk.** The liquidation threshold includes borrowing fees from the
+  contract. Distances compare the same-block oracle mark and trigger levels
+  in the pair's quote token. A zero or negative distance means the price
+  reached or crossed the trigger. For a non-USD quote, displayed USD prices
+  use the oracle's quote-token conversion. If the contract threshold or
+  matching trade state is unavailable, any Keeper liquidation figure is
+  labeled as an estimate and has no distance. If only the oracle mark is
+  unavailable or stale under the market's contract settings, the threshold
+  can still be shown. A stale mark at or past the liquidation threshold
+  carries a warning because a catalyst can liquidate at that price.
+  A pending after-hours leverage adjustment withholds
+  gross PnL and TP/SL distances and retains liquidation distance when the
+  mark is usable.
+- **Orders.** Pending limit and stop orders list their trigger prices.
+  Queued market orders come from Keeper's `pending_exec` records. For a
+  queued open, the trade ID is reserved. Collateral on a queued order, when
+  present, is in base units.
+- **Local blockers.** An unknown or pending intent blocks all trades for the account.
+  An accepted intent for a position blocks requests on that position.
+  An accepted open blocks another open by default until its outcome is settled.
+- **Session.** The overview shows the expiry of a stored session for the
+  selected account and warns in its last three days.
+
+Each section's `fetchedAt` records when the client read it, in UTC. Source
+timestamps and `sourceAgeSeconds` describe the data at fetch time. A
+position's indexed trade record, contract threshold, and oracle mark carry
+separate source times. Oracle metadata shows the publish block separately
+from the LCD read block. The estimate from Keeper has an unknown source time.
+The LCD supplies missing block times after its chain matches Keeper's. A
+custom Keeper requires an explicit LCD for that chain. An independently
+overridden WebSocket is labeled as a balance source on an unverified chain.
+Local intent age starts at reservation. Session age starts at token issuance
+when the stored token provides that claim.
+
+A failed read produces a section `error` with a code and message. Other
+sections still return their data. An eight-second LCD deadline keeps already
+loaded rows when further chain reads stall. The overview flags a paginated
+list when it cannot confirm the list on a second scan.
+
 ## Updates
 
 ```bash
@@ -129,28 +191,54 @@ in the browser. Keeper issues it for 30 days in production. It authorizes
 every trade kind on the account's deposited funds, and Keeper cannot revoke it
 yet: signing out of Sai Web clears only the browser copy, not the CLI's.
 
-`auth import` stores a token copied from Sai Web. The **Connect Sai CLI /
-MCP** button that copies it is in review
-(https://github.com/SaiDotFun/sai-web/pull/1591); until it ships, use
-`auth login NAME` below.
+On Sai Web Mainnet, open the wallet menu and select **Connect Sai CLI / MCP**
+beside **Send to phone**. The button appears for the selected, connected
+wallet with an active trading session. Check the expiry, click **Copy session
+token**, and run the `sai auth import` command shown in the dialog. The command
+specifies the Mainnet endpoint.
 
-- With a terminal, it asks for the token at a hidden prompt. Press Enter
+- With a terminal, paste the token at the hidden prompt or press Enter
   without typing to read the clipboard.
 - Without a terminal, as when an agent runs it, it reads the clipboard with the
   first command that works: `pbpaste`, `wl-paste`, `xclip`, or `powershell.exe
   Get-Clipboard` (WSL and Windows). If none works, as over SSH, it exits
-  non-zero and asks for the person to run `sai auth import` in their own
-  terminal.
+  non-zero. Run the dialog's import command in your own terminal.
 - It never reads the token from arguments, environment variables, or piped
-  stdin, and never prints it. Like `auth login` and `auth status`, it prints
-  only `addr`, `expiresAt`, and `endpoint`.
+  stdin. Like `auth login`, it prints `addr`, `expiresAt`, and `endpoint`.
 - After storing the token, it reads the clipboard again and clears it only if
   it still holds the token. Anything copied in the meantime stays.
+
+The dialog pins Mainnet for import only. Check the session and, if you want
+Mainnet as your saved default, set the Keeper endpoint.
+
+```bash
+sai --endpoint https://sai-keeper.nibiru.fi/query auth status
+sai config set keeper.endpoint https://sai-keeper.nibiru.fi/query
+```
+
+Later CLI commands and any MCP server using the session must target the same
+Keeper endpoint. An explicit `--endpoint` or `SAI_ENDPOINT` overrides the
+saved setting. Update any conflicting overrides and restart running MCP
+servers to pick up the change.
 
 `auth login` signs Keeper's challenge with a local key. Before anything
 signs, the CLI checks that the typed data has primary type
 `UserTradingSession`, domain `Sai` version `1`, your addr, and the issued
 challenge nonce.
+
+Run `sai auth renew [ADDR]` to get a fresh session using the key saved by
+`sai auth login NAME`. With no address, it renews the active account. An
+explicit address renews that account and keeps the active selection. If a
+keystore session predates the saved key name, run `sai auth login NAME` once.
+For a session copied from Sai Web, copy a fresh token and run `sai auth
+import`.
+
+Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
+warning when a session has less than three days left. Interactive commands
+can also print a one-line notice to stderr. JSON output carries the warning
+in the reported session data. Use the Keeper endpoint named in the renewal
+or import hint. If the hint asks you to reuse your settings, keep the original
+Keeper configuration when running the command.
 
 `auth login NAME` picks the key named `NAME`:
 
@@ -275,41 +363,106 @@ or an unreadable file `SESSION_UNAVAILABLE`. Each message tells the agent to
 have the user run `sai auth login NAME` or `sai auth import`. A signed-in trade
 still needs the `previewDigest` of the preview the user confirmed.
 
+The partial-close digest covers the close percentage, starting collateral and
+leverage, and the contract inputs used to quote the requested slice. The
+margin digest covers the full quote, including starting collateral, stored
+leverage, and the inputs that determine effective leverage. Before submitting,
+both tools re-read the position and the effective-leverage inputs, including
+the applicable after-hours cap, at the same block. Submission requires an LCD
+that reports the query height and serves height-pinned queries. If a trade call
+finds a change, it returns `PREVIEW_MISMATCH` and includes the latest preview
+when it can still quote the position. The direct leverage tool confirms the
+requested target leverage.
+
 ## Commands
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
 `account balances ADDR`, `account history ADDR`, `trade open`, `trade
-close`, `trade partial-close`, `trade tpsl`, `intent status ADDR --key KEY`,
+close`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
 and live `watch` streams. Run any command with `--help` for details. Trading
 requires a funded account; funding is performed separately. Trade commands
 support `--dry-run` to inspect the local semantic request.
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
-requiring refresh and may include an optional supplied reference. A partial close sizes the
-reduction from the Perp contract's collateral, refuses when Keeper's index
-disagrees with the contract, and rechecks the position before submission. It
-accepts `--lcd-endpoint` like `trade margin`. Market schedule and other Keeper admission checks
-remain authoritative.
+requiring refresh and may include an optional supplied reference. A partial
+close sizes the collateral reduction from the Perp contract's position.
+It quotes the requested slice in fields `quote.closedNotionalUsdc` and
+`quote.closedNotionalUsd` using the effective leverage, collateral/USD
+oracle price, and Perp's rounding. A missing sizing input sets
+`quote.closedNotionalIsEstimate` to true. If the collateral price is
+unavailable, the USD field is null.
+The CLI rechecks the position before submission. Partial close accepts
+`--lcd-endpoint` like `trade margin`. Market schedule and other Keeper
+admission checks remain authoritative.
 
 `trade leverage TRADE_ID --leverage VALUE` sets a target leverage.
-`trade margin TRADE_ID --direction add|remove --amount USDC` reads the exact
-position and exchange balance from the Perp contract, then quotes a target
-leverage. The margin amount is a quote, not a cap: Keeper executes a leverage
-change, and the actual margin delta may differ if the position changes after
-the final check. `--dry-run` reads live state and prints the quote without
-submitting an intent. Use `--lcd-endpoint` to select the matching network's
+`trade margin TRADE_ID --direction add|remove --amount USDC` reads the
+position, exchange balance, and applicable after-hours cap from Perp. It uses
+the effective leverage to quote a target and refuses if it cannot verify
+the direction. When the after-hours guard is pending,
+`quote.marginChangeIsEstimate` is true because the guard can deduct fees
+before the leverage change. Keeper submits the target leverage. Perp uses
+effective leverage at execution to determine the direction and amount.
+`--dry-run` reads live state and prints the quote without submitting an
+intent. Use `--lcd-endpoint` to select the matching network's
 Nibiru REST service; the CLI checks that its chain matches Keeper.
-The CLI refuses the quote if the indexed position and contract disagree. Wait
-for the index to synchronize and retry; no margin intent has been submitted.
+Margin changes and partial closes briefly re-read Keeper and the contract if
+their position data disagree. If the mismatch persists, the command stops
+before submitting and asks you to retry after Keeper synchronizes.
 
 The CLI persists non-secret request identities under `$SAI_HOME/trader` or
 `~/.sai/trader`. A network error after submission leaves the outcome unknown,
 and an unknown intent blocks new trades on the account. Reconcile it with
-`intent status ADDR --key KEY`. If Keeper has no record of the key five
+`sai intent wait KEY` or inspect the latest record with
+`sai intent status ADDR --key KEY`. If Keeper has no record of the key five
 minutes after submission, past Keeper's two-minute admission expiry, the CLI
 marks it `absent` and trading resumes. A connection that fails before the
 request is sent marks the intent `not_sent`, which does not block. Keeper
 admission does not establish execution or finality.
+
+### Wait for an Intent
+
+```bash
+sai --json intent wait INTENT_KEY --timeout 30
+```
+
+The command uses the account recorded for the key on the configured Keeper
+endpoint, then the active account on that endpoint. Pass `--addr ADDR` to
+look up an intent from another machine or account. Add `--wait` to a live
+trade command to submit once and wait up to 30 seconds for that key. With
+MCP, call `intent_wait` after the trade returns its key. The tool caps each
+call at 10 seconds.
+
+The result contains an `outcome` and a `receipt`. An unresolved timeout
+returns `unknown` with code `OUTCOME_UNKNOWN` and exits 5 in the CLI. Call
+wait again with the same key and account. If reconciliation releases the
+local block after the admission grace period, the wait returns `absent`
+and exits 1. A delayed admission can still appear.
+If the ledger already has a final outcome and Keeper is unavailable, the
+wait returns `terminal` and exits 1 with the execution details unavailable.
+
+A confirmed failure exits 1, and an admission rejection exits 4. The
+outcomes `filled`, `placed`, and `succeeded` exit 0. A limit or stop
+order can return `placed` before its trigger. The receipt's `action`
+identifies the intent kind and order type when available.
+Keeper can confirm execution while the matching history is still unavailable.
+In that case the wait returns `succeeded` for a market intent.
+If matched history records liquidation or another effect that differs from
+the request, the CLI exits 1. The receipt reports the observed
+`execution.tradeChangeType` and the outcome is `liquidated` or `unexpected`.
+An after-hours risk adjustment alongside the recorded action appears in
+`execution.extraEffects`.
+
+The receipt's `requestTxHash` identifies the transaction that submitted
+the request. For a next-oracle fill, `execution.block` is the later block
+that filled it. When history is available, `execution.historyId` identifies
+the matching row. `positionNow` shows Keeper's latest state for that trade,
+and `positionFeesUsd` gives cumulative fees. The fill can include an oracle
+quote and the escrowed collateral in base units from the matching market
+order. Actual fill price and size remain null when Keeper exposes only the
+current position.
+
+### Doctor
 
 `sai doctor` checks the install, the version, config, MCP registrations,
 `$SAI_HOME/trader`, `$SAI_HOME/logs`, the session, the intent ledger, and
@@ -340,6 +493,33 @@ log lines included, and `--offline` skips the network checks, which
 otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 `--lcd-endpoint` override them for one run.
+
+### Intent and History JSON
+
+`intent status` returns Keeper intent rows in `userIntents` and any matching
+trade history in `matchedTradeHistory`. Sai can add `outcome`,
+`localStatus`, and `hint`. `account history` returns trade-history rows in
+`perp.tradeHistory`. The CLI and MCP use the same Keeper fields.
+
+| Rows | Keeper Fields |
+| --- | --- |
+| Intent | `intentKey`, `kind`, `lifecycleStep`, `execActor`, `evmAddress`, `nibiAddress`, `txHash`, `execBlock`, `execBlockTs`, `errorCode`, `errorMsg` |
+| Trade history | `id`, `intentKey`, `tradeChangeType`, `txHash`, `evmTxHash`, `block.block`, `block.block_ts`, `trade.id`, `trade.trader` |
+
+Sai omits null, unrecognized, and invalid row fields and lowercases valid
+transaction hashes. A malformed hash or timestamp adds the corresponding
+flag with value `true`. The flags are `txHashInvalid`,
+`evmTxHashInvalid`, `execBlockTsInvalid`, and `block.block_tsInvalid`.
+
+Use `outcome` and `localStatus` when present. If both are absent, read the
+latest row's `lifecycleStep` and `execActor` together. A server `exec_pass`
+confirms the intent succeeded. Matching trade history can arrive later.
+[Keeper lifecycle and actor mapping](https://github.com/SaiDotFun/open-sai/blob/main/cli/sai_cli/core/intent-outcomes.md#keeper-intent-outcomes)
+
+On an intent error, `errorCode` keeps recognized codes such as
+`wallet_rejected` and `rpc_submission_failed`. Sai uses `KEEPER_ERROR`
+when the code is missing or unrecognized. The `errorMsg` field says
+`Keeper reported an intent error.`.
 
 ## Errors and Exit Codes
 
@@ -373,6 +553,14 @@ Exit 6 covers `SIGNED_OUT` and
 `SESSION_EXPIRED`. `SESSION_UNAVAILABLE` has exit 1 and describes a local
 session the command could not use, for example one for another Keeper
 endpoint.
+
+For Keeper withdrawal failures, `intent status` and MCP `intent_status`
+report these values in `userIntents[].errorCode`.
+
+| Keeper Intent Code | Meaning | What to Do |
+| --- | --- | --- |
+| `withdraw_evm_unconfigured` | Keeper lacks the configuration for EVM withdrawals. | Wait for Keeper to be configured before retrying. |
+| `invalid_withdraw` | Keeper rejected the withdrawal request as invalid. | Review and correct the withdrawal request before retrying. |
 
 The CLI, MCP tools, and failure logs share codes. MCP tool errors have
 top-level `error` and `code` fields. The `command.end` event includes the
@@ -483,7 +671,7 @@ returns `intentKey`, `keeper`, and `txHash`. A failed Keeper read adds
 `keeperError` alongside the local trail. The `stats` report maps operations
 to `count`, `p50Ms`, and `p95Ms` under `keeper`, with counts by code under
 `errors`. It also returns `gaps` and the UTC cutoff `since`, if set.
-The `tail` command prints stored JSON objects one per line.
+The `tail` command prints one JSON object per line.
 
 A `keeper.request` has `status` `ok`, `error`, `rejected` (Keeper refused
 admission), or `not_sent` (the connection failed first). Its `operation` is
@@ -511,10 +699,11 @@ Keeper request and response payloads. The logger also scrubs every string.
   still waiting to be written. The background writer rereads the session
   store and replaces its tokens again. Anything shaped like a JWT, and hex
   strings of 100 digits or more, such as a signature, are replaced too.
-- Text Keeper or a tool returned, and error messages that can quote what
-  was typed (`keeperErrors`, `errorMsg`, `error`), are cut to 300
-  characters, lose hex strings of 64 digits or more, and end at the first
-  URL.
+- For GraphQL errors, `keeper.request` records the total count and up to
+  three validated codes. Unrecognized codes appear as `KEEPER_ERROR`.
+- Other untrusted text from Keeper or a tool is cut to 300 characters.
+  Sai removes hex strings of 64 digits or more and cuts the text at the
+  first URL.
 - `mcp.tool_call` logs only the parameters the tool defines.
   `unknownArguments` counts the rest, and a call to a tool the server does
   not have is logged as tool `unknown` with no arguments.
