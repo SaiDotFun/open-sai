@@ -28,12 +28,15 @@ from sai_cli.sai_cli import main
 ADDR = "0x" + "a" * 40
 TOKEN = "fake-token"
 CHAIN_ID = "test-1"
-TRADER = "nibi1trader"
+TRADER = "nibi1424242424242424242424242424242422mldj0"
+OTHER_TRADER = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 
 
 @dataclass
 class Position:
     collateral: int = 4_000_000
+    trader: str = TRADER
+    position_reads: int = 0
     trade_type: str = "trade"
     keeper_market_open: bool = True
     market_trading_state: str = "open"
@@ -126,7 +129,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     keeper.POSITION: {
                         "perp": {
                             "trade": {
-                                "trader": TRADER,
+                                "id": 7,
+                                "trader": position.trader,
                                 "isOpen": True,
                                 "tradeType": "trade",
                                 "collateralAmount": position.collateral,
@@ -172,6 +176,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
             assert path.startswith(prefix)
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
+                position.position_reads += 1
                 index = message["get_trade_raw"]["index"]
                 if index != 7:
                     self.reply(
@@ -202,7 +207,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 return
             if "get_trade_raw" in message:
                 data = {
-                    "user": TRADER,
+                    "user": position.trader,
                     "user_trade_index": "UserTradeIndex(7)",
                     "market_index": "MarketIndex(0)",
                     "collateral_index": "TokenIndex(1)",
@@ -371,9 +376,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
             thread.join()
 
 
-@asynccontextmanager
-async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
-    endpoint = f"{base_url}/query"
+def save_session(endpoint: str) -> None:
     storage.save_session(
         {
             "token": TOKEN,
@@ -382,6 +385,12 @@ async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
             "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
         }
     )
+
+
+@asynccontextmanager
+async def connected_client(base_url: str) -> AsyncGenerator[ClientSession]:
+    endpoint = f"{base_url}/query"
+    save_session(endpoint)
     config = settings.load(
         flags={"keeper.endpoint": endpoint, "lcd.endpoint": base_url}
     )
@@ -398,6 +407,69 @@ async def call(
     block = result.content[0]
     assert isinstance(block, TextContent)
     return json.loads(block.text)
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        ("margin", "7", "--direction", "add", "--amount", "1"),
+        ("partial-close", "7", "--percent", "50"),
+    ],
+)
+def test_cli_refuses_another_accounts_position(position_service, command):
+    position, base_url = position_service
+    endpoint = f"{base_url}/query"
+    save_session(endpoint)
+    position.trader = OTHER_TRADER
+    args = ["--json", "--endpoint", endpoint, "--lcd-endpoint", base_url, "trade"]
+    runner = CliRunner()
+
+    for flags in (["--dry-run"], []):
+        result = runner.invoke(main, [*args, *command, *flags])
+        assert result.exit_code == 1, result.output
+        error = json.loads(result.stdout)["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert error["message"] == "Keeper position belongs to a different account"
+
+    assert position.position_reads == 0
+    assert position.submitted == []
+    assert not (storage.home() / "intents.sqlite3").exists()
+
+
+@pytest.mark.parametrize(
+    ("action", "args"),
+    [
+        ("margin", {"trade_id": 7, "direction": "add", "amount": "1"}),
+        ("partial_close", {"trade_id": 7, "percent": 50}),
+    ],
+)
+def test_mcp_refuses_another_accounts_position(position_service, action, args):
+    position, base_url = position_service
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            assert preview["addr"] == ADDR
+            position.trader = OTHER_TRADER
+            position_reads = position.position_reads
+
+            refused_preview = await call(client, f"preview_{action}", args)
+            refused_trade = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            for result in (refused_preview, refused_trade):
+                assert result == {
+                    "code": "INVALID_REQUEST",
+                    "error": "Keeper position belongs to a different account",
+                }
+
+            assert position.position_reads == position_reads
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

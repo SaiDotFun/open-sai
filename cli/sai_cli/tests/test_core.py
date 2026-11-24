@@ -488,6 +488,9 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
 
 
 def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
+    addr = "0x" + "a" * 40
+    trader = "nibi1424242424242424242424242424242422mldj0"
+
     def gql(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.ROUTE:
             return {
@@ -502,7 +505,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
                 "perp": {
                     "trade": {
                         "id": 7,
-                        "trader": "nibi1trader",
+                        "trader": trader,
                         "isOpen": True,
                         "tradeType": "trade",
                         "collateralAmount": 10000000,
@@ -527,7 +530,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
         }
 
     raw = {
-        "user": "nibi1trader",
+        "user": trader,
         "user_trade_index": "UserTradeIndex(7)",
         "market_index": "MarketIndex(0)",
         "collateral_index": "TokenIndex(1)",
@@ -550,7 +553,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
             raw if "get_trade_raw" in message else funds
         ),
     )
-    snapshot = margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7)
+    snapshot = margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", addr, 7)
     assert snapshot.raw == raw
     assert snapshot.funds == funds
     assert snapshot.market["marketId"] == 0
@@ -558,13 +561,12 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
     # Matching their binary64 representations must not reject this snapshot.
     raw["leverage"] = "10.00000000000000001"
     assert (
-        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7).raw
-        == raw
+        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", addr, 7).raw == raw
     )
     raw["leverage"] = "10"
     raw["collateral_amount"] = "9000000"
     with pytest.raises(ValueError, match="Indexed position differs"):
-        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 7)
+        margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", addr, 7)
 
 
 def test_leverage_is_separate_update_intent():

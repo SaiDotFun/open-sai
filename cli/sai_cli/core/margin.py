@@ -595,6 +595,9 @@ def _position(
     )["perp"]["trade"]
     if not position or not position["isOpen"] or position["tradeType"] != "trade":
         raise PositionUnavailable("Open position not found")
+    account = keeper.canonical_account(addr)
+    if account is None or keeper.canonical_account(position.get("trader")) != account:
+        raise ValueError("Keeper position belongs to a different account")
     return position
 
 
