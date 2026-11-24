@@ -1,8 +1,9 @@
 use std::{
     env, fs,
+    io::{IsTerminal, Read, Write},
     os::unix::fs::{PermissionsExt, symlink},
     path::Path,
-    process::Command,
+    process::{Command, Stdio},
     time::Duration,
 };
 
@@ -30,45 +31,114 @@ printf '{"transport":{"type":"stdio","command":"%s","args":["mcp","serve"]}}\n' 
 
 #[test]
 fn standalone_foreground() {
-    replay("standalone_foreground", "standalone/current/sai", false);
+    replay("standalone");
 }
 
 #[test]
 fn uv_background() {
-    replay(
-        "uv_background",
-        ".local/share/uv/tools/sai-cli/bin/sai",
-        true,
-    );
+    replay("uv-background");
 }
 
-fn replay(test: &str, installed: &str, background: bool) {
-    // Run with an isolated HOME, PATH and working directory. The test harness
-    // can run these tests concurrently without changing its process environment.
-    if env::var_os("SAI_MCP_UPDATE_REPLAY").is_some() {
-        let home = env::home_dir().unwrap();
-        let project = env::current_dir().unwrap();
-        check_fixture(&home, &project, installed, background);
+#[test]
+#[ignore = "fixture subprocess invoked by the replay tests"]
+fn replay_child() {
+    let mut request = String::new();
+    if std::io::stdin().is_terminal() || std::io::stdin().read_to_string(&mut request).unwrap() == 0
+    {
         return;
     }
+    let (root, mode) = request.split_once('\n').unwrap();
+    let root = Path::new(root);
+    assert!(root.is_absolute());
+    assert_eq!(
+        fs::symlink_metadata(root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let home = root.join("home");
+    let project = root.join("project");
+    assert_eq!(home.canonicalize().unwrap(), home);
+    assert_eq!(project.canonicalize().unwrap(), project);
+    assert!(fs::read_dir(&home).unwrap().next().is_none());
+    assert!(fs::read_dir(&project).unwrap().next().is_none());
+    assert_eq!(env::home_dir().as_ref(), Some(&home));
+    assert_eq!(env::current_dir().unwrap(), project);
+    assert_eq!(
+        env::var_os("CODEX_HOME").as_deref(),
+        Some(home.join(".codex").as_os_str())
+    );
+    let (installed, background) = match mode {
+        "standalone" => ("standalone/current/sai", false),
+        "uv-background" => (".local/share/uv/tools/sai-cli/bin/sai", true),
+        _ => panic!("Unknown update fixture mode"),
+    };
+    check_fixture(&home, &project, installed, background);
+}
 
-    let fixture = tempfile::tempdir().unwrap();
-    let home = fixture.path().join("home");
-    let project = fixture.path().join("project");
+fn replay(mode: &str) {
+    // Create the private home in the parent. The child receives the fixture
+    // path through stdin, so an inherited environment cannot select it.
+    let fixture = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let home = root.join("home");
+    let project = root.join("project");
     fs::create_dir(&home).unwrap();
     fs::create_dir(&project).unwrap();
     let path = env::join_paths([home.join("bin"), "/usr/bin".into(), "/bin".into()]).unwrap();
-    let name = format!("{}::{test}", module_path!().split_once("::").unwrap().1);
-    let output = Command::new(env::current_exe().unwrap())
-        .args(["--exact", &name, "--nocapture"])
+    let mut child = Command::new(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--exact",
+            &replay_test_name("replay_child"),
+            "--nocapture",
+        ])
         .env_clear()
-        .env("SAI_MCP_UPDATE_REPLAY", "1")
         .env("HOME", &home)
         .env("CODEX_HOME", home.join(".codex"))
         .env("PATH", path)
         .current_dir(&project)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write!(child.stdin.take().unwrap(), "{}\n{mode}", root.display()).unwrap();
+    assert_replay(child.wait_with_output().unwrap());
+}
+
+fn replay_test_name(test: &str) -> String {
+    format!("{}::{test}", module_path!().split_once("::").unwrap().1)
+}
+
+#[test]
+fn inherited_replay_environment_cannot_write_to_ambient_home() {
+    let ambient = tempfile::tempdir().unwrap();
+    let home = ambient.path().join("home");
+    let project = ambient.path().join("project");
+    fs::create_dir(&project).unwrap();
+    let codex = home.join(".codex/config.toml");
+    let launcher = home.join("bin/sai");
+    write(&codex, "ambient fixture", 0o600);
+    write(&launcher, "ambient launcher", 0o755);
+    let output = Command::new(env::current_exe().unwrap())
+        .args(["--exact", &replay_test_name("standalone_foreground")])
+        .env_clear()
+        .env("HOME", &home)
+        .env("CODEX_HOME", home.join(".codex"))
+        .env("PATH", "/usr/bin:/bin")
+        .env("SAI_MCP_UPDATE_REPLAY", "0")
+        .current_dir(&project)
+        .stdin(Stdio::null())
         .output()
         .unwrap();
+    assert_eq!(fs::read_to_string(codex).unwrap(), "ambient fixture");
+    assert_eq!(fs::read_to_string(launcher).unwrap(), "ambient launcher");
+    assert_replay(output);
+}
+
+fn assert_replay(output: std::process::Output) {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success() && stdout.contains("1 passed"),
