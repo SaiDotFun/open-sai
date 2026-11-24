@@ -125,8 +125,7 @@ fn endpoint_origin(endpoint: &str) -> String {
             return None;
         }
         let authority = rest.split(['/', '?', '#']).next()?;
-        let (_, host_port) =
-            authority.rsplit_once('@').unwrap_or(("", authority));
+        let (_, host_port) = authority.rsplit_once('@').unwrap_or(("", authority));
         let (host, port) = if let Some(bracketed) = host_port.strip_prefix('[') {
             let (address, suffix) = bracketed.split_once(']')?;
             address.parse::<Ipv6Addr>().ok()?;
@@ -138,8 +137,7 @@ fn endpoint_origin(endpoint: &str) -> String {
                     .or_else(|| suffix.is_empty().then_some(""))?,
             )
         } else {
-            let (host, port) =
-                host_port.split_once(':').unwrap_or((host_port, ""));
+            let (host, port) = host_port.split_once(':').unwrap_or((host_port, ""));
             if host.is_empty()
                 || !host
                     .bytes()
@@ -182,29 +180,24 @@ impl<'a> Storage<'a> {
         self
     }
 
-    pub fn with_event_sink(
-        mut self,
-        sink: &'a (dyn Fn(StorageEvent<'_>) + Sync),
-    ) -> Self {
+    pub fn with_event_sink(mut self, sink: &'a (dyn Fn(StorageEvent<'_>) + Sync)) -> Self {
         self.events = Some(sink);
         self
     }
 
-    pub fn intent_status_hint(
-        &self,
-        endpoint: &str,
-        account: &str,
-        key: &str,
-    ) -> String {
+    pub fn intent_status_hint(&self, endpoint: &str, account: &str, key: &str) -> String {
         use crate::session::shell_quote;
 
         let flag = if endpoint_origin(endpoint) == endpoint
-            && self.trader.parent().is_some_and(|home| {
-                crate::log::redact(home, endpoint) == endpoint
-            }) {
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
+        {
             shell_quote(endpoint)
         } else {
-            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#.into()
+            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
+                .into()
         };
         format!(
             "sai --endpoint {flag} intent status {} --key {}",

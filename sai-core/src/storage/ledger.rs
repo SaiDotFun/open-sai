@@ -1,9 +1,7 @@
 use std::{fs, os::unix::fs::PermissionsExt, str::FromStr};
 
 use chrono::{NaiveDateTime, Utc};
-use rusqlite::{
-    Connection, OptionalExtension, TransactionBehavior::Immediate, params,
-};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior::Immediate, params};
 use serde::Serialize;
 
 use super::{Storage, StorageError, StorageEvent, endpoint_origin};
@@ -43,11 +41,7 @@ impl IntentStatus {
             (previous, self),
             (
                 "unknown",
-                Self::Accepted
-                    | Self::Pending
-                    | Self::Terminal
-                    | Self::Rejected
-                    | Self::NotSent
+                Self::Accepted | Self::Pending | Self::Terminal | Self::Rejected | Self::NotSent
             ) | ("accepted" | "absent", Self::Pending | Self::Terminal)
                 | ("pending", Self::Terminal)
         )
@@ -71,8 +65,7 @@ pub struct IntentRow {
 }
 
 fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
-    let version =
-        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    let version = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
     if version > SCHEMA_VERSION {
         return Err(StorageError::NewerLedger);
     }
@@ -88,9 +81,7 @@ fn has_column(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
 }
 
 fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
-    if schema_version(connection)? == SCHEMA_VERSION
-        && has_column(connection, "keeper_status")?
-    {
+    if schema_version(connection)? == SCHEMA_VERSION && has_column(connection, "keeper_status")? {
         return Ok(());
     }
 
@@ -98,15 +89,13 @@ fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
     if schema_version(&transaction)? < SCHEMA_VERSION {
         transaction.execute(CREATE_INTENTS, [])?;
         if !has_column(&transaction, "created_at")? {
-            transaction
-                .execute("ALTER TABLE intents ADD COLUMN created_at REAL", [])?;
+            transaction.execute("ALTER TABLE intents ADD COLUMN created_at REAL", [])?;
         }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     }
     if !has_column(&transaction, "keeper_status")? {
         // Keep user_version 1 so the v0.1.0 client can still open the ledger.
-        transaction
-            .execute("ALTER TABLE intents ADD COLUMN keeper_status TEXT", [])?;
+        transaction.execute("ALTER TABLE intents ADD COLUMN keeper_status TEXT", [])?;
     }
     transaction.commit()?;
     Ok(())
@@ -124,7 +113,12 @@ fn check_open_pending(
             "SELECT id FROM intents WHERE endpoint=?1 AND account=?2 AND kind=?3
              AND (keeper_status='pending' OR (NOT ?4 AND status IN ('unknown', 'accepted')))
              ORDER BY rowid DESC LIMIT 1",
-            params![endpoint, account.to_lowercase(), OPEN_TRADE, allow_concurrent_open],
+            params![
+                endpoint,
+                account.to_lowercase(),
+                OPEN_TRADE,
+                allow_concurrent_open
+            ],
             |row| row.get(0),
         )
         .optional()?;
@@ -143,18 +137,14 @@ fn unix_time() -> f64 {
 fn key_time(key: &str) -> Option<f64> {
     // Older rows have no created_at. The key starts with a UTC timestamp
     // followed by three millisecond digits.
-    let seconds =
-        NaiveDateTime::parse_from_str(key.get(..15)?, "%Y%m%dT%H%M%S").ok()?;
+    let seconds = NaiveDateTime::parse_from_str(key.get(..15)?, "%Y%m%dT%H%M%S").ok()?;
     let fraction = key.get(15..key.len().min(18))?;
     if !fraction.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
     let fraction = u32::from_str(fraction).ok()?;
     let precision = key.len().saturating_sub(15).min(3) as i32;
-    Some(
-        seconds.and_utc().timestamp() as f64
-            + f64::from(fraction) / 10_f64.powi(precision),
-    )
+    Some(seconds.and_utc().timestamp() as f64 + f64::from(fraction) / 10_f64.powi(precision))
 }
 
 impl Storage<'_> {
@@ -190,13 +180,7 @@ impl Storage<'_> {
         allow_concurrent_open: bool,
     ) -> Result<(), StorageError> {
         let connection = self.open_ledger()?;
-        check_open_pending(
-            &connection,
-            endpoint,
-            account,
-            allow_concurrent_open,
-            self,
-        )
+        check_open_pending(&connection, endpoint, account, allow_concurrent_open, self)
     }
 
     /// An explicit override skips unknown or accepted opens, but never Keeper-pending rows.
@@ -214,13 +198,7 @@ impl Storage<'_> {
         let addr = account.to_lowercase();
         let concurrent_open = kind == OPEN_TRADE && allow_concurrent_open;
         if kind == OPEN_TRADE {
-            check_open_pending(
-                &transaction,
-                endpoint,
-                account,
-                concurrent_open,
-                self,
-            )?;
+            check_open_pending(&transaction, endpoint, account, concurrent_open, self)?;
         }
         let unresolved: Option<String> = transaction
             .query_row(
@@ -312,27 +290,22 @@ impl Storage<'_> {
         if options.only_if_absent && previous != IntentStatus::Absent.as_str() {
             return Ok(Some(previous.into()));
         }
-        let status = if previous == IntentStatus::Absent.as_str()
-            && status == IntentStatus::Accepted
-        {
-            IntentStatus::Pending
-        } else {
-            status
-        };
-        let legacy_terminal =
-            stored == IntentStatus::Terminal.as_str() && keeper_status.is_none();
+        let status =
+            if previous == IntentStatus::Absent.as_str() && status == IntentStatus::Accepted {
+                IntentStatus::Pending
+            } else {
+                status
+            };
+        let legacy_terminal = stored == IntentStatus::Terminal.as_str() && keeper_status.is_none();
         let repair = legacy_terminal
             && (status == IntentStatus::Terminal
-                || (status == IntentStatus::Pending
-                    && options.repair_legacy_terminal));
+                || (status == IntentStatus::Pending && options.repair_legacy_terminal));
         if !status.follows(previous) && !repair {
             return Ok(Some(previous.into()));
         }
         let (stored, keeper_status) = match status {
             // Older clients treat unknown as an account-wide block.
-            IntentStatus::Pending => {
-                (IntentStatus::Unknown.as_str(), Some(status.as_str()))
-            }
+            IntentStatus::Pending => (IntentStatus::Unknown.as_str(), Some(status.as_str())),
             IntentStatus::Terminal => (status.as_str(), Some(status.as_str())),
             _ => (status.as_str(), None),
         };
@@ -414,16 +387,13 @@ impl Storage<'_> {
             "SELECT id, kind, COALESCE(keeper_status, status) FROM intents
              WHERE endpoint=?1 AND account=?2 ORDER BY rowid DESC",
         )?;
-        let rows = statement.query_map(
-            params![endpoint, account.to_lowercase()],
-            |row| {
-                Ok(IntentRow {
-                    key: row.get(0)?,
-                    kind: row.get(1)?,
-                    status: row.get(2)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(params![endpoint, account.to_lowercase()], |row| {
+            Ok(IntentRow {
+                key: row.get(0)?,
+                kind: row.get(1)?,
+                status: row.get(2)?,
+            })
+        })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 }

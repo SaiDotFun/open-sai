@@ -9,8 +9,7 @@ use std::{
 
 use rusqlite::Connection;
 use sai_core::storage::{
-    IntentStatus, RemovedSession, Session, StatusUpdateOptions, Storage,
-    StorageError, StorageEvent,
+    IntentStatus, RemovedSession, Session, StatusUpdateOptions, Storage, StorageError, StorageEvent,
 };
 use tempfile::tempdir;
 use zeroize::Zeroizing;
@@ -285,7 +284,8 @@ fn storage_events_carry_only_keeper_origins() {
     use std::sync::Mutex;
 
     let home = tempdir().unwrap();
-    let endpoint = "HTTPS://fixture-user:fixture-password@KEEPER.invalid:0443/private?key=fixture#secret";
+    let endpoint =
+        "HTTPS://fixture-user:fixture-password@KEEPER.invalid:0443/private?key=fixture#secret";
     let seen = Mutex::new(Vec::new());
     let sink = |event: StorageEvent<'_>| {
         let found = match event {
