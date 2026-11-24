@@ -429,11 +429,11 @@ def test_trade_wait_interrupt_retains_reservation(
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
             requests.clear()
-            replies.append(
-                Reply(body_delay=4.0) if phase == "submit" else Reply(disconnect=True)
-            )
+            # A zero-length body completes as soon as the headers arrive.
+            delayed = Reply(body=b"{}", body_delay=4.0)
+            replies.append(delayed if phase == "submit" else Reply(disconnect=True))
             if phase == "poll":
-                replies.append(Reply(body_delay=4.0))
+                replies.append(delayed)
             with subprocess.Popen(
                 [*cli, "--endpoint", endpoint, "--json", "trade", *CLOSE, "--wait"],
                 env=cli_environment(home),
