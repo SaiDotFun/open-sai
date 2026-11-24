@@ -12,7 +12,7 @@ use tokio_tungstenite::{
     },
 };
 
-use super::transport;
+use super::{ProbeEndpoint, check_transport, transport};
 
 /// Read the LCD chain ID. None means node_info answered without a network.
 pub async fn lcd_network(
@@ -21,6 +21,7 @@ pub async fn lcd_network(
 ) -> Result<Option<String>, &'static str> {
     const NODE_INFO: &str = "/cosmos/base/tendermint/v1beta1/node_info";
     const UNREADABLE: &str = "Unable to read contract state";
+    check_transport(endpoint, ProbeEndpoint::Lcd)?;
     let url = format!("{}{NODE_INFO}", endpoint.trim_end_matches('/'));
     let (status, bytes) = transport::get(&url, timeout)
         .await
@@ -40,6 +41,7 @@ pub async fn lcd_network(
 
 /// Confirm graphql-transport-ws negotiation and connection_ack, with no subscription.
 pub async fn websocket_handshake(endpoint: &str, timeout: Duration) -> Result<(), String> {
+    check_transport(endpoint, ProbeEndpoint::WebSocket).map_err(|_| String::from("StreamError"))?;
     time::timeout(timeout, async {
         let mut request = endpoint.into_client_request().map_err(ws_error)?;
         request.headers_mut().insert(

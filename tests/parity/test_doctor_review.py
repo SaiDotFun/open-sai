@@ -7,11 +7,13 @@ import os
 import stat
 import subprocess
 import sys
+from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcp_clients import seed_clients, write
+from sai_cli.tests.loopback import http_server
 
 
 @pytest.fixture
@@ -84,3 +86,54 @@ def test_claude_install_keeps_entry_until_replaced(
     else:
         assert path.read_bytes() == before
     assert stat.S_IMODE(path.stat().st_mode) == 0o640
+
+
+@pytest.mark.parametrize("credentials", [False, True])
+def test_doctor_rejects_unsafe_transport_before_connecting(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str], credentials: bool
+) -> None:
+    seen: list[str] = []
+
+    class Proxy(BaseHTTPRequestHandler):
+        def respond(self) -> None:
+            seen.append(self.command)
+            self.send_response(403)
+            self.end_headers()
+
+        do_GET = respond
+        do_CONNECT = respond
+
+        def log_message(self, *_args: object) -> None:
+            pass
+
+    # The reserved address can only be reached through the local fixture proxy.
+    # The Keeper endpoint is refused independently so it cannot contact the proxy.
+    with http_server(Proxy) as proxy:
+        fixture_env |= {
+            "HTTP_PROXY": proxy,
+            "HTTPS_PROXY": proxy,
+            "NO_PROXY": "",
+            "SAI_ENDPOINT": "http://192.0.2.1:9",
+            "SAI_LCD_ENDPOINT": (
+                "https://fixture-user:fixture-password@192.0.2.1:9"
+                if credentials
+                else "http://192.0.2.1:9"
+            ),
+            "SAI_WS_ENDPOINT": (
+                "wss://fixture-user:fixture-password@192.0.2.1:9"
+                if credentials
+                else "ws://192.0.2.1:9"
+            ),
+        }
+        result = invoke(candidate, tmp_path, fixture_env, "doctor", "--no-fix")
+    report = checks(result)
+    assert seen == []
+    assert report["lcd"]["status"] == report["websocket"]["status"] == "fail"
+    lcd_error = (
+        "Credentials are not allowed in the LCD URL"
+        if credentials
+        else "LCD endpoint must use HTTPS, except on loopback"
+    )
+    assert lcd_error in report["lcd"]["summary"]
+    assert report["websocket"]["summary"].endswith("StreamError")
+    assert "fixture-password" not in result.stdout + result.stderr
