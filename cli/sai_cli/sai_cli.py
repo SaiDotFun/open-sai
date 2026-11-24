@@ -2295,7 +2295,7 @@ def print_log_limit(report: dict[str, Any]) -> None:
 @click.argument("key")
 @click.option("--offline", is_flag=True, help="Read local logs only.")
 @click.option("--addr", help="EVM address to use for the Keeper lookup.")
-@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_intent(
     ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None
