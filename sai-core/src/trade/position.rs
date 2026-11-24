@@ -9,6 +9,7 @@ use serde_json::{Map, Value, json};
 use crate::{
     errors::{Code, SaiError},
     keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, canonical_account, truthy},
+    settings::repr,
 };
 
 use super::{Confirmation, SubmitOptions, TradePreview, Trading, actions::id};
@@ -36,6 +37,82 @@ pub enum PositionMode<'a> {
     DryRun,
     Preview,
     Submit(Option<Confirmation<'a>>),
+}
+
+pub fn parse_partial_close_percent(input: &str) -> Result<u8, SaiError> {
+    let invalid = || {
+        SaiError::usage(format!(
+            "Invalid value for '--percent': {} is not a valid integer range.",
+            repr(input),
+        ))
+    };
+    let text = input.trim();
+    let digits = text.strip_prefix(['+', '-']).unwrap_or(text);
+    if digits.split('_').any(str::is_empty) {
+        return Err(invalid());
+    }
+    let digits: String = digits
+        .chars()
+        .filter(|&digit| digit != '_')
+        .map(decimal_digit)
+        .collect::<Option<_>>()
+        .ok_or_else(invalid)?;
+    if digits.len() > 4300 {
+        return Err(invalid());
+    }
+    let significant = digits.trim_start_matches('0');
+    let normalized = if significant.is_empty() {
+        "0"
+    } else {
+        significant
+    };
+    let negative = text.starts_with('-') && normalized != "0";
+    normalized
+        .parse::<u8>()
+        .ok()
+        .filter(|percent| !negative && (1..=99).contains(percent))
+        .ok_or_else(|| {
+            let sign = if negative { "-" } else { "" };
+            SaiError::usage(format!(
+                "Invalid value for '--percent': {sign}{normalized} is not in the range 1<=x<=99."
+            ))
+        })
+}
+
+fn decimal_digit(digit: char) -> Option<char> {
+    if digit.is_ascii() {
+        return digit.is_ascii_digit().then_some(digit);
+    }
+    // The zeroes of the Unicode 14 decimal ranges used by the Python 3.11
+    // reference. Every range contains ten consecutive digits.
+    const ZEROES: &[u32] = &[
+        0x0030, 0x0660, 0x06f0, 0x07c0, 0x0966, 0x09e6, 0x0a66, 0x0ae6, 0x0b66, 0x0be6, 0x0c66,
+        0x0ce6, 0x0d66, 0x0de6, 0x0e50, 0x0ed0, 0x0f20, 0x1040, 0x1090, 0x17e0, 0x1810, 0x1946,
+        0x19d0, 0x1a80, 0x1a90, 0x1b50, 0x1bb0, 0x1c40, 0x1c50, 0xa620, 0xa8d0, 0xa900, 0xa9d0,
+        0xa9f0, 0xaa50, 0xabf0, 0xff10, 0x104a0, 0x10d30, 0x11066, 0x110f0, 0x11136, 0x111d0,
+        0x112f0, 0x11450, 0x114d0, 0x11650, 0x116c0, 0x11730, 0x118e0, 0x11950, 0x11c50, 0x11d50,
+        0x11da0, 0x16a60, 0x16ac0, 0x16b50, 0x1d7ce, 0x1d7d8, 0x1d7e2, 0x1d7ec, 0x1d7f6, 0x1e140,
+        0x1e2f0, 0x1e950, 0x1fbf0,
+    ];
+    let point = u32::from(digit);
+    let previous = ZEROES.partition_point(|&zero| zero <= point) - 1;
+    let offset = point - ZEROES[previous];
+    (offset < 10).then(|| char::from(b'0' + offset as u8))
+}
+
+#[cfg(test)]
+mod percent_tests {
+    use super::parse_partial_close_percent;
+
+    #[test]
+    fn percentages_use_the_python_311_decimal_digit_repertoire() {
+        assert_eq!(
+            parse_partial_close_percent("\u{0665}_\u{0660}").unwrap(),
+            50
+        );
+        // Unicode 16 added Garay digits. Python 3.11 rejects them.
+        assert!(parse_partial_close_percent("\u{10d45}\u{10d40}").is_err());
+    }
 }
 
 struct Snapshot {

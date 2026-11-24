@@ -355,6 +355,25 @@ state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "error.message" = "Invalid value for '--percent': 100 is not in the range 1<=x<=99." }
 
 [[case]]
+name = "trade-partial-close-malformed-percent"
+args = ["--json", "trade", "partial-close", "7", "--percent", "5__0", "--dry-run"]
+seed = "session"
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer range." }
+
+[[case]]
+name = "trade-partial-close-unicode-percent"
+args = ["--json", "trade", "partial-close", "7", "--percent", "٥_٠", "--dry-run"]
+seed = "session"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "quote.percent" = 50 }
+
+[[case]]
 name = "trade-partial-close-invalid-id"
 args = ["--json", "trade", "partial-close", "invalid", "--percent", "50"]
 expect = 2

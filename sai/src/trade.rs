@@ -195,7 +195,7 @@ pub fn run(
                 &settings,
                 account,
                 PositionAction::PartialClose {
-                    percent: partial_percent(&percent)?,
+                    percent: trade::parse_partial_close_percent(&percent)?,
                 },
                 json,
             );
@@ -250,21 +250,6 @@ pub fn missing_position_option(argument: &str) -> Option<SaiError> {
         _ => return None,
     };
     Some(SaiError::usage(message))
-}
-
-fn partial_percent(input: &str) -> Result<u8, SaiError> {
-    let parsed = input.trim().replace('_', "").parse::<i128>().map_err(|_| {
-        SaiError::usage(format!(
-            "Invalid value for '--percent': {} is not a valid integer range.",
-            repr(input),
-        ))
-    })?;
-    if !(1..=99).contains(&parsed) {
-        return Err(SaiError::usage(format!(
-            "Invalid value for '--percent': {parsed} is not in the range 1<=x<=99."
-        )));
-    }
-    Ok(parsed as u8)
 }
 
 impl Position {

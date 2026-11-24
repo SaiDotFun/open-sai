@@ -18,7 +18,7 @@ use crate::{
 
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
-pub use position::{MarginDirection, PositionAction, PositionMode};
+pub use position::{MarginDirection, PositionAction, PositionMode, parse_partial_close_percent};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TradeIntent {
