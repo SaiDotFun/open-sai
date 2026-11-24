@@ -26,6 +26,10 @@ from typing import Any
 
 import pytest
 from sai_cli.core import keeper, log, reconcile, storage
+from sai_cli.tests.loopback import graphql_ws
+from websockets.http11 import Request as UpgradeRequest
+from websockets.http11 import Response as UpgradeResponse
+from websockets.sync.server import ServerConnection
 
 FIXTURE = json.loads(
     (
@@ -1074,43 +1078,94 @@ def test_watch_reports_tls_certificate_failure(
     with replay(context) as (endpoint, _replies, requests):
         ws = endpoint.replace("https://", "wss://", 1)
         for index, cli in enumerate(cli_pair):
-            home = tmp_path / str(index)
-            with subprocess.Popen(
-                [*cli, "--json", "--ws-endpoint", ws, "watch", "balances", ADDR],
-                env={
-                    "PATH": os.defpath,
-                    "HOME": str(tmp_path),
-                    "SAI_HOME": str(home),
-                    "SAI_LOG": "1",
-                    "SSL_CERT_FILE": str(certs / "other-ca.pem"),
-                },
-                cwd=tmp_path,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
-            ) as proc:
-                assert proc.stderr is not None
-                try:
-                    assert select.select([proc.stderr], [], [], 8)[0]
-                    warning = proc.stderr.readline()
-                    os.killpg(proc.pid, signal.SIGINT)
-                    stdout, _ = proc.communicate(timeout=5)
-                finally:
-                    if proc.poll() is None:
-                        os.killpg(proc.pid, signal.SIGKILL)
-                        proc.communicate(timeout=5)
-            assert proc.returncode == 1
-            assert json.loads(stdout)["error"]["message"] == "Aborted"
-            assert warning == (
-                b"Disconnected (SSLCertVerificationError); data may be stale;"
-                b" reconnecting in 2s\n"
+            assert_watch_disconnect(
+                cli,
+                tmp_path / str(index),
+                ws,
+                "SSLCertVerificationError",
+                overrides={"SSL_CERT_FILE": str(certs / "other-ca.pem")},
             )
-            assert [
-                (event["code"], event["errorType"])
-                for event in read_events(home)
-                if event["event"] == "watch.disconnected"
-            ] == [("STREAM_ERROR", "SSLCertVerificationError")]
-            assert not requests
+        assert not requests
+
+
+def assert_watch_disconnect(
+    cli: CLI,
+    home: Path,
+    ws: str,
+    error_type: str,
+    *,
+    overrides: dict[str, str] | None = None,
+) -> None:
+    with subprocess.Popen(
+        [*cli, "--json", "--ws-endpoint", ws, "watch", "balances", ADDR],
+        env={
+            "PATH": os.defpath,
+            "HOME": str(home.parent),
+            "SAI_HOME": str(home),
+            "SAI_LOG": "1",
+            **(overrides or {}),
+        },
+        cwd=home.parent,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    ) as proc:
+        assert proc.stderr is not None
+        try:
+            assert select.select([proc.stderr], [], [], 8)[0]
+            warning = proc.stderr.readline()
+            os.killpg(proc.pid, signal.SIGINT)
+            stdout, _ = proc.communicate(timeout=5)
+        finally:
+            if proc.poll() is None:
+                os.killpg(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+    assert proc.returncode == 1
+    assert json.loads(stdout)["error"]["message"] == "Aborted"
+    assert warning == (
+        f"Disconnected ({error_type}); data may be stale; reconnecting in 2s\n".encode()
+    )
+    assert [
+        (event["code"], event["errorType"])
+        for event in read_events(home)
+        if event["event"] == "watch.disconnected"
+    ] == [("STREAM_ERROR", error_type)]
+
+
+@pytest.mark.parametrize(
+    ("header", "values", "error_type"),
+    [
+        ("Connection", (), "InvalidUpgrade"),
+        ("Connection", ("keep-alive",), "InvalidUpgrade"),
+        ("Upgrade", (), "InvalidUpgrade"),
+        ("Upgrade", ("websocket", "other/2"), "InvalidUpgrade"),
+        ("Upgrade", ("websocket trailing",), "InvalidHeaderFormat"),
+        ("Sec-WebSocket-Accept", (), "InvalidHeader"),
+        ("Sec-WebSocket-Accept", ("first", "second"), "InvalidHeader"),
+        ("Sec-WebSocket-Accept", ("wrong",), "InvalidHeaderValue"),
+    ],
+)
+def test_watch_reports_rejected_upgrade(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    header: str,
+    values: tuple[str, ...],
+    error_type: str,
+) -> None:
+    def replace_header(
+        _connection: ServerConnection,
+        _request: UpgradeRequest,
+        response: UpgradeResponse,
+    ) -> None:
+        del response.headers[header]
+        for value in values:
+            response.headers[header] = value
+
+    with graphql_ws(
+        lambda connection: connection.close(), process_response=replace_header
+    ) as ws:
+        for index, cli in enumerate(cli_pair):
+            assert_watch_disconnect(cli, tmp_path / str(index), ws, error_type)
 
 
 @pytest.mark.parametrize(

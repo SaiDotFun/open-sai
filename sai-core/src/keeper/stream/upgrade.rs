@@ -81,16 +81,24 @@ pub(super) async fn connect(url: &Url, socket: SocketBox) -> Result<Upgrade, Fai
 }
 
 fn validate_headers(headers: &HeaderMap, accept: &str) -> Result<(), Failure> {
-    let connected = headers
-        .get_all(CONNECTION)
+    let connection = header_tokens(headers, CONNECTION)?;
+    if !connection
         .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(','))
-        .any(|token| token.trim().eq_ignore_ascii_case("upgrade"));
-    if !connected
-        || !single(headers, UPGRADE)?.is_some_and(|value| value.eq_ignore_ascii_case("websocket"))
-        || single(headers, SEC_WEBSOCKET_ACCEPT)? != Some(accept)
+        .any(|token| token.eq_ignore_ascii_case("upgrade"))
     {
+        return Err(Failure::Disconnected("InvalidUpgrade"));
+    }
+    let upgrade = header_tokens(headers, UPGRADE)?;
+    if !matches!(upgrade.as_slice(), [token] if token.eq_ignore_ascii_case("websocket")) {
+        return Err(Failure::Disconnected("InvalidUpgrade"));
+    }
+
+    let mut accept_headers = headers.get_all(SEC_WEBSOCKET_ACCEPT).iter();
+    let received = accept_headers
+        .next()
+        .filter(|_| accept_headers.next().is_none())
+        .ok_or(Failure::Disconnected("InvalidHeader"))?;
+    if received.as_bytes() != accept.as_bytes() {
         return Err(Failure::Disconnected("InvalidHeaderValue"));
     }
 
@@ -100,6 +108,44 @@ fn validate_headers(headers: &HeaderMap, accept: &str) -> Result<(), Failure> {
         return Err(Failure::Disconnected("NegotiationError"));
     }
     Ok(())
+}
+
+fn header_tokens(headers: &HeaderMap, name: HeaderName) -> Result<Vec<&str>, Failure> {
+    let protocols = name == UPGRADE;
+    let mut tokens = Vec::new();
+    for value in headers.get_all(name).iter() {
+        let value = std::str::from_utf8(value.as_bytes())
+            .map_err(|_| Failure::Disconnected("InvalidHeaderFormat"))?;
+        let count = tokens.len();
+        for token in value
+            .split(',')
+            .map(|token| token.trim_matches([' ', '\t']))
+        {
+            if token.is_empty() {
+                continue;
+            }
+            let valid = if protocols && let Some((name, version)) = token.split_once('/') {
+                is_http_token(name) && is_http_token(version)
+            } else {
+                is_http_token(token)
+            };
+            if !valid {
+                return Err(Failure::Disconnected("InvalidHeaderFormat"));
+            }
+            tokens.push(token);
+        }
+        if tokens.len() == count {
+            return Err(Failure::Disconnected("InvalidHeaderFormat"));
+        }
+    }
+    Ok(tokens)
+}
+
+fn is_http_token(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&byte))
 }
 
 fn single(headers: &HeaderMap, name: HeaderName) -> Result<Option<&str>, Failure> {
