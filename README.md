@@ -23,13 +23,21 @@ sai --help
 ```
 
 If you installed Sai with [uv](https://docs.astral.sh/uv/), run `sai update`
-to switch to the native shim and keep your uv launcher. On Windows, stay on
+after the full-Python bridge release is available. Run it again after the
+first native release to switch to the shim and keep your uv launcher. On Windows, stay on
 the full Python release `sai-cli==0.1.2` until native binaries are available.
 Use the pinned installer to get the verified Python wheel:
 
 ```powershell
 uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version 0.1.2
 ```
+
+The full-Python bridge release must ship after `sai-cli/v0.1.2` and before
+the first native tag. Rehearse its wheel with
+`uv run python scripts/build-bridge.py --version <bridge-version> --out-dir dist`.
+Before tagging the bridge, set that same version in `pyproject.toml` so the
+existing release workflow builds the matching wheel. The first native tag
+must use a higher version.
 
 To build from source instead, install from Git:
 

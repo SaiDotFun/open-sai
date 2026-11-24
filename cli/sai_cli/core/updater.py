@@ -79,6 +79,7 @@ RETRY_INTERVAL = 15 * 60
 TOOL_LOCK_NAME = ".sai-cli-update.lock"
 NATIVE_PENDING = ".sai-cli-native-pending.json"
 NATIVE_WHEELS = ".sai-cli-native-wheels"
+PRE_BRIDGE_PIN = "0.1.2"
 # A copy of the tool's environment, kept beside it while an update that has
 # no verified wheel to go back to replaces it.
 SNAPSHOT_PREFIX = ".sai-cli-rollback-"
@@ -1127,7 +1128,7 @@ def _install(
             discard()
             message = (
                 f"Sai {target} requires a native binary for a supported platform. "
-                f"Keep the Python install with `sai-cli=={installed}`."
+                f"Keep sai {installed}. The supported Python pin is `sai-cli=={PRE_BRIDGE_PIN}`."
             )
             return Outcome(UNSUPPORTED, message, installed, target), False
 

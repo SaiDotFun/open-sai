@@ -215,6 +215,20 @@ def artifact(name: str) -> Path:
     return Path(value).resolve(strict=True)
 
 
+def test_bridge_build_refuses_the_published_python_version(install: Install) -> None:
+    result = install.run(
+        sys.executable,
+        ROOT / "scripts" / "build-bridge.py",
+        "--version",
+        PRE_BRIDGE,
+        "--out-dir",
+        install.home / "dist",
+    )
+    assert result.returncode == 2
+    assert "requires a distinct stable version newer than 0.1.2" in result.stderr
+    assert not (install.home / "dist").exists()
+
+
 def save_profile(install: Install, replay: Replay) -> tuple[Path, bytes]:
     ok(
         install.run(
@@ -771,6 +785,6 @@ def test_windows_keeps_a_runnable_python_launcher(
     )
     assert expected in message
     assert not any(f"/sai-{version}-" in path for path in replay.requests)
-    install.pin(PRE_BRIDGE)
+    install.pin(wheel_version(python_wheel))
     assert install.launcher.read_bytes() == launcher
     assert profile.read_bytes() == contents

@@ -5,6 +5,7 @@ on:
     paths:
       - 'cli/sai_cli/core/**'
       - 'scripts/install.py'
+      - 'scripts/build-bridge.py'
       - 'shim/**'
       - 'tests/parity/test_installer_bridge.py'
       - '.github/workflows/installer-windows.yml'
@@ -48,7 +49,7 @@ jobs:
           uv build --wheel (Join-Path $artifacts 'baseline-src') --out-dir $baseline
           Copy-Item (Join-Path $artifacts 'baseline-src/scripts/install.py') $baseline
           Set-Content -Path (Join-Path $baseline 'commit') -Value $ref -Encoding utf8NoBOM
-          uv build --wheel --out-dir $bridge
+          uv run --locked python scripts/build-bridge.py --version 0.1.3 --out-dir $bridge
           if (Test-Path 'shim/pyproject.toml') {
             Copy-Item -Recurse 'shim' $source
           } else {
