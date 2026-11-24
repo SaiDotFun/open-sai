@@ -22,6 +22,47 @@ LOCK_DESCENDANT = (
 )
 
 
+class RetryBlockTest(unittest.TestCase):
+    def test_candidate_requires_structured_code_and_original_key(self) -> None:
+        key = "original-intent"
+        for code, reported_key, exit_code, accepted in (
+            ("RECENT_OPEN_PENDING", key, 1, True),
+            ("RECENT_OPEN_PENDING", "other-intent", 1, False),
+            ("INVALID_REQUEST", key, 1, False),
+            ("RECENT_OPEN_PENDING", key, 0, False),
+        ):
+            with self.subTest(
+                code=code, reported_key=reported_key, exit_code=exit_code
+            ):
+                payload = {
+                    "error": {
+                        "code": code,
+                        "intentKey": reported_key,
+                        "message": "wording can change",
+                    }
+                }
+                result = subprocess.CompletedProcess(
+                    [], exit_code, json.dumps(payload), ""
+                )
+                self.assertEqual(
+                    REHEARSAL["is_retry_block"](result, key, legacy=False), accepted
+                )
+
+    def test_legacy_message_is_accepted_only_for_the_original_key_and_legacy_cli(
+        self,
+    ) -> None:
+        key = "original-intent"
+        stderr = (
+            f"Error: Reconcile uncertain intent {key} before submitting another trade"
+        )
+        result = subprocess.CompletedProcess([], 1, "", stderr)
+        self.assertTrue(REHEARSAL["is_retry_block"](result, key, legacy=True))
+        self.assertFalse(
+            REHEARSAL["is_retry_block"](result, "other-intent", legacy=True)
+        )
+        self.assertFalse(REHEARSAL["is_retry_block"](result, key, legacy=False))
+
+
 class LauncherTest(unittest.TestCase):
     def test_env_launcher_finds_its_runtime_in_a_fresh_home(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

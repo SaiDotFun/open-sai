@@ -762,7 +762,31 @@ def check_doctor(tool: Install, base: str, key: str, *, pending: bool) -> None:
         )
 
 
-def probe_retry(tool: Install, replay: Replay, key: str) -> bool:
+def is_retry_block(
+    result: subprocess.CompletedProcess[str], key: str, *, legacy: bool
+) -> bool:
+    if result.returncode == 0:
+        return False
+    if legacy:
+        return (
+            f"Reconcile uncertain intent {key} before submitting another trade"
+            in result.stderr
+        )
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return (
+        isinstance(error, dict)
+        and error.get("code") == "RECENT_OPEN_PENDING"
+        and error.get("intentKey") == key
+    )
+
+
+def probe_retry(
+    tool: Install, replay: Replay, key: str, *, legacy: bool = False
+) -> bool:
     before = len(replay.submitted)
     result = tool.run(
         "Retry the synthetic open", tool.sai, "--json", *TRADE, check=False
@@ -772,11 +796,8 @@ def probe_retry(tool: Install, replay: Replay, key: str) -> bool:
             result.returncode == 0, "The retry reached Keeper but was not acknowledged"
         )
         return False
-    output = result.stdout + result.stderr
     require(
-        len(replay.submitted) == before
-        and result.returncode != 0
-        and f"Reconcile uncertain intent {key}" in output,
+        len(replay.submitted) == before and is_retry_block(result, key, legacy=legacy),
         "The retry failed without the original intent's trade guard",
     )
     return True
@@ -905,7 +926,10 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             ledger_row(ledger, key, migrated=False) == ("unknown",),
             "The baseline did not retain the unknown open",
         )
-        require(probe_retry(tool, replay, key), "The baseline submitted a second open")
+        require(
+            probe_retry(tool, replay, key, legacy=True),
+            "The baseline submitted a second open",
+        )
 
         replay.latest = version
         tool.json(
@@ -981,7 +1005,7 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             "The old CLI could not read the migrated pending open",
         )
         require(
-            probe_retry(tool, replay, key),
+            probe_retry(tool, replay, key, legacy=True),
             "The downgraded CLI submitted a second open before reconciliation",
         )
         print(
@@ -989,7 +1013,7 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             flush=True,
         )
         tool.json("Reconcile with the old CLI", *args)
-        blocked = probe_retry(tool, replay, key)
+        blocked = probe_retry(tool, replay, key, legacy=True)
         saved_status = ledger_row(ledger, key, migrated=True)[0]
         status = saved_status if saved_status in ("terminal", "unknown") else "other"
         print(
