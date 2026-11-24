@@ -304,6 +304,24 @@ def open_estimates(
     return {"fees": fees, "liquidationPrice": liq, "worstCaseFill": fill}
 
 
+def perp_prices(lcd: str, state: margin.PositionSnapshot, height: str) -> Any:
+    return margin.smart_value(
+        lcd,
+        state.contract,
+        {
+            "get_perp_prices": {
+                "market_index": state.raw["market_index"],
+                "collateral_index": state.raw["collateral_index"],
+            }
+        },
+        height=height,
+    )
+
+
+def past_liquidation(price: Decimal, threshold: Decimal, long: bool) -> bool:
+    return price <= threshold if long else price >= threshold
+
+
 def close_estimates(
     lcd: str,
     state: margin.PositionSnapshot | None,
@@ -331,17 +349,7 @@ def close_estimates(
     raw = state.raw
     try:
         height = margin.verified_position_height(lcd, state, trade_id)
-        prices = margin.smart_value(
-            lcd,
-            state.contract,
-            {
-                "get_perp_prices": {
-                    "market_index": raw["market_index"],
-                    "collateral_index": raw["collateral_index"],
-                }
-            },
-            height=height,
-        )
+        prices = perp_prices(lcd, state, height)
         oracle = prices["market"]
         if not isinstance(oracle, dict):
             return result
@@ -402,7 +410,7 @@ def close_estimates(
             return result
         observed_at = intents.now()
         collateral = int(raw["collateral_amount"])
-        if (long and market <= trigger) or (not long and market >= trigger):
+        if past_liquidation(market, trigger, long):
             fee = 2 * (collateral * 5 // 100)
             return {
                 **result,
@@ -542,11 +550,26 @@ def position_estimates(
                 result["liquidationPrice"] = outside
                 return result
             liq = liquidation(entry, raw["long"], collateral, target)
+            result["liquidationPrice"] = liq
             if liq["status"] == "estimate":
                 liq["assumption"] = (
-                    "The target leverage takes effect at the quoted collateral."
+                    "The target leverage takes effect if Perp's borrowing-inclusive "
+                    "liquidation check passes."
                 )
-            result["liquidationPrice"] = liq
+                if height is not None:
+                    prices = perp_prices(lcd, state, height)
+                    price = margin.contract_decimal(prices["market"]["base_per_quote"])
+                    # Borrowing fees can only make this threshold more restrictive.
+                    if price > 0 and past_liquidation(
+                        price, Decimal(liq["price"]), raw["long"]
+                    ):
+                        reason = "The observed oracle price is past the prospective liquidation threshold."
+                        result["execution"] = {
+                            "status": "would_be_rejected",
+                            "code": "LiquidationReached",
+                            "reason": reason,
+                        }
+                        result["liquidationPrice"] = unavailable(reason)
     except READ_ERRORS:
         pass
     return result

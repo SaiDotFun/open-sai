@@ -1552,3 +1552,36 @@ def test_pending_open_estimates_follow_perp_market_state(position_service, order
                 assert "close-only" in item["reason"]
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("price", "rejected"), [("97", True), ("98.4", True), ("99", False)]
+)
+def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
+    position_service, price, rejected
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "20"
+    position.max_leverage = 50
+    position.price = price
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client, "preview_leverage", {"trade_id": 7, "leverage": "50"}
+            )
+            estimates = quote["estimates"]
+            liq = estimates["liquidationPrice"]
+            if rejected:
+                assert estimates["execution"]["status"] == "would_be_rejected"
+                assert estimates["execution"]["code"] == "LiquidationReached"
+                assert liq["status"] == "unavailable"
+                assert "price" not in liq
+            else:
+                assert liq["status"] == "estimate"
+                assert liq["price"] == "98.4"
+                assert "borrowing-inclusive" in liq["assumption"]
+
+    asyncio.run(scenario())
