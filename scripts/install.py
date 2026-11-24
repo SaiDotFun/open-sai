@@ -945,6 +945,8 @@ def install_native(args: argparse.Namespace) -> int:
             with tempfile.NamedTemporaryFile(
                 mode="w", dir=root, delete=False
             ) as record:
+                # The native updater also reads this record. null means the
+                # first install had no launcher to restore.
                 json.dump({"old": old, "new": new}, record)
                 record.flush()
                 os.fsync(record.fileno())

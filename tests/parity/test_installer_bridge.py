@@ -482,6 +482,45 @@ def test_standalone_recovers_an_interrupted_first_switch(
     assert not pending(install).exists()
 
 
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_native_updater_recovers_an_interrupted_first_install(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay, "RECOVERY_RUST")
+    probe = """
+import os, runpy, signal, sys
+script, launcher, *args = sys.argv[1:]
+def interrupt(event, values):
+    if (event == 'subprocess.Popen'
+        and [os.fsdecode(value) for value in values[1]] == [launcher, '--version']):
+        os.kill(os.getpid(), signal.SIGKILL)
+sys.addaudithook(interrupt)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    pre_mcp_xfail(result)
+    assert result.returncode == -9, (result.stdout, result.stderr)
+    assert json.loads(pending(install).read_text())["old"] is None
+    result = install.run(
+        install.launcher, "update", "--api-base", replay.base, "--web-base", replay.base
+    )
+    assert "first Sai install was rolled back" in result.stderr
+    assert not install.launcher.is_symlink()
+    assert not pending(install).exists()
+
+
 def add_shim(replay: Replay, wheel: Path, binary: Path | None = None) -> str:
     version = wheel_version(wheel)
     files = {wheel.name: wheel.read_bytes()}
