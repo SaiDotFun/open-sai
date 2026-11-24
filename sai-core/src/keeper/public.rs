@@ -10,7 +10,6 @@ use crate::{
     errors::Code,
     log,
     reconcile::{HISTORY_HINT, LOCAL_PENDING_HINT, PENDING_HINT, UNINDEXED_HINT},
-    session::parse_expiry,
 };
 
 static INTENT_KEY: LazyLock<Regex> = LazyLock::new(|| {
@@ -83,9 +82,22 @@ const ERROR_CODES: &[&str] = &[
     "market_order_market_closed",
     "market_order_trade_not_open",
     "market_order_outcome_not_indexed",
+    "withdraw_evm_unconfigured",
+    "invalid_withdraw",
     "intent_already_used",
     "below_minimum",
     "insufficient_idle",
+    "intent_validation_failed",
+    "chain_switch_failed",
+    "gas_estimation_failed",
+    "wallet_rejected",
+    "wallet_sign_failed",
+    "chain_mismatch",
+    "request_pending",
+    "rpc_submission_failed",
+    "sign_failed_unknown",
+    "intent_auth_rejected",
+    "jwt_failed",
 ];
 
 /// Project the reconciled output once, after raw Keeper values have served their
@@ -132,20 +144,20 @@ pub fn public_account_history(home: &Path, data: &Map<String, Value>) -> Value {
     let projected: Vec<_> = rows
         .iter()
         .filter_map(Value::as_object)
-        .map(|row| scrub(history_row(row, account_history_timestamp).into()))
+        .map(|row| scrub(intent_history(row).into()))
         .collect();
     json!({"perp": {"tradeHistory": projected}})
 }
 
-fn account_history_timestamp(block: &mut Map<String, Value>, timestamp: &Value) {
+fn keep_timestamp(out: &mut Map<String, Value>, key: &str, timestamp: &Value) {
     if timestamp.as_str().is_some_and(|text| {
         HISTORY_TIMESTAMP.is_match(text)
             && !text.starts_with("0000-")
             && chrono::DateTime::parse_from_rfc3339(text).is_ok()
     }) {
-        block.insert("block_ts".into(), timestamp.clone());
+        out.insert(key.into(), timestamp.clone());
     } else if !timestamp.is_null() {
-        block.insert("block_tsInvalid".into(), json!(true));
+        out.insert(format!("{key}Invalid"), json!(true));
     }
 }
 
@@ -165,12 +177,6 @@ fn number(value: &Value) -> bool {
 
 fn row_id(value: &Value) -> bool {
     number(value) || value.as_str().is_some_and(|text| ROW_ID.is_match(text))
-}
-
-fn block_time(value: &Value) -> bool {
-    value
-        .as_str()
-        .is_some_and(|text| text.chars().count() <= 40 && parse_expiry(text).is_some())
 }
 
 fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
@@ -268,12 +274,7 @@ fn intent_record(row: &Map<String, Value>) -> Value {
         value("execBlock"),
         number(value("execBlock")),
     );
-    keep(
-        &mut record,
-        "execBlockTs",
-        value("execBlockTs"),
-        block_time(value("execBlockTs")),
-    );
+    keep_timestamp(&mut record, "execBlockTs", value("execBlockTs"));
     keep_hash(&mut record, "txHash", value("txHash"));
     let code = value("errorCode");
     if truthy(code)
@@ -305,15 +306,6 @@ fn intent_record(row: &Map<String, Value>) -> Value {
 }
 
 fn intent_history(row: &Map<String, Value>) -> Value {
-    history_row(row, |block, timestamp| {
-        keep(block, "block_ts", timestamp, block_time(timestamp));
-    })
-}
-
-fn history_row(
-    row: &Map<String, Value>,
-    project_timestamp: impl FnOnce(&mut Map<String, Value>, &Value),
-) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut history = Map::new();
     keep_intent_key(&mut history, value("intentKey"));
@@ -348,7 +340,7 @@ fn history_row(
             keep(&mut public, "block", height, row_id(height));
         }
         if let Some(timestamp) = block.get("block_ts") {
-            project_timestamp(&mut public, timestamp);
+            keep_timestamp(&mut public, "block_ts", timestamp);
         }
         history.insert("block".into(), Value::Object(public));
     }
