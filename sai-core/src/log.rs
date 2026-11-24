@@ -269,8 +269,9 @@ fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
 }
 
 fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
+    let fields = event.fields.clean(tokens);
     let mut line = Map::new();
-    if matches!(event.surface, Surface::Update) {
+    if matches!(event.surface, Surface::Update) && fields["command"] == "update" {
         line.insert("schema".into(), json!(2));
         line.insert("commandId".into(), json!(&*UPDATE_COMMAND_ID));
     }
@@ -285,7 +286,7 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
     line.insert("version".into(), json!(env!("CARGO_PKG_VERSION")));
     line.insert("runId".into(), json!(RUN_ID.as_str()));
     line.insert("seq".into(), json!(event.sequence));
-    if let Value::Object(fields) = event.fields.clean(tokens) {
+    if let Value::Object(fields) = fields {
         for (key, field) in fields {
             if !COMMON.contains(&key.as_str()) {
                 line.insert(key, field);
