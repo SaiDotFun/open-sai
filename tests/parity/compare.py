@@ -403,15 +403,27 @@ def sqlite_identifier(token: str) -> str:
     return token.translate(ASCII_UPPER)
 
 
-def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
-    """Read CHECK expressions, table options, and column collations from stored DDL."""
+def sqlite_tokens(sql: str) -> list[str]:
     # SQLite treats high-byte characters as identifier characters, except
     # when its tokenizer skips a BOM. Quoted tokens can contain parentheses.
-    tokens = [
+    return [
         token[0].translate(ASCII_UPPER) if token.lastgroup == "name" else token[0]
         for token in sqlite_tokenizer().finditer(sql)
         if token.lastgroup != "trivia"
     ]
+
+
+def normalize_collations(tokens: list[str]) -> list[str]:
+    normalized = tokens.copy()
+    for i, token in enumerate(tokens[:-1]):
+        if token == "COLLATE":
+            normalized[i + 1] = sqlite_identifier(tokens[i + 1])
+    return normalized
+
+
+def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
+    """Read CHECK expressions, table options, and column collations from stored DDL."""
+    tokens = sqlite_tokens(sql)
     if tokens[:2] != ["CREATE", "TABLE"]:
         return [], [], {}
     opening = tokens.index("(")
@@ -445,12 +457,34 @@ def table_ddl(sql: str) -> tuple[list[list[str]], list[str], dict[str, str]]:
     raise ValueError("Unbalanced CREATE TABLE definition")
 
 
+def index_ddl(sql: str) -> tuple[list[list[str]], list[str]]:
+    """Read index keys and the partial-index predicate from stored DDL."""
+    tokens = sqlite_tokens(sql)
+    start = tokens.index("(") + 1
+    keys = []
+    depth = 0
+    for i in range(start, len(tokens)):
+        token = tokens[i]
+        if depth == 0 and token in {",", ")"}:
+            keys.append(tokens[start:i])
+            start = i + 1
+            if token == ")":
+                where = tokens[i + 2 :] if tokens[i + 1 : i + 2] == ["WHERE"] else []
+                return keys, where
+        elif token == "(":
+            depth += 1
+        elif token == ")":
+            depth -= 1
+    raise ValueError("Unbalanced CREATE INDEX definition")
+
+
 def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         raise ValueError(SQLITE_SCHEMA_REQUIREMENT)
     catalog = conn.execute(
         "SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name"
     ).fetchall()
+    index_sql = {name: sql for kind, name, _, sql in catalog if kind == "index" and sql}
     tables = {}
     for kind, name, _, sql in catalog:
         if kind not in {"table", "view"}:
@@ -478,10 +512,25 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
             'SELECT name, "unique", origin, partial FROM pragma_index_list(?) ORDER BY name',
             (name,),
         ):
+            keys, where = (
+                index_ddl(index_sql[index]) if index in index_sql else ([], [])
+            )
+            index_columns = conn.execute(
+                'SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?) ORDER BY seqno',
+                (index,),
+            ).fetchall()
             indexes[index] = {
                 "unique": unique,
                 "origin": origin,
                 "partial": partial,
+                "where": normalize_collations(where),
+                "expressions": {
+                    seqno: normalize_collations(key)
+                    for seqno, key in enumerate(keys)
+                    # SQLite exposes the effective collation, but omits inner
+                    # COLLATE clauses and marks expression keys with cid -2.
+                    if index_columns[seqno][1] == -2 or key.count("COLLATE") > 1
+                },
                 "columns": [
                     (
                         seqno,
@@ -493,10 +542,7 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                         else collation.translate(ASCII_UPPER),
                         is_key,
                     )
-                    for seqno, cid, index_column, descending, collation, is_key in conn.execute(
-                        'SELECT seqno, cid, name, "desc", coll, "key" FROM pragma_index_xinfo(?) ORDER BY seqno',
-                        (index,),
-                    )
+                    for seqno, cid, index_column, descending, collation, is_key in index_columns
                 ],
             }
         tables[name] = {
@@ -510,6 +556,8 @@ def sqlite_schema(conn: sqlite3.Connection) -> dict[str, Any]:
                 "SELECT * FROM pragma_foreign_key_list(?) ORDER BY id, seq", (name,)
             ).fetchall(),
         }
+        if kind == "view":
+            tables[name]["definition"] = normalize_collations(sqlite_tokens(sql))
     return {
         "tables": tables,
         "objects": [(kind, name, table) for kind, name, table, _ in catalog],
