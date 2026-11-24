@@ -156,7 +156,7 @@ impl Trading<'_> {
     }
 }
 
-fn id(value: &str) -> Result<BigInt, SaiError> {
+pub(super) fn id(value: &str) -> Result<BigInt, SaiError> {
     let cleaned = value.trim().replace('_', "");
     cleaned
         .parse()
@@ -167,7 +167,7 @@ fn invalid(message: &str) -> SaiError {
     SaiError::new(Code::InvalidRequest, message)
 }
 
-fn incomplete(kind: &str) -> SaiError {
+pub(super) fn incomplete(kind: &str) -> SaiError {
     SaiError::new(
         Code::IncompleteData,
         format!("Keeper or contract data was missing or malformed ({kind})"),

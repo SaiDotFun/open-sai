@@ -2,6 +2,7 @@
 
 mod actions;
 mod confirmation;
+mod position;
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -17,6 +18,7 @@ use crate::{
 
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
+pub use position::{MarginDirection, PositionAction, PositionMode};
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TradeIntent {

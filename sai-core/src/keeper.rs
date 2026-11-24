@@ -20,6 +20,7 @@ use crate::{
 pub use public::public_intent_status;
 pub(crate) use public::request_hash;
 pub use queries::*;
+pub(crate) use transport::get as lcd_get;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 pub const ABSENT_AFTER_SECONDS: f64 = 300.0;
