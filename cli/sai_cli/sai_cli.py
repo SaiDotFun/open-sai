@@ -130,12 +130,33 @@ def unlogged(names: list[str], argv: list[str]) -> bool:
     )
 
 
-class LoggedGroup(click.Group):
+class HelpOnMissingInput(click.Command):
+    """Show full help when Click requires input and the command received none."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        bare = not args
+        try:
+            return super().parse_args(ctx, args)
+        except click.MissingParameter:
+            if not bare or ctx.find_root().params.get("json_output"):
+                raise
+            click.echo(ctx.get_help(), err=True, color=ctx.color)
+            ctx.exit(2)
+
+
+class SaiGroup(click.Group):
+    command_class = HelpOnMissingInput
+    group_class = type
+
+
+class LoggedGroup(SaiGroup):
     """The root group: logs `command.start` and `command.end` for each run.
 
     Events written while the command runs carry its `command`. `sai mcp
     serve` logs to the `mcp` surface and `sai update` to `update`.
     """
+
+    group_class = SaiGroup
 
     # One entry per `main` in progress; the REPL runs commands inside one.
     runs: ClassVar[list[dict[str, Any]]] = []
@@ -188,10 +209,13 @@ class LoggedGroup(click.Group):
                 )
 
     def invoke(self, ctx: click.Context) -> Any:
-        """Keep the error message: in standalone mode click prints it and
-        exits before `main` can see it."""
+        """Record errors and exit codes before Click handles them."""
         try:
             return super().invoke(ctx)
+        except click.exceptions.Exit as exc:
+            if self.runs:
+                self.runs[-1]["exitCode"] = exc.exit_code
+            raise
         except click.ClickException as exc:
             if self.runs:
                 self.runs[-1]["error"] = exc.format_message()
