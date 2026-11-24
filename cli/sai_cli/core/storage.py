@@ -19,6 +19,7 @@ from contextvars import ContextVar
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -244,7 +245,15 @@ def load_session(addr: str | None = None) -> dict[str, str]:
     """Return the session for ADDR, or the active account's session."""
     accounts = load_accounts()
     if addr is not None:
-        return accounts["sessions"][_find(accounts, addr)]
+        try:
+            key = _find(accounts, addr)
+        except ValueError as exc:
+            raise SessionError(
+                str(exc),
+                Code.SIGNED_OUT,
+                hint=shlex.join(["sai", "auth", "login", "NAME", "--addr", addr]),
+            ) from exc
+        return accounts["sessions"][key]
     if accounts["active"] is None:
         if accounts["sessions"]:
             raise SessionError(
@@ -372,6 +381,25 @@ def db() -> sqlite3.Connection:
     return connection
 
 
+def intent_status_hint(endpoint: str, account: str, key: str) -> str:
+    """Build the reconciliation command without echoing URL credentials."""
+    args = shlex.join(["intent", "status", account, "--key", key])
+    parts = urlsplit(endpoint)
+    if (
+        parts.username is not None
+        or parts.password is not None
+        or parts.query
+        or parts.fragment
+        or log.redact(endpoint) != endpoint
+    ):
+        return (
+            'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
+            'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" '
+            f"{args}"
+        )
+    return f"sai --endpoint {shlex.quote(endpoint)} {args}"
+
+
 def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> None:
     with db() as connection:
         connection.execute("BEGIN IMMEDIATE")
@@ -384,9 +412,7 @@ def pending(key: str, endpoint: str, account: str, kind: str, entity: str) -> No
             raise UnresolvedIntent(
                 f"Reconcile uncertain intent {blocked_key} before submitting another trade",
                 intent_key=blocked_key,
-                hint=shlex.join(
-                    ["sai", "intent", "status", account, "--key", blocked_key]
-                ),
+                hint=intent_status_hint(endpoint, account, blocked_key),
             )
         connection.execute(
             "INSERT INTO intents (id, endpoint, account, kind, status, entity, created_at) VALUES (?, ?, ?, ?, 'unknown', ?, ?)",

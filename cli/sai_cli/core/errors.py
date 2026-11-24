@@ -59,6 +59,7 @@ class SaiError(Exception):
         hint: str | None = None,
         intent_key: str | None = None,
         exit_code: ExitCode | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message)
         self.message = message
@@ -66,6 +67,7 @@ class SaiError(Exception):
             self.code = code
         self.hint = hint if hint is not None else HINT_BY_CODE.get(self.code)
         self.intent_key = intent_key
+        self.details = details
         self.exit_code = (
             exit_code
             if exit_code is not None
@@ -86,6 +88,8 @@ class SaiError(Exception):
             value["intentKey"] = self.intent_key
         if self.hint is not None:
             value["hint"] = self.hint
+        if self.details is not None:
+            value["details"] = self.details
         return value
 
 
@@ -93,6 +97,10 @@ class SessionError(SaiError, ValueError):
     """A local session is missing, expired, or unusable."""
 
     code = Code.SESSION_UNAVAILABLE
+
+
+class McpStdioError(SaiError):
+    """An MCP server failure after the transport took ownership of stdout."""
 
 
 def describe(exc: Exception) -> SaiError:

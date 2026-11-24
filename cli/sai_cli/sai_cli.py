@@ -32,7 +32,7 @@ from .core import (
 )
 from .core import session as sessions
 from .core import settings as sai_settings
-from .core.errors import Code, ExitCode, SaiError, describe
+from .core.errors import Code, ExitCode, McpStdioError, SaiError, describe
 from .utils.repl_skin import ReplSkin
 
 PACKAGE = "sai-cli"
@@ -147,12 +147,23 @@ def cli_failure(exc: Exception) -> SaiError:
     return describe(exc)
 
 
+def redact_error(value: Any) -> Any:
+    """Redact stored tokens in an error without changing its JSON structure."""
+    if isinstance(value, dict):
+        return {log.redact(key): redact_error(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact_error(item) for item in value]
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    return log.redact(str(value))
+
+
 def show_failure(exc: Exception, failure: SaiError, json_output: bool) -> None:
-    if json_output:
+    if json_output and not isinstance(failure, McpStdioError):
         error = failure.as_dict()
-        for key in ("message", "hint"):
+        for key in ("message", "hint", "details"):
             if key in error:
-                error[key] = log.redact(error[key])
+                error[key] = redact_error(error[key])
         click.echo(json.dumps({"error": error}, separators=(",", ":")))
     elif isinstance(exc, click.UsageError):
         click.UsageError(log.redact(failure.message), exc.ctx).show()
@@ -611,7 +622,12 @@ def read_token() -> str:
     if copied is None:
         if sys.stdin.isatty():
             raise ValueError(f"No working clipboard command ({clipboard.NAMES})")
-        raise ValueError(NO_CLIPBOARD.format(names=clipboard.NAMES))
+        raise SaiError(
+            NO_CLIPBOARD.format(names=clipboard.NAMES),
+            Code.INVALID_REQUEST,
+            hint="sai auth import",
+            exit_code=ExitCode.UNSUPPORTED,
+        )
     if not copied[0]:
         raise ValueError(
             "Clipboard is empty; copy the session token from Sai Web and retry"
@@ -1108,7 +1124,9 @@ def doctor_command(
                 for check in checks
                 if check.status == "fail"
             )
-        raise SaiError(report)
+        raise SaiError(
+            report, details=doctor.report(checks) if ctx.obj["json"] else None
+        )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
     else:
@@ -1480,7 +1498,11 @@ def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
             details = "\n".join(lines)
         else:
             details = json.dumps(summary, indent=2)
-        raise SaiError(details, hint="sai mcp list")
+        report = {
+            **summary,
+            "results": [{**r.to_json(), "changed": r.changed} for r in results],
+        }
+        raise SaiError(details, hint="sai mcp list", details=report)
     emit(ctx, summary)
 
 

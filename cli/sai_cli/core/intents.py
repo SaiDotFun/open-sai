@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import re
-import shlex
+import sqlite3
 from datetime import UTC, datetime
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from secrets import choice
 from typing import Any
 
-from . import keeper, storage
+from . import keeper, log, storage
+from .errors import Code
 
 
 def now() -> str:
@@ -146,6 +147,27 @@ def partial_intent(
     }
 
 
+def _record_submission_status(
+    key: str, endpoint: str, account: str, status: str
+) -> BaseException | None:
+    """Try the ledger update without masking the outcome from Keeper."""
+    try:
+        storage.set_status(key, endpoint, account, status)
+    except (sqlite3.Error, OSError, ValueError, KeyboardInterrupt) as exc:
+        log.event(
+            "intent.status_write_failed",
+            "warn",
+            code=Code.INTERNAL_ERROR,
+            intentKey=key,
+            addr=account,
+            endpoint=log.endpoint(endpoint),
+            status=status,
+            errorType=type(exc).__name__,
+        )
+        return exc
+    return None
+
+
 def submit(
     endpoint: str, session: dict[str, str], intent: dict[str, Any]
 ) -> dict[str, Any]:
@@ -185,21 +207,32 @@ def submit(
             or ack["evmAddress"].lower() != account.lower()
         ):
             raise keeper.KeeperError("Acknowledgement does not match submitted intent")
-    except keeper.AdmissionRejected as exc:
+    except (keeper.AdmissionRejected, keeper.NotSent) as exc:
         exc.intent_key = key
-        storage.set_status(key, endpoint, account, "rejected")
+        status = "rejected" if isinstance(exc, keeper.AdmissionRejected) else "not_sent"
+        if failure := _record_submission_status(key, endpoint, account, status):
+            exc.hint = storage.intent_status_hint(endpoint, account, key)
+            raise exc from failure
         raise
-    except keeper.NotSent as exc:
-        exc.intent_key = key
-        storage.set_status(key, endpoint, account, "not_sent")
-        raise
-    except (keeper.KeeperError, KeyError, TypeError, AttributeError) as exc:
+    except (
+        keeper.KeeperError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        KeyboardInterrupt,
+    ) as exc:
         raise keeper.OutcomeUnknown(
             f"Outcome unknown for intent {key}; reconcile before another trade",
             key,
-            hint=shlex.join(["sai", "intent", "status", account, "--key", key]),
+            hint=storage.intent_status_hint(endpoint, account, key),
         ) from exc
-    storage.set_status(key, endpoint, account, "accepted")
+    if failure := _record_submission_status(key, endpoint, account, "accepted"):
+        raise keeper.OutcomeUnknown(
+            f"Keeper accepted intent {key}, but the local ledger update failed;"
+            " reconcile before another trade",
+            key,
+            hint=storage.intent_status_hint(endpoint, account, key),
+        ) from failure
     return {
         "intentKey": key,
         "status": "accepted",

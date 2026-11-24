@@ -21,7 +21,14 @@ def assert_error(result: Result, exit_code: int, code: str) -> dict:
     assert set(envelope) == {"error"}
     error = envelope["error"]
     assert {"code", "message", "retryable"} <= set(error)
-    assert set(error) <= {"code", "message", "retryable", "hint", "intentKey"}
+    assert set(error) <= {
+        "code",
+        "message",
+        "retryable",
+        "hint",
+        "intentKey",
+        "details",
+    }
     assert error["code"] == code
     assert isinstance(error["message"], str) and error["message"]
     assert error["retryable"] is (exit_code == 4)
@@ -55,6 +62,14 @@ def test_root_json_flag_is_detected_when_earlier_option_fails():
 def test_no_json_command_does_not_open_the_repl():
     result = CliRunner().invoke(main, ["--json"])
     assert_error(result, 2, "INVALID_REQUEST")
+
+
+@pytest.mark.parametrize("args", [("auth", "status"), ("trade", "close", "7")])
+def test_explicit_account_without_session_requires_sign_in(args):
+    result = CliRunner().invoke(main, ["--json", "--as", ADDR, *args])
+    error = assert_error(result, 6, "SIGNED_OUT")
+    assert f"{ADDR} is not connected" in error["message"]
+    assert error["hint"] == f"sai auth login NAME --addr {ADDR}"
 
 
 def test_click_usage_remains_on_stderr_in_text_mode():
