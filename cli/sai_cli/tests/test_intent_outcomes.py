@@ -1678,8 +1678,11 @@ def test_wait_returns_conditional_order_placement_without_fill(keeper_replay):
 def test_wait_reports_placement_even_when_history_is_empty(keeper_replay, order_type):
     endpoint, replies = keeper_replay
     reserve(endpoint)
-    completed = deepcopy(RESPONSES["limit_placement_exec_pass"])
-    completed["data"]["userIntents"][0]["body"] = {"orderType": order_type}
+    completed: Reply = "limit_placement_exec_pass"
+    if order_type == "stop":
+        stop_reply = deepcopy(RESPONSES["limit_placement_exec_pass"])
+        stop_reply["data"]["userIntents"][0]["body"] = {"orderType": order_type}
+        completed = stop_reply
     replies.extend((completed, "not_yet_in_history", "not_yet_in_history"))
     clock = FakeClock()
     result = wait.for_intent(
