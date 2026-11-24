@@ -71,6 +71,18 @@ OPEN_WITH_BAD_AMOUNT = {
     "slippage": "1",
     "preview_digest": "fixture",
 }
+# Remove with the temporary mcp_info exception once trade_open is implemented.
+# The amount and digest cannot produce a valid trade.
+DEFERRED_TRADE_PROBE = Call(
+    "trade_open",
+    {
+        **OPEN_WITH_BAD_AMOUNT,
+        "amount": "invalid-decimal",
+        "preview_digest": "invalid-digest",
+    },
+    "NOT_IMPLEMENTED",
+)
+
 CALLS = {
     "initialize": (),
     "info": (Call("mcp_info"),),

@@ -41,7 +41,7 @@ from compare import (
     stderr_category,
     stdout,
 )
-from mcp_cases import CALLS, handshake
+from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, handshake
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
 from sai_cli.core import log
@@ -68,6 +68,7 @@ class Case:
     mcp_profile: str = ""
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
+    mcp_deferred_trade_exception: bool = False
     mcp_checkout_wire: list[str] | None = None
     seed: str = "empty"
     server: str = "normal"
@@ -181,6 +182,8 @@ def mcp_exchange(
     env: dict[str, str],
     endpoints: Endpoints,
     case: Case,
+    *,
+    probe_deferred_trade: bool,
 ) -> subprocess.CompletedProcess[str]:
     # Keep stdin open until the server replies. Closing it while a request is
     # still running can cancel the MCP server's pending work.
@@ -212,12 +215,22 @@ def mcp_exchange(
             deadline = time.monotonic() + 20
             try:
                 requests = [
-                    (request, None) for request in handshake(case.mcp_protocol)
-                ] + [
-                    (call.request(id_, endpoints), call.session)
-                    for id_, call in enumerate(CALLS[case.mcp_profile], 3)
+                    (request, None, False) for request in handshake(case.mcp_protocol)
                 ]
-                for request, session in requests:
+                calls = CALLS[case.mcp_profile]
+                if probe_deferred_trade:
+                    requests.append(
+                        (
+                            DEFERRED_TRADE_PROBE.request(3 + len(calls), endpoints),
+                            None,
+                            True,
+                        )
+                    )
+                requests.extend(
+                    (call.request(id_, endpoints), call.session, False)
+                    for id_, call in enumerate(calls, 3)
+                )
+                for request, session, probe in requests:
                     if session is not None:
                         write_seed(
                             home, endpoints, [session_fixture(endpoints, session)]
@@ -245,7 +258,10 @@ def mcp_exchange(
                     ):
                         label = request.get("params", {}).get("name", request["method"])
                         raise ValueError(f"Unexpected MCP frame for {label}")
-                    received.append(line)
+                    if probe:
+                        check_deferred_trade_probe(message["result"])
+                    else:
+                        received.append(line)
                 proc.stdin.close()
                 if lines.get(timeout=max(0, deadline - time.monotonic())) is not None:
                     raise ValueError("Unexpected MCP stdout after the last response")
@@ -263,6 +279,24 @@ def mcp_exchange(
         return subprocess.CompletedProcess(
             [*binary, *args], code, "".join(received), stderr.read()
         )
+
+
+def check_deferred_trade_probe(result: dict[str, Any]) -> None:
+    blocks = result.get("content")
+    if (
+        result.get("isError") is False
+        and isinstance(blocks, list)
+        and len(blocks) == 1
+        and blocks[0].get("type") == "text"
+        and isinstance(text := blocks[0].get("text"), str)
+        and result.get("structuredContent") == {"result": text}
+        and isinstance(value := json.loads(text), dict)
+        and value.get("code") == DEFERRED_TRADE_PROBE.expected
+    ):
+        return
+    raise ValueError(
+        "Temporary trading availability exception expired. Remove it once trade_open is implemented"
+    )
 
 
 def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
@@ -292,7 +326,12 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
 
 
 def observe(
-    case: Case, binary: list[str], home: Path, endpoints: Endpoints
+    case: Case,
+    binary: list[str],
+    home: Path,
+    endpoints: Endpoints,
+    *,
+    native_mcp: bool = False,
 ) -> Observation:
     started_at = time.time()
     seed_home(home, endpoints, case.seed)
@@ -354,7 +393,15 @@ def observe(
     elif case.mode == "mcp":
         if not case.mcp_logs:
             env["SAI_LOG"] = "0"
-        result = mcp_exchange(binary, args, home, env, endpoints, case)
+        result = mcp_exchange(
+            binary,
+            args,
+            home,
+            env,
+            endpoints,
+            case,
+            probe_deferred_trade=native_mcp and case.mcp_deferred_trade_exception,
+        )
     else:
         result = invoke(binary, args, home, env)
     ended_at = time.time()
@@ -528,6 +575,8 @@ def safe_observe(
     binary: list[str],
     home: Path,
     endpoints: Endpoints,
+    *,
+    native_mcp: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
     endpoints.interrupt_ready.clear()
@@ -539,7 +588,7 @@ def safe_observe(
     outbound = unroutable_packets()
     try:
         result: tuple[Observation | None, str] = (
-            observe(case, binary, home, endpoints),
+            observe(case, binary, home, endpoints, native_mcp=native_mcp),
             "",
         )
     except subprocess.TimeoutExpired:
@@ -555,7 +604,9 @@ def safe_observe(
     return result
 
 
-def expect_native_mcp_info(output: list[dict[str, Any]]) -> str | None:
+def expect_native_mcp_info(
+    output: list[dict[str, Any]], *, allow_deferred_trade: bool
+) -> str | None:
     reasons: dict[str, None] = {}
     for frame in output:
         result = frame["result"]
@@ -573,14 +624,18 @@ def expect_native_mcp_info(output: list[dict[str, Any]]) -> str | None:
             }
             reasons["Native MCP reports the LCD origin without the private path"] = None
         trading = value["trading"]
-        if trading["available"] is True and trading["reason"] == "signed-in":
+        if (
+            allow_deferred_trade
+            and trading["available"] is True
+            and trading["reason"] == "signed-in"
+        ):
             updates["trading"] = {
                 **trading,
                 "available": False,
                 "reason": "not-implemented",
             }
             reasons[
-                "Native trading is unavailable while the trade tools are deferred"
+                "Temporary native trading deferral until trade_open is implemented"
             ] = None
         value.update(updates)
         result["content"][0]["text"].update(updates)
@@ -599,7 +654,11 @@ def run_case(
             case, reference, Path(temp) / "reference", endpoints
         )
         right, right_error = safe_observe(
-            case, candidate, Path(temp) / "candidate", endpoints
+            case,
+            candidate,
+            Path(temp) / "candidate",
+            endpoints,
+            native_mcp=reference != candidate,
         )
     tools = {}
     if case.mode == "mcp" and left is not None:
@@ -631,7 +690,10 @@ def run_case(
         )
     expected = None
     if case.mode == "mcp" and reference != candidate:
-        expected = expect_native_mcp_info(left.output)
+        expected = expect_native_mcp_info(
+            left.output,
+            allow_deferred_trade=case.mcp_deferred_trade_exception,
+        )
     diffs = differences(left, right)
     if (
         diffs

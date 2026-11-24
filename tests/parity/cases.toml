@@ -546,6 +546,8 @@ name = "mcp-session-reloads"
 args = ["--endpoint","{http}","mcp","serve","--endpoint","{keeper}"]
 mode = "mcp"
 mcp_profile = "session"
+# Temporary. The native-only trade_open probe expires this when the tool lands.
+mcp_deferred_trade_exception = true
 seed = "session"
 wire = ["trades", "trades", "trades"]
 
