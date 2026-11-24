@@ -843,15 +843,7 @@ impl Clients {
         if client == Client::Codex {
             Client::repair_codex(&self.home, self.cwd(), name, &target, entry, deadline)
         } else {
-            client.write(
-                entry.scope,
-                &self.home,
-                self.cwd(),
-                name,
-                &target,
-                Some(entry),
-                deadline,
-            )
+            Client::repair_cursor(&self.home, self.cwd(), name, &target, entry, deadline)
         }
         .map_err(problem)
     }

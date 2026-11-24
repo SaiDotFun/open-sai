@@ -13,6 +13,9 @@ use serde_json::{Map, Value};
 
 use super::{Client, Registration, Scope, Target};
 
+#[cfg(test)]
+mod tests;
+
 pub(super) type Result<T> = std::result::Result<T, String>;
 pub(super) const READ_ONLY_CONFIG: &str = "The client config is read-only";
 
@@ -143,6 +146,54 @@ impl Client {
         }
         let update = old.map_or(JsonUpdate::Install(None), JsonUpdate::Repair);
         self.write_json(&path, cwd, scope, name, target, update, deadline)
+            .map(|_| ())
+    }
+
+    pub(super) fn repair_cursor(
+        home: &Path,
+        cwd: &Path,
+        name: &str,
+        target: &Target,
+        old: &Registration,
+        deadline: Instant,
+    ) -> Result<()> {
+        let path = Self::Cursor.path(old.scope, home, cwd);
+        let published = Self::Cursor.write_json(
+            &path,
+            cwd,
+            old.scope,
+            name,
+            target,
+            JsonUpdate::Repair(old),
+            deadline,
+        )?;
+        Self::verify_cursor_repair(&path, old.scope, name, target, published, deadline)
+    }
+
+    fn verify_cursor_repair(
+        path: &Path,
+        scope: Scope,
+        name: &str,
+        target: &Target,
+        published: Option<PublishedConfig>,
+        deadline: Instant,
+    ) -> Result<()> {
+        let verification = read_json(path, deadline).and_then(|doc| {
+            let raw = &doc["mcpServers"][name];
+            let actual = Registration::new(raw.clone(), raw, scope, false, vec![]);
+            if actual.is_some_and(|entry| entry.stdio && entry.argv == target.argv) {
+                Ok(())
+            } else {
+                Err("Cursor did not load the repaired Sai registration".into())
+            }
+        });
+        if let Err(error) = &verification
+            && let Some(published) = published
+            && let Err(restore) = published.restore(path, Instant::now() + Duration::from_secs(1))
+        {
+            return Err(format!("{error}. {restore}"));
+        }
+        verification
     }
 
     pub(super) fn repair_codex(
@@ -225,6 +276,7 @@ impl Client {
             JsonUpdate::Install(Some(old)),
             deadline,
         )
+        .map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -237,7 +289,7 @@ impl Client {
         target: &Target,
         update: JsonUpdate<'_>,
         deadline: Instant,
-    ) -> Result<()> {
+    ) -> Result<Option<PublishedConfig>> {
         let existing = match update {
             JsonUpdate::Install(old) => old,
             JsonUpdate::Repair(old) => Some(old),
@@ -299,7 +351,6 @@ impl Client {
                 serde_json::to_string_pretty(&doc).map_err(|_| "Could not write MCP config")?;
             Ok(format!("{}\n", crate::local::ascii_json(&rendered)))
         })
-        .map(|_| ())
     }
 }
 
@@ -624,7 +675,7 @@ impl PublishedConfig {
         // file this repair published, even if a newer file has identical text.
         let original = self
             .original
-            .ok_or("The original Codex config is unavailable")?;
+            .ok_or("The original client config is unavailable")?;
         let restored = replace_if_current(
             path,
             &self.destination,
@@ -636,7 +687,7 @@ impl PublishedConfig {
         if restored.is_some() {
             Ok(())
         } else {
-            Err("Codex config.toml changed before Sai could restore it".into())
+            Err("The client config changed before Sai could restore it".into())
         }
     }
 }
