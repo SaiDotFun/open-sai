@@ -246,3 +246,33 @@ to create and push the tag. The tag starts the
 builds the wheel and sdist, writes `SHA256SUMS`, and publishes all three as a
 GitHub Release. The install script and `sai update` look for the highest
 `sai-cli/v*` release that is not a pre-release.
+
+### Rehearse an Upgrade and Downgrade
+
+After the version bump lands on `main`, build the candidate and rehearse it
+before tagging. The script needs Python 3.11 or later, `uv`, `claude`, and
+`codex` on `PATH`, and network access to GitHub and the Python package index.
+Use executables that can run with a fresh home directory.
+
+```bash
+uv build --wheel --out-dir dist
+python3 scripts/release-rehearsal.py dist/sai_cli-0.1.1-py3-none-any.whl
+```
+
+The script installs the published v0.1.0 wheel through the release installer
+in a temporary home and caches the candidate's dependencies. For the
+rehearsal, it sets uv offline and pins the endpoints to loopback. On Linux,
+it uses a loopback-only network namespace when available. Otherwise it
+reports that it is using a dead proxy for proxy-aware traffic. A synthetic
+session and loopback Keeper leave an open unresolved. The script serves both wheels
+and their checksums to `sai update`. It checks that the session, config,
+and Claude and Codex MCP registrations work through the same launcher,
+that the migrated ledger blocks a retry, and that `sai doctor` passes once
+Keeper reports a terminal outcome.
+It restores the pending ledger checkpoint before running
+`sai update --to 0.1.0` and reports whether v0.1.0 still blocks the open
+before and after reconciling it.
+
+Run `python3 scripts/release-rehearsal.py --self-test` for the local script
+checks. Add `--verbose` to a rehearsal to keep child output in a private
+scratch log. The script prints the log path and removes the temporary home.
