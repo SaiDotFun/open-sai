@@ -403,7 +403,8 @@ def loopback(
         "get_trade_raw": {
             "trader": (
                 cancel_trader
-                if scenario == "pending-order" or cancel_target is not None
+                if scenario in {"pending-order", "concurrent-close"}
+                or cancel_target is not None
                 else position["trader"]
             ),
             "index": 7,
