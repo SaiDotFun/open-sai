@@ -716,7 +716,7 @@ def test_help_version_and_skill_write_nothing(home):
 def test_keeper_errors_record_what_keeper_answered(home, keeper_stub):
     base, state = keeper_stub
     state.errors = [
-        {"message": "market is paused", "extensions": {"code": "MARKET_PAUSED"}}
+        {"message": "market is paused", "extensions": {"code": "FORBIDDEN"}}
     ]
     with pytest.raises(keeper.KeeperError):
         keeper.request(base, keeper.POSITIONS, {"trader": ADDR}, token=jwt())
@@ -726,11 +726,38 @@ def test_keeper_errors_record_what_keeper_answered(home, keeper_stub):
     rejected, unavailable = events(home, "keeper.request")
     assert rejected["operation"] == "positions" and rejected["status"] == "error"
     assert rejected["addr"] == ADDR and rejected["authenticated"] is True
-    assert rejected["keeperErrors"] == [
-        {"code": "MARKET_PAUSED", "message": "market is paused"}
-    ]
+    assert rejected["keeperErrorCount"] == 1
+    assert rejected["keeperErrors"] == [{"code": "FORBIDDEN"}]
     assert rejected["error"] == "Keeper rejected the request; check inputs and session"
     assert unavailable["operation"] == "custom" and unavailable["httpStatus"] == 503
+
+
+def test_market_list_logs_only_validated_graphql_codes(home, keeper_stub):
+    base, state = keeper_stub
+    origin = base.removesuffix("/query")
+    target = f"/{PATH_KEY}/query?api_key={URL_KEY}"
+    state.errors = [
+        {"message": target, "extensions": {"code": "GRAPHQL_VALIDATION_FAILED"}},
+        {"message": target, "extensions": {"code": target}},
+    ]
+
+    code, output = run_cli("--json", "--endpoint", origin + target, "market", "list")
+    assert code == 1 and json.loads(output)["error"]["code"] == "KEEPER_ERROR"
+    assert state.paths == [target]
+    [request] = events(home, "keeper.request")
+    assert request["operation"] == "markets" and request["endpoint"] == origin
+    assert request["httpStatus"] == 200
+    assert request["keeperErrorCount"] == 2
+    assert request["keeperErrors"] == [
+        {"code": "GRAPHQL_VALIDATION_FAILED"},
+        {"code": "KEEPER_ERROR"},
+    ]
+    for flags in ((), ("--json",)):
+        code, tail = run_cli(*flags, "logs", "tail", "--event", "keeper.request")
+        assert code == 0 and "GRAPHQL_VALIDATION_FAILED" in tail
+        assert PATH_KEY not in tail and URL_KEY not in tail
+    for text in (output, raw_logs(home)):
+        assert PATH_KEY not in text and URL_KEY not in text
 
 
 def test_intent_and_history_reads_log_graphql_codes_and_count(home, keeper_stub):
@@ -791,13 +818,13 @@ def test_intent_and_history_reads_log_graphql_codes_and_count(home, keeper_stub)
         assert secret not in tail and "GRAPHQL_VALIDATION_FAILED" in tail
 
 
-def test_a_keeper_error_that_echoes_the_signature_is_scrubbed(home, keeper_stub):
+def test_keeper_session_errors_log_codes_without_echoing_signatures(home, keeper_stub):
     """Keeper's message for a bad session mutation can quote its input."""
     base, state = keeper_stub
     token = jwt(OTHER)
     echo = f"invalid signature {SIGNATURE} for challenge {'c' * 64}, token {token}"
     state.errors = [
-        {"message": echo, "extensions": {"code": "BAD_SIGNATURE"}},
+        {"message": echo, "extensions": {"code": "UNAUTHENTICATED"}},
         {"message": "x" * 5000, "extensions": {"code": SIGNATURE}},
     ]
     variables = {"signature": SIGNATURE, "challenge": "c" * 64}
@@ -805,13 +832,11 @@ def test_a_keeper_error_that_echoes_the_signature_is_scrubbed(home, keeper_stub)
         keeper.request(base, keeper.SESSION, variables)
     request = events(home, "keeper.request")[0]
     assert request["operation"] == "session"
-    first, second = request["keeperErrors"]
-    assert first == {
-        "code": "BAD_SIGNATURE",
-        "message": f"invalid signature {log.REDACTED_HEX} for challenge"
-        f" {log.REDACTED_HEX}, token {log.REDACTED}",
-    }
-    assert second["code"] == log.REDACTED_HEX and len(second["message"]) < 350
+    assert request["keeperErrorCount"] == 2
+    assert request["keeperErrors"] == [
+        {"code": "UNAUTHENTICATED"},
+        {"code": "KEEPER_ERROR"},
+    ]
     raw = raw_logs(home)
     for secret in (SIGNATURE, SIGNATURE[2:], "c" * 64, token):
         assert secret not in raw
