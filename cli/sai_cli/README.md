@@ -35,7 +35,10 @@ log setting `invalid` and turns logging off.
 The list shows Keeper URLs as origins. The LCD URL can include a path.
 `sai config get KEY` prints the exact resolved value. With the global
 `--json` flag, it returns `key`, `value`, and `source`. An unknown key or
-invalid value exits 2 with code `INVALID_REQUEST` and lists the valid keys.
+an invalid value passed to `config set` is a usage error. Sai lists the
+valid keys and exits 2 with code `INVALID_REQUEST`. An invalid override,
+such as `SAI_UPDATE_AUTO=maybe`, makes `config list` exit 1 with code
+`INVALID_REQUEST` and a validation message.
 
 The first `set`, or an `unset` that removes a value, writes the whole file
 with every key commented out and explained, at mode 0600 in a 0700
