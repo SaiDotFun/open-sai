@@ -781,9 +781,20 @@ def protect_displaced_launcher(
 ) -> bool:
     """Return a competing installer's entry to its path, or leave it recoverable."""
     try:
-        if published is not None and launcher_entry(launcher) == published:
-            rename_launcher(displaced, launcher, exchange=True)
-            return launcher_entry(displaced) == published
+        active = launcher_entry(launcher)
+        if active is not None and active == launcher_entry(displaced):
+            return True
+        if published is not None:
+            withdrawn = displaced.with_name("public")
+            if launcher_entry(withdrawn) is None and active == published:
+                # Capture and check the public entry before putting anything back.
+                rename_launcher(launcher, withdrawn, exchange=False)
+            captured = launcher_entry(withdrawn)
+            if captured != published:
+                if captured is not None:
+                    rename_launcher(withdrawn, launcher, exchange=False)
+                    sync_dir(launcher.parent)
+                return False
         rename_launcher(displaced, launcher, exchange=False)
         return True
     except (OSError, LauncherChanged):

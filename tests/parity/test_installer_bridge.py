@@ -491,6 +491,52 @@ runpy.run_path(script, run_name='__main__')
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_standalone_keeps_the_newest_competing_launcher_public(
+    install: Install, replay: Replay
+) -> None:
+    native_artifact(replay)
+    ok(install.install(replay, "--native"))
+    older = install.home / "older-competitor"
+    newer = install.home / "newer-competitor"
+    older.write_text("older launcher")
+    newer.write_text("newer launcher")
+    older_entry, newer_entry = older.stat(), newer.stat()
+    probe = """
+import os, runpy, sys
+script, launcher, older, newer, *args = sys.argv[1:]
+competitors = iter([older, newer])
+def race(event, values):
+    if event == 'sai.launcher.rename' and launcher in values:
+        replacement = next(competitors, None)
+        if replacement:
+            os.replace(replacement, launcher)
+sys.addaudithook(race)
+sys.argv = [script, *args]
+runpy.run_path(script, run_name='__main__')
+"""
+    result = install.run(
+        sys.executable,
+        "-c",
+        probe,
+        INSTALLER,
+        install.launcher,
+        older,
+        newer,
+        "--native",
+        "--api-base",
+        replay.base,
+        "--web-base",
+        replay.base,
+    )
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    staged = pending(install).parent / ".launcher-switch" / "sai"
+    assert str(staged) in result.stderr
+    assert os.path.samestat(install.launcher.stat(), newer_entry)
+    assert os.path.samestat(staged.stat(), older_entry)
+    assert pending(install).is_file()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 def test_standalone_refuses_an_indirect_managed_target(
     install: Install, replay: Replay
 ) -> None:
