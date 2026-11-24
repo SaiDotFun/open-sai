@@ -148,7 +148,6 @@ def read_collateral_price(lcd: str, contract: str, token: str) -> dict[str, Any]
             lcd,
             contract,
             {"get_collateral_price": {"collateral_index": token}},
-            timeout=QUOTE_TIMEOUT,
         )
     )
     if price <= 0:
@@ -188,7 +187,7 @@ def open_estimates(
     liq = unavailable("An entry price and opening fee estimate are required.")
     if lcd and row is not None and all(key in row for key in FEE_FIELDS):
         try:
-            contract = margin.trading_contract(endpoint, lcd, QUOTE_TIMEOUT)
+            contract = margin.trading_contract(endpoint, lcd)
             token = f"TokenIndex({row['collateralToken']['id']})"
             collateral_price = read_collateral_price(lcd, contract, token)
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))

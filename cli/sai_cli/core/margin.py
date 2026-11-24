@@ -56,18 +56,13 @@ def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
 
 
 def smart_value(
-    lcd: str,
-    contract: str,
-    message: dict[str, Any],
-    *,
-    height: str | None = None,
-    timeout: float = 20,
+    lcd: str, contract: str, message: dict[str, Any], *, height: str | None = None
 ) -> Any:
     """Read a CosmWasm smart query, including scalar and array responses."""
     url = _smart_url(lcd, contract, message)
     if height is None:
-        return _get_json(url, timeout).get("data")
-    return _get_json_at_height(url, timeout, height=height)[0].get("data")
+        return _get_json(url).get("data")
+    return _get_json_at_height(url, height=height)[0].get("data")
 
 
 def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
@@ -141,11 +136,9 @@ def position_unchanged(
     return True
 
 
-def trading_contract(endpoint: str, lcd: str, timeout: float = 20) -> str:
-    route = keeper.request(endpoint, keeper.ROUTE, timeout=timeout)["oneClickTrading"]
-    node = _get_json(
-        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info", timeout
-    )
+def trading_contract(endpoint: str, lcd: str) -> str:
+    route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
+    node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
     if (
         not route["enabled"]
         or node.get("default_node_info", {}).get("network") != route["chainId"]

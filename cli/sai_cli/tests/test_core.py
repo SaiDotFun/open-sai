@@ -515,14 +515,14 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
     monkeypatch.setattr(
         margin,
         "_get_json",
-        lambda url, timeout=20: {"default_node_info": {"network": "nibiru-testnet-2"}},
+        lambda url: {"default_node_info": {"network": "nibiru-testnet-2"}},
     )
     with pytest.raises(ValueError, match="network do not match"):
         margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 1)
 
 
 def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
-    def gql(endpoint, query, variables=None, token=None, timeout=20):
+    def gql(endpoint, query, variables=None, token=None):
         if query == keeper.ROUTE:
             return {
                 "oneClickTrading": {
@@ -575,7 +575,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
     monkeypatch.setattr(
         margin,
         "_get_json",
-        lambda url, timeout=20: {"default_node_info": {"network": "cataclysm-1"}},
+        lambda url: {"default_node_info": {"network": "cataclysm-1"}},
     )
     monkeypatch.setattr(
         margin,
