@@ -20,6 +20,7 @@ import tracemalloc
 import zlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from http.server import ThreadingHTTPServer
@@ -39,6 +40,7 @@ from sai_cli.core import session as sessions
 from sai_cli.core.log_events import SCHEMA_VERSION, VOLATILE_FIELDS, valid_event
 from sai_cli.mcp_server import server
 from sai_cli.sai_cli import command_path, main
+from sai_cli.tests.loopback import graphql_ws
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
@@ -1210,6 +1212,65 @@ def test_doctor_logs_the_invalid_request_code_for_a_failed_config_check(
         check["id"] == "config" and check["status"] == "fail"
         for check in result["checks"]
     )
+
+
+def test_doctor_workers_log_with_an_endpoint_flag_shadowing_the_file(
+    home, monkeypatch, keeper_stub
+):
+    endpoint, state = keeper_stub
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    (home / "config.toml").write_text('[keeper]\nendpoint = "https://[invalid"\n')
+    save_session(endpoint)
+    storage.pending("doctor-fixture-key", endpoint, ADDR, "CLOSE_POSITION", "7")
+    state.intents = [
+        {
+            "intentKey": "doctor-fixture-key",
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": ADDR,
+        }
+    ]
+
+    def ack(connection):
+        assert json.loads(connection.recv())["type"] == "connection_init"
+        connection.send(json.dumps({"type": "connection_ack"}))
+
+    with graphql_ws(ack) as websocket:
+        code, output = run_cli(
+            "--json",
+            "--endpoint",
+            endpoint,
+            "--ws-endpoint",
+            websocket,
+            "--lcd-endpoint",
+            endpoint.removesuffix("/query"),
+            "doctor",
+        )
+
+    assert code == 0, output
+    checks = {check["id"]: check["status"] for check in json.loads(output)["checks"]}
+    assert checks["keeper"] == "pass"
+    assert checks["intents"] == "fixed"
+    start = events(home, "command.start")[0]
+    requests = events(home, "keeper.request")
+    assert sorted(row["operation"] for row in requests) == ["intents", "route"]
+    assert {row["commandId"] for row in requests} == {start["commandId"]}
+
+
+def test_copied_log_context_stays_silenced_after_the_parent_exits(home):
+    with log.silenced():
+        context = copy_context()
+
+    worker = threading.Thread(target=context.run, args=(log.event, "test.late"))
+    worker.start()
+    worker.join()
+
+    assert log.flush(60)
+    assert not (home / "logs").exists()
 
 
 # Retention

@@ -30,6 +30,7 @@ import threading
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
@@ -908,7 +909,7 @@ def reconcile_keys(
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             outcome["error"] = type(exc).__name__
 
-    thread = threading.Thread(target=work, daemon=True)
+    thread = threading.Thread(target=copy_context().run, args=(work,), daemon=True)
     thread.start()
     thread.join(deadline)
     gate.shut()
@@ -1305,7 +1306,7 @@ def run_network(ctx: Context, deadline: float) -> list[Check]:
         results[name] = timed(name, fn, ctx)
 
     threads = [
-        threading.Thread(target=work, args=(name, fn), daemon=True)
+        threading.Thread(target=copy_context().run, args=(work, name, fn), daemon=True)
         for name, fn in NETWORK_CHECKS
     ]
     end = time.monotonic() + deadline

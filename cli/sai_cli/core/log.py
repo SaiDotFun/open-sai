@@ -166,6 +166,7 @@ _context: ContextVar[Mapping[str, Any]] = ContextVar(
 _flag_keys: ContextVar[frozenset[str]] = ContextVar(
     "sai_log_setting_flags", default=frozenset()
 )
+_silenced_context = ContextVar("sai_log_silenced", default=False)
 # How many `silenced` blocks are open, in any thread.
 _silenced = 0
 
@@ -619,13 +620,15 @@ def bind(**fields: Any) -> Generator[None]:
 
 @contextmanager
 def silenced() -> Generator[None]:
-    """Write no events inside the block, in any thread of this process."""
+    """Suppress events during the block and in contexts copied from it."""
     global _silenced
+    token = _silenced_context.set(True)
     _silenced += 1
     try:
         yield
     finally:
         _silenced -= 1
+        _silenced_context.reset(token)
 
 
 def bound(name: str) -> Any:
@@ -1078,7 +1081,7 @@ def _target() -> _ConfigKey | None:
     """The home and logging values an event would be written under now, or
     None when it would not be written: logging is silenced, SAI_LOG is off,
     or the writer found this home off or unusable moments ago."""
-    if _silenced:
+    if _silenced or _silenced_context.get():
         return None
     raw_on = os.environ.get("SAI_LOG")
     if _off(raw_on):
