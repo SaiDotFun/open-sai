@@ -8,7 +8,7 @@ import shlex
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from . import log, storage
+from . import keeper, log, storage
 from .errors import Code, SessionError
 
 EXPIRY_WARNING = timedelta(days=3)
@@ -142,7 +142,18 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
     }
 
 
-def summary(result: dict[str, str]) -> dict[str, str | None]:
+def session_address(result: dict[str, str], account_key: str) -> str:
+    addr = result["evmAddress"]
+    if not keeper.is_address(addr) or addr.lower() != account_key:
+        raise SessionError(
+            f"Stored session has an invalid address; {storage.SIGN_IN_AGAIN}"
+        )
+    return addr
+
+
+def summary(
+    result: dict[str, str], *, account_key: str | None = None
+) -> dict[str, str | None]:
     """Return the address, expiry, and Keeper origin for display."""
     endpoint = result.get("endpoint")
     if endpoint is not None and not isinstance(endpoint, str):
@@ -150,7 +161,9 @@ def summary(result: dict[str, str]) -> dict[str, str | None]:
             f"Stored session has an invalid endpoint; {storage.SIGN_IN_AGAIN}"
         )
     return {
-        "addr": result["evmAddress"],
+        "addr": result["evmAddress"]
+        if account_key is None
+        else session_address(result, account_key),
         "expiresAt": result["expiresAt"],
         "endpoint": log.origin(endpoint) if endpoint is not None else None,
     }

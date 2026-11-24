@@ -327,17 +327,18 @@ def use_session(
     addr: str, prepare: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 ) -> dict[str, Any]:
     """Select ADDR, preparing its response from the candidate state before saving."""
-    from .session import expiry_time
+    from .session import expiry_time, session_address
 
     with _locked():
         accounts = load_accounts()
         key = _find(accounts, addr)
         session = accounts["sessions"][key]
+        address = session_address(session, key)
         expiry_time(session)
         accounts["active"] = key
         response = session if prepare is None else prepare(accounts)
         _save_accounts(accounts)
-        log.event("session.active", addr=session["evmAddress"])
+        log.event("session.active", addr=address)
         return response
 
 

@@ -1475,7 +1475,10 @@ def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
         }
 
 
-@pytest.mark.parametrize("corruption", ["selected-expiry", "other-expiry", "endpoint"])
+@pytest.mark.parametrize(
+    "corruption",
+    ["selected-expiry", "other-expiry", "endpoint", "address", "other-address"],
+)
 def test_stdio_auth_use_refuses_malformed_response_before_switching(
     tmp_path: Path, corruption: str
 ) -> None:
@@ -1489,6 +1492,9 @@ def test_stdio_auth_use_refuses_malformed_response_before_switching(
     if corruption == "endpoint":
         records[ADDR]["endpoint"] = {"value": secret}
         field = "endpoint"
+    elif corruption in {"address", "other-address"}:
+        records[third if corruption == "other-address" else ADDR]["evmAddress"] = secret
+        field = "address"
     else:
         records[third if corruption == "other-expiry" else ADDR]["expiresAt"] = secret
         field = "expiry"

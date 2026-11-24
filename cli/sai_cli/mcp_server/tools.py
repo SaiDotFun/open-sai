@@ -352,7 +352,7 @@ def account_rows(settings: Settings, accounts: dict[str, Any]) -> dict[str, Any]
         matches = result.get("endpoint") == settings.endpoint
         rows.append(
             {
-                **sessions.summary(result),
+                **sessions.summary(result, account_key=key),
                 "active": key == accounts["active"],
                 "expired": expired,
                 "endpointMatches": matches,

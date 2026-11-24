@@ -868,7 +868,7 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
     now = datetime.now(UTC)
     return [
         {
-            **sessions.summary(result),
+            **sessions.summary(result, account_key=key),
             "active": key == accounts["active"],
             "expired": sessions.expiry_time(result) <= now,
             "endpointMatches": result.get("endpoint") == endpoint,

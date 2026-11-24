@@ -569,16 +569,22 @@ def test_use_rejects_malformed_expiry_before_switching(
         assert result.stderr == f"Error: {message}\n"
 
 
-def test_use_refuses_endpoint_object_before_switching(
-    env: Env, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("corruption", ["endpoint", "address", "address-mismatch"])
+def test_use_refuses_malformed_session_before_switching(
+    env: Env, monkeypatch: pytest.MonkeyPatch, corruption: str
 ) -> None:
-    marker = "synthetic-cli-endpoint-credential-marker"
+    marker = "synthetic-cli-switch-credential-marker"
     monkeypatch.setenv("SAI_HOME", str(env.home))
+    selected: dict[str, Any] = session_for(marker)
+    if corruption == "endpoint":
+        selected["endpoint"] = {"value": marker}
+    else:
+        selected["evmAddress"] = marker if corruption == "address" else OTHER
     storage._save_accounts(
         {
             "active": OTHER,
             "sessions": {
-                ADDR: {**session_for(make_token()), "endpoint": {"value": marker}},
+                ADDR: selected,
                 OTHER: {**session_for(make_token(OTHER)), "evmAddress": OTHER},
             },
         }
@@ -591,7 +597,7 @@ def test_use_refuses_endpoint_object_before_switching(
     assert result.returncode == 1
     assert marker not in result.stdout + result.stderr
     assert json.loads(result.stdout)["error"]["code"] == "SESSION_UNAVAILABLE"
-    assert "invalid endpoint" in result.stdout
+    assert f"invalid {corruption.split('-')[0]}" in result.stdout
     assert marker.encode() not in env.stored_bytes()
     assert b"session.active" not in env.stored_bytes()
     assert path.read_bytes() == before
