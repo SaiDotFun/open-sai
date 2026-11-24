@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from compare import Normalize
+from compare import Normalize, validate_log_endpoint_key
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
 from websockets.http11 import Request as UpgradeRequest
@@ -186,6 +186,8 @@ def read_state(home: Path) -> tuple[Any, ...]:
     files = {
         str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
     }
+    if "logs/.endpoint-key" in files:
+        validate_log_endpoint_key(home / "logs/.endpoint-key")
     db = home / "trader/intents.sqlite3"
     if not db.exists():
         return (files,)
@@ -195,6 +197,19 @@ def read_state(home: Path) -> tuple[Any, ...]:
         version = connection.execute("PRAGMA user_version").fetchone()
         rows = connection.execute("SELECT * FROM intents ORDER BY id")
         return files, schema.fetchall(), version, rows.fetchall()
+
+
+def test_read_state_rejects_short_endpoint_key(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    key = log_dir / ".endpoint-key"
+    key.write_bytes(b"x" * 32)
+    key.chmod(0o600)
+    read_state(tmp_path)
+
+    key.write_bytes(b"x")
+    with pytest.raises(ValueError, match="Expected a 32-byte log endpoint key"):
+        read_state(tmp_path)
 
 
 def seed(

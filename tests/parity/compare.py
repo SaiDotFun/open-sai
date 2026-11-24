@@ -1015,10 +1015,14 @@ def content(path: Path, name: str, normalize: Normalize) -> Any:
         replace_if(value, "checkedAt", timestamp)
         return value
     if name == "logs/.endpoint-key":
-        if path.stat().st_size != 32:
-            raise ValueError("Expected a 32-byte log endpoint key")
+        validate_log_endpoint_key(path)
         return "<generated endpoint key>"
     return path.read_bytes()
+
+
+def validate_log_endpoint_key(path: Path) -> None:
+    if path.stat().st_size != 32:
+        raise ValueError("Expected a 32-byte log endpoint key")
 
 
 def read_log(path: Path, day: str) -> list[dict[str, Any]]:
