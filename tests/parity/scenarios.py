@@ -227,6 +227,7 @@ def loopback(
     market_price: float | None = None,
     cancel_target: str | None = None,
     close_target: str | None = None,
+    lcd_query: bool = False,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -674,8 +675,14 @@ def loopback(
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
                 return
-            path = urlsplit(self.path).path
+            request_url = urlsplit(self.path)
+            path = request_url.path
             if path.startswith(scope):
+                if lcd_query and parse_qs(request_url.query).get("project") != [
+                    "fixture"
+                ]:
+                    self.reject("Missing LCD project query parameter")
+                    return
                 path = path.removeprefix(scope)
                 if (
                     scenario == "doctor-lcd-unreachable"

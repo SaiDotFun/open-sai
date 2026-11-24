@@ -54,6 +54,35 @@ fn read_request(stream: &mut TcpStream) -> (Vec<String>, Vec<u8>) {
 }
 
 #[tokio::test]
+async fn lcd_probe_appends_path_before_query() {
+    let listener = listener();
+    let endpoint = format!(
+        "http://{}/prefix/?project=fixture",
+        listener.local_addr().unwrap()
+    );
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let (headers, _) = read_request(&mut stream);
+        let body = r#"{"default_node_info":{"network":"fixture-chain"}}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        headers[0].clone()
+    });
+    assert_eq!(
+        sai_core::keeper::lcd_network(&endpoint, Duration::from_secs(1)).await,
+        Ok(Some("fixture-chain".into()))
+    );
+    assert_eq!(
+        server.join().unwrap(),
+        "GET /prefix/cosmos/base/tendermint/v1beta1/node_info?project=fixture HTTP/1.1"
+    );
+}
+
+#[tokio::test]
 async fn tls_connect_timeout_is_not_sent() {
     let listener = listener();
     let endpoint = format!("https://{}/query", listener.local_addr().unwrap());

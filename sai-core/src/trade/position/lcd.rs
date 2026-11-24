@@ -94,7 +94,7 @@ impl Lcd<'_> {
             Regex::new(r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found")
                 .expect("valid missing-cap pattern")
         });
-        let mut url = lcd_url(&format!("{}{path}", self.0.trim_end_matches('/')))?;
+        let mut url = lcd_url(self.0, path)?;
         if !matches!(read, Read::Snapshot) {
             url.query_pairs_mut()
                 .append_pair("_sai_query", &Uuid::new_v4().simple().to_string());

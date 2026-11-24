@@ -8,7 +8,7 @@ use url::{Url, form_urlencoded::byte_serialize};
 use uuid::Uuid;
 
 use crate::{
-    endpoint::Endpoint,
+    endpoint::{Endpoint, append_path},
     errors::SaiError,
     keeper::{self, TIMEOUT},
     storage::Session,
@@ -48,13 +48,7 @@ impl Trading<'_> {
             .filter(|_| preview.intent.kind == "CANCEL_PENDING_TRADE")
             .map(|target| target.trade_id.as_str())
             .ok_or_else(SaiError::internal)?;
-        let trade = read_cancel_target(
-            lcd.0.trim_end_matches('/'),
-            &route.contract_address,
-            session.addr(),
-            id,
-        )
-        .await?;
+        let trade = read_cancel_target(lcd.0, &route.contract_address, session.addr(), id).await?;
         if trade["user_trade_index"] != format!("UserTradeIndex({id})")
             || trade["is_open"].as_bool() != Some(true)
             || !matches!(trade["trade_type"].as_str(), Some("limit" | "stop"))
@@ -100,8 +94,8 @@ async fn read_cancel_target(
     let encoded = STANDARD.encode(query.to_string());
     let encoded: String = byte_serialize(encoded.as_bytes()).collect();
     let contract: String = byte_serialize(contract.as_bytes()).collect();
-    let url = format!("{lcd}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}");
-    let mut url = lcd_url(&url)?;
+    let path = format!("/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}");
+    let mut url = lcd_url(lcd, &path)?;
     url.query_pairs_mut()
         .append_pair("_sai_query", &Uuid::new_v4().simple().to_string());
     let (status, _, bytes) = keeper::lcd_get(url.as_str(), HeaderMap::new(), TIMEOUT)
@@ -130,7 +124,7 @@ fn read_object(success: bool, bytes: &[u8]) -> Option<Value> {
         .filter(Value::is_object)
 }
 
-pub(super) fn lcd_url(raw: &str) -> Result<Url, SaiError> {
+pub(super) fn lcd_url(raw: &str, path: &str) -> Result<Url, SaiError> {
     let Some(endpoint) = Endpoint::split(raw).filter(|endpoint| {
         endpoint.scheme == "https"
             || (endpoint.scheme == "http"
@@ -146,5 +140,7 @@ pub(super) fn lcd_url(raw: &str) -> Result<Url, SaiError> {
     {
         return Err(invalid("Credentials are not allowed in the LCD URL"));
     }
-    Url::parse(raw).map_err(|_| invalid("Unable to read contract state"))
+    let mut url = Url::parse(raw).map_err(|_| invalid("Unable to read contract state"))?;
+    append_path(&mut url, path);
+    Ok(url)
 }

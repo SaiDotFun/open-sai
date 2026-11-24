@@ -84,13 +84,17 @@ def run(
     *,
     python: bool,
     account: str | None = None,
+    lcd_endpoint: str | None = None,
 ) -> tuple[int, dict[str, Any], str]:
     if python and args[:2] == CANCEL[:2]:
         args = ("trade", "close", args[2], "--cancel-order", *args[3:])
+    env = {**child_env(root, endpoints), "SAI_LOG": "1", "SAI_UPDATE_AUTO": "0"}
+    if lcd_endpoint is not None:
+        env["SAI_LCD_ENDPOINT"] = lcd_endpoint
     result = subprocess.run(
         [*cli, "--json", *(("--as", account) if account else ()), *args],
         cwd=root,
-        env={**child_env(root, endpoints), "SAI_LOG": "1", "SAI_UPDATE_AUTO": "0"},
+        env=env,
         stdin=subprocess.DEVNULL,
         capture_output=True,
         encoding="utf-8",
@@ -415,6 +419,39 @@ def test_close_verifies_position_owner_before_reservation(
             assert [request.label for request in endpoints.wire] == wire
             assert not endpoints.errors
             assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
+
+
+@pytest.mark.parametrize("args", [CLOSE, CANCEL])
+def test_position_trade_preserves_lcd_query(
+    current_trade_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    args: CLI,
+) -> None:
+    cancel = args == CANCEL
+    for index, cli in enumerate(current_trade_pair):
+        with loopback(
+            "trade-accepted",
+            cancel_target="pending" if cancel else None,
+            close_target=None if cancel else "verified",
+            lcd_query=True,
+        ) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, output, stderr = run(
+                cli,
+                home,
+                endpoints,
+                args,
+                python=index == 0,
+                lcd_endpoint=f"{endpoints.http}/?project=fixture",
+            )
+            assert (code, output.get("status"), stderr) == (0, "accepted", "")
+            assert [request.label for request in endpoints.wire] == [
+                *(CANCEL_READS if cancel else CLOSE_READS),
+                "recordUserIntent",
+            ]
+            assert not endpoints.errors
+            assert len(rows(home)) == 1
 
 
 @pytest.mark.parametrize("args", [CANCEL, (*CLOSE, "--cancel-order")])
