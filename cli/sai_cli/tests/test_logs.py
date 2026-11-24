@@ -649,6 +649,7 @@ def test_no_token_or_url_credential_reaches_a_log_line(home, keeper_stub):
     assert "code" in call(mcp, "auth_use", {"addr": OPAQUE_TOKEN})
     # A known parameter holding a credential URL, then unknown parameters.
     assert "perp" in call(mcp, "account_positions", {"addr": with_password})
+    assert "perp" in call(mcp, "account_positions", {"addr": SIGNATURE})
     stray = {"endpoint": with_password, "token": OPAQUE_TOKEN, "sig": SIGNATURE}
     with pytest.raises(ToolError, match="market_prices"):
         asyncio.run(mcp.call_tool("market_prices", stray))
