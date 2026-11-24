@@ -188,7 +188,7 @@ class ClaudeRepair:
     name: str
     reset_args: bool = False
     replace_entry: bool = False
-    use_profile: bool = False
+    sai_home: str | None = None
     directory: Path | None = None
 
 
@@ -207,7 +207,9 @@ class RegistrationCheck:
 def claude_replacement_commands(entry: ClaudeRepair) -> list[str]:
     scope_and_name = shlex.join(["--scope", entry.scope, entry.name])
     profile = (
-        ' --env="SAI_HOME=${SAI_HOME:?Set SAI_HOME first}"' if entry.use_profile else ""
+        f" {shlex.quote(f'--env=SAI_HOME={entry.sai_home}')}"
+        if entry.sai_home is not None
+        else ""
     )
     commands = [
         f"claude mcp remove {scope_and_name}",
@@ -247,7 +249,7 @@ def report_different_claude_entry(
         scope,
         NAME,
         replace_entry=True,
-        use_profile="SAI_HOME" in target.env,
+        sai_home=target.env.get("SAI_HOME"),
         directory=client.scope_directory(scope),
     )
     hint = claude_repair_hint((entry,))
@@ -306,7 +308,12 @@ def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
 
 def server_env(environ: Mapping[str, str]) -> dict[str, str]:
     home = environ.get("SAI_HOME")
-    return {"SAI_HOME": os.path.abspath(os.path.expanduser(home))} if home else {}
+    return {"SAI_HOME": absolute_sai_home(home)} if home else {}
+
+
+def absolute_sai_home(home: str, directory: Path | None = None) -> str:
+    path = Path(os.path.expanduser(home))
+    return os.path.abspath(path if directory is None else directory / path)
 
 
 def server_target(
@@ -1518,13 +1525,19 @@ def check_claude_differences(
             elif expected is None:
                 manual.append("Install a stable Sai launcher on PATH.")
             else:
+                home = expected.env.get("SAI_HOME")
+                directory = client.scope_directory(reg.scope)
                 repairs.append(
                     ClaudeRepair(
                         reg.scope,
                         name,
                         replace_entry=True,
-                        use_profile="SAI_HOME" in expected.env,
-                        directory=client.scope_directory(reg.scope),
+                        sai_home=(
+                            absolute_sai_home(home, directory or client.cwd)
+                            if home is not None
+                            else None
+                        ),
+                        directory=directory,
                     )
                 )
         elif issue is None:

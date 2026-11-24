@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -481,7 +482,7 @@ def test_doctor_reports_exact_claude_repairs_for_each_scope(env: Env, monkeypatc
             f"claude mcp remove --scope {scope} sai" in command for command in commands
         )
         add = (
-            f'claude mcp add --scope {scope} sai --env="SAI_HOME=${{SAI_HOME:?Set SAI_HOME first}}"'
+            f"claude mcp add --scope {scope} sai --env=SAI_HOME={home}"
             ' -- "$(command -v sai)" mcp serve'
         )
         assert any(add in command for command in commands)
@@ -592,7 +593,9 @@ def test_doctor_compares_sai_home_without_printing_or_rewriting_it(
     assert check["status"] == status
     assert ("SAI_HOME" in check["summary"]) == (status == "warn")
     assert profiles["different"] not in result.output
-    assert profiles["current"] not in json.dumps(check)
+    assert profiles["current"] not in check["summary"]
+    if expected == "current" and status == "warn":
+        assert f"--env=SAI_HOME={profiles['current']}" in check["fix"]
     assert path.read_text() == original
 
 
@@ -1243,6 +1246,32 @@ def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.Monke
     )
 
 
+@pytest.mark.parametrize("profile", ["relative profile", "~/profile with spaces"])
+def test_claude_printed_profile_matches_normal_install(
+    env: Env, monkeypatch: pytest.MonkeyPatch, profile: str
+):
+    monkeypatch.setenv("SAI_HOME", profile)
+    config = env.home / ".claude.json"
+    config.write_text(
+        json.dumps({"mcpServers": {"sai": claude_entry(["old-launcher"])}})
+    )
+    expected_home = os.path.abspath(os.path.expanduser(profile))
+    result = invoke("mcp", "install", "claude")
+    failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    commands = row["fix"].split("`")[1::2]
+    assert any(
+        shlex.quote(f"--env=SAI_HOME={expected_home}") in cmd for cmd in commands
+    )
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    monkeypatch.delenv("SAI_HOME")
+    subprocess.run([shell, "-c", " && ".join(commands)], cwd=env.home, check=True)
+    assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": expected_home}
+    monkeypatch.setenv("SAI_HOME", profile)
+    assert actions(invoke("mcp", "install", "claude")) == {"claude": "unchanged"}
+
+
 @pytest.mark.parametrize("surface", ["install", "doctor"])
 def test_claude_local_replacement_targets_git_root(
     env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
@@ -1303,6 +1332,22 @@ def test_update_ignores_a_healthy_claude_profile_pin(env: Env, background: bool)
     )
     assert env.claude_json() == original
     assert not any(call[1] in ("add", "remove") for call in env.calls())
+
+
+def test_update_commands_keep_the_profile_of_a_stale_claude_entry(env: Env):
+    profile = env.root / "pinned profile"
+    original = {
+        "mcpServers": {
+            "sai": claude_entry(["old-launcher"], {"SAI_HOME": str(profile)})
+        }
+    }
+    (env.home / ".claude.json").write_text(json.dumps(original))
+    updated = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, True
+    )
+    notice = updater.mcp_notice(updated.mcp_results(), updated.mcp_notes)
+    assert shlex.quote(f"--env=SAI_HOME={profile}") in notice
+    assert env.claude_json() == original
 
 
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):
@@ -2119,7 +2164,8 @@ def test_codex_project_tool_filter_is_an_override(env: Env):
 def test_claude_install_reports_scoped_commands_without_credentials(
     env: Env, monkeypatch: pytest.MonkeyPatch, scope: str, output_mode: str
 ):
-    monkeypatch.setenv("SAI_HOME", str(env.root / f"profile-{SECRET}"))
+    profile = env.root / "selected profile"
+    monkeypatch.setenv("SAI_HOME", str(profile))
     command = [f"/opt/launcher-{SECRET}", "--credential", SECRET]
     entry = claude_entry(command, {"PRIVATE_TOKEN": SECRET})
     data = {"mcpServers": {"sai": entry, OTHER: {"command": "untouched"}}}
@@ -2156,7 +2202,7 @@ def test_claude_install_reports_scoped_commands_without_credentials(
     assert row["action"] == "failed"
     assert f"claude mcp remove --scope {scope} sai" in row["fix"]
     assert (
-        f'claude mcp add --scope {scope} sai --env="SAI_HOME=${{SAI_HOME:?Set SAI_HOME first}}"'
+        f"claude mcp add --scope {scope} sai {shlex.quote(f'--env=SAI_HOME={profile}')}"
         ' -- "$(command -v sai)" mcp serve'
     ) in row["fix"]
     assert "substitute your requested command" in row["fix"]

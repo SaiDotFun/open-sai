@@ -585,7 +585,11 @@ class Outcome:
                                     if repair.replace_entry
                                     else {}
                                 ),
-                                **({"useProfile": True} if repair.use_profile else {}),
+                                **(
+                                    {"saiHome": repair.sai_home}
+                                    if repair.sai_home is not None
+                                    else {}
+                                ),
                                 **(
                                     {"directory": str(repair.directory)}
                                     if repair.directory is not None
@@ -1165,7 +1169,9 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
                     repair["name"],
                     repair.get("resetArgs") is True,
                     replace_entry=repair.get("replaceEntry") is True,
-                    use_profile=repair.get("useProfile") is True,
+                    sai_home=repair["saiHome"]
+                    if isinstance(repair.get("saiHome"), str)
+                    else None,
                     directory=Path(repair["directory"])
                     if isinstance(repair.get("directory"), str)
                     else None,
