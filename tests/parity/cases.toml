@@ -526,6 +526,8 @@ mcp_profile = "reads"
 seed = "ledger"
 server = "mcp-reads"
 wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
+# The current Python checkout uses the narrower history query during reconciliation.
+mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
 
 [[case]]
 name = "mcp-argument-validation"

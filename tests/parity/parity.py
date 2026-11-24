@@ -68,6 +68,7 @@ class Case:
     mcp_profile: str = ""
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
+    mcp_checkout_wire: list[str] | None = None
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -729,6 +730,12 @@ def main() -> int:
     tools: dict[str, str] = {}
     for case in selected:
         oracle = mcp_reference if case.mode == "mcp" else reference
+        if (
+            candidate is reference
+            and oracle is reference
+            and case.mcp_checkout_wire is not None
+        ):
+            case = replace(case, wire=case.mcp_checkout_wire)
         executable = oracle if candidate is reference else candidate
         diffs, listed, expected = run_case(case, oracle, executable)
         for tool, status in listed.items():
