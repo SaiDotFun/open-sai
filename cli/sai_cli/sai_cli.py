@@ -884,7 +884,7 @@ def account_rows(endpoint: str) -> list[dict[str, Any]]:
     now = datetime.now(UTC)
     return [
         {
-            **sessions.summary(result, account_key=key),
+            **sessions.summary(result),
             "active": key == accounts["active"],
             "expired": sessions.expiry_time(result) <= now,
             "endpointMatches": result.get("endpoint") == endpoint,
@@ -2313,7 +2313,7 @@ def print_log_limit(report: dict[str, Any]) -> None:
 @click.argument("key")
 @click.option("--offline", is_flag=True, help="Read local logs only.")
 @click.option("--addr", help="EVM address to use for the Keeper lookup.")
-@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.option("--before", help="Resume from a cursor or read before a UTC timestamp.")
 @click.pass_context
 def logs_intent(
     ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None
