@@ -261,6 +261,46 @@ def test_agent_import_without_clipboard_asks_for_a_terminal(env: Env) -> None:
     assert not (env.home / "trader" / "sessions.json").exists()
 
 
+@pytest.mark.parametrize("json_output", [False, True])
+@pytest.mark.parametrize(
+    "form", ["operand", "escaped", "unknown-option", "option-value"]
+)
+def test_import_usage_omits_rejected_operands(env: Env, json_output: bool, form: str):
+    secret = "synthetic-import-credential-marker"
+    operands = {
+        "operand": (secret, make_token()),
+        "escaped": ("--", f"--{secret}"),
+        "unknown-option": (f"--{secret}",),
+        "option-value": (f"--help={secret}",),
+    }[form]
+    flags = ("--json",) if json_output else ()
+    env.clipboard()
+    result = env.run(*flags, "auth", "import", *operands)
+
+    assert result.returncode == 2
+    assert all(
+        operand not in result.stdout + result.stderr
+        for operand in operands
+        if operand != "--"
+    )
+    stored = env.stored_bytes()
+    assert secret.encode() not in stored
+    assert b"command.start" in stored and b"command.end" in stored
+    assert env.log.read_text() == ""
+    assert not (env.home / "trader" / "sessions.json").exists()
+    message = "Unexpected arguments to auth import."
+    if json_output:
+        assert result.stderr == ""
+        assert json.loads(result.stdout)["error"] == {
+            "code": "INVALID_REQUEST",
+            "message": message,
+            "retryable": False,
+        }
+    else:
+        assert result.stdout == ""
+        assert f"Error: {message}" in result.stderr
+
+
 def test_invalid_clipboard_is_not_echoed_or_cleared(env: Env) -> None:
     secret = "not-a-jwt-but-maybe-a-password"
     expired = make_token(hours=-1)

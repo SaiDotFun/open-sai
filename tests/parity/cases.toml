@@ -278,6 +278,19 @@ expect = 1
 wire = ["ws:init"]
 
 [[case]]
+name = "auth-import-rejected-operand-text"
+args = ["auth","import","synthetic-import-credential-marker"]
+mode = "text"
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
+name = "auth-import-rejected-operand-json"
+args = ["--json","auth","import","synthetic-import-credential-marker"]
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
 name = "auth-status-signed-out"
 args = ["--json","auth","status"]
 expect = 6

@@ -90,13 +90,13 @@ def session(ctx: click.Context) -> dict[str, str]:
     return sessions.load_active_session(keeper_url(ctx), ctx.obj["as_addr"])
 
 
-def command_path(group: click.Group, args: list[str]) -> list[str]:
-    """The command names in ARGS, such as ["market", "prices"], found by
-    walking GROUP's commands past options and their values."""
+def command_path(group: click.Group, args: list[str]) -> tuple[list[str], int]:
+    """Return the command names and the index where their operands begin."""
     names: list[str] = []
+    operands_at = 0
     current: click.Command = group
     skip = False
-    for token in args:
+    for index, token in enumerate(args):
         if skip:
             skip = False
             continue
@@ -117,8 +117,9 @@ def command_path(group: click.Group, args: list[str]) -> list[str]:
         if found is None:
             break
         names.append(token)
+        operands_at = index + 1
         current = found
-    return names
+    return names, operands_at
 
 
 # Options that print something and exit before any command runs.
@@ -224,6 +225,25 @@ class HelpOnMissingInput(click.Command):
             ctx.exit(ExitCode.USAGE)
 
 
+class AuthImportCommand(click.Command):
+    """Keep rejected arguments out of usage errors for token import."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        first = args[0] if args else None
+        try:
+            return super().parse_args(ctx, args)
+        except click.UsageError as exc:
+            if (
+                first == "--json"
+                and isinstance(exc, click.NoSuchOption)
+                and exc.option_name == "--json"
+            ):
+                raise
+            raise click.UsageError(
+                "Unexpected arguments to auth import.", ctx
+            ) from None
+
+
 class SaiGroup(click.Group):
     command_class = HelpOnMissingInput
     group_class = type
@@ -248,9 +268,11 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names = command_path(self, argv)
+        names, operands_at = command_path(self, argv)
         quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
+        # Import takes no operands. A rejected value can be a session token.
+        logged_argv = argv[:operands_at] if command == "auth import" else argv
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
         started = time.monotonic()
         exit_code: int = ExitCode.OK
@@ -260,7 +282,7 @@ class LoggedGroup(SaiGroup):
         def log_start() -> None:
             nonlocal start_logged
             if not quiet and not start_logged:
-                log.event("command.start", argv=log.argv(argv[:64]))
+                log.event("command.start", argv=log.argv(logged_argv[:64]))
                 start_logged = True
 
         with (
@@ -768,7 +790,7 @@ def read_token() -> str:
     return copied[0]
 
 
-@auth.command("import")
+@auth.command("import", cls=AuthImportCommand)
 @click.pass_context
 def import_token(ctx: click.Context) -> None:
     """Connect with a session token copied from Sai Web.

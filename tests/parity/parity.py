@@ -89,7 +89,8 @@ class Case:
 
     @property
     def command(self) -> str:
-        return " ".join(command_path(python_cli, self.args)) or self.args[0]
+        names, _ = command_path(python_cli, self.args)
+        return " ".join(names) or self.args[0]
 
 
 @dataclass(frozen=True)
