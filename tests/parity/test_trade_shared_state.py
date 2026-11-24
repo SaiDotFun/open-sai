@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from collections.abc import AsyncGenerator, Generator
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from keeper_wire import WireRequest
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
@@ -577,7 +579,14 @@ def test_wait_deadline_then_restart(
     reader = runtime(waiter, request, python_reference)
     action = ACTIONS["close"]
     replay = action.replay(phase="pending")
-    with loopback(action.server, trade_replay=replay) as endpoints:
+    release_wait = threading.Event()
+
+    def hold_wait(request: WireRequest, auth: str | None) -> dict[str, Any] | None:
+        if request.label == "waitUserIntents" and not release_wait.wait(10):
+            raise ValueError("Test did not release the outcome reply")
+        return replay(request, auth)
+
+    with loopback(action.server, trade_replay=hold_wait) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, writer, "close")
@@ -585,8 +594,15 @@ def test_wait_deadline_then_restart(
             pytest.skip(f"Rust intent wait awaits {REPO_URL}/pull/122")
         first = home.json(writer, "trade", *action.args)
         key = first["intentKey"]
-        wait = ("intent", "wait", key, "--timeout", "1")
-        timed_out = home.json(reader, *wait, code=5)
+        pending = home.json(reader, "intent", "status", ADDRESS, "--key", key)
+        assert pending["localStatus"] == "pending"
+        home.row(key, action.kind, action.entity, "pending")
+        try:
+            timed_out = home.json(
+                reader, "intent", "wait", key, "--timeout", "1", code=5
+            )
+        finally:
+            release_wait.set()
         assert timed_out["intentKey"] == key and timed_out["outcome"] == "unknown"
         assert timed_out["receipt"]["execution"] is None
         home.local(writer, key, action.kind, "pending")
