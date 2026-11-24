@@ -355,11 +355,7 @@ fn config_check(flags: &Flags, env: &Environment) -> (Check, Option<Settings>, b
 fn install_info() -> (Check, Value, bool) {
     let start = Instant::now();
     let executable = env::current_exe().unwrap_or_else(|_| PathBuf::from("sai"));
-    let checkout = executable.ancestors().skip(1).find(|path| {
-        path.join("Cargo.toml").is_file()
-            && path.join("pyproject.toml").is_file()
-            && path.join("sai/src/main.rs").is_file()
-    });
+    let checkout = mcp::checkout_root(&executable);
     let provenance = if let Some(root) = checkout {
         json!({"kind": "source-checkout", "path": root, "git": mcp::checkout_state(root)})
     } else {

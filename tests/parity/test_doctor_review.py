@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -157,3 +158,45 @@ def test_doctor_restores_codex_config_when_verification_fails(
     assert json.loads(cursor.read_text())["mcpServers"]["sai"]["command"] == str(
         tmp_path / "bin/sai"
     )
+
+
+@pytest.mark.parametrize("registered", [True, False])
+def test_doctor_prefers_the_running_install_over_path_shadow(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str], registered: bool
+) -> None:
+    stable = tmp_path / ".local/bin/sai"
+    stable.parent.mkdir(parents=True)
+    installed = stable.with_name("sai-release")
+    shutil.copy2(candidate, installed)
+    if registered:
+        stable.symlink_to(installed.name)
+    shadow = tmp_path / "shadow/sai"
+    write(shadow, "#!/bin/sh\nexit 77\n", 0o755)
+    fixture_env["PATH"] = f"{shadow.parent}:{stable.parent}:{os.defpath}"
+    config = tmp_path / ".cursor/mcp.json"
+    write(
+        config,
+        json.dumps(
+            {
+                "mcpServers": {
+                    "sai": {
+                        "command": str(tmp_path / "removed/sai"),
+                        "args": ["mcp", "serve"],
+                        "env": {"SAI_HOME": fixture_env["SAI_HOME"]},
+                    }
+                }
+            }
+        ),
+    )
+    before = config.read_bytes()
+    result = invoke(str(installed), tmp_path, fixture_env, "doctor", "--offline")
+    cursor = checks(result)["mcp.cursor"]
+    if registered:
+        assert cursor["status"] == "fixed"
+        assert json.loads(config.read_text())["mcpServers"]["sai"]["command"] == str(
+            stable
+        )
+    else:
+        assert cursor["status"] == "fail"
+        assert cursor["fix"] == "Install a stable Sai launcher on PATH"
+        assert config.read_bytes() == before

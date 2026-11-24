@@ -325,6 +325,52 @@ fn reported_target(override_argv: Vec<String>, home: &Path) -> ClientResult<Targ
     Ok(target)
 }
 
+fn doctor_target(home: &Path) -> Option<Target> {
+    use std::os::unix::fs::MetadataExt;
+
+    let executable = env::current_exe().ok()?;
+    if in_uv_cache(&executable, home) {
+        return None;
+    }
+    if checkout_root(&executable).is_some() {
+        // Python's source checkouts also use the developer's PATH.
+        return server_target(Vec::new(), home).ok();
+    }
+    #[cfg(target_os = "linux")]
+    let running = std::fs::metadata("/proc/self/exe").ok()?;
+    #[cfg(not(target_os = "linux"))]
+    let running = executable.metadata().ok()?;
+
+    let path = env::var_os("PATH").unwrap_or_default();
+    let launchers = std::iter::once(home.join(".local/bin/sai"))
+        .chain(env::split_paths(&path).map(|dir| absolute(&dir).join("sai")));
+    let launcher = launchers.into_iter().find(|launcher| {
+        launcher.is_absolute()
+            && !in_uv_cache(launcher, home)
+            && launcher.to_str().and_then(which).is_some()
+            && launcher
+                .metadata()
+                .is_ok_and(|meta| meta.dev() == running.dev() && meta.ino() == running.ino())
+    })?;
+    Some(Target {
+        argv: vec![
+            launcher.into_os_string().into_string().ok()?,
+            "mcp".into(),
+            "serve".into(),
+        ],
+        profile: profile(home),
+        explicit: false,
+    })
+}
+
+pub(crate) fn checkout_root(executable: &Path) -> Option<&Path> {
+    executable.ancestors().skip(1).find(|path| {
+        path.join("Cargo.toml").is_file()
+            && path.join("pyproject.toml").is_file()
+            && path.join("sai/src/main.rs").is_file()
+    })
+}
+
 struct Clients {
     home: PathBuf,
     cwd: PathBuf,
@@ -578,7 +624,7 @@ pub(crate) fn check_registrations(
     timeout: Duration,
 ) -> ClientResult<Vec<RegistrationCheck>> {
     let clients = Clients::open()?;
-    let target = server_target(Vec::new(), &clients.home).ok();
+    let target = doctor_target(&clients.home);
     let deadline = Instant::now() + timeout;
     Ok(CLIENTS
         .into_iter()
