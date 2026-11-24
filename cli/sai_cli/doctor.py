@@ -714,6 +714,7 @@ def check_session(ctx: Context) -> Check:
             {"signedIn": False},
         )
     addr = state["addr"]
+    guidance = state.get("renewalGuidance")
     details = {
         "addr": addr,
         "expiresAt": state["expiresAt"],
@@ -721,11 +722,12 @@ def check_session(ctx: Context) -> Check:
         "endpointMatches": state["endpointMatches"],
     }
     if state["expired"]:
+        summary = f"Session for {short(addr)} expired at {state['expiresAt']}"
         return Check(
             "session",
             "fail",
-            f"Session for {short(addr)} expired at {state['expiresAt']}",
-            state.get("renewalCommand", SIGN_IN),
+            f"{summary}. {guidance}" if guidance else summary,
+            state.get("renewalCommand", None if guidance else SIGN_IN),
             details,
         )
     if not state["endpointMatches"]:
@@ -754,8 +756,8 @@ def check_session(ctx: Context) -> Check:
         return Check(
             "session",
             "warn",
-            warning,
-            state["renewalCommand"],
+            f"{warning} {guidance}" if guidance else warning,
+            state.get("renewalCommand"),
             details,
         )
     return Check(
