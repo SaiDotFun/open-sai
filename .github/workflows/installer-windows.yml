@@ -1,0 +1,65 @@
+name: Installer Rehearsal (Windows)
+
+on:
+  pull_request:
+    paths:
+      - 'cli/sai_cli/core/**'
+      - 'scripts/install.py'
+      - 'shim/**'
+      - 'tests/parity/test_installer_bridge.py'
+      - '.github/workflows/installer-windows.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  pre-bridge:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the shim before PR #116 lands
+        if: hashFiles('shim/pyproject.toml') == ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: SaiDotFun/open-sai
+          ref: 4bd968eb956c154f0a0ab53ccc288ceb78dd8713
+          path: .installer-dist
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+      - name: Build the three local replay wheels
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $artifacts = Join-Path $env:RUNNER_TEMP 'sai-installer'
+          $baseline = Join-Path $artifacts 'pre-bridge'
+          $bridge = Join-Path $artifacts 'bridge'
+          $shim = Join-Path $artifacts 'shim'
+          $source = Join-Path $artifacts 'shim-src'
+          New-Item -ItemType Directory -Path $artifacts
+          $ref = '8557a7e13dceab0accc369191182c8e01423c91b'
+          git worktree add --detach (Join-Path $artifacts 'baseline-src') $ref
+          uv build --wheel (Join-Path $artifacts 'baseline-src') --out-dir $baseline
+          Copy-Item (Join-Path $artifacts 'baseline-src/scripts/install.py') $baseline
+          Set-Content -Path (Join-Path $baseline 'commit') -Value $ref -Encoding utf8NoBOM
+          uv build --wheel --out-dir $bridge
+          if (Test-Path 'shim/pyproject.toml') {
+            Copy-Item -Recurse 'shim' $source
+          } else {
+            Copy-Item -Recurse '.installer-dist/shim' $source
+          }
+          $project = Join-Path $source 'pyproject.toml'
+          (Get-Content -Raw $project) -replace '(?m)^version = ".*"$', 'version = "0.2.0"' |
+            Set-Content -Path $project -Encoding utf8NoBOM
+          uv build --wheel $source --out-dir $shim
+          "SAI_C10B_PRE_BRIDGE=$baseline" >> $env:GITHUB_ENV
+          "SAI_C10B_BRIDGE=$((Get-ChildItem $bridge -Filter *.whl).FullName)" >> $env:GITHUB_ENV
+          "SAI_C10B_SHIM=$((Get-ChildItem $shim -Filter *.whl).FullName)" >> $env:GITHUB_ENV
+      - name: Rehearse both Python updaters against the shim
+        run: uv run --locked pytest tests/parity/test_installer_bridge.py -k windows
