@@ -94,7 +94,10 @@ async fn probe_version(path: &Path) -> Option<String> {
     if !child.wait().await.ok()?.success() {
         return None;
     }
-    let version = output.trim().strip_prefix("sai ")?;
+    let output = output.trim();
+    let version = output
+        .strip_prefix("sai ")
+        .or_else(|| output.strip_prefix("sai, version "))?;
     is_version(version).then(|| version.to_owned())
 }
 

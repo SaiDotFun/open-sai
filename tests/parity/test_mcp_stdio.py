@@ -277,8 +277,9 @@ def test_audit_boolean_coercion(native: Path, tmp_path: Path, offline: object) -
 
 
 @pytest.mark.parametrize("symlink", [False, True], ids=["binary", "symlink"])
+@pytest.mark.parametrize("banner", ["sai", "sai, version"], ids=["native", "python"])
 def test_info_observes_launcher_replacement(
-    native: Path, tmp_path: Path, symlink: bool
+    native: Path, tmp_path: Path, symlink: bool, banner: str
 ) -> None:
     launcher = tmp_path / "sai"
     if symlink:
@@ -294,7 +295,7 @@ def test_info_observes_launcher_replacement(
         assert before["restartNeeded"] is False
 
         replacement = tmp_path / "replacement"
-        replacement.write_text("#!/bin/sh\nprintf 'sai 99.1.2\\n'\n")
+        replacement.write_text(f"#!/bin/sh\nprintf '{banner} 99.1.2\\n'\n")
         replacement.chmod(0o700)
         replacement.replace(launcher)
 
