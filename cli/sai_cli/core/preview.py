@@ -89,6 +89,31 @@ def liquidation(
         }
 
 
+def minimum_fee_usd(schedule: dict[str, Any]) -> int:
+    """Floor Perp's USD minimum fee to base units."""
+    minimum = int(schedule["min_position_size_usd"])
+    if minimum < 0:
+        raise ValueError("Invalid minimum position size")
+    opening = margin.contract_decimal(schedule["open_fee_p"])
+    trigger = margin.contract_decimal(schedule["trigger_order_fee_p"])
+    return int(minimum * (2 * opening + trigger))
+
+
+def leverage_allowed(
+    market: dict[str, Any], requested: Decimal, current: Decimal | None = None
+) -> bool:
+    """Check the market's quoted group minimum and effective pair maximum."""
+    minimum = Decimal(str(market["minLeverage"]))
+    maximum = Decimal(str(market["maxLeverage"]))
+    if not (minimum.is_finite() and maximum.is_finite() and 0 < minimum <= maximum):
+        raise ValueError("Market leverage limits are unavailable")
+    return (
+        requested != current
+        and requested <= maximum
+        and (requested >= minimum or (current is not None and requested > current))
+    )
+
+
 def base_fees(
     row: dict[str, Any],
     collateral_price: dict[str, Any],
@@ -104,11 +129,11 @@ def base_fees(
         open_rate = margin.contract_decimal(row["open_fee_p"])
         close_rate = margin.contract_decimal(row["close_fee_p"])
         trigger_rate = margin.contract_decimal(row["trigger_order_fee_p"])
-        minimum_usd = int(row["min_position_size_usd"])
-        if minimum_usd < 0 or notional <= 0:
+        if notional <= 0:
             raise ValueError("Invalid fee basis")
-        minimum_fee = int(minimum_usd * (2 * open_rate + trigger_rate))
-        basis = max(notional, int(minimum_fee / Decimal(collateral_price["price"])))
+        basis = max(
+            notional, int(minimum_fee_usd(row) / Decimal(collateral_price["price"]))
+        )
         fee = int(basis * (open_rate if opening else close_rate))
         if triggered:
             fee += int(basis * trigger_rate)
@@ -220,10 +245,29 @@ def open_estimates(
             collateral_price = read_collateral_price(lcd, contract, token)
             collateral = int(Decimal(body["amountUsd"]).scaleb(6))
             leverage = Decimal(body["leverage"])
+            notional = _notional(collateral, leverage)
+            with localcontext() as context:
+                context.prec = 90
+                # Trade.validate floors USD notional before dividing by leverage.
+                collateral_value = int(
+                    int(notional * Decimal(collateral_price["price"])) / leverage
+                )
+                allowed = leverage_allowed(
+                    row, leverage
+                ) and collateral_value >= 5 * minimum_fee_usd(schedule)
+            if not allowed:
+                outside = unavailable(
+                    "The open request is outside the market's collateral or leverage limits."
+                )
+                return {
+                    "fees": outside,
+                    "liquidationPrice": outside,
+                    "worstCaseFill": fill,
+                }
             fee, fees = base_fees(
                 schedule,
                 collateral_price,
-                _notional(collateral, leverage),
+                notional,
                 opening=True,
                 triggered=order_type != "market",
             )
@@ -395,11 +439,13 @@ def close_estimates(
 
 
 def position_estimates(
+    lcd: str,
     state: margin.PositionSnapshot | None,
     effective: Decimal | None,
     *,
     target: Decimal | None = None,
     updates_triggers: bool = False,
+    height: str | None = None,
 ) -> dict[str, Any]:
     """Quote leverage or TP/SL changes after checking the after-hours guard."""
     unknown = unavailable("Cannot verify that the Perp after-hours guard is inactive.")
@@ -428,6 +474,17 @@ def position_estimates(
                 "reason": "This action changes only TP/SL triggers.",
             }
         elif target is not None and type(raw.get("long")) is bool:
+            outside = unavailable(
+                "The leverage request is outside the market's collateral or leverage limits."
+            )
+            if not leverage_allowed(state.market, target, current=effective):
+                result["liquidationPrice"] = outside
+                return result
+            pair = contract_market(
+                lcd, state.contract, raw["market_index"], height=height
+            )
+            schedule = fee_schedule(lcd, state.contract, pair, height=height)
+            open_rate = margin.contract_decimal(schedule["open_fee_p"])
             entry = price_input(
                 intents.positive(raw["open_price"], "Entry price"),
                 "Sai Perp stored entry price",
@@ -435,7 +492,12 @@ def position_estimates(
             )
             with localcontext() as context:
                 context.prec = 90
-                collateral = int(int(raw["collateral_amount"]) * effective / target)
+                before = int(raw["collateral_amount"])
+                collateral = int(before * effective / target)
+                minimum = int(_notional(before, effective) * open_rate)
+            if collateral <= minimum:
+                result["liquidationPrice"] = outside
+                return result
             liq = liquidation(entry, raw["long"], collateral, target)
             if liq["status"] == "estimate":
                 liq["assumption"] = (

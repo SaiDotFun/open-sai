@@ -155,7 +155,8 @@ The `observedAt` field gives the UTC time the CLI or MCP server read a
 price. Oracle publication can predate that read. User-supplied references
 and triggers have no observation timestamp.
 
-Show `unavailable` when a required input is missing. An `unbounded` fill has
+Show `unavailable` when a required input is missing or quoted collateral or
+leverage falls outside market limits. An `unbounded` fill has
 no advance price limit. A full close leaves no liquidation price. When the after-hours guard is inactive,
 TP/SL changes leave the liquidation price unchanged, and margin and leverage
 updates have no fill price. With an active or unverified guard, the preview

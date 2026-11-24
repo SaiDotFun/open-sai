@@ -337,7 +337,7 @@ def _estimate_position(
     target: Decimal | None = None,
     updates_triggers: bool = False,
 ) -> dict[str, Any]:
-    state, effective = None, None
+    state, effective, height = None, None, None
     if lcd is not None:
         try:
             addr = get_session()["evmAddress"]
@@ -352,7 +352,12 @@ def _estimate_position(
     if target is None and not updates_triggers:
         return estimates.close_estimates(lcd or "", state, trade_id, None)
     return estimates.position_estimates(
-        state, effective, target=target, updates_triggers=updates_triggers
+        lcd or "",
+        state,
+        effective,
+        target=target,
+        updates_triggers=updates_triggers,
+        height=height,
     )
 
 
@@ -447,6 +452,7 @@ def change_margin(
         before_submit=before_submit,
         changed_message="Position changed; review the margin change again",
         estimate=lambda state, inputs, fresh: estimates.position_estimates(
+            lcd_endpoint,
             state,
             _quoted_leverage(inputs),
             target=Decimal(fresh["quote"]["requestedLeverage"]),

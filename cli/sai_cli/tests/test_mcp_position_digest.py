@@ -55,6 +55,7 @@ class Position:
     cap_query_heights: list[str | None] = field(default_factory=list)
     collateral_price: str | None = "1"
     close_fee: str = "0.002"
+    minimum_position_microusd: str = "1"
     preview_inputs: bool = False
     malformed_node_info: bool = False
     price: float | str = 100.5
@@ -267,7 +268,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                         "open_fee_p": "0.001",
                         "close_fee_p": position.close_fee,
                         "trigger_order_fee_p": "0.003",
-                        "min_position_size_usd": "1",
+                        "min_position_size_usd": position.minimum_position_microusd,
                     }
                     if position.preview_inputs
                     else None
@@ -867,7 +868,7 @@ def test_cli_preview_text_and_json_use_the_order_trigger(
 
     result = runner.invoke(main, ["--json", *args])
     assert result.exit_code == 0, result.output
-    preview = json.loads(result.output)
+    preview = json.loads(result.stdout)
     assert preview["addr"] is None
     estimates = preview["estimates"]
     assert estimates["worstCaseFill"] == {
@@ -1345,5 +1346,56 @@ def test_close_liquidation_respects_perp_oracle_ttl(position_service, age, execu
                     assert result["execution"]["code"] == "OraclePriceStale"
                     assert result["fees"]["status"] == "unavailable"
                     assert "amountUsdc" not in result["fees"]
+
+    asyncio.run(scenario())
+
+
+def test_open_liquidation_preview_requires_perps_minimum_collateral(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.minimum_position_microusd = "100000000"
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "limit",
+        "price": "100",
+        "amount": "1",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, "preview_open", args)
+            liq = quote["estimates"]["liquidationPrice"]
+            assert liq["status"] == "unavailable"
+            assert "outside" in liq["reason"]
+            assert "price" not in liq
+            boundary = await call(client, "preview_open", {**args, "amount": "2.5"})
+            assert boundary["estimates"]["liquidationPrice"]["status"] == "estimate"
+
+    asyncio.run(scenario())
+
+
+def test_leverage_liquidation_preview_requires_market_leverage_cap(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.leverage = "20"
+    position.collateral = 100_000_000
+    position.max_leverage = 50
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client, "preview_leverage", {"trade_id": 7, "leverage": "100"}
+            )
+            liq = quote["estimates"]["liquidationPrice"]
+            assert liq["status"] == "unavailable"
+            assert "outside" in liq["reason"]
+            assert "price" not in liq
+            boundary = await call(
+                client, "preview_leverage", {"trade_id": 7, "leverage": "50"}
+            )
+            assert boundary["estimates"]["liquidationPrice"]["status"] == "estimate"
 
     asyncio.run(scenario())
