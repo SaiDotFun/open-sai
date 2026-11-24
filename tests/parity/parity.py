@@ -18,7 +18,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -83,10 +83,21 @@ class Case:
     output: dict[str, Any] | None = None
     retry_expect: int | None = None
     mcp_calls: list[dict[str, Any]] | None = None
+    rust: dict[str, Any] | None = None
+    accepted_difference: str | None = None
 
     @property
     def command(self) -> str:
         return " ".join(command_path(python_cli, self.args)) or self.args[0]
+
+    def rust_case(self) -> Case:
+        wire = list(self.wire or [])
+        if self.name.startswith(("trade-margin", "trade-partial-close")):
+            # Rust checks the position owner before its first LCD request.
+            for index in range(len(wire) - 2):
+                if wire[index : index + 3] == ["oneClickTrading", "node_info", "trade"]:
+                    wire[index + 1 : index + 3] = ["trade", "node_info"]
+        return replace(self, **{"wire": wire, **(self.rust or {})})
 
 
 @dataclass(frozen=True)
@@ -427,6 +438,8 @@ def safe_observe(
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
 ) -> tuple[list[str], dict[str, str]]:
+    rust = candidate is not reference
+    candidate_case = case.rust_case() if rust else case
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server) as endpoints,
@@ -435,7 +448,7 @@ def run_case(
             case, reference, Path(temp) / "reference", endpoints
         )
         right, right_error = safe_observe(
-            case, candidate, Path(temp) / "candidate", endpoints
+            candidate_case, candidate, Path(temp) / "candidate", endpoints
         )
     tools = {}
     inventory_case = case.mode == "mcp" and case.mcp_calls is None
@@ -459,7 +472,16 @@ def run_case(
             for side, error in (("reference", left_error), ("candidate", right_error))
             if error
         ], tools
-    diffs = differences(left, right)
+    if rust and case.accepted_difference:
+        diffs = []
+        if right.exit_code != candidate_case.expect:
+            diffs.append(
+                f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
+            )
+        if left.stderr != right.stderr:
+            diffs.append("stderr differs")
+    else:
+        diffs = differences(left, right)
     if left.exit_code != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
@@ -551,10 +573,11 @@ def main() -> int:
         diffs, listed = run_case(case, reference, candidate)
         tools.update(listed)
         mismatches += bool(diffs)
+        accepted = case.accepted_difference if candidate is not reference else None
         row(
             f"`sai {shlex.join(case.args)}` ({case.name})",
-            "DIFF" if diffs else "PASS",
-            ", ".join(diffs),
+            "DIFF" if diffs else "ACCEPTED" if accepted else "PASS",
+            ", ".join(diffs) if diffs else accepted or "",
         )
     if not args.case:
         for name, reason in sorted(deferred.items()):

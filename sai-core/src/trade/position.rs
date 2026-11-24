@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     errors::{Code, SaiError},
-    keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, truthy},
+    keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, canonical_account, truthy},
 };
 
 use super::{Confirmation, SubmitOptions, TradePreview, Trading, actions::id};
@@ -183,8 +183,7 @@ impl Trading<'_> {
     ) -> Result<Snapshot, SaiError> {
         let route = self.position_request(ROUTE, Map::new()).await?;
         let route = field(&route, "oneClickTrading")?;
-        let network = lcd.network().await?;
-        if !truthy(field(route, "enabled")?) || &network != field(route, "chainId")? {
+        if !truthy(field(route, "enabled")?) {
             return Err(invalid("Keeper trading route and LCD network do not match"));
         }
         let position = self
@@ -199,6 +198,16 @@ impl Trading<'_> {
             || field(position, "tradeType")? != "trade"
         {
             return Err(invalid("Open position not found"));
+        }
+        let trader = text_field(position, "trader")?;
+        if canonical_account(trader)
+            .zip(canonical_account(addr))
+            .is_none_or(|(trader, account)| trader != account)
+        {
+            return Err(invalid("Keeper position belongs to a different account"));
+        }
+        if &lcd.network().await? != field(route, "chainId")? {
+            return Err(invalid("Keeper trading route and LCD network do not match"));
         }
         let borrowing = field(position, "perpBorrowing")?;
         let collateral = field(borrowing, "collateralToken")?;
@@ -225,7 +234,6 @@ impl Trading<'_> {
             return Err(invalid("Open market data is unavailable"));
         }
         let contract = text_field(route, "contractAddress")?;
-        let trader = text_field(position, "trader")?;
         let token = format!("TokenIndex({token_id})");
         let (raw, _) = lcd
             .position(contract, trader, trade_id, Read::Snapshot)

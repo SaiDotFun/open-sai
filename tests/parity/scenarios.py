@@ -40,6 +40,7 @@ POSITION_SCENARIOS = {
     "position-after-hours",
     "position-index-lag",
     "position-wrong-chain",
+    "position-foreign-trader",
     "position-no-oracle",
     "position-wrong-height",
     "partial-preview-changed",
@@ -204,7 +205,12 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     market = {**recorded_markets[0], "marketId": borrowing["marketId"]}
     recorded_markets.append(market)
     collateral = market["collateralToken"]
-    trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
+    trader = OTHER_ADDRESS if scenario == "position-foreign-trader" else ADDRESS.upper()
+    trade = {
+        **position,
+        "trader": trader,
+        "perpBorrowing": {**borrowing, "collateralToken": collateral},
+    }
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
     history = {
         "id": 7,
@@ -254,7 +260,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     token_index = f"TokenIndex({collateral['id']})"
     contracts = {
         "get_trade_raw": {
-            "user": position["trader"],
+            "user": trader,
             "user_trade_index": "UserTradeIndex(7)",
             "market_index": market_index,
             "collateral_index": token_index,
@@ -286,16 +292,16 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             get_after_hours_leverage="1.234567890123456789",
         )
     contract_args = {
-        "get_trade_raw": {"trader": position["trader"], "index": 7},
+        "get_trade_raw": {"trader": trader, "index": 7},
         "get_exchange_balance": {
-            "user": position["trader"],
+            "user": trader,
             "collateral_index": token_index,
         },
         "is_after_hours_market": {"market_index": market_index},
         "get_collateral_price": {"collateral_index": token_index},
         "get_market": {"index": market_index},
         "get_trade_infos": {
-            "trader": position["trader"],
+            "trader": trader,
             "start_idx": 7,
             "scan_limit": 1,
         },
@@ -307,6 +313,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "margin-accepted": MARGIN_INTENT,
         "margin-rejected": MARGIN_INTENT,
         "margin-unknown": MARGIN_INTENT,
+        "position-foreign-trader": MARGIN_INTENT,
         "partial-accepted": PARTIAL_INTENT,
         "partial-unknown": PARTIAL_INTENT,
     }.get(scenario)

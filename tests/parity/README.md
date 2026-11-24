@@ -35,6 +35,8 @@ differs or fails its expectations.
 `PASS` means the selected invocation or MCP tool call matched. `LISTED`
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command that needs another fixture.
+`ACCEPTED` means each implementation met its recorded expectations for an
+intentional difference.
 
 ## Add a Case
 
@@ -86,6 +88,11 @@ from [PR 58](https://github.com/SaiDotFun/open-sai/pull/58). The cases pin
 decimal strings and the digest bytes returned by the MCP previews. The
 ambiguous-ack cases retry in the same home and require one Keeper mutation
 and one unresolved ledger row.
+
+Rust verifies that the Keeper trader belongs to the active account before
+contacting the LCD. The runner asserts the request order on each side. The
+foreign-trader cases record Python's existing behavior and require Rust to
+refuse with zero LCD calls, zero submissions, and no ledger.
 
 ```sh
 SAI_PARITY_PYTHON=/path/to/pinned/.venv/bin/sai \
