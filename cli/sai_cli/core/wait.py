@@ -24,6 +24,7 @@ MAX_DELAY = 2.0
 OUTCOME_CODES = {
     "unknown": Code.OUTCOME_UNKNOWN,
     "rejected": Code.ADMISSION_REJECTED,
+    "not_sent": Code.NOT_SENT,
     "failed": Code.KEEPER_ERROR,
 }
 Outcome = Literal[
@@ -32,10 +33,18 @@ Outcome = Literal[
     "succeeded",
     "failed",
     "rejected",
+    "not_sent",
     "absent",
     "terminal",
     "unknown",
 ]
+
+RECORDED_OUTCOMES: dict[str, Outcome] = {
+    "terminal": "terminal",
+    "absent": "absent",
+    "rejected": "rejected",
+    "not_sent": "not_sent",
+}
 
 
 @dataclass(frozen=True)
@@ -65,9 +74,34 @@ def for_intent(
     clock: Clock = Clock(),
 ) -> dict[str, Any]:
     """Run the CLI wait with the same polling logic as MCP."""
-    return asyncio.run(
-        for_intent_async(endpoint, addr, key, timeout=timeout, clock=clock)
-    )
+    try:
+        return asyncio.run(
+            for_intent_async(endpoint, addr, key, timeout=timeout, clock=clock)
+        )
+    except KeyboardInterrupt:
+        try:
+            recorded = _recorded_outcome(endpoint, addr, key)
+        except (sqlite3.Error, OSError, ValueError):
+            recorded = None
+        return {
+            **_result(key, addr, recorded or "unknown", {}, [], None, None),
+            "interrupted": True,
+            "hint": storage.intent_status_hint(endpoint, addr, key),
+        }
+
+
+def _recorded_outcome(endpoint: str, addr: str, key: str) -> Outcome | None:
+    """Read a definitive disposition without waiting on a locked ledger."""
+    with storage.busy_timeout(0):
+        try:
+            local = storage.intent_record(endpoint, key)
+        except sqlite3.OperationalError as exc:
+            if not ledger_busy(exc):
+                raise
+            return None
+    if local is not None and local[0] == keeper.canonical_account(addr):
+        return RECORDED_OUTCOMES.get(local[1])
+    return None
 
 
 async def for_intent_async(
@@ -270,6 +304,8 @@ def _result(
         result.update(keeperErrorCode=row.get("errorCode"), message=row.get("errorMsg"))
     if outcome == "rejected":
         result["message"] = "Keeper rejected admission for this intent."
+    if outcome == "not_sent":
+        result["message"] = "The local ledger recorded that the intent was not sent."
     if outcome == "terminal":
         result["message"] = (
             "The local ledger recorded a final outcome. Its execution details are unavailable."

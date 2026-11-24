@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
+import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -39,6 +43,8 @@ OTHER_NIBI_ADDR = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 
 @dataclass
 class SlowBody:
+    response: str = "filled"
+    hold: bool = False
     started: threading.Event = field(default_factory=threading.Event)
     release: threading.Event = field(default_factory=threading.Event)
     finished: threading.Event = field(default_factory=threading.Event)
@@ -67,7 +73,7 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
             replay = replies.popleft()
             slow = replay if isinstance(replay, SlowBody) else None
             if isinstance(replay, SlowBody):
-                replay = "filled"
+                replay = replay.response
             if request["query"] == keeper.SUBMIT:
                 active_key = request["variables"]["input"]["intentKey"]
             if replay == "drop_ack":
@@ -132,6 +138,8 @@ def keeper_replay() -> Iterator[tuple[str, deque[Reply]]]:
             slow.started.set()
             try:
                 with suppress(BrokenPipeError, ConnectionResetError):
+                    if slow.hold:
+                        slow.release.wait(10)
                     chunk = max(1, len(body) // 8)
                     for start in range(0, len(body), chunk):
                         slow.release.wait(0.08)
@@ -676,6 +684,93 @@ def test_cli_retry_with_wait_reports_acknowledged_open_key(keeper_replay):
     allowed = runner.invoke(main, [*args, "--allow-concurrent-open"])
     assert allowed.exit_code == 0, allowed.output
     assert json.loads(allowed.output)["intentKey"] != key
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX subprocess signals")
+@pytest.mark.parametrize(
+    ("admission", "before_interrupt", "held_response", "outcome", "exit_code"),
+    [
+        ("admission_ack", ["filled"], "filled_history", "terminal", 1),
+        ("drop_ack", [], "accepted", "unknown", 5),
+    ],
+)
+def test_sigint_during_trade_wait_preserves_original_key(
+    keeper_replay, admission, before_interrupt, held_response, outcome, exit_code
+):
+    endpoint, replies = keeper_replay
+    storage.save_session(
+        {
+            "token": "fake-token",
+            "evmAddress": ADDR,
+            "endpoint": endpoint,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
+    market = {
+        "data": {
+            "perp": {
+                "borrowings": [
+                    {
+                        "marketId": 0,
+                        "collateralToken": {"symbol": "USDC"},
+                        "isOpen": True,
+                        "price": 100,
+                    }
+                ]
+            }
+        }
+    }
+    slow = SlowBody(response=held_response, hold=True)
+    replies.extend((market, admission, *before_interrupt, slow))
+    command = [
+        sys.executable,
+        "-c",
+        "from sai_cli.sai_cli import main; main()",
+        "--endpoint",
+        endpoint,
+        "--json",
+        "trade",
+        "open",
+        "--market",
+        "0",
+        "--side",
+        "long",
+        "--type",
+        "market",
+        "--amount",
+        "10",
+        "--leverage",
+        "2",
+        "--slippage",
+        "1",
+        "--wait",
+    ]
+    with subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    ) as process:
+        try:
+            assert slow.started.wait(5)
+            [entry] = storage.list_pending(endpoint, ADDR)
+            assert entry["status"] == outcome
+            process.send_signal(signal.SIGINT)
+            stdout, stderr = process.communicate(timeout=5)
+        finally:
+            slow.release.set()
+            if process.poll() is None:
+                process.kill()
+    assert process.returncode == exit_code, (stdout, stderr)
+    result = json.loads(stdout)
+    assert result["interrupted"] is True
+    assert result["outcome"] == outcome
+    assert result["error"]["intentKey"] == result["intentKey"] == entry["intentKey"]
+    assert result["error"]["hint"] == storage.intent_status_hint(
+        endpoint, ADDR, entry["intentKey"]
+    )
+    if outcome == "unknown":
+        assert result["error"]["code"] == "OUTCOME_UNKNOWN"
 
 
 def fill_history() -> dict:

@@ -912,7 +912,7 @@ def wait_option(action: Callable[..., None]) -> Callable[..., None]:
 def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
     exit_code = ExitCode.OK
-    if outcome == "unknown":
+    if outcome == "unknown" and not result.get("interrupted"):
         result["hint"] = storage.keeper_command_hint(
             keeper_url(ctx),
             "intent",
