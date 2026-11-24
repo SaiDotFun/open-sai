@@ -35,6 +35,8 @@ DOWNLOAD_HOSTS = {
 MANIFEST_LIMIT = 64 * 1024
 ARCHIVE_LIMIT = 64 * 1024 * 1024
 BINARY_LIMIT = 96 * 1024 * 1024
+# POSIX pax -x ustar permits physical records of up to 63 logical blocks.
+USTAR_RECORD_LIMIT = 63 * tarfile.BLOCKSIZE
 CHUNK = 128 * 1024
 SHA256 = re.compile(r"[0-9a-f]{64}")
 VERSION = re.compile(
@@ -180,11 +182,16 @@ def unpack(archive: BinaryIO, output: BinaryIO) -> str:
             output.write(chunk)
             digest.update(chunk)
             remaining -= len(chunk)
-        # Account for the file's padding and the two required end blocks.
-        # A second member or an extended header would have nonzero bytes.
-        padding = source.read(tarfile.RECORDSIZE + 1)
+        # The member alignment and two end blocks can cross a record boundary.
+        # After the end blocks, up to one record minus one block may remain.
         minimum = -member.size % tarfile.BLOCKSIZE + 2 * tarfile.BLOCKSIZE
-        if not minimum <= len(padding) <= tarfile.RECORDSIZE or any(padding):
+        limit = minimum + USTAR_RECORD_LIMIT - tarfile.BLOCKSIZE
+        padding = source.read(limit + 1)
+        if (
+            not minimum <= len(padding) <= limit
+            or (len(padding) - minimum) % tarfile.BLOCKSIZE
+            or any(padding)
+        ):
             raise ShimError("The native archive contains extra data after sai")
     return digest.hexdigest()
 
