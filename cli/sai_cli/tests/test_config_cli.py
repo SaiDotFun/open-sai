@@ -315,6 +315,42 @@ def test_malformed_command_endpoint_is_a_usage_error(args, key):
     assert result.stderr == ""
 
 
+@pytest.mark.parametrize(
+    ("args", "key"),
+    [
+        (("watch", "price", "1", "--ws-endpoint", ""), "keeper.ws_endpoint"),
+        (
+            (
+                "trade",
+                "partial-close",
+                "7",
+                "--percent",
+                "10",
+                "--dry-run",
+                "--lcd-endpoint",
+                "",
+            ),
+            "lcd.endpoint",
+        ),
+        (
+            ("doctor", "--offline", "--no-fix", "--ws-endpoint", ""),
+            "keeper.ws_endpoint",
+        ),
+        (("doctor", "--offline", "--no-fix", "--lcd-endpoint", ""), "lcd.endpoint"),
+    ],
+)
+def test_explicitly_empty_subcommand_endpoint_is_a_usage_error(monkeypatch, args, key):
+    # A fallback to the configured WebSocket is refused before it connects.
+    monkeypatch.setenv("SAI_WS_ENDPOINT", "ws://keeper.example/query")
+    result = sai("--json", *args)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert result.stderr == ""
+
+
 def test_commands_use_the_configured_endpoint():
     """A Keeper endpoint set in the file is the one queries go to."""
     sai("config", "set", "keeper.endpoint", DEAD)

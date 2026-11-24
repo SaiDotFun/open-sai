@@ -1146,7 +1146,7 @@ def doctor_command(
         ("keeper.ws_endpoint", ws_endpoint),
         ("lcd.endpoint", lcd_endpoint),
     ):
-        if value:
+        if value is not None:
             flags[key] = value
     config_check, config = doctor.check_config(flags)
     checks = [
@@ -1234,7 +1234,7 @@ def watch_price(ctx: click.Context, token_id: int, ws_endpoint: str | None) -> N
 
 def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
     """The command's --ws-endpoint, else the resolved WebSocket setting."""
-    if ws_endpoint:
+    if ws_endpoint is not None:
         sai_settings.check_value("keeper.ws_endpoint", ws_endpoint)
         return ws_endpoint
     return settings(ctx).ws_endpoint
@@ -1242,7 +1242,7 @@ def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
 
 def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
     """The command's --lcd-endpoint, else the resolved LCD setting."""
-    if lcd_endpoint:
+    if lcd_endpoint is not None:
         sai_settings.check_value("lcd.endpoint", lcd_endpoint)
         return lcd_endpoint
     return settings(ctx).lcd_endpoint
