@@ -165,7 +165,7 @@
       }
     },
     "intent.wait.start": {
-      "emitter": "core intent wait (lane A4)",
+      "emitter": "core.wait.for_intent_async",
       "levels": [
         "info"
       ],
@@ -180,7 +180,7 @@
       }
     },
     "intent.wait.end": {
-      "emitter": "core intent wait (lane A4)",
+      "emitter": "core.wait.for_intent_async",
       "levels": [
         "info",
         "warn",
