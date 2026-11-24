@@ -96,7 +96,7 @@ directories before asking uv to install a verified wheel. A pinned
 
 C9c compares `sai update --check` with Python commit
 `ea09f0d417a53a71079bb8c5e426005fa29051a4`. Run the `update-*` cases in
-the parity driver and `tests/parity/test_update.py` with `SAI_PARITY_BIN`
+the parity driver and `tests/parity/test_native_update.py` with `SAI_PARITY_BIN`
 pointing to the Rust build. The native install tests serve fixture
 archives and wheels on loopback and run real uv tools in temporary homes.
 
