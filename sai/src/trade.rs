@@ -55,6 +55,9 @@ pub enum TradeCommand {
         clear_stop_loss: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Wait up to 30 seconds for the intent outcome.
+        #[arg(long)]
+        wait: bool,
     },
     /// Set target leverage without changing TP or SL.
     Leverage {
@@ -65,6 +68,9 @@ pub enum TradeCommand {
         leverage: String,
         #[arg(long)]
         dry_run: bool,
+        /// Wait up to 30 seconds for the intent outcome.
+        #[arg(long)]
+        wait: bool,
     },
 }
 
@@ -193,6 +199,7 @@ pub fn run(
             clear_take_profit,
             clear_stop_loss,
             dry_run,
+            wait,
         } => (
             trade::tpsl_preview(
                 &trade_id,
@@ -202,7 +209,7 @@ pub fn run(
                 clear_stop_loss,
             )?,
             dry_run,
-            false,
+            wait,
             false,
             false,
         ),
@@ -210,10 +217,11 @@ pub fn run(
             trade_id,
             leverage,
             dry_run,
+            wait,
         } => (
             trade::leverage_preview(&trade_id, &leverage)?,
             dry_run,
-            false,
+            wait,
             false,
             false,
         ),
