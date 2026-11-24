@@ -90,6 +90,7 @@ class Case:
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
     expected_overview_help: str | None = None
+    exact_output: bool = False
 
     @property
     def command(self) -> str:
@@ -414,7 +415,11 @@ def observe(
         stderr += tuple(
             f"contender {category}" for category in stderr_category(contender.stderr)
         )
-    exact = case.command.split()[0] in {"market", "account", "watch"}
+    exact = case.exact_output or case.command.split()[0] in {
+        "market",
+        "account",
+        "watch",
+    }
     raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
     return Observation(result.returncode, output, stderr, files, raw)
 
@@ -709,7 +714,7 @@ def main() -> int:
     for case in selected:
         # uv run prepends its own bin directory to PATH. Launch the Python
         # entry point directly so both CLIs inspect the fixture launcher.
-        if case.client_seed or case.command == "doctor":
+        if case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
             case_reference = [c9a_python]
         else:
             case_reference = reference

@@ -353,6 +353,34 @@ state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "terminal" }
 [[case]]
 name = "doctor-offline"
 args = ["--json","doctor","--offline","--no-fix"]
+
+[[case]]
+name = "doctor-unknown-option"
+args = ["doctor", "--unknown"]
+mode = "text"
+exact_output = true
+expect = 2
+
+[[case]]
+name = "mcp-install-invalid-scope"
+args = ["mcp", "install", "--scope", "nonsense"]
+mode = "text"
+exact_output = true
+expect = 2
+
+[[case]]
+name = "mcp-install-empty-scope"
+args = ["mcp", "install", "--scope="]
+mode = "text"
+exact_output = true
+expect = 2
+
+[[case]]
+name = "mcp-install-missing-scope"
+args = ["mcp", "install", "--scope"]
+mode = "text"
+exact_output = true
+expect = 2
 state = { "trader" = "<absent>" }
 
 [[case]]

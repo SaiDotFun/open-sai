@@ -56,9 +56,9 @@ pub(crate) struct InstallArgs {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Scope {
-    Local,
-    Project,
     User,
+    Project,
+    Local,
 }
 
 impl Scope {

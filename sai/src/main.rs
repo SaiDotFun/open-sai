@@ -271,7 +271,7 @@ fn complete(
     } else if interrupted {
         eprintln!("Aborted!");
     } else {
-        if error.exit_code == ExitCode::Usage && command != "doctor" {
+        if error.exit_code == ExitCode::Usage && !(command == "doctor" && error.details.is_some()) {
             eprintln!(
                 "{}\nTry '{} --help' for help.\n",
                 usage(command),
@@ -529,10 +529,43 @@ fn print_parse_error(
         }
         _ => {}
     }
+    if command == "mcp install"
+        && error.kind() == ErrorKind::InvalidValue
+        && context_text(error, ContextKind::InvalidArg)
+            .is_some_and(|arg| arg.split(' ').next() == Some("--scope"))
+        && let Some(value) = context_text(error, ContextKind::InvalidValue)
+        && let Some(ContextValue::Strings(choices)) = error.get(ContextKind::ValidValue)
+    {
+        let explicit_empty = operands.iter().any(|arg| arg == "--scope=")
+            || operands
+                .windows(2)
+                .any(|args| args[0] == "--scope" && args[1].is_empty());
+        if value.is_empty() && !explicit_empty {
+            let usage = SaiError::usage("Option '--scope' requires an argument.");
+            if !json {
+                eprintln!("Error: {}", usage.message);
+                return (ExitCode::Usage, Some(usage));
+            }
+            return complete(Err(usage), command, json, home);
+        }
+        let choices = choices
+            .iter()
+            .map(|choice| repr(choice))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let usage = SaiError::usage(format!(
+            "Invalid value for '--scope': {} is not one of {choices}.",
+            repr(value)
+        ));
+        return complete(Err(usage), command, json, home);
+    }
     let usage_command = match error.get(ContextKind::Usage) {
         Some(ContextValue::StyledStr(usage)) => {
             let usage = usage.to_string();
-            let path = usage.trim_start_matches("Usage: sai").trim();
+            let path = usage
+                .strip_prefix("Usage: ")
+                .and_then(|usage| usage.split_once(' '))
+                .map_or("", |(_, path)| path.trim());
             if path == command || path.starts_with(&format!("{command} ")) {
                 command
             } else if path == "config" || path.starts_with("config ") {
