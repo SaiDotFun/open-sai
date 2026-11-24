@@ -160,7 +160,10 @@ def prepare_rust(source: Path) -> None:
             'percent-encoding = "2"\nflate2.workspace = true\nreqwest.workspace = true\n'
             "semver.workspace = true\nsha2.workspace = true\ntar.workspace = true\nurl.workspace = true\n",
         )
-    edit(cargo, 'features = ["signal"]', 'features = ["io-util", "process", "signal"]')
+        signals = 'features = ["signal"]'
+        if signals not in cargo.read_text():
+            signals = 'features = ["process", "signal"]'
+        edit(cargo, signals, 'features = ["io-util", "process", "signal"]')
     edit(
         main,
         "    let args: Vec<_> = env::args_os().collect();",
