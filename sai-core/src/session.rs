@@ -157,7 +157,11 @@ impl Storage<'_> {
                 Code::SessionExpired,
                 "Trading session expired; sign in again",
             );
-            error.hint = Some(self.sign_in_hint(endpoint, Some(session.addr())));
+            error.hint = Some(if session.key_name().is_some() || session.is_imported() {
+                renewal_command(session)
+            } else {
+                self.sign_in_hint(endpoint, Some(session.addr()))
+            });
             return Err(SessionError(error));
         }
         Ok(())
