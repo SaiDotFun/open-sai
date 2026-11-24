@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 from fake_release import build_wheel, downloads, release_routes
-from sai_cli.core import update
+from sai_cli.core import storage, update
 from test_update import API_PATH, WEB_PATH, Routes, Stub, listing, redirect
 
 SCRIPTS = Path(__file__).resolve().parents[3] / "scripts"
@@ -185,7 +185,8 @@ def test_a_loose_wheel_cache_is_made_private_before_uv_reads_it(fake_uv, tmp_pat
     home = tmp_path / "sai-home"
     wheels = home / "cache" / "wheels"
     wheels.mkdir(parents=True)
-    for directory in (home, home / "cache", wheels):
+    home.chmod(0o700)
+    for directory in (home / "cache", wheels):
         directory.chmod(0o777)
     with Stub(release_routes(WHEELS)) as stub:
         result = run(fake_uv, stub)
@@ -193,6 +194,36 @@ def test_a_loose_wheel_cache_is_made_private_before_uv_reads_it(fake_uv, tmp_pat
     for directory in (home, home / "cache", wheels):
         assert directory.stat().st_mode & 0o777 == 0o700, directory
     assert len(installs(fake_uv)) == 1
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
+@pytest.mark.parametrize(
+    ("profile", "mode", "expected"),
+    [
+        ("dedicated", 0o755, 0o700),
+        ("empty", 0o755, 0o755),
+        ("mixed-use", 0o755, 0o755),
+        ("dedicated", 0o2770, 0o2770),
+    ],
+)
+def test_installer_respects_existing_root_mode(
+    tmp_path, monkeypatch, profile, mode, expected
+):
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    if profile != "empty":
+        storage.db().close()
+    if profile == "mixed-use":
+        (tmp_path / "project.txt").touch()
+    tmp_path.chmod(mode)
+
+    if mode & 0o022:
+        with pytest.raises(install.LookupFailed, match="writable by other users"):
+            install.private_cache()
+        assert not (tmp_path / "cache").exists()
+    else:
+        wheels = install.private_cache()
+        assert wheels.stat().st_mode & 0o777 == 0o700
+    assert tmp_path.stat().st_mode & 0o7777 == expected
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX ownership")
