@@ -15,7 +15,7 @@ from sai_cli.core import keeper, storage
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
-TRADER = "nibi1trader"
+TRADER = "nibi1424242424242424242424242424242422mldj0"
 NETWORK = "cataclysm-1"
 
 
