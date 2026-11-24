@@ -29,8 +29,11 @@ pub(in crate::update) struct Standalone {
 }
 
 #[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 struct Pending {
-    old: String,
+    // A first install has no launcher to restore.
+    #[serde(deserialize_with = "Option::deserialize")]
+    old: Option<String>,
     new: String,
 }
 
@@ -94,7 +97,6 @@ impl Standalone {
             .parent()
             .expect("launcher has a parent")
             .join(link);
-        let target = target.canonicalize().map_err(|_| outside())?;
         let directory = target
             .parent()
             .and_then(Path::file_name)
@@ -132,21 +134,44 @@ impl Standalone {
         let bytes = match fs::read(&record) {
             Ok(bytes) => bytes,
             Err(err) if err.kind() == io::ErrorKind::NotFound => {
-                return Ok(dir_version(&active).expect("validated managed target"));
+                return Ok(
+                    dir_version(&active).expect("validated managed target")
+                );
             }
             Err(err) => return Err(io_error(err)),
         };
-        let pending: Pending = serde_json::from_slice(&bytes)
-            .map_err(|_| "could not read the pending Sai install record".to_owned())?;
-        let previous = dir_version(&pending.old)
-            .filter(|_| self.target(&pending.old).is_some() && self.target(&pending.new).is_some())
-            .ok_or_else(|| {
-                "the pending Sai install record names a missing or invalid binary".to_owned()
-            })?;
+        let pending: Pending = serde_json::from_slice(&bytes).map_err(|_| {
+            "could not read the pending Sai install record".to_owned()
+        })?;
+        let invalid = || {
+            "the pending Sai install record names a missing or invalid binary"
+                .to_owned()
+        };
+        self.target(&pending.new).ok_or_else(invalid)?;
+        let Some(old) = pending.old else {
+            if active != pending.new || self.active()? != pending.new {
+                return Err(
+                    "the Sai launcher changed during an interrupted install"
+                        .into(),
+                );
+            }
+            fs::remove_file(&self.launcher).map_err(io_error)?;
+            state::sync_dir(
+                self.launcher.parent().expect("launcher has a parent"),
+            )
+            .map_err(io_error)?;
+            remove_record(&record)?;
+            return Err("Interrupted first Sai install was rolled back. Run the installer again.".into());
+        };
+        let previous = dir_version(&old)
+            .filter(|_| self.target(&old).is_some())
+            .ok_or_else(invalid)?;
         if active == pending.new {
-            self.switch(&pending.new, &pending.old)?;
-        } else if active != pending.old {
-            return Err("the Sai launcher changed during an interrupted update".into());
+            self.switch(&pending.new, &old)?;
+        } else if active != old {
+            return Err(
+                "the Sai launcher changed during an interrupted update".into()
+            );
         }
         remove_record(&record)?;
         Ok(previous)
@@ -209,10 +234,13 @@ impl Standalone {
             }
             self.publish(stage, &new)?;
             let record = self.root.join(RECORD);
-            let pending = Pending { old, new };
+            let pending = Pending {
+                old: Some(old.clone()),
+                new,
+            };
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let switched = async {
-                self.switch(&pending.old, &pending.new)?;
+                self.switch(&old, &pending.new)?;
                 smoke::verify(&self.launcher, home.path(), target, None).await?;
                 remove_record(&record)
             }
@@ -223,10 +251,10 @@ impl Standalone {
                 Err(reason) => {
                     let rollback = self.active().and_then(|active| {
                         if active == pending.new {
-                            self.switch(&pending.new, &pending.old)?;
+                            self.switch(&pending.new, &old)?;
                             let _ = remove_record(&record);
                             Ok(true)
-                        } else if active == pending.old {
+                        } else if active == old {
                             let _ = remove_record(&record);
                             Ok(false)
                         } else {

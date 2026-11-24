@@ -9,6 +9,33 @@ use tokio::{
 
 use super::*;
 
+#[test]
+fn recovery_rolls_back_a_first_install_without_an_old_target() {
+    let temp = TempDir::new().unwrap();
+    let directory = temp.path().canonicalize().unwrap();
+    let root = directory.join(ROOT);
+    let new = format!("0.2.0-{}", "a".repeat(64));
+    let binary = root.join(&new).join("sai");
+    state::private_dir(binary.parent().unwrap()).unwrap();
+    fs::write(&binary, "candidate").unwrap();
+    let launcher = directory.join("sai");
+    symlink(&binary, &launcher).unwrap();
+    let record = root.join(RECORD);
+    state::atomic_json(&record, &serde_json::json!({"old": null, "new": new}))
+        .unwrap();
+
+    let install = Standalone::discover(&binary).unwrap();
+    assert!(
+        install
+            .recover()
+            .unwrap_err()
+            .contains("first Sai install was rolled back")
+    );
+    assert!(!launcher.is_symlink());
+    assert!(!record.exists());
+    assert!(binary.is_file());
+}
+
 #[tokio::test(start_paused = true)]
 async fn download_deadline_leaves_the_launcher_untouched() {
     let temp = TempDir::new().unwrap();
