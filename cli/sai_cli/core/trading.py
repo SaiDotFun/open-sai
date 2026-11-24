@@ -496,7 +496,13 @@ def _position_preview(
     before_submit: SubmitCheck | None,
     changed_message: str,
     estimate: Callable[
-        [margin.PositionSnapshot, dict[str, Any], dict[str, Any]], dict[str, Any]
+        [
+            margin.PositionSnapshot,
+            dict[str, Any],
+            dict[str, Any],
+            margin.RecheckedPosition | None,
+        ],
+        dict[str, Any],
     ],
 ) -> dict[str, Any]:
     def read_quote() -> PositionPreview:
@@ -507,7 +513,7 @@ def _position_preview(
                 raise
             try:
                 state, inputs, fresh = build()
-                _attach_estimates(fresh, estimate(state, inputs, fresh))
+                _attach_estimates(fresh, estimate(state, inputs, fresh, None))
             except margin.TradingNetworkMismatch:
                 raise PositionChanged(
                     f"{exc}. Use an LCD on Keeper's chain and request a new preview."
@@ -525,7 +531,7 @@ def _position_preview(
 
     state, inputs, preview = read_quote()
     if dry_run:
-        _attach_estimates(preview, estimate(state, inputs, preview))
+        _attach_estimates(preview, estimate(state, inputs, preview, None))
         return preview
 
     try:
@@ -536,7 +542,8 @@ def _position_preview(
         margin.MarketUnavailable,
     ) as exc:
         raise PositionChanged(f"{changed_message}. {exc}") from exc
-    changed = not margin.position_unchanged(lcd_endpoint, state, trade_id, inputs)
+    rechecked = margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
+    changed = rechecked is None
     if changed:
         try:
             state, inputs, fresh = read_quote()
@@ -547,12 +554,12 @@ def _position_preview(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
     if changed or fresh != preview:
-        _attach_estimates(fresh, estimate(state, inputs, fresh))
+        _attach_estimates(fresh, estimate(state, inputs, fresh, rechecked))
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
     _checked(
         before_submit or _accept,
         fresh,
-        lambda _: estimate(state, inputs, fresh),
+        lambda _: estimate(state, inputs, fresh, rechecked),
         addr=addr,
     )
     return fresh
@@ -616,7 +623,7 @@ def change_margin(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the margin change again",
-        estimate=lambda state, inputs, fresh: estimates.position_estimates(
+        estimate=lambda state, inputs, fresh, _: estimates.position_estimates(
             lcd_endpoint,
             state,
             trade_id,
@@ -699,12 +706,13 @@ def partial_close(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the reduction again",
-        estimate=lambda state, inputs, fresh: estimates.close_estimates(
+        estimate=lambda state, inputs, fresh, rechecked: estimates.close_estimates(
             lcd_endpoint,
             state,
             trade_id,
             int(fresh["intent"]["body"]["collateral"]["amountUsdc"]),
             require_unchanged=not dry_run,
+            rechecked=rechecked,
         ),
     )
     if dry_run:

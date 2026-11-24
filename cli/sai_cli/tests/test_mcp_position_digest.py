@@ -103,6 +103,8 @@ class Position:
     price: float | str = 100.5
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
+    perp_price_query_heights: list[str | None] = field(default_factory=list)
+    collateral_price_on_perp_read: str | None = None
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
     )
@@ -283,6 +285,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 assert self.headers.get("x-cosmos-block-height") == str(
                     position.reported_height
                 )
+                position.perp_price_query_heights.append(
+                    self.headers.get("x-cosmos-block-height")
+                )
+                if position.collateral_price_on_perp_read is not None:
+                    position.collateral_price = position.collateral_price_on_perp_read
+                    position.collateral_price_on_perp_read = None
                 data = (
                     {
                         "market": None
@@ -1144,7 +1152,8 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             )
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
-            assert position.price_query_heights == [None, None, None, "121", None]
+            assert position.price_query_heights == [None, None, None, None]
+            assert position.perp_price_query_heights == ["121"]
             fresh = result["preview"]
             assert fresh["quote"]["collateralPriceUsd"] == "0.98"
             assert fresh["quote"]["closedNotionalUsd"] == "245"
@@ -1159,6 +1168,49 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             )
             assert accepted["status"] == "accepted", accepted
             assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+def test_partial_close_binds_collateral_from_the_publication_time_read(
+    position_service,
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            assert preview["quote"]["closedNotionalUsd"] == "250"
+            position.reported_height = 121
+            position.collateral_price_on_perp_read = "0.98"
+
+            refused = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert position.submitted == []
+            assert position.perp_price_query_heights == ["120", "121", "121"]
+            assert all(height is None for height in position.price_query_heights)
+            fresh = refused["preview"]
+            assert fresh["quote"]["closedNotionalUsd"] == "245"
+            assert fresh["intent"] == preview["intent"]
+            assert fresh["previewDigest"] != preview["previewDigest"]
+
+            accepted = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
+            assert accepted["status"] == "accepted"
+            assert len(position.submitted) == 1
+            assert position.perp_price_query_heights == ["120", "121", "121", "121"]
 
     asyncio.run(scenario())
 

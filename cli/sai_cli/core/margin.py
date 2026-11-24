@@ -469,32 +469,52 @@ def verified_position_height(lcd: str, state: PositionSnapshot, trade_id: int) -
     return height
 
 
-def position_unchanged(
-    lcd: str, state: PositionSnapshot, trade_id: int, quoted_inputs: dict[str, Any]
-) -> bool:
+@dataclass(frozen=True)
+class RecheckedPosition:
+    height: str
+    effective_leverage: Decimal | None
+    close_prices: Any = None
+
+
+def recheck_position(
+    lcd: str,
+    state: PositionSnapshot,
+    trade_id: int,
+    quoted_inputs: dict[str, Any],
+) -> RecheckedPosition | None:
     """Recheck the on-chain quote inputs at the final position's block."""
     latest, height = _latest_position(lcd, state, trade_id)
     if not _same_position(state.raw, latest):
-        return False
-    _, inputs = leverage_inputs(lcd, state, trade_id, height=height)
+        return None
+    check_collateral = "collateralPriceUsd" in quoted_inputs
+    if check_collateral and (
+        latest.get("long") is not state.raw.get("long")
+        or latest.get("open_price") != state.raw.get("open_price")
+    ):
+        return None
+    effective, inputs = leverage_inputs(lcd, state, trade_id, height=height)
     quoted_leverage = {
         key: value
         for key, value in quoted_inputs.items()
         if key != "collateralPriceUsd"
     }
     if inputs != quoted_leverage:
-        return False
+        return None
     if height is None:
         raise ValueError(
             "Cannot confirm the position and leverage at the same block."
             " Retry with an LCD that reports the contract query height."
         )
-    if "collateralPriceUsd" not in quoted_inputs:
-        return True
-    return (
-        str(collateral_price(lcd, state, height=height))
-        == quoted_inputs["collateralPriceUsd"]
-    )
+    prices = None
+    if check_collateral:
+        prices = perp_prices(lcd, state, height)
+        value = prices.get("collateral") if isinstance(prices, dict) else None
+        if (
+            value is None
+            or str(contract_decimal(value)) != quoted_inputs["collateralPriceUsd"]
+        ):
+            return None
+    return RecheckedPosition(height, effective, prices)
 
 
 def block_timestamp(lcd: str, height: str) -> int:
@@ -681,6 +701,20 @@ def collateral_price(
     # A replacement preview must see the new price even after a cached quote.
     return contract_decimal(
         smart_value(lcd, state.contract, query, height=height, fresh=True)
+    )
+
+
+def perp_prices(lcd: str, state: PositionSnapshot, height: str) -> Any:
+    return smart_value(
+        lcd,
+        state.contract,
+        {
+            "get_perp_prices": {
+                "market_index": state.raw["market_index"],
+                "collateral_index": state.raw["collateral_index"],
+            }
+        },
+        height=height,
     )
 
 
