@@ -8,7 +8,6 @@ import contextlib
 import hashlib
 import json
 import os
-import re
 import shlex
 import sqlite3
 import sys
@@ -26,10 +25,6 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from . import log, paths
 from .errors import Code, SaiError, SessionError
-
-PLAIN_KEEPER_URL = re.compile(
-    r"https?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query"
-)
 
 
 class UnresolvedIntent(SaiError, ValueError):
@@ -409,10 +404,10 @@ def db() -> sqlite3.Connection:
 def keeper_command_hint(endpoint: str, *args: str) -> str:
     """Pin the selected Keeper in a recovery command.
 
-    Only the standard /query path is safe to echo. Custom gateway paths
-    can carry credentials.
+    Ask the caller to supply the original URL when the origin is insufficient.
     """
-    if PLAIN_KEEPER_URL.fullmatch(endpoint) and log.redact(endpoint) == endpoint:
+    origin = log.origin(endpoint)
+    if origin != log.REDACTED_URL and origin == endpoint == log.redact(endpoint):
         flag = shlex.quote(endpoint)
     else:
         flag = (

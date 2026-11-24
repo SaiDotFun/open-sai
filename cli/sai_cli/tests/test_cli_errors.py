@@ -12,9 +12,10 @@ from sai_cli.core import keeper, storage
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
-OVERRIDE = "http://127.0.0.1:9/query"
+OVERRIDE = "http://127.0.0.1:9"
 PRIVATE_PATH = "fixture-endpoint-key"
-PRIVATE_OVERRIDE = f"http://127.0.0.1:9/{PRIVATE_PATH}/query"
+PRIVATE_QUERY = "fixture-endpoint-query-key"
+PRIVATE_OVERRIDE = f"{OVERRIDE}/{PRIVATE_PATH}/query?key={PRIVATE_QUERY}"
 
 
 def assert_error(result: Result, exit_code: int, code: str) -> dict:
@@ -90,6 +91,7 @@ def test_explicit_account_sign_in_hint_pins_the_selected_keeper(
         assert error["hint"].startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
         assert error["hint"].endswith(f"auth login NAME --addr {ADDR}")
         assert PRIVATE_PATH not in result.output
+        assert PRIVATE_QUERY not in result.output
         assert endpoint not in result.output
 
 
@@ -117,8 +119,10 @@ def test_success_and_sign_in_exit_codes():
     runner = CliRunner()
     args = ["--json", "--endpoint", keeper.MAINNET_HTTP]
     signed_out = runner.invoke(main, [*args, "trade", "close", "7"])
-    hint = f"sai --endpoint {keeper.MAINNET_HTTP} auth login NAME"
-    assert assert_error(signed_out, 6, "SIGNED_OUT")["hint"] == hint
+    hint = assert_error(signed_out, 6, "SIGNED_OUT")["hint"]
+    assert hint.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert hint.endswith("auth login NAME")
+    assert keeper.MAINNET_HTTP not in signed_out.output
     listed = runner.invoke(main, [*args, "auth", "list"])
     assert listed.exit_code == 0 and json.loads(listed.stdout) == {"accounts": []}
     storage.save_session(

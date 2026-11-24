@@ -11,7 +11,7 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner, Result
-from sai_cli.core import keeper, margin, settings
+from sai_cli.core import margin, settings
 from sai_cli.sai_cli import forwarded_flags, main
 
 SECRET_URL = "https://user:pw@k.example/query?key=s"
@@ -40,13 +40,13 @@ def test_list_json_shape_with_defaults(tmp_path):
     assert data["path"] == str(tmp_path / "config.toml")
     assert list(data["settings"]) == list(settings.KEYS)
     assert data["settings"]["keeper.endpoint"] == {
-        "value": keeper.MAINNET_HTTP,
+        "value": "https://sai-keeper.nibiru.fi",
         "source": "default",
         "env": "SAI_ENDPOINT",
-        "default": keeper.MAINNET_HTTP,
+        "default": "https://sai-keeper.nibiru.fi",
     }
     assert data["settings"]["keeper.ws_endpoint"] == {
-        "value": keeper.MAINNET_WS,
+        "value": "wss://sai-keeper.nibiru.fi",
         "source": "derived",
         "env": "SAI_WS_ENDPOINT",
         "default": None,
@@ -71,10 +71,10 @@ def test_set_get_unset(tmp_path):
     assert tomllib.loads(path.read_text())["keeper"] == {"endpoint": SECRET_URL}
 
     entry = listed()["settings"]["keeper.endpoint"]
-    assert entry["value"] == "https://k.example/query"
+    assert entry["value"] == "https://k.example"
     assert entry["source"] == "file"
     assert listed()["settings"]["keeper.ws_endpoint"] == {
-        "value": "wss://k.example/query",
+        "value": "wss://k.example",
         "source": "derived",
         "env": "SAI_WS_ENDPOINT",
         "default": None,
@@ -102,6 +102,25 @@ def test_bool_setting_text_output():
     assert sai("config", "get", "update.auto").stdout == "false\n"
     text = sai("config", "list").stdout
     assert "update.auto = false  # file, SAI_UPDATE_AUTO" in text
+
+
+def test_list_shows_only_keeper_origins():
+    path_key, query_key = "fixture-path-key", "fixture-query-key"
+    endpoint = f"https://[::1]:9443/{path_key}/query?key={query_key}"
+    assert sai("config", "set", "keeper.endpoint", endpoint).exit_code == 0
+
+    text = sai("config", "list")
+    structured = sai("--json", "config", "list")
+    for result in (text, structured):
+        assert result.exit_code == 0
+        assert path_key not in result.output and query_key not in result.output
+
+    assert 'keeper.endpoint = "https://[::1]:9443"' in text.stdout
+    assert 'keeper.ws_endpoint = "wss://[::1]:9443"' in text.stdout
+    shown = json.loads(structured.stdout)["settings"]
+    assert shown["keeper.endpoint"]["value"] == "https://[::1]:9443"
+    assert shown["keeper.ws_endpoint"]["value"] == "wss://[::1]:9443"
+    assert shown["keeper.ws_endpoint"]["source"] == "derived"
 
 
 @pytest.mark.parametrize(
@@ -304,13 +323,13 @@ def test_flag_and_env_override_the_file(monkeypatch):
     data = listed("--endpoint", "https://flag.example/q")["settings"]
     assert data["keeper.endpoint"]["source"] == "flag"
     # The file's WebSocket belongs to the file's Keeper, so it is derived.
-    assert data["keeper.ws_endpoint"]["value"] == "wss://flag.example/q"
+    assert data["keeper.ws_endpoint"]["value"] == "wss://flag.example"
     assert data["keeper.ws_endpoint"]["source"] == "derived"
     assert listed()["settings"]["keeper.ws_endpoint"]["source"] == "file"
 
     monkeypatch.setenv("SAI_ENDPOINT", "https://env.example/q")
     entry = listed()["settings"]["keeper.endpoint"]
-    assert (entry["value"], entry["source"]) == ("https://env.example/q", "env")
+    assert (entry["value"], entry["source"]) == ("https://env.example", "env")
     result = sai("config", "set", "keeper.endpoint", "https://file2.example/q")
     assert "SAI_ENDPOINT is set and overrides keeper.endpoint" in result.stderr
 

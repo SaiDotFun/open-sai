@@ -181,7 +181,7 @@ def assert_connected(env: Env, token: str, result_stdout: str) -> None:
     assert output == {
         "addr": ADDR,
         "expiresAt": output["expiresAt"],
-        "endpoint": keeper.MAINNET_HTTP,
+        "endpoint": "https://sai-keeper.nibiru.fi",
     }
     assert token.encode() not in env.stored_bytes()
     status = env.run("--json", "auth", "status")
@@ -1106,15 +1106,12 @@ def test_ud_signing_failure_without_a_terminal_says_to_use_one(
     )
     assert result.returncode == 3
     # The whole command, so a retry keeps the endpoint and --addr.
-    if private_path:
-        assert secret not in result.stdout + result.stderr
-        assert endpoint not in result.stdout + result.stderr
-        endpoint_arg = (
-            '"${SAI_RECONCILE_ENDPOINT:?'
-            'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
-        )
-    else:
-        endpoint_arg = endpoint
+    assert secret not in result.stdout + result.stderr
+    assert endpoint not in result.stdout + result.stderr
+    endpoint_arg = (
+        '"${SAI_RECONCILE_ENDPOINT:?'
+        'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
+    )
     command = f"sai --endpoint {endpoint_arg} --json auth login dev --addr {ADDR}"
     assert f"Run `{command}` in a terminal." in login_error(result)
     assert json.loads(result.stdout)["error"]["hint"] == command

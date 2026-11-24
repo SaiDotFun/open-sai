@@ -77,6 +77,7 @@ from typing import Any, Self
 from urllib.parse import urlsplit
 
 from . import paths
+from .errors import Code
 from .log_events import COMMON_REQUIRED, EVENTS, SCHEMA_VERSION, valid_event
 
 DIR_NAME = "logs"
@@ -119,6 +120,17 @@ REDACTED = "[redacted session token]"
 REDACTED_HEX = "[redacted hex]"
 REDACTED_URL = "[redacted url]"
 COMMON = tuple(COMMON_REQUIRED)
+_GRAPHQL_ERROR_CODES = frozenset(
+    {
+        "GRAPHQL_PARSE_FAILED",
+        "GRAPHQL_VALIDATION_FAILED",
+        "INTENT_NOT_ACCEPTED",
+        "BAD_USER_INPUT",
+        "FORBIDDEN",
+        "INTERNAL_SERVER_ERROR",
+        "UNAUTHENTICATED",
+    }
+)
 
 RUN_ID = uuid.uuid4().hex
 _seq = itertools.count(1)
@@ -470,6 +482,29 @@ def clean(value: Any, tokens: tuple[str, ...] | None = None) -> Any:
     if isinstance(value, (list, tuple, set, frozenset)):
         return [clean(item, found) for item in value]
     return scrub(str(value), found)
+
+
+def keeper_error_fields(
+    errors: object, *, retained: bool = False, total: object = None
+) -> dict[str, int | list[dict[str, str]]]:
+    """Project Keeper's response errors or a stored event's error fields.
+
+    Preserve the total when recorded. Older events only have the list
+    that was saved.
+    """
+    codes: list[dict[str, str]] = []
+    for item in errors[:3] if isinstance(errors, list) else ():
+        if not isinstance(item, dict):
+            continue
+        fields = item if retained else item.get("extensions")
+        code = fields.get("code") if isinstance(fields, dict) else None
+        if not isinstance(code, str) or code not in _GRAPHQL_ERROR_CODES:
+            code = Code.KEEPER_ERROR
+        codes.append({"code": code})
+    count = len(errors) if isinstance(errors, list) else 1
+    if type(total) is int:
+        count = max(count, total)
+    return {"keeperErrors": codes, "keeperErrorCount": count}
 
 
 def _clip(text: str, limit: int) -> str:
@@ -1267,7 +1302,18 @@ def _invalid_constant(_text: str) -> Any:
 
 
 def decode_row(raw: bytes) -> Any:
-    return json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
+    line = json.loads(raw, parse_float=_finite_number, parse_constant=_invalid_constant)
+    if (
+        isinstance(line, dict)
+        and line.get("event") == "keeper.request"
+        and "keeperErrors" in line
+    ):
+        line.update(
+            keeper_error_fields(
+                line["keeperErrors"], retained=True, total=line.get("keeperErrorCount")
+            )
+        )
+    return line
 
 
 MAX_SCAN_BYTES = 16 * 1024 * 1024
