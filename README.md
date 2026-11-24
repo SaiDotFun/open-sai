@@ -284,6 +284,9 @@ It restores the pending ledger checkpoint before running
 `sai update --to 0.1.0` and reports whether v0.1.0 still blocks the open
 before and after reconciling it.
 
+The script stops its command process groups during teardown. On Linux, it
+also adopts and stops orphaned helpers that started a separate session.
+
 Run `python3 scripts/release-rehearsal.py --self-test` for the local script
 checks. Add `--verbose` to a rehearsal to keep child output in a private
 scratch log. The script prints the log path and removes the temporary home.

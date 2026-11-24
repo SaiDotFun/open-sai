@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -275,6 +276,55 @@ def owned_process(
 def stop_process_group(leader: subprocess.Popen[bytes]) -> None:
     with suppress(ProcessLookupError):
         os.killpg(leader.pid, signal.SIGKILL)
+
+
+def stop_adopted_children() -> None:
+    # All owned command contexts have closed. Remaining children are orphans
+    # adopted by the rehearsal, including helpers that created a new session.
+    while True:
+        try:
+            exited, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if exited:
+            continue
+        pids = set()
+        for children in Path("/proc/self/task").glob("*/children"):
+            with suppress(FileNotFoundError):
+                pids.update(map(int, children.read_text().split()))
+        for pid in pids:
+            # The PID remains owned until this process reaps the child.
+            with suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+        if pids:
+            os.waitpid(-1, 0)
+
+
+@contextmanager
+def reap_detached_children() -> Generator[None, None, None]:
+    if sys.platform != "linux":
+        yield
+        return
+    require(
+        Path("/proc/thread-self/children").is_file(),
+        "Linux descendant cleanup requires the procfs children list",
+    )
+    get_subreaper, set_subreaper = 37, 36  # linux/prctl.h
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    prctl.argtypes = [ctypes.c_int, *([ctypes.c_ulong] * 4)]
+
+    def set_option(option: int, value: int) -> None:
+        if prctl(option, value, 0, 0, 0) == -1:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+
+    previous = ctypes.c_int()
+    set_option(get_subreaper, ctypes.addressof(previous))
+    with cleanup_stack() as cleanup:
+        set_option(set_subreaper, 1)
+        cleanup.callback(set_option, set_subreaper, previous.value)
+        cleanup.callback(stop_adopted_children)
+        yield
 
 
 def loopback_env(base: str, proxy_port: int) -> dict[str, str]:
@@ -967,7 +1017,7 @@ def isolated_stage(root_name: str, wheel_name: str, version: str, log_name: str)
     tool = Install(root, Path(log_name) if log_name else None, prepared=True)
 
     def work() -> int:
-        with cancel_on_signal():
+        with cancel_on_signal(), reap_detached_children():
             return rehearse_staged(tool, root, wheel, version)
 
     return report_result(work)
@@ -1211,9 +1261,10 @@ def main() -> int:
                     dir=diagnostics.parent if diagnostics else None,
                 )
             )
-            return rehearse(
-                Path(scratch), wheel, version, diagnostics, strict=args.strict
-            )
+            with reap_detached_children():
+                return rehearse(
+                    Path(scratch), wheel, version, diagnostics, strict=args.strict
+                )
 
     return report_result(work)
 

@@ -19,8 +19,8 @@ from unittest.mock import patch
 
 REHEARSAL = runpy.run_path(str(Path(__file__).with_name("release-rehearsal.py")))
 LOCK_DESCENDANT = (
-    "import fcntl, sys, time; file = open(sys.argv[1], 'w'); "
-    "fcntl.flock(file, fcntl.LOCK_EX); print('locked', flush=True); time.sleep(30)"
+    "import fcntl, os, sys, time; file = open(sys.argv[1], 'w'); "
+    "fcntl.flock(file, fcntl.LOCK_EX); print('locked', os.getpid(), flush=True); time.sleep(30)"
 )
 
 
@@ -244,9 +244,13 @@ class ProcessTest(unittest.TestCase):
                     time.sleep(0.01)
 
     def assert_interruption_cleans_up(
-        self, sig: signal.Signals, teardown_hook: str = ""
+        self, sig: signal.Signals, teardown_hook: str = "", *, detached: bool = False
     ) -> None:
         script = Path(__file__).with_name("release-rehearsal.py").resolve()
+        launcher = (
+            "import subprocess, sys; "
+            f"subprocess.run(sys.argv[1:], start_new_session={detached!r})"
+        )
         parent = """
 import os, runpy, signal, sys, tempfile
 from pathlib import Path
@@ -273,16 +277,18 @@ def verify_child_stopped(child):
 try:
     with entry["cancel_on_signal"](), entry["cleanup_stack"]() as cleanup:
         home = cleanup.enter_context(tempfile.TemporaryDirectory(dir=sys.argv[2]))
-        process_context = entry["owned_process"](tuple(sys.argv[5:]), Path(home), {"HOME": home})
-        with process_context as child:
-            cleanup.callback(verify_child_stopped, child)
-            if entry["ReplyReader"](child.stdout).line("descendant") != "locked":
-                sys.exit(2)
-            print(os.getpgid(child.pid), home, flush=True)
-            if hook:
-                sys.setprofile(interrupt_at_teardown)
-            else:
-                entry["communicate"](child, timeout=30)
+        with entry["reap_detached_children"]():
+            process_context = entry["owned_process"](tuple(sys.argv[5:]), Path(home), {"HOME": home})
+            with process_context as child:
+                cleanup.callback(verify_child_stopped, child)
+                status, descendant = entry["ReplyReader"](child.stdout).line("descendant").split()
+                if status != "locked":
+                    sys.exit(2)
+                print(os.getpgid(child.pid), descendant, home, flush=True)
+                if hook:
+                    sys.setprofile(interrupt_at_teardown)
+                else:
+                    entry["communicate"](child, timeout=30)
 except entry["RehearsalInterrupted"] as exc:
     sys.exit(128 + exc.signum)
 """
@@ -299,7 +305,7 @@ except entry["RehearsalInterrupted"] as exc:
                     str(sig.value),
                     sys.executable,
                     "-c",
-                    "import subprocess, sys; subprocess.run(sys.argv[1:])",
+                    launcher,
                     sys.executable,
                     "-c",
                     LOCK_DESCENDANT,
@@ -310,10 +316,10 @@ except entry["RehearsalInterrupted"] as exc:
             ) as process,
         ):
             lock = Path(temp) / "descendant.lock"
-            group, home_name = (
+            group, descendant, home_name = (
                 REHEARSAL["ReplyReader"](process.stdout)
                 .line("parent ready")
-                .split(" ", 1)
+                .split(" ", 2)
             )
             home = Path(home_name)
             try:
@@ -324,6 +330,9 @@ except entry["RehearsalInterrupted"] as exc:
                 self.assertFalse(home.exists())
                 self.assert_group_released(lock)
             except BaseException:
+                if detached:
+                    with suppress(ProcessLookupError):
+                        os.kill(int(descendant), signal.SIGKILL)
                 with suppress(ProcessLookupError):
                     os.killpg(int(group), signal.SIGKILL)
                 raise
@@ -344,6 +353,10 @@ except entry["RehearsalInterrupted"] as exc:
         for sig in (signal.SIGTERM, signal.SIGINT):
             with self.subTest(signal=sig.name):
                 self.assert_interruption_cleans_up(sig, "owned_process.__exit__")
+
+    @unittest.skipUnless(sys.platform == "linux", "Linux subreaper coverage")
+    def test_sigterm_stops_a_helper_in_a_separate_session(self) -> None:
+        self.assert_interruption_cleans_up(signal.SIGTERM, detached=True)
 
     def test_partial_reply_times_out(self) -> None:
         read, write = os.pipe()
@@ -375,7 +388,8 @@ except entry["RehearsalInterrupted"] as exc:
                 REHEARSAL["owned_process"](command, root, {"HOME": temp}) as child,
             ):
                 self.assertEqual(
-                    REHEARSAL["ReplyReader"](child.stdout).line("lock"), "locked"
+                    REHEARSAL["ReplyReader"](child.stdout).line("lock").split()[0],
+                    "locked",
                 )
                 child.communicate(timeout=0.1)
             self.assert_group_released(lock)
