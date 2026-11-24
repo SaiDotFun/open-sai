@@ -76,6 +76,12 @@ mode = "text"
 expect = 2
 
 [[case]]
+name = "market-bare"
+args = ["market"]
+mode = "text"
+expect = 2
+
+[[case]]
 name = "market-list"
 args = ["--json","market","list"]
 wire = ["borrowings"]
@@ -104,6 +110,12 @@ args = ["--json","market","prices"]
 server = "read-partial-error"
 expect = 1
 wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "account-bare"
+args = ["account"]
+mode = "text"
+expect = 2
 
 [[case]]
 name = "account-positions"
@@ -233,6 +245,12 @@ wire = ["oneClickTrading","ws:init","node_info"]
 name = "doctor-fix"
 args = ["--json","doctor","--offline"]
 state = { "trader" = "directory" }
+
+[[case]]
+name = "watch-bare"
+args = ["watch"]
+mode = "text"
+expect = 2
 
 [[case]]
 name = "watch-price"

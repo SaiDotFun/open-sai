@@ -495,8 +495,8 @@ fn print_parse_error(
             ) && let Some(help) = help()
             {
                 let error = SaiError::usage(help);
-                if json {
-                    return complete(Err(error), command, true, home);
+                if json || matches!(command, "market" | "account" | "watch") {
+                    return complete(Err(error), command, json, home);
                 }
                 eprintln!("{}", error.message);
                 return (ExitCode::Usage, Some(error));
