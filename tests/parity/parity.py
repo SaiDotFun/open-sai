@@ -771,6 +771,8 @@ def run_case(
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints
         )
+        if rust and case.mcp_checkout_wire is not None:
+            candidate_case = replace(candidate_case, wire=case.mcp_checkout_wire)
         right, right_error = safe_observe(
             candidate_case,
             candidate,
