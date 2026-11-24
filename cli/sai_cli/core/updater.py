@@ -598,6 +598,12 @@ class Outcome:
                 "client": check.client,
                 "status": check.status,
                 "changes": list(check.changes),
+                **({"pinned": True} if check.pinned else {}),
+                **(
+                    {"legacyName": mcp_install.RETIRED_NAME}
+                    if check.legacy_name
+                    else {}
+                ),
             }
             for check in self.mcp
         ]
@@ -1103,7 +1109,7 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
         mcp=tuple(
             check
             for check in checks
-            if check.status in ("fixed", "fail") or check.pinned
+            if check.status in ("fixed", "fail") or check.pinned or check.legacy_name
         ),
         mcp_notes=tuple(notes),
     )
@@ -1129,7 +1135,7 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
 
 def mcp_notice(results: Any, notes: Any = None) -> str:
     """Summarize this update's repairs using only known client names."""
-    repaired, failed, pinned = [], [], []
+    repaired, failed, pinned, legacy = [], [], [], []
     for entry in results if isinstance(results, list) else []:
         if (
             not isinstance(entry, dict)
@@ -1142,7 +1148,13 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
             repaired.append(entry["client"])
         if entry.get("status") == "fail":
             failed.append(entry["client"])
-        elif entry.get("status") == "warn":
+        keeps_name = entry.get("legacyName") == mcp_install.RETIRED_NAME
+        if keeps_name:
+            legacy.append(entry["client"])
+        # Older update records used warn exclusively for a pinned launcher.
+        if entry.get("pinned") is True or (
+            entry.get("status") == "warn" and not keeps_name
+        ):
             pinned.append(entry["client"])
     messages = []
     if repaired:
@@ -1154,6 +1166,11 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         )
     if pinned:
         messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
+    if legacy:
+        messages.append(
+            f"Sai MCP kept the existing {mcp_install.RETIRED_NAME} name"
+            f" for {', '.join(legacy)}."
+        )
     if isinstance(notes, (list, tuple)):
         messages.extend(
             MCP_NOTES[note]

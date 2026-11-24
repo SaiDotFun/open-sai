@@ -23,11 +23,20 @@ from dataclasses import replace
 from pathlib import Path
 
 import pytest
+import tomlkit
 from click.testing import CliRunner
 from fake_release import build_wheel, downloads, release_routes
 from sai_cli.core import log, update, updater
 from sai_cli.sai_cli import EXIT_UNSUPPORTED, auto_update_applies, main
-from test_mcp_install import FAKE_CLAUDE, OLD_COMMAND, OTHER, SECRET, write_exe
+from test_mcp_install import (
+    FAKE_CLAUDE,
+    FAKE_CODEX,
+    OLD_COMMAND,
+    OTHER,
+    SECRET,
+    write_exe,
+    write_project_mcp_denials,
+)
 from test_update import API_PATH, Stub, listing, make_prefix
 
 REAL_UV = os.environ.get("UV") or shutil.which("uv")
@@ -138,6 +147,7 @@ BROKEN_WHEN_INSTALLED = (
         "failed",
         "deleted-cwd",
         "deleted-cwd-relative",
+        "denied-project",
     ],
 )
 def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
@@ -150,14 +160,16 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     monkeypatch.setenv("FAKE_LOG", str(uv_dirs / "client-calls.jsonl"))
     project = uv_dirs / "project"
     project.mkdir()
-    config = home / ".claude.json"
+    denied = mode == "denied-project"
+    name = OLD_COMMAND if denied else "sai"
+    config = project / ".mcp.json" if denied else home / ".claude.json"
     entry = {
         "command": OLD_COMMAND,
         "args": ["--endpoint", "https://private.example/" + SECRET],
         "env": {"CUSTOM": SECRET},
     }
     other = {"url": "https://private.example/mcp", "headers": {"X-Token": SECRET}}
-    original = json.dumps({"mcpServers": {"sai": entry, OTHER: other}})
+    original = json.dumps({"mcpServers": {name: entry, OTHER: other}})
     config.write_text(original)
     cursor = project / ".cursor" / "mcp.json"
     server_body = ""
@@ -175,6 +187,19 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         (home / ".cursor").mkdir()
         cursor.parent.mkdir()
         cursor.write_text(original)
+    if denied:
+        policies = write_project_mcp_denials(project)
+        codex_home.mkdir()
+        codex_config = codex_home / "config.toml"
+        codex_config.write_text(
+            tomlkit.dumps(
+                {
+                    "mcp_servers": {
+                        name: {**entry, "enabled": False, "enabled_tools": []}
+                    }
+                }
+            )
+        )
     wheels = {
         "0.1.0": build_wheel("0.1.0"),
         "0.2.0": build_wheel("0.2.0", server_body),
@@ -184,6 +209,8 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         tool = Tool(uv_dirs, stub.url)
         tool.install_release("0.1.0")
         write_exe(tool.sai.with_name("claude"), FAKE_CLAUDE)
+        if denied:
+            write_exe(tool.sai.with_name("codex"), FAKE_CODEX)
         # Supply the installed tool prefix to the real CLI. Keep the test
         # runner's Python and dependencies while uv replaces the tool.
         monkeypatch.setenv(
@@ -212,7 +239,7 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         assert result.exit_code == 0, result.output
         assert tool.version() == "0.2.0"
         expected = {
-            "sai": {
+            name: {
                 **entry,
                 "command": str(tool.sai),
                 "args": ["mcp", "serve", *entry["args"]],
@@ -226,6 +253,13 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             assert not project.exists()
         else:
             assert json.loads(cursor.read_text())["mcpServers"] == expected
+        if denied:
+            assert all(
+                path.read_bytes() == content for path, content in policies.items()
+            )
+            assert tomlkit.parse(codex_config.read_text()).unwrap()["mcp_servers"] == {
+                name: {**expected[name], "enabled": False, "enabled_tools": []},
+            }
         state = updater.read_state()
         assert state["result"]["status"] == updater.UPDATED
         if mode == "deleted-cwd-relative":
@@ -242,7 +276,12 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         assert len(repair) == 1
         assert repair[0]["background"] is (mode == "background")
         assert repair[0]["clients"][0]["client"] == "claude"
-        assert repair[0]["clients"][0]["status"] == "fixed"
+        assert repair[0]["clients"][0]["status"] == ("warn" if denied else "fixed")
+        if denied:
+            clients = {client["client"]: client for client in repair[0]["clients"]}
+            assert set(clients) == {"claude", "codex", "cursor"}
+            assert all(client["legacyName"] == name for client in clients.values())
+            assert f"kept the existing {name} name" in result.stdout
         message = "Repaired Sai MCP registrations for claude"
         if mode == "background":
             assert result.output == ""

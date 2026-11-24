@@ -215,6 +215,23 @@ def doctor_entries(env: Env) -> dict[str, dict[str, Any]]:
     }
 
 
+def write_project_mcp_denials(project: Path) -> dict[Path, bytes]:
+    files = {
+        project / ".claude" / "settings.local.json": {
+            "enableAllProjectMcpServers": True,
+            "disabledMcpjsonServers": [OLD_COMMAND],
+        },
+        project / ".cursor" / "cli.json": {
+            "permissions": {"deny": [f"Mcp({OLD_COMMAND}:*)"]},
+        },
+    }
+    original = {path: json.dumps(data).encode() for path, data in files.items()}
+    for path, content in original.items():
+        path.parent.mkdir(exist_ok=True)
+        path.write_bytes(content)
+    return original
+
+
 def mcp_checks(result: Any) -> dict[str, dict[str, Any]]:
     report = payload(result)
     if "error" in report:
@@ -231,11 +248,12 @@ def mcp_checks(result: Any) -> dict[str, dict[str, Any]]:
     [
         ("stable", "pass"),
         ("other-absolute", "warn"),
-        ("legacy-pinned", "fail"),
+        ("legacy-pinned", "warn"),
         ("missing", "fail"),
         ("uv-cache", "fail"),
         ("legacy-command", "fail"),
-        ("legacy-name", "fail"),
+        ("legacy-name", "warn"),
+        ("legacy-name-stale", "fail"),
     ],
 )
 def test_doctor_repairs_recognized_registrations_in_all_clients(
@@ -252,9 +270,13 @@ def test_doctor_repairs_recognized_registrations_in_all_clients(
         command = str(path)
     suffix = ["--endpoint", "https://private.example/query?token=" + SECRET]
     args = ["mcp", "serve", *suffix]
-    if kind == "legacy-command":
+    if kind in ("legacy-command", "legacy-name-stale"):
         command, args = OLD_COMMAND, suffix
-    name = OLD_COMMAND if kind in ("legacy-name", "legacy-pinned") else "sai"
+    name = (
+        OLD_COMMAND
+        if kind in ("legacy-name", "legacy-name-stale", "legacy-pinned")
+        else "sai"
+    )
     entry = {
         "command": command,
         "args": args,
@@ -279,9 +301,7 @@ def test_doctor_repairs_recognized_registrations_in_all_clients(
     result = invoke("doctor", "--offline")
     assert result.exit_code == 0, result.output
     status = (
-        "warn"
-        if kind == "legacy-pinned"
-        else ("fixed" if expected == "fail" else expected)
+        "warn" if name == OLD_COMMAND else ("fixed" if expected == "fail" else expected)
     )
     assert {check["status"] for check in mcp_checks(result).values()} == {status}
     if expected != "fail":
@@ -289,9 +309,9 @@ def test_doctor_repairs_recognized_registrations_in_all_clients(
     else:
         for registrations in doctor_entries(env).values():
             assert registrations == {
-                "sai": {
+                name: {
                     **entry,
-                    "command": command if kind == "legacy-pinned" else str(env.sai),
+                    "command": str(env.sai),
                     "args": ["mcp", "serve", *suffix],
                 },
                 OTHER: unrelated,
@@ -299,13 +319,42 @@ def test_doctor_repairs_recognized_registrations_in_all_clients(
         assert all(check["changes"] for check in mcp_checks(result).values())
         again = invoke("doctor", "--offline")
         assert {check["status"] for check in mcp_checks(again).values()} == {
-            "warn" if kind == "legacy-pinned" else "pass"
+            "warn" if name == OLD_COMMAND else "pass"
         }
     assert log.flush()
     output = report.output + result.output
     output += "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
     for private_value in (SECRET, OTHER, "private.example"):
         assert private_value not in output
+
+
+def test_doctor_preserves_denied_registration_names(env: Env):
+    policies = write_project_mcp_denials(env.project)
+    entry = {"command": OLD_COMMAND, "args": [], "env": {"CUSTOM": SECRET}}
+    denied_codex = {**entry, "enabled": False, "enabled_tools": []}
+    claude = env.project / ".mcp.json"
+    cursor = env.project / ".cursor" / "mcp.json"
+    env.cursor_path().parent.mkdir()
+    for path in (claude, cursor):
+        path.write_text(json.dumps({"mcpServers": {OLD_COMMAND: entry}}))
+    env.write_codex({OLD_COMMAND: denied_codex})
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 0, result.output
+    checks = mcp_checks(result)
+    assert set(checks) == set(mcp_install.CLIENTS)
+    for check in checks.values():
+        assert check["status"] == "warn" and check["changes"]
+        assert OLD_COMMAND in check["summary"]
+    expected = {**entry, "command": str(env.sai), "args": ["mcp", "serve"]}
+    for path in (claude, cursor):
+        assert json.loads(path.read_text())["mcpServers"] == {OLD_COMMAND: expected}
+    assert tomlkit.parse(env.codex_path().read_text()).unwrap()["mcp_servers"] == {
+        OLD_COMMAND: {**expected, "enabled": False, "enabled_tools": []},
+    }
+    assert all(path.read_bytes() == content for path, content in policies.items())
+    assert SECRET not in result.output
 
 
 def test_doctor_repairs_claude_scopes_without_remove_and_add(env: Env, monkeypatch):
@@ -591,7 +640,9 @@ def test_codex_install_keeps_an_inline_servers_table(env: Env):
 @pytest.mark.parametrize(
     "layout", ["inline-child", "outer-inline", "dotted-child", "root-dotted"]
 )
-def test_doctor_renames_codex_inline_and_dotted_registrations(env: Env, layout: str):
+def test_doctor_repairs_codex_legacy_inline_and_dotted_registrations(
+    env: Env, layout: str
+):
     other = f'"{OTHER}"  = {{command = "outer", enabled_tools = []}}'
     old = f'"{OLD_COMMAND}"'
     entry = f'{{command = "{OLD_COMMAND}", env = {{CUSTOM = "{SECRET}"}}, enabled_tools = []}}'
@@ -618,13 +669,15 @@ def test_doctor_renames_codex_inline_and_dotted_registrations(env: Env, layout: 
     result = invoke("doctor", "--offline")
 
     assert result.exit_code == 0, result.output
-    assert mcp_checks(result)["codex"]["status"] == "fixed"
+    check = mcp_checks(result)["codex"]
+    assert check["status"] == "warn" and check["changes"]
+    assert OLD_COMMAND in check["summary"]
     updated = env.codex_path().read_text()
     assert untouched in updated
     parsed = tomlkit.parse(updated).unwrap()["mcp_servers"]
     assert parsed == {
         OTHER: {"command": "outer", "enabled_tools": []},
-        "sai": {
+        OLD_COMMAND: {
             "command": str(env.sai),
             "args": ["mcp", "serve"],
             "env": {"CUSTOM": SECRET},

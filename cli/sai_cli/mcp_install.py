@@ -20,7 +20,6 @@ import sys
 import tempfile
 import tomllib
 from collections.abc import Callable, Mapping, MutableMapping
-from copy import deepcopy
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -28,7 +27,7 @@ from typing import Any
 
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
-from tomlkit.items import InlineTable, Table
+from tomlkit.items import InlineTable
 
 from .core import settings
 
@@ -172,6 +171,7 @@ class RegistrationCheck:
     fix: str | None = None
     changes: tuple[str, ...] = ()
     pinned: bool = False
+    legacy_name: bool = False
 
 
 def normalize_client(name: str) -> str:
@@ -874,7 +874,6 @@ class StaleRegistration:
     registration: Registration
     reason: str
     args: list[str] | None = None  # None means a manual edit is needed.
-    launcher: str | None = None  # Retain a working absolute launcher.
 
 
 def after_server_options(args: list[str], *, root: bool = False) -> list[str] | None:
@@ -936,17 +935,6 @@ def stale_registration(
     cached = binary == NAME and inside(
         Path(on_path or command), uv_cache_dirs(client.environ, client.home)
     )
-    if name == RETIRED_NAME:
-        pinned = path.is_absolute() and on_path is not None and not cached
-        if pinned and binary != NAME:
-            repair = args
-        return StaleRegistration(
-            name,
-            reg,
-            "The client has a retired Sai registration",
-            repair,
-            command if pinned and repair is not None else None,
-        )
     if not on_path:
         return StaleRegistration(
             name, reg, "Sai registration points to a missing command", repair
@@ -978,8 +966,6 @@ def repair_entry(
         or [original.get("command"), *args] != stale.registration.argv
     ):
         raise ClientError("The Sai registration changed concurrently")
-    if stale.name != NAME and NAME in entries:
-        raise ClientError("The current and retired names both have a registration")
     return original
 
 
@@ -993,9 +979,9 @@ def edit_codex_config(
         try:
             source = seen.decode() if seen is not None else ""
             rendered = edit_codex_source(source, target, stale)
-            names = {NAME, stale.name} if stale else {NAME}
-            if unrelated_codex_settings(source, names) != unrelated_codex_settings(
-                rendered, names
+            name = stale.name if stale else NAME
+            if unrelated_codex_settings(source, name) != unrelated_codex_settings(
+                rendered, name
             ):
                 raise ClientError(
                     "Could not preserve settings outside the Sai registration"
@@ -1042,24 +1028,13 @@ def edit_codex_source(
         entry["command"] = target.argv[0]
     if entry.get("args") != target.argv[1:]:
         entry["args"] = target.argv[1:]
-    if stale and stale.name != NAME:
-        entry = deepcopy(entry)
-        del entries[stale.name]
-        source = keep_table_separators(source, doc.as_string())
-    elif original is entry:
+    if original is entry:
         return keep_table_separators(source, doc.as_string())
     if isinstance(entries, InlineTable):
-        if stale and stale.name != NAME:
-            doc = tomlkit.parse(source)
-            entries = doc["mcp_servers"]
         entries[NAME] = entry
         return doc.as_string()
     # Appending a new header to the original text leaves root-level dotted
     # keys in place. Inserting a header through the AST can capture them.
-    if not isinstance(entry, Table) or entry.is_super_table():
-        # Dotted keys and inline entries attached to an ordinary parent can
-        # render a second [mcp_servers] header unless the child has its own.
-        entry = tomlkit.item(dict(entry))
     table = tomlkit.table(is_super_table=True)
     table[NAME] = entry
     addition = tomlkit.document()
@@ -1090,12 +1065,11 @@ def keep_table_separators(source: str, rendered: str) -> str:
     return "".join(result)
 
 
-def unrelated_codex_settings(source: str, names: set[str]) -> dict[str, Any]:
+def unrelated_codex_settings(source: str, name: str) -> dict[str, Any]:
     """Check the resulting TOML independently of the editor's in-memory tree."""
     doc = tomllib.loads(source)
     if entries := doc.get("mcp_servers"):
-        for name in names:
-            entries.pop(name, None)
+        entries.pop(name, None)
     if doc.get("mcp_servers") == {}:
         del doc["mcp_servers"]
     return doc
@@ -1148,27 +1122,23 @@ def repair_path(client: Client, scope: str) -> Path:
 def replace_registration(
     client: Client, stale: StaleRegistration, target: Target
 ) -> None:
-    """Repair the existing entry while preserving its settings."""
+    """Repair the existing entry without changing its name or client policy."""
     scope, name = stale.registration.scope, stale.name
     if stale.args is None or scope in client.read_only_scopes:
         raise ClientError("This registration needs a manual edit")
-    launcher = stale.launcher or target.argv[0]
+    launcher = target.argv[0]
     expected = Target([launcher, *stale.args])
     if isinstance(client, Codex):
         path = client.config_path(scope)
         edit_codex_config(path, expected, stale=stale)
-        actual = client.get(client.neutral_dir(), "user")
+        actual = client.get(client.neutral_dir(), "user", name)
         if actual is None or actual.argv != expected.argv:
             raise ClientError("Codex did not load the repaired Sai registration")
-        if name != NAME and client.get(client.neutral_dir(), "user", name) is not None:
-            raise ClientError("Codex still shows the retired Sai registration")
         return
     path = repair_path(client, scope)
     config = read_client_config(client, scope, path)
     entry = repair_entry(config.entries, stale)
     entry["command"], entry["args"] = launcher, stale.args
-    if name != NAME:
-        config.entries[NAME] = config.entries.pop(name)
     # Publish a complete entry in one rename. In particular, Claude must
     # never observe a replacement that is missing its profile or endpoints.
     if not replace_bytes(
@@ -1203,6 +1173,8 @@ def check_registration(
     if not found:
         return RegistrationCheck(name, "warn", "Sai is not registered", install)
     stale = [issue for _, issue in inspected if issue is not None]
+    legacy_name = any(server == RETIRED_NAME for server, _ in found)
+    legacy_warning = f"Sai retains its existing {RETIRED_NAME} registration name"
     expected_env = server_env(client.environ) if compare_profile else {}
     different_profile = compare_profile and any(
         not reg.matches_sai_home(expected_env) for reg, _ in inspected
@@ -1210,7 +1182,7 @@ def check_registration(
     pinned = target is not None and any(
         reg.argv
         and Path(reg.argv[0]).is_absolute()
-        and (issue is None or issue.launcher)
+        and issue is None
         and Path(reg.argv[0]).resolve() != Path(target.argv[0]).resolve()
         for reg, issue in inspected
     )
@@ -1221,16 +1193,13 @@ def check_registration(
             failures.append(
                 (issue.reason, "Edit the Sai registration in this client's config")
             )
-        elif target is None and not issue.launcher:
+        elif target is None:
             failures.append((issue.reason, "Install a stable Sai launcher on PATH"))
         elif not fix:
             failures.append((issue.reason, "Run `sai doctor` with fixes enabled"))
         else:
             try:
-                replacement = (
-                    target if target is not None else Target([issue.launcher or ""])
-                )
-                replace_registration(client, issue, replacement)
+                replace_registration(client, issue, target)
             except (ClientError, OSError, ValueError, TOMLKitError, TypeError):
                 failures.append(
                     (
@@ -1264,13 +1233,19 @@ def check_registration(
             )
     if failures:
         summary, hint = failures[0]
-        return RegistrationCheck(name, "fail", summary, hint, tuple(changes))
-    if pinned or different_profile:
+        if legacy_name:
+            summary += f". {legacy_warning}"
+        return RegistrationCheck(
+            name, "fail", summary, hint, tuple(changes), legacy_name=legacy_name
+        )
+    if pinned or different_profile or legacy_name:
         warnings = []
         if pinned:
             warnings.append("Sai uses a pinned launcher from a different install")
         if different_profile:
             warnings.append("Sai registration has a different SAI_HOME setting")
+        if legacy_name:
+            warnings.append(legacy_warning)
         return RegistrationCheck(
             name,
             "warn",
@@ -1278,6 +1253,7 @@ def check_registration(
             "Check SAI_HOME in the client registration" if different_profile else None,
             changes=tuple(changes),
             pinned=pinned,
+            legacy_name=legacy_name,
         )
     if not changes:
         return RegistrationCheck(name, "pass", "Sai registration is current")
