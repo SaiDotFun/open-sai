@@ -1182,6 +1182,33 @@ def test_log_writer_honors_external_disable_and_reenable(home):
     ]
 
 
+def test_log_retry_only_stats_config_on_the_caller_thread(home, monkeypatch):
+    monkeypatch.delenv("SAI_LOG", raising=False)
+    (home / "config.toml").write_text("[logs]\nenabled = false\n")
+    log.event("test.disabled")
+    assert log.flush(10)
+
+    operations = []
+
+    def record(frame, event, arg):
+        if event == "c_call" and arg.__name__ in {"stat", "open", "read", "acquire"}:
+            operations.append(arg.__name__)
+        if event == "call" and frame.f_code.co_name in {"read_file", "parse_file"}:
+            operations.append(frame.f_code.co_name)
+
+    previous = sys.getprofile()
+    sys.setprofile(record)
+    try:
+        active = log.active()
+        log.event("test.still.disabled")
+    finally:
+        sys.setprofile(previous)
+
+    assert not active
+    assert operations == ["stat", "stat"]
+    assert not (home / "logs").exists()
+
+
 def test_log_writer_reads_unchanged_config_once(home):
     path = home / "config.toml"
     path.write_text("[logs]\nenabled = true\n")
