@@ -4,23 +4,10 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import pytest
-
-
-@pytest.fixture
-def cli_pair() -> tuple[tuple[str, ...], tuple[str, ...]]:
-    candidate = os.environ.get("SAI_PARITY_BIN")
-    if candidate is None:
-        pytest.skip("set SAI_PARITY_BIN to the Rust sai executable")
-    executable = shutil.which(candidate)
-    if executable is None:
-        pytest.fail("SAI_PARITY_BIN must name an executable")
-    return (sys.executable, "-m", "sai_cli"), (str(Path(executable).absolute()),)
 
 
 def invoke(
@@ -132,7 +119,12 @@ def test_undecodable_environment(
     if setting == "SAI_ENDPOINT":
         assert observed[0] == observed[1]
         assert observed[0][0] == 1
-        assert b"SAI_ENDPOINT: Invalid value for keeper.endpoint" in observed[0][2]
+        assert observed[0][2] == b""
+        error = json.loads(observed[0][1])["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        assert error["message"].startswith(
+            "SAI_ENDPOINT: Invalid value for keeper.endpoint"
+        )
     else:
         assert observed[0][:2] == observed[1][:2]
         assert observed[0][2].startswith(b"SAI_LOG: invalid value for logs.enabled;")
