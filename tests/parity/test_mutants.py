@@ -28,9 +28,11 @@ pytestmark = [
 ]
 
 
-def run_driver(case: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+def run_driver(
+    case: str, env: dict[str, str], *args: str
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
-        [sys.executable, str(HERE / "parity.py"), "--case", case],
+        [sys.executable, str(HERE / "parity.py"), "--case", case, *args],
         cwd=ROOT,
         env=env,
         capture_output=True,
@@ -130,6 +132,17 @@ def test_doctor_offline_rejects_trader_creation_in_both_clis(tmp_path: Path) -> 
         assert (
             f"{side} Persisted state differs from expectation at trader" in run.stdout
         )
+
+
+def test_explicit_reference_takes_precedence_over_lane_pin(tmp_path: Path) -> None:
+    reference = write_mutant(tmp_path, "doctor-create-trader")
+    env = {**os.environ, "SAI_C9A_PYTHON": str(tmp_path / "unused")}
+    env.pop("SAI_PARITY_BIN", None)
+
+    run = run_driver("doctor-offline", env, "--reference", str(reference))
+
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "reference Persisted state differs from expectation at trader" in run.stdout
 
 
 def test_reference_uses_real_uv_with_home_dependent_shim(tmp_path: Path) -> None:

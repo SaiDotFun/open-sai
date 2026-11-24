@@ -87,7 +87,10 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
 
 The Rust CI job sets `SAI_PARITY_PYTHON` to the `sai` executable built from
 the Python tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
-Use that executable to reproduce the release comparison locally.
+To compare every selected manifest case against that same executable, run
+`uv run --locked python tests/parity/parity.py --reference "$SAI_PARITY_PYTHON"`
+with `SAI_PARITY_BIN` set to the Rust binary. The explicit reference applies
+to the CLI cases and the MCP transcripts.
 
 ## Auth Subprocess Cases
 

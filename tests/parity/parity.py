@@ -784,12 +784,28 @@ def main() -> int:
     parser.add_argument(
         "--case", action="append", help="Run matching case IDs (glob, repeatable)"
     )
+    parser.add_argument(
+        "--reference", help="Use this Python sai executable for every selected case"
+    )
     args = parser.parse_args()
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         parser.error(SQLITE_SCHEMA_REQUIREMENT)
     try:
         enter_loopback()
-        uv = resolve_uv()
+        if args.reference is None:
+            reference = [
+                resolve_uv(),
+                "run",
+                "--project",
+                str(ROOT),
+                "--no-sync",
+                "--offline",
+                "sai",
+            ]
+        elif executable := shutil.which(args.reference):
+            reference = [str(Path(executable).absolute())]
+        else:
+            parser.error("--reference must name an executable Python sai")
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         parser.error(str(exc))
     with (HERE / "cases.toml").open("rb") as file:
@@ -811,7 +827,6 @@ def main() -> int:
     ]
     if not selected:
         parser.error("No parity cases matched")
-    reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
     candidate = reference
     c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
         Path(sys.executable).with_name("sai")
@@ -822,7 +837,7 @@ def main() -> int:
             parser.error("SAI_PARITY_BIN must name an executable file or command")
         candidate = [str(Path(executable).absolute())]
     mcp_reference = reference
-    if any(case.mode == "mcp" for case in selected):
+    if args.reference is None and any(case.mode == "mcp" for case in selected):
         if override := os.getenv("SAI_MCP_PARITY_PYTHON"):
             executable = shutil.which(override)
             if not executable:
@@ -841,7 +856,9 @@ def main() -> int:
     expected_differences = 0
     tools: dict[str, str] = {}
     for case in selected:
-        if case.mode == "mcp":
+        if args.reference is not None:
+            oracle = reference
+        elif case.mode == "mcp":
             oracle = mcp_reference
         elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
             # Launch directly so uv cannot shadow the fixture launcher on PATH.
