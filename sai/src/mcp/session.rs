@@ -27,7 +27,7 @@ impl StoredSession {
         if !storage.session_exists() {
             return Self::Missing;
         }
-        let session = match storage.load_session(addr) {
+        let session = match storage.load_session_for_mcp(addr) {
             Ok(session) => session,
             Err(error) => return Self::Unreadable(error.into()),
         };

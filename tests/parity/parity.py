@@ -676,6 +676,32 @@ def expect_native_mcp_info(
     return ", ".join(reasons) or None
 
 
+def project_reference_auth_status_errors(
+    output: list[dict[str, Any]], endpoints: Endpoints
+) -> str | None:
+    """Replace the rejected address that the pinned Python reply quotes."""
+    calls = CALLS["auth-status"]
+    replies = {frame["id"]: frame["result"] for frame in output}
+    changed = False
+    for id_, call in enumerate(calls, 3):
+        addr = call.args.get("addr")
+        if isinstance(addr, str) and call.expected == "SESSION_UNAVAILABLE":
+            result = replies[id_]
+            body = result["content"][0]["text"]
+            prefix = endpoints.expand(addr) + " is not connected;"
+            if body["error"].startswith(prefix):
+                error = (
+                    "Requested account is not connected;" + body["error"][len(prefix) :]
+                )
+                body["error"] = error
+                result["structuredContent"]["result"]["error"] = error
+                result["_toolText"] = rewrite_mcp_fields(
+                    result["_toolText"], {"error": error}
+                )
+                changed = True
+    return "Native MCP auth status omits disconnected addresses" if changed else None
+
+
 def project_reference_lcd_origin(output: dict[str, Any]) -> None:
     """The pinned Python reference still displays the LCD URL path."""
     error = output.get("error")
@@ -754,6 +780,12 @@ def run_case(
             left.output,
             allow_deferred_trade=case.mcp_deferred_trade_exception,
         )
+        if case.mcp_profile == "auth-status":
+            auth_status = project_reference_auth_status_errors(left.output, endpoints)
+            expected = (
+                ", ".join(reason for reason in (expected, auth_status) if reason)
+                or None
+            )
     diffs = differences(left, right)
     if (
         diffs

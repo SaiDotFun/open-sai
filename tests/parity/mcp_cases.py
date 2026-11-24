@@ -24,6 +24,8 @@ def handshake(version: str) -> tuple[dict[str, Any], ...]:
     )
 
 
+REJECTED_AUTH_ADDRESS = "https://keeper.invalid/private/query?key=fixture-mcp-addr"
+
 ACCOUNT_READS = (
     "account_positions",
     "account_history",
@@ -119,6 +121,7 @@ CALLS = {
         Call("auth_status"),
         Call("auth_status", {"addr": False}, "invalid"),
         Call("auth_status", {"addr": "{other_addr}"}, "SESSION_UNAVAILABLE"),
+        Call("auth_status", {"addr": REJECTED_AUTH_ADDRESS}, "SESSION_UNAVAILABLE"),
         Call("auth_status", expected="SESSION_EXPIRED", session="expired"),
         Call("auth_status", expected="SESSION_UNAVAILABLE", session="other-endpoint"),
     ),

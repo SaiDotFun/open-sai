@@ -60,6 +60,10 @@ unregistered operand. Python returns a fixed diagnostic and omits argument
 values from auth command logs. Native auth logging also differs from Python
 when the command includes an argument value.
 
+Native MCP `auth_status` uses "Requested account" for disconnected addresses
+so an accidental URL in `addr` cannot reach the client transcript. The parity
+case rewrites that address in the pinned Python reference only.
+
 ## Compare MCP Stdio
 
 Check out Python commit `1c671b231b0fc968a44ec8dd520e67ea28e25b7f` in a

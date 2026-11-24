@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp_cases import REJECTED_AUTH_ADDRESS
 from scenarios import ADDRESS, INTENT, Endpoints, child_env, loopback, seed_home
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
@@ -175,6 +176,20 @@ def test_cancelling_read_closes_keeper_connection(
         assert endpoints.interrupt_closed.wait(3), "Keeper connection remained open"
         stdio.send("ping", id_=3)
         assert stdio.receive() == {"jsonrpc": "2.0", "id": 3, "result": {}}
+
+
+def test_auth_status_omits_a_rejected_address(native: Path, tmp_path: Path) -> None:
+    with (
+        loopback("normal") as endpoints,
+        server(native, tmp_path / "home", endpoints, seed="session") as stdio,
+    ):
+        result = stdio.call(2, "auth_status", addr=REJECTED_AUTH_ADDRESS)
+        assert result["isError"] is False
+        assert "fixture-mcp-addr" not in json.dumps(result)
+        body = json.loads(result["content"][0]["text"])
+        assert body["code"] == "SESSION_UNAVAILABLE"
+        assert body["error"].startswith("Requested account is not connected;")
+        assert not endpoints.wire
 
 
 def test_short_intent_wait_polls_while_eight_long_waits_are_pending(
