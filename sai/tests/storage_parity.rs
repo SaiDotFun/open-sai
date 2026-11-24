@@ -85,11 +85,13 @@ fn missing_home_status_and_list_have_no_side_effects() {
         .args(["--json", "auth", "status"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
+    assert_eq!(output.status.code(), Some(6));
+    assert!(output.stderr.is_empty());
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "SIGNED_OUT");
     assert_eq!(
-        output.stderr,
-        b"Error: No Sai session; run `sai auth import` or `sai auth login NAME`\n"
+        error["message"],
+        "No Sai session; run `sai auth import` or `sai auth login NAME`"
     );
     assert!(!home.exists());
 }
@@ -200,11 +202,18 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(code), "{variable}");
-        let stderr = String::from_utf8(output.stderr).unwrap();
-        assert!(!stderr.contains(marker), "{variable} echoed its value");
-        assert!(stderr.contains(variable) && stderr.contains(key));
+        let diagnostic = if code == 0 {
+            String::from_utf8(output.stderr).unwrap()
+        } else {
+            assert!(output.stderr.is_empty());
+            let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+            assert_eq!(error["code"], "INVALID_REQUEST");
+            error["message"].as_str().unwrap().to_owned()
+        };
+        assert!(!diagnostic.contains(marker), "{variable} echoed its value");
+        assert!(diagnostic.contains(variable) && diagnostic.contains(key));
         if variable == "SAI_UPDATE_AUTO" {
-            assert!(stderr.contains("expected true, false, yes, no, on, off, 1, or 0"));
+            assert!(diagnostic.contains("expected true, false, yes, no, on, off, 1, or 0"));
         }
     }
 
@@ -370,11 +379,13 @@ fn rust_saved_session_round_trips_in_python() {
             ENDPOINT.into(),
         ))
         .unwrap();
-    parity(
+    let status = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "status"],
-        1,
+        6,
     );
+    let error: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
     let output = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "list"],

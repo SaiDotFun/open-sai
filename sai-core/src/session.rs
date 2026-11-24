@@ -1,18 +1,27 @@
 //! Endpoint and expiry checks shared by the CLI and other front ends.
 
-use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
+use std::sync::LazyLock;
 
-use crate::storage::{Session, SessionError, Storage, StorageError, StorageEvent};
+use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
+use regex::Regex;
+
+use crate::{
+    errors::{Code, SaiError},
+    log,
+    storage::{Session, SessionError, Storage, StorageError, StorageEvent},
+};
 
 pub fn expired(session: &Session, now: DateTime<Utc>) -> Result<bool, SessionError> {
     let expires_at = parse_expiry(session.expires_at())
-        .ok_or_else(|| SessionError::new("Stored session has an invalid expiry"))?;
+        .ok_or_else(|| SessionError::new(
+            "Stored session has an invalid expiry; run `sai auth import` or `sai auth login NAME` again",
+        ))?;
     Ok(expires_at <= now)
 }
 
 // Stored Keeper expiries follow Python's datetime.fromisoformat. Convert to
 // UTC for comparisons and retain the original text in the session.
-fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_expiry(text: &str) -> Option<DateTime<Utc>> {
     let date_end = date_length(text.as_bytes())?;
     let date = text.get(..date_end)?;
     let tail = text.get(date_end..)?;
@@ -120,7 +129,14 @@ impl Storage<'_> {
         endpoint: &str,
         addr: Option<&str>,
     ) -> Result<Session, StorageError> {
-        let session = self.load_session(addr)?;
+        let session = self.load_session(addr).map_err(|mut error| {
+            if let StorageError::Session(SessionError(failure)) = &mut error
+                && failure.code == Code::SignedOut
+            {
+                failure.hint = Some(self.sign_in_hint(endpoint, addr));
+            }
+            error
+        })?;
         self.check_active(&session, endpoint)?;
         Ok(session)
     }
@@ -136,9 +152,50 @@ impl Storage<'_> {
                 addr: session.addr(),
                 expires_at: session.expires_at(),
             });
-            return Err(SessionError::new("Trading session expired; sign in again"));
+            let mut error = SaiError::new(
+                Code::SessionExpired,
+                "Trading session expired; sign in again",
+            );
+            error.hint = Some(self.sign_in_hint(endpoint, Some(session.addr())));
+            return Err(SessionError(error));
         }
         Ok(())
+    }
+
+    fn sign_in_hint(&self, endpoint: &str, addr: Option<&str>) -> String {
+        static PLAIN_KEEPER_URL: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\Ahttps?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query\z")
+                .expect("valid Keeper URL pattern")
+        });
+        let flag = if PLAIN_KEEPER_URL.is_match(endpoint)
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| log::redact(home, endpoint) == endpoint)
+        {
+            shell_quote(endpoint)
+        } else {
+            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
+                .into()
+        };
+        let mut hint = format!("sai --endpoint {flag} auth login NAME");
+        if let Some(addr) = addr {
+            hint.push_str(" --addr ");
+            hint.push_str(&shell_quote(addr));
+        }
+        hint
+    }
+}
+
+fn shell_quote(text: &str) -> String {
+    if !text.is_empty()
+        && text
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&byte))
+    {
+        text.into()
+    } else {
+        format!("'{}'", text.replace('\'', "'\"'\"'"))
     }
 }
 

@@ -309,6 +309,16 @@ impl fmt::Display for SettingsError {
 
 impl std::error::Error for SettingsError {}
 
+impl From<SettingsError> for crate::errors::SaiError {
+    fn from(error: SettingsError) -> Self {
+        if error.is_uneditable() {
+            Self::usage(error.to_string())
+        } else {
+            Self::new(crate::errors::Code::InvalidRequest, error.to_string())
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Source {
     Flag,
