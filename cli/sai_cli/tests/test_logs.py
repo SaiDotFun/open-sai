@@ -534,6 +534,34 @@ def test_command_start_keeps_only_the_configured_endpoint_origin(home):
     assert marker not in raw_logs(home)
 
 
+@pytest.mark.parametrize(
+    ("prefix", "inline", "template"),
+    [
+        (("--endpoint",), False, "ftp://{marker}.invalid"),
+        (("config", "set", "keeper.endpoint"), False, "ftp://{marker}.invalid"),
+        (("mcp", "serve", "--ws-endpoint"), True, "https://{marker}.invalid"),
+        (("--lcd-endpoint",), True, "wss://{marker}.invalid"),
+        (("--endpoint",), False, "https://{marker}.invalid/#fragment"),
+    ],
+)
+def test_command_start_redacts_rejected_parseable_endpoints(
+    home, prefix, inline, template
+):
+    marker = "fixture-rejected-endpoint"
+    endpoint = template.format(marker=marker)
+    suffix = ("config", "list") if prefix[0].startswith("--") else ()
+    if inline:
+        args = [*prefix[:-1], f"{prefix[-1]}={endpoint}"]
+        shown = [*prefix[:-1], f"{prefix[-1]}=[redacted]"]
+    else:
+        args = [*prefix, endpoint]
+        shown = [*prefix, "[redacted]"]
+
+    assert run_cli("--json", *args, *suffix)[0] == 2
+    assert events(home, "command.start")[0]["argv"] == ["--json", *shown, *suffix]
+    assert marker not in raw_logs(home)
+
+
 def test_urls_are_reduced_to_their_origin():
     url = (
         f"https://user:{URL_PASSWORD}@keeper.example:8443/{PATH_KEY}/q?key={URL_KEY}#f"

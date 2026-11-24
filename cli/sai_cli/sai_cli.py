@@ -147,26 +147,30 @@ def audit_argv(args: list[str], config_set_at: int | None) -> list[log.Arg]:
             if spec is None:
                 safe[value_at] = "[redacted]"
             elif spec.kind == "url":
-                safe[value_at] = audit_origin(safe[value_at])
+                safe[value_at] = audit_origin(key, safe[value_at])
             else:
                 try:
                     sai_settings.parse_value(key, safe[value_at])
                 except sai_settings.InvalidSetting:
                     safe[value_at] = "[redacted]"
 
-    endpoint_options = {option for option, _ in GLOBAL_FLAGS}
+    endpoint_options = dict(GLOBAL_FLAGS)
     indexed = iter(enumerate(safe))
     for index, token in indexed:
         option, equals, value = token.partition("=")
-        if option in endpoint_options:
+        if key := endpoint_options.get(option):
             if equals:
-                safe[index] = f"{option}={audit_origin(value)}"
+                safe[index] = f"{option}={audit_origin(key, value)}"
             elif next(indexed, None) is not None:
-                safe[index + 1] = audit_origin(safe[index + 1])
+                safe[index + 1] = audit_origin(key, safe[index + 1])
     return log.argv(safe)
 
 
-def audit_origin(value: str) -> str:
+def audit_origin(key: str, value: str) -> str:
+    try:
+        sai_settings.check_value(key, value)
+    except sai_settings.InvalidSetting:
+        return "[redacted]"
     origin = log.origin(value)
     return "[redacted]" if origin == log.REDACTED_URL else origin
 
