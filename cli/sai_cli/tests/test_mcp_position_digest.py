@@ -57,6 +57,7 @@ class Position:
     risk_block: int = 90
     cap: str | None = "5"
     caps_on_position_read: deque[str | None] = field(default_factory=deque)
+    collateral_on_position_read: deque[int | None] = field(default_factory=deque)
     reported_height: int | None = 120
     cache_contract_queries: bool = False
     drop_pinned_height: bool = False
@@ -187,6 +188,10 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 if position.logout_on_position_read:
                     assert storage.delete_session(ADDR) == ADDR
                     position.logout_on_position_read = False
+                if position.collateral_on_position_read:
+                    collateral = position.collateral_on_position_read.popleft()
+                    if collateral is not None:
+                        position.collateral = collateral
                 if position.caps_on_position_read:
                     cap = position.caps_on_position_read.popleft()
                     if cap is not None:
@@ -1750,7 +1755,33 @@ def test_cli_and_mcp_have_the_same_position_rejection(
     assert position.submitted == []
 
 
-def test_leverage_cut_accepts_exactly_the_required_available_balance(position_service):
+def test_margin_refuses_position_drift_during_rejection_check(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            request = {"trade_id": 7, "direction": "add", "amount": "1"}
+            quote = await call(client, "preview_margin", request)
+            # Both rebuilt quotes and the position comparison still match.
+            # The rejection check's own position read sees the resized trade.
+            position.collateral_on_position_read.extend([None, None, None, 3_000_000])
+            result = await call(
+                client,
+                "trade_margin",
+                {**request, "preview_digest": quote["previewDigest"]},
+            )
+            assert result["code"] == "PREVIEW_MISMATCH"
+            assert "final preview check" in result["error"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("target", "required"), [("5", "100"), ("4", "150")])
+def test_leverage_submit_rechecks_balance_after_confirmation(
+    position_service, target, required
+):
     position, base_url = position_service
     position.preview_inputs = True
     position.collateral = 100_000_000
@@ -1771,13 +1802,15 @@ def test_leverage_cut_accepts_exactly_the_required_available_balance(position_se
                 "trade_leverage",
                 {
                     "trade_id": 7,
-                    "leverage": "4",
+                    "leverage": target,
                     "preview_digest": quote["previewDigest"],
                 },
             )
             assert refused["code"] == "PREVIEW_MISMATCH"
             assert_rejected_preview(
-                refused["preview"], "InsufficientDepositBalance", "150.000000 USDC"
+                refused["preview"],
+                "InsufficientDepositBalance",
+                f"{required}.000000 USDC",
             )
             assert (
                 refused["error"]

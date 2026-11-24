@@ -557,5 +557,13 @@ name = "trade-concurrent-close"
 args = ["--json", "trade", "close", "7"]
 seed = "session"
 server = "concurrent-close"
-wire = ["recordUserIntent"]
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
+    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "recordUserIntent",
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
+    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

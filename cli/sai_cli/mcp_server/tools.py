@@ -137,6 +137,8 @@ def describe(exc: Exception) -> dict[str, Any]:
         extra = {} if exc.preview is None else {"preview": exc.preview}
         reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
         return error(reason or failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.ExecutionRejected):
+        return error(failure.message, failure.code, preview=exc.preview)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
             return error(failure.message, Code.PREVIEW_MISMATCH)

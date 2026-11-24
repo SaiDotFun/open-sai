@@ -383,6 +383,8 @@ def close_estimates(
     state: margin.PositionSnapshot | None,
     trade_id: int,
     reduce_by: int | None,
+    *,
+    require_unchanged: bool = False,
 ) -> dict[str, Any]:
     """Check Perp's liquidation route before quoting the voluntary fee components."""
     unknown = unavailable(
@@ -509,6 +511,9 @@ def close_estimates(
             triggered=reduce_by is not None,
             available_collateral=collateral,
         )
+    except margin.PositionChanged:
+        if require_unchanged:
+            raise
     except READ_ERRORS:
         pass
     return result
@@ -521,6 +526,7 @@ def position_estimates(
     *,
     target: Decimal | None = None,
     quoted_effective: Decimal | None = None,
+    require_unchanged: bool = False,
 ) -> dict[str, Any]:
     """Quote leverage or TP/SL changes after checking the after-hours guard."""
     unknown = unavailable(
@@ -550,8 +556,12 @@ def position_estimates(
                 "reason": "This action changes only TP/SL triggers.",
             },
         )
+    except margin.PositionChanged:
+        if require_unchanged:
+            raise
     except READ_ERRORS:
-        return result
+        pass
+    return result
 
 
 def _position_change_estimates(liq: dict[str, Any]) -> dict[str, Any]:

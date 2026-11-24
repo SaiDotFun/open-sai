@@ -353,11 +353,12 @@ def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
 def verified_position_height(lcd: str, state: PositionSnapshot, trade_id: int) -> str:
     latest, height = _latest_position(lcd, state, trade_id)
     if (
-        height is None
-        or not _same_position(state.raw, latest)
+        not _same_position(state.raw, latest)
         or latest.get("long") is not state.raw.get("long")
         or latest.get("open_price") != state.raw.get("open_price")
     ):
+        raise PositionChanged("Position changed during the final preview check.")
+    if height is None:
         raise ValueError("Cannot verify the quoted position at the LCD query height")
     return height
 
