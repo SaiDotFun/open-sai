@@ -706,7 +706,7 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
         (key.parse_value(raw), Source::Flag)
     } else if let Some(raw) = env.raw(key) {
         let value = raw.to_str().map_or_else(
-            || Err(key.invalid_env_value()),
+            || Err(SettingsError::invalid(key.invalid_env_value().message)),
             |raw| {
                 key.parse_value(raw).map_err(|error| {
                     if error.invalid_endpoint {
