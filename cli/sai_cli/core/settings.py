@@ -24,9 +24,12 @@ from types import MappingProxyType
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+import httpx
 import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from tomlkit.items import Comment, Null, Table, Trivia
+from websockets.exceptions import InvalidURI
+from websockets.uri import parse_uri
 
 from . import keeper, margin, stream
 
@@ -40,6 +43,7 @@ LENIENT_SECTIONS = frozenset({"logs"})
 _RANK = {"flag": 0, "env": 1, "file": 2, "default": 3}
 _TRUE = ("true", "1", "yes", "on")
 _FALSE = ("false", "0", "no", "off")
+_URL_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
 
 
 class SettingsError(ValueError):
@@ -213,6 +217,9 @@ def parse_value(key: str, raw: str) -> str | bool | int:
                 f"Invalid value {raw!r} for {key}: expected a whole number, 1 or more"
             )
         return check_value(key, int(text))
+    # Keep raw control characters that stripping surrounding whitespace removed.
+    if text != raw and _URL_CONTROL.search(raw):
+        text = raw
     return check_value(key, text)
 
 
@@ -236,9 +243,6 @@ def check_value(key: str, value: Any) -> str | bool | int:
         hostname = parts.hostname
         # urlsplit defers port validation until the property is read.
         _ = parts.port
-    except ValueError:
-        pass
-    else:
         # Older urlsplit versions ignore text around a bracketed host.
         if "[" in parts.netloc or "]" in parts.netloc:
             host_port = parts.netloc.rpartition("@")[2]
@@ -255,14 +259,17 @@ def check_value(key: str, value: Any) -> str | bool | int:
             and scheme.lstrip().lower() == parts.scheme
             and parts.scheme in spec.schemes
             and hostname
+            and not _URL_CONTROL.search(value)
         ):
-            # urlsplit strips tabs and newlines before it parses the authority.
             authority = re.split(r"[/#?]", rest, maxsplit=1)[0]
-            if not any(
-                char.isspace() or char == "\\" or ord(char) < 32 or ord(char) == 127
-                for char in authority
-            ):
-                return value
+            if not any(char.isspace() or char == "\\" for char in authority):
+                if parts.scheme in ("ws", "wss"):
+                    parse_uri(value)
+                    return value
+                if httpx.URL(value).is_absolute_url:
+                    return value
+    except (ValueError, httpx.InvalidURL, InvalidURI):
+        pass
     raise InvalidEndpoint(
         f"Invalid value for {key}: expected a URL starting with"
         f" {' or '.join(s + '://' for s in spec.schemes)}"

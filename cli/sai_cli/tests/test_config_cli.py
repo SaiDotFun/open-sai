@@ -141,11 +141,55 @@ def test_config_set_rejects_malformed_ipv6_authority(tmp_path, authority):
     assert not (tmp_path / ".config.lock").exists()
 
 
-def test_config_set_accepts_ipv6_with_port():
+@pytest.mark.parametrize("padding", ["", "\xa0"])
+def test_config_set_accepts_ipv6_with_port(padding):
     endpoint = "https://[::1]:8443/path"
-    result = sai("--json", "config", "set", "keeper.endpoint", endpoint)
+    result = sai(
+        "--json", "config", "set", "keeper.endpoint", f"{padding}{endpoint}{padding}"
+    )
     assert result.exit_code == 0
     assert json.loads(result.stdout)["value"] == endpoint
+
+
+@pytest.mark.parametrize(
+    ("key", "endpoint"),
+    [
+        ("keeper.endpoint", "https://127.0.0.999/query"),
+        ("keeper.endpoint", "https://keeper.example/que\try"),
+        ("keeper.endpoint", "https://keeper.example/query\t"),
+        ("lcd.endpoint", "https://127.0.0.999/query"),
+        ("keeper.ws_endpoint", "wss://keeper.example/query#fragment"),
+    ],
+)
+def test_config_set_rejects_endpoints_the_transport_cannot_parse(
+    tmp_path, key, endpoint
+):
+    result = sai("--json", "config", "set", key, endpoint)
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert key in error["message"]
+    assert endpoint not in error["message"]
+    assert result.stderr == ""
+    assert not (tmp_path / "config.toml").exists()
+    assert not (tmp_path / ".config.lock").exists()
+
+
+@pytest.mark.parametrize(
+    "endpoint", ["https://127.0.0.999/query", "https://127.0.0.1:9/que\try"]
+)
+def test_market_list_rejects_an_unparseable_endpoint_from_config(tmp_path, endpoint):
+    path = tmp_path / "config.toml"
+    path.write_text(f"[keeper]\nendpoint = {json.dumps(endpoint)}\n")
+
+    result = sai("--json", "market", "list")
+
+    assert result.exit_code == 2
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INVALID_REQUEST"
+    assert "keeper.endpoint" in error["message"]
+    assert result.stderr == ""
 
 
 @pytest.mark.parametrize("source", ["set", "flag", "env", "file"])
