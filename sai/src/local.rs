@@ -165,7 +165,7 @@ pub fn intent(
                 .enable_all()
                 .build()
                 .map_err(|_| SaiError::internal())?;
-            let data = runtime.block_on(reconcile::reconcile(
+            let mut data = runtime.block_on(reconcile::reconcile(
                 settings.endpoint(),
                 &addr,
                 key.as_deref(),
@@ -173,6 +173,7 @@ pub fn intent(
                 &storage,
                 events,
             ))?;
+            keeper::scrub_intent_errors(&env.home, &mut data);
             emit(&data, json)
         }
         IntentCommand::Local { addr } => {

@@ -3,6 +3,7 @@
 mod queries;
 
 use std::{
+    path::Path,
     pin::pin,
     sync::Arc,
     time::{Duration, Instant},
@@ -272,6 +273,51 @@ pub(crate) fn truthy(value: &Value) -> bool {
         Value::String(value) => !value.is_empty(),
         Value::Array(value) => !value.is_empty(),
         Value::Object(value) => !value.is_empty(),
+    }
+}
+
+/// Render the error fields using PR 69's public intent record policy.
+/// Ledger reconciliation must read the original observation first.
+pub fn scrub_intent_errors(home: &Path, data: &mut Map<String, Value>) {
+    let Some(rows) = data.get_mut("userIntents").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let scrub = log::scrubber(home);
+    for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+        let code = row.get("errorCode");
+        if !code.is_some_and(truthy)
+            && !row.get("errorMsg").is_some_and(truthy)
+            && !matches!(
+                row.get("lifecycleStep").and_then(Value::as_str),
+                Some("jwt_failed" | "sign_reject" | "sign_failed" | "exec_req_fail" | "exec_fail")
+            )
+        {
+            continue;
+        }
+        let code = match code.and_then(Value::as_str) {
+            Some(
+                code @ ("SLIPPAGE"
+                | "simulation_failed"
+                | "admission_expired"
+                | "broadcast_rejected"
+                | "chain_execution_failed"
+                | "market_order_expired"
+                | "market_order_fill_failed"
+                | "market_order_trading_paused"
+                | "market_order_market_closed"
+                | "market_order_trade_not_open"
+                | "market_order_outcome_not_indexed"
+                | "intent_already_used"
+                | "below_minimum"
+                | "insufficient_idle"),
+            ) => json!(code),
+            _ => json!(Code::KeeperError),
+        };
+        row.insert("errorCode".into(), scrub(code.into()));
+        row.insert(
+            "errorMsg".into(),
+            scrub(Field::Untrusted("Keeper reported an intent error.".into())),
+        );
     }
 }
 

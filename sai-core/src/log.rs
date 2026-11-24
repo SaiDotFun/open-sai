@@ -97,6 +97,13 @@ pub fn redact(home: &std::path::Path, text: &str) -> String {
     privacy::replace_tokens(text, &known)
 }
 
+/// Use the event writer's privacy rules for Keeper-controlled display fields.
+pub fn scrubber(home: &std::path::Path) -> impl Fn(Field) -> Value {
+    Tokens::default().refresh(home);
+    let known = Arc::clone(&KNOWN.lock().unwrap_or_else(|error| error.into_inner()));
+    move |field| field.clean(&known)
+}
+
 #[derive(Default)]
 struct Queue {
     chars: AtomicUsize,

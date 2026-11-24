@@ -200,6 +200,60 @@ class Step:
     json_output: bool = True
 
 
+def public_intent_errors(output: bytes, *, compact: bool) -> bytes:
+    """Apply PR 69's error fields to stdout from the pinned Python CLI."""
+    if not output:
+        return output
+    document = json.loads(output)
+    if not isinstance(document, dict) or not isinstance(
+        document.get("userIntents"), list
+    ):
+        return output
+    safe_record = getattr(keeper, "safe_intent_record", None)
+    for row in document["userIntents"]:
+        if safe_record is not None:
+            # PR 69 applies this projection in MCP. Use its error fields as
+            # soon as the Python reference includes the helper.
+            public = safe_record(row)
+        elif (
+            row.get("errorCode")
+            or row.get("errorMsg")
+            or row.get("lifecycleStep")
+            in {
+                "jwt_failed",
+                "sign_reject",
+                "sign_failed",
+                "exec_req_fail",
+                "exec_fail",
+            }
+        ):
+            # The pinned reference exposes raw fields. Listed codes cover its
+            # lifecycle replay fixtures. Production Rust owns the full allowlist.
+            code = row.get("errorCode")
+            known = {
+                "admission_expired",
+                "broadcast_rejected",
+                "simulation_failed",
+                "chain_execution_failed",
+                "market_order_outcome_not_indexed",
+                "market_order_expired",
+                "market_order_fill_failed",
+                "market_order_trading_paused",
+                "market_order_market_closed",
+                "market_order_trade_not_open",
+            }
+            public = {
+                "errorCode": code if code in known else "KEEPER_ERROR",
+                "errorMsg": "Keeper reported an intent error.",
+            }
+        else:
+            continue
+        for field in ("errorCode", "errorMsg"):
+            if field in public:
+                row[field] = public[field]
+    return (json.dumps(document, indent=None if compact else 2) + "\n").encode()
+
+
 def compare(
     cli_pair: tuple[CLI, CLI],
     root: Path,
@@ -250,7 +304,10 @@ def compare(
                     assert (
                         next(row for row in rows if row[0] == "foreign")[4] == "unknown"
                     )
-                runs.append((result.stdout, result.stderr, list(requests), state))
+                stdout = result.stdout
+                if index == 0 and step.code == 0:
+                    stdout = public_intent_errors(stdout, compact=step.json_output)
+                runs.append((stdout, result.stderr, list(requests), state))
             observed.append((runs, read_events(home)))
         assert observed[0] == observed[1]
 
@@ -620,3 +677,57 @@ def test_expired_auth_status(
         assert error["hint"].endswith(f"auth login NAME --addr {ADDR}")
         observed.append((result.stdout, read_events(home)))
     assert observed[0] == observed[1]
+
+
+@pytest.mark.parametrize("json_output", [True, False])
+@pytest.mark.parametrize("known_code", [True, False])
+def test_public_intent_status_scrubs_keeper_message(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    json_output: bool,
+    known_code: bool,
+) -> None:
+    token = "synthetic-stored-session"
+    private = f"Keeper message: {token} " + "x" * 500
+    with replay() as (endpoint, replies, requests):
+        expected = "market_order_expired" if known_code else "KEEPER_ERROR"
+        for index, cli in enumerate(cli_pair):
+            home = tmp_path / str(index)
+            monkeypatch.setenv("SAI_HOME", str(home))
+            with log.silenced():
+                storage.save_session(
+                    {
+                        "evmAddress": ADDR,
+                        "endpoint": endpoint,
+                        "token": token,
+                        "expiresAt": "2099-01-01T00:00:00Z",
+                    }
+                )
+            row = RESPONSES["market_order_expired"]["data"]["userIntents"][0]
+            row = {
+                **row,
+                "errorMsg": private,
+                "errorCode": expected if known_code else token,
+            }
+            requests.clear()
+            replies.append(response({"data": {"userIntents": [row]}}))
+            args = ["--endpoint", endpoint]
+            if json_output:
+                args.append("--json")
+            result = invoke(cli, home, *args, "intent", "status", ADDR, "--key", KEY)
+            assert result.returncode == 0
+            assert not result.stderr
+            assert [request.body for request in requests] == [
+                wire(keeper.INTENTS, user=ADDR, key=KEY)
+            ]
+            output = result.stdout
+            if index == 0:
+                # Until the reference CLI uses the projection, compare its
+                # public error fields. The Rust side is always checked raw.
+                output = public_intent_errors(output, compact=json_output)
+            assert token.encode() not in output
+            assert private.encode() not in output
+            public = json.loads(output)["userIntents"][0]
+            assert public["errorCode"] == expected
+            assert public["errorMsg"] == "Keeper reported an intent error."
