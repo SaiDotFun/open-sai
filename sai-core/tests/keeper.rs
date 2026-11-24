@@ -10,7 +10,10 @@ use sai_core::{
     keeper::{INTENTS, Keeper, MARKETS, SUBMIT},
     log::{EventContext, Surface},
     storage::{Session, Storage},
-    trade::{Confirmation, OpenTrade, OrderType, Side, SubmitOptions, Trading, preview_digest},
+    trade::{
+        Confirmation, OpenTrade, OrderType, PreviewMode, Side, SubmitOptions, Trading,
+        preview_digest,
+    },
 };
 use serde_json::{Map, Value, json};
 
@@ -52,24 +55,27 @@ fn read_request(stream: &mut TcpStream) -> (Vec<String>, Vec<u8>) {
 }
 
 #[tokio::test]
-async fn shared_market_submit_refreshes_before_reserving() {
+async fn shared_market_refusal_returns_refreshed_estimates_before_reserving() {
     let listener = listener();
     let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
+    let server_listener = listener.try_clone().unwrap();
     let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let (_, bytes) = read_request(&mut stream);
-        let req: Value = serde_json::from_slice(&bytes).unwrap();
-        let response = json!({"data": {"perp": {"borrowings": [
-            {"marketId": 3, "price": "102", "isOpen": true, "collateralToken": {"symbol": "USDC"}}
-        ]}}})
-        .to_string();
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-            response.len()
-        )
-        .unwrap();
-        req["query"].clone()
+        for price in ["100", "102"] {
+            let (mut stream, _) = server_listener.accept().unwrap();
+            let (_, bytes) = read_request(&mut stream);
+            let req: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(req["query"], MARKETS);
+            let response = json!({"data": {"perp": {"borrowings": [
+                {"marketId": 3, "price": price, "isOpen": true, "collateralToken": {"symbol": "USDC"}}
+            ]}}})
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                response.len()
+            )
+            .unwrap();
+        }
     });
     let home = tempfile::tempdir().unwrap();
     let storage = Storage::new(home.path());
@@ -96,7 +102,13 @@ async fn shared_market_submit_refreshes_before_reserving() {
     }
     .preview()
     .unwrap();
-    preview.reference_price = Some("100".into());
+    preview = trading
+        .prepare_preview(preview, Some(&session), PreviewMode::Mcp)
+        .await
+        .unwrap();
+    let original = preview.confirmed_output(Some(addr));
+    assert_eq!(original["referencePrice"], "100");
+    assert_eq!(original["estimates"]["worstCaseFill"]["price"], "102.01");
     let digest = preview_digest(&preview, Some(addr));
     let result = trading
         .submit(
@@ -108,8 +120,26 @@ async fn shared_market_submit_refreshes_before_reserving() {
             },
         )
         .await;
-    assert_eq!(server.join().unwrap(), MARKETS);
-    assert_eq!(result.err().unwrap().code, Code::PriceMoved);
+    let error = result.err().unwrap();
+    assert_eq!(error.code, Code::PriceMoved);
+    let replacement = &error.details.unwrap()["preview"];
+    assert_eq!(replacement["referencePrice"], "102");
+    let fill = &replacement["estimates"]["worstCaseFill"];
+    assert_eq!(fill["status"], "bound");
+    assert_eq!(fill["price"], "104.0502");
+    assert_eq!(fill["reference"]["price"], "102");
+    assert_ne!(replacement["previewDigest"], digest);
+    preview.reference_price = Some("102".into());
+    assert_eq!(
+        replacement["previewDigest"],
+        preview_digest(&preview, Some(addr))
+    );
+    server.join().unwrap();
+    listener.set_nonblocking(true).unwrap();
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
 
