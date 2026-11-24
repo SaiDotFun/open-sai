@@ -91,6 +91,25 @@ def rows(home: Path) -> list[tuple[Any, ...]]:
         ).fetchall()
 
 
+def test_numeric_keeper_price_rounds_to_even(
+    trade_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    for index, cli in enumerate(trade_pair):
+        with loopback("trade-accepted", market_price=68669.000244140625) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, result, _ = run(cli, home, endpoints, OPEN, python=index == 0)
+            assert code == 0
+            assert [request.label for request in endpoints.wire] == [
+                "borrowings",
+                "recordUserIntent",
+            ]
+            body = endpoints.wire[-1].variables["input"]["intent"]["body"]
+            assert (
+                body["intentPrice"] == result["referencePrice"] == "68669.00024414062"
+            )
+
+
 def trade_events(home: Path, key: str, endpoint: str) -> list[tuple[str, str | None]]:
     events = [
         json.loads(line)

@@ -198,7 +198,20 @@ fn decimal_price(value: &Value) -> Result<String, SaiError> {
             let value = value
                 .as_f64()
                 .ok_or_else(|| invalid("Current price must be a positive finite decimal"))?;
-            format!("{value:?}")
+            // Debug supplies the shortest precision and Python's notation
+            // cutoffs. Precision formatting breaks decimal ties toward even.
+            let shortest = format!("{value:?}");
+            let (mantissa, scientific) = shortest
+                .split_once('e')
+                .map_or((shortest.as_str(), false), |(mantissa, _)| (mantissa, true));
+            let precision = mantissa
+                .split_once('.')
+                .map_or(0, |(_, digits)| digits.len());
+            if scientific {
+                format!("{value:.precision$e}")
+            } else {
+                format!("{value:.precision$}")
+            }
         } else {
             raw
         };
@@ -247,6 +260,7 @@ mod tests {
     #[test]
     fn market_price_formats_numbers_and_decimal_strings_like_python() {
         for (wire, expected) in [
+            ("68669.000244140625", "68669.00024414062"),
             ("123.000", "123.0"),
             ("1e-7", "0.0000001"),
             ("1e16", "10000000000000000"),

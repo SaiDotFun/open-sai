@@ -158,7 +158,9 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
 
 
 @contextmanager
-def loopback(scenario: str) -> Generator[Endpoints]:
+def loopback(
+    scenario: str, *, market_price: float | None = None
+) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
     admission = Admission()
@@ -169,6 +171,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
     borrowing = position["perpBorrowing"]
     recorded_markets = markets["data"]["perp"]["borrowings"]
     market = {**recorded_markets[0], "marketId": borrowing["marketId"]}
+    if market_price is not None:
+        market["price"] = market_price
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
