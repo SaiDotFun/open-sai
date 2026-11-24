@@ -317,6 +317,19 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                         self.reject(f"Wrong Keeper variables for {name}")
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif scenario == "read-partial-error":
+                        self.reply(
+                            {**responses[name], "errors": [{"message": "partial read"}]}
+                        )
+                    elif scenario == "read-partial" and name == "trades":
+                        partial = {
+                            **position,
+                            "state": None,
+                            "collateralAmount": "18446744073709551616123456",
+                        }
+                        self.reply({"data": {"perp": {"trades": [partial]}}})
+                    elif scenario == "read-empty" and name == "tradeHistory":
+                        self.reply({"data": {"perp": {"tradeHistory": []}}})
                     else:
                         self.reply(responses[name])
                     return

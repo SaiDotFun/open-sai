@@ -93,13 +93,32 @@ expect = 1
 wire = ["tokenPricesUsd"]
 
 [[case]]
+name = "market-prices-partial-error"
+args = ["--json","market","prices"]
+server = "read-partial-error"
+expect = 1
+wire = ["tokenPricesUsd"]
+
+[[case]]
 name = "account-positions"
 args = ["--json","account","positions","{addr}"]
 wire = ["trades"]
 
 [[case]]
+name = "account-positions-partial"
+args = ["--json","account","positions","{addr}"]
+server = "read-partial"
+wire = ["trades"]
+
+[[case]]
 name = "account-history"
 args = ["--json","account","history","{addr}"]
+wire = ["tradeHistory"]
+
+[[case]]
+name = "account-history-empty"
+args = ["--json","account","history","{addr}"]
+server = "read-empty"
 wire = ["tradeHistory"]
 
 [[case]]

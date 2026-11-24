@@ -1,5 +1,6 @@
 mod config;
 mod local;
+mod reads;
 
 use std::{env, path::Path, process, time::Instant};
 
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 
 use config::ConfigCommand;
 use local::{AuthCommand, IntentCommand};
+use reads::{AccountCommand, MarketCommand};
 
 #[derive(Parser)]
 #[command(
@@ -44,6 +46,16 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Inspect markets and prices.
+    Market {
+        #[command(subcommand)]
+        command: MarketCommand,
+    },
+    /// Inspect positions and account activity.
+    Account {
+        #[command(subcommand)]
+        command: AccountCommand,
+    },
     /// Manage local Sai sessions.
     Auth {
         #[arg(long, global = true, help = "Print machine-readable JSON")]
@@ -142,6 +154,8 @@ fn main() -> process::ExitCode {
                             local::intent(command, &flags, env, json, events)
                         }
                         Command::Config { command } => command.run(&flags, env, json),
+                        Command::Market { command } => command.run(&flags, env, json, events),
+                        Command::Account { command } => command.run(&flags, env, json, events),
                     }
                 });
             complete(result, command, json, home)
@@ -221,8 +235,10 @@ fn usage(command: &str) -> String {
     let args = match command {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
-        "config list" | "auth status" | "auth list" => "",
-        "intent status" | "intent local" | "auth use" => " ADDR",
+        "config list" | "auth status" | "auth list" | "market list" | "market prices" => "",
+        "intent status" | "intent local" | "auth use" | "account positions" | "account history" => {
+            " ADDR"
+        }
         "auth logout" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
         _ => " COMMAND [ARGS]...",
@@ -298,10 +314,12 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
         match arg.as_str() {
             "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return ("logs", &[]),
-            "config" | "auth" | "intent" => {
+            "config" | "auth" | "intent" | "market" | "account" => {
                 let group = match arg.as_str() {
                     "auth" => "auth",
                     "intent" => "intent",
+                    "market" => "market",
+                    "account" => "account",
                     _ => "config",
                 };
                 let Some((index, leaf)) = args
@@ -323,6 +341,10 @@ fn command_path(args: &[String]) -> (&'static str, &[String]) {
                     ("auth", "logout") => "auth logout",
                     ("intent", "local") => "intent local",
                     ("intent", "status") => "intent status",
+                    ("market", "list") => "market list",
+                    ("market", "prices") => "market prices",
+                    ("account", "positions") => "account positions",
+                    ("account", "history") => "account history",
                     _ => group,
                 };
                 return (path, &args[index + 1..]);
@@ -356,7 +378,7 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
             } else {
                 let consumed = match command {
                     "config get" | "config unset" | "intent status" | "intent local"
-                    | "auth use" | "auth logout" => 1,
+                    | "auth use" | "auth logout" | "account positions" | "account history" => 1,
                     "config set" => 2,
                     _ => 0,
                 };
