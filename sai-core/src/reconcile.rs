@@ -1,6 +1,9 @@
 //! Reconcile local intent rows against Keeper's authoritative outcomes.
 
-use std::time::Duration;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use serde_json::{Map, Value, json};
 
@@ -8,12 +11,14 @@ use crate::{
     errors::{Code, SaiError},
     keeper::{self, Keeper, canonical_account, stringify, truthy},
     log::{EventContext, Field, Level},
-    storage::{IntentStatus, StatusUpdateOptions, Storage},
+    storage::{IntentStatus, StatusUpdateOptions, Storage, StorageError},
 };
 
 const OUTCOME_NOT_INDEXED: &str = "market_order_outcome_not_indexed";
 const HISTORY_TIMEOUT: Duration = Duration::from_secs(2);
 const HISTORY_RETRY_DELAY: Duration = Duration::from_millis(250);
+const HISTORY_PAGE_SIZE: usize = 25;
+const HISTORY_MAX_PAGES: usize = 4;
 pub(crate) const PENDING_HINT: &str = "Fill pending at the next oracle price. Do not resubmit.";
 pub(crate) const UNINDEXED_HINT: &str =
     "The order may have filled. Check positions and run intent status again. Do not resubmit.";
@@ -87,6 +92,49 @@ fn account_matches(value: &Value, account: &str) -> bool {
     value.as_str().and_then(canonical_account).as_deref() == Some(account)
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct WaitBudget {
+    pub started: Instant,
+    pub timeout: Duration,
+}
+
+impl WaitBudget {
+    pub fn remaining(self) -> Duration {
+        self.timeout.saturating_sub(self.started.elapsed())
+    }
+}
+
+pub(crate) enum PollError {
+    Keeper(SaiError),
+    Data(SaiError),
+    Storage(StorageError),
+    Deadline,
+}
+
+impl From<StorageError> for PollError {
+    fn from(error: StorageError) -> Self {
+        Self::Storage(error)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Poll {
+    timeout: Duration,
+    budget: Option<WaitBudget>,
+}
+
+impl Poll {
+    fn before_write(self) -> Result<(), PollError> {
+        if self
+            .budget
+            .is_some_and(|budget| budget.remaining().is_zero())
+        {
+            return Err(PollError::Deadline);
+        }
+        Ok(())
+    }
+}
+
 /// Query Keeper with the requested account verbatim. Scope ledger writes to its
 /// canonical address and use the C3 transaction rules for every transition.
 pub async fn reconcile(
@@ -98,17 +146,74 @@ pub async fn reconcile(
     events: EventContext<'_>,
 ) -> Result<Map<String, Value>, SaiError> {
     let keeper = Keeper::new(endpoint, events);
-    let mut data = keeper
-        .request(
-            keeper::INTENTS,
-            Map::from_iter([("user".into(), json!(addr)), ("key".into(), json!(key))]),
-            None,
+    poll(
+        &keeper,
+        addr,
+        key,
+        Poll {
             timeout,
-        )
-        .await?;
+            budget: None,
+        },
+        storage,
+        events,
+    )
+    .await
+    .map_err(|error| match error {
+        PollError::Keeper(error) | PollError::Data(error) => error,
+        PollError::Storage(error) => error.into(),
+        PollError::Deadline => SaiError::internal(),
+    })
+}
+
+pub(crate) async fn poll_wait(
+    keeper: &Keeper<'_>,
+    addr: &str,
+    key: &str,
+    budget: WaitBudget,
+    storage: &Storage<'_>,
+    events: EventContext<'_>,
+) -> Result<Map<String, Value>, PollError> {
+    poll(
+        keeper,
+        addr,
+        Some(key),
+        Poll {
+            timeout: HISTORY_TIMEOUT,
+            budget: Some(budget),
+        },
+        storage,
+        events,
+    )
+    .await
+}
+
+async fn poll(
+    keeper: &Keeper<'_>,
+    addr: &str,
+    key: Option<&str>,
+    poll: Poll,
+    storage: &Storage<'_>,
+    events: EventContext<'_>,
+) -> Result<Map<String, Value>, PollError> {
+    let endpoint = keeper.endpoint();
+    let mut variables = Map::from_iter([("user".into(), json!(addr)), ("key".into(), json!(key))]);
+    let mut data = if let Some(budget) = poll.budget {
+        variables.insert("includeAction".into(), json!(true));
+        let timeout = poll.timeout.min(budget.remaining());
+        bounded_request(keeper, keeper::WAIT_INTENTS, variables, timeout).await?
+    } else {
+        keeper
+            .request(keeper::INTENTS, variables, None, poll.timeout)
+            .await
+            .map_err(PollError::Keeper)?
+    };
     let Some(rows) = data.get_mut("userIntents").filter(|rows| !rows.is_null()) else {
         return Ok(data);
     };
+    if poll.budget.is_some() && !rows.is_array() {
+        *rows = Value::Null;
+        return Ok(data);
+    }
     let absent = rows.as_array().is_some_and(Vec::is_empty);
     let account = canonical_account(addr);
     let original = rows.take();
@@ -128,22 +233,36 @@ pub async fn reconcile(
         (Value::Array(_), None) => {}
         (other, _) if !truthy(&other) => {}
         (Value::String(_) | Value::Object(_), None) => {}
-        (Value::String(_) | Value::Object(_), Some(_)) => return Err(SaiError::internal()),
-        _ => return Err(incomplete_data("TypeError")),
+        (Value::String(_) | Value::Object(_), Some(_)) => {
+            return Err(PollError::Data(SaiError::internal()));
+        }
+        _ => return Err(PollError::Data(incomplete_data("TypeError"))),
     }
     let Some(account) = account else {
         *rows = Value::Array(matching);
         return Ok(data);
     };
     let Some(key) = key else {
-        reconcile_account(storage, endpoint, &account, &mut matching)?;
+        reconcile_account(storage, endpoint, &account, &mut matching).map_err(PollError::Data)?;
         *rows = Value::Array(matching);
         return Ok(data);
     };
     *rows = Value::Array(matching);
 
     if absent {
-        log_keeper(events, endpoint, addr, key, None);
+        log_keeper(
+            events,
+            endpoint,
+            if poll.budget.is_some() {
+                &account
+            } else {
+                addr
+            },
+            key,
+            None,
+            poll.budget.is_some(),
+        );
+        poll.before_write()?;
         let local =
             storage.mark_absent(key, endpoint, &account, keeper::ABSENT_AFTER_SECONDS, None)?;
         if let Some(status) = &local {
@@ -154,15 +273,26 @@ pub async fn reconcile(
         }
     } else if let Some(row) = data["userIntents"].get(0).cloned() {
         let outcome = classify_outcome(&row);
-        log_keeper(events, endpoint, addr, key, Some((&row, outcome)));
+        log_keeper(
+            events,
+            endpoint,
+            if poll.budget.is_some() {
+                &account
+            } else {
+                addr
+            },
+            key,
+            Some((&row, outcome)),
+            poll.budget.is_some(),
+        );
         if outcome != Outcome::Unknown {
             let context = KeyedIntent {
                 storage,
-                keeper: &keeper,
+                keeper,
                 addr,
                 account: &account,
                 key,
-                timeout,
+                poll,
             };
             reconcile_key(&context, &row, outcome, &mut data).await?;
         }
@@ -211,7 +341,7 @@ struct KeyedIntent<'a> {
     addr: &'a str,
     account: &'a str,
     key: &'a str,
-    timeout: Duration,
+    poll: Poll,
 }
 
 async fn reconcile_key(
@@ -219,9 +349,10 @@ async fn reconcile_key(
     row: &Value,
     mut outcome: Outcome,
     data: &mut Map<String, Value>,
-) -> Result<(), SaiError> {
+) -> Result<(), PollError> {
     let store = |outcome| {
-        store_outcome(
+        context.poll.before_write()?;
+        Ok::<_, PollError>(store_outcome(
             context.storage,
             context.keeper.endpoint(),
             context.account,
@@ -229,13 +360,17 @@ async fn reconcile_key(
             row,
             outcome,
             false,
-        )
+        )?)
     };
     let mut local = store(outcome)?;
     if (outcome == Outcome::TerminalFilled && (row["kind"].is_null() || perp_history(&row["kind"])))
         || (outcome == Outcome::Pending && row["lifecycleStep"] != "pending_exec")
     {
-        let matches = read_history(context, row).await?;
+        let matches = if let Some(budget) = context.poll.budget {
+            read_wait_history(context, row, budget).await
+        } else {
+            read_history(context, row).await.map_err(PollError::Data)?
+        };
         let established_fill = !matches.is_empty() && outcome == Outcome::Pending;
         data.insert("matchedTradeHistory".into(), json!(matches));
         if established_fill {
@@ -276,14 +411,14 @@ fn store_outcome(
     row: &Value,
     outcome: Outcome,
     only_if_absent: bool,
-) -> Result<Option<String>, SaiError> {
+) -> Result<Option<String>, StorageError> {
     let status = match outcome {
         Outcome::Accepted => IntentStatus::Accepted,
         Outcome::Pending => IntentStatus::Pending,
         Outcome::TerminalFailed | Outcome::TerminalFilled => IntentStatus::Terminal,
         Outcome::Unknown => return Ok(None),
     };
-    Ok(storage.set_status_with(
+    storage.set_status_with(
         key,
         endpoint,
         account,
@@ -292,7 +427,7 @@ fn store_outcome(
             repair_legacy_terminal: outcome == Outcome::Pending && explicit_market_pending(row),
             only_if_absent,
         },
-    )?)
+    )
 }
 
 fn normalize_hash(value: &Value) -> Result<String, SaiError> {
@@ -321,7 +456,7 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Result<Vec<Valu
                 keeper::HISTORY,
                 Map::from_iter([("trader".into(), json!(context.addr))]),
                 None,
-                context.timeout.min(HISTORY_TIMEOUT),
+                context.poll.timeout.min(HISTORY_TIMEOUT),
             )
             .await
         else {
@@ -339,7 +474,9 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Result<Vec<Valu
             Value::Array(items) => items,
             // Python iterates these containers. An empty one yields no matches.
             Value::Object(_) | Value::String(_) if !truthy(history) => continue,
-            Value::Object(_) | Value::String(_) => return Err(SaiError::internal()),
+            Value::Object(_) | Value::String(_) => {
+                return Err(SaiError::internal());
+            }
             _ => return Err(incomplete_data("TypeError")),
         };
         let mut matches = Vec::new();
@@ -364,6 +501,103 @@ async fn read_history(context: &KeyedIntent<'_>, row: &Value) -> Result<Vec<Valu
     Ok(Vec::new())
 }
 
+async fn bounded_request(
+    keeper: &Keeper<'_>,
+    query: &str,
+    variables: Map<String, Value>,
+    timeout: Duration,
+) -> Result<Map<String, Value>, PollError> {
+    if timeout.is_zero() {
+        return Err(PollError::Deadline);
+    }
+    keeper
+        .request(query, variables, None, timeout)
+        .await
+        .map_err(PollError::Keeper)
+}
+
+async fn read_wait_history(
+    context: &KeyedIntent<'_>,
+    row: &Value,
+    budget: WaitBudget,
+) -> Vec<Value> {
+    let Ok(hash) = normalize_hash(&row["txHash"]) else {
+        return Vec::new();
+    };
+    if hash.is_empty() {
+        return Vec::new();
+    }
+    let started = Instant::now();
+    let remaining = || {
+        budget
+            .remaining()
+            .min(HISTORY_TIMEOUT.saturating_sub(started.elapsed()))
+    };
+    let mut pages_left = HISTORY_MAX_PAGES + 1;
+    let mut found = Vec::new();
+    for attempt in 0..2 {
+        if attempt > 0 {
+            if remaining() <= HISTORY_RETRY_DELAY {
+                break;
+            }
+            tokio::time::sleep(HISTORY_RETRY_DELAY).await;
+        }
+        let mut seen = HashSet::new();
+        let mut execution_block = (row["lifecycleStep"] == "exec_pass")
+            .then(|| row["execBlock"].as_i64())
+            .flatten();
+        for page in 0..pages_left.min(HISTORY_MAX_PAGES) {
+            pages_left -= 1;
+            let Ok(data) = bounded_request(
+                context.keeper,
+                keeper::INTENT_HISTORY,
+                Map::from_iter([
+                    ("trader".into(), json!(context.addr)),
+                    ("limit".into(), json!(HISTORY_PAGE_SIZE)),
+                    ("offset".into(), json!(page * HISTORY_PAGE_SIZE)),
+                ]),
+                remaining(),
+            )
+            .await
+            else {
+                return found;
+            };
+            let Some(history) = data["perp"]["tradeHistory"].as_array() else {
+                return found;
+            };
+            for item in history {
+                if item["intentKey"] == context.key
+                    && account_matches(&item["trade"]["trader"], context.account)
+                    && ["txHash", "evmTxHash"]
+                        .iter()
+                        .any(|field| normalize_hash(&item[*field]).is_ok_and(|value| value == hash))
+                    && item["id"].as_i64().is_none_or(|id| seen.insert(id))
+                {
+                    found.push(item.clone());
+                }
+            }
+            if history.len() < HISTORY_PAGE_SIZE {
+                break;
+            }
+            if let Some(first) = found.first() {
+                execution_block = execution_block.or_else(|| first["block"]["block"].as_i64());
+                if let Some((oldest, execution)) = history
+                    .last()
+                    .and_then(|item| item["block"]["block"].as_i64())
+                    .zip(execution_block)
+                    && oldest < execution
+                {
+                    break;
+                }
+            }
+        }
+        if !found.is_empty() {
+            break;
+        }
+    }
+    found
+}
+
 fn incomplete_data(kind: &str) -> SaiError {
     SaiError::new(
         Code::IncompleteData,
@@ -377,6 +611,7 @@ fn log_keeper(
     addr: &str,
     key: &str,
     observed: Option<(&Value, Outcome)>,
+    wait: bool,
 ) {
     let mut fields = vec![
         ("intentKey", json!(key).into()),
@@ -385,11 +620,26 @@ fn log_keeper(
         ("endpointId", Field::endpoint_identity(endpoint)),
     ];
     if let Some((row, outcome)) = observed {
-        for key in ["kind", "lifecycleStep", "execActor", "errorCode", "txHash"] {
-            fields.push((key, row[key].clone().into()));
-        }
-        if !row["errorMsg"].is_null() {
-            fields.push(("errorMsg", Field::Untrusted(stringify(&row["errorMsg"]))));
+        if wait {
+            let mut public = row.as_object().map_or(Value::Null, keeper::intent_record);
+            public["errorCode"] = keeper::wait_error_code(row, &public);
+            for key in [
+                "kind",
+                "lifecycleStep",
+                "execActor",
+                "errorCode",
+                "txHash",
+                "txHashInvalid",
+            ] {
+                fields.push((key, public[key].clone().into()));
+            }
+        } else {
+            for key in ["kind", "lifecycleStep", "execActor", "errorCode", "txHash"] {
+                fields.push((key, row[key].clone().into()));
+            }
+            if !row["errorMsg"].is_null() {
+                fields.push(("errorMsg", Field::Untrusted(stringify(&row["errorMsg"]))));
+            }
         }
         if outcome == Outcome::TerminalFailed {
             fields.push(("code", json!(Code::KeeperError).into()));

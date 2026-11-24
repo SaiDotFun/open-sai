@@ -74,6 +74,7 @@ impl From<StorageError> for SaiError {
 }
 
 /// Persisted account sessions and trade reservations under a single Sai home.
+#[derive(Clone)]
 pub struct Storage<'a> {
     pub(crate) trader: PathBuf,
     busy_timeout: Duration,
@@ -210,14 +211,19 @@ impl<'a> Storage<'a> {
     }
 
     pub fn intent_status_hint(&self, endpoint: &str, account: &str, key: &str) -> String {
+        self.trade_command_hint(endpoint, &["intent", "status", account, "--key", key])
+    }
+
+    pub fn trade_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
         use crate::session::shell_quote;
 
         let flag = self.keeper_hint_flag(endpoint);
-        format!(
-            "sai --endpoint {flag} intent status {} --key {}",
-            shell_quote(account),
-            shell_quote(key)
-        )
+        let args = args
+            .iter()
+            .map(|arg| shell_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("sai --endpoint {flag} {args}")
     }
 
     pub(crate) fn keeper_hint_flag(&self, endpoint: &str) -> String {

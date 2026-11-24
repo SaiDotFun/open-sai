@@ -12,8 +12,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
@@ -171,12 +171,13 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         for name in ("config.toml", "trader/sessions.json"):
             (sai_home / name).chmod(0o600)
         return
-    if seed in {"config", "config-logs-disabled"}:
+    if seed in {"config", "config-logs-disabled", "invalid-expiry"}:
         path = sai_home / "config.toml"
         text = CONFIG if seed == "config" else "[logs]\nenabled = false\n"
         path.write_text(text, encoding="utf-8")
         path.chmod(0o600)
-        return
+        if seed != "invalid-expiry":
+            return
     if seed == "mcp-info-cache":
         path = sai_home / "update.json"
         path.write_text(
@@ -192,14 +193,17 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         "doctor-near-expiry",
         "doctor-ledger-session",
         "history-token",
+        "invalid-expiry",
     }:
         sessions.append(session_fixture(endpoints, "session"))
         if seed == "doctor-near-expiry":
             sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
-        if seed == "accounts":
+        if seed in {"accounts", "invalid-expiry"}:
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+        if seed == "invalid-expiry":
+            sessions[0]["expiresAt"] = "synthetic-expiry-credential-marker"
     if seed == "doctor-ledger-session":
         config = sai_home / "config.toml"
         config.write_text("[logs]\nenabled = false\n")
@@ -211,6 +215,8 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         ledger=seed in {"ledger", "doctor-ledger-session"},
         disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
     )
+    if seed == "invalid-expiry":
+        (sai_home / "trader" / "sessions.lock").chmod(0o600)
 
 
 def session_fixture(endpoints: Endpoints, state: str) -> dict[str, Any]:
@@ -259,6 +265,8 @@ def write_seed(
 def loopback(
     scenario: str,
     *,
+    trade_replay: Callable[[WireRequest, str | None], dict[str, Any] | None]
+    | None = None,
     market_price: float | None = None,
     cancel_target: str | None = None,
 ) -> Generator[Endpoints]:
@@ -591,8 +599,35 @@ def loopback(
                     return
                 wire.append(request)
                 name = request.label
+                if trade_replay is not None and name in {
+                    "recordUserIntent",
+                    "userIntents",
+                    "waitUserIntents",
+                    "tradeHistory",
+                    "intentTradeHistory",
+                }:
+                    try:
+                        reply = trade_replay(request, self.headers.get("Authorization"))
+                    except (TypeError, ValueError) as exc:
+                        self.reject(str(exc))
+                    else:
+                        if reply is None:
+                            self.close_connection = True
+                        else:
+                            with suppress(BrokenPipeError, ConnectionResetError):
+                                self.reply(reply)
+                    return
                 if name == "recordUserIntent" and scenario == "concurrent-close":
                     self.admit_close(request.variables)
+                    return
+                if (
+                    scenario == "confirmation-account-change"
+                    and name == "trade"
+                    and same_variables(
+                        request.variables, {"trader": OTHER_ADDRESS, "id": 7}
+                    )
+                ):
+                    self.reply({"data": {"perp": {"trade": None}}})
                     return
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
                     self.admit_trade(request.variables)
@@ -759,17 +794,17 @@ def loopback(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        expected = {name: contract_args[name]}
+                        expected = [{name: contract_args[name]}]
                         # Ownership uses the account address. The next read
                         # uses Perp's stored owner to pin the quote.
-                        if (
-                            scenario == "concurrent-close"
-                            and name == "get_trade_raw"
-                            and query
-                            == {name: {"trader": position["trader"], "index": 7}}
-                        ):
-                            expected = query
-                        if not same_variables(query, expected):
+                        if name == "get_trade_raw":
+                            if scenario == "concurrent-close":
+                                expected.append(
+                                    {name: {"trader": position["trader"], "index": 7}}
+                                )
+                            if trade_replay is not None:
+                                expected.append({name: {"trader": ADDRESS, "index": 7}})
+                        if not any(same_variables(query, args) for args in expected):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))

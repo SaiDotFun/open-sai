@@ -1,9 +1,10 @@
 # List uncovered commands explicitly so adding a command requires a decision.
 [deferred]
 "account overview" = "Requires pinned LCD and trade replay fixtures."
-"auth import" = "Compared with a fixture clipboard and PTY in test_auth.py."
+"auth import" = "Successful imports are compared with a fixture clipboard and PTY in test_auth.py."
 "auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
 "auth renew" = "Compared with Python main in test_auth.py."
+"intent wait" = "Covered by the pinned, stateful replays in test_intent_wait.py."
 "mcp uninstall" = "Requires a client registration fixture."
 "logs intent" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
 "logs run" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
@@ -277,6 +278,19 @@ expect = 1
 wire = ["ws:init"]
 
 [[case]]
+name = "auth-import-rejected-operand-text"
+args = ["auth","import","synthetic-import-credential-marker"]
+mode = "text"
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
+name = "auth-import-rejected-operand-json"
+args = ["--json","auth","import","synthetic-import-credential-marker"]
+expect = 2
+seed = "config-logs-disabled"
+
+[[case]]
 name = "auth-status-signed-out"
 args = ["--json","auth","status"]
 expect = 6
@@ -309,6 +323,21 @@ state = { "trader/sessions.json#payload.active" = "0x111111111111111111111111111
 name = "auth-use-missing"
 args = ["--json","auth","use","{addr}"]
 expect = 1
+
+[[case]]
+name = "auth-use-invalid-expiry-text"
+args = ["auth","use","{addr}"]
+mode = "text"
+expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
+
+[[case]]
+name = "auth-use-invalid-expiry-json"
+args = ["--json","auth","use","{addr}"]
+expect = 1
+seed = "invalid-expiry"
+state = { "trader/sessions.json#payload.active" = "0x2222222222222222222222222222222222222222" }
 
 [[case]]
 name = "auth-logout"
