@@ -131,7 +131,8 @@ To reproduce the pinned comparison, install Python from that commit and set
 Accepted C9b divergences from the pinned Python reference
 
 - Rust `logs tail` strips credentials, paths, queries, and fragments from
-  endpoints in retained rows. Python currently prints the retained value.
+  URLs throughout retained rows, including arguments and nested fields.
+  Python currently prints the retained values.
 - Rust `logs intent` resumes at the first unread file positions when a
   page ends and retains attribution from both the initial scan and anchors
   discovered in later scans.

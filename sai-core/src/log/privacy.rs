@@ -1,4 +1,4 @@
-use std::sync::LazyLock;
+use std::{borrow::Cow, sync::LazyLock};
 
 use regex::{Captures, Regex};
 use serde_json::{Map, Value};
@@ -235,17 +235,59 @@ pub(super) fn origin(text: &str) -> String {
     }
 }
 
-fn scrub(text: &str, tokens: &[String], url: &Regex, untrusted: bool) -> String {
-    let text = replace_tokens(text, tokens);
-    let text = JWT.replace_all(&text, REDACTED);
-    let text = url.replace_all(&text, |matched: &Captures<'_>| {
+fn redact_urls<'a>(text: &'a str, url: &Regex, untrusted: bool) -> Cow<'a, str> {
+    url.replace_all(text, |matched: &Captures<'_>| {
         let origin = origin(&matched[0]);
         if untrusted {
             format!("{origin} {CUT}")
         } else {
             origin
         }
-    });
+    })
+}
+
+fn redact_url_text(text: String, url: &Regex) -> String {
+    match redact_urls(&text, url, false) {
+        Cow::Borrowed(_) => text,
+        Cow::Owned(redacted) => redacted,
+    }
+}
+
+fn redact_retained_value(value: Value, url: &Regex) -> Value {
+    match value {
+        Value::String(text) => Value::String(redact_url_text(text, url)),
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(|value| redact_retained_value(value, url))
+                .collect(),
+        ),
+        Value::Object(mut row) => {
+            redact_retained_urls(&mut row);
+            Value::Object(row)
+        }
+        value => value,
+    }
+}
+
+pub(super) fn redact_retained_urls(row: &mut Map<String, Value>) {
+    *row = std::mem::take(row)
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match key.as_str() {
+                "endpoint" => value.as_str().map(origin).into(),
+                "argv" => redact_retained_value(value, &URL_REST),
+                _ => redact_retained_value(value, &URL),
+            };
+            (redact_url_text(key, &URL), value)
+        })
+        .collect();
+}
+
+fn scrub(text: &str, tokens: &[String], url: &Regex, untrusted: bool) -> String {
+    let text = replace_tokens(text, tokens);
+    let text = JWT.replace_all(&text, REDACTED);
+    let text = redact_urls(&text, url, untrusted);
     let (hex, limit) = if untrusted {
         (&*HEX, MAX_UNTRUSTED)
     } else {

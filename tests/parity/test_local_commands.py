@@ -307,29 +307,62 @@ def test_log_path_and_tail(
     assert outputs[0] == outputs[1]
 
 
-def test_logs_tail_redacts_retained_endpoint(
+def test_logs_tail_redacts_retained_endpoints(
     local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
 ) -> None:
     origin = "https://fixture.invalid:8443"
     endpoint = (
         "https://user:fixture@fixture.invalid:8443/private?token=fixture#fragment"
     )
-    # Accepted divergence: Python still exposes the retained endpoint verbatim.
-    for index, (cli, expected) in enumerate(
-        zip(local_pair, (endpoint, origin), strict=True)
+    ws_origin = "wss://ws.fixture.invalid"
+    ws_endpoint = ws_origin + "/private-ws?session=fixture"
+    # Accepted divergence: Python still exposes the retained URLs verbatim.
+    for index, (cli, expected, expected_ws) in enumerate(
+        zip(local_pair, (endpoint, origin), (ws_endpoint, ws_origin), strict=True)
     ):
         root = tmp_path / str(index)
-        seed_logs(root, {"cli": [event("keeper.request", 1, endpoint=endpoint)]})
-        for flag in ((), ("--json",)):
+        seed_logs(
+            root,
+            {
+                "cli": [
+                    event(
+                        "command.start",
+                        1,
+                        endpoint=endpoint,
+                        argv=[
+                            f"--endpoint={endpoint}",
+                            "--ws-endpoint",
+                            ws_endpoint,
+                            f"{origin}/private with spaces",
+                        ],
+                        detail={endpoint: [{"probe": f"{endpoint} or {ws_endpoint}"}]},
+                    )
+                ]
+            },
+        )
+        for flag in (("--json",), ()):
             result = invoke(cli, root, *flag, "logs", "tail")
             assert result.returncode == 0 and result.stderr == b""
             if flag:
-                assert json.loads(result.stdout)["endpoint"] == expected
+                row = json.loads(result.stdout)
+                assert row["endpoint"] == expected
+                assert row["argv"] == [
+                    f"--endpoint={expected}",
+                    "--ws-endpoint",
+                    expected_ws,
+                    (f"{origin}/private with spaces" if index == 0 else origin),
+                ]
+                assert row["detail"] == {
+                    expected: [{"probe": f"{expected} or {expected_ws}"}]
+                }
             else:
-                assert b"endpoint=" + expected.encode() in result.stdout
+                assert f"endpoint={expected}".encode() in result.stdout
+                assert f'"--endpoint={expected}"'.encode() in result.stdout
+                assert f'"{expected_ws}"'.encode() in result.stdout
             if index:
                 assert b"/private" not in result.stdout
                 assert b"user:fixture" not in result.stdout
+                assert b"with spaces" not in result.stdout
 
 
 def test_logs_run_keeps_events_with_non_utf8_argv(
