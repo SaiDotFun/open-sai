@@ -1,0 +1,365 @@
+{
+  "schema": 2,
+  "volatileFields": [
+    "ts",
+    "pid",
+    "runId",
+    "callId",
+    "durationMs",
+    "version"
+  ],
+  "common": {
+    "required": {
+      "schema": "integer",
+      "ts": "string",
+      "level": "string",
+      "event": "string",
+      "surface": "string",
+      "pid": "integer",
+      "version": "string",
+      "runId": "string",
+      "seq": "integer"
+    },
+    "optional": {
+      "command": "string",
+      "tool": "string",
+      "callId": "string",
+      "truncated": "string[]"
+    }
+  },
+  "events": {
+    "command.start": {
+      "emitter": "sai_cli.LoggedGroup.main",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "argv": "string[]"
+      },
+      "optional": {}
+    },
+    "command.end": {
+      "emitter": "sai_cli.LoggedGroup.main",
+      "levels": [
+        "info",
+        "warn"
+      ],
+      "required": {
+        "exitCode": "integer",
+        "durationMs": "integer"
+      },
+      "optional": {
+        "code": "string",
+        "error": "string",
+        "intentKey": "string"
+      }
+    },
+    "doctor.result": {
+      "emitter": "sai_cli.doctor_command",
+      "levels": [
+        "info",
+        "warn"
+      ],
+      "required": {
+        "overall": "string",
+        "fix": "boolean",
+        "offline": "boolean",
+        "checks": "object[]"
+      },
+      "optional": {
+        "code": "string"
+      }
+    },
+    "intent.keeper": {
+      "emitter": "core.reconcile.reconcile",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "intentKey": "string",
+        "addr": "string",
+        "endpoint": "string"
+      },
+      "optional": {
+        "kind": "string",
+        "lifecycleStep": "string",
+        "execActor": "string",
+        "errorCode": "string",
+        "errorMsg": "string",
+        "txHash": "string",
+        "found": "boolean",
+        "code": "string"
+      }
+    },
+    "intent.reserved": {
+      "emitter": "core.storage.pending",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "intentKey": "string",
+        "kind": "string",
+        "status": "string",
+        "addr": "string",
+        "endpoint": "string"
+      },
+      "optional": {
+        "tradeId": "string"
+      }
+    },
+    "intent.status": {
+      "emitter": "core.storage._log_status",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "intentKey": "string",
+        "kind": "string",
+        "previous": "string",
+        "status": "string",
+        "addr": "string",
+        "endpoint": "string"
+      },
+      "optional": {
+        "code": "string"
+      }
+    },
+    "intent.submitted": {
+      "emitter": "core.intents.submit",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "intentKey": "string",
+        "kind": "string",
+        "addr": "string",
+        "endpoint": "string"
+      },
+      "optional": {
+        "txHash": "string"
+      }
+    },
+    "intent.wait.start": {
+      "emitter": "core intent wait (lane A4)",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "intentKey": "string"
+      },
+      "optional": {
+        "addr": "string",
+        "endpoint": "string",
+        "timeoutMs": "integer"
+      }
+    },
+    "intent.wait.end": {
+      "emitter": "core intent wait (lane A4)",
+      "levels": [
+        "info",
+        "warn",
+        "error"
+      ],
+      "required": {
+        "intentKey": "string",
+        "status": "string",
+        "durationMs": "integer"
+      },
+      "optional": {
+        "addr": "string",
+        "endpoint": "string",
+        "txHash": "string",
+        "fillBlock": "integer",
+        "code": "string",
+        "error": "string"
+      }
+    },
+    "keeper.request": {
+      "emitter": "core.keeper._log_request",
+      "levels": [
+        "info",
+        "warn"
+      ],
+      "required": {
+        "operation": "string",
+        "endpoint": "string",
+        "authenticated": "boolean",
+        "durationMs": "integer",
+        "status": "string"
+      },
+      "optional": {
+        "addr": "string",
+        "code": "string",
+        "error": "string",
+        "httpStatus": "integer",
+        "keeperErrors": "object[]"
+      }
+    },
+    "log.dropped": {
+      "emitter": "core.log._write",
+      "levels": [
+        "warn"
+      ],
+      "required": {
+        "count": "integer"
+      },
+      "optional": {}
+    },
+    "mcp.server_start": {
+      "emitter": "mcp_server.server.serve",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "keeper": "string",
+        "websocket": "string",
+        "lcd": "string"
+      },
+      "optional": {}
+    },
+    "mcp.tool_call": {
+      "emitter": "mcp_server.server.SaiMCP.call_tool",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "tool": "string",
+        "callId": "string",
+        "arguments": "object"
+      },
+      "optional": {
+        "unknownArguments": "integer"
+      }
+    },
+    "mcp.tool_result": {
+      "emitter": "mcp_server.server.SaiMCP.call_tool",
+      "levels": [
+        "info",
+        "warn",
+        "error"
+      ],
+      "required": {
+        "tool": "string",
+        "callId": "string",
+        "ok": "boolean",
+        "durationMs": "integer"
+      },
+      "optional": {
+        "code": "string",
+        "error": "string",
+        "errorType": "string",
+        "account": "string",
+        "status": "string",
+        "intentKey": "string",
+        "previewDigest": "string"
+      }
+    },
+    "session.active": {
+      "emitter": "core.storage.use_session",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "addr": "string"
+      },
+      "optional": {}
+    },
+    "session.expired": {
+      "emitter": "core.session.check_active",
+      "levels": [
+        "warn"
+      ],
+      "required": {
+        "expiresAt": "string",
+        "code": "string"
+      },
+      "optional": {
+        "addr": "string"
+      }
+    },
+    "session.removed": {
+      "emitter": "core.storage.delete_session",
+      "levels": [
+        "info",
+        "warn"
+      ],
+      "required": {},
+      "optional": {
+        "addr": "string",
+        "connectedAccounts": "integer",
+        "code": "string",
+        "reason": "string"
+      }
+    },
+    "session.saved": {
+      "emitter": "core.storage.save_session",
+      "levels": [
+        "info"
+      ],
+      "required": {
+        "addr": "string",
+        "expiresAt": "string",
+        "connectedAccounts": "integer"
+      },
+      "optional": {
+        "endpoint": "string"
+      }
+    },
+    "update.check": {
+      "emitter": "sai_cli.check_update",
+      "levels": [
+        "info",
+        "warn"
+      ],
+      "required": {
+        "ok": "boolean"
+      },
+      "optional": {
+        "installed": "string",
+        "latest": "string",
+        "updateAvailable": "boolean",
+        "installKind": "string",
+        "code": "string",
+        "error": "string"
+      }
+    },
+    "update.result": {
+      "emitter": "sai_cli.log_update",
+      "levels": [
+        "info",
+        "warn"
+      ],
+      "required": {
+        "status": "string",
+        "rolledBack": "boolean",
+        "background": "boolean"
+      },
+      "optional": {
+        "installed": "string",
+        "target": "string",
+        "message": "string",
+        "code": "string"
+      }
+    },
+    "update.scheduled": {
+      "emitter": "core.updater.tick",
+      "levels": [
+        "info"
+      ],
+      "required": {},
+      "optional": {}
+    },
+    "watch.disconnected": {
+      "emitter": "sai_cli.watch_stream",
+      "levels": [
+        "warn"
+      ],
+      "required": {
+        "code": "string",
+        "errorType": "string",
+        "endpoint": "string"
+      },
+      "optional": {}
+    }
+  }
+}

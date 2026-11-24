@@ -222,19 +222,16 @@ class LoggedGroup(click.Group):
                     return result
             finally:
                 if not quiet:
-                    fields: dict[str, Any] = {}
-                    if failure is not None:
-                        fields.update(
-                            code=failure.code, error=log.untrusted(failure.message)
-                        )
-                        if failure.intent_key is not None:
-                            fields["intentKey"] = failure.intent_key
                     log.event(
                         "command.end",
                         "info" if exit_code == ExitCode.OK else "warn",
                         durationMs=round((time.monotonic() - started) * 1000),
                         exitCode=exit_code,
-                        **fields,
+                        code=failure.code if failure is not None else None,
+                        error=log.untrusted(failure.message)
+                        if failure is not None
+                        else None,
+                        intentKey=failure.intent_key if failure is not None else None,
                     )
         raise SystemExit(exit_code)
 
@@ -1096,7 +1093,7 @@ def doctor_command(
         fix=not no_fix,
         offline=offline,
         checks=[doctor.log_entry(check) for check in checks],
-        **({"code": Code.INTERNAL_ERROR} if overall == "fail" else {}),
+        code=Code.INTERNAL_ERROR if overall == "fail" else None,
     )
     if overall == "fail":
         if not ctx.obj["json"]:
@@ -1833,7 +1830,7 @@ def log_update(outcome: updater.Outcome, *, background: bool) -> None:
         rolledBack=outcome.rolled_back,
         background=background,
         message=log.untrusted(outcome.message),
-        **({"code": Code.INTERNAL_ERROR} if outcome.exit_code else {}),
+        code=Code.INTERNAL_ERROR if outcome.exit_code else None,
     )
 
 

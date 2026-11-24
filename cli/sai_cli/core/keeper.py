@@ -179,7 +179,11 @@ def _log_request(
             addr=account,
             authenticated=bool(token),
             durationMs=round((time.monotonic() - started) * 1000),
-            **outcome,
+            status=outcome["status"],
+            code=outcome.get("code"),
+            error=outcome.get("error"),
+            httpStatus=outcome.get("httpStatus"),
+            keeperErrors=outcome.get("keeperErrors"),
         )
     except Exception:  # noqa: BLE001, S110 - logging must not change the outcome
         pass

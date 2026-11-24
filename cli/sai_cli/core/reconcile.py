@@ -52,7 +52,7 @@ def reconcile(
             txHash=row.get("txHash"),
             addr=addr,
             endpoint=log.endpoint(endpoint),
-            **({"code": Code.KEEPER_ERROR} if step in FAILED_STEPS else {}),
+            code=Code.KEEPER_ERROR if step in FAILED_STEPS else None,
         )
         if (
             row.get("intentKey") == key
@@ -82,7 +82,6 @@ def reconcile(
         log.event(
             "intent.keeper",
             intentKey=key,
-            lifecycleStep=None,
             found=False,
             addr=addr,
             endpoint=log.endpoint(endpoint),

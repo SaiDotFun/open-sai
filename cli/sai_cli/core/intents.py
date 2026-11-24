@@ -9,7 +9,7 @@ from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from secrets import choice
 from typing import Any
 
-from . import keeper, storage
+from . import keeper, log, storage
 
 
 def now() -> str:
@@ -199,6 +199,15 @@ def submit(
             key,
             hint=shlex.join(["sai", "intent", "status", account, "--key", key]),
         ) from exc
+    tx_hash = ack.get("txHash")
+    log.event(
+        "intent.submitted",
+        intentKey=key,
+        kind=intent["kind"],
+        addr=account,
+        endpoint=log.endpoint(endpoint),
+        txHash=log.Arg(tx_hash) if isinstance(tx_hash, str) and tx_hash else None,
+    )
     storage.set_status(key, endpoint, account, "accepted")
     return {
         "intentKey": key,

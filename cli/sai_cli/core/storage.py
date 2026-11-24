@@ -430,7 +430,7 @@ def _log_status(
         status=status,
         addr=account,
         endpoint=log.endpoint(endpoint),
-        **({"code": code} if code is not None else {}),
+        code=code,
     )
 
 

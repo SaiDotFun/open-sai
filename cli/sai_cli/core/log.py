@@ -4,10 +4,8 @@ Each surface writes its own file per UTC day, `<surface>-YYYY-MM-DD.jsonl`,
 where the surface is `cli`, `mcp`, or `update`. The directory has mode 0700
 and the files 0600.
 
-Every line carries `ts`, `level`, `event`, `surface`, `pid`, `version`,
-`runId` (one per process), and `seq` (the event's number within the run,
-which orders events that share a millisecond), then the fields bound with
-`bind`, then the event's own fields.
+The event registry in `core.log_events` defines the common fields and the
+fields for each event. Fields bound with `bind` accompany the event.
 
 `event` does no I/O and never blocks: it stamps the line, copies its fields
 within a fixed budget, and puts it on a bounded queue. One daemon thread
@@ -73,6 +71,8 @@ from types import MappingProxyType
 from typing import Any, Self
 from urllib.parse import urlsplit
 
+from .log_events import COMMON_REQUIRED, SCHEMA_VERSION
+
 DIR_NAME = "logs"
 SURFACES = ("cli", "mcp", "update")
 LEVELS = ("info", "warn", "error")
@@ -110,7 +110,7 @@ TAIL_CHUNK = 64 * 1024
 REDACTED = "[redacted session token]"
 REDACTED_HEX = "[redacted hex]"
 REDACTED_URL = "[redacted url]"
-COMMON = ("ts", "level", "event", "surface", "pid", "version", "runId", "seq")
+COMMON = tuple(COMMON_REQUIRED)
 
 RUN_ID = uuid.uuid4().hex
 _seq = itertools.count(1)
@@ -908,9 +908,14 @@ def event(name: str, level: str = "info", /, **fields: Any) -> None:
             return
         context = dict(_context.get())
         surface = context.pop("surface", "cli")
-        extra = {k: v for k, v in {**context, **fields}.items() if v is not None}
+        extra = {
+            k: v
+            for k, v in {**context, **fields}.items()
+            if v is not None and k not in COMMON
+        }
         budget = [EVENT_CHARS, EVENT_NODES]
         line = {
+            "schema": SCHEMA_VERSION,
             "ts": stamp(now()),
             "level": level if level in LEVELS else "info",
             "event": str(name)[:MAX_UNTRUSTED],

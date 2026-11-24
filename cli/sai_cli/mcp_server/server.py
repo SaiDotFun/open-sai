@@ -702,6 +702,7 @@ class SaiMCP(FastMCP):
                     "error",
                     ok=False,
                     code=Code.INVALID_REQUEST if known is None else failure.code,
+                    intentKey=failure.intent_key,
                     errorType=type(exc).__name__,
                     error=sai_log.untrusted(first),
                     durationMs=round((time.monotonic() - started) * 1000),
@@ -717,7 +718,13 @@ class SaiMCP(FastMCP):
                 "mcp.tool_result",
                 "info" if summary["ok"] else "warn",
                 durationMs=round((time.monotonic() - started) * 1000),
-                **summary,
+                ok=summary["ok"],
+                code=summary.get("code"),
+                error=summary.get("error"),
+                account=summary.get("account"),
+                status=summary.get("status"),
+                intentKey=summary.get("intentKey"),
+                previewDigest=summary.get("previewDigest"),
             )
             return result
 
@@ -809,15 +816,16 @@ def result_summary(text: str | None) -> dict[str, Any]:
     for name in RESULT_FIELDS:
         if isinstance(value.get(name), str):
             summary[name] = sai_log.Arg(value[name])
-        elif isinstance(value.get(name), (bool, int, float)):
-            summary[name] = value[name]
     if isinstance(summary.get("error"), str):
         summary["error"] = sai_log.untrusted(summary["error"])
     if not summary["ok"]:
         if summary.get("code") == BAD_SETTINGS:
             summary["code"] = Code.INVALID_REQUEST
-        elif not summary.get("code"):
-            summary["code"] = Code.INTERNAL_ERROR
+        else:
+            try:
+                summary["code"] = Code(summary.get("code"))
+            except ValueError:
+                summary["code"] = Code.INTERNAL_ERROR
     account = value.get("account", value.get("addr"))
     if isinstance(account, str):
         summary["account"] = sai_log.Arg(account)
