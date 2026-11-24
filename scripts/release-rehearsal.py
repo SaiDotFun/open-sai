@@ -18,11 +18,12 @@ import sys
 import tempfile
 import time
 import unittest
+from collections import deque
 from collections.abc import Generator
 from contextlib import closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import IO, Any
+from typing import IO, Any, NamedTuple
 
 TESTS = Path(__file__).resolve().parents[1] / "cli" / "sai_cli" / "tests"
 sys.path.insert(0, str(TESTS))
@@ -186,6 +187,73 @@ def loopback_env(base: str, proxy_port: int) -> dict[str, str]:
     }
 
 
+class SelectedField(NamedTuple):
+    name: str
+    key: str
+    children: tuple[SelectedField, ...]
+
+
+def selection_set(query: str) -> tuple[SelectedField, ...]:
+    """Parse the field selections used by the replay's inline operations."""
+    tokens = deque(
+        token
+        for token in re.findall(r'#[^\n]*|"(?:\\.|[^"\\])*"|[_A-Za-z]\w*|[^\s,]', query)
+        if not token.startswith("#")
+    )
+
+    def take_name() -> str:
+        name = tokens.popleft()
+        if not re.fullmatch(r"[_A-Za-z]\w*", name):
+            raise ValueError("Expected a GraphQL field name")
+        return name
+
+    def skip_arguments() -> None:
+        depth = 1
+        tokens.popleft()
+        while depth:
+            token = tokens.popleft()
+            depth += (token == "(") - (token == ")")
+
+    def fields() -> tuple[SelectedField, ...]:
+        tokens.popleft()
+        result = []
+        while tokens[0] != "}":
+            key = name = take_name()
+            if tokens[0] == ":":
+                tokens.popleft()
+                name = take_name()
+            if tokens[0] == "(":
+                skip_arguments()
+            children = fields() if tokens[0] == "{" else ()
+            result.append(SelectedField(name, key, children))
+        tokens.popleft()
+        return tuple(result)
+
+    try:
+        while tokens[0] != "{":
+            if tokens[0] == "(":
+                skip_arguments()
+            else:
+                take_name()
+        selected = fields()
+    except IndexError as exc:
+        raise ValueError("Incomplete GraphQL selection") from exc
+    if tokens or not selected:
+        raise ValueError("Expected a single inline GraphQL operation")
+    return selected
+
+
+def project_fields(value: Any, fields: tuple[SelectedField, ...]) -> Any:
+    if isinstance(value, list):
+        return [project_fields(item, fields) for item in value]
+    if isinstance(value, dict):
+        return {
+            field.key: project_fields(value.get(field.name), field.children)
+            for field in fields
+        }
+    return value
+
+
 class Replay:
     def __init__(self, wheel: Path, version: str) -> None:
         fixture = json.loads((TESTS / "fixtures" / "intent_outcomes.json").read_text())
@@ -228,7 +296,14 @@ class Replay:
                 if not isinstance(query, str) or not isinstance(variables, dict):
                     self.send_error(400)
                     return
-                if "recordUserIntent" in query:
+                try:
+                    selected = selection_set(query)
+                except ValueError:
+                    self.send_error(400)
+                    return
+                roots = {field.name: field.children for field in selected}
+                perp = {field.name for field in roots.get("perp", ())}
+                if "recordUserIntent" in roots:
                     if self.headers.get("Authorization") != f"Bearer {SYNTHETIC_TOKEN}":
                         self.send_error(403)
                         return
@@ -246,19 +321,15 @@ class Replay:
                         # Keeper got the request, but the client never gets its ack.
                         self.close_connection = True
                         return
-                    self.reply(
-                        {
-                            "data": {
-                                "recordUserIntent": {
-                                    "intentKey": key,
-                                    "evmAddress": replay.addr,
-                                    "lifecycleStep": "jwt_pass",
-                                    "execActor": "server",
-                                }
-                            }
+                    data: dict[str, Any] = {
+                        "recordUserIntent": {
+                            "intentKey": key,
+                            "evmAddress": replay.addr,
+                            "lifecycleStep": "jwt_pass",
+                            "execActor": "server",
                         }
-                    )
-                elif "userIntents" in query:
+                    }
+                elif "userIntents" in roots:
                     rows = []
                     user = variables.get("user")
                     key = variables.get("key")
@@ -273,40 +344,34 @@ class Replay:
                             0
                         ]
                         rows.append({**row, "intentKey": key})
-                    self.reply({"data": {"userIntents": rows}})
-                elif "tradeHistory" in query:
-                    self.reply({"data": {"perp": {"tradeHistory": []}}})
-                elif "oneClickTrading" in query:
-                    self.reply(
-                        {
-                            "data": {
-                                "oneClickTrading": {
-                                    "enabled": True,
-                                    "chainId": CHAIN,
-                                    "contractAddress": "nibi1x",
-                                }
-                            }
+                    data = {"userIntents": rows}
+                elif "tradeHistory" in perp:
+                    data = {"perp": {"tradeHistory": []}}
+                elif "oneClickTrading" in roots:
+                    data = {
+                        "oneClickTrading": {
+                            "enabled": True,
+                            "chainId": CHAIN,
+                            "contractAddress": "nibi1x",
                         }
-                    )
-                elif "borrowings" in query:
-                    self.reply(
-                        {
-                            "data": {
-                                "perp": {
-                                    "borrowings": [
-                                        {
-                                            "marketId": 0,
-                                            "collateralToken": {"symbol": "USDC"},
-                                            "isOpen": True,
-                                            "price": 100,
-                                        }
-                                    ]
+                    }
+                elif "borrowings" in perp:
+                    data = {
+                        "perp": {
+                            "borrowings": [
+                                {
+                                    "marketId": 0,
+                                    "collateralToken": {"symbol": "USDC"},
+                                    "isOpen": True,
+                                    "price": 100,
                                 }
-                            }
+                            ]
                         }
-                    )
+                    }
                 else:
                     self.send_error(400)
+                    return
+                self.reply({"data": project_fields(data, selected)})
 
         return Handler
 
@@ -721,7 +786,8 @@ def rehearse(root: Path, wheel: Path, version: str, diagnostics: Path | None) ->
         args = ("intent", "status", replay.addr, "--key", key)
         status = tool.json("Reconcile with the candidate", *args)
         require(
-            status["outcome"] == "pending"
+            isinstance(status, dict)
+            and status.get("outcome") == "pending"
             and ledger_row(ledger, key, migrated=True) == ("unknown", "pending"),
             "Candidate did not migrate the open to pending",
         )

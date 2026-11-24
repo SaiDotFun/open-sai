@@ -157,6 +157,26 @@ class ProcessTest(unittest.TestCase):
 
 
 class KeeperReplayTest(unittest.TestCase):
+    def test_projects_nested_and_aliased_fields(self) -> None:
+        fields = REHEARSAL["selection_set"](
+            "query TradeStatus($key: String) {\n"
+            " rows: userIntents(where:{intentKey:$key}) { intentKey # errorCode\n"
+            " trade { owner: trader } } }"
+        )
+        payload = {
+            "userIntents": [
+                {
+                    "intentKey": "the-key",
+                    "errorCode": "market_order_outcome_not_indexed",
+                    "trade": {"trader": "trader-address", "id": 123},
+                }
+            ]
+        }
+        self.assertEqual(
+            REHEARSAL["project_fields"](payload, fields),
+            {"rows": [{"intentKey": "the-key", "trade": {"owner": "trader-address"}}]},
+        )
+
     def test_requires_the_original_intent_key_and_account(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             wheel = Path(temp) / "sai_cli-0.1.1-py3-none-any.whl"
@@ -194,4 +214,4 @@ class KeeperReplayTest(unittest.TestCase):
                         )
                         with urllib.request.urlopen(request, timeout=2) as response:
                             rows = json.load(response)["data"]["userIntents"]
-                        self.assertEqual([row["intentKey"] for row in rows], expected)
+                        self.assertEqual(rows, [{"intentKey": key} for key in expected])
