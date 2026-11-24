@@ -31,7 +31,7 @@ from tomlkit.items import Comment, Null, Table, Trivia
 from websockets.exceptions import InvalidURI
 from websockets.uri import parse_uri
 
-from . import keeper, margin, paths, stream
+from . import keeper, log, margin, paths, stream
 
 FILE_NAME = "config.toml"
 LOCK_NAME = ".config.lock"
@@ -467,18 +467,15 @@ def public_url(url: str | None) -> str | None:
     return urlunsplit((parts.scheme, netloc, parts.path, "", ""))
 
 
-def public_origin(url: str | None) -> str | None:
-    """Remove the path as well when it could contain a credential."""
-    public = public_url(url)
-    return urlsplit(public)._replace(path="").geturl() if public else None
-
-
 def public(settings: Settings) -> dict[str, dict[str, Any]]:
-    """Every key with its value, source, variable, and default; URLs are
-    redacted with `public_url`."""
+    """Every key with its display value, source, variable, and default."""
 
     def shown(spec: Setting, value: Any) -> Any:
-        return public_url(value) if spec.kind == "url" else value
+        if spec.kind != "url" or value is None:
+            return value
+        if spec.section == "keeper":
+            return log.origin(value)
+        return public_url(value)
 
     return {
         spec.key: {

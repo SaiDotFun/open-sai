@@ -28,7 +28,7 @@ from ..core import log as sai_log
 from ..core import session as sessions
 from ..core.errors import Code, SaiError, SessionError
 from ..core.errors import describe as describe_error
-from ..core.settings import Settings, public_origin, public_url
+from ..core.settings import Settings
 
 log = logging.getLogger("sai_cli.mcp_server")
 
@@ -293,7 +293,7 @@ def resolve_addr(settings: Settings, addr: str | None) -> dict[str, Any]:
     }
 
 
-def session_state(settings: Settings, *, origin_only: bool = False) -> dict[str, Any]:
+def session_state(settings: Settings) -> dict[str, Any]:
     """Describe the stored session without its token."""
     try:
         if not storage.session_exists():
@@ -313,12 +313,8 @@ def session_state(settings: Settings, *, origin_only: bool = False) -> dict[str,
         "signedIn": True,
         "connectedAccounts": connected,
         "usable": matches and not expired,
-        "addr": stored["evmAddress"],
-        "expiresAt": stored["expiresAt"],
+        **sessions.summary(stored),
         "expired": expired,
-        "endpoint": (public_origin if origin_only else public_url)(
-            stored.get("endpoint")
-        ),
         "endpointMatches": matches,
         **({"renewalCommand": sessions.renewal_command(stored)} if expired else {}),
         **(sessions.expiry_fields(stored, now) if matches else {}),
@@ -328,7 +324,7 @@ def session_state(settings: Settings, *, origin_only: bool = False) -> dict[str,
 def auth_status(settings: Settings, addr: str | None = None) -> dict[str, Any]:
     stored = session_loader(settings, addr)()
     return {
-        **sessions.summary(stored, origin_only=True),
+        **sessions.summary(stored),
         **sessions.expiry_fields(stored),
     }
 
@@ -343,11 +339,9 @@ def account_rows(settings: Settings) -> dict[str, Any]:
         matches = result.get("endpoint") == settings.endpoint
         rows.append(
             {
-                "addr": result["evmAddress"],
+                **sessions.summary(result),
                 "active": key == accounts["active"],
-                "expiresAt": result["expiresAt"],
                 "expired": expired,
-                "endpoint": public_url(result.get("endpoint")),
                 "endpointMatches": matches,
                 "usable": matches and not expired,
                 **sessions.expiry_fields(result, now),

@@ -969,8 +969,8 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 "mcpVersion": info.version("mcp"),
                 "provenance": info.provenance(),
                 "endpoints": {
-                    "keeper": sai_settings.public_url(config.endpoint),
-                    "websocket": sai_settings.public_url(config.ws_endpoint),
+                    "keeper": sai_log.origin(config.endpoint),
+                    "websocket": sai_log.origin(config.ws_endpoint),
                     "lcd": sai_settings.public_url(config.lcd_endpoint),
                 },
                 "configFile": str(sai_settings.config_path(os.environ)),
@@ -980,7 +980,7 @@ def create_server(settings: Settings | None = None) -> FastMCP:
                 },
                 "tools": names,
                 "trading": tools.trading_state(config),
-                "session": tools.session_state(config, origin_only=True),
+                "session": tools.session_state(config),
             }
 
         return await call(report)

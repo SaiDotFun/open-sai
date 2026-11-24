@@ -169,9 +169,12 @@ to repair. Run the command they print, such as
 `sai mcp install --client claude --scope user --repair-existing sai`.
 It edits the existing registration under its current name and scope.
 
-Running `install` again reports `unchanged`. An older entry is `replaced`,
-and so is one that sets other environment variables or that Codex has
-disabled. `uninstall` removes Sai from every scope it is registered in unless
+Running `install` again reports `unchanged`. Install replaces a `sai` entry
+that uses an older command, sets other environment variables, or is disabled
+in Codex. Install reports a working legacy entry under its existing name and
+scope. If the legacy entry needs repair, run `sai doctor`.
+
+`uninstall` removes Sai from every scope it is registered in unless
 you pass `--scope`. When Codex loads a different `sai` entry from the current project's
 `.codex/config.toml`, sai reports it but never edits it; change it there
 yourself. `--dry-run` shows the commands without running them. `install`

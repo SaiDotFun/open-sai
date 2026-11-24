@@ -7,11 +7,9 @@ import json
 import shlex
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import urlsplit
 
 from . import log, storage
 from .errors import Code, SessionError
-from .settings import public_origin, public_url
 
 EXPIRY_WARNING = timedelta(days=3)
 
@@ -26,26 +24,23 @@ def expiry_time(result: dict[str, str]) -> datetime:
 def renewal_command(result: dict[str, str]) -> str:
     """Return recovery instructions scoped to the session's Keeper."""
     endpoint = result.get("endpoint")
-    public = public_url(endpoint)
-    origin = ""
-    prefix = ["sai"]
-    if public:
-        parsed = urlsplit(public)
-        origin = " at " + parsed._replace(path="").geturl()
-        if public == endpoint and parsed.path in ("", "/", "/query", "/graphql"):
-            prefix += ["--endpoint", public]
-    suffix = (
-        f" (reuse the Keeper endpoint{origin} configured when this session was stored)"
-        if len(prefix) == 1
-        else ""
-    )
+
+    def command(*args: str) -> str:
+        if endpoint:
+            return storage.keeper_command_hint(endpoint, "auth", *args)
+        return shlex.join(["sai", "auth", *args])
+
+    origin = log.origin(endpoint) if endpoint else None
+    suffix = ""
+    if not endpoint or endpoint != origin:
+        where = f" at {origin}" if origin not in (None, log.REDACTED_URL) else ""
+        suffix = f" (reuse the Keeper endpoint{where} configured when this session was stored)"
     if result.get("keyName"):
-        return shlex.join([*prefix, "auth", "renew", result["evmAddress"]]) + suffix
-    browser = shlex.join([*prefix, "auth", "import"])
+        return command("renew", result["evmAddress"]) + suffix
+    browser = command("import")
     if result.get("source") == "imported":
         return browser + suffix
-    local = shlex.join([*prefix, "auth", "login", "NAME"])
-    return f"{local} or {browser}{suffix}"
+    return f"{command('login', 'NAME')} or {browser}{suffix}"
 
 
 def expiry_warning(result: dict[str, str], now: datetime) -> str | None:
@@ -147,13 +142,13 @@ def import_session(token: str, endpoint: str) -> dict[str, str]:
     }
 
 
-def summary(result: dict[str, str], *, origin_only: bool = False) -> dict[str, str]:
-    """Return the fields safe to show: addr, expiry, endpoint; no token."""
+def summary(result: dict[str, str]) -> dict[str, str | None]:
+    """Return the address, expiry, and Keeper origin for display."""
+    endpoint = result.get("endpoint")
     return {
         "addr": result["evmAddress"],
         "expiresAt": result["expiresAt"],
-        "endpoint": (public_origin if origin_only else public_url)(result["endpoint"])
-        or "",
+        "endpoint": log.origin(endpoint) if endpoint is not None else None,
     }
 
 

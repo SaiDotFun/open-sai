@@ -406,10 +406,8 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
         assert exit_code == 1
         error = blocked["error"]
         assert error["intentKey"] == key and error["retryable"] is False
-        assert (
-            error["hint"]
-            == f"sai --endpoint {endpoint} intent status {ADDR} --key {key}"
-        )
+        assert error["hint"].endswith(f"intent status {ADDR} --key {key}")
+        assert endpoint not in error["hint"]
     assert error["code"] == "RECENT_OPEN_PENDING"
     assert submitted_keys == [key]
 

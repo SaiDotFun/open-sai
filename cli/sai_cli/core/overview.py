@@ -16,7 +16,8 @@ from typing import Any
 
 from . import keeper, margin, reconcile, session, storage, stream
 from .errors import Code, SaiError
-from .settings import Settings, public_origin
+from .log import origin
+from .settings import Settings
 
 PAGE_SIZE = 100
 MAX_PAGES = 20
@@ -1009,7 +1010,7 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
     balances = _read(lambda: _balances(settings, addr))
     same_keeper = settings.ws_endpoint == stream.derive_ws(settings.endpoint)
     balances["source"] = {
-        "endpoint": public_origin(settings.ws_endpoint),
+        "endpoint": origin(settings.ws_endpoint),
         "matchesKeeper": same_keeper,
     }
     if not same_keeper:

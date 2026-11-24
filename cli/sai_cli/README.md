@@ -626,7 +626,7 @@ returns `intentKey`, `keeper`, and `txHash`. A failed Keeper read adds
 `keeperError` alongside the local trail. The `stats` report maps operations
 to `count`, `p50Ms`, and `p95Ms` under `keeper`, with counts by code under
 `errors`. It also returns `gaps` and the UTC cutoff `since`, if set.
-The `tail` command prints stored JSON objects one per line.
+The `tail` command prints one JSON object per line.
 
 A `keeper.request` has `status` `ok`, `error`, `rejected` (Keeper refused
 admission), or `not_sent` (the connection failed first). Its `operation` is
@@ -654,10 +654,11 @@ Keeper request and response payloads. The logger also scrubs every string.
   still waiting to be written. The background writer rereads the session
   store and replaces its tokens again. Anything shaped like a JWT, and hex
   strings of 100 digits or more, such as a signature, are replaced too.
-- Text Keeper or a tool returned, and error messages that can quote what
-  was typed (`keeperErrors`, `errorMsg`, `error`), are cut to 300
-  characters, lose hex strings of 64 digits or more, and end at the first
-  URL.
+- For GraphQL errors, `keeper.request` records the total count and up to
+  three validated codes. Unrecognized codes appear as `KEEPER_ERROR`.
+- Other untrusted text from Keeper or a tool is cut to 300 characters.
+  Sai removes hex strings of 64 digits or more and cuts the text at the
+  first URL.
 - `mcp.tool_call` logs only the parameters the tool defines.
   `unknownArguments` counts the rest, and a call to a tool the server does
   not have is logged as tool `unknown` with no arguments.

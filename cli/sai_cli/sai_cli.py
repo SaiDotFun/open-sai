@@ -559,7 +559,7 @@ def renew(ctx: click.Context, addr: str | None) -> None:
         result = signed_login(endpoint, name, stored["evmAddress"])
         result.update(endpoint=endpoint, keyName=name)
         storage.replace_session(stored, result)
-        emit(ctx, sessions.summary(result, origin_only=True))
+        emit(ctx, sessions.summary(result))
     except NeedsTerminal as exc:
         raise SaiError(
             f"{exc} Run {sessions.renewal_command(stored)} in a terminal.",
@@ -840,7 +840,7 @@ def auth_status(ctx: click.Context) -> None:
     result = session(ctx)
     fields = sessions.expiry_fields(result)
     show_expiry_notice(ctx, fields)
-    emit(ctx, {**sessions.summary(result, origin_only=True), **fields})
+    emit(ctx, {**sessions.summary(result), **fields})
 
 
 @main.group()
@@ -1418,8 +1418,8 @@ def config_file() -> Path:
 def config_list(ctx: click.Context) -> None:
     """Show every setting with its value and source.
 
-    The source is flag, env, file, default, or derived. URLs are shown
-    without credentials; `sai config get` prints the exact value.
+    The source is flag, env, file, default, or derived. Keeper URLs are
+    shown as origins. `sai config get` prints the exact value.
     """
     shown = sai_settings.public(settings(ctx))
     if ctx.obj["json"]:
@@ -1931,7 +1931,7 @@ def logs_tail(
     """Show the most recent events, oldest first.
 
     Plain output is one line per event: time (UTC), surface, level, event,
-    then its fields. With --json, each line is the stored JSON object.
+    then its fields. With --json, each line is a JSON object.
 
     \b
     Examples:

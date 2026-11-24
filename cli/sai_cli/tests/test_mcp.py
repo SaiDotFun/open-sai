@@ -390,8 +390,8 @@ def test_server_reads_the_config_file_and_reports_its_path(tmp_path):
         '[keeper]\nendpoint = "http://127.0.0.1:9/query"\n'
     )
     info = invoke(server.create_server(), "mcp_info")
-    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9/query"
-    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9/query"
+    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
+    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
     assert info["configFile"] == str(tmp_path / "config.toml")
 
 
@@ -1301,8 +1301,8 @@ def test_mcp_info_strips_credentials_from_endpoints(monkeypatch):
     storage.save_session(stored_session(endpoint="https://u:p@k.example/q?t=s"))
     info = invoke(server.create_server(), "mcp_info")
     assert info["endpoints"] == {
-        "keeper": "https://k.example:8443/query",
-        "websocket": "wss://k.example:8443/query",
+        "keeper": "https://k.example:8443",
+        "websocket": "wss://k.example:8443",
         "lcd": "https://lcd.example/",
     }
     assert info["session"]["endpoint"] == "https://k.example"
@@ -1350,7 +1350,23 @@ def test_session_reports_never_include_the_token(mcp):
     assert info["session"]["renewalCommand"] == status["renewalCommand"]
     assert "expiryWarning" in invoke(mcp, "auth_list")["accounts"][0]
     assert info["provenance"]["kind"] in ("source-checkout", "installed")
-    assert info["endpoints"]["keeper"] == ENDPOINT
+    assert info["endpoints"]["keeper"] == "https://sai-keeper.nibiru.fi"
+
+
+def test_session_reports_keep_an_account_without_an_endpoint(mcp):
+    stored = stored_session()
+    del stored["endpoint"]
+    storage.save_session(stored)
+
+    info = invoke(mcp, "mcp_info")
+    [account] = invoke(mcp, "auth_list")["accounts"]
+    assert info["session"]["signedIn"] is True
+    assert account["active"] is True
+    for report in (info["session"], account):
+        assert report["addr"] == ADDR
+        assert report["endpoint"] is None
+        assert report["endpointMatches"] is False
+        assert report["usable"] is False
 
 
 # Stdio
@@ -1417,8 +1433,8 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
     assert "sai auth login" in started["instructions"]
     assert {tool["name"] for tool in listed["tools"]} == READ_TOOLS | TRADE_TOOLS
     info = json.loads(called["content"][0]["text"])
-    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9/query"
-    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9/query"
+    assert info["endpoints"]["keeper"] == "http://127.0.0.1:9"
+    assert info["endpoints"]["websocket"] == "ws://127.0.0.1:9"
     assert info["trading"]["reason"] == "signed-out"
     assert "agent client should launch it" not in stderr
 

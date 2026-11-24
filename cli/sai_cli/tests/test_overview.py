@@ -266,10 +266,10 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
     assert decoded["queuedMarketOrders"]["data"] == []
     session = decoded["session"]["data"]
     assert "expires in" in session["expiryWarning"]
-    assert (
-        session["renewalCommand"]
-        == f"sai --endpoint {replay['config'].endpoint} auth renew {ADDR}"
-    )
+    command = session["renewalCommand"]
+    assert command.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+    assert f"auth renew {ADDR}" in command
+    assert replay["config"].endpoint not in command
     assert session["sourceAgeSeconds"] == pytest.approx(28 * 86400, abs=5)
     assert [args for query, args in replay["calls"] if query == "lcd"] == ["latest"]
     assert keeper.PRICES not in {query for query, _ in replay["calls"]}
@@ -894,7 +894,7 @@ def test_overview_rejects_an_invalid_lcd_port():
 def test_balance_source_label_warns_about_an_independent_websocket(replay):
     balances = mcp(replay, addr=ADDR)["balances"]
     assert balances["source"] == {
-        "endpoint": settings.public_origin(replay["config"].ws_endpoint),
+        "endpoint": replay["config"].ws_endpoint.removesuffix("/query"),
         "matchesKeeper": False,
     }
     assert "different chain" in balances["warning"]

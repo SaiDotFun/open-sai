@@ -234,7 +234,7 @@ sai logs path
 ```
 
 - `tail` shows the most recent events, oldest first. `-n` sets how many.
-  With `--json` each line is the stored JSON object.
+  With `--json`, each line is a JSON object.
 - `--surface` is `cli`, `mcp`, or `update`. Each surface has its own file
   per UTC day.
 - `--event NAME` matches one event or a family by prefix: `intent`,
