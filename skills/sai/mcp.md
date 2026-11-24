@@ -80,8 +80,10 @@ The server lists every tool whether or not anyone is signed in. Each
 `trade_*` call checks the session of the account it acts as.
 
 If `mcp_info.session.expiryWarning` is present, tell the person when the
-session expires. To renew, use the same Keeper endpoint. The v0.1.2
-`renewalCommand` can include explanatory text after the command.
+session expires. Renew against the same Keeper endpoint. In v0.1.2,
+`renewalCommand` can include explanatory text after the command. On `main`,
+pass along the `renewalCommand` and any `renewalGuidance` separately when
+the report includes them.
 
 | `mcp_info.trading.reason` | What It Means for the Active Account |
 | --- | --- |
@@ -106,8 +108,10 @@ for the token and never returns it.
    every preview and trade. Without `addr` a tool acts on whichever account
    is active at that moment, and another terminal or client can switch it.
 2. Show the person the preview, the `addr` it names, and the network from
-   `mcp_info`. Give the fees, liquidation price, and worst-case fill from
-   `estimates` where available. Wait for explicit confirmation.
+   `mcp_info`. If `estimates.execution.status` is `would_be_rejected`, show
+   the reason and stop. The server leaves out `previewDigest` for that
+   result. Otherwise, give the fees, liquidation price, and worst-case fill
+   where available. Wait for explicit confirmation.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
@@ -176,11 +180,16 @@ the stored trigger after checking that the order can fill. The worst fill is
 A stop can miss its fill when a gap takes the price outside that bound.
 [trading-safety.md](trading-safety.md) rule 3 has the full rule.
 
-On `PREVIEW_MISMATCH` or `PRICE_MOVED`, the server submits nothing. If the
-result includes `preview`, show it and get confirmation again. If
-`PREVIEW_MISMATCH` omits `preview`, pause and call the matching `preview_*`
-tool. Ask for confirmation once you have a current quote. On retry, use its
-`preview_digest` and, for a market open, its `reference_price`.
+On `PREVIEW_MISMATCH` or `PRICE_MOVED`, nothing was submitted. Use the
+replacement `preview` only if Sai can verify the quote. For a partial
+close, check that `quote.collateralPriceUsd` has a value. A USDC estimate
+can still have a digest when that field is `null`.
+
+If the replacement is missing or lacks a verifiable quote, wait until Sai
+can verify the quote and call the matching `preview_*` tool again. Ask for
+confirmation only when the preview shows a verifiable quote, including the
+collateral price for a partial close. Discard the old digest and submit with
+the new `preview_digest` and, for a market open, the new `reference_price`.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Both check that the order is pending. If it fills after the
