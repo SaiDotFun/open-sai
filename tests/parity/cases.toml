@@ -73,7 +73,8 @@ state = { "config.toml" = "<absent>" }
 name = "config-invalid-endpoint"
 args = ["--json","config","set","keeper.endpoint","https://[::1]suffix/path"]
 expect = 2
-state = { "config.toml" = "<absent>", ".config.lock" = "<absent>" }
+seed = "config-logs-disabled"
+state = { "config.toml#keeper.endpoint" = "<absent>", "config.toml#logs.enabled" = false, ".config.lock" = "<absent>", "logs" = "<absent>" }
 
 [[case]]
 name = "config-unknown-key"

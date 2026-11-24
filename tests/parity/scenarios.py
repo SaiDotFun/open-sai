@@ -124,9 +124,10 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         for name in ("config.toml", "trader/sessions.json"):
             (sai_home / name).chmod(0o600)
         return
-    if seed == "config":
+    if seed in {"config", "config-logs-disabled"}:
         path = sai_home / "config.toml"
-        path.write_text(CONFIG, encoding="utf-8")
+        text = CONFIG if seed == "config" else "[logs]\nenabled = false\n"
+        path.write_text(text, encoding="utf-8")
         path.chmod(0o600)
         return
     session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
