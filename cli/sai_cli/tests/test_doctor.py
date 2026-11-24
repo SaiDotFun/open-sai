@@ -328,6 +328,36 @@ def test_doctor_reports_and_preserves_an_existing_shared_or_ambiguous_root(
     assert isolated_home.stat().st_mode & 0o7777 == mode
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory modes")
+def test_doctor_gives_shared_root_guidance_in_both_modes(isolated_home):
+    storage.db().close()
+    history = isolated_home / "trader" / "history"
+    history.touch()
+    history.chmod(0o644)
+    isolated_home.chmod(0o2770)
+    root_advice = (
+        "Sai preserves the permissions of existing directories because they may be shared."
+        " Use a dedicated directory for SAI_HOME and keep the existing trader data,"
+        " including the intent ledger, when moving the profile."
+    )
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["fix"] == f"{root_advice} chmod go-rwx {history}"
+    assert history.stat().st_mode & 0o777 == 0o644
+    assert isolated_home.stat().st_mode & 0o7777 == 0o2770
+
+    code, output = run_cli("--json", "doctor", "--offline")
+    assert code == 0
+    check = next(c for c in json.loads(output)["checks"] if c["id"] == "home")
+    assert check["status"] == "warn"
+    assert check["fix"] == root_advice
+    assert history.stat().st_mode & 0o777 == 0o600
+    assert isolated_home.stat().st_mode & 0o7777 == 0o2770
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX file modes")
 def test_fix_makes_the_directory_and_files_private(isolated_home):
     root = loosen(isolated_home)

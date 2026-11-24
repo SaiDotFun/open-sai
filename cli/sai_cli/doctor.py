@@ -347,6 +347,11 @@ MANAGED = (
     "history",
 )
 SYMLINK_FIX = "Replace the symlink with a real file or directory by hand"
+SAI_HOME_MODE_FIX = (
+    "Sai preserves the permissions of existing directories because they may be shared."
+    " Use a dedicated directory for SAI_HOME and keep the existing trader data,"
+    " including the intent ledger, when moving the profile."
+)
 
 
 def symlinks(names: Sequence[str] = MANAGED) -> list[Path]:
@@ -450,24 +455,23 @@ def check_home(ctx: Context) -> Check:
     details["looseModes"] = [
         {"path": str(path), "mode": f"{mode:o}"} for path, mode, _ in loose
     ]
+    home_fix = SAI_HOME_MODE_FIX if home_loose else ""
     if links:
-        fixes = [SYMLINK_FIX]
-        if home_loose:
-            fixes.append(f"Review permissions on {sai_home}")
         return Check(
             "home",
             "fail",
             f"{', '.join(map(str, links))}: profile path is a symlink",
-            "; ".join(fixes),
+            f"{SYMLINK_FIX}. {home_fix}" if home_fix else SYMLINK_FIX,
             {**details, "symlinks": [str(path) for path in links]},
         )
     trader_exists = root.is_dir()
     if loose and not ctx.fix:
+        trader_fix = "; ".join(f"chmod go-rwx {path}" for path, _, _ in trader_loose)
         return Check(
             "home",
             "warn",
             f"{plural(len(loose), 'path')} in {sai_home} accessible by other users",
-            "; ".join(f"chmod go-rwx {path}" for path, _, _ in loose),
+            f"{home_fix} {trader_fix}".strip(),
             details,
         )
     if not trader_exists and not ctx.fix:
@@ -493,7 +497,7 @@ def check_home(ctx: Context) -> Check:
             "home",
             "fail",
             f"Could not make {plural(len(failed), 'path')} private",
-            "; ".join(failed),
+            f"{home_fix} {'; '.join(failed)}".strip(),
             details,
             changes=changes,
         )
@@ -502,7 +506,7 @@ def check_home(ctx: Context) -> Check:
             "home",
             "warn",
             f"{sai_home} is accessible by other users",
-            "Review the directory's permissions by hand",
+            home_fix,
             details,
             changes=changes,
         )
