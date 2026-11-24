@@ -27,6 +27,10 @@ sai mcp uninstall codex
 - `--scope project` writes the project's shared config (Claude Code
   `.mcp.json`, Cursor `.cursor/mcp.json`) instead of the user's. Codex is
   user only.
+- When doctor or an update reports a stale Claude Code launcher, use the
+  exact repair command it prints. For example, `sai mcp install --client
+  claude --scope user --repair-existing sai` edits the existing user entry
+  in place. Keep the name and scope from the report.
 - From a checkout, give the server command after `--`:
   `sai mcp install claude -- uv run --directory /path/to/open-sai sai mcp serve`.
 - The client must restart or reconnect to load a change. Cursor may also ask

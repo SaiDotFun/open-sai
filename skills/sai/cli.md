@@ -146,16 +146,19 @@ When a command fails in a way you cannot explain, run:
 sai --json doctor
 ```
 
-Doctor checks the install, the session, the intent ledger, and the Keeper
-HTTP, WebSocket, and LCD endpoints. It fixes what is safe to fix: file modes
-under `$SAI_HOME/trader`, the ledger schema, and unknown intents it can
-settle by reading Keeper. It never trades, never rewrites the session, and
-never prints the token.
+Doctor checks the install, config, MCP registrations, the session, the
+intent ledger, and the Keeper HTTP, WebSocket, and LCD endpoints. It can
+fix file modes under `$SAI_HOME/trader`, repair stale Codex and Cursor
+launchers, migrate the ledger, and settle unknown intents by reading Keeper.
+It never trades, rewrites the session, or prints the token.
 
 - Each check has a `status` of `pass`, `fixed`, `warn`, `fail`, or `skipped`,
   and a `fix` command when one applies. `changes` lists what doctor changed.
 - Show the person what doctor changed, then the checks that still fail and
   their fixes.
+- For a stale Claude Code registration, show the person the exact command in
+  `fix`. They can run it to repair the existing registration in its original
+  scope. Project and local repairs run from the directory doctor checked.
 - `--no-fix` reports without changing anything. `--offline` skips the network
   checks.
 - Doctor exits 1 while any check still fails.
@@ -227,6 +230,8 @@ sai update
 - After an update, ask the person to restart or reconnect their agent client.
   A running MCP server keeps the old code until then; tool `mcp_info` reports
   `restartNeeded`.
+- Pass along any explicit Claude Code repair command in the update result or
+  background notice.
 - `sai update` only updates a `uv tool install` of a release or of the
   official Git source. A checkout, a `uvx` run, or another install gets a
   note and exit code 3. Follow the note.

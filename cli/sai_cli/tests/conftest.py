@@ -1,8 +1,9 @@
-"""Prevent in-process tests from connecting to external TCP services."""
+"""Isolate test homes and prevent connections to external TCP services."""
 
 from __future__ import annotations
 
 import ipaddress
+import os
 import socket
 
 import pytest
@@ -26,6 +27,17 @@ def block_external_tcp(monkeypatch):
         return original(sock, address)
 
     monkeypatch.setattr(socket.socket, "connect", connect_local_only)
+
+
+@pytest.fixture(autouse=True)
+def private_client_home(monkeypatch, tmp_path_factory):
+    """Doctor and update must never inspect the developer's MCP registrations."""
+    home = tmp_path_factory.mktemp("mcp-home")
+    monkeypatch.setenv("HOME", str(home))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("CODEX_HOME", str(home / ".codex"))
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
 
 
 @pytest.fixture(autouse=True)

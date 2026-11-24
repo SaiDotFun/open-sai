@@ -45,6 +45,14 @@ class SettingsError(ValueError):
     """A setting, its value, or the config file is invalid."""
 
 
+class ConfigError(SettingsError):
+    """An invalid config file with a diagnostic safe for doctor output."""
+
+    def __init__(self, diagnostic: str, detail: str) -> None:
+        super().__init__(detail)
+        self.diagnostic = diagnostic
+
+
 @dataclass(frozen=True)
 class Invalid:
     """A value in the config file that failed its check, kept so `resolve`
@@ -215,8 +223,14 @@ def check_value(key: str, value: Any) -> str | bool | int:
         return value
     if not isinstance(value, str):
         raise SettingsError(f"Invalid value for {key}: expected a URL string")
-    parts = urlsplit(value)
-    if parts.scheme not in spec.schemes or not parts.netloc:
+    try:
+        parts = urlsplit(value)
+        hostname = parts.hostname
+        # urlsplit defers port validation until the property is read.
+        _ = parts.port
+    except ValueError:
+        raise SettingsError(f"Invalid URL for {key}") from None
+    if parts.scheme not in spec.schemes or not hostname:
         raise SettingsError(
             f"Invalid value for {key}: expected a URL starting with"
             f" {' or '.join(s + '://' for s in spec.schemes)}"
@@ -243,8 +257,10 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
     """
     try:
         data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as exc:
-        raise SettingsError(f"Cannot parse {path}: {exc}") from None
+    except ValueError as exc:
+        raise ConfigError(
+            "config.toml is not valid TOML", f"Cannot parse {path}: {exc}"
+        ) from None
     values: dict[str, Any] = {}
     warnings: list[str] = []
     for section, table in data.items():
@@ -260,9 +276,8 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
             if section in SECTIONS:
                 # A known section that is not a table would otherwise fall back
                 # to the default and quietly select another Keeper.
-                raise SettingsError(
-                    f"{path}: {section!r} must be a table, such as [{section}]"
-                )
+                message = f"{section!r} must be a table, such as [{section}]"
+                raise ConfigError(message, f"{path}: {message}")
             warnings.append(f"{path}: ignoring unknown setting {section!r}")
             continue
         for name, value in table.items():
@@ -274,7 +289,7 @@ def parse_file(text: str, path: Path | str) -> tuple[dict[str, Any], list[str]]:
                 values[key] = check_value(key, value)
             except SettingsError as exc:
                 if section not in LENIENT_SECTIONS:
-                    raise SettingsError(f"{path}: {exc}") from None
+                    raise ConfigError(str(exc), f"{path}: {exc}") from None
                 values[key] = Invalid(str(exc))
                 warnings.append(f"{path}: {exc}; logging is off until it is fixed")
     return values, warnings
@@ -286,8 +301,13 @@ def read_file(path: Path) -> tuple[dict[str, Any], list[str]]:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
         return {}, []
+    except UnicodeError:
+        message = "config.toml must use UTF-8"
+        raise ConfigError(message, f"{path}: {message}") from None
     except OSError as exc:
-        raise SettingsError(f"Cannot read {path}: {exc.strerror}") from None
+        raise ConfigError(
+            "Could not read config.toml", f"Cannot read {path}: {exc.strerror}"
+        ) from None
     return parse_file(text, path)
 
 
