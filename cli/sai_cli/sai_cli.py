@@ -1284,7 +1284,11 @@ preview_digest_option = click.option(
     help="Trigger for limit and stop orders. For market orders, pass the preview's"
     " reference price when submitting with --preview-digest.",
 )
-@click.option("--slippage", required=True, help="Maximum slippage percentage.")
+@click.option(
+    "--slippage",
+    required=True,
+    help="Maximum slippage percentage, greater than 0 and at most 100.",
+)
 @click.option("--take-profit")
 @click.option("--stop-loss")
 @click.option(
