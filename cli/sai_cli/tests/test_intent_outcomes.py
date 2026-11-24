@@ -23,7 +23,12 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from loopback_keeper import KeeperHandler, keeper_server
+from loopback_keeper import (
+    POSITION_ROUTE,
+    PositionKeeperHandler,
+    keeper_server,
+    position_data,
+)
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from sai_cli.core import keeper, log, reconcile, settings, storage, wait
@@ -104,12 +109,18 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
     active_key = KEY
     offset = 0
 
-    class Handler(KeeperHandler):
+    class Handler(PositionKeeperHandler):
         def do_POST(self) -> None:
             nonlocal active_key, offset
             try:
                 request = self.read_json()
             except (ConnectionResetError, json.JSONDecodeError):
+                return
+            if request["query"] == keeper.POSITION:
+                self.reply({"data": position_data(request["variables"])})
+                return
+            if request["query"] == keeper.ROUTE:
+                self.reply({"data": POSITION_ROUTE})
                 return
             if request["query"] == keeper.SUBMIT:
                 active_key = request["variables"]["input"]["intentKey"]
@@ -1699,7 +1710,18 @@ def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, out
         )
         replies.extend((completed, history))
     result = CliRunner().invoke(
-        main, ["--endpoint", endpoint, "--json", "trade", "close", "7", "--wait"]
+        main,
+        [
+            "--endpoint",
+            endpoint,
+            "--lcd-endpoint",
+            endpoint.removesuffix("/query"),
+            "--json",
+            "trade",
+            "close",
+            "7",
+            "--wait",
+        ],
     )
     assert result.exit_code == exit_code, result.output
     value = json.loads(result.output)
