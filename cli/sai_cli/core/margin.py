@@ -486,12 +486,20 @@ def trading_contract(endpoint: str, lcd: str) -> str:
     return trading_route(endpoint, lcd)["contractAddress"]
 
 
-def verify_position_owner(endpoint: str, lcd: str, addr: str, trade_id: int) -> None:
-    """Verify the live contract target before accepting a position intent."""
-    contract = trading_contract(endpoint, lcd)
+@dataclass(frozen=True)
+class VerifiedPosition:
+    route: PositionRoute
+    raw: dict[str, Any]
+
+
+def verify_position_owner(
+    endpoint: str, lcd: str, addr: str, trade_id: int
+) -> VerifiedPosition:
+    """Read the live target and check its trade index and owner."""
+    route = trading_route(endpoint, lcd)
     raw = smart_value(
         lcd,
-        contract,
+        route["contractAddress"],
         {"get_trade_raw": {"trader": addr, "index": trade_id}},
         fresh=True,
     )
@@ -502,6 +510,7 @@ def verify_position_owner(endpoint: str, lcd: str, addr: str, trade_id: int) -> 
         raise ValueError(f"Unable to verify contract position {trade_id}")
     if not keeper.same_account(addr, raw.get("user")):
         raise PositionOwnerMismatch("Contract position belongs to a different account")
+    return VerifiedPosition(route, raw)
 
 
 def snapshot(
@@ -511,9 +520,10 @@ def snapshot(
     trade_id: int,
     *,
     indexed: dict[str, Any] | None = None,
+    verified: VerifiedPosition | None = None,
 ) -> PositionSnapshot:
-    """Read contract state, optionally reusing a verified Keeper position."""
-    route = trading_route(endpoint, lcd)
+    """Read contract state, reusing any position data checked by the caller."""
+    route = trading_route(endpoint, lcd) if verified is None else verified.route
     contract = route["contractAddress"]
     position = (
         indexed if indexed is not None else indexed_position(endpoint, addr, trade_id)
@@ -539,8 +549,9 @@ def snapshot(
     ):
         raise MarketUnavailable("Open market data is unavailable")
 
-    def raw_trade(timeout: float) -> dict[str, Any]:
-        raw = _read_position(lcd, contract, trader, trade_id, timeout)
+    def raw_trade(timeout: float, raw: dict[str, Any] | None = None) -> dict[str, Any]:
+        if raw is None:
+            raw = _read_position(lcd, contract, trader, trade_id, timeout)
         if not keeper.same_account(addr, raw.get("user")):
             raise PositionOwnerMismatch(
                 "Contract position belongs to a different account"
@@ -555,7 +566,7 @@ def snapshot(
             raise PositionChanged("Position changed. Review the margin change again.")
         return raw
 
-    raw = raw_trade(20)
+    raw = raw_trade(20, None if verified is None else verified.raw)
     if not _same_margin(raw, position):
         end = time.monotonic() + INDEX_RETRY_BUDGET
         for delay in INDEX_RETRY_DELAYS:

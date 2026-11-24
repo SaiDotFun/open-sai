@@ -359,17 +359,25 @@ def _position_intent(
     addr = get_session()["evmAddress"]
     indexed = margin.indexed_position(endpoint, addr, trade_id)
     preview = {"dryRun": True, "intent": payload}
+    if lcd is None and not dry_run:
+        raise ValueError("Cannot verify the position without an LCD")
+    verified = None
+    if lcd is not None:
+        try:
+            verified = margin.verify_position_owner(endpoint, lcd, addr, trade_id)
+        except estimates.READ_ERRORS:
+            if not dry_run:
+                raise
 
     def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
         return _estimate_position(
-            endpoint, lcd, addr, trade_id, indexed, target, updates_triggers
+            endpoint, lcd, addr, trade_id, indexed, verified, target, updates_triggers
         )
 
     if dry_run:
+        if verified is None:
+            preview["positionOwnerVerified"] = False
         return {**preview, "estimates": estimate(preview)}
-    if lcd is None:
-        raise ValueError("Cannot verify the position without an LCD")
-    margin.verify_position_owner(endpoint, lcd, addr, trade_id)
     _checked(before_submit, preview, estimate)
     return intents.submit(endpoint, get_session(), payload)
 
@@ -380,13 +388,16 @@ def _estimate_position(
     addr: str,
     trade_id: int,
     indexed: dict[str, Any],
+    verified: margin.VerifiedPosition | None,
     target: Decimal | None,
     updates_triggers: bool,
 ) -> dict[str, Any]:
     state, effective, height = None, None, None
-    if lcd is not None:
+    if lcd is not None and verified is not None:
         try:
-            state = margin.snapshot(endpoint, lcd, addr, trade_id, indexed=indexed)
+            state = margin.snapshot(
+                endpoint, lcd, addr, trade_id, indexed=indexed, verified=verified
+            )
             if target is not None or updates_triggers:
                 height = margin.verified_position_height(lcd, state, trade_id)
                 effective, _ = margin.leverage_inputs(

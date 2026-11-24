@@ -540,6 +540,33 @@ def test_mcp_refuses_another_accounts_position(position_service, action, args):
 
 
 @pytest.mark.parametrize(("action", "args"), MCP_POSITION_ACTIONS)
+def test_mcp_contract_outage_returns_unverified_preview(position_service, action, args):
+    position, base_url = position_service
+    position.contract_position_unavailable = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            assert preview["dryRun"] is True
+            assert preview["addr"] == ADDR
+            assert preview["positionOwnerVerified"] is False
+            assert "previewDigest" not in preview
+            assert preview["estimates"]["fees"]["status"] == "unavailable"
+
+            position.contract_position_unavailable = False
+            position.preview_inputs = True
+            position.keeper_market_open = False
+            verified = await call(client, f"preview_{action}", args)
+            assert verified["intent"] == preview["intent"]
+            assert len(verified["previewDigest"]) == 64
+            assert verified["estimates"]["fees"]["status"] == "unavailable"
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("action", "args"), MCP_POSITION_ACTIONS)
 @pytest.mark.parametrize("scenario", ["foreign-owner", "missing-owner", "unavailable"])
 def test_mcp_rechecks_contract_position_before_admission(
     position_service, action, args, scenario
