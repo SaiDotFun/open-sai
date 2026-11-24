@@ -499,6 +499,14 @@ def rehearse(root: Path, wheel: Path, version: str) -> None:
             "Update to the candidate", "update", "--api-base", base, "--web-base", base
         )
         tool.verify_version(version)
+        require(
+            probe_retry(tool, replay, key),
+            "Candidate submitted a second open before reconciling the legacy intent",
+        )
+        require(
+            ledger_row(ledger, key, migrated=True) == ("unknown", None),
+            "The original open must still be unknown before reconciliation",
+        )
         require(config.read_bytes() == configured, "Update changed the user config")
         tool.verify_session(session)
         tool.verify_mcp(version)
@@ -509,10 +517,13 @@ def rehearse(root: Path, wheel: Path, version: str) -> None:
             and ledger_row(ledger, key, migrated=True) == ("unknown", "pending"),
             "Candidate did not migrate the open to pending",
         )
-        require(probe_retry(tool, replay, key), "Candidate submitted a second open")
+        require(
+            probe_retry(tool, replay, key),
+            "Candidate submitted a second open after reconciling the pending intent",
+        )
         check_doctor(tool, base, key, pending=True)
         print(
-            f"Upgraded to {version}. Session, config, and MCP survived. The migrated open still blocks.",
+            f"Upgraded to {version}. Session, config, and MCP survived. Retry blocked before and after reconciliation.",
             flush=True,
         )
 
@@ -543,10 +554,12 @@ def rehearse(root: Path, wheel: Path, version: str) -> None:
             ),
             "The old CLI could not read the migrated pending open",
         )
-        blocked = probe_retry(tool, replay, key)
+        require(
+            probe_retry(tool, replay, key),
+            "The downgraded CLI submitted a second open before reconciliation",
+        )
         print(
-            f"Downgraded to {BASELINE}. Retry before reconciliation: "
-            f"{'blocked' if blocked else 'reached loopback Keeper'}.",
+            f"Downgraded to {BASELINE}. Retry before reconciliation: blocked.",
             flush=True,
         )
         tool.json("Reconcile with the old CLI", *args)
