@@ -271,9 +271,11 @@ fn print_parse_error(
             let usage_command = match error.get(ContextKind::Usage) {
                 Some(ContextValue::StyledStr(usage)) => {
                     let usage = usage.to_string();
-                    let path = usage.trim_start_matches("Usage: sai");
-                    if path.starts_with(" config ") {
-                        if path.starts_with(&format!(" {command} ")) {
+                    let path = usage.trim_start_matches("Usage: sai").trim();
+                    if path == "config" || path.starts_with("config ") {
+                        if path == command
+                            || path.starts_with(&format!("{command} "))
+                        {
                             command
                         } else {
                             "config"
