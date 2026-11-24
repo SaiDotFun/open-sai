@@ -175,6 +175,36 @@ def read_events(home: Path) -> list[dict[str, Any]]:
             if dynamic in event:
                 assert isinstance(event[dynamic], str if dynamic == "ts" else int)
                 event[dynamic] = "<dynamic>"
+        # C4's Python reference wrote v1 rows. The C9b cases compare
+        # these v2 fields directly against the newer Python writer.
+        for field in ("schema", "commandId", "endpointId"):
+            event.pop(field, None)
+        if event["event"] == "keeper.request":
+            event.pop("intentKey", None)
+            if "keeperErrors" in event:
+                event.update(
+                    log.keeper_error_fields(
+                        event["keeperErrors"],
+                        retained=True,
+                        total=event.get("keeperErrorCount"),
+                    )
+                )
+        if event["event"] == "intent.keeper":
+            if (code := keeper.intent_error_code(event)) is not None:
+                event["errorCode"] = code
+            event.pop("errorMsg", None)
+            for field, allowed in (
+                ("kind", keeper.INTENT_KINDS),
+                ("lifecycleStep", keeper.INTENT_STEPS),
+                ("execActor", keeper.INTENT_ACTORS),
+            ):
+                if event.get(field) not in allowed:
+                    event.pop(field, None)
+            tx, invalid = keeper.request_hash(event.pop("txHash", None))
+            if tx is not None:
+                event["txHash"] = tx
+            if invalid:
+                event["txHashInvalid"] = True
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
     return events
 
@@ -183,6 +213,9 @@ def read_state(home: Path) -> tuple[Any, ...]:
     files = {
         str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
     }
+    for name in ("logs/.endpoint-key", "logs/.endpoint-key.lock"):
+        if name in files:
+            assert files.pop(name) & 0o777 == 0o600
     db = home / "trader/intents.sqlite3"
     if not db.exists():
         return (files,)

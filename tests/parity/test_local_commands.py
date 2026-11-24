@@ -149,3 +149,35 @@ def test_skill_install(
         repeated = invoke(cli, root, "--json", "skill", "install", *options)
         assert repeated.returncode == 0 and repeated.stderr == b""
         assert json.loads(repeated.stdout) == {**report, "action": "unchanged"}
+
+
+def test_command_log_v2(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    runs = []
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        cli_json(cli, root, "config", "list")
+        logs = root / "sai-home/logs"
+        rows = [
+            json.loads(line)
+            for file in logs.glob("*.jsonl")
+            for line in file.read_bytes().splitlines()
+        ]
+        assert [row["event"] for row in rows] == ["command.start", "command.end"]
+        assert all(row["schema"] == 2 for row in rows)
+        assert rows[0]["runId"] == rows[1]["runId"]
+        assert rows[0]["commandId"] == rows[1]["commandId"]
+        assert len(rows[0]["commandId"]) == 32
+        for row in rows:
+            for volatile in (
+                "ts",
+                "pid",
+                "version",
+                "runId",
+                "commandId",
+                "durationMs",
+            ):
+                row.pop(volatile, None)
+        runs.append(rows)
+    assert runs[0] == runs[1]

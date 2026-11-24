@@ -6,7 +6,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     errors::{Code, SaiError},
-    keeper::{self, Keeper, canonical_account, stringify, truthy},
+    keeper::{self, Keeper, canonical_account, truthy},
     log::{EventContext, Field, Level},
     storage::{IntentStatus, StatusUpdateOptions, Storage},
 };
@@ -387,11 +387,18 @@ fn log_keeper(
         ("endpoint", Field::Endpoint(endpoint.into())),
     ];
     if let Some((row, outcome)) = observed {
-        for key in ["kind", "lifecycleStep", "execActor", "errorCode", "txHash"] {
-            fields.push((key, row[key].clone().into()));
+        for key in ["kind", "lifecycleStep", "execActor"] {
+            if keeper::known_intent_field(key, &row[key]) {
+                fields.push((key, row[key].clone().into()));
+            }
         }
-        if !row["errorMsg"].is_null() {
-            fields.push(("errorMsg", Field::Untrusted(stringify(&row["errorMsg"]))));
+        if let Some(code) = row.as_object().and_then(keeper::log_intent_error_code) {
+            fields.push(("errorCode", json!(code).into()));
+        }
+        if let Some(hash) = keeper::request_hash(&row["txHash"]) {
+            fields.push(("txHash", json!(hash).into()));
+        } else if !row["txHash"].is_null() {
+            fields.push(("txHashInvalid", json!(true).into()));
         }
         if outcome == Outcome::TerminalFailed {
             fields.push(("code", json!(Code::KeeperError).into()));

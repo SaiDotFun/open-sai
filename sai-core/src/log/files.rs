@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{self, Write as _},
+    io::{self, Read as _, Write as _},
     path::Path,
     time::SystemTime,
 };
@@ -10,6 +10,7 @@ use chrono::{DateTime, Datelike, NaiveDate, Utc};
 use super::Surface;
 
 const PRUNE_MARKER: &str = ".pruned";
+const ENDPOINT_KEY: &str = ".endpoint-key";
 
 #[cfg(unix)]
 pub(super) struct LogDir(File);
@@ -19,6 +20,10 @@ pub(super) struct LogDir(std::path::PathBuf);
 
 impl LogDir {
     pub fn open(root: &Path) -> io::Result<Self> {
+        Self::open_at(root, true)
+    }
+
+    fn open_at(root: &Path, create: bool) -> io::Result<Self> {
         let mut builder = fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
@@ -30,7 +35,9 @@ impl LogDir {
             use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
             builder.mode(0o700);
-            builder.create(root)?;
+            if create {
+                builder.create(root)?;
+            }
             let fd = open(
                 root,
                 OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW,
@@ -41,17 +48,49 @@ impl LogDir {
             if info.uid() != geteuid().as_raw() {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            restrict(&dir, &info)?;
+            if create {
+                restrict(&dir, &info)?;
+            }
             Ok(Self(dir))
         }
         #[cfg(not(unix))]
         {
-            builder.create(root)?;
-            if redirected(&fs::symlink_metadata(root)?) {
+            if create {
+                builder.create(root)?;
+            }
+            let metadata = fs::symlink_metadata(root)?;
+            if !metadata.is_dir() || redirected(&metadata) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
             Ok(Self(root.into()))
         }
+    }
+
+    #[cfg(unix)]
+    pub fn read_file(&self, name: &str) -> io::Result<File> {
+        use rustix::{
+            fs::{Mode, OFlags, openat},
+            process::geteuid,
+        };
+        use std::os::unix::fs::MetadataExt;
+
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK;
+        let file = File::from(openat(&self.0, name, flags, Mode::empty())?);
+        let info = file.metadata()?;
+        if !info.is_file() || info.nlink() > 1 || info.uid() != geteuid().as_raw() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        Ok(file)
+    }
+
+    #[cfg(not(unix))]
+    pub fn read_file(&self, name: &str) -> io::Result<File> {
+        let path = self.0.join(name);
+        let info = fs::symlink_metadata(&path)?;
+        if !info.is_file() || redirected(&info) {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        File::open(path)
     }
 
     #[cfg(unix)]
@@ -98,6 +137,69 @@ impl LogDir {
         } else {
             Err(io::ErrorKind::WriteZero.into())
         }
+    }
+
+    fn read_key(&self) -> io::Result<Option<[u8; 32]>> {
+        let file = match self.read_file(ENDPOINT_KEY) {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if file.metadata()?.permissions().mode() & 0o077 != 0 {
+                return Err(io::ErrorKind::PermissionDenied.into());
+            }
+        }
+        let mut key = Vec::new();
+        file.take(33).read_to_end(&mut key)?;
+        key.try_into()
+            .map(Some)
+            .map_err(|_| io::ErrorKind::InvalidData.into())
+    }
+
+    pub fn key(&self, create: bool) -> Option<[u8; 32]> {
+        let key = self.read_key().ok()?;
+        if key.is_some() || !create {
+            return key;
+        }
+        let lock = self.private_file(".endpoint-key.lock", false).ok()?;
+        lock.lock().ok()?;
+        if let Some(key) = self.read_key().ok()? {
+            return Some(key);
+        }
+        let mut key = [0; 32];
+        ring::rand::SecureRandom::fill(&ring::rand::SystemRandom::new(), &mut key).ok()?;
+        let name = format!(".endpoint-key-{}", uuid::Uuid::new_v4().simple());
+        let mut staged = self.private_file(&name, true).ok()?;
+        let saved = staged.write_all(&key);
+        drop(staged);
+        let result = saved.and_then(|()| self.publish_key(&name));
+        if result.is_err() {
+            self.remove_key_stage(&name);
+        }
+        result.ok().map(|()| key)
+    }
+
+    #[cfg(unix)]
+    fn publish_key(&self, name: &str) -> io::Result<()> {
+        Ok(rustix::fs::renameat(&self.0, name, &self.0, ENDPOINT_KEY)?)
+    }
+
+    #[cfg(not(unix))]
+    fn publish_key(&self, name: &str) -> io::Result<()> {
+        fs::rename(self.0.join(name), self.0.join(ENDPOINT_KEY))
+    }
+
+    #[cfg(unix)]
+    fn remove_key_stage(&self, name: &str) {
+        let _ = rustix::fs::unlinkat(&self.0, name, rustix::fs::AtFlags::empty());
+    }
+
+    #[cfg(not(unix))]
+    fn remove_key_stage(&self, name: &str) {
+        let _ = fs::remove_file(self.0.join(name));
     }
 
     pub fn prune(&self, keep_days: u64, today: NaiveDate) -> io::Result<()> {
@@ -187,23 +289,20 @@ fn redirected(metadata: &fs::Metadata) -> bool {
     metadata.is_symlink()
 }
 
-fn expired(name: &str, keep_days: u64, today: NaiveDate) -> bool {
-    let Some((surface, date)) = name
-        .strip_suffix(".jsonl")
-        .and_then(|name| name.split_once('-'))
-    else {
-        return false;
-    };
-    if !Surface::ALL.iter().any(|valid| valid.as_str() == surface)
-        || date.len() != 10
-        || date.as_bytes()[4] != b'-'
-        || date.as_bytes()[7] != b'-'
-    {
-        return false;
+pub(super) fn parse_name(name: &str) -> Option<(NaiveDate, usize)> {
+    let (surface, date) = name.strip_suffix(".jsonl")?.split_once('-')?;
+    let slot = Surface::ALL
+        .iter()
+        .position(|valid| valid.as_str() == surface)?;
+    if date.len() != 10 || date.as_bytes()[4] != b'-' || date.as_bytes()[7] != b'-' {
+        return None;
     }
-    NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|date| {
-        date.format("%Y-%m-%d").to_string().len() == 10
-            && date.year_ce().0
-            && (today - date).num_days() >= i64::try_from(keep_days).unwrap_or(i64::MAX)
+    let day = NaiveDate::parse_from_str(date, "%Y-%m-%d").ok()?;
+    (day.year_ce().0 && day.format("%Y-%m-%d").to_string() == date).then_some((day, slot))
+}
+
+fn expired(name: &str, keep_days: u64, today: NaiveDate) -> bool {
+    parse_name(name).is_some_and(|(date, _)| {
+        (today - date).num_days() >= i64::try_from(keep_days).unwrap_or(i64::MAX)
     })
 }

@@ -18,6 +18,7 @@ use std::{
 
 use chrono::{DateTime, NaiveDate, SecondsFormat, Utc};
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use crate::settings::{self, Environment};
@@ -32,8 +33,8 @@ const QUEUE_CHARS: usize = 4 * 1024 * 1024;
 const MAX_LINE: usize = 16 * 1024;
 pub const EXIT_FLUSH: Duration = Duration::from_millis(300);
 
-const COMMON: [&str; 8] = [
-    "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
+const COMMON: [&str; 9] = [
+    "schema", "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
 ];
 static RUN_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -117,13 +118,55 @@ struct Event {
     name: String,
     level: Level,
     fields: Field,
+    endpoint: Option<[u8; 32]>,
     chars: usize,
 }
 
 pub struct LogWriter {
-    events: SyncSender<Event>,
+    events: SyncSender<Work>,
     done: Mutex<Receiver<()>>,
     queue: Arc<Queue>,
+}
+
+enum Work {
+    Record(Event),
+    Flush(mpsc::Sender<()>),
+}
+
+pub fn command_id() -> String {
+    Uuid::new_v4().simple().to_string()
+}
+
+pub(crate) fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn endpoint_digest(endpoint: &str) -> Option<[u8; 32]> {
+    let origin = privacy::origin(endpoint);
+    if origin == "[redacted url]" {
+        return None;
+    }
+    let parsed = crate::endpoint::Endpoint::split(endpoint.trim())?;
+    let path = if parsed.path.is_empty() {
+        "/"
+    } else {
+        &parsed.path
+    };
+    Some(Sha256::digest(format!("{origin}{path}?{}", parsed.query)).into())
+}
+
+fn keyed_endpoint(digest: &[u8; 32], key: &[u8; 32]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let tag = ring::hmac::sign(&key, digest);
+    let mut result = String::from("h1_");
+    for byte in tag.as_ref() {
+        let _ = write!(result, "{byte:02x}");
+    }
+    result
 }
 
 /// Log events that occur while handling a CLI command or an MCP call.
@@ -132,9 +175,19 @@ pub struct EventContext<'a> {
     pub writer: Option<&'a LogWriter>,
     pub surface: Surface,
     pub command: Option<&'a str>,
+    pub command_id: Option<&'a str>,
 }
 
 impl EventContext<'_> {
+    pub fn quiet() -> Self {
+        Self {
+            writer: None,
+            surface: Surface::Cli,
+            command: None,
+            command_id: None,
+        }
+    }
+
     pub fn event<'a>(
         self,
         name: &str,
@@ -145,7 +198,15 @@ impl EventContext<'_> {
         let command = self
             .command
             .map(|command| ("command", Field::Text(command.into())));
-        writer.event(self.surface, name, level, command.into_iter().chain(fields));
+        let id = self
+            .command_id
+            .map(|id| ("commandId", Field::Text(id.into())));
+        writer.event(
+            self.surface,
+            name,
+            level,
+            command.into_iter().chain(id).chain(fields),
+        );
     }
 }
 
@@ -185,10 +246,16 @@ impl LogWriter {
         let sequence = SEQUENCE.fetch_add(1, Relaxed);
         let known = KNOWN.try_lock().ok().map(|value| Arc::clone(&value));
         let mut budget = Budget::new();
+        let mut endpoint = None;
         let fields = Field::Object(
             fields
                 .into_iter()
                 .filter_map(|(key, field)| {
+                    if key == "endpoint"
+                        && let Field::Endpoint(ref url) = field
+                    {
+                        endpoint = endpoint_digest(url);
+                    }
                     if COMMON.contains(&key) || matches!(&field, Field::Scalar(Value::Null)) {
                         None
                     } else {
@@ -213,11 +280,20 @@ impl LogWriter {
             name: prefix(name, 300).to_owned(),
             level,
             fields,
+            endpoint,
             chars,
         };
-        if self.events.try_send(event).is_err() {
+        if self.events.try_send(Work::Record(event)).is_err() {
             self.queue.chars.fetch_sub(chars, Relaxed);
             self.queue.dropped.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// Allow a read in a long-lived process to see events already queued.
+    pub fn flush(&self, timeout: Duration) {
+        let (done, wait) = mpsc::channel();
+        if self.events.try_send(Work::Flush(done)).is_ok() {
+            let _ = wait.recv_timeout(timeout);
         }
     }
 
@@ -230,13 +306,20 @@ impl LogWriter {
     }
 }
 
-fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
+fn drain(env: Environment, events: Receiver<Work>, queue: &Queue) {
     let config_path = env.path();
     let log_path = env.home.join("logs");
     let mut config: Option<(Option<FileStamp>, Option<u64>)> = None;
     let mut checked_day = None;
     let mut tokens = Tokens::default();
-    for event in events {
+    for work in events {
+        let event = match work {
+            Work::Record(event) => event,
+            Work::Flush(done) => {
+                let _ = done.send(());
+                continue;
+            }
+        };
         queue.chars.fetch_sub(event.chars, Relaxed);
         let current_stamp = stamp(&config_path);
         let keep = match config {
@@ -269,6 +352,7 @@ fn drain(env: Environment, events: Receiver<Event>, queue: &Queue) {
 
 fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
     let mut line = Map::new();
+    line.insert("schema".into(), json!(2));
     line.insert(
         "ts".into(),
         json!(event.timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
@@ -287,6 +371,11 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
             }
         }
     }
+    if let Some(digest) = event.endpoint
+        && let Some(key) = directory.key(true)
+    {
+        line.insert("endpointId".into(), json!(keyed_endpoint(&digest, &key)));
+    }
     let mut data = encode(&line);
     let dropped = queue.dropped.swap(0, Relaxed);
     if dropped != 0 {
@@ -304,7 +393,7 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
     let _ = directory.append(&name, &data);
 }
 
-fn json_ascii(value: &Map<String, Value>) -> String {
+fn json_ascii_value(value: &impl serde::Serialize) -> String {
     let encoded = serde_json::to_string(value).expect("serializing JSON to a buffer");
     let mut escaped = String::with_capacity(encoded.len());
     for c in encoded.chars() {
@@ -320,7 +409,7 @@ fn json_ascii(value: &Map<String, Value>) -> String {
 }
 
 fn encode(line: &Map<String, Value>) -> Vec<u8> {
-    let mut encoded = json_ascii(line);
+    let mut encoded = json_ascii_value(line);
     if encoded.len() > MAX_LINE {
         let mut kept = Map::new();
         let mut truncated = Vec::new();
@@ -333,11 +422,11 @@ fn encode(line: &Map<String, Value>) -> Vec<u8> {
         }
         truncated.sort();
         kept.insert("truncated".into(), json!(truncated));
-        encoded = json_ascii(&kept);
+        encoded = json_ascii_value(&kept);
         // Long field names can otherwise make the fallback line oversized.
         if encoded.len() > MAX_LINE {
             kept.insert("truncated".into(), json!(["[cut]"]));
-            encoded = json_ascii(&kept);
+            encoded = json_ascii_value(&kept);
         }
     }
     encoded.push('\n');

@@ -112,10 +112,12 @@ fn main() -> process::ExitCode {
         }
         .into()
     };
+    let command_id = log::command_id();
     let events = EventContext {
         writer: writer.as_ref(),
         surface: Surface::Cli,
         command: (!command.is_empty()).then_some(command),
+        command_id: Some(&command_id),
     };
     if let Some(writer) = &writer {
         writer.event(
@@ -124,6 +126,7 @@ fn main() -> process::ExitCode {
             Level::Info,
             [
                 ("command", command_field()),
+                ("commandId", json!(command_id).into()),
                 ("argv", Field::argv(argv.iter().take(64).cloned())),
             ],
         );
@@ -159,7 +162,7 @@ fn main() -> process::ExitCode {
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
     };
-    finish(writer, command_field(), started, outcome)
+    finish(writer, command_field(), &command_id, started, outcome)
 }
 
 fn eager_skill(argv: &[String]) -> bool {
@@ -288,6 +291,7 @@ fn redact_details(value: &Value, redact: &impl Fn(&str) -> String) -> Value {
 fn finish(
     writer: Option<LogWriter>,
     command: Field,
+    command_id: &str,
     started: Instant,
     (code, error): (ExitCode, Option<SaiError>),
 ) -> process::ExitCode {
@@ -300,6 +304,7 @@ fn finish(
         };
         let mut fields = vec![
             ("command", command),
+            ("commandId", json!(command_id).into()),
             ("durationMs", json!(duration_ms).into()),
             ("exitCode", json!(code as u8).into()),
         ];

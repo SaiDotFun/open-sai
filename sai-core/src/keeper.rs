@@ -18,6 +18,7 @@ use crate::{
 };
 
 pub use public::public_intent_status;
+pub(crate) use public::{known_intent_field, log_intent_error_code, request_hash};
 pub use queries::*;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
@@ -31,7 +32,7 @@ pub struct Keeper<'a> {
 #[derive(Default)]
 struct ResponseLog {
     http_status: Option<u16>,
-    errors: Option<Field>,
+    errors: Option<(Value, Value)>,
 }
 
 impl<'a> Keeper<'a> {
@@ -60,6 +61,14 @@ impl<'a> Keeper<'a> {
             .into_iter()
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
+        let intent = if query == INTENTS {
+            variables
+                .get("key")
+                .and_then(Value::as_str)
+                .filter(|key| log::valid_identifier(key))
+        } else {
+            None
+        };
         let mut response = ResponseLog::default();
         let result = self
             .post(query, &variables, token, timeout, &mut response)
@@ -82,6 +91,7 @@ impl<'a> Keeper<'a> {
                 ),
             },
         };
+        let (errors, count) = response.errors.unwrap_or_default();
         self.events.event(
             "keeper.request",
             level,
@@ -89,16 +99,15 @@ impl<'a> Keeper<'a> {
                 ("operation", json!(queries::operation(query)).into()),
                 ("endpoint", Field::Endpoint(self.endpoint.into())),
                 ("addr", json!(addr).into()),
+                ("intentKey", json!(intent).into()),
                 ("authenticated", json!(token.is_some()).into()),
                 ("durationMs", json!(duration).into()),
                 ("status", json!(status).into()),
                 ("code", json!(code).into()),
                 ("error", json!(error).into()),
                 ("httpStatus", json!(response.http_status).into()),
-                (
-                    "keeperErrors",
-                    response.errors.unwrap_or(Field::Scalar(Value::Null)),
-                ),
+                ("keeperErrors", errors.into()),
+                ("keeperErrorCount", count.into()),
             ],
         );
         result
@@ -125,7 +134,7 @@ impl<'a> Keeper<'a> {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
-            log.errors = Some(graphql_errors(errors));
+            log.errors = Some(graphql_error_fields(errors, false, None));
             if query == SUBMIT
                 && !result.get("data").is_some_and(truthy)
                 && errors.as_array().is_some_and(|items| {
@@ -188,27 +197,6 @@ fn not_sent() -> SaiError {
     )
 }
 
-fn graphql_errors(errors: &Value) -> Field {
-    let entries = errors.as_array().into_iter().flatten().take(3);
-    Field::Array(
-        entries
-            .filter_map(Value::as_object)
-            .map(|item| {
-                let code = item.get("extensions").and_then(|value| value.get("code"));
-                let code = code.filter(|value| !value.is_null()).map(stringify);
-                let message = item.get("message").map_or_else(String::new, stringify);
-                Field::Object(vec![
-                    (
-                        "code".into(),
-                        code.map_or(Field::Scalar(Value::Null), Field::Untrusted),
-                    ),
-                    ("message".into(), Field::Untrusted(message)),
-                ])
-            })
-            .collect(),
-    )
-}
-
 pub(crate) fn stringify(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
@@ -230,7 +218,43 @@ pub(crate) fn truthy(value: &Value) -> bool {
     }
 }
 
-fn is_evm_address(value: &str) -> bool {
+pub(crate) fn graphql_error_fields(
+    errors: &Value,
+    retained: bool,
+    total: Option<&Value>,
+) -> (Value, Value) {
+    let codes: Vec<_> = errors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+        .filter(|item| item.is_object())
+        .map(|item| {
+            let field = if retained { item } else { &item["extensions"] };
+            let code = field["code"]
+                .as_str()
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "GRAPHQL_PARSE_FAILED"
+                            | "GRAPHQL_VALIDATION_FAILED"
+                            | "INTENT_NOT_ACCEPTED"
+                            | "BAD_USER_INPUT"
+                            | "FORBIDDEN"
+                            | "INTERNAL_SERVER_ERROR"
+                            | "UNAUTHENTICATED"
+                    )
+                })
+                .unwrap_or("KEEPER_ERROR");
+            json!({"code": code})
+        })
+        .collect();
+    let count = errors.as_array().map_or(1, Vec::len) as u64;
+    let total = total.and_then(Value::as_u64).unwrap_or(count).max(count);
+    (json!(codes), json!(total))
+}
+
+pub(crate) fn is_evm_address(value: &str) -> bool {
     value
         .strip_prefix("0x")
         .is_some_and(|hex| hex.len() == 40 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))

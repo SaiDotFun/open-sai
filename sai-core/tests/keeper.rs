@@ -16,6 +16,7 @@ const EVENTS: EventContext<'_> = EventContext {
     writer: None,
     surface: Surface::Cli,
     command: None,
+    command_id: None,
 };
 
 fn listener() -> TcpListener {

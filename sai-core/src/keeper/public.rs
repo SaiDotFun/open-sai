@@ -2,12 +2,12 @@
 
 use std::{path::Path, sync::LazyLock};
 
+use chrono::{DateTime, Datelike, Timelike};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
 use super::{canonical_account, is_evm_address, truthy};
 use crate::{
-    errors::Code,
     log,
     reconcile::{HISTORY_HINT, LOCAL_PENDING_HINT, PENDING_HINT, UNINDEXED_HINT},
     session::parse_expiry,
@@ -18,6 +18,13 @@ static INTENT_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 static ROW_ID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\A[0-9]{1,24}(?:[-_:][0-9]{1,24}){0,3}\z").expect("row ID pattern")
+});
+static BLOCK_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}",
+        r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])\z"
+    ))
+    .expect("Keeper block timestamp pattern")
 });
 
 const KINDS: &[&str] = &[
@@ -79,6 +86,21 @@ const ERROR_CODES: &[&str] = &[
     "below_minimum",
     "insufficient_idle",
 ];
+const LOG_ERROR_CODES: &[&str] = &[
+    "withdraw_evm_unconfigured",
+    "invalid_withdraw",
+    "intent_validation_failed",
+    "chain_switch_failed",
+    "gas_estimation_failed",
+    "wallet_rejected",
+    "wallet_sign_failed",
+    "chain_mismatch",
+    "request_pending",
+    "rpc_submission_failed",
+    "sign_failed_unknown",
+    "intent_auth_rejected",
+    "jwt_failed",
+];
 
 /// Project the reconciled output once, after raw Keeper values have served their
 /// purpose for correlation and ledger writes. Scrub every string that survives.
@@ -135,17 +157,37 @@ fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
     if value.is_null() {
         return;
     }
-    if let Some(hash) = value.as_str() {
+    if let Some(hash) = request_hash(value) {
+        out.insert(key.into(), json!(hash));
+    } else {
+        out.insert(format!("{key}Invalid"), json!(true));
+    }
+}
+
+pub(crate) fn request_hash(value: &Value) -> Option<String> {
+    value.as_str().and_then(|hash| {
         let digits = hash
             .strip_prefix("0x")
             .or_else(|| hash.strip_prefix("0X"))
             .unwrap_or(hash);
         if digits.len() == 64 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            out.insert(key.into(), json!(hash.to_ascii_lowercase()));
-            return;
+            Some(hash.to_ascii_lowercase())
+        } else {
+            None
         }
+    })
+}
+
+pub(crate) fn known_intent_field(field: &str, value: &Value) -> bool {
+    match field {
+        "kind" => known(value, KINDS),
+        "lifecycleStep" => known(value, STEPS),
+        "execActor" => known(value, &["client", "server", "user"]),
+        "errorCode" => {
+            known(value, ERROR_CODES) || known(value, LOG_ERROR_CODES) || value == "KEEPER_ERROR"
+        }
+        _ => false,
     }
-    out.insert(format!("{key}Invalid"), json!(true));
 }
 
 fn reconcile_fields(out: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -192,6 +234,10 @@ fn keep_intent_key(out: &mut Map<String, Value>, key: &Value) {
 }
 
 fn intent_record(row: &Map<String, Value>) -> Value {
+    project_intent_record(row, false)
+}
+
+fn project_intent_record(row: &Map<String, Value>, logging: bool) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut record = Map::new();
     keep_intent_key(&mut record, value("intentKey"));
@@ -226,15 +272,40 @@ fn intent_record(row: &Map<String, Value>) -> Value {
         value("execBlock"),
         number(value("execBlock")),
     );
-    keep(
-        &mut record,
-        "execBlockTs",
-        value("execBlockTs"),
-        block_time(value("execBlockTs")),
-    );
+    let timestamp = value("execBlockTs");
+    let valid = if logging {
+        timestamp.as_str().is_some_and(|ts| {
+            BLOCK_TIMESTAMP.is_match(ts)
+                && DateTime::parse_from_rfc3339(ts)
+                    .is_ok_and(|ts| ts.year() > 0 && ts.nanosecond() < 1_000_000_000)
+        })
+    } else {
+        block_time(timestamp)
+    };
+    keep(&mut record, "execBlockTs", timestamp, valid);
+    if logging && !timestamp.is_null() && !valid {
+        record.insert("execBlockTsInvalid".into(), json!(true));
+    }
     keep_hash(&mut record, "txHash", value("txHash"));
+    if let Some(code) = error_code(row, logging) {
+        record.insert("errorCode".into(), json!(code));
+        // This fixed message is shorter than the untrusted-text limit.
+        record.insert("errorMsg".into(), json!("Keeper reported an intent error."));
+    }
+    if !logging {
+        reconcile_fields(&mut record, row);
+    }
+    Value::Object(record)
+}
+
+pub(crate) fn log_intent_error_code(row: &Map<String, Value>) -> Option<&str> {
+    error_code(row, true)
+}
+
+fn error_code(row: &Map<String, Value>, logging: bool) -> Option<&str> {
+    let value = |key| row.get(key).unwrap_or(&Value::Null);
     let code = value("errorCode");
-    if truthy(code)
+    let failed = truthy(code)
         || truthy(value("errorMsg"))
         || known(
             value("lifecycleStep"),
@@ -245,21 +316,14 @@ fn intent_record(row: &Map<String, Value>) -> Value {
                 "exec_req_fail",
                 "exec_fail",
             ],
-        )
-    {
-        record.insert(
-            "errorCode".into(),
-            if known(code, ERROR_CODES) {
-                code.clone()
-            } else {
-                json!(Code::KeeperError)
-            },
         );
-        // This fixed message is shorter than the untrusted-text limit.
-        record.insert("errorMsg".into(), json!("Keeper reported an intent error."));
-    }
-    reconcile_fields(&mut record, row);
-    Value::Object(record)
+    failed.then(|| {
+        code.as_str()
+            .filter(|code| {
+                ERROR_CODES.contains(code) || (logging && LOG_ERROR_CODES.contains(code))
+            })
+            .unwrap_or("KEEPER_ERROR")
+    })
 }
 
 fn intent_history(row: &Map<String, Value>) -> Value {
