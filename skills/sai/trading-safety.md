@@ -102,11 +102,10 @@ error after submission leaves the outcome unknown.
   admission can still appear.
 - An intent marked `not_sent` failed before the request left the machine. It
   does not block.
-- A second open returns `RECENT_OPEN_PENDING` while an earlier open is
-  unresolved. Check the existing key with `intent_wait`. After Keeper
-  acknowledges the first open, use CLI flag `--allow-concurrent-open` or
-  MCP argument `allow_concurrent_open=true` only if the person confirms a
-  second open. Unknown and pending outcomes still block new trades.
+- Tool `trade_open` refuses with `RECENT_OPEN_PENDING` while a recent open is
+  unknown or accepted. Check those intents with `intent_status`. Pass
+  `allow_concurrent_open=true` only when the person confirms they want
+  another open position.
 - `sai doctor` settles unknown intents it can resolve by reading Keeper. It
   never places or cancels a trade.
 

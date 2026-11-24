@@ -64,7 +64,7 @@ to check for a final outcome.
 intentKey. Never resubmit blindly; the first request may have gone through.
 - After a timeout or error on any trade_* call, call intent_local before \
 retrying. For RECENT_OPEN_PENDING, check the listed keys with intent_status. \
-Wait for a final outcome on pending fills. For acknowledged opens, use \
+Wait for a final outcome on pending fills. For recent accepted opens, use \
 allow_concurrent_open=true only after the user confirms another position.
 - The user can connect several accounts; one is active. auth_list shows \
 them. Preview and trade tools act on the active account unless given \

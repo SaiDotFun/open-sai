@@ -342,11 +342,6 @@ the request, the CLI exits 1. The receipt reports the observed
 An after-hours risk adjustment alongside the recorded action appears in
 `execution.extraEffects`.
 
-An acknowledged open blocks another open for the same account and Keeper
-endpoint. The refusal gives the existing intent key. Use
-`--allow-concurrent-open` or the MCP argument `allow_concurrent_open=true`
-only after confirming a second open. Unknown or pending outcomes still block.
-
 The receipt's `requestTxHash` identifies the transaction that submitted
 the request. For a next-oracle fill, `execution.block` is the later block
 that filled it. When history is available, `execution.historyId` identifies

@@ -334,11 +334,7 @@ def test_before_submit_sees_the_submitted_intent_and_can_refuse(monkeypatch):
         )
     with pytest.raises(Refused):
         trading.open_trade(
-            ENDPOINT,
-            session_for,
-            **open_args(dry_run=False),
-            before_submit=refuse,
-            allow_concurrent_open=True,
+            ENDPOINT, session_for, **open_args(dry_run=False), before_submit=refuse
         )
     assert len(fake.submitted) == 1
     assert storage.list_pending(ENDPOINT, ADDR)[0]["status"] == "accepted"

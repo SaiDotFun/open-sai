@@ -1137,9 +1137,9 @@ def trade_open(
                 slippage=slippage,
                 take_profit=take_profit,
                 stop_loss=stop_loss,
+                allow_concurrent_open=allow_concurrent_open,
                 dry_run=dry_run,
                 notify=warn,
-                allow_concurrent_open=allow_concurrent_open,
             ),
         )
     except (ValueError, KeyError, keeper.KeeperError) as exc:
