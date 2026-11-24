@@ -783,9 +783,7 @@ class KeeperReplayTest(unittest.TestCase):
                 for name in node.targets
             )
         )
-        self.replay.lifecycle = "filled"
-        body = {"kind": "OPEN_TRADE"}
-        self.replay.responses["filled"]["data"]["userIntents"][0]["body"] = body
+        self.replay.lifecycle = "limit_placement_exec_pass"
         variables = {"user": self.replay.addr, "key": self.key}
         with REHEARSAL["keeper_server"](self.replay.handler()) as base:
             for override in ({}, {"includeAction": False}, {"includeAction": True}):
@@ -796,7 +794,7 @@ class KeeperReplayTest(unittest.TestCase):
                     self.assertEqual(row["intentKey"], self.key)
                     self.assertEqual(row["lifecycleStep"], "exec_pass")
                     if override.get("includeAction"):
-                        self.assertEqual(row["body"], body)
+                        self.assertEqual(row["body"], {"orderType": "limit"})
                     else:
                         self.assertNotIn("body", row)
 
