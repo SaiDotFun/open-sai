@@ -197,6 +197,11 @@ For `PRICE_MOVED`, check that the replacement `preview` has a
 `previewDigest` and `referencePrice`. If the digest is absent, address the
 reported rejection and request a fresh preview before asking for confirmation.
 
+For a partial close, check that `quote.collateralPriceUsd` has a value
+before asking for confirmation. An estimated preview can carry a digest
+while that field is `null`. Wait for the collateral price and request a
+fresh preview in that case.
+
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Both check that the order is pending. If it fills after the
 submit-time check, Perp can close the filled position at market.
