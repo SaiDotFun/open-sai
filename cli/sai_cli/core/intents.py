@@ -161,6 +161,7 @@ def _record_submission_status(
             intentKey=key,
             addr=account,
             endpoint=log.endpoint(endpoint),
+            endpointId=log.endpoint_identity(endpoint),
             status=status,
             errorType=type(exc).__name__,
         )
@@ -226,6 +227,17 @@ def submit(
             key,
             hint=storage.intent_status_hint(endpoint, account, key),
         ) from exc
+    tx_hash, invalid_hash = keeper.request_hash(ack.get("txHash"))
+    log.event(
+        "intent.submitted",
+        intentKey=key,
+        kind=intent["kind"],
+        addr=account,
+        endpoint=log.endpoint(endpoint),
+        endpointId=log.endpoint_identity(endpoint),
+        txHash=tx_hash,
+        txHashInvalid=invalid_hash,
+    )
     if failure := _record_submission_status(key, endpoint, account, "accepted"):
         raise keeper.OutcomeUnknown(
             f"Keeper accepted intent {key}, but the local ledger update failed;"

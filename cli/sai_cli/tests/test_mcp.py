@@ -57,6 +57,7 @@ READ_TOOLS = {
     "preview_leverage",
     "preview_margin",
     "preview_partial_close",
+    "logs_intent",
 }
 LOCAL_TOOLS = {"mcp_info", "auth_status", "auth_list", "auth_use", "intent_local"}
 # Changes only which connected account is active on this machine.
