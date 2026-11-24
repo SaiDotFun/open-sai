@@ -1,4 +1,4 @@
-"""Rehearse a sai-cli release wheel against the published v0.1.0 install."""
+"""Rehearse a sai-cli release wheel against a published install."""
 
 from __future__ import annotations
 
@@ -25,16 +25,16 @@ from contextlib import ExitStack, closing, contextmanager, nullcontext, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import IO, Any, NamedTuple, TypeVar
+from urllib.parse import quote
 
-TESTS = Path(__file__).resolve().parents[1] / "cli" / "sai_cli" / "tests"
-sys.path.insert(0, str(TESTS))
+SCRIPTS = Path(__file__).resolve().parent
+TESTS = SCRIPTS.parent / "cli" / "sai_cli" / "tests"
+sys.path[:0] = [str(SCRIPTS), str(TESTS)]
+import install as release_install
 from loopback_keeper import KeeperHandler, keeper_server
 
-BASELINE = "0.1.0"
-REPO = "SaiDotFun/open-sai"
-INSTALLER = (
-    f"https://raw.githubusercontent.com/{REPO}/sai-cli/v{BASELINE}/scripts/install.py"
-)
+REPO = release_install.REPO
+VERSION = r"(?:0|[1-9][0-9]*)(?:\.(?:0|[1-9][0-9]*)){2}"
 CLIENTS = ("claude", "codex")
 SYNTHETIC_TOKEN = "release-rehearsal-fixture-only"
 CHAIN = "cataclysm-1"
@@ -200,6 +200,75 @@ def communicate(
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise RehearsalError(message)
+
+
+def resolve_baseline(
+    api_base: str = release_install.API_BASE, web_base: str = release_install.WEB_BASE
+) -> str:
+    try:
+        tag = release_install.find_latest(
+            api_base, web_base, check_cancelled=CANCELLATION.check
+        )
+    except release_install.LookupFailed as exc:
+        raise RehearsalError(
+            f"Could not resolve the latest published sai-cli release: {exc}. "
+            "Pass --from VERSION to select a published baseline."
+        ) from exc
+    if tag is None:
+        raise RehearsalError("No sai-cli release is published yet")
+    return release_install.version_of(tag)
+
+
+def verify_published_baseline(version: str, api_base: str) -> None:
+    tag = f"{release_install.TAG_PREFIX}{version}"
+    url = f"{api_base.rstrip('/')}/repos/{REPO}/releases/tags/{quote(tag, safe='')}"
+    error = f"Could not verify published sai-cli release {version}"
+    try:
+        status, _, body = release_install.within(
+            release_install.TOTAL_TIMEOUT,
+            f"checking release {tag}",
+            lambda deadline: release_install.request(url, "GET", deadline),
+            check_cancelled=CANCELLATION.check,
+        )
+    except release_install.LookupFailed as exc:
+        raise RehearsalError(f"{error}: {exc}") from exc
+    if status == 404:
+        raise RehearsalError(f"{error}: release not found on GitHub")
+    if status != 200:
+        raise RehearsalError(f"{error}: GitHub API answered HTTP {status}")
+    require(
+        len(body) <= release_install.MAX_BODY,
+        f"{error}: GitHub API answer is too large",
+    )
+    try:
+        release = json.loads(body)
+    except ValueError as exc:
+        raise RehearsalError(
+            f"{error}: GitHub API answered with malformed JSON"
+        ) from exc
+    require(
+        isinstance(release, dict)
+        and release.get("tag_name") == tag
+        and release.get("draft") is False
+        and release.get("prerelease") is False,
+        f"{error}: expected a stable release tagged {tag}",
+    )
+    assets = release.get("assets")
+    uploaded = (
+        [
+            asset.get("name")
+            for asset in assets
+            if isinstance(asset, dict) and asset.get("state") == "uploaded"
+        ]
+        if isinstance(assets, list)
+        else []
+    )
+    missing = [
+        name
+        for name in (release_install.wheel_name(version), "SHA256SUMS")
+        if name not in uploaded
+    ]
+    require(not missing, f"{error}: missing release assets {', '.join(missing)}")
 
 
 class ReplyReader:
@@ -548,12 +617,16 @@ class Replay:
         fixture = json.loads((TESTS / "fixtures" / "intent_outcomes.json").read_text())
         self.addr = fixture["address"]
         self.responses = {**fixture["recorded"], **fixture["replays"]}
+        self.nibi_addr = self.responses["filled"]["data"]["userIntents"][0][
+            "nibiAddress"
+        ]
         self.assets: dict[str, tuple[bytes, str]] = {}
         self.add_release(wheel, version)
         self.get_requests: list[str] = []
-        self.latest = BASELINE
+        self.latest = version
         self.submitted: list[str] = []
         self.lifecycle = "outcome_not_indexed"
+        self.history: list[dict[str, Any]] = []
 
     def add_release(self, wheel: Path, version: str, *native_assets: Path) -> None:
         sums = []
@@ -577,6 +650,23 @@ class Replay:
             row = self.responses[self.lifecycle]["data"]["userIntents"][0]
             return [{**row, "intentKey": key}]
         return []
+
+    def history_page(self, arguments: dict[str, Any]) -> list[dict[str, Any]]:
+        offset = arguments.get("offset", 0)
+        limit = arguments.get("limit", len(self.history))
+        if type(offset) is not int or type(limit) is not int or min(offset, limit) < 0:
+            raise ValueError("Invalid history pagination")
+        where = arguments.get("where")
+        trader = where.get("trader") if isinstance(where, dict) else None
+        if not isinstance(trader, str):
+            return []
+        aliases = {trader.lower()}
+        if trader.lower() in {self.addr, self.nibi_addr}:
+            aliases.update((self.addr, self.nibi_addr))
+        rows = [
+            row for row in self.history if row["trade"]["trader"].lower() in aliases
+        ]
+        return rows[offset : offset + limit]
 
     def handler(self) -> type[KeeperHandler]:
         replay = self
@@ -612,7 +702,12 @@ class Replay:
                     self.send_error(400)
                     return
                 roots = {field.name: field.children for field in selected}
-                perp = {field.name for field in roots.get("perp", ())}
+                perp = {
+                    child.name
+                    for root in selected
+                    if root.name == "perp"
+                    for child in root.children
+                }
                 if "recordUserIntent" in roots:
                     if self.headers.get("Authorization") != f"Bearer {SYNTHETIC_TOKEN}":
                         self.send_error(403)
@@ -655,7 +750,25 @@ class Replay:
                     self.reply({"data": data})
                     return
                 elif "tradeHistory" in perp:
-                    data = {"perp": {"tradeHistory": []}}
+                    try:
+                        data = {
+                            root.key: {
+                                field.key: project_fields(
+                                    replay.history_page(field.arguments), field.children
+                                )
+                                if field.name == "tradeHistory"
+                                else None
+                                for field in root.children
+                            }
+                            if root.name == "perp"
+                            else None
+                            for root in selected
+                        }
+                    except ValueError:
+                        self.send_error(400)
+                        return
+                    self.reply({"data": data})
+                    return
                 elif "oneClickTrading" in roots:
                     data = {
                         "oneClickTrading": {
@@ -717,6 +830,7 @@ class Install:
         self.diagnostics = diagnostics
         self.home = root / "home"
         self.sai_home = self.home / ".sai"
+        self.session_file = self.sai_home / "trader/sessions.json"
         bin_dir = self.home / ".local" / "bin"
         self.sai = bin_dir / "sai"
         self.uv = bin_dir / "uv"
@@ -831,19 +945,19 @@ class Install:
             "Candidate did not resolve the saved Keeper endpoint from the config file",
         )
 
-    def verify_session(self, original: dict[str, str]) -> None:
+    def verify_session(self, original: bytes, expected: dict[str, str]) -> None:
         require(
-            self.json("Read the stored session", "auth", "status") == original,
-            "The stored session changed",
+            self.session_file.is_file() and self.session_file.read_bytes() == original,
+            "The stored session file changed",
         )
         self.run(
-            "Read the stored synthetic token",
+            "Verify the stored session record",
             self.python,
             "-I",
             "-c",
-            "import sys; from sai_cli.core.storage import load_session; "
-            "sys.exit(load_session()['token'] != sys.stdin.read())",
-            input_text=SYNTHETIC_TOKEN,
+            "import json, sys; from sai_cli.core.storage import load_session; "
+            "sys.exit(load_session() != json.load(sys.stdin))",
+            input_text=json.dumps(expected),
         )
 
     def verify_mcp(self, version: str) -> None:
@@ -924,17 +1038,19 @@ def backup_ledger(source: Path, destination: Path) -> None:
         old.backup(new)
 
 
-def ledger_row(ledger: Path, key: str, *, migrated: bool) -> tuple[Any, ...]:
+def ledger_row(ledger: Path, key: str, *, migrated: bool | None) -> tuple[Any, ...]:
     with closing(sqlite3.connect(f"{ledger.as_uri()}?mode=ro", uri=True)) as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(intents)")}
+        has_keeper_status = "keeper_status" in columns
         require(
-            ("keeper_status" in columns) == migrated, "Unexpected intent ledger schema"
+            migrated is None or has_keeper_status == migrated,
+            "Unexpected intent ledger schema",
         )
         require(
             db.execute("PRAGMA user_version").fetchone() == (1,),
             "Unexpected ledger version",
         )
-        states = "status, keeper_status" if migrated else "status"
+        states = "status, keeper_status" if has_keeper_status else "status"
         row = db.execute(f"SELECT {states} FROM intents WHERE id=?", (key,)).fetchone()
     require(row is not None, "The original open is missing from the ledger")
     return row
@@ -984,16 +1100,9 @@ def check_doctor(tool: Install, base: str, key: str, *, pending: bool) -> None:
         )
 
 
-def is_retry_block(
-    result: subprocess.CompletedProcess[str], key: str, *, legacy: bool
+def reports_intent_error(
+    result: subprocess.CompletedProcess[str], code: str, key: str
 ) -> bool:
-    if result.returncode == 0:
-        return False
-    if legacy:
-        return (
-            f"Reconcile uncertain intent {key} before submitting another trade"
-            in result.stderr
-        )
     try:
         payload = json.loads(result.stdout)
     except json.JSONDecodeError:
@@ -1001,8 +1110,32 @@ def is_retry_block(
     error = payload.get("error") if isinstance(payload, dict) else None
     return (
         isinstance(error, dict)
-        and error.get("code") == "RECENT_OPEN_PENDING"
+        and error.get("code") == code
         and error.get("intentKey") == key
+    )
+
+
+def is_lost_acknowledgement(result: subprocess.CompletedProcess[str], key: str) -> bool:
+    return (
+        result.returncode == 5 and reports_intent_error(result, "OUTCOME_UNKNOWN", key)
+    ) or (
+        result.returncode == 1
+        and f"Outcome unknown for intent {key}; reconcile before another trade"
+        in result.stderr
+    )
+
+
+def is_retry_block(
+    result: subprocess.CompletedProcess[str], key: str, *, legacy: bool
+) -> bool:
+    return (
+        result.returncode != 0
+        and reports_intent_error(result, "RECENT_OPEN_PENDING", key)
+    ) or (
+        legacy
+        and result.returncode == 1
+        and f"Reconcile uncertain intent {key} before submitting another trade"
+        in result.stderr
     )
 
 
@@ -1025,8 +1158,46 @@ def probe_retry(
     return True
 
 
+def probe_intent_projection(tool: Install, replay: Replay, key: str) -> None:
+    row = replay.responses["filled_history"]["data"]["perp"]["tradeHistory"][0]
+    # Intent status requests 25 rows per page. Place the matching row on page two.
+    replay.history = [{**row, "id": row["id"] + i} for i in range(25, 0, -1)]
+    replay.history.append(
+        {**row, "intentKey": key, "block": {**row["block"], "block_ts": "invalid"}}
+    )
+    replay.lifecycle = "outcome_not_indexed"
+    result = tool.json(
+        "Probe intent status projection", "intent", "status", replay.addr, "--key", key
+    )
+    require(
+        result.get("outcome") == "terminal-filled"
+        and result.get("matchedTradeHistory")
+        == [
+            {
+                "id": row["id"],
+                "intentKey": key,
+                "tradeChangeType": row["tradeChangeType"],
+                "txHash": row["txHash"].lower(),
+                "block": {"block": row["block"]["block"], "block_tsInvalid": True},
+                "trade": row["trade"],
+            }
+        ],
+        "Intent status did not project the matching history row from the next page",
+    )
+    print(
+        "Intent status projected the matching row from paginated trade history.",
+        flush=True,
+    )
+
+
 def rehearse(
-    root: Path, wheel: Path, version: str, diagnostics: Path | None, *, strict: bool
+    root: Path,
+    wheel: Path,
+    version: str,
+    baseline: str,
+    diagnostics: Path | None,
+    *,
+    strict: bool,
 ) -> int:
     tool = Install(root, diagnostics)
     prefix = namespace_prefix(tool.home, tool.env)
@@ -1034,12 +1205,15 @@ def rehearse(
         raise RehearsalError(
             "--strict requires a loopback-only network namespace for egress isolation"
         )
-    with keeper_server(Replay(wheel, version).handler()) as base:
+    replay = Replay(wheel, version)
+    replay.latest = baseline
+    installer = f"https://raw.githubusercontent.com/{REPO}/sai-cli/v{baseline}/scripts/install.py"
+    with keeper_server(replay.handler()) as base:
         tool.run(
             "Install the published release",
             tool.uv,
             "run",
-            INSTALLER,
+            installer,
             "--api-base",
             base,
         )
@@ -1061,7 +1235,7 @@ def rehearse(
             file=sys.stderr,
             flush=True,
         )
-        return rehearse_staged(tool, root, wheel, version)
+        return rehearse_staged(tool, root, wheel, version, baseline)
     print("Using a loopback-only network namespace for the rehearsal.", flush=True)
     command = (
         *prefix,
@@ -1073,6 +1247,7 @@ def rehearse(
         root,
         wheel,
         version,
+        baseline,
         str(diagnostics) if diagnostics else "",
     )
     # Only the rehearsal script's own progress reaches these streams. It keeps
@@ -1081,23 +1256,27 @@ def rehearse(
         return wait_with_cancellation(stage.wait, None)
 
 
-def isolated_stage(root_name: str, wheel_name: str, version: str, log_name: str) -> int:
+def isolated_stage(
+    root_name: str, wheel_name: str, version: str, baseline: str, log_name: str
+) -> int:
     root, wheel = Path(root_name), Path(wheel_name)
     tool = Install(root, Path(log_name) if log_name else None, prepared=True)
 
     def work() -> int:
         with cancel_on_signal(), reap_detached_children():
-            return rehearse_staged(tool, root, wheel, version)
+            return rehearse_staged(tool, root, wheel, version, baseline)
 
     return report_result(work)
 
 
-def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int:
-    replay = Replay(wheel, version)
+def rehearse_staged(
+    tool: Install, root: Path, wheel: Path, version: str, baseline: str
+) -> int:
     baseline_wheel = (
-        tool.sai_home / "cache/wheels" / f"sai_cli-{BASELINE}-py3-none-any.whl"
+        tool.sai_home / "cache/wheels" / release_install.wheel_name(baseline)
     )
-    replay.add_release(baseline_wheel, BASELINE)
+    replay = Replay(baseline_wheel, baseline)
+    replay.add_release(wheel, version)
     with (
         keeper_server(replay.handler()) as base,
         socket.socket(socket.AF_INET, socket.SOCK_STREAM) as dead_proxy,
@@ -1113,13 +1292,19 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             CHECK_NETWORK,
             f"{base}/repos/{REPO}/releases?per_page=100",
         )
-        tool.verify_version(BASELINE)
-        print(f"Installed published sai {BASELINE} at {tool.sai}", flush=True)
+        tool.verify_version(baseline)
+        print(f"Installed published sai {baseline} at {tool.sai}", flush=True)
 
         tool.json(
             "Configure loopback Keeper", "config", "set", "keeper.endpoint", endpoint
         )
         tool.json("Disable auto-update", "config", "set", "update.auto", "false")
+        session_record = {
+            "evmAddress": replay.addr,
+            "endpoint": endpoint,
+            "token": SYNTHETIC_TOKEN,
+            "expiresAt": (datetime.now(UTC) + timedelta(days=7)).isoformat(),
+        }
         tool.run(
             "Save the synthetic session",
             tool.python,
@@ -1127,35 +1312,28 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             "-c",
             "import json, sys; from sai_cli.core.storage import save_session; "
             "save_session(json.load(sys.stdin))",
-            input_text=json.dumps(
-                {
-                    "evmAddress": replay.addr,
-                    "endpoint": endpoint,
-                    "token": SYNTHETIC_TOKEN,
-                    "expiresAt": (datetime.now(UTC) + timedelta(days=7)).isoformat(),
-                }
-            ),
+            input_text=json.dumps(session_record),
         )
-        session = tool.json("Read the baseline session", "auth", "status")
+        session_file = tool.session_file.read_bytes()
+        tool.verify_session(session_file, session_record)
         config = tool.sai_home / "config.toml"
         configured = config.read_bytes()
         tool.json("Register MCP clients", "mcp", "install", *CLIENTS)
-        tool.verify_mcp(BASELINE)
+        tool.verify_mcp(baseline)
 
         first = tool.run(
             "Open against loopback Keeper", tool.sai, "--json", *TRADE, check=False
         )
         require(
-            first.returncode == 1
-            and len(replay.submitted) == 1
-            and f"Outcome unknown for intent {replay.submitted[0]}" in first.stderr,
+            len(replay.submitted) == 1
+            and is_lost_acknowledgement(first, replay.submitted[0]),
             f"The baseline did not report a lost acknowledgement (exit {first.returncode},"
             f" {len(replay.submitted)} Keeper submissions)",
         )
         key = replay.submitted[0]
         ledger = tool.sai_home / "trader/intents.sqlite3"
         require(
-            ledger_row(ledger, key, migrated=False) == ("unknown",),
+            ledger_row(ledger, key, migrated=None) in (("unknown",), ("unknown", None)),
             "The baseline did not retain the unknown open",
         )
         require(
@@ -1178,7 +1356,7 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
         )
         require(config.read_bytes() == configured, "Update changed the user config")
         tool.verify_saved_endpoint(endpoint)
-        tool.verify_session(session)
+        tool.verify_session(session_file, session_record)
         tool.verify_mcp(version)
         args = ("intent", "status", replay.addr, "--key", key)
         status = tool.json("Reconcile with the candidate", *args)
@@ -1207,8 +1385,10 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
                 ledger_row(ledger, key, migrated=True) == ("terminal", "terminal"),
                 "Doctor did not preserve the original open as terminal",
             )
+            probe_intent_projection(tool, replay, key)
         finally:
             replay.lifecycle = "outcome_not_indexed"
+            replay.history.clear()
             backup_ledger(checkpoint, ledger)
         print(
             "Doctor passed after Keeper reported a terminal outcome. Restored the pending ledger for downgrade.",
@@ -1219,20 +1399,21 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             "Downgrade through sai update",
             "update",
             "--to",
-            BASELINE,
+            baseline,
             "--web-base",
             base,
         )
-        tool.verify_version(BASELINE)
+        tool.verify_version(baseline)
         require(config.read_bytes() == configured, "Downgrade changed the user config")
-        tool.verify_session(session)
-        tool.verify_mcp(BASELINE)
+        tool.verify_session(session_file, session_record)
+        tool.verify_mcp(baseline)
         local = tool.json(
             "Read the migrated ledger with the old CLI", "intent", "local", replay.addr
         )
         require(
             any(
-                row["intentKey"] == key and row["status"] == "unknown" for row in local
+                row["intentKey"] == key and row["status"] in {"unknown", "pending"}
+                for row in local
             ),
             "The old CLI could not read the migrated pending open",
         )
@@ -1241,7 +1422,7 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
             "The downgraded CLI submitted a second open before reconciliation",
         )
         print(
-            f"Downgraded to {BASELINE}. Retry before reconciliation: blocked.",
+            f"Downgraded to {baseline}. Retry before reconciliation: blocked.",
             flush=True,
         )
         tool.json("Reconcile with the old CLI", *args)
@@ -1249,7 +1430,7 @@ def rehearse_staged(tool: Install, root: Path, wheel: Path, version: str) -> int
         saved_status = ledger_row(ledger, key, migrated=True)[0]
         status = saved_status if saved_status in ("terminal", "unknown") else "other"
         print(
-            f"v{BASELINE} reconciled market_order_outcome_not_indexed as {status}. "
+            f"v{baseline} reconciled market_order_outcome_not_indexed as {status}. "
             f"Retry after reconciliation: {'blocked' if blocked else 'reached loopback Keeper'}."
         )
     return 0
@@ -1271,10 +1452,19 @@ def report_result(work: Callable[[], int]) -> int:
     return 1
 
 
-def main() -> int:
+def main(*, api_base: str = release_install.API_BASE) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "wheel", type=Path, nargs="?", help="Candidate release wheel newer than 0.1.0"
+        "wheel",
+        type=Path,
+        nargs="?",
+        help="Candidate release wheel newer than the baseline",
+    )
+    parser.add_argument(
+        "--from",
+        dest="baseline",
+        metavar="VERSION",
+        help="Published baseline version (default: latest published sai-cli release)",
     )
     parser.add_argument(
         "--self-test", action="store_true", help="Run local rehearsal tests"
@@ -1295,6 +1485,8 @@ def main() -> int:
             parser.error("--self-test takes no candidate wheel")
         if args.strict:
             parser.error("--strict requires a candidate wheel")
+        if args.baseline is not None:
+            parser.error("--from requires a candidate wheel")
         suite = unittest.defaultTestLoader.discover(
             str(Path(__file__).resolve().parent), pattern="release_rehearsal_test.py"
         )
@@ -1302,28 +1494,33 @@ def main() -> int:
     if args.wheel is None:
         parser.error("a candidate wheel is required")
     wheel = args.wheel.resolve()
-    match = re.fullmatch(
-        r"sai_cli-((?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*))-py3-none-any\.whl",
-        wheel.name,
-    )
-    if (
-        not match
-        or tuple(map(int, match[1].split("."))) <= (0, 1, 0)
-        or not wheel.is_file()
-    ):
-        parser.error(
-            "provide an existing sai_cli-X.Y.Z-py3-none-any.whl newer than 0.1.0"
-        )
+    match = re.fullmatch(rf"sai_cli-({VERSION})-py3-none-any\.whl", wheel.name)
+    if not match or not wheel.is_file():
+        parser.error("provide an existing sai_cli-X.Y.Z-py3-none-any.whl")
+    if args.baseline is not None and not re.fullmatch(VERSION, args.baseline):
+        parser.error("--from requires a version in X.Y.Z form")
     version = match[1]
 
     def work() -> int:
-        diagnostics = None
-        if args.verbose:
-            directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
-            diagnostics = directory / "child-output.log"
-            diagnostics.touch(mode=0o600)
-            print(f"Child output log: {diagnostics}", file=sys.stderr)
         with cancel_on_signal(), cleanup_stack() as cleanup:
+            baseline = (
+                args.baseline
+                if args.baseline is not None
+                else resolve_baseline(api_base)
+            )
+            require(
+                tuple(map(int, version.split(".")))
+                > tuple(map(int, baseline.split("."))),
+                f"Candidate sai {version} must be newer than baseline sai {baseline}",
+            )
+            if args.baseline is not None:
+                verify_published_baseline(baseline, api_base)
+            diagnostics = None
+            if args.verbose:
+                directory = Path(tempfile.mkdtemp(prefix="sai-rehearsal-diagnostics-"))
+                diagnostics = directory / "child-output.log"
+                diagnostics.touch(mode=0o600)
+                print(f"Child output log: {diagnostics}", file=sys.stderr)
             scratch = cleanup.enter_context(
                 tempfile.TemporaryDirectory(
                     prefix="sai-release-rehearsal-",
@@ -1332,7 +1529,12 @@ def main() -> int:
             )
             with reap_detached_children():
                 return rehearse(
-                    Path(scratch), wheel, version, diagnostics, strict=args.strict
+                    Path(scratch),
+                    wheel,
+                    version,
+                    baseline,
+                    diagnostics,
+                    strict=args.strict,
                 )
 
     return report_result(work)

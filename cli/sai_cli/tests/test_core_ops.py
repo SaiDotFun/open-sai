@@ -102,8 +102,12 @@ class FakeKeeper:
         variables: dict[str, Any] | None = None,
         token: str | None = None,
         timeout: float = 20,
+        *,
+        attempt: keeper.RequestAttempt | None = None,
     ) -> dict[str, Any]:
         if query == keeper.SUBMIT:
+            if attempt is not None:
+                attempt.transport_started = True
             assert variables is not None
             envelope = variables["input"]
             self.submitted.append(envelope)

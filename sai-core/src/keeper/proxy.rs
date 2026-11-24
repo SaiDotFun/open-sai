@@ -27,6 +27,54 @@ pub(super) fn for_endpoint(url: &Url, destination: &Uri) -> Option<Intercept> {
         .intercept(destination)
 }
 
+pub(super) fn for_websocket(url: &Url, destination: &Uri) -> Result<Option<Intercept>, ()> {
+    let Some(proxies) = environment_proxies() else {
+        return Ok(Matcher::from_system().intercept(destination));
+    };
+    let host = url.host_str().ok_or(())?.trim_matches(['[', ']']);
+    let host_port = format!("{host}:{}", url.port_or_known_default().ok_or(())?);
+    let bypass = proxies
+        .get("no")
+        .into_iter()
+        .flat_map(|value| value.split(','));
+    if bypass
+        .map(|name| name.trim().trim_start_matches('.').to_ascii_lowercase())
+        .any(|entry| {
+            entry == "*"
+                || (!entry.is_empty()
+                    && [host, &host_port].iter().any(|name| {
+                        *name == entry
+                            || name
+                                .strip_suffix(&entry)
+                                .is_some_and(|prefix| prefix.ends_with('.'))
+                    }))
+        })
+    {
+        return Ok(None);
+    }
+    let schemes = if url.scheme() == "wss" {
+        ["wss", "socks", "https"].as_slice()
+    } else {
+        ["ws", "socks", "https", "http"].as_slice()
+    };
+    let Some((scheme, proxy)) = schemes
+        .iter()
+        .find_map(|scheme| proxies.get(*scheme).map(|proxy| (*scheme, proxy)))
+    else {
+        return Ok(None);
+    };
+    // The Python package requires an optional dependency for SOCKS.
+    if scheme == "socks" || !proxy.starts_with("http://") && !proxy.starts_with("https://") {
+        return Err(());
+    }
+    Matcher::builder()
+        .all(proxy)
+        .build()
+        .intercept(destination)
+        .map(Some)
+        .ok_or(())
+}
+
 fn environment_proxies() -> Option<BTreeMap<String, String>> {
     let entries: Vec<_> = env::vars_os()
         .filter_map(|(name, value)| {

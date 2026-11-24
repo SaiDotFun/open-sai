@@ -68,6 +68,8 @@ def run_mutant(
         ),
         ("history-operation", "account-history", "Keeper HTTP GraphQL request differs"),
         ("ws-projection", "watch-price", "WebSocket GraphQL request differs"),
+        ("stdout-key-order", "market-list", "stdout bytes differ"),
+        ("stderr-duplicate", "account-balances", "stderr bytes differ"),
         ("ledger-milliseconds", "trade-concurrent-close", "Unix timestamp in seconds"),
         ("ledger-rowid", "intent-local-reserved", "intents.sqlite3.schema"),
         ("ledger-index", "intent-local-reserved", "intents.sqlite3.schema"),
