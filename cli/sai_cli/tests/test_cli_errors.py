@@ -12,6 +12,9 @@ from sai_cli.core import keeper, storage
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
+OVERRIDE = "http://127.0.0.1:9/query"
+PRIVATE_PATH = "fixture-endpoint-key"
+PRIVATE_OVERRIDE = f"http://127.0.0.1:9/{PRIVATE_PATH}/query"
 
 
 def assert_error(result: Result, exit_code: int, code: str) -> dict:
@@ -81,9 +84,18 @@ def test_success_and_sign_in_exit_codes():
     runner = CliRunner()
     args = ["--json", "--endpoint", keeper.MAINNET_HTTP]
     signed_out = runner.invoke(main, [*args, "trade", "close", "7"])
-    assert assert_error(signed_out, 6, "SIGNED_OUT")["hint"] == "sai auth login NAME"
+    hint = f"sai --endpoint {keeper.MAINNET_HTTP} auth login NAME"
+    assert assert_error(signed_out, 6, "SIGNED_OUT")["hint"] == hint
     listed = runner.invoke(main, [*args, "auth", "list"])
     assert listed.exit_code == 0 and json.loads(listed.stdout) == {"accounts": []}
+    storage.save_session(
+        {
+            "token": "other-session-token",
+            "evmAddress": "0x" + "b" * 40,
+            "endpoint": keeper.MAINNET_HTTP,
+            "expiresAt": (datetime.now(UTC) + timedelta(hours=1)).isoformat(),
+        }
+    )
     storage.save_session(
         {
             "token": "test-session-token",
@@ -93,7 +105,14 @@ def test_success_and_sign_in_exit_codes():
         }
     )
     expired = runner.invoke(main, [*args, "auth", "status"])
-    assert assert_error(expired, 6, "SESSION_EXPIRED")["hint"] == "sai auth login NAME"
+    assert (
+        assert_error(expired, 6, "SESSION_EXPIRED")["hint"] == f"{hint} --addr {ADDR}"
+    )
+    retry_trade = runner.invoke(main, [*args, "trade", "close", "7"])
+    assert (
+        assert_error(retry_trade, 6, "SESSION_EXPIRED")["hint"]
+        == f"{hint} --addr {ADDR}"
+    )
     text = runner.invoke(main, ["--endpoint", keeper.MAINNET_HTTP, "auth", "status"])
     assert text.exit_code == 6 and text.stdout == ""
     assert "Trading session expired" in text.stderr

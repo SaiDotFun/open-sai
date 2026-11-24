@@ -74,9 +74,12 @@ RECENT_OPEN = (
     "An open-trade intent for this account from the last {minutes} minutes"
     " is still {statuses}, so this open was not submitted: after a timeout or"
     " error the first request may have gone through. Call intent_local, then"
-    " intent_status with each key in intentKeys. Retry with"
-    " allow_concurrent_open=true only once the user confirms they want"
-    " another open position."
+    " intent_status with each key in intentKeys."
+)
+PENDING_OPEN = (
+    "An open for this account is pending at the next oracle price or waiting"
+    " for Keeper to index its outcome. Call intent_status with each key in"
+    " intentKeys and wait for a final outcome before submitting another trade."
 )
 PRICE_MOVED = (
     "The market price moved {moved}% from the confirmed referencePrice, more"
@@ -511,10 +514,8 @@ def submit_check(
     return bound(load, digest, reference_price, slippage)
 
 
-# Statuses of an open that may still fill, and how long one can. Keeper
-# fails a queued intent after its admission expiry; past that margin, an
-# open no longer stands in for the one being submitted.
-OPEN_PENDING = ("unknown", "accepted")
+# The admission window bounds the recent-open check. A pending fill keeps
+# blocking until Keeper provides a final outcome.
 RECENT_OPEN_SECONDS = keeper.ABSENT_AFTER_SECONDS
 
 
@@ -523,39 +524,49 @@ def recent_opens(
 ) -> list[dict[str, str]]:
     """Return this account's OPEN_TRADE intents that may still fill.
 
-    The store keeps no payload, so any recent unknown or accepted open
-    counts, whatever its market, side, or amount.
+    Recent unknown or accepted opens count, and a known pending open counts
+    at any age.
     """
     current = time.time() if now is None else now
     with storage.db() as connection:
         rows = connection.execute(
-            "SELECT id, status, created_at FROM intents WHERE endpoint=?"
-            " AND account=? AND kind='OPEN_TRADE' AND status IN (?, ?)"
+            "SELECT id, COALESCE(keeper_status,status), created_at FROM intents"
+            " WHERE endpoint=? AND account=? AND kind='OPEN_TRADE'"
+            " AND COALESCE(keeper_status,status) IN ('unknown', 'accepted', 'pending')"
             " ORDER BY rowid DESC",
-            (endpoint, account.lower(), *OPEN_PENDING),
+            (endpoint, account.lower()),
         ).fetchall()
     recent: list[dict[str, str]] = []
     for key, status, created in rows:
         stamp = created if created is not None else storage._key_time(key)
-        if stamp is None or current - stamp <= RECENT_OPEN_SECONDS:
+        if (
+            status == "pending"
+            or stamp is None
+            or current - stamp <= RECENT_OPEN_SECONDS
+        ):
             recent.append({"intentKey": key, "status": status})
     return recent
 
 
-def no_recent_open(settings: Settings, load: AccountSession) -> trading.SubmitCheck:
-    """Return a check that refuses an open while a recent one may fill."""
+def no_recent_open(
+    settings: Settings, load: AccountSession, *, allow_concurrent_open: bool
+) -> trading.SubmitCheck:
+    """Return a check for pending and recent opens."""
 
     def check(_preview: dict[str, Any]) -> None:
         account = load()["evmAddress"]
-        pending = recent_opens(settings.endpoint, account)
+        opens = recent_opens(settings.endpoint, account)
+        pending = [row["intentKey"] for row in opens if row["status"] == "pending"]
         if pending:
-            statuses = " or ".join(sorted({row["status"] for row in pending}))
+            raise Refused(PENDING_OPEN, Code.RECENT_OPEN_PENDING, intentKeys=pending)
+        if opens and not allow_concurrent_open:
+            statuses = " or ".join(sorted({row["status"] for row in opens}))
             raise Refused(
                 RECENT_OPEN.format(
                     minutes=RECENT_OPEN_SECONDS // 60, statuses=statuses
                 ),
                 Code.RECENT_OPEN_PENDING,
-                intentKeys=[row["intentKey"] for row in pending],
+                intentKeys=[row["intentKey"] for row in opens],
             )
 
     return check
@@ -615,8 +626,11 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
-    if not dry_run and not allow_concurrent_open:
-        check = both(no_recent_open(settings, load), check)
+    if not dry_run:
+        check = both(
+            no_recent_open(settings, load, allow_concurrent_open=allow_concurrent_open),
+            check,
+        )
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,

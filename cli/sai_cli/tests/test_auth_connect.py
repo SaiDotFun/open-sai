@@ -965,18 +965,34 @@ def test_cast_signs_in_a_terminal_when_ud_cannot_unlock_the_keystore(
     assert keeper_auth["signatures"] == [{"signature": SIGNATURE, "challenge": NONCE}]
 
 
+@pytest.mark.parametrize(
+    "private_path", [False, True], ids=["plain-url", "private-path"]
+)
 def test_ud_signing_failure_without_a_terminal_says_to_use_one(
-    env: Env, keeper_auth
+    env: Env, keeper_auth, private_path: bool
 ) -> None:
     fake_ud(env, locked=True)
     fake_cast(env)
     keystore(env, addr=ADDR)
-    result = login(env, keeper_auth, "dev", "--addr", ADDR)
+    endpoint = keeper_auth["endpoint"]
+    secret = "test-keeper-path-key"
+    if private_path:
+        endpoint = f"{endpoint.removesuffix('/query')}/{secret}/query"
+    result = env.run(
+        "--json", "--endpoint", endpoint, "auth", "login", "dev", "--addr", ADDR
+    )
     assert result.returncode == 3
     # The whole command, so a retry keeps the endpoint and --addr.
-    command = (
-        f"sai --endpoint {keeper_auth['endpoint']} --json auth login dev --addr {ADDR}"
-    )
+    if private_path:
+        assert secret not in result.stdout + result.stderr
+        assert endpoint not in result.stdout + result.stderr
+        endpoint_arg = (
+            '"${SAI_RECONCILE_ENDPOINT:?'
+            'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
+        )
+    else:
+        endpoint_arg = endpoint
+    command = f"sai --endpoint {endpoint_arg} --json auth login dev --addr {ADDR}"
     assert f"Run `{command}` in a terminal." in login_error(result)
     assert json.loads(result.stdout)["error"]["hint"] == command
     assert "/cast " not in env.log.read_text()

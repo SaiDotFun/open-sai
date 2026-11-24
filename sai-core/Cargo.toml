@@ -1,0 +1,12 @@
+[package]
+name = "sai-core"
+description = "Shared logic for the Sai CLI and MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+toml_edit.workspace = true
+toml_parser.workspace = true
