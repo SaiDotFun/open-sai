@@ -2425,6 +2425,51 @@ def test_logs_run_defers_gap_until_call_parent_is_found(home, parent_found):
     assert gaps == ([gap] if parent_found else [])
 
 
+def test_logs_run_returns_process_events_before_resolving_unrelated_gaps(home):
+    root = home / "logs"
+    root.mkdir()
+    start = datetime(2026, 11, 24, tzinfo=UTC)
+    run_id = "12345678123443218123456789012345"
+    older = 50_000
+    end = older + 2 * log_queries.MAX_REPORT_ROWS
+    with log.file_path("cli", start.date(), root).open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {
+                    "event": "command.start",
+                    "runId": "other" if i < older else run_id,
+                    "seq": i,
+                    "ts": log.stamp(start + timedelta(milliseconds=i)),
+                }
+            )
+            for i in range(end)
+        )
+    log.file_path("mcp", start.date(), root).write_bytes(
+        log.encode(
+            {
+                "event": "log.dropped",
+                "runId": "other",
+                "count": 1,
+                "ts": log.stamp(start + timedelta(minutes=1)),
+            }
+        )
+    )
+
+    args = ("--json", "logs", "run", run_id)
+    code, output = run_cli(*args)
+    assert code == 0
+    first = json.loads(output)
+    halfway = older + log_queries.MAX_REPORT_ROWS
+    assert [row["seq"] for row in first["events"]] == list(range(halfway, end))
+    assert first["gaps"] == []
+
+    code, output = run_cli(*args, "--before", first["nextBefore"])
+    assert code == 0
+    second = json.loads(output)
+    assert [row["seq"] for row in second["events"]] == list(range(older, halfway))
+    assert second["gaps"] == []
+
+
 @pytest.mark.parametrize("cli_count", [1, log_queries.MAX_REPORT_ROWS + 1])
 def test_logs_run_paging_defers_rows_below_the_scan_frontier(home, cli_count):
     root = home / "logs"

@@ -20,6 +20,7 @@ from .log_events import COMMON_OPTIONAL, COMMON_REQUIRED, EVENTS
 LogLine = dict[str, Any]
 Scope = tuple[str, str]
 TOKEN = re.compile(r"[A-Za-z0-9_-]{1,128}")
+PROCESS_RUN_ID = re.compile(r"[a-f0-9]{32}")
 ENDPOINT_ID = re.compile(r"h1_[a-f0-9]{64}")
 SHA256_HEX = re.compile(r"[a-f0-9]{64}")
 MCP_STATUSES = frozenset(
@@ -583,7 +584,8 @@ def run(
 
     cursor = _Cursor.parse(before)
     last_day = cursor.last_day
-    parent = cursor.parent
+    # Process runs use the full UUID hex. MCP calls use a 12-character prefix.
+    parent = NO_CALL_PARENT if PROCESS_RUN_ID.fullmatch(identifier) else cursor.parent
 
     def parent_key(run_id: str) -> str:
         return hashlib.sha256(f"{identifier}~{run_id}".encode()).hexdigest()
@@ -602,7 +604,12 @@ def run(
             parent = parent_key(run_id)
 
     log.flush(1.0)
-    if cursor.position is None and last_day is not None and last_day < date.max:
+    if (
+        not parent
+        and cursor.position is None
+        and last_day is not None
+        and last_day < date.max
+    ):
         context = log.LogScan(CONTEXT_BYTES, CONTEXT_ROWS, CONTEXT_FILES)
         for line in context.rows(
             root,
