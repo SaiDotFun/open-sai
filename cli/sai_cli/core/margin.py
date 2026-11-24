@@ -56,13 +56,18 @@ def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
 
 
 def smart_value(
-    lcd: str, contract: str, message: dict[str, Any], *, height: str | None = None
+    lcd: str,
+    contract: str,
+    message: dict[str, Any],
+    *,
+    height: str | None = None,
+    timeout: float = 20,
 ) -> Any:
     """Read a CosmWasm smart query, including scalar and array responses."""
     url = _smart_url(lcd, contract, message)
     if height is None:
-        return _get_json(url).get("data")
-    return _get_json_at_height(url, height=height)[0].get("data")
+        return _get_json(url, timeout).get("data")
+    return _get_json_at_height(url, timeout, height=height)[0].get("data")
 
 
 def smart(lcd: str, contract: str, message: dict[str, Any]) -> dict[str, Any]:
@@ -78,6 +83,7 @@ class PositionSnapshot:
     funds: dict[str, Any]
     market: dict[str, Any]
     contract: str
+    observed_at: str | None = None
 
 
 def _read_position(
@@ -135,14 +141,21 @@ def position_unchanged(
     return True
 
 
-def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
-    route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
-    node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
+def trading_contract(endpoint: str, lcd: str, timeout: float = 20) -> str:
+    route = keeper.request(endpoint, keeper.ROUTE, timeout=timeout)["oneClickTrading"]
+    node = _get_json(
+        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info", timeout
+    )
     if (
         not route["enabled"]
         or node.get("default_node_info", {}).get("network") != route["chainId"]
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
+    return route["contractAddress"]
+
+
+def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
+    contract = trading_contract(endpoint, lcd)
     position = keeper.request(
         endpoint, keeper.POSITION, {"trader": addr, "id": trade_id}
     )["perp"]["trade"]
@@ -166,8 +179,8 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         raise ValueError("Open market data is unavailable")
     trader = position["trader"]
     token = f"TokenIndex({collateral['id']})"
-    contract = route["contractAddress"]
     raw = _read_position(lcd, contract, trader, trade_id)
+    observed_at = intents.now()
     funds = smart(
         lcd,
         contract,
@@ -189,7 +202,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
         raise ValueError(
             "Indexed position differs from contract state; wait for synchronization and retry"
         )
-    return PositionSnapshot(raw, funds, market, contract)
+    return PositionSnapshot(raw, funds, market, contract, observed_at)
 
 
 def contract_decimal(value: Any) -> Decimal:

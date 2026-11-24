@@ -140,10 +140,19 @@ def test_cli_dry_run_does_not_create_session_or_send():
 
 
 def test_cli_dry_run_names_the_account_it_would_use(session):
+    session = {**session, "endpoint": "http://127.0.0.1:1/query"}
     other = {**session, "evmAddress": "0x" + "c" * 40, "token": "other-token"}
     storage.save_session(session)
     storage.save_session(other)
-    args = ["--json", "trade", "close", "4", "--dry-run"]
+    args = [
+        "--endpoint",
+        session["endpoint"],
+        "--json",
+        "trade",
+        "close",
+        "4",
+        "--dry-run",
+    ]
     active = CliRunner().invoke(main, args)
     assert json.loads(active.output)["addr"] == other["evmAddress"]
     chosen = CliRunner().invoke(main, ["--as", session["evmAddress"], *args])
@@ -337,6 +346,8 @@ def test_market_dry_run_needs_no_price_and_marks_refresh():
         main,
         [
             "--json",
+            "--endpoint",
+            "http://127.0.0.1:1/query",
             "trade",
             "open",
             "--market",
@@ -504,14 +515,14 @@ def test_margin_rejects_wrong_lcd_network(monkeypatch):
     monkeypatch.setattr(
         margin,
         "_get_json",
-        lambda url: {"default_node_info": {"network": "nibiru-testnet-2"}},
+        lambda url, timeout=20: {"default_node_info": {"network": "nibiru-testnet-2"}},
     )
     with pytest.raises(ValueError, match="network do not match"):
         margin.snapshot(keeper.MAINNET_HTTP, "https://example.com", "0xabc", 1)
 
 
 def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
-    def gql(endpoint, query, variables=None, token=None):
+    def gql(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.ROUTE:
             return {
                 "oneClickTrading": {
@@ -564,7 +575,7 @@ def test_margin_snapshot_checks_raw_position_and_available_funds(monkeypatch):
     monkeypatch.setattr(
         margin,
         "_get_json",
-        lambda url: {"default_node_info": {"network": "cataclysm-1"}},
+        lambda url, timeout=20: {"default_node_info": {"network": "cataclysm-1"}},
     )
     monkeypatch.setattr(
         margin,

@@ -875,6 +875,7 @@ def trade_open(
                 take_profit=take_profit,
                 stop_loss=stop_loss,
                 dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
                 notify=warn,
             ),
         )
@@ -904,6 +905,7 @@ def trade_close(
                 trade_id=trade_id,
                 cancel_order=cancel_order,
                 dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -964,6 +966,7 @@ def trade_leverage(
                 trade_id=trade_id,
                 leverage=leverage,
                 dry_run=dry_run,
+                lcd_endpoint=settings(ctx).lcd_endpoint,
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:

@@ -994,7 +994,7 @@ def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
     assert preview["addr"] is None
     storage.save_session(stored_session())
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)
@@ -1025,7 +1025,7 @@ def test_logout_during_the_refresh_refuses_a_confirmed_signed_in_trade(
     preview = invoke(mcp, "preview_open", MARKET_OPEN)
     assert preview["addr"] == ADDR
 
-    def logout_on_refresh(endpoint, query, variables=None, token=None):
+    def logout_on_refresh(endpoint, query, variables=None, token=None, timeout=20):
         if query == keeper.MARKETS:
             storage.delete_session()
         return fake(endpoint, query, variables, token)

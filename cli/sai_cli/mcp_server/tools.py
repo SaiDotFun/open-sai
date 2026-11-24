@@ -95,7 +95,7 @@ class SessionUnavailable(ValueError):
         self.code = code
 
 
-class Refused(ValueError):
+class Refused(trading.PreviewRefused):
     """A trade was refused before submission; CODE says why.
 
     PREVIEW, when set, is the fresh preview with its own previewDigest for
@@ -109,9 +109,8 @@ class Refused(ValueError):
         preview: dict[str, Any] | None = None,
         **extra: Any,
     ) -> None:
-        super().__init__(message)
+        super().__init__(message, preview)
         self.code = code
-        self.preview = preview
         self.extra = extra
 
 
@@ -658,13 +657,11 @@ def open_trade(
         take_profit=take_profit,
         stop_loss=stop_loss,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
+        mcp_market=True,
         notify=notices.append,
         before_submit=check,
     )
-    if dry_run and market:
-        # Read-only: the price a live submit would refresh to now.
-        current = trading.open_usdc_market(settings.endpoint, market_id)["price"]
-        result["referencePrice"] = format(Decimal(str(current)), "f")
     if notices:
         result["notices"] = notices
     return finish(load, dry_run, result)
@@ -687,6 +684,7 @@ def close_trade(
         trade_id=trade_id,
         cancel_order=cancel_order,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)
@@ -737,6 +735,7 @@ def set_leverage(
         trade_id=trade_id,
         leverage=leverage,
         dry_run=dry_run,
+        lcd_endpoint=settings.lcd_endpoint,
         before_submit=check,
     )
     return finish(load, dry_run, result)

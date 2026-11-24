@@ -17,11 +17,13 @@ from typing import Any
 from urllib.parse import unquote
 
 import pytest
+from click.testing import CliRunner
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
 from sai_cli.core import keeper, settings, storage
 from sai_cli.mcp_server.server import create_server
+from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
 TOKEN = "fake-token"
@@ -41,6 +43,8 @@ class Position:
     reported_height: int | None = 120
     cap_query_heights: list[str | None] = field(default_factory=list)
     collateral_price: str | None = "1"
+    preview_inputs: bool = False
+    price: float = 100.5
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
     )
@@ -78,6 +82,15 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     }
                 }
             else:
+                market_row = market
+                if position.preview_inputs:
+                    market_row = {
+                        **market,
+                        "price": position.price,
+                        "openFeePct": 0.001,
+                        "closeFeePct": 0.002,
+                        "triggerOrderFeePct": 0.003,
+                    }
                 data = {
                     keeper.ROUTE: {
                         "oneClickTrading": {
@@ -98,8 +111,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                             }
                         }
                     },
-                    keeper.MARKET: {"perp": {"borrowing": market}},
-                    keeper.MARKETS: {"perp": {"borrowings": [market]}},
+                    keeper.MARKET: {"perp": {"borrowing": market_row}},
+                    keeper.MARKETS: {"perp": {"borrowings": [market_row]}},
                 }[request["query"]]
             self.reply({"data": data})
 
@@ -127,6 +140,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     "collateral_amount": str(position.collateral),
                     "leverage": position.leverage,
                 }
+                if position.preview_inputs:
+                    data.update(open_price="100", long=True)
             elif "get_exchange_balance" in message:
                 data = {
                     "collateral_index": "TokenIndex(1)",
@@ -612,5 +627,199 @@ def test_margin_binds_starting_leverage_even_when_the_result_rounds_the_same(
                 "leverageBefore": position.leverage,
                 "effectiveLeverage": position.leverage,
             }
+
+    asyncio.run(scenario())
+
+
+def test_cli_preview_text_and_json_use_the_order_trigger(
+    position_service: tuple[Position, str], tmp_path, monkeypatch
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    args = [
+        "--endpoint",
+        f"{base_url}/query",
+        "--lcd-endpoint",
+        base_url,
+        "trade",
+        "open",
+        "--market",
+        "0",
+        "--side",
+        "long",
+        "--type",
+        "limit",
+        "--amount",
+        "10",
+        "--leverage",
+        "2",
+        "--price",
+        "100",
+        "--slippage",
+        "1",
+        "--dry-run",
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, args)
+    assert result.exit_code == 0, result.output
+    assert '"worstCaseFill": {' in result.output
+    assert '"amountUsdc": "0.08"' in result.output
+
+    result = runner.invoke(main, ["--json", *args])
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.output)
+    assert preview["addr"] is None
+    estimates = preview["estimates"]
+    assert estimates["worstCaseFill"] == {
+        "status": "bound",
+        "price": "101",
+        "side": "maximum",
+        "reference": {"price": "100", "source": "Order trigger", "observedAt": None},
+    }
+    fees = estimates["fees"]
+    assert fees["amountUsdc"] == "0.08"
+    assert fees["status"] == "estimate"
+    assert fees["collateralPriceUsd"]["price"] == "1"
+    assert fees["collateralPriceUsd"]["observedAt"].endswith("Z")
+    assert Decimal(estimates["liquidationPrice"]["price"]).quantize(
+        Decimal(".0001")
+    ) == Decimal(60)
+    assert position.submitted == []
+
+
+@pytest.mark.parametrize(
+    ("side", "worst"), [("long", "102.52005"), ("short", "98.50005")]
+)
+def test_mcp_market_bound_and_moved_price_preview(
+    position_service: tuple[Position, str], side: str, worst: str
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    args = {
+        "market_id": 0,
+        "side": side,
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_open", args)
+            fill = preview["estimates"]["worstCaseFill"]
+            assert fill["price"] == worst
+            assert fill["status"] == "bound"
+            assert fill["reference"]["price"] == preview["referencePrice"] == "100.5"
+            assert fill["reference"]["source"] == "Sai Keeper market price"
+            assert fill["reference"]["observedAt"].endswith("Z")
+            assert preview["estimates"]["fees"]["amountUsdc"] == "0.02"
+            position.price = 110
+            moved = await call(
+                client,
+                "trade_open",
+                {
+                    **args,
+                    "preview_digest": preview["previewDigest"],
+                    "reference_price": preview["referencePrice"],
+                },
+            )
+            assert moved["code"] == "PRICE_MOVED"
+            assert (
+                moved["preview"]["estimates"]["worstCaseFill"]["reference"]["price"]
+                == "110"
+            )
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_mcp_stop_has_no_bound_and_unavailable_oracle_keeps_preview(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral_price = None
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(
+                client,
+                "preview_open",
+                {
+                    "market_id": 0,
+                    "side": "short",
+                    "order_type": "stop",
+                    "price": "100",
+                    "amount": "10",
+                    "leverage": "2",
+                    "slippage": "1",
+                },
+            )
+            estimates = preview["estimates"]
+            assert estimates["worstCaseFill"]["status"] == "unbounded"
+            assert "price" not in estimates["worstCaseFill"]
+            assert estimates["fees"]["status"] == "unavailable"
+            assert estimates["liquidationPrice"]["status"] == "unavailable"
+            assert len(preview["previewDigest"]) == 64
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_mcp_position_estimates_do_not_change_confirmed_terms(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            variants = (
+                ("close", {}, "0.016", "unbounded", None),
+                ("partial_close", {"percent": 50}, "0.008", "unbounded", "60"),
+                ("leverage", {"leverage": "4"}, "0", "not_applicable", "80"),
+                (
+                    "margin",
+                    {"direction": "add", "amount": "4"},
+                    "0",
+                    "not_applicable",
+                    "20",
+                ),
+                ("tpsl", {"take_profit": "120"}, "0", "not_applicable", None),
+                ("close", {"cancel_order": True}, None, "not_applicable", None),
+            )
+            for tool, args, fee, fill, liq in variants:
+                preview = await call(client, f"preview_{tool}", {"trade_id": 7, **args})
+                estimates = preview["estimates"]
+                assert estimates["fees"].get("amountUsdc") == fee
+                assert estimates["worstCaseFill"]["status"] == fill
+                quote = estimates["liquidationPrice"]
+                if liq is None:
+                    assert quote["status"] in {"unchanged", "not_applicable"}
+                else:
+                    assert quote["status"] == "estimate"
+                    assert Decimal(quote["price"]).quantize(
+                        Decimal(".0001")
+                    ) == Decimal(liq)
+                    assert quote["entry"]["observedAt"].endswith("Z")
+            assert position.submitted == []
+
+            preview = await call(client, "preview_close", {"trade_id": 7})
+            position.collateral_price = None
+            fresh = await call(client, "preview_close", {"trade_id": 7})
+            assert fresh["estimates"]["fees"]["status"] == "unavailable"
+            assert fresh["previewDigest"] == preview["previewDigest"]
+            accepted = await call(
+                client,
+                "trade_close",
+                {
+                    "trade_id": 7,
+                    "preview_digest": preview["previewDigest"],
+                },
+            )
+            assert accepted["status"] == "accepted"
+            assert len(position.submitted) == 1
 
     asyncio.run(scenario())
