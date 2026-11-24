@@ -413,19 +413,43 @@ def _position_preview(
     addr: str,
     trade_id: int,
     dry_run: bool,
-    before_submit: SubmitCheck,
+    before_submit: SubmitCheck | None,
     changed_message: str,
     estimate: Callable[
         [margin.PositionSnapshot, dict[str, Any], dict[str, Any]], dict[str, Any]
     ],
 ) -> dict[str, Any]:
-    state, inputs, preview = build()
+    def read_quote() -> PositionPreview:
+        try:
+            return build()
+        except margin.TradingNetworkMismatch as exc:
+            if dry_run or before_submit is None:
+                raise
+            try:
+                state, inputs, fresh = build()
+                fresh["estimates"] = estimate(state, inputs, fresh)
+            except margin.TradingNetworkMismatch:
+                raise PositionChanged(
+                    f"{exc}. Use an LCD on Keeper's chain and request a new preview."
+                ) from exc
+            except estimates.READ_ERRORS as refresh_error:
+                raise PositionChanged(
+                    "Could not refresh the position preview after an LCD network mismatch."
+                    " Request a new preview before submitting."
+                ) from refresh_error
+            raise PositionChanged(
+                "Keeper trading route and LCD network differed during confirmation."
+                " Review the replacement preview before submitting.",
+                {**fresh, "addr": addr},
+            ) from exc
+
+    state, inputs, preview = read_quote()
     if dry_run:
         preview["estimates"] = estimate(state, inputs, preview)
         return preview
 
     try:
-        state, inputs, fresh = build()
+        state, inputs, fresh = read_quote()
     except (
         margin.IndexLag,
         margin.PositionUnavailable,
@@ -435,7 +459,9 @@ def _position_preview(
     changed = not margin.position_unchanged(lcd_endpoint, state, trade_id, inputs)
     if changed:
         try:
-            state, inputs, fresh = build()
+            state, inputs, fresh = read_quote()
+        except PositionChanged:
+            raise
         except (ValueError, keeper.KeeperError, KeyError, TypeError) as exc:
             raise PositionChanged(
                 f"{changed_message}. Could not quote the latest position. {exc}"
@@ -443,7 +469,8 @@ def _position_preview(
     if changed or fresh != preview:
         fresh["estimates"] = estimate(state, inputs, fresh)
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
-    _checked(before_submit, fresh, lambda _: estimate(state, inputs, fresh))
+    if before_submit is not None:
+        _checked(before_submit, fresh, lambda _: estimate(state, inputs, fresh))
     return fresh
 
 
@@ -456,7 +483,7 @@ def change_margin(
     amount: str,
     lcd_endpoint: str,
     dry_run: bool,
-    before_submit: SubmitCheck = _accept,
+    before_submit: SubmitCheck | None = None,
 ) -> dict[str, Any]:
     """Add or remove margin through a target-leverage intent.
 
@@ -483,6 +510,7 @@ def change_margin(
             inputs,
             {
                 "dryRun": True,
+                "positionRoute": state.route,
                 "quote": {
                     **quote,
                     **inputs,
@@ -525,7 +553,7 @@ def partial_close(
     percent: int,
     lcd_endpoint: str,
     dry_run: bool,
-    before_submit: SubmitCheck = _accept,
+    before_submit: SubmitCheck | None = None,
 ) -> dict[str, Any]:
     """Reduce an open USDC position by a whole percentage.
 
@@ -563,6 +591,7 @@ def partial_close(
             {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
             {
                 "dryRun": True,
+                "positionRoute": state.route,
                 "intent": payload,
                 "quote": {
                     "percent": percent,
