@@ -32,10 +32,13 @@ def test_retired_mcp_names_do_not_reappear():
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        if path.relative_to(ROOT).as_posix() == "cli/sai_cli/mcp_install.py":
-            # The migration recognizes this name solely to remove it.
+        relative = path.relative_to(ROOT).as_posix()
+        # Each adapter recognizes the retired name in existing registrations.
+        if relative == "cli/sai_cli/mcp_install.py":
             text = text.replace(f'RETIRED_NAME = "{RETIRED[0]}"', "", 1)
+        elif relative == "sai/src/mcp_registration.rs":
+            text = text.replace(f'const RETIRED_NAME: &str = "{RETIRED[0]}";', "", 1)
         for name in RETIRED:
             if name in text:
-                found.append(f"{path.relative_to(ROOT)}: {name}")
+                found.append(f"{relative}: {name}")
     assert found == []
