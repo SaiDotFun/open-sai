@@ -100,6 +100,7 @@ print(json.dumps({"name": name, "enabled": True, **data}))
 # Codex is asked twice: from CODEX_HOME for the user entry, then from the
 # working directory for the entry it uses here.
 GETS = [["mcp", "get", "sai", "--json"]] * 2
+LEGACY_GETS = [["mcp", "get", OLD_COMMAND, "--json"]] * 2
 # After a change, Codex is asked again: both reads, then the working directory.
 CHECK = [["mcp", "get", "sai", "--json"]] * 3
 
@@ -355,6 +356,45 @@ def test_doctor_preserves_denied_registration_names(env: Env):
     }
     assert all(path.read_bytes() == content for path, content in policies.items())
     assert SECRET not in result.output
+
+
+@pytest.mark.parametrize("canonical_exists", [False, True])
+def test_mcp_list_and_uninstall_all_include_repaired_legacy_entries(
+    env: Env, canonical_exists: bool
+):
+    entry = {"command": OLD_COMMAND, "args": [], "env": {"CUSTOM": SECRET}}
+    unrelated = write_doctor_entries(env, OLD_COMMAND, entry)
+    repaired = invoke("doctor", "--offline")
+    assert repaired.exit_code == 0, repaired.output
+    if canonical_exists:
+        assert invoke("mcp", "install", "--all").exit_code == 0
+
+    listed = invoke("mcp", "list")
+    for row in payload(listed)["clients"]:
+        assert row["registered"]
+        assert row.get("registeredName", "sai") == (
+            "sai" if canonical_exists else OLD_COMMAND
+        )
+        assert any(reg.get("name") == OLD_COMMAND for reg in row["registrations"])
+
+    planned = invoke("mcp", "uninstall", "--all", "--dry-run")
+    names = {"sai", OLD_COMMAND} if canonical_exists else {OLD_COMMAND}
+    plan = payload(planned)["results"]
+    assert {(row["client"], row.get("name", "sai")) for row in plan} == {
+        (client, name) for client in mcp_install.CLIENTS for name in names
+    }
+    assert {(row["action"], row["would"]) for row in plan} == {("planned", "removed")}
+    assert all(OLD_COMMAND in entries for entries in doctor_entries(env).values())
+
+    removed = invoke("mcp", "uninstall", "--all")
+    assert removed.exit_code == 0, removed.output
+    assert actions(removed) == dict.fromkeys(mcp_install.CLIENTS, "removed")
+    assert {row.get("name", "sai") for row in payload(removed)["results"]} == names
+    assert all(
+        entries == {OTHER: unrelated} for entries in doctor_entries(env).values()
+    )
+    for result in (listed, planned, removed):
+        assert SECRET not in result.output and OTHER not in result.output
 
 
 def test_doctor_repairs_claude_scopes_without_remove_and_add(env: Env, monkeypatch):
@@ -836,12 +876,13 @@ def test_uninstall_runs_remove_and_reports_absent(env: Env):
     assert env.calls() == [
         ["mcp", "remove", "--scope", "user", "sai"],
         *GETS,
+        *LEGACY_GETS,
         *CHECK,
     ]
     env.clear()
     again = invoke("mcp", "uninstall", "claude", "codex", "--dry-run")
     assert actions(again) == {"claude": "absent", "codex": "absent"}
-    assert env.calls() == GETS
+    assert env.calls() == GETS + LEGACY_GETS
 
 
 def test_uv_cache_path_is_refused(env: Env, monkeypatch: pytest.MonkeyPatch):
@@ -1100,7 +1141,7 @@ def test_disabled_codex_entry_is_not_current_and_is_replaced(env: Env):
     assert (row["client"], row["current"], row["disabled"]) == ("codex", False, True)
     result = invoke("mcp", "install", "codex")
     assert actions(result) == {"codex": "replaced"}
-    assert env.calls() == GETS + GETS + CHECK
+    assert env.calls() == GETS + LEGACY_GETS + GETS + CHECK
     row = payload(invoke("mcp", "list"))["clients"][1]
     assert row["current"] is True
     assert "disabled" not in row

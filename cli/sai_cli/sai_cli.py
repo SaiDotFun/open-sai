@@ -1646,7 +1646,7 @@ def mcp_uninstall(
 ) -> None:
     """Remove Sai from Claude Code, Codex, or Cursor.
 
-    Removes sai from every scope it is registered in for each client, unless
+    Removes canonical and legacy Sai entries from every scope for each client, unless
     --scope names one. With no CLIENT and no --all, a terminal asks which to
     remove; without a terminal this is a usage error that names where Sai is
     registered.

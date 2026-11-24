@@ -33,6 +33,7 @@ from .core import settings
 
 NAME = "sai"
 RETIRED_NAME = "sai-mcp"
+SERVER_NAMES = (NAME, RETIRED_NAME)
 HIDDEN = "<hidden>"
 CODEX_TOOL_FILTERS = ("enabled_tools", "disabled_tools")
 STILL_ACTIVE = "a project .codex/config.toml entry is still active"
@@ -139,12 +140,14 @@ class Result:
     shadowed_by: str | None = None
     # A client config was written, even if the check afterwards failed.
     changed: bool = False
+    name: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {"client": self.client, "action": self.action}
         names = {"shadowed_by": "shadowedBy"}
         for key in (
             "scope",
+            "name",
             "would",
             "command",
             "args",
@@ -465,8 +468,8 @@ class Client:
     def effective(self, found: list[Registration]) -> Registration | None:
         return found[0] if found else None
 
-    def registration(self, scope: str) -> Registration | None:
-        return next((r for r in self.registrations() if r.scope == scope), None)
+    def registration(self, scope: str, name: str = NAME) -> Registration | None:
+        return next((r for r in self.registrations(name) if r.scope == scope), None)
 
     def add_steps(self, scope: str, target: Target) -> list[list[str]]:
         raise NotImplementedError
@@ -474,9 +477,9 @@ class Client:
     def remove_steps(self, scope: str, name: str = NAME) -> list[list[str]]:
         raise NotImplementedError
 
-    def verify(self, scope: str, target: Target | None) -> None:
+    def verify(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
         """Re-read after a change: the entry matches target, or is gone."""
-        reg = self.registration(scope)
+        reg = self.registration(scope, name)
         if target is not None and (reg is None or not reg.matches(target)):
             raise ClientError(f"{self.name} does not show the new sai entry")
         if target is None and reg is not None:
@@ -556,17 +559,17 @@ class Codex(Client):
         home = self.home_dir()
         return home if home.is_dir() else Path(tempfile.gettempdir())
 
-    def verify(self, scope: str, target: Target | None) -> None:
+    def verify(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
         """Ask Codex again, from $CODEX_HOME and from the working directory.
 
         Equal user and project entries look like one entry before a change,
         so only the answer from the working directory afterwards shows
         whether a project entry is still what Codex runs here.
         """
-        super().verify(scope, target)
+        super().verify(scope, target, name=name)
         if self.cwd is None:
             return
-        here = self.get(self.cwd, "project")
+        here = self.get(self.cwd, "project", name)
         if target is None and here is None:
             return
         if target is not None and here is not None and here.matches(target):
@@ -620,8 +623,8 @@ class Codex(Client):
         self.check_scope(scope)
         return self.home_dir() / "config.toml"
 
-    def write(self, scope: str, target: Target | None) -> None:
-        edit_codex_config(self.config_path(scope), target)
+    def write(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
+        edit_codex_config(self.config_path(scope), target, name=name)
 
 
 class Cursor(Client):
@@ -657,7 +660,7 @@ class Cursor(Client):
                     found.append(reg)
         return self.ordered(found)
 
-    def write(self, scope: str, target: Target | None) -> None:
+    def write(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
         """Set or delete the sai entry, merging again once if the file moves."""
         path = self.config_path(scope)
         for _ in range(2):
@@ -670,7 +673,7 @@ class Cursor(Client):
             if not isinstance(entries, dict):
                 entries = {}
             if target is None:
-                entries.pop(NAME, None)
+                entries.pop(name, None)
             else:
                 entry: dict[str, Any] = {
                     "command": target.argv[0],
@@ -717,21 +720,32 @@ def list_clients(
             "scope": None,
         }
         try:
-            found = client.registrations()
+            found = [(server, client.registrations(server)) for server in SERVER_NAMES]
         except ClientError as exc:
             row["error"] = str(exc)
             found = []
-        effective = client.effective(found)
-        row["registrations"] = [reg.to_json(target, reg is effective) for reg in found]
-        if found:
-            reg = effective or found[0]
+        row["registrations"] = [
+            {
+                **reg.to_json(target, reg is client.effective(entries)),
+                **({"name": server} if server != NAME else {}),
+            }
+            for server, entries in found
+            for reg in entries
+        ]
+        primary = next(
+            ((server, entries[0]) for server, entries in found if entries), None
+        )
+        if primary is not None:
+            server, reg = primary
             shown = reg.shown(target)
             row.update(
                 registered=True,
-                current=reg is effective and target is not None and reg.matches(target),
+                current=target is not None and reg.matches(target),
                 registeredCommand=shown["command"],
                 scope=reg.scope,
             )
+            if server != NAME:
+                row["registeredName"] = server
             if "args" in shown:
                 row["args"] = shown["args"]
             if reg.stale_env:
@@ -806,39 +820,39 @@ def uninstall_client(
     since removing the others leaves it running.
     """
     try:
-        found = client.registrations()
+        found = [(name, client.registrations(name)) for name in SERVER_NAMES]
     except ClientError as exc:
         return [Result(client.name, "failed", scope=scope, error=str(exc))]
-    if scope is not None:
-        existing = next((r for r in found if r.scope == scope), None)
-        results = [uninstall_one(client, scope, existing, dry_run, target)]
-    elif not found:
-        return [Result(client.name, "absent")]
-    else:
-        results = [uninstall_one(client, r.scope, r, dry_run, target) for r in found]
-    winner = client.effective(found)
-    done = {r.scope for r in results}
-    if (
-        winner is not None
-        and winner.scope in client.read_only_scopes
-        and winner.scope not in done
-    ):
-        results.append(uninstall_one(client, winner.scope, winner, dry_run, target))
-    return results
+    results = []
+    for name, entries in found:
+        selected = [reg for reg in entries if scope is None or reg.scope == scope]
+        winner = client.effective(entries)
+        if (
+            winner is not None
+            and winner.scope in client.read_only_scopes
+            and winner not in selected
+        ):
+            selected.append(winner)
+        results.extend(
+            uninstall_one(client, reg.scope, reg, dry_run, target, name=name)
+            for reg in selected
+        )
+    return results or [Result(client.name, "absent", scope=scope)]
 
 
 def uninstall_one(
     client: Client,
     scope: str,
-    existing: Registration | None,
+    existing: Registration,
     dry_run: bool,
     target: Target | None = None,
+    *,
+    name: str = NAME,
 ) -> Result:
-    result = Result(client.name, "failed", scope=scope)
+    result = Result(
+        client.name, "failed", scope=scope, name=name if name != NAME else None
+    )
     try:
-        if existing is None:
-            result.action = "absent"
-            return result
         shown = existing.shown(target)
         result.command, result.args = shown["command"], shown.get("args")
         if scope in client.read_only_scopes and isinstance(client, Codex):
@@ -847,13 +861,13 @@ def uninstall_one(
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = client.remove_steps(scope)
+            steps = client.remove_steps(scope, name)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", "removed"
             return result
         if isinstance(client, (Codex, Cursor)):
-            client.write(scope, None)
+            client.write(scope, None, name=name)
         else:
             for argv in steps:
                 run(argv)
@@ -861,7 +875,7 @@ def uninstall_one(
                 # changed the client.
                 result.changed = True
         result.changed = True
-        client.verify(scope, None)
+        client.verify(scope, None, name=name)
         result.action = "removed"
     except (ClientError, OSError) as exc:
         result.action, result.error = "failed", str(exc)
@@ -970,16 +984,20 @@ def repair_entry(
 
 
 def edit_codex_config(
-    path: Path, target: Target | None, *, stale: StaleRegistration | None = None
+    path: Path,
+    target: Target | None,
+    *,
+    stale: StaleRegistration | None = None,
+    name: str = NAME,
 ) -> None:
     """Change only Sai's table, publishing the complete config in one rename."""
+    name = stale.name if stale else name
     for _ in range(2):
         destination = path.resolve()
         seen = read_bytes(destination)
         try:
             source = seen.decode() if seen is not None else ""
-            rendered = edit_codex_source(source, target, stale)
-            name = stale.name if stale else NAME
+            rendered = edit_codex_source(source, target, stale, name)
             if unrelated_codex_settings(source, name) != unrelated_codex_settings(
                 rendered, name
             ):
@@ -995,14 +1013,14 @@ def edit_codex_config(
 
 
 def edit_codex_source(
-    source: str, target: Target | None, stale: StaleRegistration | None
+    source: str, target: Target | None, stale: StaleRegistration | None, name: str
 ) -> str:
     doc = tomlkit.parse(source)
     entries = doc.get("mcp_servers", {})
     if not isinstance(entries, MutableMapping):
         raise ClientError("Codex mcp_servers must be a table")
     if target is None:
-        if entries.pop(NAME, None) is None:
+        if entries.pop(name, None) is None:
             return source
         return keep_table_separators(source, doc.as_string())
 
@@ -1160,7 +1178,7 @@ def check_registration(
     try:
         found = [
             (server, reg)
-            for server in (NAME, RETIRED_NAME)
+            for server in SERVER_NAMES
             for reg in client.registrations(server)
         ]
         inspected = [
@@ -1215,7 +1233,7 @@ def check_registration(
         try:
             if any(
                 stale_registration(client, server, reg) is not None
-                for server in (NAME, RETIRED_NAME)
+                for server in SERVER_NAMES
                 for reg in client.registrations(server)
             ):
                 failures.append(
