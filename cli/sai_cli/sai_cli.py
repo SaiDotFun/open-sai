@@ -8,6 +8,7 @@ import os
 import shlex
 import sys
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -22,6 +23,7 @@ from .core import (
     clipboard,
     keeper,
     log,
+    log_queries,
     reconcile,
     storage,
     stream,
@@ -230,7 +232,11 @@ class LoggedGroup(SaiGroup):
         started = time.monotonic()
         exit_code: int = ExitCode.OK
         failure: SaiError | None = None
-        with log.silenced() if quiet else log.bind(surface=surface, command=command):
+        with (
+            log.silenced()
+            if quiet
+            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
+        ):
             if not quiet:
                 log.event("command.start", argv=log.argv(argv[:64]))
             try:
@@ -256,19 +262,16 @@ class LoggedGroup(SaiGroup):
                     return result
             finally:
                 if not quiet:
-                    fields: dict[str, Any] = {}
-                    if failure is not None:
-                        fields.update(
-                            code=failure.code, error=log.untrusted(failure.message)
-                        )
-                        if failure.intent_key is not None:
-                            fields["intentKey"] = failure.intent_key
                     log.event(
                         "command.end",
                         "info" if exit_code == ExitCode.OK else "warn",
                         durationMs=round((time.monotonic() - started) * 1000),
                         exitCode=exit_code,
-                        **fields,
+                        code=failure.code if failure is not None else None,
+                        error=log.untrusted(failure.message)
+                        if failure is not None
+                        else None,
+                        intentKey=failure.intent_key if failure is not None else None,
                     )
         raise SystemExit(exit_code)
 
@@ -906,6 +909,13 @@ def warn(message: str) -> None:
 @click.option("--slippage", required=True, help="Maximum slippage percentage.")
 @click.option("--take-profit")
 @click.option("--stop-loss")
+@click.option(
+    "--allow-concurrent-open",
+    is_flag=True,
+    help="Allow another open while an earlier open is unknown or accepted."
+    " Any locally pending open on the same account and Keeper still blocks,"
+    " including a late acknowledgement.",
+)
 @click.option("--dry-run", is_flag=True)
 @click.pass_context
 def trade_open(
@@ -919,6 +929,7 @@ def trade_open(
     slippage: str,
     take_profit: str | None,
     stop_loss: str | None,
+    allow_concurrent_open: bool,
     dry_run: bool,
 ) -> None:
     """Open a market, limit, or stop trade."""
@@ -936,6 +947,7 @@ def trade_open(
             slippage=slippage,
             take_profit=take_profit,
             stop_loss=stop_loss,
+            allow_concurrent_open=allow_concurrent_open,
             dry_run=dry_run,
             notify=warn,
         ),
@@ -1149,7 +1161,7 @@ def doctor_command(
         fix=not no_fix,
         offline=offline,
         checks=[doctor.log_entry(check) for check in checks],
-        **({"code": code} if overall == "fail" else {}),
+        code=code if overall == "fail" else None,
     )
     if overall == "fail":
         if not ctx.obj["json"]:
@@ -1759,6 +1771,99 @@ def logs_tail(
             click.echo(log.render(line))
 
 
+def print_log_trail(ctx: click.Context, report: dict[str, Any]) -> None:
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    lines = sorted(report["events"] + report["gaps"], key=log.event_order)
+    if not lines:
+        click.echo("No matching log events.")
+    for line in lines:
+        prefix = "Gap  " if line.get("event") == "log.dropped" else ""
+        click.echo(prefix + log.render(line))
+    if warning := report.get("scopeWarning"):
+        click.echo(warning)
+    for line in report.get("unattributedGaps", ()):
+        click.echo("Unattributed gap  " + log.render(line))
+    if (count := report.get("unattributedGapCount", 0)) > len(
+        report.get("unattributedGaps", ())
+    ):
+        click.echo(f"Unattributed drop notices in scan  {count}")
+    print_log_limit(report)
+
+
+def print_log_limit(report: dict[str, Any]) -> None:
+    if report.get("truncated"):
+        click.echo("Report truncated. " + report["more"])
+        if before := report.get("nextBefore"):
+            click.echo(f"Earlier timestamps  --before {before}")
+
+
+@logs_group.command("intent")
+@click.argument("key")
+@click.option("--offline", is_flag=True, help="Read local logs only.")
+@click.option("--addr", help="EVM address to use for the Keeper lookup.")
+@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.pass_context
+def logs_intent(
+    ctx: click.Context, key: str, offline: bool, addr: str | None, before: str | None
+) -> None:
+    """Show an intent's CLI and MCP trail and its current Keeper record."""
+    endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
+    account = addr if addr is not None else ctx.obj["as_addr"]
+    report = log_queries.intent(
+        key, endpoint=endpoint, addr=account, offline=offline, before=before
+    )
+    print_log_trail(ctx, report)
+    if ctx.obj["json"]:
+        return
+    if report["txHash"]:
+        click.echo(f"Request transaction {report['txHash']}")
+    if record := report["keeper"]:
+        click.echo("Keeper " + json.dumps(record, separators=(",", ":")))
+    elif error := report.get("keeperError"):
+        click.echo(f"Keeper lookup failed ({error['code']}). {error['message']}")
+    elif not offline:
+        click.echo("Keeper has no record for this intent.")
+
+
+@logs_group.command("run")
+@click.argument("id")
+@click.option("--before", help="Read earlier events before this UTC timestamp.")
+@click.pass_context
+def logs_run(ctx: click.Context, id: str, before: str | None) -> None:
+    """Show one process run or one MCP call by ID."""
+    print_log_trail(ctx, log_queries.run(id, before=before))
+
+
+@logs_group.command("stats")
+@click.option(
+    "--since", metavar="DURATION", help="Look back by a duration such as 24h."
+)
+@click.option("--before", help="Use events before this UTC timestamp.")
+@click.pass_context
+def logs_stats(ctx: click.Context, since: str | None, before: str | None) -> None:
+    """Summarize Keeper latency and error codes in the retained logs."""
+    report = log_queries.stats(since, before=before)
+    if ctx.obj["json"]:
+        emit(ctx, report)
+        return
+    if report["keeper"]:
+        click.echo("Keeper operation  Requests  p50 (ms)  p95 (ms)")
+        for name, values in report["keeper"].items():
+            click.echo(
+                f"{name:16}  {values['count']:8}  {values['p50Ms']:8}  {values['p95Ms']:8}"
+            )
+    else:
+        click.echo("No timed Keeper requests.")
+    click.echo("Errors by code" if report["errors"] else "No coded errors.")
+    for code, count in report["errors"].items():
+        click.echo(f"{code}  {count}")
+    for line in report["gaps"]:
+        click.echo("Gap  " + log.render(line))
+    print_log_limit(report)
+
+
 # Exit code for an install `sai update` cannot change in place.
 EXIT_UNSUPPORTED = updater.EXIT_UNSUPPORTED
 
@@ -1892,7 +1997,7 @@ def log_update(outcome: updater.Outcome, *, background: bool) -> None:
         rolledBack=outcome.rolled_back,
         background=background,
         message=log.untrusted(outcome.message),
-        **({"code": Code.INTERNAL_ERROR} if outcome.exit_code else {}),
+        code=Code.INTERNAL_ERROR if outcome.exit_code else None,
     )
 
 
