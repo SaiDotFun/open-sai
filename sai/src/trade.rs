@@ -9,7 +9,7 @@ use sai_core::{
     log::EventContext,
     settings::{Environment, Flags},
     storage::{Session, Storage, StorageEvent},
-    trade::{self, OpenTrade, SubmitOptions, TradePreview, Trading, close_preview},
+    trade::{self, OpenTrade, PreviewMode, SubmitOptions, TradePreview, Trading, close_preview},
     wait,
 };
 use serde_json::{Map, Value, json};
@@ -233,10 +233,6 @@ pub fn run(
         }
         Err(error) => return Err(error),
     };
-    if dry_run && !cancelling && !preview.is_standalone_position_update() {
-        local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
-        return Ok(ExitCode::Ok);
-    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -251,12 +247,12 @@ pub fn run(
             local::emit(&output, json)?;
             return Ok(ExitCode::Ok);
         }
-        local::emit(
-            &runtime.block_on(
-                trading.cancel_preview(session.as_ref().ok_or_else(SaiError::internal)?, &preview),
-            )?,
-            json,
-        )?;
+        let preview = runtime.block_on(trading.prepare_preview(
+            preview,
+            session.as_ref(),
+            PreviewMode::Cli,
+        ))?;
+        local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
         return Ok(ExitCode::Ok);
     }
     let session = session.ok_or_else(SaiError::internal)?;
