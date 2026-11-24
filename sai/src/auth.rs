@@ -1,11 +1,15 @@
 use std::{
     env,
-    io::{self, IsTerminal},
+    io::{self, IsTerminal, Write},
+    os::fd::{AsFd, BorrowedFd},
 };
 
 use chrono::Utc;
 use clap::Subcommand;
-use rustix::termios::{LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr};
+use rustix::{
+    fs::{OFlags, fcntl_getfl, fcntl_setfl},
+    termios::{InputModes, LocalModes, OptionalActions, Termios, tcgetattr, tcsetattr},
+};
 use sai_core::{
     auth::{self, CLIPBOARD_NAMES, Clipboard, LoginError},
     errors::{Code, ExitCode, SaiError},
@@ -16,6 +20,10 @@ use sai_core::{
     storage::{RemovedSession, SessionSummary, Storage, StorageError, StorageEvent},
 };
 use serde::Serialize;
+use tokio::{
+    io::{Interest, unix::AsyncFd},
+    signal::unix::{SignalKind, signal},
+};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -266,6 +274,7 @@ async fn import(
 struct HiddenInput<'a> {
     stdin: &'a io::Stdin,
     original: Termios,
+    flags: OFlags,
 }
 
 impl<'a> HiddenInput<'a> {
@@ -275,46 +284,82 @@ impl<'a> HiddenInput<'a> {
         hidden
             .local_modes
             .remove(LocalModes::ECHO | LocalModes::ECHONL);
+        hidden
+            .local_modes
+            .insert(LocalModes::ICANON | LocalModes::ISIG);
+        hidden
+            .input_modes
+            .remove(InputModes::IGNCR | InputModes::INLCR);
+        hidden.input_modes.insert(InputModes::ICRNL);
+        let flags = fcntl_getfl(stdin)?;
+        let guard = Self {
+            stdin,
+            original,
+            flags,
+        };
         tcsetattr(stdin, OptionalActions::Flush, &hidden)?;
-        Ok(Self { stdin, original })
+        fcntl_setfl(stdin, flags | OFlags::NONBLOCK)?;
+        Ok(guard)
     }
 }
 
 impl Drop for HiddenInput<'_> {
     fn drop(&mut self) {
+        let _ = fcntl_setfl(self.stdin, self.flags);
         let _ = tcsetattr(self.stdin, OptionalActions::Now, &self.original);
     }
+}
+
+async fn hidden_line(terminal: &AsyncFd<BorrowedFd<'_>>) -> io::Result<Zeroizing<String>> {
+    let mut token = Zeroizing::new(Vec::new());
+    let mut buffer = Zeroizing::new([0u8; 1024]);
+    loop {
+        let size = terminal
+            .async_io(Interest::READABLE, |stdin| {
+                rustix::io::read(*stdin, &mut buffer[..]).map_err(Into::into)
+            })
+            .await?;
+        if size == 0 && token.is_empty() {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        token.extend_from_slice(&buffer[..size]);
+        if size == 0 || token.ends_with(b"\n") {
+            break;
+        }
+    }
+
+    let text = std::str::from_utf8(&token).map_err(io::Error::other)?;
+    Ok(Zeroizing::new(text.trim().to_owned()))
+}
+
+async fn prompt_token(stdin: &io::Stdin) -> Result<Zeroizing<String>, SaiError> {
+    let aborted = || SaiError::new(Code::InvalidRequest, "Aborted");
+    let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| SaiError::internal())?;
+    let _hidden = HiddenInput::new(stdin).map_err(|_| aborted())?;
+    // SAFETY: BorrowedFd keeps stdin's descriptor valid and unchanged while
+    // the registration is live. HiddenInput has already enabled nonblocking reads.
+    let terminal = unsafe { AsyncFd::register_with_interest(stdin.as_fd(), Interest::READABLE) }
+        .map_err(|_| aborted())?;
+    io::stderr()
+        .write_all(b"Paste the Sai session token (Enter reads the clipboard): ")
+        .and_then(|()| io::stderr().flush())
+        .map_err(|_| aborted())?;
+    let result = tokio::select! {
+        biased;
+        _ = interrupt.recv() => Err(aborted()),
+        line = hidden_line(&terminal) => line.map_err(|_| aborted()),
+    };
+    eprintln!();
+    result
 }
 
 async fn read_token() -> Result<Zeroizing<String>, SaiError> {
     let stdin = io::stdin();
     let terminal = stdin.is_terminal();
     if terminal {
-        // rpassword turns Ctrl-C into SIGINT after restoring the terminal.
-        // Catch it so a canceled prompt uses the CLI's normal error format.
-        let _interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
-            .map_err(|_| SaiError::internal())?;
-        // rpassword prints the prompt before setting its terminal mode.
-        let hidden =
-            HiddenInput::new(&stdin).map_err(|_| SaiError::new(Code::InvalidRequest, "Aborted"))?;
-        let config = rpassword::ConfigBuilder::new()
-            .input_file_path("/dev/stdin")
-            .output_writer(io::stderr())
-            .build();
-        let typed = rpassword::prompt_password_with_config(
-            "Paste the Sai session token (Enter reads the clipboard): ",
-            config,
-        )
-        .map(Zeroizing::new)
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::UnexpectedEof {
-                eprintln!();
-            }
-            SaiError::new(Code::InvalidRequest, "Aborted")
-        })?;
-        drop(hidden);
-        if !typed.trim().is_empty() {
-            return Ok(Zeroizing::new(typed.trim().to_owned()));
+        let typed = prompt_token(&stdin).await?;
+        if !typed.is_empty() {
+            return Ok(typed);
         }
     }
     let Some((copied, _)) = Clipboard::read().await else {

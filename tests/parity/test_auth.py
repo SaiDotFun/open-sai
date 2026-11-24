@@ -3,12 +3,19 @@
 from __future__ import annotations
 
 import base64
+import fcntl
 import inspect
 import json
 import os
+import pty
+import select
 import shutil
+import signal
 import subprocess
 import sys
+import termios
+import tty
+from contextlib import suppress
 from pathlib import Path
 from typing import Any
 
@@ -375,6 +382,86 @@ def test_import_disables_echo_before_showing_prompt(
     assert result[0] == 0
     assert token.encode() not in transcript
     assert_unexposed(rust, result[1] + result[2], token)
+
+
+def interrupt_prompt(
+    env: Env, args: CLI, terminal_ctrl_c: bool, *, raw_mode: bool = False
+) -> tuple[int, str, str]:
+    master, slave = pty.openpty()
+    if raw_mode:
+        tty.setraw(slave)
+    original = termios.tcgetattr(master)
+    original_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
+    # Attach a controlling PTY so the terminal itself can deliver VINTR.
+    launch = (
+        "import fcntl, os, sys, termios; "
+        "fcntl.ioctl(0, termios.TIOCSCTTY, 0); "
+        "os.execv(sys.argv[1], sys.argv[1:])"
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", launch, *env.command, *args],
+        stdin=slave,
+        stderr=slave,
+        stdout=subprocess.PIPE,
+        env=env.vars(),
+        start_new_session=True,
+    )
+    transcript = bytearray()
+    try:
+        while not transcript.endswith(b": "):
+            assert select.select([master], [], [], 5)[0], "import prompt did not appear"
+            transcript.extend(os.read(master, 4096))
+        assert b"Paste the Sai session token" in transcript
+        assert not termios.tcgetattr(master)[3] & termios.ECHO
+        if terminal_ctrl_c:
+            os.write(master, b"\x03")
+        else:
+            proc.send_signal(signal.SIGINT)
+        stdout, _ = proc.communicate(timeout=3)
+        assert termios.tcgetattr(master) == original
+        assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
+        os.set_blocking(master, False)
+        with suppress(OSError):
+            while chunk := os.read(master, 4096):
+                transcript.extend(chunk)
+        return (
+            proc.returncode,
+            stdout.decode(),
+            transcript.decode().replace("\r\n", "\n"),
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        os.close(slave)
+        os.close(master)
+
+
+@pytest.mark.parametrize("terminal_ctrl_c", [False, True])
+@pytest.mark.parametrize("json_output", [False, True])
+def test_interrupting_import_prompt_restores_the_terminal(
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], terminal_ctrl_c: bool, json_output: bool
+) -> None:
+    args = ("--json", "auth", "import") if json_output else ("auth", "import")
+    results = []
+    for env in homes(tmp_path, auth_pair):
+        result = interrupt_prompt(env, args, terminal_ctrl_c)
+        assert result[0] == 1
+        assert not session_state(env)["sessions"]
+        results.append(result)
+    assert results[0] == results[1]
+
+
+def test_import_ctrl_c_restores_an_inherited_raw_terminal(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI]
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    code, stdout, stderr = interrupt_prompt(
+        rust, ("auth", "import"), terminal_ctrl_c=True, raw_mode=True
+    )
+    assert code == 1
+    assert stdout == ""
+    assert stderr.endswith("\nAborted!\n")
 
 
 @pytest.mark.parametrize("entry", ["clipboard", "hidden", "enter", "changed"])
