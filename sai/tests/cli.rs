@@ -413,9 +413,69 @@ fn undecodable_environment_values_keep_their_precedence() {
     assert_eq!(result["settings"]["logs.enabled"]["source"], "invalid");
     assert_eq!(
         output.stderr,
-        b"SAI_LOG: invalid value for logs.enabled; logging is off until it is fixed\n",
+        b"SAI_LOG: Invalid value for logs.enabled: expected true, false, yes, no, on, off, 1, or 0; logging is off until it is fixed\n",
     );
     assert!(!root.path().join("logs").exists());
+}
+
+#[test]
+fn invalid_environment_settings_never_echo_values_to_stderr() {
+    let home = tempdir().unwrap();
+    let invalid = "not-a-setting-value-private-fixture";
+    let cases = [
+        (
+            "SAI_ENDPOINT",
+            "keeper.endpoint",
+            "a URL starting with https:// or http://",
+            1,
+        ),
+        (
+            "SAI_WS_ENDPOINT",
+            "keeper.ws_endpoint",
+            "a URL starting with wss:// or ws://",
+            1,
+        ),
+        (
+            "SAI_LCD_ENDPOINT",
+            "lcd.endpoint",
+            "a URL starting with https:// or http://",
+            1,
+        ),
+        (
+            "SAI_UPDATE_AUTO",
+            "update.auto",
+            "true, false, yes, no, on, off, 1, or 0",
+            1,
+        ),
+        (
+            "SAI_LOG",
+            "logs.enabled",
+            "true, false, yes, no, on, off, 1, or 0",
+            0,
+        ),
+        (
+            "SAI_LOG_KEEP_DAYS",
+            "logs.keep_days",
+            "a whole number, 1 or more",
+            0,
+        ),
+    ];
+    for (variable, key, expected, exit_code) in cases {
+        let output = sai(home.path())
+            .env(variable, invalid)
+            .args(["config", "get", key])
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert_eq!(output.status.code(), Some(exit_code), "{variable}");
+        assert!(!stderr.contains(invalid), "{variable} echoed its value");
+        assert!(
+            stderr.contains(&format!(
+                "{variable}: Invalid value for {key}: expected {expected}"
+            )),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

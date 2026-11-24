@@ -129,11 +129,16 @@ def test_undecodable_environment(
         )
         observed.append((result.returncode, result.stdout, result.stderr))
         assert not (home / "logs").exists()
-    assert observed[0] == observed[1]
     if setting == "SAI_ENDPOINT":
+        assert observed[0] == observed[1]
         assert observed[0][0] == 1
         assert b"SAI_ENDPOINT: Invalid value for keeper.endpoint" in observed[0][2]
     else:
+        assert observed[0][:2] == observed[1][:2]
+        assert observed[0][2].startswith(b"SAI_LOG: invalid value for logs.enabled;")
+        assert observed[1][2].startswith(
+            b"SAI_LOG: Invalid value for logs.enabled: expected true, false,"
+        )
         assert observed[0][0] == 0
         assert json.loads(observed[0][1]) == {
             "key": "logs.enabled",

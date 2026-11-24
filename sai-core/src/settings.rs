@@ -185,6 +185,16 @@ impl Key {
         ))
     }
 
+    fn invalid_env_value(self) -> SettingsError {
+        match self.spec().kind {
+            Kind::Url([secure, plain]) => {
+                self.expected(&format!("a URL starting with {secure}:// or {plain}://"))
+            }
+            Kind::Bool => self.expected("true, false, yes, no, on, off, 1, or 0"),
+            Kind::Days => self.expected("a whole number, 1 or more"),
+        }
+    }
+
     fn check_url(self, value: &str) -> Result<Value, SettingsError> {
         let Kind::Url(schemes) = self.spec().kind else {
             unreachable!()
@@ -399,14 +409,13 @@ impl Settings {
             let (value, source) = pick(key, flags, env, file.entries[index].as_ref());
             resolved.entries[index] = match value {
                 Ok(value) => (value, source),
-                Err(_) if key.is_log() => {
+                Err(error) if key.is_log() => {
                     let already_off = resolved.value(Key::LogsEnabled).as_bool() == Some(false);
                     let source = if already_off { source } else { Source::Invalid };
                     if source == Source::Invalid && env.is_set(key) {
                         resolved.warnings.push(format!(
-                            "{}: invalid value for {}; logging is off until it is fixed",
-                            key.spec().env,
-                            key.spec().name
+                            "{}: {error}; logging is off until it is fixed",
+                            key.spec().env
                         ));
                     }
                     (key.default_value(), source)
@@ -529,13 +538,10 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
     if let Some(raw) = flags.value(key) {
         (key.parse_value(raw), Source::Flag)
     } else if let Some(raw) = env.raw(key) {
-        let value = match raw.to_str() {
-            Some(raw) => key.parse_value(raw),
-            None => match key.spec().kind {
-                Kind::Url(_) => key.check_url(""),
-                _ => Err(key.expected("a UTF-8 value")),
-            },
-        };
+        let value = raw
+            .to_str()
+            .and_then(|raw| key.parse_value(raw).ok())
+            .ok_or_else(|| key.invalid_env_value());
         (value, Source::Env)
     } else if let Some(value) = file {
         (value.clone(), Source::File)

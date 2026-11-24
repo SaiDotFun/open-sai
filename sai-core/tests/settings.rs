@@ -79,7 +79,7 @@ fn file_type_errors_are_reported_before_overrides_except_for_logging() {
                 env.path().display()
             ),
             format!("{}: ignoring unknown setting 'theme'", env.path().display()),
-            "SAI_LOG_KEEP_DAYS: invalid value for logs.keep_days; logging is off until it is fixed"
+            "SAI_LOG_KEEP_DAYS: Invalid value for logs.keep_days: expected a whole number, 1 or more; logging is off until it is fixed"
                 .to_owned(),
         ]
     );
