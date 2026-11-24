@@ -38,7 +38,7 @@ use uuid::Uuid;
 use crate::reads::output;
 
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
-// Wire metadata captured from Python main at aaf32399ce415f351a1fb2617d5ea34810d6735a.
+// Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.
 static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
 });
@@ -161,7 +161,7 @@ impl SaiMcp {
         let query = match name {
             "market_list" => keeper::MARKETS,
             "market_prices" => keeper::PRICES,
-            "mcp_info" => return Ok(self.info(&storage).await),
+            "mcp_info" => return self.info(&storage).await,
             "auth_list" | "auth_status" | "auth_use" => {
                 return self
                     .auth(name, args.get("addr").and_then(Value::as_str), call_id)
@@ -239,13 +239,14 @@ impl SaiMcp {
             let log_storage = |event: StorageEvent<'_>| crate::local::storage_event(events, event);
             let storage = Storage::new(&home).with_event_sink(&log_storage);
             match name.as_str() {
-                "auth_status" => session::auth_status(&storage, &endpoint, addr.as_deref()),
+                "auth_status" => session::auth_status(&storage, &home, &endpoint, addr.as_deref()),
                 "auth_use" => session::auth_use(
                     &storage,
+                    &home,
                     &endpoint,
                     addr.as_deref().ok_or_else(SaiError::internal)?,
                 ),
-                "auth_list" => session::auth_list(&storage, &endpoint),
+                "auth_list" => session::auth_list(&storage, &home, &endpoint),
                 _ => Err(SaiError::internal()),
             }
         })
@@ -302,7 +303,7 @@ impl SaiMcp {
         .await
     }
 
-    async fn info(&self, storage: &Storage<'_>) -> Value {
+    async fn info(&self, storage: &Storage<'_>) -> Result<Value, SaiError> {
         let install_dir = self.install.directory().map(Path::to_string_lossy);
         let home = &self.env.home;
         let version = install::RUNNING_VERSION;
@@ -313,7 +314,7 @@ impl SaiMcp {
         let mut names: Vec<_> = TOOLS.iter().map(|tool| tool.name.as_ref()).collect();
         names.sort_unstable();
         let session = session::StoredSession::load(storage, self.settings.endpoint(), None);
-        json!({
+        Ok(json!({
             "name": "sai",
             "package": "sai-cli",
             "version": version,
@@ -334,8 +335,8 @@ impl SaiMcp {
             },
             "tools": names,
             "trading": session.trading(),
-            "session": session.summary(storage),
-        })
+            "session": session.summary(storage, home)?,
+        }))
     }
 
     fn error(&self, error: SaiError) -> Value {
@@ -521,7 +522,7 @@ fn log_call(events: EventContext<'_>, tool: Option<&Tool>, args: &Map<String, Va
             .keys()
             .filter(|key| !properties.contains_key(*key))
             .count();
-        if tool.name != "logs_intent" {
+        if !matches!(tool.name.as_ref(), "auth_use" | "logs_intent") {
             known.extend(properties.keys().filter_map(|key| {
                 let field = match args.get(key)? {
                     Value::String(text) => Field::Arg(text.clone()),

@@ -530,3 +530,60 @@ def test_deferred_read_tools_accept_valid_arguments_without_requests(
         assert result["structuredContent"] == {"result": text}
         assert json.loads(text)["code"] == "NOT_IMPLEMENTED"
         assert not endpoints.wire
+
+
+def test_auth_switch_keeps_rejected_arguments_private(
+    native: Path, tmp_path: Path
+) -> None:
+    marker = "synthetic-unregistered-mcp-auth-credential"
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="accounts", logs=True) as stdio,
+    ):
+        result = stdio.call(2, "auth_use", addr=marker)
+        assert json.loads(result["content"][0]["text"])["error"].startswith(
+            "Requested account is not connected;"
+        )
+        rejected = stdio.call(3, "auth_use", addr={"value": marker})
+        assert rejected["isError"] is True
+        assert rejected["content"][0]["text"] == "Argument 'addr' must be a string."
+        assert not endpoints.wire
+        assert stdio.proc.stdin is not None and stdio.proc.stdout is not None
+        stdio.proc.stdin.close()
+        assert stdio.proc.wait(timeout=3) == 0
+        assert stdio.proc.stdout.read() == b""
+        assert stdio.proc.stderr is not None
+        assert marker.encode() not in stdio.proc.stderr.read()
+    logs = "".join(path.read_text() for path in (home / "sai/logs").glob("mcp-*.jsonl"))
+    assert "mcp.tool_call" in logs
+    assert "session.active" not in logs
+    assert marker not in json.dumps([result, rejected]) + logs
+
+
+def test_auth_switch_succeeds_after_legacy_cleanup_failure(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="accounts") as stdio,
+    ):
+        legacy = home / "sai/trader/session.json"
+        legacy.mkdir()
+        switched = json.loads(
+            stdio.call(2, "auth_use", addr=ADDRESS)["content"][0]["text"]
+        )
+        assert [row["addr"] for row in switched["accounts"] if row["active"]] == [
+            ADDRESS
+        ]
+        status = json.loads(stdio.call(3, "auth_status")["content"][0]["text"])
+        assert status["addr"] == ADDRESS
+        assert legacy.is_dir()
+        assert not endpoints.wire
+        assert stdio.proc.stderr is not None
+        assert select.select([stdio.proc.stderr], [], [], 3)[0]
+        assert (
+            b"Could not remove legacy session file trader/session.json"
+            in stdio.proc.stderr.readline()
+        )

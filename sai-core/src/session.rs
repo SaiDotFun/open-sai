@@ -336,10 +336,11 @@ impl Storage<'_> {
         };
         let home = self.trader.parent();
         let endpoint = session.endpoint().unwrap_or_default();
-        let origin = keeper_origin(endpoint)
-            .filter(|origin| home.is_some_and(|home| log::redact(home, origin) == *origin));
-        let public_default = endpoint == MAINNET_HTTP
-            && home.is_some_and(|home| log::redact(home, endpoint) == endpoint);
+        let endpoint_is_public = home.is_some_and(|home| log::redact(home, endpoint) == endpoint);
+        let origin = keeper_origin(endpoint).filter(|origin| {
+            endpoint_is_public && home.is_some_and(|home| log::redact(home, origin) == *origin)
+        });
+        let public_default = endpoint == MAINNET_HTTP && endpoint_is_public;
         let route = if public_default {
             Some(endpoint)
         } else {
@@ -362,12 +363,21 @@ impl Storage<'_> {
     }
 
     pub fn expiry_notice(&self, session: &Session, left: TimeDelta) -> Option<ExpiryNotice> {
+        self.expiry_notice_for_address(session, left, session.addr())
+    }
+
+    pub fn expiry_notice_for_address(
+        &self,
+        session: &Session,
+        left: TimeDelta,
+        display_address: &str,
+    ) -> Option<ExpiryNotice> {
         let when = expiry_warning_time(left)?;
         let (renewal_command, renewal_guidance) = self.renewal_fields(session);
         Some(ExpiryNotice {
             expiry_warning: format!(
                 "Sai session for {} expires in {when}.",
-                escape_warning_text(session.addr())
+                escape_warning_text(display_address)
             ),
             renewal_command,
             renewal_guidance,

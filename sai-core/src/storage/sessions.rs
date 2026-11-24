@@ -83,6 +83,21 @@ impl Session {
         self.extra.get("endpoint").and_then(Value::as_str)
     }
 
+    pub fn checked_endpoint(&self) -> Result<Option<&str>, SessionError> {
+        match self.extra.get("endpoint") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(endpoint)) => Ok(Some(endpoint)),
+            _ => Err(session_error("Stored session has an invalid endpoint")),
+        }
+    }
+
+    pub fn checked_address(&self, key: &str) -> Result<&str, SessionError> {
+        if !crate::keeper::is_evm_address(self.addr()) || self.addr().to_ascii_lowercase() != key {
+            return Err(session_error("Stored session has an invalid address"));
+        }
+        Ok(self.addr())
+    }
+
     pub fn key_name(&self) -> Option<&str> {
         self.extra
             .get("keyName")
@@ -151,12 +166,24 @@ struct StoredAccounts(#[serde(with = "Accounts")] Accounts);
 
 impl Accounts {
     pub fn iter(&self) -> impl Iterator<Item = (&Session, bool)> {
-        self.sessions
-            .iter()
-            .map(|(addr, session)| (&session.0, Some(addr) == self.active.as_ref()))
+        self.entries().map(|(_, session, active)| (session, active))
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Session, bool)> {
+        self.sessions.iter().map(|(addr, session)| {
+            (
+                addr.as_str(),
+                &session.0,
+                Some(addr) == self.active.as_ref(),
+            )
+        })
     }
 
     fn find(&self, addr: &str) -> Result<String, SessionError> {
+        self.find_with_label(addr, addr)
+    }
+
+    fn find_with_label(&self, addr: &str, label: &str) -> Result<String, SessionError> {
         let key = addr.to_lowercase();
         if self.sessions.contains_key(&key) {
             Ok(key)
@@ -164,7 +191,7 @@ impl Accounts {
             Err(SessionError(SaiError::new(
                 Code::InvalidRequest,
                 format!(
-                    "{addr} is not connected; run `sai auth list` to see connected \
+                    "{label} is not connected; run `sai auth list` to see connected \
                  accounts, or sign in with `sai auth login NAME` or `sai auth import`"
                 ),
             )))
@@ -269,6 +296,12 @@ impl Storage<'_> {
     }
 
     fn save_accounts(&self, accounts: &Accounts) -> Result<(), StorageError> {
+        self.write_accounts(accounts)?;
+        remove_if_exists(&self.trader.join(LEGACY_SESSION))?;
+        Ok(())
+    }
+
+    fn write_accounts(&self, accounts: &Accounts) -> Result<(), StorageError> {
         let cannot_save = || SessionError::new("Cannot encrypt session");
         let mut nonce = [0; 12];
         OsRng
@@ -292,7 +325,6 @@ impl Storage<'_> {
         serde_json::to_writer(temp.as_file_mut(), &envelope).map_err(io::Error::other)?;
         temp.persist(self.trader.join(SESSIONS))
             .map_err(|error| error.error)?;
-        remove_if_exists(&self.trader.join(LEGACY_SESSION))?;
         Ok(())
     }
 
@@ -412,18 +444,53 @@ impl Storage<'_> {
     }
 
     pub fn use_session(&self, addr: &str) -> Result<Session, StorageError> {
+        self.select_session(
+            addr,
+            addr,
+            |_, session, _| {
+                crate::session::session_expiry(session)?;
+                Ok(())
+            },
+            |accounts| self.save_accounts(accounts),
+        )
+        .map(|(session, ())| session)
+    }
+
+    /// Prepare an account-switch reply from the new selection before committing it.
+    pub fn use_session_prepared<T>(
+        &self,
+        addr: &str,
+        prepare: impl FnOnce(&str, &Session, &Accounts) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.select_session(addr, "Requested account", prepare, |accounts| {
+            self.write_accounts(accounts)?;
+            if remove_if_exists(&self.trader.join(LEGACY_SESSION)).is_err() {
+                eprintln!("Could not remove legacy session file trader/session.json after saving accounts.");
+            }
+            Ok(())
+        })
+        .map(|(_, report)| report)
+    }
+
+    fn select_session<T>(
+        &self,
+        addr: &str,
+        label: &str,
+        prepare: impl FnOnce(&str, &Session, &Accounts) -> Result<T, StorageError>,
+        save: impl FnOnce(&Accounts) -> Result<(), StorageError>,
+    ) -> Result<(Session, T), StorageError> {
         let lock = self.lock_sessions()?;
         let mut accounts = self.load_accounts()?;
-        let key = accounts.find(addr)?;
-        crate::session::session_expiry(&accounts.sessions[&key].0)?;
+        let key = accounts.find_with_label(addr, label)?;
         accounts.active = Some(key.clone());
-        self.save_accounts(&accounts)?;
+        let report = prepare(&key, &accounts.sessions[&key].0, &accounts)?;
+        save(&accounts)?;
         drop(lock);
         let session = accounts.sessions.remove(&key).expect("connected account").0;
         self.emit(StorageEvent::SessionActive {
             addr: session.addr(),
         });
-        Ok(session)
+        Ok((session, report))
     }
 
     pub fn session_exists(&self) -> bool {

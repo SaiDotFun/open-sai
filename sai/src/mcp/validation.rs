@@ -84,6 +84,9 @@ pub(super) fn arguments(
         args.extend(converted);
         return Ok(args);
     };
+    if tool.name == "auth_use" {
+        return Err("Argument 'addr' must be a string.".into());
+    }
     if tool.name == "logs_intent" {
         return Err(match first.field {
             "key" => "Argument 'key' must be a string.",

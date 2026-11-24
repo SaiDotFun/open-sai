@@ -194,6 +194,8 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         "doctor-ledger-session",
         "history-token",
         "mcp-auth-switch",
+        "mcp-auth-redaction",
+        "mcp-invalid-expiry",
         "invalid-expiry",
     }:
         sessions.append(session_fixture(endpoints, "session"))
@@ -201,10 +203,29 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
             sessions[0].update(expiresAt=endpoints.near_expiry, keyName="fixture-key")
         if seed == "history-token":
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
-        if seed in {"accounts", "mcp-auth-switch", "invalid-expiry"}:
+        if seed in {
+            "accounts",
+            "mcp-auth-switch",
+            "mcp-auth-redaction",
+            "invalid-expiry",
+            "mcp-invalid-expiry",
+        }:
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
-        if seed == "invalid-expiry":
+        if seed in {"invalid-expiry", "mcp-invalid-expiry"}:
             sessions[0]["expiresAt"] = "synthetic-expiry-credential-marker"
+        if seed == "mcp-invalid-expiry":
+            sessions.reverse()
+        if seed == "mcp-auth-redaction":
+            marker = "synthetic-session-origin-credential"
+            sessions[0].update(token=marker, expiresAt=endpoints.near_expiry)
+            sessions.append(
+                {
+                    **sessions[0],
+                    "evmAddress": OTHER_ADDRESS,
+                    "token": sessions[0]["expiresAt"],
+                    "endpoint": f"{endpoints.keeper}/{marker}",
+                }
+            )
     if seed == "doctor-ledger-session":
         config = sai_home / "config.toml"
         config.write_text("[logs]\nenabled = false\n")
@@ -216,7 +237,12 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         ledger=seed in {"ledger", "doctor-ledger-session"},
         disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
     )
-    if seed in {"mcp-auth-switch", "invalid-expiry"}:
+    if seed in {
+        "mcp-auth-switch",
+        "mcp-auth-redaction",
+        "invalid-expiry",
+        "mcp-invalid-expiry",
+    }:
         (sai_home / "trader" / "sessions.lock").chmod(0o600)
 
 

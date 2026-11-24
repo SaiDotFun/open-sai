@@ -1,4 +1,4 @@
-"""Stdio calls for the Python MCP contract at aaf32399ce415f351a1fb2617d5ea34810d6735a."""
+"""Stdio calls for the Python MCP contract at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f."""
 
 from __future__ import annotations
 
@@ -130,6 +130,15 @@ CALLS = {
         Call("auth_status", switch_active="{other_addr}"),
         Call("auth_status", {"addr": "{addr}"}),
         Call("auth_list"),
+    ),
+    "auth-use-invalid-expiry": (
+        Call("auth_use", {"addr": "{other_addr}"}, "SESSION_UNAVAILABLE"),
+        Call("auth_status", expected="SESSION_UNAVAILABLE"),
+    ),
+    "auth-redaction": (
+        Call("auth_list"),
+        Call("auth_status", {"addr": "{addr}"}),
+        Call("auth_use", {"addr": "{addr}"}),
     ),
     "overview-validation": (
         Call("account_overview", {"addr": False}, "invalid"),

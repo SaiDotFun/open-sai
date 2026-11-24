@@ -49,7 +49,7 @@ when the command includes an argument value.
 
 ## Compare MCP Stdio
 
-Check out Python commit `aaf32399ce415f351a1fb2617d5ea34810d6735a` in a
+Check out Python commit `1c671b231b0fc968a44ec8dd520e67ea28e25b7f` in a
 separate directory. Use CPython 3.12, which preserves the tool description
 indentation recorded in the Rust inventory.
 
@@ -65,7 +65,9 @@ strict argument errors, and the JSON string in each successful response's
 `content` and `structuredContent`. It also replaces a fixture session
 between calls to check the trade refusal before argument validation.
 Auth cases check expiry, strict arguments, and active account changes
-from both MCP and a separate CLI process. The inventory and validation
+from both MCP and a separate CLI process. They also check credential
+redaction and verify that an invalid account summary leaves selection intact.
+The inventory and validation
 cases include overview, wait, and logs while their cores are pending.
 
 ## Add a Case
