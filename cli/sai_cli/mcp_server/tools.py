@@ -27,6 +27,8 @@ from typing import Any
 from ..core import intents, keeper, overview, reconcile, storage, stream, trading
 from ..core import log as sai_log
 from ..core import session as sessions
+from ..core.errors import Code, SaiError, SessionError
+from ..core.errors import describe as describe_error
 from ..core.settings import Settings, public_origin, public_url
 
 log = logging.getLogger("sai_cli.mcp_server")
@@ -45,12 +47,12 @@ SIGN_IN = (
     " import` in a terminal, then retry. Reads and most previews work without it."
 )
 NOT_SIGNED_IN = {
-    "signed-out": ("No Sai account is signed in." + SIGN_IN, "SIGNED_OUT"),
-    "expired": ("The Sai trading session expired." + SIGN_IN, "SESSION_EXPIRED"),
+    "signed-out": ("No Sai account is signed in." + SIGN_IN, Code.SIGNED_OUT),
+    "expired": ("The Sai trading session expired." + SIGN_IN, Code.SESSION_EXPIRED),
     "other-endpoint": (
         "The signed-in Sai session belongs to a different Keeper endpoint than"
         " this server's." + SIGN_IN,
-        "SESSION_UNAVAILABLE",
+        Code.SESSION_UNAVAILABLE,
     ),
 }
 INTERNAL = "Unexpected error in the Sai MCP server; see its stderr log"
@@ -87,18 +89,14 @@ PRICE_MOVED = (
 )
 
 
-class SessionUnavailable(ValueError):
+class SessionUnavailable(SessionError):
     """The stored session is missing, expired, or unusable by the server.
 
     CODE is SIGNED_OUT, SESSION_EXPIRED, or SESSION_UNAVAILABLE.
     """
 
-    def __init__(self, message: str, code: str = "SESSION_UNAVAILABLE") -> None:
-        super().__init__(message)
-        self.code = code
 
-
-class Refused(ValueError):
+class Refused(SaiError, ValueError):
     """A trade was refused before submission; CODE says why.
 
     PREVIEW, when set, is the fresh preview with its own previewDigest for
@@ -108,12 +106,11 @@ class Refused(ValueError):
     def __init__(
         self,
         message: str,
-        code: str,
+        code: Code,
         preview: dict[str, Any] | None = None,
         **extra: Any,
     ) -> None:
-        super().__init__(message)
-        self.code = code
+        super().__init__(message, code)
         self.preview = preview
         self.extra = extra
 
@@ -126,41 +123,27 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
 
 
 def describe(exc: Exception) -> dict[str, Any]:
-    """Map a known error to a stable code; messages carry no secrets."""
-    if isinstance(exc, keeper.OutcomeUnknown):
-        key = exc.intent_key
+    """Format the shared classification using the MCP response fields."""
+    failure = describe_error(exc)
+    if failure.code == Code.OUTCOME_UNKNOWN:
+        key = failure.intent_key
         return error(
-            str(exc),
-            "OUTCOME_UNKNOWN",
+            failure.message,
+            failure.code,
             intentKey=key,
             next=(
                 f"Call intent_status with key {key} to reconcile. Do not"
                 " resubmit until it reports a final outcome."
             ),
         )
-    if isinstance(exc, keeper.AdmissionRejected):
-        return error(str(exc), "ADMISSION_REJECTED")
-    if isinstance(exc, keeper.NotSent):
-        return error(str(exc), "NOT_SENT")
-    if isinstance(exc, keeper.KeeperError):
-        return error(str(exc), "KEEPER_ERROR")
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
-        return error(str(exc), exc.code, **extra, **exc.extra)
-    if isinstance(exc, SessionUnavailable):
-        return error(str(exc), exc.code)
-    if isinstance(exc, stream.StreamError):
-        return error(str(exc), "STREAM_ERROR")
-    if isinstance(exc, ValueError):
-        return error(str(exc), "INVALID_REQUEST")
-    if isinstance(exc, (KeyError, TypeError)):
-        return error(
-            f"Keeper or contract data was missing or malformed ({type(exc).__name__})",
-            "INCOMPLETE_DATA",
-        )
-    trace = "".join(traceback.format_exception(exc))
-    log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
-    return error(INTERNAL, "INTERNAL_ERROR")
+        return error(failure.message, failure.code, **extra, **exc.extra)
+    if failure.code == Code.INTERNAL_ERROR:
+        trace = "".join(traceback.format_exception(exc))
+        log.error("Unexpected error in Sai MCP tool\n%s", redact(trace))
+        return error(INTERNAL, failure.code)
+    return error(failure.message, failure.code)
 
 
 REDACTED = sai_log.REDACTED
@@ -514,7 +497,7 @@ def bound(
             else {**fresh, "referencePrice": format(reference, "f")}
         )
         if preview_digest(confirmed) != digest:
-            raise Refused(MISMATCH, "PREVIEW_MISMATCH", fresh)
+            raise Refused(MISMATCH, Code.PREVIEW_MISMATCH, fresh)
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
@@ -524,7 +507,7 @@ def bound(
                 moved=format(moved.quantize(Decimal("0.0001")), "f"),
                 slippage=slippage,
             )
-            raise Refused(message, "PRICE_MOVED", fresh)
+            raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check
 
@@ -588,14 +571,14 @@ def no_recent_open(
         opens = recent_opens(settings.endpoint, account)
         pending = [row["intentKey"] for row in opens if row["status"] == "pending"]
         if pending:
-            raise Refused(PENDING_OPEN, "RECENT_OPEN_PENDING", intentKeys=pending)
+            raise Refused(PENDING_OPEN, Code.RECENT_OPEN_PENDING, intentKeys=pending)
         if opens and not allow_concurrent_open:
             statuses = " or ".join(sorted({row["status"] for row in opens}))
             raise Refused(
                 RECENT_OPEN.format(
                     minutes=RECENT_OPEN_SECONDS // 60, statuses=statuses
                 ),
-                "RECENT_OPEN_PENDING",
+                Code.RECENT_OPEN_PENDING,
                 intentKeys=[row["intentKey"] for row in opens],
             )
 

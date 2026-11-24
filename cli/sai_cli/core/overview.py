@@ -15,6 +15,7 @@ from threading import BoundedSemaphore, Thread
 from typing import Any
 
 from . import keeper, margin, reconcile, session, storage, stream
+from .errors import Code, SaiError
 from .settings import Settings, public_origin
 
 PAGE_SIZE = 100
@@ -38,28 +39,24 @@ class AccountUnavailable(ValueError):
     """The default account could not be resolved for this endpoint."""
 
 
-def _failure(code: str, message: str, *, retryable: bool = False) -> dict[str, Any]:
-    return {"code": code, "message": message, "retryable": retryable}
+def _failure(code: Code, message: str) -> dict[str, Any]:
+    return SaiError(message, code).as_dict()
 
 
 def _read(action: Callable[[], Any]) -> dict[str, Any]:
     try:
         data = action()
-    except (keeper.KeeperError, stream.StreamError) as exc:
-        code = {
-            keeper.NotSent: "NOT_SENT",
-            stream.StreamError: "STREAM_ERROR",
-        }.get(type(exc), "KEEPER_ERROR")
-        return {"fetchedAt": None, "error": _failure(code, str(exc), retryable=True)}
+    except SaiError as exc:
+        return {"fetchedAt": None, "error": exc.as_dict()}
     except (OSError, sqlite3.Error):
         return {
             "fetchedAt": None,
-            "error": _failure("LOCAL_IO_ERROR", "Could not read local Sai data"),
+            "error": _failure(Code.INTERNAL_ERROR, "Could not read local Sai data"),
         }
     except (KeyError, TypeError, ValueError, OverflowError, DecimalException):
         return {
             "fetchedAt": None,
-            "error": _failure("INCOMPLETE_DATA", "The source returned invalid data"),
+            "error": _failure(Code.INCOMPLETE_DATA, "The source returned invalid data"),
         }
     return {"fetchedAt": datetime.now(UTC).isoformat(), "data": data}
 
@@ -677,9 +674,8 @@ def _trade_row(
 
 def _mark_incomplete(section: dict[str, Any]) -> None:
     section["error"] = _failure(
-        "INCOMPLETE_DATA",
+        Code.INCOMPLETE_DATA,
         "The paginated list could not be confirmed and may be incomplete",
-        retryable=True,
     )
 
 
@@ -788,7 +784,7 @@ def _trade_sections(
                 if unindexed_fill
                 else "The indexed positions could not be confirmed against the live contract list."
             )
-            positions["error"] = _failure("INCOMPLETE_DATA", message, retryable=True)
+            positions["error"] = _failure(Code.INCOMPLETE_DATA, message)
         elif (
             "error" not in positions
             and chain is not None
@@ -796,9 +792,8 @@ def _trade_sections(
             and any(row["riskStatus"] != "verified" for row in items)
         ):
             positions["error"] = _failure(
-                "INCOMPLETE_DATA",
+                Code.INCOMPLETE_DATA,
                 "The LCD deadline expired. Position risk is partial.",
-                retryable=True,
             )
         pnls = [row["unrealizedPnlUsd"] for row in items]
         positions["data"] = {
@@ -829,7 +824,7 @@ def _trade_sections(
         ]
         if used_ids - quotes.keys():
             prices["error"] = _failure(
-                "INCOMPLETE_DATA",
+                Code.INCOMPLETE_DATA,
                 "Keeper has no positive USD price for one or more tokens",
             )
     return positions, orders, prices
@@ -933,7 +928,7 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
             raise AccountUnavailable(str(exc)) from exc
         session_section: dict[str, Any] = {
             "fetchedAt": None,
-            "error": _failure("INCOMPLETE_DATA", str(exc)),
+            "error": _failure(Code.INCOMPLETE_DATA, str(exc)),
         }
     else:
         key = addr.lower() if addr is not None else accounts["active"]
@@ -980,7 +975,7 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
         balance_lookup = lookup if same_keeper else None
         if not rows:
             balances["error"] = _failure(
-                "INCOMPLETE_DATA",
+                Code.INCOMPLETE_DATA,
                 "Keeper returned no Sai balance rows. Funds are unknown.",
             )
         balances["data"] = {

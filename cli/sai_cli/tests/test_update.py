@@ -718,12 +718,14 @@ def test_a_withdrawn_release_leaves_the_cache_but_a_failed_check_does_not():
     assert update.latest_version() is None
 
 
-def test_update_check_failure_exits_1_without_stdout_or_cache():
+def test_update_check_failure_exits_1_with_a_json_error_and_no_cache():
     with Stub({API_PATH: (200, {}, b"garbage")}) as stub:
         result = check(stub, "--json")
     assert result.exit_code == 1
-    assert result.stdout == ""
-    assert "update check failed" in result.stderr
+    assert result.stderr == ""
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INTERNAL_ERROR" and error["retryable"] is False
+    assert "update check failed" in error["message"]
     assert update.read_cache() is None
 
 

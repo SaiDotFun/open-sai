@@ -8,6 +8,7 @@ from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Literal
 
 from . import keeper, log, storage
+from .errors import Code
 
 WriteGate = Callable[[], AbstractContextManager[object]]
 IntentOutcome = Literal[
@@ -217,6 +218,7 @@ def reconcile(
 
     row = matching[0]
     step = row.get("lifecycleStep")
+    outcome = classify_outcome(row)
     log.event(
         "intent.keeper",
         intentKey=key,
@@ -228,8 +230,8 @@ def reconcile(
         txHash=row.get("txHash"),
         addr=addr,
         endpoint=log.endpoint(endpoint),
+        **({"code": Code.KEEPER_ERROR} if outcome == "terminal-failed" else {}),
     )
-    outcome = classify_outcome(row)
     if outcome == "unknown":
         return data
     local = _store_outcome(endpoint, account, row, outcome, write)

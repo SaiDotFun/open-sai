@@ -14,6 +14,7 @@ from websockets.sync.client import ClientConnection, connect
 from websockets.typing import Subprotocol
 
 from . import keeper
+from .errors import Code, SaiError
 
 BALANCES = "subscription($user:String!) { userBalances(where:{user:$user}) { amount usd_value token_info { name symbol decimals type } } }"
 BALANCES_WITH_BLOCK = BALANCES.replace("usd_value", "usd_value lastUpdatedBlock")
@@ -29,8 +30,10 @@ CONNECTED = "Connected; waiting for current snapshot"
 DISCONNECTS = (OSError, TimeoutError, WebSocketException)
 
 
-class StreamError(ValueError):
+class StreamError(SaiError, ValueError):
     """Keeper's subscription refused, ended, or sent incomplete data."""
+
+    code = Code.STREAM_ERROR
 
 
 def _ignore(_message: str) -> None:
