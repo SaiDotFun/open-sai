@@ -108,8 +108,10 @@ for the token and never returns it.
    every preview and trade. Without `addr` a tool acts on whichever account
    is active at that moment, and another terminal or client can switch it.
 2. Show the person the preview, the `addr` it names, and the network from
-   `mcp_info`. Give the fees, liquidation price, and worst-case fill from
-   `estimates` where available. Wait for explicit confirmation.
+   `mcp_info`. If `estimates.execution.status` is `would_be_rejected`, show
+   the reason and stop. The server leaves out `previewDigest` for that
+   result. Otherwise, give the fees, liquidation price, and worst-case fill
+   where available. Wait for explicit confirmation.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
