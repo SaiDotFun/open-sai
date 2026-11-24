@@ -19,6 +19,7 @@ use local::IntentCommand;
 
 #[derive(Parser)]
 #[command(
+    bin_name = "sai",
     version,
     about,
     disable_help_subcommand = true,

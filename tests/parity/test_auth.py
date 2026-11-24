@@ -303,6 +303,7 @@ def test_import_usage_keeps_rejected_token_private(
         assert result.stdout == ""
 
 
+@pytest.mark.parametrize("alias", [False, True])
 @pytest.mark.parametrize(
     "args",
     [
@@ -312,10 +313,15 @@ def test_import_usage_keeps_rejected_token_private(
     ],
 )
 def test_import_rejects_nonroot_json_before_reading_clipboard(
-    tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI
+    tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI, alias: bool
 ) -> None:
     results = []
-    for env in homes(tmp_path, auth_pair):
+    python, rust = homes(tmp_path, auth_pair)
+    if alias:
+        launcher = tmp_path / "sai-under-review"
+        launcher.symlink_to(Path(rust.command[0]))
+        rust.command = (str(launcher),)
+    for env in (python, rust):
         env.clipboard()
         token = fixture_token(ADDR)
         env.clip.write_text(token)
