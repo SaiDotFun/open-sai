@@ -613,6 +613,8 @@ def can_log_to_profile() -> bool:
     """Avoid the writer's automatic chmod in an existing, ambiguous logs directory."""
     if os.name == "nt":
         return True
+    # A preceding command may still be creating its log or endpoint key.
+    log.flush(1.0)
     root = log.directory()
     try:
         fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
