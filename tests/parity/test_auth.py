@@ -101,6 +101,7 @@ def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> No
     [
         ("cast", 0, 1, 1),
         ("ud", 0, 1, 1),
+        ("ud-inaccessible", 0, 1, 1),
         ("missing", 1, 0, 0),
         ("mismatch", 1, 0, 0),
         ("collision", 1, 0, 0),
@@ -147,6 +148,12 @@ def test_auth_login(
             keystore(env, addr=None if case == "cast" else addr)
         if case in {"ud", "ud-locked", "terminal-fallback", "rotated-keystore"}:
             fake_ud(env, locked=case != "ud", rotate=case == "rotated-keystore")
+        elif case == "ud-inaccessible":
+            fake_ud(env)
+            tool = env.bin / "ud"
+            tool.chmod(0o001)
+            if os.access(tool, os.X_OK):
+                pytest.skip("fixture requires an invoking user without execute access")
         elif case == "unavailable":
             fake_ud(env, down=True)
         elif case in {"collision", "address-disambiguates"}:

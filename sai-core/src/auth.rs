@@ -226,7 +226,9 @@ fn keeper_error(message: &str) -> SaiError {
 
 // Match executable discovery without mistaking a failed launch for an absent tool.
 fn installed(program: &str) -> bool {
-    use std::{env, os::unix::fs::PermissionsExt};
+    use std::env;
+
+    use rustix::fs::{Access, access};
 
     let path = env::var_os("PATH").unwrap_or_else(|| "/bin:/usr/bin".into());
     env::split_paths(&path).any(|dir| {
@@ -235,8 +237,6 @@ fn installed(program: &str) -> bool {
         } else {
             dir.join(program)
         };
-        candidate
-            .metadata()
-            .is_ok_and(|info| info.is_file() && info.permissions().mode() & 0o111 != 0)
+        candidate.is_file() && access(&candidate, Access::EXEC_OK).is_ok()
     })
 }
