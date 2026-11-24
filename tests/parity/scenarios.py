@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
 from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
+from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection
 
 HERE = Path(__file__).resolve().parent
@@ -396,15 +398,31 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         def log_message(self, format: str, *args: object) -> None:
             pass
 
+    redirect_path = f"{scope}/subscriptions?moved=1"
+
+    def websocket_redirect(
+        connection: ServerConnection, request: Request
+    ) -> Response | None:
+        if scenario == "ws-redirect-limit":
+            location = request.path
+        elif scenario == "ws-redirect" and request.path == f"{scope}/query":
+            location = "subscriptions?moved=1"
+        else:
+            return None
+        wire.append(WireRequest("ws:redirect"))
+        response = connection.respond(HTTPStatus.TEMPORARY_REDIRECT, "Use another path")
+        response.headers["Location"] = location
+        return response
+
     disconnected_at = 0.0
 
     def websocket(connection: ServerConnection) -> None:
         nonlocal disconnected_at
         try:
-            if (
-                connection.request is None
-                or connection.request.path != f"{scope}/query"
-            ):
+            expected_path = (
+                redirect_path if scenario == "ws-redirect" else f"{scope}/query"
+            )
+            if connection.request is None or connection.request.path != expected_path:
                 connection.close()
                 return
             initial = json.loads(connection.recv(timeout=5))
@@ -461,7 +479,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     '"payload":{"data":{"userBalances":[{"amount":1E-7}]}}}'
                 )
             connection.send(message)
-            if scenario in {"watch", "watch-number-spelling"}:
+            if scenario in {"watch", "watch-number-spelling", "ws-redirect"}:
                 connection.send(json.dumps({"id": request_id, "type": "complete"}))
             if scenario == "watch-reconnect" and count == 1:
                 disconnected_at = time.monotonic()
@@ -475,7 +493,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         except (ValueError, KeyError, StopIteration, TimeoutError, TypeError):
             errors.append("Unsupported Keeper WebSocket exchange")
 
-    with http_server(Handler) as http, graphql_ws(websocket) as ws:
+    with (
+        http_server(Handler) as http,
+        graphql_ws(websocket, process_request=websocket_redirect) as ws,
+    ):
         yield Endpoints(
             http + scope,
             ws.removesuffix("/query") + scope + "/query",

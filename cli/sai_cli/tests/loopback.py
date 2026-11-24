@@ -10,6 +10,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from websockets.http11 import Request, Response
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
 
@@ -35,9 +36,18 @@ def http_server(handler: type[BaseHTTPRequestHandler]) -> Generator[str]:
 
 
 @contextmanager
-def graphql_ws(handler: Callable[[ServerConnection], None]) -> Generator[str]:
+def graphql_ws(
+    handler: Callable[[ServerConnection], None],
+    *,
+    process_request: Callable[[ServerConnection, Request], Response | None]
+    | None = None,
+) -> Generator[str]:
     with serve(
-        handler, "127.0.0.1", 0, subprotocols=[Subprotocol("graphql-transport-ws")]
+        handler,
+        "127.0.0.1",
+        0,
+        subprotocols=[Subprotocol("graphql-transport-ws")],
+        process_request=process_request,
     ) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()

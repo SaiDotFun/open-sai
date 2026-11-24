@@ -164,6 +164,19 @@ unset = ["SAI_WS_ENDPOINT"]
 wire = ["ws:init","ws:userBalances"]
 
 [[case]]
+name = "account-balances-redirect"
+args = ["--json","account","balances","{addr}"]
+server = "ws-redirect"
+wire = ["ws:redirect","ws:init","ws:userBalances"]
+
+[[case]]
+name = "account-balances-redirect-limit"
+args = ["--json","account","balances","{addr}"]
+server = "ws-redirect-limit"
+expect = 1
+wire = ["ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect","ws:redirect"]
+
+[[case]]
 name = "account-balances-partial-error"
 args = ["--json","account","balances","{addr}","--ws-endpoint","{ws}"]
 server = "ws-partial"
@@ -280,6 +293,14 @@ mode = "jsonl"
 server = "watch"
 expect = 1
 wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "watch-balances-redirect"
+args = ["--json","watch","balances","{addr}"]
+mode = "jsonl"
+server = "ws-redirect"
+expect = 1
+wire = ["ws:redirect","ws:init","ws:userBalances"]
 
 [[case]]
 name = "watch-balances-raw-numbers"

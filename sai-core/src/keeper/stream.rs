@@ -1,6 +1,6 @@
 //! Keeper snapshots over graphql-transport-ws.
 
-use std::{io, time::Duration};
+use std::{env, io, time::Duration};
 
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Number, Value, json};
@@ -10,7 +10,7 @@ use tokio_tungstenite::{
     tungstenite::{
         Error as WsError, Message,
         client::IntoClientRequest,
-        http::header::SEC_WEBSOCKET_PROTOCOL,
+        http::header::{LOCATION, SEC_WEBSOCKET_PROTOCOL},
         protocol::{WebSocketConfig, frame::coding::CloseCode},
     },
 };
@@ -22,6 +22,7 @@ use crate::{
     errors::{Code, SaiError},
 };
 
+const DEFAULT_REDIRECT_ATTEMPTS: isize = 10;
 const OPEN_TIMEOUT: Duration = Duration::from_secs(10);
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 const SNAPSHOT_TIMEOUT: Duration = Duration::from_secs(20);
@@ -173,35 +174,55 @@ impl Connection {
     }
 
     async fn upgrade(endpoint: &str, field: &'static str) -> Result<Self, Failure> {
-        let url = Url::parse(endpoint).map_err(|_| Failure::Disconnected("InvalidURI"))?;
+        let mut url = Url::parse(endpoint).map_err(|_| Failure::Disconnected("InvalidURI"))?;
         if url.fragment().is_some() {
             return Err(Failure::Disconnected("InvalidURI"));
         }
-        let mut request = url.as_str().into_client_request()?;
-        request.headers_mut().insert(
-            SEC_WEBSOCKET_PROTOCOL,
-            SUBPROTOCOL.parse().expect("valid subprotocol"),
-        );
-        let stream = transport::websocket_socket(&url, OPEN_TIMEOUT)
-            .await
-            .map_err(|error| {
-                let reason = match error.code {
-                    Code::NotSent => "ConnectionRefusedError",
-                    _ => "OSError",
-                };
-                Failure::Disconnected(reason)
-            })?;
-        let config = WebSocketConfig::default()
-            .max_message_size(Some(1 << 20))
-            .max_frame_size(Some(1 << 20));
-        let (socket, _) = client_async_with_config(request, stream, Some(config)).await?;
-        Ok(Self {
-            socket,
-            field,
-            heartbeat: Instant::now() + PING_INTERVAL,
-            ping: None,
-            ping_count: 0,
-        })
+        let attempts = env::var("WEBSOCKETS_MAX_REDIRECTS")
+            .ok()
+            .and_then(|value| value.trim().parse::<isize>().ok())
+            .unwrap_or(DEFAULT_REDIRECT_ATTEMPTS);
+        for _ in 0..attempts {
+            let mut request = url.as_str().into_client_request()?;
+            request.headers_mut().insert(
+                SEC_WEBSOCKET_PROTOCOL,
+                SUBPROTOCOL.parse().expect("valid subprotocol"),
+            );
+            let stream = transport::websocket_socket(&url, OPEN_TIMEOUT)
+                .await
+                .map_err(|error| {
+                    let reason = match error.code {
+                        Code::NotSent => "ConnectionRefusedError",
+                        _ => "OSError",
+                    };
+                    Failure::Disconnected(reason)
+                })?;
+            let config = WebSocketConfig::default()
+                .max_message_size(Some(1 << 20))
+                .max_frame_size(Some(1 << 20));
+            match client_async_with_config(request, stream, Some(config)).await {
+                Ok((socket, _)) => {
+                    return Ok(Self {
+                        socket,
+                        field,
+                        heartbeat: Instant::now() + PING_INTERVAL,
+                        ping: None,
+                        ping_count: 0,
+                    });
+                }
+                Err(WsError::Http(response))
+                    if matches!(response.status().as_u16(), 300..=303 | 307 | 308)
+                        && response.headers().contains_key(LOCATION) =>
+                {
+                    let location = response.headers()[LOCATION]
+                        .to_str()
+                        .map_err(|_| Failure::Disconnected("InvalidURI"))?;
+                    url = redirect_target(&url, location)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Err(Failure::Disconnected("SecurityError"))
     }
 
     /// Return each complete subscription payload in arrival order.
@@ -294,6 +315,21 @@ impl Connection {
         })
         .await;
     }
+}
+
+fn redirect_target(previous: &Url, location: &str) -> Result<Url, Failure> {
+    let next = previous
+        .join(location)
+        .map_err(|_| Failure::Disconnected("InvalidURI"))?;
+    if !matches!(next.scheme(), "ws" | "wss") || next.fragment().is_some() {
+        return Err(Failure::Disconnected("InvalidURI"));
+    }
+    if (previous.scheme() == "wss" && next.scheme() != "wss")
+        || check_endpoint(next.as_str()).is_err()
+    {
+        return Err(Failure::Disconnected("SecurityError"));
+    }
+    Ok(next)
 }
 
 fn decode(bytes: &[u8]) -> Result<Value, Failure> {
