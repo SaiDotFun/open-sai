@@ -972,6 +972,22 @@ def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
         not in status.stdout + refused.stdout + refused.stderr
     )
 
+    env.clip.write_text(make_token())
+    command = row["renewalCommand"]
+    missing_endpoint = env.run_shell(command)
+    assert missing_endpoint.returncode != 0
+    assert (
+        "Set SAI_RECONCILE_ENDPOINT to the original Keeper URL"
+        in missing_endpoint.stderr
+    )
+
+    renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    assert renewed.returncode == 0, renewed.stderr
+    assert "synthetic-test-credential" not in renewed.stdout + renewed.stderr
+    current = env.run(*args, "status")
+    assert current.returncode == 0
+    assert json.loads(current.stdout)["expiresAt"] > row["expiresAt"]
+
 
 def test_renew_json_shows_only_the_keeper_origin(env: Env, keeper_auth):
     fake_cast(env)

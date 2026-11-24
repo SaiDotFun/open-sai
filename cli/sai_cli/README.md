@@ -226,19 +226,38 @@ signs, the CLI checks that the typed data has primary type
 `UserTradingSession`, domain `Sai` version `1`, your addr, and the issued
 challenge nonce.
 
+### Renewing Sessions
+
 Run `sai auth renew [ADDR]` to get a fresh session using the key saved by
 `sai auth login NAME`. With no address, it renews the active account. An
 explicit address renews that account and keeps the active selection. If a
-keystore session predates the saved key name, run `sai auth login NAME` once.
+keystore session predates the saved key name, run `sai auth login NAME` once
+or use the reported `sai auth import --addr ADDR` command with a fresh Sai Web
+token for that address.
 For a session copied from Sai Web, copy a fresh token and run `sai auth
 import`.
 
 Status, list, doctor, the overview, and the MCP tool `mcp_info` report a
 warning when a session has less than three days left. Interactive commands
-can also print a one-line notice to stderr. JSON output carries the warning
-in the reported session data. Use the Keeper endpoint named in the renewal
-or import hint. If the hint asks you to reuse your settings, keep the original
-Keeper configuration when running the command.
+can also print a one-line notice to stderr. In the `auth status` and `auth
+list` JSON output, the account overview, and MCP session reports, look for
+`expiryWarning`, the shell command `renewalCommand`, and optional
+`renewalGuidance`. Share the guidance separately when passing the command to
+someone else.
+
+The command uses your current Keeper settings when they match the stored
+session. A different Keeper URL with a path or other private parts requires
+`SAI_RECONCILE_ENDPOINT`. If the command references that variable, supply the
+full original URL privately in the same shell before running it. In Bash,
+you can enter the URL at a hidden prompt to keep it out of shell history.
+
+```bash
+read -rsp 'Original Keeper URL: ' SAI_RECONCILE_ENDPOINT
+printf '\n'
+export SAI_RECONCILE_ENDPOINT
+```
+
+### Choosing a Signing Key
 
 `auth login NAME` picks the key named `NAME`:
 

@@ -113,6 +113,12 @@ browser session, copy a fresh Sai Web token and run `sai auth import`.
 `sai auth status`, `sai auth list`, `sai doctor`, and the MCP tool
 `mcp_info` warn when a session has less than three days left.
 
+Run the `renewalCommand` from the session report and read `renewalGuidance`
+separately when it appears. The command uses your current Keeper settings
+when they match the session. If the command references
+`SAI_RECONCILE_ENDPOINT`, supply the original URL privately in the same shell.
+See [Renewing Sessions](cli/sai_cli/README.md#renewing-sessions).
+
 After connecting, commands run without prompts until the session expires. Know
 what the token is:
 
