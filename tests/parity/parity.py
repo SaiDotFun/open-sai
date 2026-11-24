@@ -714,6 +714,12 @@ def project_reference_log_privacy(
             for field in ("error", "errorMsg", "errorMessage"):
                 if field in old and new.get(field) == "[redacted]":
                     old[field] = "[redacted]"
+            if old.get("event") == "mcp.tool_call":
+                old_args, new_args = old.get("arguments"), new.get("arguments")
+                if isinstance(old_args, dict) and isinstance(new_args, dict):
+                    for key in old_args.keys() & new_args.keys():
+                        if new_args[key] == "[redacted]":
+                            old_args[key] = "[redacted]"
 
 
 def project_reference_rejected_scope(reference: Observation) -> Observation:

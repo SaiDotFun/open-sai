@@ -495,7 +495,7 @@ fn log_call(events: EventContext<'_>, tool: Option<&Tool>, args: &Map<String, Va
         if tool.name != "logs_intent" {
             known.extend(properties.keys().filter_map(|key| {
                 let field = match args.get(key)? {
-                    Value::String(text) => Field::Arg(text.clone()),
+                    Value::String(_) => Field::redacted_argument(),
                     Value::Array(items) => Field::Text(format!("[list of {}]", items.len())),
                     Value::Object(items) => Field::Text(format!("[dict of {}]", items.len())),
                     value => Field::Scalar(value.clone()),

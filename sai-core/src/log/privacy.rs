@@ -239,6 +239,10 @@ impl From<Value> for Field {
 }
 
 impl Field {
+    pub fn redacted_argument() -> Self {
+        Self::Text(REDACTED_INPUT.into())
+    }
+
     pub fn argv(args: impl IntoIterator<Item = String>) -> Self {
         Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Text).collect())
     }
