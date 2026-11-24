@@ -505,7 +505,7 @@ mcp_protocol = "2026-07-28"
 
 [[case]]
 name = "mcp-info-public-endpoints"
-args = ["mcp","serve","--endpoint","{keeper}?fixture=hidden","--ws-endpoint","{ws}?fixture=hidden","--lcd-endpoint","{http}/api?fixture=hidden"]
+args = ["mcp","serve","--endpoint","{keeper}?fixture=hidden","--ws-endpoint","{ws}?fixture=hidden","--lcd-endpoint","{http}/fixture-lcd-private?fixture=hidden"]
 mode = "mcp"
 mcp_profile = "info"
 seed = "mcp-info-cache"

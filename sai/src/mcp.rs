@@ -27,7 +27,7 @@ use sai_core::{
     keeper::{self, Keeper, stream},
     log::{self, EventContext, Field, Level, LogWriter, Surface},
     reconcile,
-    settings::{Environment, Flags, Key, Settings},
+    settings::{Environment, Flags, Settings},
     storage::{Storage, StorageEvent},
 };
 use serde_json::{Map, Value, json};
@@ -247,7 +247,7 @@ impl SaiMcp {
             "endpoints": {
                 "keeper": log::endpoint_origin(self.settings.endpoint()),
                 "websocket": log::endpoint_origin(self.settings.ws_endpoint()),
-                "lcd": Key::LcdEndpoint.public_value(self.settings.value(Key::LcdEndpoint)),
+                "lcd": log::endpoint_origin(self.settings.lcd_endpoint()),
             },
             "configFile": self.env.path().to_string_lossy(),
             "logs": {

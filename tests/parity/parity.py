@@ -552,6 +552,12 @@ def safe_observe(
 
 
 def expect_native_mcp_info(output: list[dict[str, Any]], profile: str) -> str | None:
+    if profile == "info":
+        report = output[2]["result"]["content"][0]["text"]
+        lcd = report["endpoints"]["lcd"]
+        if lcd.endswith("/fixture-lcd-private"):
+            report["endpoints"]["lcd"] = lcd.removesuffix("/fixture-lcd-private")
+            return "Native MCP reports the LCD origin without the private path"
     if profile != "session":
         return None
     report = output[2]["result"]["content"][0]["text"]
