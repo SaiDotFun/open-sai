@@ -357,6 +357,7 @@ impl Uv {
         releases: &Releases,
         installed: &Version,
         target: &Version,
+        profile: &Path,
         allowed: impl Fn() -> bool,
     ) -> Change {
         let result = async {
@@ -424,6 +425,12 @@ impl Uv {
                 self.install(&uv, &python, &next, home.path(), None).await?;
                 self.owner(false)?;
                 smoke::verify(&self.launcher, home.path(), target, shim_base).await?;
+                // Let the shim verify and cache its binary in the invoking profile.
+                if smoke::version(&self.launcher, profile, shim_base).await? != *target {
+                    return Err(format!(
+                        "the updated launcher did not report {target} in this profile"
+                    ));
+                }
                 provenance::record(&self.prefix, &next, &self.wheel_path(&next)?)?;
                 remove_record(&record)
             }

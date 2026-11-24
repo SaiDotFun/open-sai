@@ -143,11 +143,16 @@ impl Install {
         releases: &Releases,
         installed: &Version,
         target: &Version,
+        profile: &Path,
         allowed: impl Fn() -> bool,
     ) -> Change {
         match self {
             Self::Standalone(install) => install.change(releases, installed, target, allowed).await,
-            Self::Uv(install) => install.change(releases, installed, target, allowed).await,
+            Self::Uv(install) => {
+                install
+                    .change(releases, installed, target, profile, allowed)
+                    .await
+            }
             Self::Other(..) => unreachable!(),
         }
     }

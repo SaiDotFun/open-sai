@@ -247,7 +247,7 @@ impl UpdateCommand {
                 );
             }
             match install
-                .change(&releases, &installed, &target, allowed)
+                .change(&releases, &installed, &target, home, allowed)
                 .await
             {
                 Change::Updated => Outcome::new(

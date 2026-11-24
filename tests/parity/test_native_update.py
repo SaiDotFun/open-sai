@@ -601,7 +601,7 @@ def uv_install(standalone: NativeInstall, tmp_path: Path) -> tuple[NativeInstall
     (bins / "uv").symlink_to(uv)
     tools = tmp_path / "uv tools"
     cache = standalone.home / "bin"
-    cache.mkdir()
+    cache.mkdir(mode=0o700)
     candidate = cache / "sai-native"
     shutil.copy2(standalone.executable, candidate)
     env = {
@@ -668,6 +668,20 @@ def test_uv_trial_home_is_private_under_a_group_writable_umask(
         result = install.invoke("--json", "update", *server.args, umask=0o002)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout)["status"] == "updated"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_uv_upgrade_can_launch_offline_in_the_updating_profile(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    with releases(cached_shim_release(install, initial, tmp_path)) as server:
+        updated = install.invoke("--json", "update", *server.args, umask=0o077)
+        assert updated.returncode == 0, updated.stdout + updated.stderr
+        assert json.loads(updated.stdout)["status"] == "updated"
+    offline = install.invoke("--version", SAI_NATIVE_RELEASE_BASE=server.base)
+    assert offline.returncode == 0, offline.stderr
+    assert offline.stdout.strip() == f"sai {NEW}"
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
