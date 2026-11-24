@@ -1,0 +1,5 @@
+future_setting = 9223372036854775808
+future_values = [-9_223_372_036_854_775_809, 0xffff_ffff_ffff_ffff_ffff]
+
+[update]
+auto = false
