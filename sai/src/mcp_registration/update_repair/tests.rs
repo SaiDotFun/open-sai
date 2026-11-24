@@ -40,6 +40,11 @@ fn uv_background() {
 }
 
 #[test]
+fn uv_background_success() {
+    replay("uv-success");
+}
+
+#[test]
 #[ignore = "fixture subprocess invoked by the replay tests"]
 fn replay_child() {
     let mut request = String::new();
@@ -66,12 +71,13 @@ fn replay_child() {
         env::var_os("CODEX_HOME").as_deref(),
         Some(home.join(".codex").as_os_str())
     );
-    let (installed, background) = match mode {
-        "standalone" => ("standalone/current/sai", false),
-        "uv-background" => (".local/share/uv/tools/sai-cli/bin/sai", true),
+    let (installed, background, reject) = match mode {
+        "standalone" => ("standalone/current/sai", false, false),
+        "uv-background" => (".local/share/uv/tools/sai-cli/bin/sai", true, true),
+        "uv-success" => (".local/share/uv/tools/sai-cli/bin/sai", true, false),
         _ => panic!("Unknown update fixture mode"),
     };
-    check_fixture(&home, &project, installed, background);
+    check_fixture(&home, &project, installed, background, reject);
 }
 
 fn replay(mode: &str) {
@@ -160,7 +166,7 @@ fn cursor_entry(command: &Path) -> Value {
     }})
 }
 
-fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool) {
+fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool, reject: bool) {
     let installed = home.join(installed);
     write(&installed, "#!/bin/sh\n[ \"$*\" = 'mcp serve' ]\n", 0o755);
     let launcher = home.join(".local/bin/sai");
@@ -176,7 +182,7 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool)
         old.display(),
     );
     write(&codex, &codex_bytes, 0o640);
-    if background {
+    if reject {
         write(&home.join("reject-repair"), "", 0o600);
     }
 
@@ -196,7 +202,7 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool)
     write(
         &user_cursor,
         &user_entry,
-        if background { 0o444 } else { 0o640 },
+        if reject { 0o444 } else { 0o640 },
     );
     let project_cursor = project.join(".cursor/mcp.json");
     let project_entry = cursor_entry(&old);
@@ -220,23 +226,58 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool)
         json!([{"scope": "user", "name": RETIRED_NAME}])
     );
     assert_eq!(fs::read_to_string(&claude).unwrap(), claude_bytes);
-    assert_eq!(fs::read_to_string(&user_cursor).unwrap(), user_entry);
     assert_eq!(
         fs::metadata(&codex).unwrap().permissions().mode() & 0o777,
         0o640
     );
 
-    if background {
+    if reject {
         assert_eq!(report("codex")["status"], "fail");
         assert_eq!(fs::read_to_string(&codex).unwrap(), codex_bytes);
         assert_eq!(report("cursor")["status"], "fail");
+        assert_eq!(fs::read_to_string(&user_cursor).unwrap(), user_entry);
+        assert_eq!(
+            fs::metadata(&user_cursor).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+    } else {
+        assert_eq!(report("codex")["status"], "fixed");
+        let updated = fs::read_to_string(&codex).unwrap();
+        assert!(updated.contains(launcher.to_str().unwrap()));
+        assert!(updated.contains("# keep this comment"));
+        assert!(updated.contains("SAI_HOME = '/fixture/profile'"));
+        let (scope, path) = if background {
+            assert_eq!(report("cursor")["status"], "fixed");
+            ("user", &user_cursor)
+        } else {
+            assert_eq!(report("cursor")["pinned"], true);
+            assert_eq!(fs::read_to_string(&user_cursor).unwrap(), user_entry);
+            ("project", &project_cursor)
+        };
+        assert_eq!(
+            report("cursor")["changes"],
+            json!([format!("Repaired the Sai registration in {scope} scope")])
+        );
+        let updated: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(updated, cursor_entry(&launcher));
+        let saved = &updated["mcpServers"]["sai"];
+        let args = saved["args"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|arg| arg.as_str().unwrap());
+        assert!(
+            Command::new(saved["command"].as_str().unwrap())
+                .args(args)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    if background {
         assert_eq!(
             fs::read_to_string(&project_cursor).unwrap(),
             project_entry.to_string()
-        );
-        assert_eq!(
-            fs::metadata(user_cursor).unwrap().permissions().mode() & 0o777,
-            0o444
         );
         assert_eq!(result.state_fields()["mcpNotes"], json!(["background"]));
         assert!(
@@ -246,25 +287,6 @@ fn check_fixture(home: &Path, project: &Path, installed: &str, background: bool)
                 .starts_with("Background updates")
         );
     } else {
-        assert_eq!(report("codex")["status"], "fixed");
-        let updated = fs::read_to_string(&codex).unwrap();
-        assert!(updated.contains(launcher.to_str().unwrap()));
-        assert!(updated.contains("# keep this comment"));
-        assert!(updated.contains("SAI_HOME = '/fixture/profile'"));
-        assert_eq!(report("cursor")["pinned"], true);
-        assert_eq!(
-            report("cursor")["changes"],
-            json!(["Repaired the Sai registration in project scope"])
-        );
-        let updated: Value = serde_json::from_slice(&fs::read(&project_cursor).unwrap()).unwrap();
-        assert_eq!(updated, cursor_entry(&launcher));
-        assert!(
-            Command::new(&launcher)
-                .args(["mcp", "serve"])
-                .status()
-                .unwrap()
-                .success()
-        );
         assert!(!fields.contains_key("mcpNotes"));
     }
     writer.flush(Duration::from_secs(2));
