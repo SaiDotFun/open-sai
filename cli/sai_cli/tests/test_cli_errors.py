@@ -12,6 +12,9 @@ from sai_cli.core import keeper, storage
 from sai_cli.sai_cli import main
 
 ADDR = "0x" + "a" * 40
+OVERRIDE = "http://127.0.0.1:9/query"
+PRIVATE_PATH = "fixture-endpoint-key"
+PRIVATE_OVERRIDE = f"http://127.0.0.1:9/{PRIVATE_PATH}/query"
 
 
 def assert_error(result: Result, exit_code: int, code: str) -> dict:
@@ -65,11 +68,25 @@ def test_no_json_command_does_not_open_the_repl():
 
 
 @pytest.mark.parametrize("args", [("auth", "status"), ("trade", "close", "7")])
-def test_explicit_account_without_session_requires_sign_in(args):
-    result = CliRunner().invoke(main, ["--json", "--as", ADDR, *args])
+@pytest.mark.parametrize("endpoint", [OVERRIDE, PRIVATE_OVERRIDE])
+def test_explicit_account_sign_in_hint_pins_the_selected_keeper(
+    monkeypatch, args, endpoint
+):
+    monkeypatch.setenv("SAI_ENDPOINT", "http://127.0.0.1:1/query")
+    result = CliRunner().invoke(
+        main, ["--json", "--endpoint", endpoint, "--as", ADDR, *args]
+    )
     error = assert_error(result, 6, "SIGNED_OUT")
     assert f"{ADDR} is not connected" in error["message"]
-    assert error["hint"] == f"sai auth login NAME --addr {ADDR}"
+    if endpoint == OVERRIDE:
+        assert (
+            error["hint"] == f"sai --endpoint {endpoint} auth login NAME --addr {ADDR}"
+        )
+    else:
+        assert error["hint"].startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
+        assert error["hint"].endswith(f"auth login NAME --addr {ADDR}")
+        assert PRIVATE_PATH not in result.output
+        assert endpoint not in result.output
 
 
 def test_click_usage_remains_on_stderr_in_text_mode():
@@ -96,7 +113,8 @@ def test_success_and_sign_in_exit_codes():
     runner = CliRunner()
     args = ["--json", "--endpoint", keeper.MAINNET_HTTP]
     signed_out = runner.invoke(main, [*args, "trade", "close", "7"])
-    assert assert_error(signed_out, 6, "SIGNED_OUT")["hint"] == "sai auth login NAME"
+    hint = f"sai --endpoint {keeper.MAINNET_HTTP} auth login NAME"
+    assert assert_error(signed_out, 6, "SIGNED_OUT")["hint"] == hint
     listed = runner.invoke(main, [*args, "auth", "list"])
     assert listed.exit_code == 0 and json.loads(listed.stdout) == {"accounts": []}
     storage.save_session(
@@ -108,7 +126,7 @@ def test_success_and_sign_in_exit_codes():
         }
     )
     expired = runner.invoke(main, [*args, "auth", "status"])
-    assert assert_error(expired, 6, "SESSION_EXPIRED")["hint"] == "sai auth login NAME"
+    assert assert_error(expired, 6, "SESSION_EXPIRED")["hint"] == hint
     text = runner.invoke(main, ["--endpoint", keeper.MAINNET_HTTP, "auth", "status"])
     assert text.exit_code == 6 and text.stdout == ""
     assert "Trading session expired" in text.stderr

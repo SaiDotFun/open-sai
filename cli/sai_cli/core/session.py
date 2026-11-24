@@ -17,12 +17,16 @@ def load_active_session(endpoint: str, addr: str | None = None) -> dict[str, str
     Never prompts: sessions are encrypted with the CLI's built-in key.
     """
     try:
-        stored = storage.load_session(addr)
-    except SessionError:
+        return check_active(storage.load_session(addr), endpoint)
+    except SessionError as exc:
+        if exc.code in (Code.SIGNED_OUT, Code.SESSION_EXPIRED):
+            flags = ("--addr", addr) if addr is not None else ()
+            exc.hint = storage.keeper_command_hint(
+                endpoint, "auth", "login", "NAME", *flags
+            )
         raise
     except ValueError as exc:
         raise SessionError(str(exc)) from exc
-    return check_active(stored, endpoint)
 
 
 def check_active(result: dict[str, str], endpoint: str) -> dict[str, str]:

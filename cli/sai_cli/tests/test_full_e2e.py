@@ -451,10 +451,14 @@ def test_connect_refusal_survives_a_failed_ledger_write(fail_ledger_updates):
     assert entry["intentKey"] == error["intentKey"] and entry["status"] == "unknown"
 
 
-def test_reconciliation_hints_keep_endpoint_query_credentials_private():
+@pytest.mark.parametrize("credential_in_path", [False, True], ids=["query", "path"])
+def test_reconciliation_hints_keep_endpoint_credentials_private(credential_in_path):
     with submission_keeper(lambda _key: None) as base:
         secret = "fixture-endpoint-secret"
-        endpoint = f"{base}?api_key={secret}"
+        if credential_in_path:
+            endpoint = f"{base.removesuffix('/query')}/{secret}/query"
+        else:
+            endpoint = f"{base}?api_key={secret}"
         save_trade_session(endpoint)
         attempts = [
             subprocess.run(
@@ -470,6 +474,7 @@ def test_reconciliation_hints_keep_endpoint_query_credentials_private():
     assert (received.returncode, blocked.returncode) == (5, 1)
     for result in attempts:
         assert secret not in result.stdout + result.stderr
+        assert endpoint not in result.stdout + result.stderr
     error, block = [json.loads(result.stdout)["error"] for result in attempts]
     assert error["hint"] == block["hint"]
     assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error["hint"]
