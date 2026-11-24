@@ -180,6 +180,47 @@ impl<'a> Trading<'a> {
         )?)
     }
 
+    /// Produce a route-bound preview for callers that require confirmation.
+    pub async fn confirmed_trade_preview(
+        &self,
+        session: &Session,
+        mut preview: TradePreview,
+    ) -> Result<Value, SaiError> {
+        let endpoint = self.keeper.endpoint();
+        self.storage.check_active_trade(session, endpoint)?;
+        if !matches!(
+            preview.intent.kind,
+            "OPEN_TRADE" | "CLOSE_POSITION" | "CANCEL_PENDING_TRADE"
+        ) {
+            return Err(SaiError::internal());
+        }
+        preview.position_route = self.basic_trade_route(session, &preview, true).await?;
+        if preview.requires_market_price_refresh() {
+            self.refresh_market_open(&mut preview).await?;
+        }
+        self.load_session(Some(session.addr()))?;
+        Ok(preview.confirmed_output(Some(session.addr())))
+    }
+
+    async fn basic_trade_route(
+        &self,
+        session: &Session,
+        preview: &TradePreview,
+        confirming: bool,
+    ) -> Result<Option<position::PositionRoute>, SaiError> {
+        match preview.intent.kind {
+            "CANCEL_PENDING_TRADE" => self.check_pending_order(session, preview).await.map(Some),
+            "CLOSE_POSITION" => self.check_close(session.addr(), preview).await.map(Some),
+            "OPEN_TRADE" if confirming => {
+                let lcd = self.lcd_endpoint.map(position::Lcd).ok_or_else(|| {
+                    actions::invalid("Cannot verify the trade route without an LCD")
+                })?;
+                self.position_route(&lcd, false).await.map(Some)
+            }
+            _ => Ok(None),
+        }
+    }
+
     /// Verify a confirmed preview, commit the reservation, then send once.
     /// The reservation stays unknown if Keeper's admission cannot be determined.
     pub async fn submit(
@@ -204,14 +245,10 @@ impl<'a> Trading<'a> {
         let endpoint = self.keeper.endpoint();
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
-        let cancelling = preview.intent.kind == "CANCEL_PENDING_TRADE";
+        let confirming = options.confirmation.is_some();
+        let route = self.basic_trade_route(session, preview, confirming).await?;
+        let checked_route = route.is_some();
         let market = preview.requires_market_price_refresh();
-        let closing = preview.is_market_close();
-        if cancelling {
-            self.check_pending_order(session, preview).await?;
-        } else if closing {
-            self.check_close(account, preview).await?;
-        }
         let update = if preview.is_standalone_position_update() {
             Some(
                 self.preflight_position_update(account, preview, options.confirmation.is_some())
@@ -221,15 +258,18 @@ impl<'a> Trading<'a> {
             None
         };
         let mut prepared;
-        let preview = if market {
+        let preview = if market || confirming && checked_route {
             prepared = preview.clone();
-            self.refresh_market_open(&mut prepared).await?;
-            let price = prepared
-                .reference_price
-                .as_deref()
-                .ok_or_else(SaiError::internal)?;
-            positive_decimal(price, "Current price")?;
-            prepared.intent.body["intentPrice"] = json!(price);
+            prepared.position_route = route;
+            if market {
+                self.refresh_market_open(&mut prepared).await?;
+                let price = prepared
+                    .reference_price
+                    .as_deref()
+                    .ok_or_else(SaiError::internal)?;
+                positive_decimal(price, "Current price")?;
+                prepared.intent.body["intentPrice"] = json!(price);
+            }
             &prepared
         } else if let Some(update) = &update {
             &update.preview
@@ -239,12 +279,7 @@ impl<'a> Trading<'a> {
         // Live reads can outlast the session. Reload the pinned account
         // before confirmation and reserve with its current token.
         let reloaded;
-        let session = if cancelling
-            || closing
-            || market
-            || update.is_some()
-            || options.confirmation.is_some()
-        {
+        let session = if checked_route || market || update.is_some() || confirming {
             reloaded = self.load_session(Some(account))?;
             &reloaded
         } else {

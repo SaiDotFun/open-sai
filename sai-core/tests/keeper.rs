@@ -7,12 +7,10 @@ use std::{
 
 use sai_core::{
     errors::Code,
-    keeper::{INTENTS, Keeper, MARKETS, SUBMIT},
+    keeper::{INTENTS, Keeper, SUBMIT},
     log::{EventContext, Surface},
-    storage::{Session, Storage},
-    trade::{Confirmation, OpenTrade, OrderType, Side, SubmitOptions, Trading, preview_digest},
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Map, Value};
 
 #[path = "keeper/position_updates.rs"]
 mod position_updates;
@@ -53,68 +51,6 @@ fn read_request(stream: &mut TcpStream) -> (Vec<String>, Vec<u8>) {
     let mut body = vec![0; length];
     reader.read_exact(&mut body).unwrap();
     (lines, body)
-}
-
-#[tokio::test]
-async fn shared_market_submit_refreshes_before_reserving() {
-    let listener = listener();
-    let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        let (_, bytes) = read_request(&mut stream);
-        let req: Value = serde_json::from_slice(&bytes).unwrap();
-        let response = json!({"data": {"perp": {"borrowings": [
-            {"marketId": 3, "price": "102", "isOpen": true, "collateralToken": {"symbol": "USDC"}}
-        ]}}})
-        .to_string();
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
-            response.len()
-        )
-        .unwrap();
-        req["query"].clone()
-    });
-    let home = tempfile::tempdir().unwrap();
-    let storage = Storage::new(home.path());
-    let addr = "0x1111111111111111111111111111111111111111";
-    let session = Session::new(
-        "fixture-token".to_owned().into(),
-        addr.into(),
-        "2099-01-01T00:00:00Z".into(),
-        endpoint.clone(),
-    );
-    storage.save_session(session).unwrap();
-    let trading = Trading::new(&endpoint, &storage, EVENTS);
-    let session = trading.load_session(None).unwrap();
-    let mut preview = OpenTrade {
-        market: "3",
-        side: Side::Long,
-        order_type: OrderType::Market,
-        amount: "20",
-        leverage: "2",
-        price: None,
-        slippage: "1",
-        take_profit: None,
-        stop_loss: None,
-    }
-    .preview()
-    .unwrap();
-    preview.reference_price = Some("100".into());
-    let digest = preview_digest(&preview, Some(addr));
-    let result = trading
-        .submit(
-            &session,
-            &preview,
-            SubmitOptions {
-                confirmation: Some(Confirmation::new(&digest, Some("100")).unwrap()),
-                ..Default::default()
-            },
-        )
-        .await;
-    assert_eq!(server.join().unwrap(), MARKETS);
-    assert_eq!(result.err().unwrap().code, Code::PriceMoved);
-    assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
 
 #[tokio::test]
