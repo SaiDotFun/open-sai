@@ -222,7 +222,8 @@
         "code": "string",
         "error": "string",
         "httpStatus": "integer",
-        "keeperErrors": "object[]"
+        "keeperErrors": "object[]",
+        "keeperErrorCount": "integer"
       }
     },
     "log.dropped": {
@@ -352,6 +353,19 @@
         "code": "string",
         "error": "string"
       }
+    },
+    "update.mcp_repair": {
+      "emitter": "core.updater.repair_after_update",
+      "levels": [
+        "info",
+        "warn"
+      ],
+      "required": {
+        "background": "boolean",
+        "clients": "object[]",
+        "notes": "string[]"
+      },
+      "optional": {}
     },
     "update.result": {
       "emitter": "sai_cli.log_update",

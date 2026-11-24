@@ -44,6 +44,7 @@ TOKEN = f"{HEADER}.{PAYLOAD}.{SIGNATURE}"
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path, monkeypatch) -> Path:
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "")
     for name in ("SAI_ENDPOINT", "SAI_WS_ENDPOINT", "SAI_LCD_ENDPOINT"):
         monkeypatch.delenv(name, raising=False)
     return tmp_path
@@ -106,6 +107,68 @@ def snapshot(root: Path) -> dict[str, tuple[int, bytes | None]]:
 def run_cli(*args: str) -> tuple[int, str]:
     result = CliRunner().invoke(main, list(args), catch_exceptions=False)
     return result.exit_code, result.output
+
+
+@pytest.mark.parametrize(
+    ("content", "expected", "summary"),
+    [
+        (b"[update]\nauto = false\n", "pass", "Config file settings are valid"),
+        (b"[future]\nprivate_setting = 'private_value'\n", "warn", "unknown settings"),
+        (b"[update\n", "fail", "not valid TOML"),
+        (b"[keeper]\nendpoint = 'https://[private_value'\n", "fail", "keeper.endpoint"),
+        (b"[update]\nauto = 'private_value'\n", "fail", "update.auto"),
+        (b"[logs]\nenabled = false\nkeep_days = 0\n", "fail", "logs.keep_days"),
+        (b"\xff", "fail", "UTF-8"),
+        pytest.param(
+            b"[logs]\nkeep_days = " + b"9" * 5000,
+            "fail",
+            "not valid TOML",
+            id="oversized-TOML-integer",
+        ),
+    ],
+)
+def test_config_check_reports_file_errors_without_echoing_values(
+    isolated_home, monkeypatch, content, expected, summary
+):
+    path = isolated_home / "config.toml"
+    path.write_bytes(content)
+    # File validation still applies to keys shadowed by an environment value.
+    monkeypatch.setenv("SAI_UPDATE_AUTO", "false")
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+    report = json.loads(output)
+    if expected == "fail":
+        assert report["error"]["code"] == "INVALID_REQUEST"
+        report = report["error"]["details"]
+    checks = {check["id"]: check for check in report["checks"]}
+    assert checks["config"]["status"] == expected
+    assert summary in checks["config"]["summary"]
+    assert "home" in checks
+    assert code == (1 if expected == "fail" else 0)
+    assert "private_setting" not in output and "private_value" not in output
+    assert path.read_bytes() == content
+
+
+def test_unusable_config_skips_checks_that_need_resolved_settings(isolated_home):
+    (isolated_home / "config.toml").write_text("[keeper\n")
+    code, output = run_cli("--json", "doctor", "--no-fix")
+    report = json.loads(output)["error"]["details"]
+    checks = {check["id"]: check for check in report["checks"]}
+    assert code == 1
+    for name in ("session", "intents", "keeper", "websocket", "lcd"):
+        assert checks[name]["status"] == "skipped"
+
+
+def test_config_warns_about_invalid_logging_override(monkeypatch):
+    monkeypatch.setenv("SAI_LOG", "private-invalid-boolean")
+
+    code, output = run_cli("--json", "doctor", "--offline", "--no-fix")
+
+    assert code == 0
+    checks = {check["id"]: check for check in json.loads(output)["checks"]}
+    assert checks["config"]["status"] == "warn"
+    assert "SAI_LOG" in checks["config"]["summary"]
+    assert "logs.enabled" in checks["config"]["summary"]
+    assert "private-invalid-boolean" not in output
 
 
 # Session

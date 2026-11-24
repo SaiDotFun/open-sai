@@ -179,6 +179,7 @@ EVENTS = {
             "error": "string",
             "httpStatus": "integer",
             "keeperErrors": "object[]",
+            "keeperErrorCount": "integer",
         },
     ),
     "log.dropped": Event("core.log._write", ("warn",), {"count": "integer"}),
@@ -247,6 +248,11 @@ EVENTS = {
             "code": "string",
             "error": "string",
         },
+    ),
+    "update.mcp_repair": Event(
+        "core.updater.repair_after_update",
+        ("info", "warn"),
+        {"background": "boolean", "clients": "object[]", "notes": "string[]"},
     ),
     "update.result": Event(
         "sai_cli.log_update",

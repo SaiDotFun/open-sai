@@ -1,11 +1,12 @@
 """Register `sai mcp serve` with agent clients: Claude Code, Codex, Cursor.
 
-Claude Code and Codex change through their own `mcp add` and `mcp remove`
-commands. Cursor has no such command, so this module edits its `mcp.json`.
+Ordinary Claude Code installs and uninstalls use its `mcp add` and
+`mcp remove` commands. Explicit Claude Code repairs edit the existing
+entry in its config file. Codex and Cursor writes also edit config files.
 
-Client config files hold other servers' secrets. Reads keep only the `sai`
-entry's command, args, and `SAI_HOME`; nothing here prints other entries,
-env values, headers, or URLs.
+Registration inspection keeps only Sai's command, args, and selected
+metadata. Repair retains the full entry in memory to preserve settings
+when publishing the replacement.
 """
 
 from __future__ import annotations
@@ -18,12 +19,22 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping
+import tomllib
+from collections.abc import Callable, Mapping, MutableMapping
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
+import tomlkit
+from tomlkit.exceptions import TOMLKitError
+from tomlkit.items import InlineTable
+
+from .core import settings
+
 NAME = "sai"
+RETIRED_NAME = "sai-mcp"
+SERVER_NAMES = (NAME, RETIRED_NAME)
 HIDDEN = "<hidden>"
 CODEX_TOOL_FILTERS = ("enabled_tools", "disabled_tools")
 STILL_ACTIVE = "a project .codex/config.toml entry is still active"
@@ -33,6 +44,7 @@ SCOPES = ("user", "project")
 UNINSTALL_SCOPES = ("user", "project", "local")
 SUBPROCESS_TIMEOUT = 60
 INSTALL_URL = "git+https://github.com/SaiDotFun/open-sai"
+ENDPOINT_FLAGS = {spec.flag: spec.key for spec in settings.SETTINGS if spec.flag}
 
 
 class InstallError(Exception):
@@ -70,6 +82,8 @@ class Registration:
     # Hash of the whole entry (env values, URL, and all), so two entries can
     # be compared without keeping or printing their values.
     fingerprint: str = ""
+    invalid_sai_home: bool = False
+    stdio: bool = True
 
     def shown(self, target: Target | None) -> dict[str, Any]:
         """The argv to print: in full only when it is the expected command.
@@ -89,11 +103,14 @@ class Registration:
     def matches(self, target: Target) -> bool:
         return (
             self.argv == target.argv
-            and self.sai_home == target.env.get("SAI_HOME")
+            and self.matches_sai_home(target.env)
             and not self.stale_env
             and not self.extra_settings
             and not self.disabled
         )
+
+    def matches_sai_home(self, env: Mapping[str, str]) -> bool:
+        return not self.invalid_sai_home and self.sai_home == env.get("SAI_HOME")
 
     def to_json(self, target: Target | None, effective: bool) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -125,12 +142,14 @@ class Result:
     shadowed_by: str | None = None
     # A client config was written, even if the check afterwards failed.
     changed: bool = False
+    name: str | None = None
 
     def to_json(self) -> dict[str, Any]:
         out: dict[str, Any] = {"client": self.client, "action": self.action}
         names = {"shadowed_by": "shadowedBy"}
         for key in (
             "scope",
+            "name",
             "would",
             "command",
             "args",
@@ -147,6 +166,42 @@ class Result:
 
 class ClientError(Exception):
     """A client command or config file failed; the message is safe to print."""
+
+
+@dataclass(frozen=True)
+class ClaudeRepair:
+    scope: str
+    name: str
+    reset_args: bool = False
+
+
+@dataclass(frozen=True)
+class RegistrationCheck:
+    client: str
+    status: str
+    summary: str
+    fix: str | None = None
+    changes: tuple[str, ...] = ()
+    pinned: bool = False
+    legacy_name: bool = False
+    manual_repairs: tuple[ClaudeRepair, ...] = ()
+
+
+def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
+    commands = [
+        f"`sai mcp install --client claude --scope {entry.scope}"
+        f" --repair-existing {entry.name}"
+        f"{' --reset-args' if entry.reset_args else ''}`"
+        for entry in entries
+    ]
+    hint = "Run " + " and ".join(commands) + "."
+    if any(entry.scope != "user" for entry in entries):
+        hint += " Run project and local commands from the project directory."
+    if any(entry.reset_args for entry in entries):
+        hint += (
+            " The --reset-args flag replaces unsupported arguments with the defaults."
+        )
+    return hint
 
 
 def normalize_client(name: str) -> str:
@@ -182,6 +237,15 @@ def inside(path: Path, roots: list[Path]) -> bool:
     return False
 
 
+def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
+    return Target([launcher, "mcp", "serve"], server_env(environ))
+
+
+def server_env(environ: Mapping[str, str]) -> dict[str, str]:
+    home = environ.get("SAI_HOME")
+    return {"SAI_HOME": os.path.abspath(os.path.expanduser(home))} if home else {}
+
+
 def server_target(
     override: list[str] | None,
     environ: Mapping[str, str],
@@ -193,11 +257,8 @@ def server_target(
     With no override, register the unresolved `sai` on PATH, normally the
     `~/.local/bin/sai` link that `uv tool` keeps across updates.
     """
-    env = {}
-    if environ.get("SAI_HOME"):
-        env["SAI_HOME"] = os.path.abspath(os.path.expanduser(environ["SAI_HOME"]))
     if override:
-        return Target(list(override), env), []
+        return Target(list(override), server_env(environ)), []
     found = shutil.which("sai", path=environ.get("PATH"))
     if found is None:
         raise InstallError(
@@ -221,7 +282,7 @@ def server_target(
             f"The `sai` on PATH ({path}) is a different install than the one"
             f" running ({running_prefix}); clients get the one on PATH."
         )
-    return Target([str(path), "mcp", "serve"], env), warnings
+    return launcher_target(str(path), environ), warnings
 
 
 # --- helpers --------------------------------------------------------------
@@ -288,9 +349,14 @@ def entry_registration(
     canonical = json.dumps([hashed, disabled], sort_keys=True, default=str)
     fingerprint = hashlib.sha256(canonical.encode()).hexdigest()
     command = entry.get("command")
-    args = entry.get("args") or []
-    argv = [command] if isinstance(command, str) else []
-    argv += [a for a in args if isinstance(a, str)] if isinstance(args, list) else []
+    args = entry.get("args", [])
+    argv = (
+        [command, *args]
+        if isinstance(command, str)
+        and isinstance(args, list)
+        and all(isinstance(arg, str) for arg in args)
+        else []
+    )
     env = entry.get("env")
     env = env if isinstance(env, dict) else {}
     home = env.get("SAI_HOME")
@@ -308,6 +374,8 @@ def entry_registration(
         disabled,
         extra_settings,
         fingerprint,
+        invalid_sai_home="SAI_HOME" in env and not isinstance(home, str),
+        stdio=entry.get("type", "stdio") == "stdio" and "url" not in entry,
     )
 
 
@@ -332,32 +400,46 @@ def before_replace(path: Path) -> None:
     """Hook between writing the temp file and the final check; tests use it."""
 
 
-def replace_if_unchanged(path: Path, data: dict[str, Any], seen: bytes | None) -> bool:
+def replace_if_unchanged(
+    path: Path, data: dict[str, Any], seen: bytes | None, destination: Path
+) -> bool:
+    return replace_bytes(
+        path,
+        (json.dumps(data, indent=2) + "\n").encode(),
+        seen,
+        destination=destination,
+    )
+
+
+def replace_bytes(
+    path: Path, data: bytes, seen: bytes | None, *, destination: Path
+) -> bool:
     """Write data over path in one rename if path still holds `seen`.
 
     Keeps the file mode (0600 for a new file). Returns False, writing
     nothing, when another program changed the file since it was read.
     """
+    # Replace the file, including when the configured path is a symlink.
+    # Recheck the link before writing so a concurrent retarget is detectable.
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
     try:
-        mode = stat.S_IMODE(path.stat().st_mode)
-    except FileNotFoundError:
-        mode = 0o600
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2)
-            handle.write("\n")
-        os.chmod(temp, mode)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
         before_replace(path)
-        if read_bytes(path) != seen:
-            Path(temp).unlink(missing_ok=True)
+        if path.resolve() != destination or read_bytes(destination) != seen:
             return False
-        os.replace(temp, path)
+        try:
+            mode = stat.S_IMODE(destination.stat().st_mode)
+        except FileNotFoundError:
+            if seen is not None:
+                return False
+            mode = 0o600
+        os.chmod(temp, mode)
+        os.replace(temp, destination)
         return True
-    except BaseException:
+    finally:
         Path(temp).unlink(missing_ok=True)
-        raise
 
 
 # --- clients --------------------------------------------------------------
@@ -367,7 +449,9 @@ class Client:
     name = ""
     binary = ""
 
-    def __init__(self, home: Path, environ: Mapping[str, str], cwd: Path) -> None:
+    def __init__(
+        self, home: Path, environ: Mapping[str, str], cwd: Path | None
+    ) -> None:
         self.home = home
         self.environ = environ
         self.cwd = cwd
@@ -398,8 +482,8 @@ class Client:
     # Scopes sai reads but never edits.
     read_only_scopes: frozenset[str] = frozenset()
 
-    def registrations(self) -> list[Registration]:
-        """Every `sai` entry, the effective one first."""
+    def registrations(self, name: str = NAME) -> list[Registration]:
+        """Entries for this server name, the effective one first."""
         raise NotImplementedError
 
     def rank(self, scope: str) -> int:
@@ -412,18 +496,20 @@ class Client:
     def effective(self, found: list[Registration]) -> Registration | None:
         return found[0] if found else None
 
-    def registration(self, scope: str) -> Registration | None:
-        return next((r for r in self.registrations() if r.scope == scope), None)
+    def registration(self, scope: str, name: str = NAME) -> Registration | None:
+        return next((r for r in self.registrations(name) if r.scope == scope), None)
 
-    def add_steps(self, scope: str, target: Target) -> list[list[str]]:
+    def add_steps(
+        self, scope: str, target: Target, name: str = NAME
+    ) -> list[list[str]]:
         raise NotImplementedError
 
-    def remove_steps(self, scope: str) -> list[list[str]]:
+    def remove_steps(self, scope: str, name: str = NAME) -> list[list[str]]:
         raise NotImplementedError
 
-    def verify(self, scope: str, target: Target | None) -> None:
+    def verify(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
         """Re-read after a change: the entry matches target, or is gone."""
-        reg = self.registration(scope)
+        reg = self.registration(scope, name)
         if target is not None and (reg is None or not reg.matches(target)):
             raise ClientError(f"{self.name} does not show the new sai entry")
         if target is None and reg is not None:
@@ -443,30 +529,34 @@ class Claude(Client):
         configured = self.environ.get("CLAUDE_CONFIG_DIR")
         return (Path(configured) if configured else self.home) / ".claude.json"
 
-    def registrations(self) -> list[Registration]:
+    def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
         found = []
-        user = servers(data).get(NAME)
+        user = servers(data).get(name)
         if user is not None:
             found.append(entry_registration(user, "user"))
+        if self.cwd is None:
+            return self.ordered([r for r in found if r is not None])
         projects = (data or {}).get("projects")
         project = projects.get(str(self.cwd)) if isinstance(projects, dict) else None
-        local = servers(project if isinstance(project, dict) else None).get(NAME)
+        local = servers(project if isinstance(project, dict) else None).get(name)
         if local is not None:
             found.append(entry_registration(local, "local"))
-        shared = servers(load_json(self.cwd / ".mcp.json")).get(NAME)
+        shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
         if shared is not None:
             found.append(entry_registration(shared, "project"))
         return self.ordered([r for r in found if r is not None])
 
-    def add_steps(self, scope: str, target: Target) -> list[list[str]]:
+    def add_steps(
+        self, scope: str, target: Target, name: str = NAME
+    ) -> list[list[str]]:
         exe = self.require_exe()
         env = [f"--env={k}={v}" for k, v in target.env.items()]
-        return [[exe, "mcp", "add", "--scope", scope, NAME, *env, "--", *target.argv]]
+        return [[exe, "mcp", "add", "--scope", scope, name, *env, "--", *target.argv]]
 
-    def remove_steps(self, scope: str) -> list[list[str]]:
-        return [[self.require_exe(), "mcp", "remove", "--scope", scope, NAME]]
+    def remove_steps(self, scope: str, name: str = NAME) -> list[list[str]]:
+        return [[self.require_exe(), "mcp", "remove", "--scope", scope, name]]
 
 
 class Codex(Client):
@@ -480,7 +570,7 @@ class Codex(Client):
     precedence = ("project", "user")
     read_only_scopes = frozenset({"project"})
 
-    def registrations(self) -> list[Registration]:
+    def registrations(self, name: str = NAME) -> list[Registration]:
         """The user entry, plus a project override when Codex reports one.
 
         Codex decides which project configs load here (project root, trust),
@@ -489,10 +579,10 @@ class Codex(Client):
         the entry Codex would use here. A difference is a project override.
         """
         neutral = self.neutral_dir()
-        user = self.get(neutral, "user")
+        user = self.get(neutral, "user", name)
         found = [user] if user is not None else []
-        if self.cwd.resolve() != neutral.resolve():
-            here = self.get(self.cwd, "project")
+        if self.cwd is not None and self.cwd.resolve() != neutral.resolve():
+            here = self.get(self.cwd, "project", name)
             if here is not None and (user is None or not same_entry(here, user)):
                 found.append(here)
         return self.ordered(found)
@@ -501,29 +591,31 @@ class Codex(Client):
         home = self.home_dir()
         return home if home.is_dir() else Path(tempfile.gettempdir())
 
-    def verify(self, scope: str, target: Target | None) -> None:
+    def verify(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
         """Ask Codex again, from $CODEX_HOME and from the working directory.
 
         Equal user and project entries look like one entry before a change,
         so only the answer from the working directory afterwards shows
         whether a project entry is still what Codex runs here.
         """
-        super().verify(scope, target)
-        here = self.get(self.cwd, "project")
+        super().verify(scope, target, name=name)
+        if self.cwd is None:
+            return
+        here = self.get(self.cwd, "project", name)
         if target is None and here is None:
             return
         if target is not None and here is not None and here.matches(target):
             return
         raise ClientError(STILL_ACTIVE)
 
-    def get(self, cwd: Path, scope: str) -> Registration | None:
-        """Run `codex mcp get sai --json` from cwd; keep command and args."""
+    def get(self, cwd: Path, scope: str, name: str = NAME) -> Registration | None:
+        """Run `codex mcp get` for one Sai server name; keep command and args."""
         exe = self.exe()
         if exe is None:
             return None
         try:
             done = subprocess.run(
-                [exe, "mcp", "get", NAME, "--json"],
+                [exe, "mcp", "get", name, "--json"],
                 cwd=cwd,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -536,10 +628,7 @@ class Codex(Client):
         if done.returncode != 0:
             if "no mcp server" in (done.stderr + done.stdout).lower():
                 return None
-            raise ClientError(
-                f"`codex mcp get` exited {done.returncode}:"
-                f" {first_line(done.stderr or done.stdout)}"
-            )
+            raise ClientError(f"`codex mcp get` exited {done.returncode}")
         try:
             data = json.loads(done.stdout)
         except ValueError:
@@ -562,14 +651,12 @@ class Codex(Client):
         if scope != "user":
             raise ClientError("Codex registers MCP servers per user only")
 
-    def add_steps(self, scope: str, target: Target) -> list[list[str]]:
+    def config_path(self, scope: str) -> Path:
         self.check_scope(scope)
-        env = [f"--env={k}={v}" for k, v in target.env.items()]
-        return [[self.require_exe(), "mcp", "add", NAME, *env, "--", *target.argv]]
+        return self.home_dir() / "config.toml"
 
-    def remove_steps(self, scope: str) -> list[list[str]]:
-        self.check_scope(scope)
-        return [[self.require_exe(), "mcp", "remove", NAME]]
+    def write(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
+        edit_codex_config(self.config_path(scope), target, name=name)
 
 
 class Cursor(Client):
@@ -591,31 +678,34 @@ class Cursor(Client):
 
     def config_path(self, scope: str) -> Path:
         base = self.cwd if scope == "project" else self.home
+        if base is None:
+            raise ClientError("No working directory for the project registration")
         return base / ".cursor" / "mcp.json"
 
-    def registrations(self) -> list[Registration]:
+    def registrations(self, name: str = NAME) -> list[Registration]:
         found = []
-        for scope in SCOPES:
-            entry = servers(load_json(self.config_path(scope))).get(NAME)
+        for scope in SCOPES if self.cwd is not None else ("user",):
+            entry = servers(load_json(self.config_path(scope))).get(name)
             if entry is not None:
                 reg = entry_registration(entry, scope)
                 if reg is not None:
                     found.append(reg)
         return self.ordered(found)
 
-    def write(self, scope: str, target: Target | None) -> None:
+    def write(self, scope: str, target: Target | None, *, name: str = NAME) -> None:
         """Set or delete the sai entry, merging again once if the file moves."""
         path = self.config_path(scope)
         for _ in range(2):
-            seen = read_bytes(path)
-            data = load_json(path) or {}
-            if read_bytes(path) != seen:
+            destination = path.resolve()
+            seen = read_bytes(destination)
+            data = load_json(destination) or {}
+            if read_bytes(destination) != seen:
                 continue
             entries = data.get("mcpServers")
             if not isinstance(entries, dict):
                 entries = {}
             if target is None:
-                entries.pop(NAME, None)
+                entries.pop(name, None)
             else:
                 entry: dict[str, Any] = {
                     "command": target.argv[0],
@@ -625,7 +715,7 @@ class Cursor(Client):
                     entry["env"] = dict(target.env)
                 entries[NAME] = entry
             data["mcpServers"] = entries
-            if replace_if_unchanged(path, data, seen):
+            if replace_if_unchanged(path, data, seen, destination):
                 return
         raise ClientError(
             f"{path} kept changing while sai was writing it; nothing was"
@@ -634,7 +724,7 @@ class Cursor(Client):
 
 
 def make_clients(
-    home: Path, environ: Mapping[str, str], cwd: Path
+    home: Path, environ: Mapping[str, str], cwd: Path | None
 ) -> dict[str, Client]:
     return {
         "claude": Claude(home, environ, cwd),
@@ -662,21 +752,32 @@ def list_clients(
             "scope": None,
         }
         try:
-            found = client.registrations()
+            found = [(server, client.registrations(server)) for server in SERVER_NAMES]
         except ClientError as exc:
             row["error"] = str(exc)
             found = []
-        effective = client.effective(found)
-        row["registrations"] = [reg.to_json(target, reg is effective) for reg in found]
-        if found:
-            reg = effective or found[0]
+        row["registrations"] = [
+            {
+                **reg.to_json(target, reg is client.effective(entries)),
+                **({"name": server} if server != NAME else {}),
+            }
+            for server, entries in found
+            for reg in entries
+        ]
+        primary = next(
+            ((server, entries[0]) for server, entries in found if entries), None
+        )
+        if primary is not None:
+            server, reg = primary
             shown = reg.shown(target)
             row.update(
                 registered=True,
-                current=reg is effective and target is not None and reg.matches(target),
+                current=target is not None and reg.matches(target),
                 registeredCommand=shown["command"],
                 scope=reg.scope,
             )
+            if server != NAME:
+                row["registeredName"] = server
             if "args" in shown:
                 row["args"] = shown["args"]
             if reg.stale_env:
@@ -689,11 +790,27 @@ def list_clients(
     return rows
 
 
+def replacement_steps(
+    client: Client, scope: str, target: Target, name: str, exists: bool
+) -> list[list[str]]:
+    remove = client.remove_steps(scope, name) if exists else []
+    return [*remove, *client.add_steps(scope, target, name)]
+
+
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
     result = Result(client.name, "failed", command=target.argv, scope=scope)
     try:
+        if isinstance(client, Codex):
+            client.check_scope(scope)
+            client.require_exe()
         found = client.registrations()
         existing = next((r for r in found if r.scope == scope), None)
+        name = NAME
+        if existing is None and isinstance(client, Claude):
+            existing = client.registration(scope, RETIRED_NAME)
+            if existing is not None:
+                name = RETIRED_NAME
+                result.name = name
         winner = client.effective(found)
         if (
             winner is not None
@@ -707,17 +824,16 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
             result.action = "unchanged"
             return result
         action = "added" if existing is None else "replaced"
-        if isinstance(client, Cursor):
+        if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = [] if existing is None else client.remove_steps(scope)
-            steps += client.add_steps(scope, target)
+            steps = replacement_steps(client, scope, target, name, existing is not None)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", action
             return result
-        if isinstance(client, Cursor):
+        if isinstance(client, (Codex, Cursor)):
             client.write(scope, target)
         else:
             for argv in steps:
@@ -726,7 +842,7 @@ def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Re
                 # changed the client.
                 result.changed = True
         result.changed = True
-        client.verify(scope, target)
+        client.verify(scope, target, name=name)
         result.action = action
     except (ClientError, OSError) as exc:
         result.action, result.error = "failed", str(exc)
@@ -742,54 +858,54 @@ def uninstall_client(
     since removing the others leaves it running.
     """
     try:
-        found = client.registrations()
+        found = [(name, client.registrations(name)) for name in SERVER_NAMES]
     except ClientError as exc:
         return [Result(client.name, "failed", scope=scope, error=str(exc))]
-    if scope is not None:
-        existing = next((r for r in found if r.scope == scope), None)
-        results = [uninstall_one(client, scope, existing, dry_run, target)]
-    elif not found:
-        return [Result(client.name, "absent")]
-    else:
-        results = [uninstall_one(client, r.scope, r, dry_run, target) for r in found]
-    winner = client.effective(found)
-    done = {r.scope for r in results}
-    if (
-        winner is not None
-        and winner.scope in client.read_only_scopes
-        and winner.scope not in done
-    ):
-        results.append(uninstall_one(client, winner.scope, winner, dry_run, target))
-    return results
+    results = []
+    for name, entries in found:
+        selected = [reg for reg in entries if scope is None or reg.scope == scope]
+        winner = client.effective(entries)
+        if (
+            winner is not None
+            and winner.scope in client.read_only_scopes
+            and winner not in selected
+        ):
+            selected.append(winner)
+        results.extend(
+            uninstall_one(client, reg.scope, reg, dry_run, target, name=name)
+            for reg in selected
+        )
+    return results or [Result(client.name, "absent", scope=scope)]
 
 
 def uninstall_one(
     client: Client,
     scope: str,
-    existing: Registration | None,
+    existing: Registration,
     dry_run: bool,
     target: Target | None = None,
+    *,
+    name: str = NAME,
 ) -> Result:
-    result = Result(client.name, "failed", scope=scope)
+    result = Result(
+        client.name, "failed", scope=scope, name=name if name != NAME else None
+    )
     try:
-        if existing is None:
-            result.action = "absent"
-            return result
         shown = existing.shown(target)
         result.command, result.args = shown["command"], shown.get("args")
         if scope in client.read_only_scopes and isinstance(client, Codex):
             raise ClientError(client.project_message())
-        if isinstance(client, Cursor):
+        if isinstance(client, (Codex, Cursor)):
             result.path = str(client.config_path(scope))
             steps: list[list[str]] = []
         else:
-            steps = client.remove_steps(scope)
+            steps = client.remove_steps(scope, name)
             result.argv = steps
         if dry_run:
             result.action, result.would = "planned", "removed"
             return result
-        if isinstance(client, Cursor):
-            client.write(scope, None)
+        if isinstance(client, (Codex, Cursor)):
+            client.write(scope, None, name=name)
         else:
             for argv in steps:
                 run(argv)
@@ -797,11 +913,529 @@ def uninstall_one(
                 # changed the client.
                 result.changed = True
         result.changed = True
-        client.verify(scope, None)
+        client.verify(scope, None, name=name)
         result.action = "removed"
     except (ClientError, OSError) as exc:
         result.action, result.error = "failed", str(exc)
     return result
+
+
+@dataclass(frozen=True)
+class StaleRegistration:
+    name: str
+    registration: Registration
+    reason: str
+    args: list[str] | None = None  # None means a manual edit is needed.
+
+
+def after_server_options(args: list[str], *, root: bool = False) -> list[str] | None:
+    """Consume options that leave the server command running."""
+    index = 0
+    while index < len(args):
+        flag, equals, value = args[index].partition("=")
+        if args[index] == "--":
+            return args[index + 1 :]
+        if root and args[index] == "--json":
+            index += 1
+            continue
+        key = ENDPOINT_FLAGS.get(flag)
+        if key is None and not (root and flag == "--as"):
+            break
+        if not equals:
+            index += 1
+            if index == len(args):
+                return None
+            value = args[index]
+        if key is not None:
+            try:
+                settings.parse_value(key, value)
+            except settings.SettingsError:
+                return None
+        index += 1
+    return args[index:]
+
+
+def serves_mcp(args: list[str]) -> bool:
+    command = after_server_options(args, root=True)
+    if not command or command[0] != "mcp":
+        return False
+    command = command[2:] if command[1:2] == ["--"] else command[1:]
+    return command[:1] == ["serve"] and after_server_options(command[1:]) == []
+
+
+def stale_registration(
+    client: Client, name: str, reg: Registration
+) -> StaleRegistration | None:
+    if not reg.argv:
+        return StaleRegistration(
+            name, reg, "Sai registration has no executable command"
+        )
+    command, *args = reg.argv
+    path = Path(command)
+    binary = path.name.removesuffix(".exe")
+    serve = serves_mcp(args)
+    if binary == RETIRED_NAME:
+        replacement = args if serve else ["mcp", "serve", *args]
+        return StaleRegistration(
+            name,
+            reg,
+            "Sai registration uses the retired executable",
+            replacement if serves_mcp(replacement) else None,
+        )
+    repair = args if binary == NAME and serve else None
+    on_path = shutil.which(command, path=client.environ.get("PATH"))
+    cached = binary == NAME and inside(
+        Path(on_path or command), uv_cache_dirs(client.environ, client.home)
+    )
+    if not on_path:
+        return StaleRegistration(
+            name, reg, "Sai registration points to a missing command", repair
+        )
+    if binary == NAME and not serve:
+        return StaleRegistration(
+            name, reg, "Sai registration does not run `sai mcp serve`"
+        )
+    if cached:
+        return StaleRegistration(
+            name, reg, "Sai registration points inside the uv cache", repair
+        )
+    if binary == NAME and not path.is_absolute():
+        return StaleRegistration(
+            name, reg, "Sai registration uses a relative command", repair
+        )
+    return None
+
+
+def repair_entry(
+    entries: MutableMapping[str, Any], stale: StaleRegistration
+) -> MutableMapping[str, Any]:
+    original = entries.get(stale.name)
+    if not isinstance(original, MutableMapping):
+        raise ClientError("The Sai registration changed concurrently")
+    args = original.get("args") or []
+    if (
+        not isinstance(args, list)
+        or [original.get("command"), *args] != stale.registration.argv
+    ):
+        raise ClientError("The Sai registration changed concurrently")
+    return original
+
+
+def edit_codex_config(
+    path: Path,
+    target: Target | None,
+    *,
+    stale: StaleRegistration | None = None,
+    name: str = NAME,
+) -> None:
+    """Change only Sai's table, publishing the complete config in one rename."""
+    name = stale.name if stale else name
+    for _ in range(2):
+        destination = path.resolve()
+        seen = read_bytes(destination)
+        try:
+            source = seen.decode() if seen is not None else ""
+            rendered = edit_codex_source(source, target, stale, name)
+            if unrelated_codex_settings(source, name) != unrelated_codex_settings(
+                rendered, name
+            ):
+                raise ClientError(
+                    "Could not preserve settings outside the Sai registration"
+                )
+        except (ValueError, TOMLKitError, TypeError):
+            raise ClientError("Could not edit Codex config.toml") from None
+        data = rendered.encode()
+        if data == seen or replace_bytes(path, data, seen, destination=destination):
+            return
+    raise ClientError("Codex config.toml changed while Sai was writing it")
+
+
+def edit_codex_source(
+    source: str, target: Target | None, stale: StaleRegistration | None, name: str
+) -> str:
+    doc = tomlkit.parse(source)
+    entries = doc.get("mcp_servers", {})
+    if not isinstance(entries, MutableMapping):
+        raise ClientError("Codex mcp_servers must be a table")
+    if target is None:
+        if entries.pop(name, None) is None:
+            return source
+        return keep_table_separators(source, doc.as_string())
+
+    original = repair_entry(entries, stale) if stale else entries.get(NAME)
+    entry: MutableMapping[str, Any]
+    if isinstance(original, MutableMapping):
+        entry = original
+    else:
+        entry = (
+            tomlkit.inline_table()
+            if isinstance(entries, InlineTable)
+            else tomlkit.table()
+        )
+    if not stale:
+        for key in list(entry):
+            if key not in ("command", "args") and (key != "env" or not target.env):
+                del entry[key]
+        if target.env:
+            env = tomlkit.inline_table()
+            env.update(target.env)
+            entry["env"] = env
+    if entry.get("command") != target.argv[0]:
+        entry["command"] = target.argv[0]
+    if entry.get("args") != target.argv[1:]:
+        entry["args"] = target.argv[1:]
+    if original is entry:
+        return keep_table_separators(source, doc.as_string())
+    if isinstance(entries, InlineTable):
+        entries[NAME] = entry
+        return doc.as_string()
+    # Appending a new header to the original text leaves root-level dotted
+    # keys in place. Inserting a header through the AST can capture them.
+    table = tomlkit.table(is_super_table=True)
+    table[NAME] = entry
+    addition = tomlkit.document()
+    addition["mcp_servers"] = table
+    separator = "" if not source or source.endswith("\n") else "\n"
+    return source + separator + addition.as_string()
+
+
+def keep_table_separators(source: str, rendered: str) -> str:
+    """Keep comments and whitespace between a removed table and its neighbors."""
+    before = source.splitlines(keepends=True)
+    after = rendered.splitlines(keepends=True)
+    result = []
+    for tag, start, end, left, right in SequenceMatcher(
+        None, before, after
+    ).get_opcodes():
+        result.extend(after[left:right])
+        if tag in ("delete", "replace"):
+            tail = end
+            while tail > start and (
+                not before[tail - 1].strip()
+                or before[tail - 1].lstrip().startswith("#")
+            ):
+                tail -= 1
+            trivia = before[tail:end]
+            if trivia and after[max(left, right - len(trivia)) : right] != trivia:
+                result.extend(trivia)
+    return "".join(result)
+
+
+def unrelated_codex_settings(source: str, name: str) -> dict[str, Any]:
+    """Check the resulting TOML independently of the editor's in-memory tree."""
+    doc = tomllib.loads(source)
+    if entries := doc.get("mcp_servers"):
+        entries.pop(name, None)
+    if doc.get("mcp_servers") == {}:
+        del doc["mcp_servers"]
+    return doc
+
+
+@dataclass
+class ClientConfig:
+    entries: MutableMapping[str, Any]
+    render: Callable[[], str]
+    seen: bytes | None
+    destination: Path
+
+
+def read_client_config(client: Client, scope: str, path: Path) -> ClientConfig:
+    """Read an editable scope. Keep the full entry local to the repair."""
+    destination = path.resolve()
+    seen = read_bytes(destination)
+    raw = seen.decode() if seen is not None else ""
+    data = json.loads(raw) if seen is not None else {}
+    if not isinstance(data, dict):
+        raise ClientError("Expected an MCP config object")
+    holder = data
+    if scope == "local":
+        projects = data.get("projects", {})
+        holder = projects.get(str(client.cwd)) if isinstance(projects, dict) else None
+        if not isinstance(holder, dict):
+            raise ClientError("Could not find the local MCP config")
+    entries = holder.setdefault("mcpServers", {})
+
+    def render() -> str:
+        return json.dumps(data, indent=2) + "\n"
+
+    if not isinstance(entries, MutableMapping):
+        raise ClientError("Expected a table of MCP servers")
+    return ClientConfig(entries, render, seen, destination)
+
+
+def repair_path(client: Client, scope: str) -> Path:
+    if isinstance(client, Claude):
+        if scope == "project" and client.cwd is None:
+            raise ClientError("No working directory for the project registration")
+        if scope == "project":
+            assert client.cwd is not None
+            return client.cwd / ".mcp.json"
+        return client.config_path()
+    assert isinstance(client, Cursor)
+    return client.config_path(scope)
+
+
+def replace_registration(
+    client: Client, stale: StaleRegistration, target: Target
+) -> None:
+    """Automatically repair an existing Codex or Cursor entry."""
+    scope, name = stale.registration.scope, stale.name
+    if stale.args is None or scope in client.read_only_scopes:
+        raise ClientError("This registration needs a manual edit")
+    if isinstance(client, Codex):
+        expected = Target([target.argv[0], *stale.args])
+        path = client.config_path(scope)
+        edit_codex_config(path, expected, stale=stale)
+        actual = client.get(client.neutral_dir(), "user", name)
+        if actual is None or actual.argv != expected.argv:
+            raise ClientError("Codex did not load the repaired Sai registration")
+        return
+    if not isinstance(client, Cursor):
+        raise ClientError("Only Codex and Cursor support automatic repair")
+    replace_json_registration(client, stale, target.argv[0], stale.args)
+
+
+def replace_json_registration(
+    client: Claude | Cursor, stale: StaleRegistration, launcher: str, args: list[str]
+) -> None:
+    scope, name = stale.registration.scope, stale.name
+    path = repair_path(client, scope)
+    config = read_client_config(client, scope, path)
+    if isinstance(client, Claude):
+        entry = config.entries.get(name)
+        if (
+            not isinstance(entry, MutableMapping)
+            or entry_registration(entry, scope) != stale.registration
+        ):
+            raise ClientError("The Sai registration changed concurrently")
+    else:
+        entry = repair_entry(config.entries, stale)
+    entry["command"], entry["args"] = launcher, args
+    # Publish a complete entry in one rename. In particular, Claude must
+    # never observe a replacement that is missing its profile or endpoints.
+    if not replace_bytes(
+        path, config.render().encode(), config.seen, destination=config.destination
+    ):
+        raise ClientError("The Sai registration changed concurrently")
+
+
+def claude_repair_args(stale: StaleRegistration) -> list[str] | None:
+    if stale.args is not None:
+        return stale.args
+    if not stale.registration.argv:
+        return None
+    args = stale.registration.argv[1:]
+    if serves_mcp(args):
+        return args
+    replacement = ["mcp", "serve", *args]
+    return replacement if serves_mcp(replacement) else None
+
+
+def repair_claude_existing(
+    client: Claude,
+    scope: str,
+    name: str,
+    target: Target,
+    dry_run: bool,
+    *,
+    reset_args: bool,
+) -> Result:
+    """Explicitly repair a named entry. Refuse if the entry disappeared."""
+    result = Result(client.name, "failed", scope=scope, name=name)
+    try:
+        existing = client.registration(scope, name)
+        if existing is None:
+            raise ClientError(f"No existing {name} registration in {scope} scope")
+        if not existing.stdio:
+            raise ClientError("The existing Claude Code entry uses a remote transport")
+        stale = stale_registration(client, name, existing)
+        if stale is None:
+            result.action = "unchanged"
+            return result
+        args = target.argv[1:] if reset_args else claude_repair_args(stale)
+        if args is None:
+            raise ClientError(
+                "Unsupported server arguments. Use --reset-args to replace them with the defaults."
+            )
+        if dry_run:
+            result.action, result.would = "planned", "replaced"
+        else:
+            replace_json_registration(client, stale, target.argv[0], args)
+            result.action, result.changed = "replaced", True
+    except ClientError as exc:
+        result.error = str(exc)
+    except (OSError, ValueError):
+        result.error = "Could not edit the Claude Code registration"
+    return result
+
+
+def check_registration(
+    client: Client,
+    target: Target | None,
+    *,
+    fix: bool,
+    compare_profile: bool,
+) -> RegistrationCheck:
+    """Inspect recognized Sai registrations without exposing client data."""
+    name = client.name
+    install = f"Run `sai mcp install {name}`"
+    if isinstance(client, Codex) and not client.exe():
+        return RegistrationCheck(
+            name, "fail", "Could not inspect Sai registration", "Put `codex` on PATH"
+        )
+    try:
+        found = [
+            (server, reg)
+            for server in SERVER_NAMES
+            for reg in client.registrations(server)
+        ]
+        inspected = [
+            (reg, stale_registration(client, server, reg)) for server, reg in found
+        ]
+    except (ClientError, OSError, ValueError):
+        return RegistrationCheck(
+            name, "fail", "Could not read the client's Sai registrations", install
+        )
+    if not found:
+        return RegistrationCheck(name, "warn", "Sai is not registered", install)
+    stale = [issue for _, issue in inspected if issue is not None]
+    legacy_name = any(server == RETIRED_NAME for server, _ in found)
+    legacy_warning = f"Sai retains its existing {RETIRED_NAME} registration name"
+    if stale and isinstance(client, Claude):
+        repairs = tuple(
+            ClaudeRepair(
+                issue.registration.scope, issue.name, claude_repair_args(issue) is None
+            )
+            for issue in stale
+            if issue.registration.stdio
+        )
+        hint = claude_repair_hint(repairs) if repairs else ""
+        if len(repairs) < len(stale):
+            hint = (
+                hint + " Review the remote Sai registration in Claude Code."
+            ).strip()
+        return RegistrationCheck(
+            name,
+            "fail",
+            ". ".join(
+                f"{issue.registration.scope} {issue.name}: {issue.reason}"
+                for issue in stale
+            ),
+            hint,
+            legacy_name=legacy_name,
+            manual_repairs=repairs,
+        )
+    expected_env = server_env(client.environ) if compare_profile else {}
+    different_profile = compare_profile and any(
+        not reg.matches_sai_home(expected_env) for reg, _ in inspected
+    )
+    pinned = target is not None and any(
+        reg.argv
+        and Path(reg.argv[0]).is_absolute()
+        and issue is None
+        and Path(reg.argv[0]).resolve() != Path(target.argv[0]).resolve()
+        for reg, issue in inspected
+    )
+    changes, failures = [], []
+    for issue in stale:
+        scope = issue.registration.scope
+        if issue.args is None or scope in client.read_only_scopes:
+            failures.append(
+                (issue.reason, "Edit the Sai registration in this client's config")
+            )
+        elif target is None:
+            failures.append((issue.reason, "Install a stable Sai launcher on PATH"))
+        elif not fix:
+            failures.append((issue.reason, "Run `sai doctor` with fixes enabled"))
+        else:
+            try:
+                replace_registration(client, issue, target)
+            except (ClientError, OSError, ValueError, TOMLKitError, TypeError):
+                failures.append(
+                    (
+                        f"{issue.reason}. Could not repair the {scope} registration",
+                        "Check this client's Sai registration and rerun `sai doctor`",
+                    )
+                )
+            else:
+                changes.append(f"Repaired the Sai registration in {scope} scope")
+    if changes and isinstance(client, Codex) and not failures:
+        # A project entry identical to the old user entry only becomes
+        # visible to the adapter after the user entry changes.
+        try:
+            if any(
+                stale_registration(client, server, reg) is not None
+                for server in SERVER_NAMES
+                for reg in client.registrations(server)
+            ):
+                failures.append(
+                    (
+                        "A stale Codex project registration is still active",
+                        "Edit the Sai registration in .codex/config.toml",
+                    )
+                )
+        except (ClientError, OSError, ValueError):
+            failures.append(
+                (
+                    "Could not verify the Codex registration",
+                    "Check the Sai registration and rerun `sai doctor`",
+                )
+            )
+    if failures:
+        summary, hint = failures[0]
+        if legacy_name:
+            summary += f". {legacy_warning}"
+        return RegistrationCheck(
+            name,
+            "fail",
+            summary,
+            hint,
+            tuple(changes),
+            legacy_name=legacy_name,
+        )
+    if pinned or different_profile or legacy_name:
+        warnings = []
+        if pinned:
+            warnings.append("Sai uses a pinned launcher from a different install")
+        if different_profile:
+            warnings.append("Sai registration has a different SAI_HOME setting")
+        if legacy_name:
+            warnings.append(legacy_warning)
+        return RegistrationCheck(
+            name,
+            "warn",
+            ". ".join(warnings),
+            "Check SAI_HOME in the client registration" if different_profile else None,
+            changes=tuple(changes),
+            pinned=pinned,
+            legacy_name=legacy_name,
+        )
+    if not changes:
+        return RegistrationCheck(name, "pass", "Sai registration is current")
+    return RegistrationCheck(
+        name, "fixed", "Sai registration repaired", changes=tuple(changes)
+    )
+
+
+def check_registrations(
+    target: Target | None,
+    *,
+    fix: bool,
+    cwd: Path | None,
+    compare_profile: bool = False,
+) -> list[RegistrationCheck]:
+    """Report only for detected clients, without running any registered server."""
+    clients = make_clients(Path.home(), os.environ, cwd)
+    return [
+        check_registration(
+            client,
+            target,
+            fix=fix,
+            compare_profile=compare_profile,
+        )
+        for client in clients.values()
+        if client.detected()[0]
+    ]
 
 
 def summarize(results: list[Result]) -> dict[str, Any]:

@@ -53,7 +53,7 @@ The wait entries reserve fields for the intent wait implementation.
 | `intent.status_write_failed` | `core.intents._record_submission_status` | `warn` | `intentKey` (string), `addr` (string), `endpoint` (string), `status` (string), `errorType` (string), `code` (string) | `endpointId` (string) |
 | `intent.wait.start` | `core intent wait (lane A4)` | `info` | `intentKey` (string) | `addr` (string), `endpoint` (string), `endpointId` (string), `timeoutMs` (integer) |
 | `intent.wait.end` | `core intent wait (lane A4)` | `info`, `warn`, `error` | `intentKey` (string), `status` (string), `durationMs` (integer) | `addr` (string), `endpoint` (string), `endpointId` (string), `txHash` (string), `txHashInvalid` (boolean), `fillBlock` (integer), `code` (string), `error` (string) |
-| `keeper.request` | `core.keeper._log_request` | `info`, `warn` | `operation` (string), `endpoint` (string), `authenticated` (boolean), `durationMs` (integer), `status` (string) | `addr` (string), `intentKey` (string), `endpointId` (string), `code` (string), `error` (string), `httpStatus` (integer), `keeperErrors` (object[]) |
+| `keeper.request` | `core.keeper._log_request` | `info`, `warn` | `operation` (string), `endpoint` (string), `authenticated` (boolean), `durationMs` (integer), `status` (string) | `addr` (string), `intentKey` (string), `endpointId` (string), `code` (string), `error` (string), `httpStatus` (integer), `keeperErrors` (object[]), `keeperErrorCount` (integer) |
 | `log.dropped` | `core.log._write` | `warn` | `count` (integer) | None |
 | `mcp.server_start` | `mcp_server.server.serve` | `info` | `keeper` (string), `websocket` (string), `lcd` (string) | None |
 | `mcp.tool_call` | `mcp_server.server.SaiMCP.call_tool` | `info` | `tool` (string), `callId` (string), `arguments` (object) | `unknownArguments` (integer) |
@@ -63,6 +63,7 @@ The wait entries reserve fields for the intent wait implementation.
 | `session.removed` | `core.storage.delete_session` | `info`, `warn` | None | `addr` (string), `connectedAccounts` (integer), `code` (string), `reason` (string) |
 | `session.saved` | `core.storage.save_session` | `info` | `addr` (string), `expiresAt` (string), `connectedAccounts` (integer) | `endpoint` (string) |
 | `update.check` | `sai_cli.check_update` | `info`, `warn` | `ok` (boolean) | `installed` (string), `latest` (string), `updateAvailable` (boolean), `installKind` (string), `code` (string), `error` (string) |
+| `update.mcp_repair` | `core.updater.repair_after_update` | `info`, `warn` | `background` (boolean), `clients` (object[]), `notes` (string[]) | None |
 | `update.result` | `sai_cli.log_update` | `info`, `warn` | `status` (string), `rolledBack` (boolean), `background` (boolean) | `installed` (string), `target` (string), `message` (string), `code` (string) |
 | `update.scheduled` | `core.updater.tick` | `info` | None | None |
 | `watch.disconnected` | `sai_cli.watch_stream` | `warn` | `code` (string), `errorType` (string), `endpoint` (string) | None |

@@ -10,12 +10,16 @@ The local commands `sai auth status`, `list`, `use`, and `logout`, and
 `sai intent local ADDR`, share Python's session files and intent database.
 Rust auth output displays only the Keeper URL's scheme, host, and port.
 Session binding and ledger lookups use the full endpoint.
+Run `sai intent status ADDR --key KEY` to reconcile one intent, or omit
+`--key` to list the account's recent Keeper records. With `--json`, command
+failures use the same error codes and envelope as the Python CLI.
 
 ## Port Order
 
-This push covers C0 through C3. C2 and C3 use Python tag `sai-cli/v0.1.1`
-as their parity reference. C4 and later wait for `sai-cli/v0.1.2`, after
-Python ships logging v2 and intent wait. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
+C2 and C3 use Python tag `sai-cli/v0.1.1` as their parity reference. C4
+uses Python commit `5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf` for
+Keeper requests, reconciliation, structured errors, and emitted events.
+Logging v2 and intent wait have their own port work. [Port tracker #49](https://github.com/SaiDotFun/open-sai/issues/49).
 
 | Lane | Acceptance criteria |
 | --- | --- |
@@ -63,6 +67,11 @@ storage_parity -- --include-ignored`. This requires `uv`. Set
 `SAI_PYTHON_REFERENCE` to the absolute path of the pinned Python checkout.
 By default the tests use the Python package in this workspace. The
 next-oracle ledger case requires Python commit `3bacd9a` or later.
+
+Run `SAI_PARITY_BIN="$PWD/target/debug/sai" uv run pytest tests/parity`
+after `just rust-build` to compare `sai intent status` against the Python
+package in this checkout. The tests reuse the recorded Keeper outcomes
+and compare request bytes and counts, ledger rows, and log events.
 
 Native archives and compatible shim wheels ship on the existing
 `sai-cli/v*` tags with SHA-256 checksums. Each shim version fetches and

@@ -32,6 +32,9 @@ def test_retired_mcp_names_do_not_reappear():
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
+        if path.relative_to(ROOT).as_posix() == "cli/sai_cli/mcp_install.py":
+            # The migration recognizes this name solely to remove it.
+            text = text.replace(f'RETIRED_NAME = "{RETIRED[0]}"', "", 1)
         for name in RETIRED:
             if name in text:
                 found.append(f"{path.relative_to(ROOT)}: {name}")

@@ -12,13 +12,13 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from multiprocessing.queues import Queue
 from pathlib import Path
 from typing import Any
 
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import KeeperHandler, keeper_server
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from sai_cli.core import keeper, reconcile, settings, storage
@@ -86,9 +86,9 @@ def submitted_keys() -> list[str]:
 def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]]]:
     replies: deque[Reply] = deque()
 
-    class Handler(BaseHTTPRequestHandler):
+    class Handler(KeeperHandler):
         def do_POST(self) -> None:
-            request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            request = self.read_json()
             if request["query"] == keeper.SUBMIT:
                 submitted_keys.append(request["variables"]["input"]["intentKey"])
             queued = replies.popleft()
@@ -122,25 +122,11 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                 assert request["variables"] == {"trader": ADDR}
             elif "borrowings" in reply["data"].get("perp", {}):
                 assert request["query"] == keeper.MARKETS
-            body = json.dumps(reply).encode()
-            self.send_response(200)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
+            self.reply(reply)
 
-        def log_message(self, format: str, *args: Any) -> None:
-            pass
-
-    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as http:
-        thread = threading.Thread(target=http.serve_forever, args=(0.01,), daemon=True)
-        thread.start()
-        try:
-            yield f"http://127.0.0.1:{http.server_port}/query", replies
-            assert not replies
-        finally:
-            http.shutdown()
-            thread.join()
+    with keeper_server(Handler) as base:
+        yield f"{base}/query", replies
+        assert not replies
 
 
 def status(endpoint: str) -> str:
@@ -288,10 +274,16 @@ def test_unindexed_sweep_then_filled_through_cli_and_mcp(keeper_replay):
     replies.extend(("filled", "not_yet_in_history", "filled_history"))
     result = cli()
     assert result["userIntents"][0]["lifecycleStep"] == "exec_pass"
-    assert (
-        result["matchedTradeHistory"]
-        == RESPONSES["filled_history"]["data"]["perp"]["tradeHistory"]
-    )
+    assert result["matchedTradeHistory"] == [
+        {
+            "id": 1007,
+            "intentKey": KEY,
+            "tradeChangeType": "position_opened",
+            "txHash": "a" * 64,
+            "block": {"block": 50109596, "block_ts": "2026-11-20T15:43:31.000Z"},
+            "trade": {"id": 7, "trader": NIBI_ADDR},
+        }
+    ]
     assert status(endpoint) == "terminal"
 
     replies.append("pending_exec")

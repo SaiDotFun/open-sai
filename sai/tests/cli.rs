@@ -108,12 +108,12 @@ fn malformed_config_fails_without_echoing_file_contents_or_logging() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .starts_with(&format!("Error: Cannot parse {}:", path.display()))
-    );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("fixture_secret"));
+    assert!(output.stderr.is_empty());
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "INVALID_REQUEST");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.starts_with(&format!("Cannot parse {}:", path.display())));
+    assert!(!message.contains("fixture_secret"));
     assert!(!root.path().join("logs").exists());
 }
 
@@ -289,8 +289,10 @@ fn multiline_inline_table_is_invalid_in_toml_1_0() {
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(1));
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Cannot parse"));
+    assert!(output.stderr.is_empty());
+    let error = &serde_json::from_slice::<Value>(&output.stdout).unwrap()["error"];
+    assert_eq!(error["code"], "INVALID_REQUEST");
+    assert!(error["message"].as_str().unwrap().contains("Cannot parse"));
 }
 
 #[test]
@@ -533,4 +535,30 @@ fn repeating_the_key_reports_only_the_extra_operand() {
         events[1]["error"],
         "Got unexpected extra argument (logs.enabled)"
     );
+}
+
+#[test]
+fn usage_errors_keep_json_at_every_supported_option_position() {
+    let home = tempdir().unwrap();
+    for args in [
+        ["--json", "intent", "status"],
+        ["intent", "--json", "status"],
+        ["intent", "status", "--json"],
+        ["auth", "--json", "use"],
+        ["auth", "use", "--json"],
+    ] {
+        let output = sai(home.path()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.is_empty());
+        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["error"]["code"], "INVALID_REQUEST");
+        assert_eq!(body["error"]["message"], "Missing argument 'ADDR'.");
+    }
+    let output = sai(home.path())
+        .args(["intent", "status", "--", "--json", "extra"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
 }

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import dataclasses
 import json
 import os
 import shlex
@@ -794,7 +793,8 @@ def positions(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def history(ctx: click.Context, addr: str) -> None:
     """Read trade history for ADDR."""
-    perform_query(ctx, keeper.HISTORY, {"trader": addr})
+    data = keeper.request(keeper_url(ctx), keeper.HISTORY, {"trader": addr})
+    emit(ctx, keeper.safe_history_response(data))
 
 
 @account.command("balances")
@@ -828,7 +828,8 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
 
     Use --key to check one intent for a final outcome.
     """
-    emit(ctx, reconcile.reconcile(keeper_url(ctx), addr, key))
+    data = reconcile.reconcile(keeper_url(ctx), addr, key)
+    emit(ctx, reconcile.status_report(data))
 
 
 @intent.command("local")
@@ -1127,25 +1128,35 @@ def doctor_command(
     ws_endpoint: str | None,
     lcd_endpoint: str | None,
 ) -> None:
-    """Check the install, session, intent ledger, and endpoints, and fix what
-    is safe to fix.
+    """Check the install, config, MCP registrations, session, intent ledger,
+    and endpoints.
 
-    Fixes: create $SAI_HOME/trader, make it, $SAI_HOME/logs, and their files
-    private, migrate the intent ledger, and reconcile unknown intents for the signed-in
-    account with Keeper (a read; no trade is placed or cancelled). It never
-    deletes or rewrites the session, and never prints its token. Each check
-    prints pass, fixed, warn, fail, or skipped, with a fix for the rest. Exits
-    1 if any check still fails.
+    With fixes enabled, doctor makes trader and log files private, repairs
+    stale Codex and Cursor MCP registrations, migrates the intent ledger,
+    and reconciles unknown intents for the signed-in account with Keeper.
+    It reports stale Claude Code registrations with a command to repair
+    each existing entry. It never deletes or rewrites the session, and
+    never prints its token. Each check prints pass, fixed, warn, fail, or
+    skipped. Doctor exits 1 if any check still fails.
     """
     from . import doctor
 
-    config = dataclasses.replace(
-        settings(ctx),
-        ws_endpoint=ws_url(ctx, ws_endpoint),
-        lcd_endpoint=lcd_url(ctx, lcd_endpoint),
-    )
-    checks = doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline))
+    flags = dict(ctx.find_root().obj["flags"])
+    for key, value in (
+        ("keeper.ws_endpoint", ws_endpoint),
+        ("lcd.endpoint", lcd_endpoint),
+    ):
+        if value:
+            flags[key] = value
+    config_check, config = doctor.check_config(flags)
+    checks = [
+        config_check,
+        *doctor.run_checks(doctor.context(config, fix=not no_fix, offline=offline)),
+    ]
     overall = doctor.overall(checks)
+    code = (
+        Code.INVALID_REQUEST if config_check.status == "fail" else Code.INTERNAL_ERROR
+    )
     log.event(
         "doctor.result",
         "info" if overall == "pass" else "warn",
@@ -1153,7 +1164,7 @@ def doctor_command(
         fix=not no_fix,
         offline=offline,
         checks=[doctor.log_entry(check) for check in checks],
-        code=Code.INTERNAL_ERROR if overall == "fail" else None,
+        code=code if overall == "fail" else None,
     )
     if overall == "fail":
         if not ctx.obj["json"]:
@@ -1166,7 +1177,7 @@ def doctor_command(
                 if check.status == "fail"
             )
         raise SaiError(
-            report, details=doctor.report(checks) if ctx.obj["json"] else None
+            report, code, details=doctor.report(checks) if ctx.obj["json"] else None
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
@@ -1549,11 +1560,12 @@ def finish(ctx: click.Context, results: list[mcp_install.Result]) -> None:
 
 SCOPE_OPTION = click.option(
     "--scope",
-    type=click.Choice(mcp_install.SCOPES),
+    type=click.Choice(mcp_install.UNINSTALL_SCOPES),
     default="user",
     show_default=True,
     help="user: every project. project: this directory's shared config"
-    " (Claude Code .mcp.json, Cursor .cursor/mcp.json). Codex is user only.",
+    " (Claude Code .mcp.json, Cursor .cursor/mcp.json)."
+    " local: this directory's Claude Code local config. Codex is user only.",
 )
 
 
@@ -1582,6 +1594,17 @@ def mcp_list(ctx: click.Context) -> None:
 
 @mcp_group.command("install", cls=ArgvAfterDash)
 @click.argument("clients", nargs=-1)
+@click.option("--client", "client_options", multiple=True, help="Name a client.")
+@click.option(
+    "--repair-existing",
+    type=click.Choice(mcp_install.SERVER_NAMES),
+    help="Repair only this existing Claude Code entry in the selected scope.",
+)
+@click.option(
+    "--reset-args",
+    is_flag=True,
+    help="Use default server arguments when repairing an existing entry.",
+)
 @click.option("--all", "all_clients", is_flag=True, help="Every detected client.")
 @click.option("--dry-run", is_flag=True, help="Show the changes; make none.")
 @SCOPE_OPTION
@@ -1589,6 +1612,9 @@ def mcp_list(ctx: click.Context) -> None:
 def mcp_install_command(
     ctx: click.Context,
     clients: tuple[str, ...],
+    client_options: tuple[str, ...],
+    repair_existing: str | None,
+    reset_args: bool,
     all_clients: bool,
     dry_run: bool,
     scope: str,
@@ -1603,9 +1629,34 @@ def mcp_install_command(
     With no CLIENT and no --all, a terminal asks which clients to register;
     without a terminal, this lists detected clients and changes nothing.
     """
+    names = chosen_clients((*clients, *client_options))
+    if reset_args and repair_existing is None:
+        raise click.UsageError("--reset-args requires --repair-existing.")
+    if repair_existing is not None and (
+        names != ["claude"] or all_clients or ctx.meta.get("server_argv")
+    ):
+        raise click.UsageError(
+            "--repair-existing requires --client claude and the default server command."
+        )
     found = mcp_clients()
     target = server_target(ctx)
-    names = chosen_clients(clients)
+    if repair_existing is not None:
+        claude = found["claude"]
+        assert isinstance(claude, mcp_install.Claude)
+        finish(
+            ctx,
+            [
+                mcp_install.repair_claude_existing(
+                    claude,
+                    scope,
+                    repair_existing,
+                    target,
+                    dry_run,
+                    reset_args=reset_args,
+                )
+            ],
+        )
+        return
     detected = [n for n, c in found.items() if c.detected()[0]]
     if all_clients:
         names = list(dict.fromkeys([*names, *detected]))
@@ -1626,6 +1677,8 @@ def mcp_install_command(
         if not detected:
             raise click.UsageError("No agent clients found; name one to register.")
         names = pick("Register Sai with (numbers, names, or all)", detected)
+    if scope == "local" and names != ["claude"]:
+        raise click.UsageError("Install scope local requires the Claude Code client.")
     results = [mcp_install.install_one(found[n], scope, target, dry_run) for n in names]
     finish(ctx, results)
 
@@ -1650,7 +1703,7 @@ def mcp_uninstall(
 ) -> None:
     """Remove Sai from Claude Code, Codex, or Cursor.
 
-    Removes sai from every scope it is registered in for each client, unless
+    Removes canonical and legacy Sai entries from every scope for each client, unless
     --scope names one. With no CLIENT and no --all, a terminal asks which to
     remove; without a terminal this is a usage error that names where Sai is
     registered.
@@ -2059,8 +2112,8 @@ def update_command(
     Downloads the release wheel, checks it against the release's SHA256SUMS,
     installs it with `uv tool install`, and then runs the new version. If any
     step fails, the previous version stays or is put back. The `sai` path and
-    everything under $SAI_HOME stay as they are, so registered MCP clients
-    keep working; restart them to load the new version.
+    your Sai data stay in place. The update repairs stale MCP registrations.
+    Restart agent clients to load the new version.
 
     Only a `uv tool install` of a release or of the official Git source is
     updated; a checkout, uvx, or other install gets a note and exit code 3.
@@ -2114,6 +2167,8 @@ def update_command(
         emit(ctx, outcome.to_json())
     else:
         click.echo(outcome.message)
+        if notice := updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes):
+            click.echo(notice)
 
 
 if __name__ == "__main__":

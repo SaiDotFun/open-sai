@@ -4,7 +4,8 @@ fix the rest.
 Each check returns pass, warn, fail, skipped, or fixed. A fixed check lists
 what it changed in `changes`. Doctor fixes only what it can from inspection:
 it creates `$SAI_HOME/trader`, tightens file modes there and under
-`$SAI_HOME/logs`, migrates the intent ledger, and reconciles unknown intents for the signed-in account with Keeper
+`$SAI_HOME/logs`, repairs stale MCP registrations, migrates the intent ledger,
+and reconciles unknown intents for the signed-in account with Keeper
 (a read; no trade is placed or cancelled). It never deletes or rewrites the
 session. `--no-fix` reports without changing anything.
 
@@ -35,11 +36,13 @@ from importlib import metadata
 from pathlib import Path
 from typing import Any
 
+from . import mcp_install
 from .core import (
     keeper,
     log,
     margin,
     reconcile,
+    settings,
     storage,
     stream,
     update,
@@ -95,9 +98,85 @@ class Context:
     offline: bool = False
     # How this copy was installed; None detects it from the running prefix.
     install: update.Install | None = None
+    config_available: bool = True
 
 
 CheckFn = Callable[[Context], "Check | Sequence[Check]"]
+
+
+def check_config(
+    flags: dict[str, str | None],
+) -> tuple[Check, Settings | None]:
+    """Validate file settings before resolving flag and environment overrides."""
+    path = settings.config_path(os.environ)
+    fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
+    try:
+        values, warnings = settings.read_file(path)
+    except settings.ConfigError as exc:
+        return Check("config", "fail", exc.diagnostic, fix), None
+    try:
+        config = settings.resolve(flags, os.environ, values)
+    except ValueError:
+        return Check(
+            "config",
+            "fail",
+            "A flag or environment setting is invalid",
+            "Check the settings listed by `sai config --help`",
+        ), None
+    invalid = [
+        key for key, value in values.items() if isinstance(value, settings.Invalid)
+    ]
+    if invalid:
+        return Check(
+            "config", "fail", f"Invalid config.toml settings: {', '.join(invalid)}", fix
+        ), config
+    invalid_env = [
+        f"{spec.env} ({spec.key})"
+        for spec in settings.SETTINGS
+        if config.sources[spec.key] == "invalid"
+        and os.environ.get(spec.env, "").strip()
+    ]
+    if invalid_env:
+        return Check(
+            "config",
+            "warn",
+            f"Invalid environment settings: {', '.join(invalid_env)}",
+            "Correct or unset the listed environment variables",
+        ), config
+    if warnings:
+        return Check(
+            "config", "warn", "config.toml contains unknown settings", fix
+        ), config
+    return Check("config", "pass", "Config file settings are valid"), config
+
+
+def check_mcp(ctx: Context) -> list[Check]:
+    home = Path.home()
+    install = ctx.install or update.install_kind()
+    target = None
+    if install.official:
+        launcher = updater.registered_launcher(Path(install.prefix))
+        if launcher is not None and shutil.which(str(launcher)):
+            target = mcp_install.launcher_target(str(launcher), os.environ)
+    else:
+        try:
+            target, _ = mcp_install.server_target(
+                None, os.environ, home, mcp_install.running_prefix()
+            )
+        except mcp_install.InstallError:
+            pass
+    return [
+        Check(
+            f"mcp.{result.client}",
+            result.status,
+            result.summary,
+            result.fix,
+            changes=list(result.changes),
+        )
+        for result in mcp_install.check_registrations(
+            target, fix=ctx.fix, cwd=Path.cwd(), compare_profile=True
+        )
+    ]
 
 
 def log_entry(check: Check) -> dict[str, Any]:
@@ -1047,6 +1126,7 @@ LOCAL_CHECKS: list[tuple[str, CheckFn]] = [
     ("version", check_version),
     ("home", check_home),
     ("logs", check_logs),
+    ("mcp", check_mcp),
     ("session", check_session),
     ("intents", check_intents),
 ]
@@ -1121,10 +1201,19 @@ def run_checks(ctx: Context) -> list[Check]:
     """Run local checks in order, then network checks in parallel."""
     checks: list[Check] = []
     for name, fn in LOCAL_CHECKS:
-        checks.extend(timed(name, fn, ctx))
+        if not ctx.config_available and name in ("session", "intents"):
+            checks.append(Check(name, "skipped", "Settings could not be loaded"))
+        else:
+            checks.extend(timed(name, fn, ctx))
     if ctx.offline:
         checks.extend(
             Check(name, "skipped", "Skipped with --offline")
+            for name, _fn in NETWORK_CHECKS
+        )
+        return checks
+    if not ctx.config_available:
+        checks.extend(
+            Check(name, "skipped", "Settings could not be loaded")
             for name, _fn in NETWORK_CHECKS
         )
         return checks
@@ -1162,7 +1251,7 @@ def session_state(config: Settings) -> dict[str, Any]:
 
 
 def context(
-    config: Settings,
+    config: Settings | None,
     path_env: str | None = None,
     *,
     fix: bool = True,
@@ -1171,10 +1260,11 @@ def context(
     return Context(
         fix=fix,
         offline=offline,
-        config=config,
-        session=session_state(config),
+        config=config if config is not None else settings.resolve({}, {}, {}),
+        session=session_state(config) if config is not None else {},
         now=datetime.now(UTC),
         path_env=os.environ.get("PATH", "") if path_env is None else path_env,
+        config_available=config is not None,
     )
 
 
