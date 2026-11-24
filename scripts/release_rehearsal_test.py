@@ -544,3 +544,47 @@ query($user: String!, $key: String) {
             )
         with error.exception as response:
             self.assertEqual(response.code, 400)
+
+    def test_rejects_invalid_intent_filter_variable_declarations(self) -> None:
+        query = """
+query($user: String!, $key: String, $other: DECLARATION) {
+  userIntents(where: {user: $user, intentKey: $key}) { intentKey }
+  invalid: userIntents(where: {FILTER}) { intentKey }
+}
+"""
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            cases = (
+                ("Int", "user: $user, intentKey: $other", self.key),
+                ("[String]", "user: $other, intentKey: $key", self.replay.addr),
+                ("String = 7", "user: $user, intentKey: $other", self.key),
+                ("String = $key", "user: $user, intentKey: $other", self.key),
+                ("String! = null", "user: $user, intentKey: $other", self.key),
+            )
+            for declaration, filters, value in cases:
+                with self.subTest(declaration=declaration):
+                    with self.assertRaises(HTTPError) as error:
+                        self.query(
+                            base,
+                            query.replace("DECLARATION", declaration).replace(
+                                "FILTER", filters
+                            ),
+                            user=self.replay.addr,
+                            key=self.key,
+                            other=value,
+                        )
+                    with error.exception as response:
+                        self.assertEqual(response.code, 400)
+
+    def test_uses_intent_filter_defaults_only_for_omitted_variables(self) -> None:
+        query = (
+            f"query($user: String! = {json.dumps(self.replay.addr)},"
+            f" $key: String = {json.dumps(self.key)}) {{"
+            " matched: userIntents(where: {user: $user, intentKey: $key}) { intentKey } }"
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            self.assertEqual(
+                self.query(base, query), {"matched": [{"intentKey": self.key}]}
+            )
+            for key in (None, "wrong-key"):
+                with self.subTest(key=key):
+                    self.assertEqual(self.query(base, query, key=key), {"matched": []})

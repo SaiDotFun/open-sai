@@ -397,7 +397,7 @@ def selection_set(
 ) -> tuple[SelectedField, ...]:
     """Parse inline field selections and resolve their supplied variables."""
     bindings = variables or {}
-    declared: set[str] = set()
+    declared: dict[str, tuple[str | None, Any]] = {}
     tokens = deque(
         token
         for token in re.findall(
@@ -418,15 +418,19 @@ def selection_set(
         if tokens.popleft() != token:
             raise ValueError(f"Expected the GraphQL token {token!r}")
 
-    def variable_type() -> None:
+    def variable_type() -> str | None:
         if tokens[0] == "[":
             tokens.popleft()
             variable_type()
             expect("]")
+            type_name = None
         else:
-            take_name()
+            type_name = take_name()
         if tokens[0] == "!":
             tokens.popleft()
+            if type_name is not None:
+                return f"{type_name}!"
+        return type_name
 
     def variable_definitions() -> None:
         expect("(")
@@ -434,34 +438,48 @@ def selection_set(
             expect("$")
             name = take_name()
             expect(":")
-            variable_type()
+            type_name = variable_type()
+            default = None
             if tokens[0] == "=":
                 tokens.popleft()
-                value()
+                if type_name in {"String", "String!"} and not (
+                    tokens[0].startswith('"')
+                    or (type_name == "String" and tokens[0] == "null")
+                ):
+                    raise ValueError("Invalid GraphQL String default")
+                default = value()
             if name in declared:
                 raise ValueError("Duplicate GraphQL variable declaration")
-            declared.add(name)
+            declared[name] = type_name, default
         expect(")")
 
-    def named_values(end: str) -> dict[str, Any]:
+    def named_values(end: str, path: tuple[str, ...]) -> dict[str, Any]:
         result = {}
         while tokens[0] != end:
             name = take_name()
             if tokens.popleft() != ":" or name in result:
                 raise ValueError("Expected a unique GraphQL name followed by ':'")
-            result[name] = value()
+            result[name] = value((*path, name))
         tokens.popleft()
         return result
 
-    def value() -> Any:
+    def value(path: tuple[str, ...] = ()) -> Any:
         token = tokens.popleft()
         if token == "$":
             name = take_name()
             if name not in declared:
                 raise ValueError("Undeclared GraphQL variable")
-            return bindings.get(name)
+            type_name, default = declared[name]
+            if type_name not in {"String", "String!"} and path in (
+                ("userIntents", "where", "user"),
+                ("userIntents", "where", "intentKey"),
+            ):
+                raise ValueError(
+                    "Expected a String variable for the userIntents filter"
+                )
+            return bindings.get(name, default)
         if token == "{":
-            return named_values("}")
+            return named_values("}", path)
         if token == "[":
             items = []
             while tokens[0] != "]":
@@ -484,7 +502,7 @@ def selection_set(
             arguments = {}
             if tokens[0] == "(":
                 tokens.popleft()
-                arguments = named_values(")")
+                arguments = named_values(")", (name,))
             children = fields() if tokens[0] == "{" else ()
             result.append(SelectedField(name, key, arguments, children))
         tokens.popleft()
