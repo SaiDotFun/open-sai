@@ -227,7 +227,7 @@ def response(payload: str | dict[str, Any] | Reply) -> Reply:
     return Reply(json.dumps(payload).encode())
 
 
-def wire(query: str, **variables: str | None) -> bytes:
+def wire(query: str, **variables: str | int | None) -> bytes:
     return json.dumps(
         {"query": query, "variables": variables},
         separators=(",", ":"),
@@ -632,7 +632,12 @@ def test_intent_status_logs_only_public_graphql_codes(
             expected_requests = [wire(keeper.INTENTS, user=ADDR, key=KEY)]
             if operation == "history":
                 replies.append(response("outcome_not_indexed"))
-                expected_requests.append(wire(keeper.HISTORY, trader=ADDR))
+                history_request = (
+                    wire(keeper.INTENT_HISTORY, trader=ADDR, limit=25, offset=0)
+                    if index == 0
+                    else wire(keeper.HISTORY, trader=ADDR)
+                )
+                expected_requests.append(history_request)
             replies.append(response(failure))
             result = invoke(
                 cli,

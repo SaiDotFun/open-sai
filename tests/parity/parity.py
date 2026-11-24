@@ -19,7 +19,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -41,6 +41,7 @@ from compare import (
 from mcp_cases import CALLS, handshake
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
+from sai_cli.core import log
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import (
@@ -73,6 +74,7 @@ class Case:
     absent_log_text: list[str] | None = None
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
+    expected_overview_help: str | None = None
 
     @property
     def command(self) -> str:
@@ -478,6 +480,45 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
     return diffs
 
 
+def matches_overview_help_difference(
+    reference: Observation, candidate: Observation
+) -> bool:
+    if reference.raw is None or candidate.raw is None:
+        return False
+    overview_line = (
+        b"  overview   Show Sai funds, positions, orders, local blockers, and...\n"
+    )
+    stdout_bytes, stderr = reference.raw
+    adjusted_stderr = stderr.replace(overview_line, b"", 1)
+    # Keep all other output and event fields under the usual comparison.
+    if adjusted_stderr == stderr or adjusted_stderr != candidate.raw[1]:
+        return False
+    name = "logs/cli.jsonl"
+    entry = reference.files.get(name)
+    if entry is None or len(entry.data) != 2:
+        return False
+    start, end = entry.data
+    if end.get("event") != "command.end":
+        return False
+    original, adjusted = [
+        log.clean(
+            log.untrusted(text.partition(b"\nError: ")[2].decode().removesuffix("\n")),
+            (),
+        )
+        for text in (stderr, adjusted_stderr)
+    ]
+    if end.get("error") != original:
+        return False
+    files = {
+        **reference.files,
+        name: replace(entry, data=[start, {**end, "error": adjusted}]),
+    }
+    adjusted_reference = replace(
+        reference, files=files, raw=(stdout_bytes, adjusted_stderr)
+    )
+    return not differences(adjusted_reference, candidate)
+
+
 def safe_observe(
     case: Case,
     binary: list[str],
@@ -512,7 +553,7 @@ def safe_observe(
 
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
-) -> tuple[list[str], dict[str, str]]:
+) -> tuple[list[str], dict[str, str], str | None]:
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
         loopback(case.server) as endpoints,
@@ -539,12 +580,27 @@ def run_case(
                     else "LISTED"
                 )
     if left is None or right is None:
-        return [
-            f"{side} {error}"
-            for side, error in (("reference", left_error), ("candidate", right_error))
-            if error
-        ], tools
+        return (
+            [
+                f"{side} {error}"
+                for side, error in (
+                    ("reference", left_error),
+                    ("candidate", right_error),
+                )
+                if error
+            ],
+            tools,
+            None,
+        )
     diffs = differences(left, right)
+    expected = None
+    if (
+        diffs
+        and case.expected_overview_help
+        and matches_overview_help_difference(left, right)
+    ):
+        diffs = []
+        expected = case.expected_overview_help
     if left.exit_code != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {left.exit_code}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
@@ -553,7 +609,7 @@ def run_case(
         for call in CALLS[case.mcp_profile]:
             if call.expected == "ok" and not diffs:
                 tools[call.tool] = "PASS"
-    return diffs, tools
+    return diffs, tools, expected
 
 
 def cli_commands(group: click.Group, prefix: str = "") -> set[str]:
@@ -631,19 +687,21 @@ def main() -> int:
     )
     print("| Command | Status | Diff summary |\n| --- | --- | --- |", flush=True)
     mismatches = 0
+    expected_differences = 0
     tools: dict[str, str] = {}
     for case in selected:
         oracle = mcp_reference if case.mode == "mcp" else reference
         executable = oracle if candidate is reference else candidate
-        diffs, listed = run_case(case, oracle, executable)
+        diffs, listed, expected = run_case(case, oracle, executable)
         for tool, status in listed.items():
             if status != "LISTED" or tool not in tools:
                 tools[tool] = status
         mismatches += bool(diffs)
+        expected_differences += bool(expected and not diffs)
         row(
             f"`sai {shlex.join(case.args)}` ({case.name})",
-            "DIFF" if diffs else "PASS",
-            ", ".join(diffs),
+            "DIFF" if diffs else "EXPECTED DIFF" if expected else "PASS",
+            ", ".join(diffs) if diffs else expected or "",
         )
     if not args.case:
         for name, reason in sorted(deferred.items()):
@@ -652,7 +710,10 @@ def main() -> int:
         print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
         for name, status in tools.items():
             row(f"`{name}`", status, "tools/call" if status == "PASS" else "tools/list")
-    print(f"\n{len(selected) - mismatches}/{len(selected)} cases passed.")
+    passed = len(selected) - mismatches - expected_differences
+    print(f"\n{passed}/{len(selected)} cases passed.")
+    if expected_differences:
+        print(f"Expected differences: {expected_differences}.")
     return int(bool(mismatches))
 
 
