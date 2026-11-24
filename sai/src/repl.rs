@@ -7,11 +7,13 @@ use std::{
     future::Future,
     io::{self, IsTerminal, Read, Write},
     path::Path,
+    sync::{Arc, Mutex},
 };
 
 use chrono::Utc;
 use rustyline::{
-    Config, Context, Editor, Helper,
+    Cmd, ConditionalEventHandler, Config, Context, Editor, Event, EventContext, EventHandler,
+    Helper, KeyCode, KeyEvent, Modifiers, Movement, RepeatCount,
     completion::Completer,
     error::ReadlineError,
     highlight::Highlighter,
@@ -49,6 +51,66 @@ impl Hinter for HistorySuggestions {
 
     fn hint(&self, line: &str, position: usize, context: &Context<'_>) -> Option<String> {
         self.0.hint(line, position, context)
+    }
+}
+
+struct HistorySearch {
+    lines: Vec<String>,
+    selection: Option<HistorySelection>,
+}
+
+struct HistorySelection {
+    line: String,
+    prefix_end: usize,
+    index: usize,
+}
+
+struct HistoryKeys(Arc<Mutex<HistorySearch>>);
+
+impl ConditionalEventHandler for HistoryKeys {
+    fn handle(
+        &self,
+        event: &Event,
+        count: RepeatCount,
+        _: bool,
+        context: &EventContext<'_>,
+    ) -> Option<Cmd> {
+        let backwards = event.get(0)?.0 == KeyCode::Up;
+        let mut history = self.0.lock().ok()?;
+        let selection = history.selection.take();
+        let mut selection = selection
+            .filter(|entry| {
+                context.line() == history.lines[entry.index]
+                    && context.pos() == context.line().len()
+            })
+            .unwrap_or_else(|| HistorySelection {
+                line: context.line().into(),
+                prefix_end: context.pos(),
+                index: history.lines.len(),
+            });
+        let prefix = &selection.line[..selection.prefix_end];
+        let matches = |&index: &usize| history.lines[index].starts_with(prefix);
+        let skip = usize::from(count.saturating_sub(1));
+        let next = if backwards {
+            (0..selection.index).rev().filter(matches).nth(skip)
+        } else {
+            (selection.index + 1..history.lines.len())
+                .filter(matches)
+                .nth(skip)
+        };
+        if let Some(index) = next {
+            selection.index = index;
+            let line = history.lines[index].clone();
+            history.selection = Some(selection);
+            Some(Cmd::Replace(Movement::WholeLine, Some(line)))
+        } else if !backwards && selection.index < history.lines.len() {
+            Some(Cmd::Replace(Movement::WholeLine, Some(selection.line)))
+        } else {
+            if selection.index < history.lines.len() {
+                history.selection = Some(selection);
+            }
+            Some(Cmd::Noop)
+        }
     }
 }
 
@@ -300,7 +362,17 @@ pub fn run(
         editor.set_helper(Some(HistorySuggestions::default()));
         let mut history = open_history(&directory).map_err(|_| SaiError::internal())?;
         load_history(&mut history, &mut editor)?;
-        Some((editor, history))
+        let search = Arc::new(Mutex::new(HistorySearch {
+            lines: editor.history().into_iter().cloned().collect(),
+            selection: None,
+        }));
+        for key in [KeyCode::Up, KeyCode::Down] {
+            editor.bind_sequence(
+                KeyEvent(key, Modifiers::NONE),
+                EventHandler::Conditional(Box::new(HistoryKeys(Arc::clone(&search)))),
+            );
+        }
+        Some((editor, history, search))
     } else {
         None
     };
@@ -317,7 +389,8 @@ pub fn run(
     }
 
     loop {
-        let line = if let Some((editor, history)) = &mut session {
+        let line = if let Some((editor, history, search)) = &mut session {
+            search.lock().map_err(|_| SaiError::internal())?.selection = None;
             match editor.readline("◆ sai ❯ ") {
                 Ok(line) => {
                     if !line.is_empty()
@@ -326,6 +399,11 @@ pub fn run(
                             .map_err(|_| SaiError::internal())?
                     {
                         record_history(history, &line).map_err(|_| SaiError::internal())?;
+                        search
+                            .lock()
+                            .map_err(|_| SaiError::internal())?
+                            .lines
+                            .push(line.clone());
                     }
                     line
                 }

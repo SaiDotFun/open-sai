@@ -772,28 +772,30 @@ def test_repl_pipe(
     assert outputs[0] == outputs[1]
 
 
-def test_repl_keeps_terminal_history_and_recovers_from_interrupt(
-    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
-) -> None:
+def read_terminal(master: int, pending: bytearray, needle: bytes) -> None:
     import errno
-    import pty
     import select
     import time
 
-    def recv(master: int, pending: bytearray, needle: bytes) -> None:
-        deadline = time.monotonic() + 8
-        while needle not in pending and time.monotonic() < deadline:
-            if not select.select([master], [], [], 0.2)[0]:
-                continue
-            try:
-                pending.extend(os.read(master, 4096))
-            except OSError as exc:
-                if exc.errno != errno.EIO:
-                    raise
-                break
-        assert needle in pending, bytes(pending)
-        end = pending.index(needle) + len(needle)
-        del pending[:end]
+    deadline = time.monotonic() + 8
+    while needle not in pending and time.monotonic() < deadline:
+        if not select.select([master], [], [], 0.2)[0]:
+            continue
+        try:
+            pending.extend(os.read(master, 4096))
+        except OSError as exc:
+            if exc.errno != errno.EIO:
+                raise
+            break
+    assert needle in pending, bytes(pending)
+    end = pending.index(needle) + len(needle)
+    del pending[:end]
+
+
+def test_repl_keeps_terminal_history_and_recovers_from_interrupt(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    import pty
 
     for index, cli in enumerate(local_pair):
         root = tmp_path / str(index)
@@ -811,17 +813,17 @@ def test_repl_keeps_terminal_history_and_recovers_from_interrupt(
             pending = bytearray()
 
             try:
-                recv(master, pending, "❯".encode())
+                read_terminal(master, pending, "❯".encode())
                 os.write(master, b"discard-me\x03")
-                recv(master, pending, "❯".encode())
+                read_terminal(master, pending, "❯".encode())
                 os.write(master, b"config get keeper.endpoint\r")
-                recv(master, pending, b"https://sai-keeper.nibiru.fi/query")
-                recv(master, pending, "❯".encode())
+                read_terminal(master, pending, b"https://sai-keeper.nibiru.fi/query")
+                read_terminal(master, pending, "❯".encode())
                 os.write(master, b"config get keeper.end")
-                recv(master, pending, b"point")
+                read_terminal(master, pending, b"point")
                 os.write(master, b"\x1b[C\r")
-                recv(master, pending, b"https://sai-keeper.nibiru.fi/query")
-                recv(master, pending, "❯".encode())
+                read_terminal(master, pending, b"https://sai-keeper.nibiru.fi/query")
+                read_terminal(master, pending, "❯".encode())
                 os.write(master, b"\x04")
                 assert process.wait(timeout=8) == 0
             finally:
@@ -832,6 +834,53 @@ def test_repl_keeps_terminal_history_and_recovers_from_interrupt(
         assert stat.S_IMODE(history.stat().st_mode) == 0o600
         assert b"+config get keeper.endpoint\n" in history.read_bytes()
         assert b"discard-me" not in history.read_bytes()
+
+
+def test_repl_history_matches_typed_prefix(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> None:
+    import pty
+
+    prompt = "❯".encode()
+    for index, cli in enumerate(local_pair):
+        root = tmp_path / str(index)
+        root.mkdir(mode=0o700)
+        master, slave = pty.openpty()
+        with subprocess.Popen(
+            cli,
+            cwd=root,
+            env={**case_env(root, logging="0"), "TERM": "xterm-256color"},
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        ) as process:
+            os.close(slave)
+            pending = bytearray()
+            try:
+                read_terminal(master, pending, prompt)
+                for command, output in (
+                    (b"config get logs.enabled", b"false\r\n"),
+                    (b"config get logs.keep_days", b"14\r\n"),
+                    (
+                        b"config get keeper.endpoint",
+                        b"https://sai-keeper.nibiru.fi/query",
+                    ),
+                    (b"config get logs.\x1b[A\x1b[A\x1b[B", b"14\r\n"),
+                    (
+                        b"config get keeper.endpoint",
+                        b"https://sai-keeper.nibiru.fi/query",
+                    ),
+                    (b"config get logs.\x1b[A", b"14\r\n"),
+                ):
+                    os.write(master, command + b"\r")
+                    read_terminal(master, pending, output)
+                    read_terminal(master, pending, prompt)
+                os.write(master, b"quit\r")
+                assert process.wait(timeout=8) == 0
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                os.close(master)
 
 
 def test_repl_commands_share_run_but_keep_command_ids(
