@@ -24,11 +24,8 @@ pub use clipboard::{CLIPBOARD_NAMES, Clipboard};
 pub use signer::{LoginError, login};
 
 async fn run(command: &mut Command, seconds: u64) -> io::Result<Output> {
-    timeout(
-        Duration::from_secs(seconds),
-        command.kill_on_drop(true).output(),
-    )
-    .await?
+    let child = command.kill_on_drop(true).spawn()?;
+    timeout(Duration::from_secs(seconds), child.wait_with_output()).await?
 }
 
 async fn run_success(command: &mut Command, seconds: u64) -> io::Result<Output> {

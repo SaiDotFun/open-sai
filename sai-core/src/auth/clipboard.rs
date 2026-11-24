@@ -45,7 +45,11 @@ impl Clipboard {
     pub async fn read() -> Option<(Zeroizing<String>, &'static Self)> {
         for tool in TOOLS.iter().filter(|tool| installed(tool.read[0])) {
             let mut command = Command::new(tool.read[0]);
-            command.args(&tool.read[1..]).stdin(Stdio::null());
+            command
+                .args(&tool.read[1..])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
             if let Ok(output) = run_success(&mut command, 10).await {
                 let bytes = Zeroizing::new(output.stdout);
                 if let Ok(text) =

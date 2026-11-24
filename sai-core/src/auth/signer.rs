@@ -188,7 +188,9 @@ async fn ud_wallet(name: &str) -> Result<Option<UdWallet>, String> {
     let mut command = Command::new("ud");
     command
         .args(["evm", "wallet", "show", name])
-        .stdin(Stdio::null());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
     let output = run(&mut command, 60)
         .await
         .map_err(|_| format!("{tool} did not run"))?;
@@ -240,6 +242,7 @@ async fn keystore_address(path: &Path, name: &str) -> Result<String, SaiError> {
     command
         .args(["wallet", "address", "--account", name])
         .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
         .stderr(Stdio::inherit());
     let output = run_success(&mut command, 300)
         .await
@@ -301,21 +304,26 @@ async fn sign_file(
         }
         Signer::Ud => {
             command = Command::new("ud");
-            command.args([
-                "evm",
-                "wallet",
-                "run",
-                name,
-                "--",
-                "wallet",
-                "sign",
-                "--data",
-                "--from-file",
-            ]);
+            command
+                .args([
+                    "evm",
+                    "wallet",
+                    "run",
+                    name,
+                    "--",
+                    "wallet",
+                    "sign",
+                    "--data",
+                    "--from-file",
+                ])
+                .stderr(Stdio::piped());
             120
         }
     };
-    command.arg(path).stdin(Stdio::inherit());
+    command
+        .arg(path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped());
     let output = run_success(&mut command, seconds)
         .await
         .map_err(|_| LoginError::SigningFailed)?;

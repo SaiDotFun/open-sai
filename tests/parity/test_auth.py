@@ -143,7 +143,7 @@ def test_auth_login(
     results = []
     for env in (python, rust):
         if case != "missing":
-            fake_cast(env)
+            fake_cast(env, diagnostics=case == "cast")
             keystore(env, addr=None if case == "cast" else addr)
         if case in {"ud", "ud-locked", "terminal-fallback", "rotated-keystore"}:
             fake_ud(env, locked=case != "ud", rotate=case == "rotated-keystore")
@@ -158,6 +158,8 @@ def test_auth_login(
             result = observed(env.run(*args))
         results.append(result)
         assert result[0] == expected_code
+        if case == "cast":
+            assert result[2] == "Fixture Cast address\nFixture Cast sign\n"
         lookup_addr = (
             addr.upper().replace("0X", "0x")
             if case in {"ud", "ud-locked", "terminal-fallback", "rotated-keystore"}
@@ -223,6 +225,28 @@ def test_auth_summaries_hide_keeper_path(
             for session in session_state(env)["sessions"].values()
         )
         results.append(outputs)
+    assert results[0] == results[1]
+
+
+def test_import_discards_clipboard_clear_output(
+    tmp_path: Path, auth_pair: tuple[CLI, CLI]
+) -> None:
+    results = []
+    for env in homes(tmp_path, auth_pair):
+        env.clipboard()
+        env.clip.write_text(fixture_token(ADDR))
+        env.tool(
+            "pbcopy",
+            "import os, stat\n"
+            "assert stat.S_ISCHR(os.fstat(1).st_mode)\n"
+            "assert stat.S_ISCHR(os.fstat(2).st_mode)\n"
+            "open(CLIP, 'w').write(sys.stdin.read())\n",
+        )
+        result = env.run("--json", "auth", "import")
+        assert result.returncode == 0
+        assert not env.clip.read_text()
+        assert result.stderr == ""
+        results.append(observed(result))
     assert results[0] == results[1]
 
 

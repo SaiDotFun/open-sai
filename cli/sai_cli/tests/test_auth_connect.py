@@ -603,14 +603,16 @@ def keeper_auth():
     thread.join()
 
 
-def fake_cast(env: Env) -> None:
+def fake_cast(env: Env, *, diagnostics: bool = False) -> None:
     env.tool(
         "cast",
         "import json, os, stat\n"
         "args = sys.argv[1:]\n"
         "if args[:2] == ['wallet', 'address']:\n"
+        f"    if {diagnostics!r}: print('Fixture Cast address', file=sys.stderr)\n"
         f"    print({ADDR!r})\n"
         "elif args[:2] == ['wallet', 'sign']:\n"
+        f"    if {diagnostics!r}: print('Fixture Cast sign', file=sys.stderr)\n"
         "    assert stat.S_IMODE(os.stat(os.path.dirname(args[-1])).st_mode) == 0o700\n"
         "    assert stat.S_IMODE(os.stat(args[-1]).st_mode) == 0o600\n"
         "    data = json.load(open(args[-1]))\n"
