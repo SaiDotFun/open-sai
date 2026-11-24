@@ -522,7 +522,6 @@ pub(crate) fn tick(command: &str, json: bool, home: &Path, events: EventContext<
         && Command::new(launcher)
             .args(["update", "--background"])
             .env("SAI_HOME", home)
-            .current_dir("/")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())

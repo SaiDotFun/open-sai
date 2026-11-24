@@ -47,6 +47,8 @@ struct Pending {
     launcher: PathBuf,
     python: PathBuf,
     #[serde(default)]
+    cwd: Option<PathBuf>,
+    #[serde(default)]
     next: Option<Wheel>,
     #[serde(default)]
     original_record: Option<String>,
@@ -89,6 +91,10 @@ impl Uv {
         &self.launcher
     }
 
+    fn bin_dir(&self) -> &Path {
+        self.launcher.parent().expect("launcher has a parent")
+    }
+
     pub(super) fn lock_path(&self) -> PathBuf {
         self.tools().join(LOCK)
     }
@@ -110,6 +116,7 @@ impl Uv {
             || record.python.canonicalize().ok().as_deref() != Some(record.python.as_path())
             || !record.python.is_file()
             || record.python.starts_with(&self.prefix)
+            || record.cwd.as_ref().is_some_and(|path| !path.is_absolute())
         {
             return Err(
                 "the pending uv install record names a different launcher or invalid interpreter"
@@ -200,18 +207,12 @@ impl Uv {
         }
     }
 
-    async fn check_destination(&self, uv: &Path, home: &Path) -> Result<()> {
-        for (extra, expected) in [
-            (&[][..], self.tools()),
-            (
-                &["--bin"][..],
-                self.launcher.parent().expect("launcher has a parent"),
-            ),
-        ] {
+    async fn check_destination(&self, uv: &Path, cwd: &Path) -> Result<()> {
+        for (extra, expected) in [(&[][..], self.tools()), (&["--bin"][..], self.bin_dir())] {
             let mut command = Command::new(uv);
-            command.current_dir(home).args(["tool", "dir"]).args(extra);
+            command.current_dir(cwd).args(["tool", "dir"]).args(extra);
             let output = smoke::uv_output(command, "`uv tool dir`").await?;
-            let found = Path::new(output.trim()).canonicalize().ok();
+            let found = cwd.join(output.trim()).canonicalize().ok();
             if found.as_deref() != Some(expected) {
                 return Err(format!(
                     "uv selects {}, expected {}.",
@@ -310,7 +311,7 @@ impl Uv {
         wheel: &Wheel,
         path: &Path,
         home: &Path,
-        trial: Option<&Path>,
+        (tools, bin): (&Path, &Path),
     ) -> Result<()> {
         verify_file(wheel, path)?;
         let mut command = Command::new(uv);
@@ -318,12 +319,9 @@ impl Uv {
             .current_dir(home)
             .args(["tool", "install", "--force", "--offline", "--python"])
             .arg(python)
-            .arg(path);
-        if let Some(trial) = trial {
-            command
-                .env("UV_TOOL_DIR", trial.join("tools"))
-                .env("UV_TOOL_BIN_DIR", trial.join("bin"));
-        }
+            .arg(path)
+            .env("UV_TOOL_DIR", tools)
+            .env("UV_TOOL_BIN_DIR", bin);
         smoke::uv_output(command, "`uv tool install`").await?;
         Ok(())
     }
@@ -342,7 +340,15 @@ impl Uv {
         self.owner(true)?;
         self.check_recoverable_package(pending)?;
         let path = self.wheel_path(wheel)?;
-        Self::install(uv, python, wheel, &path, home, None).await?;
+        Self::install(
+            uv,
+            python,
+            wheel,
+            &path,
+            home,
+            (self.tools(), self.bin_dir()),
+        )
+        .await?;
         self.owner(false)?;
         if smoke::version(&self.launcher, home, shim_base).await? != version {
             return Err(format!("the restored launcher did not report {version}"));
@@ -354,9 +360,14 @@ impl Uv {
 
     pub(super) async fn recover(&self, home: &Path, allowed: impl Fn() -> bool) -> Result<Version> {
         if let Some(pending) = self.pending()? {
-            let scratch = TempDir::new().map_err(io_error)?;
+            let cwd = env::current_dir().map_err(io_error)?;
+            let original = pending
+                .cwd
+                .as_deref()
+                .filter(|path| path.is_dir())
+                .unwrap_or(&cwd);
             let uv = find_uv()?;
-            self.check_destination(&uv, scratch.path()).await?;
+            self.check_destination(&uv, original).await?;
             if !allowed() {
                 return Ok(self.version());
             }
@@ -383,23 +394,19 @@ impl Uv {
                 .map_err(io_error)?;
             fs::set_permissions(home.path(), permissions).map_err(io_error)?;
             let trial = TempDir::new_in(home.path()).map_err(io_error)?;
+            let cwd = env::current_dir().map_err(io_error)?;
             let uv = find_uv()?;
-            if let Err(reason) = self.check_destination(&uv, home.path()).await {
+            if let Err(reason) = self.check_destination(&uv, &cwd).await {
                 return Ok(Change::Unsupported(reason));
             }
             let python = self.python()?;
+            let trial_tools = trial.path().join("tools");
+            let trial_bin = trial.path().join("bin");
+            let trial_dirs = (trial_tools.as_path(), trial_bin.as_path());
             let shim_base = releases.shim_fixture_base();
             let (next, staged_next) = Self::stage(releases, target, home.path()).await?;
             let check = async {
-                Self::install(
-                    &uv,
-                    &python,
-                    &next,
-                    &staged_next,
-                    home.path(),
-                    Some(trial.path()),
-                )
-                .await?;
+                Self::install(&uv, &python, &next, &staged_next, home.path(), trial_dirs).await?;
                 smoke::verify(
                     &trial.path().join("bin/sai"),
                     home.path(),
@@ -421,7 +428,7 @@ impl Uv {
                     &previous,
                     &staged_previous,
                     home.path(),
-                    Some(trial.path()),
+                    trial_dirs,
                 )
                 .await?;
                 smoke::verify(
@@ -448,12 +455,21 @@ impl Uv {
                 wheel: previous,
                 launcher: self.launcher.clone(),
                 python: python.clone(),
+                cwd: Some(cwd),
                 next: Some(next.clone()),
                 original_record: provenance::installed_digest(&self.prefix),
             };
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let changed = async {
-                Self::install(&uv, &python, &next, &published_next, home.path(), None).await?;
+                Self::install(
+                    &uv,
+                    &python,
+                    &next,
+                    &published_next,
+                    home.path(),
+                    (self.tools(), self.bin_dir()),
+                )
+                .await?;
                 self.owner(false)?;
                 smoke::verify(&self.launcher, home.path(), target, shim_base).await?;
                 // Let the shim verify and cache its binary in the invoking profile.

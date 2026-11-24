@@ -266,12 +266,17 @@ class NativeInstall:
     installed: str
 
     def invoke(
-        self, *args: str, exe: Path | None = None, umask: int = -1, **overrides: str
+        self,
+        *args: str,
+        exe: Path | None = None,
+        cwd: Path | None = None,
+        umask: int = -1,
+        **overrides: str,
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
             [exe or self.launcher, *args],
             env={**self.env, **overrides},
-            cwd=self.home.parent,
+            cwd=cwd or self.home.parent,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -864,6 +869,40 @@ def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
         encoding="utf-8",
     )
     return pending
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("different_cwd", [False, True])
+def test_uv_recovery_uses_recorded_cwd_for_relative_bin_directory(
+    standalone: NativeInstall, tmp_path: Path, different_cwd: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    record = interrupted_uv_install(install, initial)
+    value = json.loads(record.read_text(encoding="utf-8"))
+    value["cwd"] = str(tmp_path)
+    record.write_text(json.dumps(value), encoding="utf-8")
+    install.launcher.unlink()
+    resume = tmp_path
+    if different_cwd:
+        resume = tmp_path / "another cwd"
+        resume.mkdir()
+    with releases({}) as server:
+        recovered = install.invoke(
+            "--json",
+            "update",
+            *server.args,
+            "--to",
+            install.installed,
+            exe=install.executable,
+            cwd=resume,
+            SAI_NATIVE_UV_PREFIX=install.env["FIXTURE_STABLE_UV_PREFIX"],
+            UV_TOOL_BIN_DIR=install.launcher.parent.name,
+        )
+        assert not server.reads
+    assert not (install.home / install.launcher.parent.name / "sai").is_symlink()
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert install.launcher.is_symlink()
+    assert not record.exists()
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
