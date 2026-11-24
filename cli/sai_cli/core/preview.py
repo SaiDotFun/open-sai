@@ -96,6 +96,7 @@ def base_fees(
     *,
     opening: bool,
     triggered: bool = False,
+    available_collateral: int | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Perp's minimum fee basis and undiscounted execution fee components."""
     with localcontext() as context:
@@ -111,6 +112,8 @@ def base_fees(
         fee = int(basis * (open_rate if opening else close_rate))
         if triggered:
             fee += int(basis * trigger_rate)
+        if available_collateral is not None:
+            fee = min(fee, available_collateral)
         return fee, {
             "status": "estimate",
             "amountUsdc": format(Decimal(fee).scaleb(-6).normalize(), "f"),
@@ -333,6 +336,7 @@ def close_estimates(
             _notional(collateral if reduce_by is None else reduce_by, effective),
             opening=False,
             triggered=reduce_by is not None,
+            available_collateral=collateral,
         )
     except READ_ERRORS:
         pass
