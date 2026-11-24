@@ -641,3 +641,70 @@ else:
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].key, "rust");
 }
+
+#[test]
+#[ignore = "requires uv and a Python reference with next-oracle outcomes"]
+fn next_oracle_reservations_and_terminal_outcomes_round_trip() {
+    let home = tempdir().unwrap();
+    let storage = Storage::new(home.path());
+    storage
+        .pending("from-rust", ENDPOINT, ADDR, "OPEN_TRADE", "")
+        .unwrap();
+    assert_eq!(
+        storage
+            .set_status("from-rust", ENDPOINT, ADDR, IntentStatus::Pending)
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+    parity(
+        home.path(),
+        &["--json", "--endpoint", ENDPOINT, "intent", "local", ADDR],
+        0,
+    );
+    write_cli_fixture(
+        home.path(),
+        r#"
+import sys
+import time
+
+from sai_cli.core import storage
+
+endpoint, addr = sys.argv[1:]
+try:
+    storage.pending("blocked", endpoint, addr, "CLOSE_POSITION", "7")
+except ValueError as error:
+    assert "Reconcile uncertain intent from-rust " in str(error)
+else:
+    raise AssertionError("Python allowed a new trade during pending execution")
+
+assert storage.set_status("from-rust", endpoint, addr, "accepted") == "pending"
+assert storage.set_status("from-rust", endpoint, addr, "terminal") == "terminal"
+storage.pending("from-python", endpoint, addr, "OPEN_TRADE", "")
+assert storage.mark_absent("from-python", endpoint, addr, 0, time.time() + 1) == "absent"
+assert storage.set_status("from-python", endpoint, addr, "accepted", only_if_absent=True) == "pending"
+"#,
+        &[ENDPOINT, ADDR],
+    );
+    parity(
+        home.path(),
+        &["--json", "--endpoint", ENDPOINT, "intent", "local", ADDR],
+        0,
+    );
+    assert!(matches!(
+        storage.pending("blocked", ENDPOINT, ADDR, "CLOSE_POSITION", "7"),
+        Err(StorageError::UncertainIntent(key)) if key == "from-python"
+    ));
+    assert_eq!(
+        storage
+            .set_status("from-python", ENDPOINT, ADDR, IntentStatus::Terminal)
+            .unwrap()
+            .as_deref(),
+        Some("terminal")
+    );
+    parity(
+        home.path(),
+        &["--json", "--endpoint", ENDPOINT, "intent", "local", ADDR],
+        0,
+    );
+}

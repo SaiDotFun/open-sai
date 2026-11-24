@@ -12,7 +12,7 @@ use thiserror::Error;
 mod ledger;
 mod sessions;
 
-pub use ledger::{IntentRow, IntentStatus};
+pub use ledger::{IntentRow, IntentStatus, StatusUpdateOptions};
 pub use sessions::{Accounts, RemovedSession, Session, SessionSummary};
 
 #[derive(Debug, Error)]

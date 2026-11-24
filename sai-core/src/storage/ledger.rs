@@ -7,12 +7,14 @@ use serde::Serialize;
 use super::{Storage, StorageError, StorageEvent, endpoint_origin};
 
 const SCHEMA_VERSION: i64 = 1;
+const LEDGER_FILE: &str = "intents.sqlite3";
 const CREATE_INTENTS: &str = "CREATE TABLE IF NOT EXISTS intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL, entity TEXT NOT NULL DEFAULT '', created_at REAL)";
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 pub enum IntentStatus {
     Unknown,
     Accepted,
+    Pending,
     Terminal,
     Rejected,
     NotSent,
@@ -24,12 +26,32 @@ impl IntentStatus {
         match self {
             Self::Unknown => "unknown",
             Self::Accepted => "accepted",
+            Self::Pending => "pending",
             Self::Terminal => "terminal",
             Self::Rejected => "rejected",
             Self::NotSent => "not_sent",
             Self::Absent => "absent",
         }
     }
+
+    fn follows(self, previous: &str) -> bool {
+        matches!(
+            (previous, self),
+            (
+                "unknown",
+                Self::Accepted | Self::Pending | Self::Terminal | Self::Rejected | Self::NotSent
+            ) | ("accepted" | "absent", Self::Pending | Self::Terminal)
+                | ("pending", Self::Terminal)
+        )
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct StatusUpdateOptions {
+    /// Explicit evidence of pending execution can repair an unverified terminal row.
+    pub repair_legacy_terminal: bool,
+    /// Account-wide reconciliation uses this to restore a block after a late admission.
+    pub only_if_absent: bool,
 }
 
 #[derive(Serialize)]
@@ -48,23 +70,30 @@ fn schema_version(connection: &Connection) -> Result<i64, StorageError> {
     Ok(version)
 }
 
+fn has_column(connection: &Connection, name: &str) -> rusqlite::Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('intents') WHERE name = ?1)",
+        [name],
+        |row| row.get(0),
+    )
+}
+
 fn migrate(connection: &mut Connection) -> Result<(), StorageError> {
-    if schema_version(connection)? == SCHEMA_VERSION {
+    if schema_version(connection)? == SCHEMA_VERSION && has_column(connection, "keeper_status")? {
         return Ok(());
     }
 
     let transaction = connection.transaction_with_behavior(Immediate)?;
     if schema_version(&transaction)? < SCHEMA_VERSION {
         transaction.execute(CREATE_INTENTS, [])?;
-        let has_timestamp: bool = transaction.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('intents') WHERE name = 'created_at')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_timestamp {
+        if !has_column(&transaction, "created_at")? {
             transaction.execute("ALTER TABLE intents ADD COLUMN created_at REAL", [])?;
         }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+    }
+    if !has_column(&transaction, "keeper_status")? {
+        // Keep user_version 1 so the v0.1.0 client can still open the ledger.
+        transaction.execute("ALTER TABLE intents ADD COLUMN keeper_status TEXT", [])?;
     }
     transaction.commit()?;
     Ok(())
@@ -91,7 +120,7 @@ fn key_time(key: &str) -> Option<f64> {
 impl Storage<'_> {
     /// Open and migrate the ledger.
     pub fn open_ledger(&self) -> Result<Connection, StorageError> {
-        let path = self.directory()?.join("intents.sqlite3");
+        let path = self.directory()?.join(LEDGER_FILE);
         // Closing a separate descriptor would release this process's SQLite
         // POSIX locks. The enclosing directory is private even on first open.
         let mut connection = Connection::open(&path)?;
@@ -116,11 +145,12 @@ impl Storage<'_> {
         let unresolved: Option<String> = transaction
             .query_row(
                 "SELECT id FROM intents WHERE endpoint=?1 AND account=?2
-                 AND (status=?3 OR (status=?4 AND entity <> '' AND entity=?5)) LIMIT 1",
+                 AND (status=?3 OR keeper_status=?4 OR (status=?5 AND entity <> '' AND entity=?6)) LIMIT 1",
                 params![
                     endpoint,
                     addr,
                     IntentStatus::Unknown.as_str(),
+                    IntentStatus::Pending.as_str(),
                     IntentStatus::Accepted.as_str(),
                     entity
                 ],
@@ -160,35 +190,83 @@ impl Storage<'_> {
         endpoint: &str,
         account: &str,
         status: IntentStatus,
-    ) -> Result<(), StorageError> {
+    ) -> Result<Option<String>, StorageError> {
+        self.set_status_with(
+            key,
+            endpoint,
+            account,
+            status,
+            StatusUpdateOptions::default(),
+        )
+    }
+
+    /// Advance a local row to an allowed Keeper status and report its resulting status.
+    pub fn set_status_with(
+        &self,
+        key: &str,
+        endpoint: &str,
+        account: &str,
+        status: IntentStatus,
+        options: StatusUpdateOptions,
+    ) -> Result<Option<String>, StorageError> {
+        if !self.trader.join(LEDGER_FILE).try_exists()? {
+            return Ok(None);
+        }
         let mut connection = self.open_ledger()?;
         let transaction = connection.transaction_with_behavior(Immediate)?;
         let addr = account.to_lowercase();
-        let current: Option<(String, String)> = transaction
+        let current: Option<(String, String, Option<String>)> = transaction
             .query_row(
-                "SELECT kind, status FROM intents WHERE id=?1 AND endpoint=?2 AND account=?3",
+                "SELECT kind, status, keeper_status FROM intents WHERE id=?1 AND endpoint=?2 AND account=?3",
                 params![key, endpoint, addr],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
+        let Some((kind, stored, keeper_status)) = current else {
+            return Ok(None);
+        };
+        let previous = keeper_status
+            .as_deref()
+            .filter(|status| !status.is_empty())
+            .unwrap_or(&stored);
+        if options.only_if_absent && previous != IntentStatus::Absent.as_str() {
+            return Ok(Some(previous.into()));
+        }
+        let status =
+            if previous == IntentStatus::Absent.as_str() && status == IntentStatus::Accepted {
+                IntentStatus::Pending
+            } else {
+                status
+            };
+        let legacy_terminal = stored == IntentStatus::Terminal.as_str() && keeper_status.is_none();
+        let repair = legacy_terminal
+            && (status == IntentStatus::Terminal
+                || (status == IntentStatus::Pending && options.repair_legacy_terminal));
+        if !status.follows(previous) && !repair {
+            return Ok(Some(previous.into()));
+        }
+        let (stored, keeper_status) = match status {
+            // Older clients treat unknown as an account-wide block.
+            IntentStatus::Pending => (IntentStatus::Unknown.as_str(), Some(status.as_str())),
+            IntentStatus::Terminal => (status.as_str(), Some(status.as_str())),
+            _ => (status.as_str(), None),
+        };
         transaction.execute(
-            "UPDATE intents SET status=?1 WHERE id=?2 AND endpoint=?3 AND account=?4",
-            params![status.as_str(), key, endpoint, addr],
+            "UPDATE intents SET status=?1, keeper_status=?2 WHERE id=?3 AND endpoint=?4 AND account=?5",
+            params![stored, keeper_status, key, endpoint, addr],
         )?;
         transaction.commit()?;
-        if let Some((kind, previous)) = current
-            && previous != status.as_str()
-        {
+        if previous != status.as_str() {
             self.emit(StorageEvent::IntentStatus {
                 key,
                 kind: &kind,
-                previous: &previous,
+                previous,
                 status,
                 addr: account,
                 endpoint: &endpoint_origin(endpoint),
             });
         }
-        Ok(())
+        Ok(Some(status.as_str().into()))
     }
 
     /// Mark an unknown row absent after Keeper returned no record and its
@@ -207,7 +285,8 @@ impl Storage<'_> {
         let addr = account.to_lowercase();
         let current: Option<(String, Option<f64>, String)> = transaction
             .query_row(
-                "SELECT status, created_at, kind FROM intents WHERE id=?1 AND endpoint=?2 AND account=?3",
+                "SELECT COALESCE(keeper_status, status), created_at, kind FROM intents
+                 WHERE id=?1 AND endpoint=?2 AND account=?3",
                 params![key, endpoint, addr],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -247,7 +326,8 @@ impl Storage<'_> {
     ) -> Result<Vec<IntentRow>, StorageError> {
         let connection = self.open_ledger()?;
         let mut statement = connection.prepare(
-            "SELECT id, kind, status FROM intents WHERE endpoint=?1 AND account=?2 ORDER BY rowid DESC",
+            "SELECT id, kind, COALESCE(keeper_status, status) FROM intents
+             WHERE endpoint=?1 AND account=?2 ORDER BY rowid DESC",
         )?;
         let rows = statement.query_map(params![endpoint, account.to_lowercase()], |row| {
             Ok(IntentRow {

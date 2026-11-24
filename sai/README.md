@@ -45,7 +45,9 @@ Use clap derive for command dispatch, Tokio with reqwest and rustls for
 HTTP, and tokio-tungstenite for Keeper streams. Use Serde for wire types,
 `toml_edit` for config edits, AES-GCM for the existing session envelope,
 rusqlite for the ledger, and the official Rust MCP SDK `rmcp` for stdio.
-Keep schema v1 compatible with Python during the handoff. Evaluate
+Schema v1 stores a next-oracle intent as `status='unknown'` and
+`keeper_status='pending'`. This keeps the trade guard active in both
+v0.1.0 and newer clients. Evaluate
 `evolve-sqlite` for a later explicit schema change. Emit documented events
 through a dedicated JSONL writer so diagnostics stay off MCP stdout.
 
@@ -58,7 +60,8 @@ builds and a CI platform matrix to build and exercise release archives.
 Run the storage parity tests with `cargo test --locked -p sai --test
 storage_parity -- --include-ignored`. This requires `uv`. Set
 `SAI_PYTHON_REFERENCE` to the absolute path of the pinned Python checkout.
-By default the tests use the Python package in this workspace.
+By default the tests use the Python package in this workspace. The
+next-oracle ledger case requires Python commit `3bacd9a` or later.
 
 Native archives and compatible shim wheels ship on the existing
 `sai-cli/v*` tags with SHA-256 checksums. Each shim version fetches and

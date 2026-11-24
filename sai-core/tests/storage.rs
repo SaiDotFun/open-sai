@@ -9,7 +9,7 @@ use std::{
 
 use rusqlite::Connection;
 use sai_core::storage::{
-    IntentStatus, RemovedSession, Session, Storage, StorageError, StorageEvent,
+    IntentStatus, RemovedSession, Session, StatusUpdateOptions, Storage, StorageError, StorageEvent,
 };
 use tempfile::tempdir;
 use zeroize::Zeroizing;
@@ -332,4 +332,125 @@ fn storage_events_carry_only_keeper_origins() {
             .unwrap()
             .is_empty()
     );
+}
+
+#[test]
+fn pending_status_keeps_a_block_until_a_terminal_outcome() {
+    let home = tempdir().unwrap();
+    let storage = Storage::new(home.path());
+    assert_eq!(
+        storage
+            .set_status("missing", ENDPOINT, ADDR, IntentStatus::Terminal)
+            .unwrap(),
+        None
+    );
+    assert!(!home.path().join("trader").exists());
+    storage
+        .pending("next-oracle", ENDPOINT, ADDR, KIND, "7")
+        .unwrap();
+
+    let transition = |status| {
+        storage
+            .set_status("next-oracle", ENDPOINT, ADDR, status)
+            .unwrap()
+            .unwrap()
+    };
+    assert_eq!(transition(IntentStatus::Accepted), "accepted");
+    assert_eq!(transition(IntentStatus::Pending), "pending");
+    let db = storage.open_ledger().unwrap();
+    let stored: (String, String) = db
+        .query_row(
+            "SELECT status, keeper_status FROM intents WHERE id = 'next-oracle'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, ("unknown".into(), "pending".into()));
+
+    assert!(matches!(
+        storage.pending("blocked", ENDPOINT, ADDR, KIND, "8"),
+        Err(StorageError::UncertainIntent(id)) if id == "next-oracle"
+    ));
+    assert_eq!(transition(IntentStatus::Accepted), "pending");
+    assert_eq!(transition(IntentStatus::Rejected), "pending");
+    assert_eq!(
+        storage
+            .mark_absent("next-oracle", ENDPOINT, ADDR, 0.0, Some(f64::MAX))
+            .unwrap()
+            .as_deref(),
+        Some("pending")
+    );
+    assert_eq!(transition(IntentStatus::Terminal), "terminal");
+    assert_eq!(transition(IntentStatus::Pending), "terminal");
+    storage
+        .pending("allowed", ENDPOINT, ADDR, KIND, "8")
+        .unwrap();
+}
+
+#[test]
+fn migrates_old_v1_and_distinguishes_legacy_from_verified_terminal() {
+    let home = tempdir().unwrap();
+    let trader = home.path().join("trader");
+    fs::create_dir(&trader).unwrap();
+    let old = Connection::open(trader.join("intents.sqlite3")).unwrap();
+    old.execute_batch(
+        "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL, account TEXT NOT NULL,
+         kind TEXT NOT NULL, status TEXT NOT NULL, entity TEXT NOT NULL DEFAULT '', created_at REAL);
+         PRAGMA user_version = 1;",
+    ).unwrap();
+    old.execute(
+        "INSERT INTO intents (id, endpoint, account, kind, status) VALUES
+         ('legacy', ?1, '0xabcd', 'CLOSE_POSITION', 'terminal'),
+         ('verified', ?1, '0xabcd', 'CLOSE_POSITION', 'terminal'),
+         ('delayed', ?1, '0xabcd', 'CLOSE_POSITION', 'absent')",
+        [ENDPOINT],
+    )
+    .unwrap();
+    drop(old);
+
+    let storage = Storage::new(home.path());
+    let db = storage.open_ledger().unwrap();
+    let version: i64 = db
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
+    let set = |key, status, options| {
+        storage
+            .set_status_with(key, ENDPOINT, ADDR, status, options)
+            .unwrap()
+            .unwrap()
+    };
+    let ordinary = StatusUpdateOptions::default();
+    let repair = StatusUpdateOptions {
+        repair_legacy_terminal: true,
+        ..ordinary
+    };
+    let only_if_absent = StatusUpdateOptions {
+        only_if_absent: true,
+        ..ordinary
+    };
+    assert_eq!(set("legacy", IntentStatus::Pending, ordinary), "terminal");
+    assert_eq!(set("legacy", IntentStatus::Pending, repair), "pending");
+    assert_eq!(
+        set("verified", IntentStatus::Terminal, ordinary),
+        "terminal"
+    );
+    assert_eq!(set("verified", IntentStatus::Pending, repair), "terminal");
+    assert_eq!(
+        set("legacy", IntentStatus::Terminal, only_if_absent),
+        "pending"
+    );
+    assert_eq!(
+        set("delayed", IntentStatus::Accepted, only_if_absent),
+        "pending"
+    );
+
+    let marker: String = db
+        .query_row(
+            "SELECT keeper_status FROM intents WHERE id = 'verified'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(marker, "terminal");
 }
