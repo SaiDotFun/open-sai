@@ -9,6 +9,9 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from release_mismatch import ExpectedReleaseMismatch, ReleaseMismatch
+
+RELEASE_SIGNATURE = pytest.StashKey[str]()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -28,20 +31,38 @@ def pytest_collection_modifyitems(
     path = Path(__file__).with_name("release-xfails.toml")
     with path.open("rb") as file:
         owners = tomllib.load(file)["pull_request"]
-    reasons = {
-        f"tests/parity/{case}": f"https://github.com/SaiDotFun/open-sai/pull/{pr}"
-        for pr, cases in owners.items()
-        for case in cases
-    }
+    reasons: dict[str, tuple[str, str]] = {}
+    for pr, cases in owners.items():
+        for case, signature in cases.items():
+            nodeid = f"tests/parity/{case}"
+            if nodeid in reasons:
+                raise pytest.UsageError(f"Multiple release owners for {nodeid}")
+            reasons[nodeid] = (pr, signature)
     for item in items:
-        if reason := reasons.pop(item.nodeid, None):
+        if entry := reasons.pop(item.nodeid, None):
+            pr, signature = entry
+            item.stash[RELEASE_SIGNATURE] = signature
             item.add_marker(
-                pytest.mark.xfail(reason=reason, strict=True, raises=AssertionError)
+                pytest.mark.xfail(
+                    reason=f"https://github.com/SaiDotFun/open-sai/pull/{pr}",
+                    strict=True,
+                    raises=ExpectedReleaseMismatch,
+                )
             )
     if reasons:
         raise pytest.UsageError(
             "Stale release expected-failure IDs: " + ", ".join(sorted(reasons))
         )
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    try:
+        return (yield)
+    except ReleaseMismatch as error:
+        if error.signature == item.stash.get(RELEASE_SIGNATURE, None):
+            raise ExpectedReleaseMismatch(error.differences) from None
+        raise
 
 
 @pytest.fixture

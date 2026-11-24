@@ -1,59 +1,59 @@
-# Cases reproduced against the released Python CLI. Each suite test must run.
-[pull_request]
-"126" = [
-  "test_intent_status.py::test_lifecycle[started]",
-  "test_intent_status.py::test_lifecycle[jwt_failed]",
-  "test_intent_status.py::test_lifecycle[user_rejected]",
-  "test_intent_status.py::test_lifecycle[user_sign_failed]",
-  "test_intent_status.py::test_lifecycle[user_submitted]",
-  "test_intent_status.py::test_lifecycle[accepted]",
-  "test_intent_status.py::test_lifecycle[submitted]",
-  "test_intent_status.py::test_lifecycle[pending_exec]",
-  "test_intent_status.py::test_lifecycle[chain_execution_failed]",
-  "test_intent_status.py::test_lifecycle[market_order_expired]",
-  "test_intent_status.py::test_lifecycle[market_order_fill_failed]",
-  "test_intent_status.py::test_lifecycle[market_order_trading_paused]",
-  "test_intent_status.py::test_lifecycle[market_order_market_closed]",
-  "test_intent_status.py::test_lifecycle[market_order_trade_not_open]",
-  "test_intent_status.py::test_lifecycle[simulation_failed]",
-  "test_intent_status.py::test_lifecycle[admission_expired]",
-  "test_intent_status.py::test_lifecycle[broadcast_rejected]",
-  "test_intent_status.py::test_lifecycle[absent]",
-  "test_intent_status.py::test_late_admission_and_stale_results[keyed]",
-  "test_intent_status.py::test_late_admission_and_stale_results[unkeyed]",
-  "test_intent_status.py::test_absent_response_only_creates_ledger_for_valid_keyed_account",
-  "test_intent_status.py::test_request_and_data_failures[redirect]",
-  "test_intent_status.py::test_request_and_data_failures[unauthorized]",
-  "test_intent_status.py::test_request_and_data_failures[server-error]",
-  "test_intent_status.py::test_request_and_data_failures[disconnect]",
-  "test_intent_status.py::test_request_and_data_failures[invalid-json]",
-  "test_intent_status.py::test_request_and_data_failures[non-object-response]",
-  "test_intent_status.py::test_request_and_data_failures[null-data]",
-  "test_intent_status.py::test_compressed_keeper_response",
-  "test_intent_status.py::test_expired_auth_status[/query]",
-  "test_intent_status.py::test_expired_auth_status[/private/query]",
-]
-"158" = [
-  "test_config_regressions.py::test_undecodable_environment[SAI_ENDPOINT]",
-  "test_intent_status.py::test_request_and_data_failures[null-intent-row]",
-]
-"185" = [
-  "test_intent_status.py::test_history[server-finality]",
-  "test_intent_status.py::test_history[user-finality-empty-history]",
-  "test_intent_status.py::test_history[other-trade-finality]",
-  "test_intent_status.py::test_history[other-trade-executed]",
-  "test_intent_status.py::test_history[limit-placement]",
-  "test_intent_status.py::test_history[filled-without-history]",
-  "test_intent_status.py::test_history[late-fill]",
-  "test_intent_status.py::test_history[unresolved]",
-  "test_intent_status.py::test_history[service-unavailable]",
-  "test_intent_status.py::test_history[body-timeout]",
-  "test_intent_status.py::test_split_history_headers_keep_the_inactivity_timer_alive",
-  "test_intent_status.py::test_malformed_history_page_stays_pending_without_retry",
-  "test_intent_status.py::test_legacy_terminal_repairs_only_for_market_pending",
-  "test_intent_status.py::test_filters_foreign_rows_and_correlates_canonical_addresses",
-  "test_intent_status.py::test_request_and_data_failures[non-list-intents]",
-  "test_intent_status.py::test_request_and_data_failures[missing-history]",
-  "test_intent_status.py::test_request_and_data_failures[null-history]",
-  "test_intent_status.py::test_public_history_projects_after_raw_hash_correlation",
-]
+# Signatures of normalized differences reproduced against sai-cli/v0.1.2.
+# Each scenario has one owner. Run without --release-xfails to inspect its paths.
+
+[pull_request."126"]
+"test_intent_status.py::test_lifecycle[started]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_lifecycle[jwt_failed]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_lifecycle[user_rejected]" = "6149c5d1147c1dc74d8764b702eefe7dda5bd86106f1c88d2020f844c496102d"
+"test_intent_status.py::test_lifecycle[user_sign_failed]" = "6149c5d1147c1dc74d8764b702eefe7dda5bd86106f1c88d2020f844c496102d"
+"test_intent_status.py::test_lifecycle[user_submitted]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_lifecycle[accepted]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_lifecycle[submitted]" = "9ab3d136aeb576f0c490d95ad2f72a73fc822a266860d5b649ad075ad70da25c"
+"test_intent_status.py::test_lifecycle[pending_exec]" = "9ab3d136aeb576f0c490d95ad2f72a73fc822a266860d5b649ad075ad70da25c"
+"test_intent_status.py::test_lifecycle[chain_execution_failed]" = "20e75443f942ae1d8647d849a5d6db5cdb7ff72833272884bbccde16f424303a"
+"test_intent_status.py::test_lifecycle[market_order_expired]" = "20e75443f942ae1d8647d849a5d6db5cdb7ff72833272884bbccde16f424303a"
+"test_intent_status.py::test_lifecycle[market_order_fill_failed]" = "20e75443f942ae1d8647d849a5d6db5cdb7ff72833272884bbccde16f424303a"
+"test_intent_status.py::test_lifecycle[market_order_trading_paused]" = "20e75443f942ae1d8647d849a5d6db5cdb7ff72833272884bbccde16f424303a"
+"test_intent_status.py::test_lifecycle[market_order_market_closed]" = "20e75443f942ae1d8647d849a5d6db5cdb7ff72833272884bbccde16f424303a"
+"test_intent_status.py::test_lifecycle[market_order_trade_not_open]" = "20e75443f942ae1d8647d849a5d6db5cdb7ff72833272884bbccde16f424303a"
+"test_intent_status.py::test_lifecycle[simulation_failed]" = "5e367a72de3a1724acbbdaee412e935757bfe76a6ba8a3d8e5dd16e6dd7c2345"
+"test_intent_status.py::test_lifecycle[admission_expired]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_lifecycle[broadcast_rejected]" = "5e367a72de3a1724acbbdaee412e935757bfe76a6ba8a3d8e5dd16e6dd7c2345"
+"test_intent_status.py::test_lifecycle[absent]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_late_admission_and_stale_results[keyed]" = "261f02c7545d253cb0731793d83c21b66c336101e7650468bb063215c045163f"
+"test_intent_status.py::test_late_admission_and_stale_results[unkeyed]" = "70620533b047e88e02665c42831a5e69a0d9d1461c470b38a1b0c2626696233d"
+"test_intent_status.py::test_absent_response_only_creates_ledger_for_valid_keyed_account" = "4ed93ab9b846004d65dbe7088f09ccbe2e4d0f94d7039cdfa939598850fe3a6e"
+"test_intent_status.py::test_request_and_data_failures[redirect]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_request_and_data_failures[unauthorized]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_request_and_data_failures[server-error]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_request_and_data_failures[disconnect]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_request_and_data_failures[invalid-json]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_request_and_data_failures[non-object-response]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_request_and_data_failures[null-data]" = "a8c58ea28ef14d277e19b2349bb8c16956e046cfc70b0e93261dfaa6e3a77da3"
+"test_intent_status.py::test_compressed_keeper_response" = "9ab3d136aeb576f0c490d95ad2f72a73fc822a266860d5b649ad075ad70da25c"
+"test_intent_status.py::test_expired_auth_status[/query]" = "771d53d592c846c350bf505078655e6a90bda1fda1923fdc71e0c85ffcc946a9"
+"test_intent_status.py::test_expired_auth_status[/private/query]" = "771d53d592c846c350bf505078655e6a90bda1fda1923fdc71e0c85ffcc946a9"
+
+[pull_request."158"]
+"test_config_regressions.py::test_undecodable_environment[SAI_ENDPOINT]" = "5acf80fd4b5a64f34378b4851d47252f652271e5ced29dbe8e639b37d0dce1ea"
+"test_intent_status.py::test_request_and_data_failures[null-intent-row]" = "8d9bee349dd7a83683e58854b204cd10b3605d3ecdad0a2d946a9327513d79b5"
+
+[pull_request."185"]
+"test_intent_status.py::test_history[server-finality]" = "0f1001bf8d516ad904c0be78f2695ef24ea1a31f004805fe65ccaa599d42b16d"
+"test_intent_status.py::test_history[user-finality-empty-history]" = "7af4fcb4d592f7a3c0be93e198c31232b535c24f9a30f0aa242fd8af3fa990ee"
+"test_intent_status.py::test_history[other-trade-finality]" = "0f1001bf8d516ad904c0be78f2695ef24ea1a31f004805fe65ccaa599d42b16d"
+"test_intent_status.py::test_history[other-trade-executed]" = "0f1001bf8d516ad904c0be78f2695ef24ea1a31f004805fe65ccaa599d42b16d"
+"test_intent_status.py::test_history[limit-placement]" = "0f1001bf8d516ad904c0be78f2695ef24ea1a31f004805fe65ccaa599d42b16d"
+"test_intent_status.py::test_history[filled-without-history]" = "79d7361631f5568266180bad814660fdf82879ffb01b05296cd780f00c58d91f"
+"test_intent_status.py::test_history[late-fill]" = "ab2159114d01bbb13340a2bd16f59c78ee9cf2d2e3b18942e1aa88f6ea270674"
+"test_intent_status.py::test_history[unresolved]" = "ab2159114d01bbb13340a2bd16f59c78ee9cf2d2e3b18942e1aa88f6ea270674"
+"test_intent_status.py::test_history[service-unavailable]" = "3201ca6e4d24fa6f2370f399445d84c01e62ab03f5674852cc367c7aef440dbe"
+"test_intent_status.py::test_history[body-timeout]" = "3201ca6e4d24fa6f2370f399445d84c01e62ab03f5674852cc367c7aef440dbe"
+"test_intent_status.py::test_split_history_headers_keep_the_inactivity_timer_alive" = "3201ca6e4d24fa6f2370f399445d84c01e62ab03f5674852cc367c7aef440dbe"
+"test_intent_status.py::test_malformed_history_page_stays_pending_without_retry" = "61eae3081e3e6d4e8941a5650cc9018df8cf9df62f94595834cbe21f67838d79"
+"test_intent_status.py::test_legacy_terminal_repairs_only_for_market_pending" = "8a227eac244639fca73dda7a05057358ca32b088c125fae2a6cd1a7dada6d828"
+"test_intent_status.py::test_filters_foreign_rows_and_correlates_canonical_addresses" = "d46dd41cdcb77992dc8b730e5a0d2e49245998ee847c595f9d51f2a37ffd30e2"
+"test_intent_status.py::test_request_and_data_failures[non-list-intents]" = "4deb3eddab4d2e8721595dcf3c5708f9f2d076082477bd62712e038de1bd44f8"
+"test_intent_status.py::test_request_and_data_failures[missing-history]" = "20d51de76ae971e075432e51ab80664bd080dbc372569ff6591c4262b8f0c3da"
+"test_intent_status.py::test_request_and_data_failures[null-history]" = "20d51de76ae971e075432e51ab80664bd080dbc372569ff6591c4262b8f0c3da"
+"test_intent_status.py::test_public_history_projects_after_raw_hash_correlation" = "cf06393804c4269edc6562e88014734882cdd40431a32a71c5fc15c2d319a0a7"

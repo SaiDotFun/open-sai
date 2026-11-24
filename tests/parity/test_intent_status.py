@@ -17,13 +17,14 @@ import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
 import pytest
 from compare import Normalize, validate_log_endpoint_key
+from release_mismatch import assert_release_equal
 from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
 from websockets.http11 import Request as UpgradeRequest
@@ -309,13 +310,28 @@ def compare(
                 if step.key is not None:
                     args.extend(("--key", step.key))
                 result = invoke(cli, home, *args)
-                assert result.returncode == step.code, (result.stdout, result.stderr)
-                assert not replies
-                assert [request.body for request in requests] == [
-                    wire(keeper.INTENTS, user=step.addr, key=step.key),
-                    *[wire(keeper.INTENT_HISTORY, trader=step.addr, limit=25, offset=0)]
-                    * (len(step.replies) - 1),
+                first_request = wire(keeper.INTENTS, user=step.addr, key=step.key)
+                history_request = wire(
+                    keeper.INTENT_HISTORY, trader=step.addr, limit=25, offset=0
+                )
+                bodies = [request.body for request in requests]
+                expected = [
+                    first_request,
+                    *[history_request] * (len(step.replies) - 1),
                 ]
+                if index == 0:
+                    assert result.returncode == step.code, (
+                        result.stdout,
+                        result.stderr,
+                    )
+                    assert not replies
+                    assert bodies == expected
+                else:
+                    assert bodies[:1] == [first_request]
+                    legacy_history = wire(keeper.HISTORY, trader=step.addr)
+                    assert all(
+                        body in (history_request, legacy_history) for body in bodies[1:]
+                    )
                 if step.json_output:
                     assert not result.stderr
                     assert len(result.stdout.splitlines()) == 1
@@ -333,9 +349,20 @@ def compare(
                     assert (
                         next(row for row in rows if row[0] == "foreign")[4] == "unknown"
                     )
-                runs.append((result.stdout, result.stderr, list(requests), state))
-            observed.append((runs, read_events(home)))
-        assert observed[0] == observed[1]
+                runs.append(
+                    {
+                        "exit": result.returncode,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "requests": [asdict(request) for request in requests],
+                        "unconsumed": len(replies),
+                        "files": state[0],
+                        "ledger": state[1:],
+                    }
+                )
+                replies.clear()
+            observed.append({"runs": runs, "logs": read_events(home)})
+        assert_release_equal(*observed)
 
 
 @pytest.mark.parametrize(
@@ -870,8 +897,8 @@ def test_expired_auth_status(
         assert payload["error"]["code"] == "SESSION_EXPIRED"
         login = origin_login_hint(origin if index == 1 else None)
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        observed.append((payload, read_events(home)))
-    assert observed[0] == observed[1]
+        observed.append({"stdout": payload, "logs": read_events(home)})
+    assert_release_equal(*observed)
 
 
 @pytest.mark.parametrize("json_output", [True, False])

@@ -8,6 +8,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from release_mismatch import assert_release_equal
 
 
 def invoke(
@@ -123,14 +124,15 @@ def test_undecodable_environment(
         observed.append((result.returncode, result.stdout, result.stderr))
         assert not (home / "logs").exists()
     if setting == "SAI_ENDPOINT":
-        assert observed[0] == observed[1]
         assert observed[0][0] == 2
-        assert observed[0][2] == b""
+        assert observed[0][2] == observed[1][2] == b""
+        assert observed[0][1] == observed[1][1]
         error = json.loads(observed[0][1])["error"]
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith(
             "SAI_ENDPOINT: Invalid value for keeper.endpoint"
         )
+        assert_release_equal({"exit": observed[0][0]}, {"exit": observed[1][0]})
     else:
         assert observed[0][:2] == observed[1][:2]
         assert observed[0][2].startswith(b"SAI_LOG: invalid value for logs.enabled;")
