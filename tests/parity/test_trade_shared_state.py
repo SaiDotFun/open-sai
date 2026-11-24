@@ -358,14 +358,15 @@ ACTIONS = {
     ),
 }
 ACTION_REASONS = {
-    "open": "#117",
-    "close": "#117",
-    "cancel": "#117",
-    "margin": "#118",
-    "partial-close": "#118",
-    "tpsl": "R1-03",
-    "leverage": "R1-03",
+    "open": "pull/117",
+    "close": "pull/117",
+    "cancel": "pull/117",
+    "margin": "pull/118",
+    "partial-close": "pull/118",
+    "tpsl": "issues/173",
+    "leverage": "pull/181",
 }
+REPO_URL = "https://github.com/SaiDotFun/open-sai"
 
 
 def command_help(home: Home, runner: Runtime, group: str, command: str) -> str | None:
@@ -391,7 +392,9 @@ def trade_help(home: Home, runner: Runtime, action_name: str) -> str:
         action_name == "cancel" and "--cancel-order" not in help_text
     ):
         assert runner.rust
-        pytest.skip(f"Rust trade {action_name} awaits {ACTION_REASONS[action_name]}")
+        pytest.skip(
+            f"Rust trade {action_name} awaits {REPO_URL}/{ACTION_REASONS[action_name]}"
+        )
     return help_text
 
 
@@ -416,39 +419,49 @@ def assert_trade_events(
 
 @pytest.mark.parametrize("action_name", ACTIONS)
 @pytest.mark.parametrize(
-    ("submitter", "reconciler"),
-    [("python", "python"), ("python", "rust"), ("rust", "python")],
+    ("submitter", "reconciler", "retry_runtime"),
+    [
+        ("python", "python", "python"),
+        ("python", "rust", "python"),
+        ("python", "rust", "rust"),
+        ("rust", "python", "python"),
+    ],
 )
 def test_lost_admission_blocks_until_reconciliation(
     action_name: str,
     submitter: str,
     reconciler: str,
+    retry_runtime: str,
     request: pytest.FixtureRequest,
     tmp_path: Path,
     python_reference: Path | None,
 ) -> None:
     writer = runtime(submitter, request, python_reference)
     reader = runtime(reconciler, request, python_reference)
+    retry = runtime(retry_runtime, request, python_reference)
     action = ACTIONS[action_name]
     replay = action.replay(lose_reply=True)
     with loopback(action.server, trade_replay=replay) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, writer, action_name)
+        if retry_runtime != submitter:
+            trade_help(home, retry, action_name)
         args = ("trade", *action.args)
         error = home.json(writer, *args, code=5)["error"]
         key = error["intentKey"]
         assert error["code"] == "OUTCOME_UNKNOWN" and error["retryable"] is False
         home.local(reader, key, action.kind, "unknown")
         home.row(key, action.kind, action.entity, "unknown")
-        assert_blocked(home.invoke(writer, "--json", *args), key)
+        assert_blocked(home.invoke(retry, "--json", *args), key)
+        assert replay.attempts() == {key: 1}
 
         replay.phase = "pending"
         status = home.json(reader, "intent", "status", ADDRESS, "--key", key)
         assert status["outcome"] == "pending"
         home.local(writer, key, action.kind, "pending")
         home.row(key, action.kind, action.entity, "pending")
-        assert_blocked(home.invoke(writer, "--json", *args), key)
+        assert_blocked(home.invoke(retry, "--json", *args), key)
 
         replay.phase = "filled"
         status = home.json(reader, "intent", "status", ADDRESS, "--key", key)
