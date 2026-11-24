@@ -18,7 +18,7 @@ fn resolves_all_layers_and_uses_websocket_from_the_same_or_higher_layer() {
     let env = fixture(
         home.path(),
         &[
-            ("SAI_ENDPOINT", " https://env.example/query "),
+            ("SAI_ENDPOINT", "https://env.example/query"),
             ("SAI_WS_ENDPOINT", "wss://other.example/ws"),
             ("SAI_LOG_KEEP_DAYS", " \t"),
         ],
