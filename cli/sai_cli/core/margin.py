@@ -5,28 +5,32 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import logging
 import re
 import socket
 import time
 from collections.abc import Callable
 from concurrent.futures import Future
 from contextlib import closing, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from secrets import token_hex
 from threading import BoundedSemaphore, Thread
-from typing import Any, Literal
-from urllib.parse import quote
+from typing import Any, Literal, TypedDict
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
 from . import intents, keeper
 from .errors import Code, SaiError
+from .log import origin
 
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
 BLOCK_PATH = "/cosmos/base/tendermint/v1beta1/blocks/"
+NODE_INFO_PATH = "/cosmos/base/tendermint/v1beta1/node_info"
 INDEX_RETRY_DELAYS = (0.25, 0.5)
 INDEX_RETRY_BUDGET = 2.0
 INDEX_LAG = (
@@ -34,6 +38,11 @@ INDEX_LAG = (
     " synchronizes. No intent was submitted."
 )
 _LCD_DNS_SLOTS = BoundedSemaphore(8)
+_LOG = logging.getLogger(__name__)
+_LCD_REQUEST: ContextVar[bool] = ContextVar("sai_lcd_request", default=False)
+# HTTPX logs the complete URL at INFO. Filter at its logger before host
+# handlers receive the record, with the filter scoped to each LCD request.
+logging.getLogger("httpx").addFilter(lambda _: not _LCD_REQUEST.get())
 _AddressInfo = (
     tuple[Literal[socket.AF_INET], socket.SocketKind, int, str, tuple[str, int]]
     | tuple[
@@ -64,6 +73,10 @@ class MarketUnavailable(ValueError):
     """Keeper has no open market for the position."""
 
 
+class TradingNetworkMismatch(ValueError):
+    """Keeper and the LCD reported different valid chain IDs."""
+
+
 class QueryHeightMismatch(SaiError, ValueError):
     """The LCD answered a pinned query at an unverified height."""
 
@@ -72,6 +85,12 @@ class QueryHeightMismatch(SaiError, ValueError):
 
 class LCDTimeout(ValueError):
     """An overview LCD request ran out of time."""
+
+
+class _LCDStatusError(ValueError):
+    def __init__(self, endpoint: str, response: httpx.Response) -> None:
+        super().__init__(f"LCD at {endpoint} returned HTTP {response.status_code}")
+        self.body = response.text
 
 
 async def _resolve_lcd_host(
@@ -109,10 +128,9 @@ async def _resolve_lcd_host(
 
 
 def _get_before_deadline(
-    url: str,
+    url: httpx.URL,
     deadline: float,
     headers: dict[str, str] | None,
-    params: dict[str, str] | None,
 ) -> httpx.Response:
     async def request() -> httpx.Response:
         remaining = deadline - time.monotonic()
@@ -120,7 +138,7 @@ def _get_before_deadline(
             raise TimeoutError("LCD read deadline exceeded")
         async with asyncio.timeout(remaining):
             async with httpx.AsyncClient(timeout=None) as client:
-                return await client.get(url, headers=headers, params=params)
+                return await client.get(url, headers=headers)
 
     with closing(asyncio.new_event_loop()) as loop:
         loop.getaddrinfo = _resolve_lcd_host
@@ -152,12 +170,26 @@ def _get_json_at_height(
         headers = {BLOCK_HEIGHT_HEADER: height} if height is not None else None
         # The mainnet LCD caches by URI and can omit metadata on a hit.
         # Give every confirmation read a fresh URI, including the height anchor.
-        params = {"_sai_query": token_hex(16)} if fresh or height is not None else None
-        if deadline is None:
-            response = httpx.get(url, timeout=timeout, headers=headers, params=params)
-        else:
-            response = _get_before_deadline(url, deadline, headers, params)
-        response.raise_for_status()
+        request_url = httpx.URL(url)
+        if fresh or height is not None:
+            query = request_url.query
+            separator = b"&" if query else b""
+            nonce = token_hex(16).encode("ascii")
+            request_url = request_url.copy_with(
+                query=query + separator + b"_sai_query=" + nonce
+            )
+        request_token = _LCD_REQUEST.set(True)
+        try:
+            if deadline is None:
+                response = httpx.get(request_url, timeout=timeout, headers=headers)
+            else:
+                response = _get_before_deadline(request_url, deadline, headers)
+        finally:
+            _LCD_REQUEST.reset(request_token)
+        site = origin(url)
+        _LOG.info("LCD HTTP response from %s (status %d)", site, response.status_code)
+        if not 200 <= response.status_code < 300:
+            raise _LCDStatusError(site, response)
         result = response.json()
         if not isinstance(result, dict):
             raise TypeError
@@ -171,13 +203,14 @@ def _get_json_at_height(
         if deadline is not None and isinstance(
             exc, (TimeoutError, httpx.TimeoutException)
         ):
-            raise LCDTimeout("LCD read timed out") from exc
+            raise LCDTimeout("LCD read timed out") from None
+        cause = exc if isinstance(exc, _LCDStatusError) else None
         if height is not None or fresh:
             raise QueryHeightMismatch(
                 "Unable to verify contract state during confirmation."
                 " Retry the preview and confirmation."
-            ) from exc
-        raise ValueError("Unable to read contract state") from exc
+            ) from cause
+        raise ValueError("Unable to read contract state") from cause
     query_height = response.headers.get(f"grpc-metadata-{BLOCK_HEIGHT_HEADER}")
     if query_height is None and allow_unprefixed_height:
         query_height = response.headers.get(BLOCK_HEIGHT_HEADER)
@@ -189,12 +222,18 @@ def _get_json_at_height(
     return result, query_height
 
 
+def lcd_url(lcd: str, route: str) -> str:
+    """Append a REST route to the LCD path and keep its query parameters."""
+    parts = urlsplit(lcd)
+    return urlunsplit(parts._replace(path=parts.path.rstrip("/") + route))
+
+
 def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
-    return f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
+    return lcd_url(lcd, f"/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}")
 
 
 def smart_value(
@@ -215,7 +254,7 @@ def smart_value(
 
 def block_header(lcd: str, height: int | str, *, deadline: float) -> dict[str, Any]:
     result, _ = _get_json_at_height(
-        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}",
+        lcd_url(lcd, f"{BLOCK_PATH}{height}"),
         fresh=height == "latest",
         deadline=deadline,
     )
@@ -265,9 +304,9 @@ def pair_leverage_cap(
         )
     except ValueError as exc:
         failure = exc.__cause__
-        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+        if isinstance(failure, _LCDStatusError) and re.search(
             r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found",
-            failure.response.text,
+            failure.body,
         ):
             return Decimal(0)
         raise
@@ -286,9 +325,9 @@ def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> A
     except QueryHeightMismatch as exc:
         failure = exc.__cause__
         # The wasm gRPC gateway can wrap Perp query errors in HTTP 500.
-        if isinstance(failure, httpx.HTTPStatusError) and re.search(
+        if isinstance(failure, _LCDStatusError) and re.search(
             rf"Trade not found for trader \S+ with index {trade_id}\b",
-            failure.response.text,
+            failure.body,
         ):
             raise ValueError(
                 f"Trade {trade_id} was not found for this account."
@@ -296,13 +335,22 @@ def read_cancel_target(lcd: str, contract: str, trader: str, trade_id: int) -> A
         raise ValueError(f"Unable to read pending order {trade_id} from Perp.") from exc
 
 
+class PositionRoute(TypedDict):
+    chainId: str
+    contractAddress: str
+
+
 @dataclass(frozen=True)
 class PositionSnapshot:
     raw: dict[str, Any]
     funds: dict[str, Any]
     market: dict[str, Any]
-    contract: str
+    route: PositionRoute
     observed_at: str | None = None
+
+    @property
+    def contract(self) -> str:
+        return self.route["contractAddress"]
 
 
 def _read_position(
@@ -392,9 +440,7 @@ def position_unchanged(
 
 def block_timestamp(lcd: str, height: str) -> int:
     """Read the UTC timestamp of a specific LCD block."""
-    result = _get_json(
-        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/blocks/{height}"
-    )
+    result = _get_json(lcd_url(lcd, f"{BLOCK_PATH}{height}"))
     block = result.get("sdk_block") or result.get("block")
     if not isinstance(block, dict):
         raise TypeError("LCD block header is unavailable")
@@ -405,21 +451,37 @@ def block_timestamp(lcd: str, height: str) -> int:
     return int(time.timestamp())
 
 
-def trading_contract(endpoint: str, lcd: str) -> str:
+def trading_route(endpoint: str, lcd: str) -> PositionRoute:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
-    node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
+    node = _get_json(lcd_url(lcd, NODE_INFO_PATH))
     info = node.get("default_node_info")
+    chain_id = route.get("chainId")
+    network = info.get("network") if isinstance(info, dict) else None
     if (
-        not route["enabled"]
-        or not isinstance(info, dict)
-        or info.get("network") != route["chainId"]
+        route["enabled"] is not True
+        or not isinstance(chain_id, str)
+        or not chain_id
+        or not isinstance(network, str)
+        or not network
     ):
         raise ValueError("Keeper trading route and LCD network do not match")
-    return route["contractAddress"]
+    contract = route.get("contractAddress")
+    if not isinstance(contract, str) or not contract:
+        raise ValueError("Keeper trading route has no contract address")
+    if network != chain_id:
+        raise TradingNetworkMismatch(
+            "Keeper trading route and LCD network do not match"
+        )
+    return {"chainId": chain_id, "contractAddress": contract}
+
+
+def trading_contract(endpoint: str, lcd: str) -> str:
+    return trading_route(endpoint, lcd)["contractAddress"]
 
 
 def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
-    contract = trading_contract(endpoint, lcd)
+    route = trading_route(endpoint, lcd)
+    contract = route["contractAddress"]
     position = _position(endpoint, addr, trade_id, timeout=20)
     borrowing = position["perpBorrowing"]
     collateral = borrowing["collateralToken"]
@@ -485,7 +547,7 @@ def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnaps
     )
     if funds.get("collateral_index") != token:
         raise PositionChanged("Position changed. Review the margin change again.")
-    return PositionSnapshot(raw, funds, market, contract, observed_at)
+    return PositionSnapshot(raw, funds, market, route, observed_at)
 
 
 def contract_decimal(value: Any) -> Decimal:

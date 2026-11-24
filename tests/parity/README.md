@@ -65,6 +65,15 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
 
+## Auth Subprocess Cases
+
+Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.
+Set `SAI_PARITY_AUTH_PYTHON` to the Python `sai` executable from a checkout
+of `main` to compare auth, including renewal, expiry recovery, and origin-only
+output. The Rust CI job pins the reference to a commit on `main`. The test runs
+use private temporary homes, fixture clipboard and signing commands, and
+loopback Keeper.
+
 The `legacy` seed contains a config file and an encrypted synthetic session
 written by the Python source at tag `sai-cli/v0.1.0`. The concurrent-close
 case overlaps two processes using one ledger. The stub holds the first
@@ -104,6 +113,7 @@ checked on both sides.
 | Text and structured output | The run's absolute temporary home path |
 | Stdout from `--version`, `skill source`, `update --check`, `doctor`, and MCP initialization | Running or installed CLI versions at the documented fields |
 | Doctor checks | `generatedAt` and check durations, including durations embedded in network-check summaries |
+| Doctor provenance | Source checkout path, commit, and dirty flag |
 | `update.json` | `checkedAt` |
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
 | Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps. The latter must be stored as REAL Unix seconds within the invocation window. |
@@ -116,3 +126,28 @@ within a run. An event with the wrong call ID or an output with a different
 intent key can therefore differ even when both IDs have valid shapes.
 `LOG_VOLATILE_FIELDS` in `compare.py` assigns normalization rules to the
 volatile fields listed in `docs/log-events.json` and to generated intent keys.
+
+## Doctor and MCP Registration Reference
+
+The C9a cases compare against Python main at
+`3feb83a1ab3e46b4f618f497a4820d6179d19eba`. Install that checkout with
+`uv sync --locked`, then point `SAI_C9A_PYTHON` at its
+`.venv/bin/sai` executable. Run the driver with
+`--case 'doctor-*' --case 'mcp-list*' --case 'mcp-install-*'` and set
+`SAI_PARITY_BIN` to the Rust binary. With `SAI_C9A_PYTHON` unset, the
+driver uses the Python entry point from its own environment.
+
+The `client_seed` key supplies private Claude Code, Codex, and Cursor
+configs. The runner uses fixture programs for client subprocesses and
+compares their arguments, file modes, config values, Codex comments, and
+which files changed. It also checks that stdout and stderr omit the
+fixture credential.
+
+In `doctor-mcp-verification-failure`, Rust restores the Codex config when
+verification rejects the repaired entry. The case checks that Rust keeps the
+original bytes and mode. The pinned Python reference leaves the replacement
+on disk.
+
+The `lcd-origin-only` cases project the LCD endpoint in Python's report to
+its origin before comparing it with Rust. They cover successful probes and
+an unavailable LCD with a private path. Rust output is compared as emitted.
