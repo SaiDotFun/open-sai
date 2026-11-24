@@ -92,7 +92,7 @@ class Registration:
         Any other entry's args may hold a token or a credential URL, so only
         the command's file name is shown.
         """
-        if target is not None and self.argv == target.argv:
+        if target is not None and self.matches_command(target):
             return {"command": self.argv}
         if not self.argv:
             return {"command": []}
@@ -103,11 +103,21 @@ class Registration:
 
     def matches(self, target: Target) -> bool:
         return (
-            self.argv == target.argv
+            self.matches_command(target)
             and self.matches_sai_home(target.env)
             and not self.stale_env
             and not self.extra_settings
             and not self.disabled
+        )
+
+    def matches_command(self, target: Target) -> bool:
+        if self.argv == target.argv:
+            return True
+        return bool(
+            self.argv
+            and target.argv
+            and self.argv[1:] == target.argv[1:]
+            and normalize_launcher(self.argv[0]) == normalize_launcher(target.argv[0])
         )
 
     def matches_sai_home(self, env: Mapping[str, str]) -> bool:
@@ -236,6 +246,14 @@ def inside(path: Path, roots: list[Path]) -> bool:
             if any(p.is_relative_to(base) for p in candidates):
                 return True
     return False
+
+
+def normalize_launcher(command: str) -> str:
+    """Resolve the directory of an absolute launcher and keep uv's executable link."""
+    if not os.path.isabs(command):
+        return command
+    directory, name = os.path.split(command)
+    return os.path.join(os.path.realpath(directory), name)
 
 
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
@@ -1279,11 +1297,11 @@ def replace_registration(
     if stale.args is None or scope in client.read_only_scopes:
         raise ClientError("This registration needs a manual edit")
     if isinstance(client, Codex):
-        expected = Target([target.argv[0], *stale.args])
+        expected = Target([normalize_launcher(target.argv[0]), *stale.args])
         path = client.config_path(scope)
         edit_codex_config(path, expected, stale=stale)
         actual = client.get(client.neutral_dir(), "user", name)
-        if actual is None or actual.argv != expected.argv:
+        if actual is None or not actual.matches_command(expected):
             raise ClientError("Codex did not load the repaired Sai registration")
         return
     if not isinstance(client, Cursor):

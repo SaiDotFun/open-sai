@@ -19,6 +19,7 @@ from sai_cli import mcp_install
 from sai_cli import sai_cli as cli
 from sai_cli.core import log
 from sai_cli.sai_cli import main
+from test_update import GIT, make_prefix
 
 # Built from parts so the retired-names test does not match this file.
 OLD_COMMAND = "sai" + "-mcp"
@@ -833,6 +834,42 @@ def test_doctor_reports_same_stale_codex_project_entry_after_repairing_user(env:
     assert json.loads(override.read_text()) == entry
     config = tomlkit.parse((env.codex_home / "config.toml").read_text()).unwrap()
     assert config["mcp_servers"]["sai"]["command"] == str(env.sai)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX uv launcher symlink")
+def test_doctor_repairs_codex_with_a_normalized_stable_launcher(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    prefix = make_prefix(env.root / "uv-tool", GIT, receipt=True)
+    executable = prefix / "sai"
+    env.sai.rename(executable)
+    env.sai.symlink_to(executable)
+    intermediate = env.root / "share"
+    intermediate.mkdir()
+    receipt_launcher = intermediate / ".." / "bin" / "sai"
+    with (prefix / "uv-receipt.toml").open("a") as receipt:
+        receipt.write(
+            f'entrypoints = [{{ name = "sai", install-path = {json.dumps(str(receipt_launcher))} }}]\n'
+        )
+    monkeypatch.setattr(sys, "prefix", str(prefix))
+    env.write_codex({"sai": claude_entry([OLD_COMMAND])})
+
+    repaired = invoke("doctor", "--offline")
+
+    assert mcp_checks(repaired)["codex"]["status"] == "fixed", repaired.output
+    entries = tomlkit.parse(env.codex_path().read_text()).unwrap()["mcp_servers"]
+    assert entries["sai"]["command"] == str(env.sai)
+    for launcher in (env.sai, receipt_launcher):
+        if launcher == receipt_launcher:
+            env.write_codex({"sai": claude_entry([str(launcher), "mcp", "serve"])})
+        listed = invoke("mcp", "list")
+        assert listed.exit_code == 0, listed.output
+        codex = next(
+            row for row in payload(listed)["clients"] if row["client"] == "codex"
+        )
+        assert codex["current"] and codex["registrations"][0]["current"]
+        assert codex["registeredCommand"] == [str(launcher), "mcp", "serve"]
+        assert mcp_checks(invoke("doctor", "--offline"))["codex"]["status"] == "pass"
 
 
 def test_install_uses_each_clients_registration_backend(env: Env):
