@@ -180,11 +180,20 @@ jobs:
           path: .parity-python-wait
           persist-credentials: false
 
+      - name: Check out the Python v0.1.2 estimate reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 8557a7e13dceab0accc369191182c8e01423c91b
+          path: .parity-python-estimates
+          persist-credentials: false
+
       - run: |
           uv sync --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
           uv sync --project .parity-python-c7 --locked --all-groups
           uv sync --project .parity-python-wait --locked --all-groups
+          uv sync --project .parity-python-estimates --locked --all-groups
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -200,4 +209,5 @@ jobs:
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
           SAI_PARITY_C7_PYTHON: ${{ github.workspace }}/.parity-python-c7/.venv/bin/sai
           SAI_PARITY_WAIT_PYTHON: ${{ github.workspace }}/.parity-python-wait/.venv/bin/sai
+          SAI_PARITY_ESTIMATES_PYTHON: ${{ github.workspace }}/.parity-python-estimates/.venv/bin/sai
         run: uv run --locked pytest tests/parity
