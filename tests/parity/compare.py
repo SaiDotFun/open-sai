@@ -289,6 +289,14 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
             records.sort(key=lambda record: str(record.get("id", "")))
         return normalize.paths(records)
     value = normalize.paths(json.loads(raw))
+    if (
+        isinstance(value, dict)
+        and isinstance(error := value.get("error"), dict)
+        and "intentKey" in error
+    ):
+        for field in ("message", "hint"):
+            if isinstance(error.get(field), str):
+                error[field] = normalize.intent_refs(error[field])
     if command == "doctor" and isinstance(value, dict):
         replace_if(value, "generatedAt", timestamp)
         doctor_checks(value.get("checks"))

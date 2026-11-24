@@ -107,7 +107,7 @@ wire = ["ws:init","ws:userBalances"]
 [[case]]
 name = "auth-status-signed-out"
 args = ["--json","auth","status"]
-expect = 1
+expect = 6
 
 [[case]]
 name = "auth-status-signed-in"

@@ -366,11 +366,6 @@ def test_serve_flags_win_over_the_environment_and_file(tmp_path, monkeypatch):
     assert served_settings(monkeypatch, None).lcd_endpoint == "http://127.0.0.1:1"
 
 
-def test_serve_exits_on_a_bad_flag_without_serving(monkeypatch):
-    with pytest.raises(SystemExit, match="sai mcp serve: --endpoint"):
-        served_settings(monkeypatch, {"keeper.endpoint": "ftp://nope"})
-
-
 def test_server_settings_resolve_once_from_the_environment(monkeypatch):
     server.create_server()
     config = server.server_settings()

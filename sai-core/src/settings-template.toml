@@ -1,0 +1,42 @@
+# Sai CLI and MCP server settings.
+#
+# `sai config set KEY VALUE` and `sai config unset KEY` edit this file
+# and keep its comments. A commented-out key is unset and shows its
+# default. Each setting comes from the first of: command-line flag,
+# environment variable, this file, built-in mainnet default.
+# `sai config list` shows each value and where it came from.
+
+[keeper]
+# Sai Keeper GraphQL HTTP endpoint for queries and trading intents.
+# Flag: --endpoint. Environment: SAI_ENDPOINT.
+# endpoint = "https://sai-keeper.nibiru.fi/query"
+
+# Keeper WebSocket endpoint for balances and live feeds. Unset derives it from
+# keeper.endpoint (https becomes wss). A value here is ignored when
+# keeper.endpoint comes from a flag or environment variable, so the two always
+# point at one Keeper.
+# Flag: --ws-endpoint. Environment: SAI_WS_ENDPOINT.
+# ws_endpoint = "wss://sai-keeper.nibiru.fi/query"
+
+[lcd]
+# Nibiru REST (LCD) endpoint that margin and partial-close quotes read exact
+# contract state from.
+# Flag: --lcd-endpoint. Environment: SAI_LCD_ENDPOINT.
+# endpoint = "https://lcd.nibiru.fi"
+
+[update]
+# Install newer sai releases automatically. false means notify only.
+# Environment: SAI_UPDATE_AUTO.
+# auto = true
+
+[logs]
+# Record commands, MCP tool calls, Keeper requests, and intent status changes
+# as JSON lines under $SAI_HOME/logs. The session token is never written.
+# false writes nothing.
+# Environment: SAI_LOG.
+# enabled = true
+
+# Days of log files to keep, counting today. Older files are deleted, at most
+# once a day.
+# Environment: SAI_LOG_KEEP_DAYS.
+# keep_days = 14

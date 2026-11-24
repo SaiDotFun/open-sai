@@ -322,12 +322,50 @@ and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
 
 Each check prints pass, fixed, warn, fail, or skipped, with what changed or
-the command that fixes it. Doctor exits 1 if any check still fails;
-`sai --json doctor` prints the same report as JSON. `--no-fix` reports
-without changing anything, log lines included, and `--offline` skips the network checks, which
+the command that fixes it. `sai --json doctor` prints a structured report on
+success. If a check fails, doctor exits 1 and the JSON error message lists the
+failed checks and their fixes. `--no-fix` reports without changing anything,
+log lines included, and `--offline` skips the network checks, which
 otherwise run in parallel and stop after 7 seconds in total. The
 endpoints come from [Settings](#settings); `sai doctor --ws-endpoint` and
 `--lcd-endpoint` override them for one run.
+
+## Errors and Exit Codes
+
+Put `--json` before the command to read errors on stdout. A failed command
+writes one JSON object with `error.code`, `error.message`, and
+`error.retryable`. The error includes `intentKey` when it refers to a
+recorded intent and `hint` when a command can help. Failed doctor checks and
+MCP registration commands include their structured reports in
+`error.details`. The registration report includes `changed` per client and
+the aggregate `reconnectNeeded` flag. If a stream such as `watch` has already
+emitted JSON lines, the error object is its final line. Once `sai mcp serve`
+starts the stdio transport, stdout carries MCP protocol traffic. Without
+`--json`, error text goes to stderr.
+
+| Exit | Meaning | What to Do |
+| --- | --- | --- |
+| 0 | Success | Read the result. |
+| 1 | Other failure | Read `error.code` and the message before deciding what to do. |
+| 2 | Command usage error | Check the command's `--help`. |
+| 3 | Unsupported install or environment | Follow the error's installation or terminal instructions. |
+| 4 | Request rejected or never sent | The request executed nothing. Review the error before retrying. |
+| 5 | Outcome unknown | Keep the intent key and reconcile it. Do not resubmit. |
+| 6 | Signed out or session expired | Sign in with `sai auth login NAME` or `sai auth import`. |
+
+`ADMISSION_REJECTED` and `NOT_SENT` have exit 4 and `retryable: true`.
+`OUTCOME_UNKNOWN` has exit 5 and `retryable: false`. The reconciliation
+and sign-in hints pin the original Keeper endpoint. For URLs that may
+contain credentials, including custom gateway paths, set
+`SAI_RECONCILE_ENDPOINT` to the original URL before running the hint.
+Exit 6 covers `SIGNED_OUT` and
+`SESSION_EXPIRED`. `SESSION_UNAVAILABLE` has exit 1 and describes a local
+session the command could not use, for example one for another Keeper
+endpoint.
+
+The CLI, MCP tools, and failure logs share codes. MCP tool errors have
+top-level `error` and `code` fields. Logs use `code` for the Sai failure
+and retain Keeper's own diagnostic fields where available.
 
 ## Agent Skill
 
