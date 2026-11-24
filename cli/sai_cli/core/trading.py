@@ -522,8 +522,7 @@ def partial_close(
 ) -> dict[str, Any]:
     """Reduce an open USDC position by a whole percentage.
 
-    The reduction is sized from contract state, checked against the market's
-    minimum position size, and re-checked before submitting.
+    The reduction is sized from contract state and re-checked before submitting.
     """
     active = get_session()
     addr = active["evmAddress"]
@@ -546,10 +545,7 @@ def partial_close(
             "collateralAmount": raw["collateral_amount"],
             "leverage": raw["leverage"],
         }
-        minimum = estimates.minimum_position_size_usd_base_units(
-            candidates[0]["minPositionSizeUSD"]
-        )
-        payload = intents.partial_intent(position, percent, minimum)
+        payload = intents.partial_intent(position, percent)
         delta = int(payload["body"]["collateral"]["amountUsdc"])
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         notional = partial.notional_quote(lcd_endpoint, state, delta, leverage)

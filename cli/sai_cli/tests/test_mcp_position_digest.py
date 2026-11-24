@@ -590,53 +590,33 @@ def test_position_confirmation_refuses_lcd_only_network_switch(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    ("minimum", "accepted"),
-    [(3_999_999, True), (4_000_000, True), (4_000_001, False)],
-)
-def test_partial_close_compares_keeper_minimum_in_usd_base_units(
-    position_service: tuple[Position, str],
-    tmp_path,
-    monkeypatch,
-    minimum: int,
-    accepted: bool,
+def test_partial_close_allows_remainder_below_fee_schedule_minimum(
+    position_service: tuple[Position, str], tmp_path, monkeypatch
 ) -> None:
     position, base_url = position_service
-    position.keeper_minimum_position_microusd = minimum
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "2"
+    position.keeper_minimum_position_microusd = 100_000_000
+    position.minimum_position_microusd = "100000000"
     monkeypatch.setenv("SAI_HOME", str(tmp_path))
 
     async def scenario() -> None:
         async with connected_client(base_url) as client:
             preview = await call(
-                client, "preview_partial_close", {"trade_id": 7, "percent": 50}
+                client, "preview_partial_close", {"trade_id": 7, "percent": 60}
             )
             result = CliRunner().invoke(
                 main,
-                [
-                    "--json",
-                    "--endpoint",
-                    f"{base_url}/query",
-                    "--lcd-endpoint",
-                    base_url,
-                    "trade",
-                    "partial-close",
-                    "7",
-                    "--percent",
-                    "50",
-                    "--dry-run",
-                ],
+                position_cli_args(
+                    base_url, ["partial-close", "7", "--percent", "60", "--dry-run"]
+                ),
             )
-            if accepted:
-                assert result.exit_code == 0, result.output
-                assert json.loads(result.stdout)["intent"] == preview["intent"]
-                assert preview["quote"]["closedNotionalUsd"] == "4"
-            else:
-                assert result.exit_code == 1, result.output
-                assert preview["code"] == "INVALID_REQUEST"
-                assert "market minimum" in preview["error"]
-                error = json.loads(result.output)["error"]
-                assert error["code"] == "INVALID_REQUEST"
-                assert error["message"] == preview["error"]
+            assert result.exit_code == 0, result.output
+            assert json.loads(result.stdout)["intent"] == preview["intent"]
+            assert preview["intent"]["body"]["collateral"]["amountUsdc"] == "60000000"
+            assert preview["quote"]["closedNotionalUsd"] == "120"
+            assert preview["estimates"]["fees"]["amountUsdc"] == "0.6"
             assert position.submitted == []
 
     asyncio.run(scenario())

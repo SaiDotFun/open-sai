@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation
 from secrets import choice
 from typing import Any
 
@@ -159,19 +159,19 @@ def tpsl_intent(
     }
 
 
-def partial_intent(
-    trade: dict[str, Any], percent: int, min_size_usd_base_units: int
-) -> dict[str, Any]:
+def partial_intent(trade: dict[str, Any], percent: int) -> dict[str, Any]:
     if percent < 1 or percent > 99:
         raise ValueError("Partial close percentage must be from 1 to 99")
-    amount = Decimal(str(trade["collateralAmount"]))
+    amount = int(trade["collateralAmount"])
     leverage = Decimal(str(trade["leverage"]))
-    delta = (amount * percent / 100).to_integral_value(rounding=ROUND_DOWN)
-    if delta <= 0 or (amount - delta) * leverage < min_size_usd_base_units:
-        raise ValueError(
-            "Reduction is too small or leaves less than the market minimum"
-        )
-    usd = format(delta / Decimal(1_000_000), "f")
+    delta = amount * percent // 100
+    numerator, denominator = leverage.as_integer_ratio()
+    # Perp floors each notional before subtracting the closed slice.
+    size = amount * numerator // denominator
+    closed = delta * numerator // denominator
+    if delta <= 0 or size <= closed:
+        raise ValueError("Reduction rounds to zero or leaves no open position")
+    usd = format(Decimal(delta) / Decimal(1_000_000), "f")
     return {
         "kind": "DECREASE_POSITION_SIZE",
         "target": {"userTradeId": str(trade["id"])},

@@ -111,7 +111,7 @@ def test_synthetic_trading_request_goldens(synthetic):
     )
     assert intents.close_intent(7) == expected["close"]
     assert intents.close_intent(7, cancel=True) == expected["cancel"]
-    assert intents.partial_intent(position, 50, 1_000_000) == expected["partial_close"]
+    assert intents.partial_intent(position, 50) == expected["partial_close"]
     assert intents.tpsl_intent(7, "110", None, False, True) == expected["tpsl"]
     assert intents.leverage_intent(7, "5") == expected["leverage"]
     quote = margin.margin_quote(
