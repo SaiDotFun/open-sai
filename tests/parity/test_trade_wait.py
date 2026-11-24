@@ -56,6 +56,9 @@ CONTRACT = "nibi1contract"
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
 SMART_QUERY = f"/cosmwasm/wasm/v1/contract/{CONTRACT}/smart/"
 ROUTE = {"enabled": True, "chainId": "cataclysm-1", "contractAddress": CONTRACT}
+WAITING_FOR_CANCEL_GUARD = pytest.mark.xfail(
+    strict=True, reason="Waiting on PR #117 for the shared pending-order preflight"
+)
 MARKETS = {
     "data": {
         "perp": {
@@ -144,7 +147,7 @@ def submitted_key(request: Request, kind: str) -> str:
     return submission["intentKey"]
 
 
-def cancel_lcd(request: Request) -> Reply:
+def cancel_lcd(request: Request, *, trade_type: str = "limit") -> Reply:
     assert "authorization" not in request.headers
     if request.path == NODE_INFO:
         return response({"default_node_info": {"network": ROUTE["chainId"]}})
@@ -157,7 +160,7 @@ def cancel_lcd(request: Request) -> Reply:
             "data": {
                 "user_trade_index": "UserTradeIndex(17)",
                 "is_open": True,
-                "trade_type": "limit",
+                "trade_type": trade_type,
             }
         }
     )
@@ -187,7 +190,16 @@ def normalized(document: Any, key: str) -> Any:
     return document.replace(key, "<intent>") if isinstance(document, str) else document
 
 
-@pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(case, marks=WAITING_FOR_CANCEL_GUARD)
+        if case.kind == "CANCEL_PENDING_TRADE"
+        else case
+        for case in CASES
+    ],
+    ids=lambda case: case.name,
+)
 def test_trade_wait(
     wait_cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
@@ -289,17 +301,21 @@ def test_trade_wait(
             key = document["intentKey"]
             assert keys == [key]
             assert not replies
-            wire = [json.loads(request.body) for request in requests if request.body]
-            if wire[0]["query"] == keeper.ROUTE:
-                assert case.kind == "CANCEL_PENDING_TRADE"
+            wire = [
+                json.loads(request.body)
+                if request.body
+                else {"path": urlsplit(request.path).path}
+                for request in requests
+            ]
+            if case.kind == "CANCEL_PENDING_TRADE":
+                assert wire[0]["query"] == keeper.ROUTE
                 assert requests[1].path == NODE_INFO
                 assert requests[2].path.startswith(SMART_QUERY)
-                wire.pop(0)
-                assert len(requests) == len(wire) + 3
             else:
-                assert index != 0 or case.kind != "CANCEL_PENDING_TRADE"
                 assert all(request.body for request in requests)
-            assert sum(item["query"].startswith("mutation") for item in wire) == 1
+            assert (
+                sum(item.get("query", "").startswith("mutation") for item in wire) == 1
+            )
             assert document["outcome"] == document["status"] == case.outcome
             assert document["addr"] == ADDR
             if case.args == OPEN:
@@ -318,7 +334,7 @@ def test_trade_wait(
             )
             assert ledger == [(key, *statuses)]
             for item in wire:
-                if item["query"].startswith("mutation"):
+                if item.get("query", "").startswith("mutation"):
                     submission = item["variables"]["input"]
                     stamp = submission["intent"].pop("tsIntentInit")
                     assert submission["lifecycle"].pop("tsLifecycleStep") == stamp
@@ -329,6 +345,58 @@ def test_trade_wait(
                 )
             )
     assert documents[0] == documents[1]
+
+
+@WAITING_FOR_CANCEL_GUARD
+@pytest.mark.parametrize("wait", [(), ("--wait",)], ids=["submit", "wait"])
+def test_trade_cancel_refuses_a_filled_target_before_mutation(
+    wait_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wait: tuple[str, ...],
+) -> None:
+    def route(request: Request) -> Reply:
+        wire = json.loads(request.body)
+        if wire["query"].startswith("mutation"):
+            # Reject a premature mutation so the failing case returns promptly.
+            return response(
+                {"errors": [{"extensions": {"code": "INTENT_NOT_ACCEPTED"}}]}
+            )
+        assert wire == {"query": keeper.ROUTE, "variables": {}}
+        return response({"data": {"oneClickTrading": ROUTE}})
+
+    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
+        endpoint,
+        replies,
+        requests,
+    ):
+        for index, cli in enumerate(wait_cli_pair):
+            home = tmp_path / str(index) / "sai"
+            connect(home, endpoint, monkeypatch)
+            requests.clear()
+            replies.append(route)
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--lcd-endpoint",
+                endpoint.removesuffix("/query"),
+                "--json",
+                "trade",
+                *CANCEL,
+                *wait,
+            )
+            assert not any(
+                request.body
+                and json.loads(request.body)["query"].startswith("mutation")
+                for request in requests
+            )
+            assert len(requests) == 3
+            assert result.returncode == 1
+            assert result.stderr == b""
+            assert json.loads(result.stdout)["error"]["code"] == "INVALID_REQUEST"
+            assert not (home / "trader/intents.sqlite3").exists()
 
 
 def test_trade_wait_dry_run(wait_cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
