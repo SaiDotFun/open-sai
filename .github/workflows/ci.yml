@@ -212,6 +212,14 @@ jobs:
           path: .parity-position-owner
           persist-credentials: false
 
+      - name: Check out Python main for position wait parity
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 20493c984e3398756365ea1a2b8786a7a0115a11
+          path: .parity-position-wait
+          persist-credentials: false
+
       - run: |
           uv sync --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
@@ -221,6 +229,7 @@ jobs:
           uv sync --project .parity-auth-python --locked --all-groups
           uv sync --project .parity-position-v012 --locked --all-groups
           uv sync --project .parity-position-owner --locked --all-groups
+          uv sync --project .parity-position-wait --locked --all-groups
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -259,4 +268,5 @@ jobs:
           SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
           SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
+          SAI_PARITY_POSITION_WAIT_PYTHON: ${{ github.workspace }}/.parity-position-wait/.venv/bin/sai
         run: uv run --locked pytest tests/parity

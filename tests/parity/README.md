@@ -37,8 +37,14 @@ compare the Keeper route, LCD checks, submission, and wait requests. They
 also check that a filled target produces zero mutations for both submit
 modes. The dry-run case compares each CLI with and without `--wait`.
 
+The TP/SL and leverage wait cases use Python main at
+`20493c984e3398756365ea1a2b8786a7a0115a11`. They check the request and
+execution blocks, admission and chain failure codes, the 30-second
+deadline, and intent-key recovery after Ctrl-C.
+
 ```sh
 SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \
+SAI_PARITY_POSITION_WAIT_PYTHON=/absolute/path/to/position-wait-pin/.venv/bin/sai \
 SAI_PARITY_BIN=/absolute/path/to/rust/sai \
 uv run pytest tests/parity/test_intent_wait.py tests/parity/test_trade_wait.py
 ```
