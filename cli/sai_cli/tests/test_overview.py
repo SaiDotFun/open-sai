@@ -703,6 +703,35 @@ def test_after_hours_adjustment_preserves_crossed_contract_threshold(replay):
     assert "keeperLiquidationEstimatePriceQuote" not in row
 
 
+@pytest.mark.parametrize(
+    ("is_long", "mark", "crossed"),
+    [
+        (True, "92.50", True),
+        (True, "93", True),
+        (True, "93.50", False),
+        (False, "93.50", True),
+        (False, "92.50", False),
+    ],
+)
+def test_stale_mark_preserves_only_a_liquidation_crossing(
+    replay, is_long, mark, crossed
+):
+    long, short = populate_trades(replay)
+    trade = long if is_long else short
+    trade.update(openPrice=100, leverage=10, state={"liquidationPrice": 92})
+    install_contract_trade(replay, trade, mark=mark, liquidation=93)
+    replay["expiration"] = 16
+    row = mcp(replay, addr=ADDR)["positions"]["data"]["items"][trade["id"]]
+    assert row["riskStatus"] == "partial"
+    warning = "at or past liquidation (stale mark)"
+    assert row.get("liquidationWarning") == (warning if crossed else None)
+    assert row["liquidationDistancePercent"] is row["unrealizedPnlUsd"] is None
+    if is_long and mark == "92.50":
+        result = cli(replay, "account", "overview", "--as", ADDR)
+        assert result.exit_code == 0, result.output
+        assert warning in result.stdout
+
+
 def test_legacy_collateral_uses_the_pinned_oracle_price_for_pnl(replay):
     long, _ = populate_trades(replay)
     long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}

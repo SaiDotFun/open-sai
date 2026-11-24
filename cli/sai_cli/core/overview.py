@@ -522,12 +522,16 @@ def _contract_risk(
         if base_at is None or (quote_id != USD_TOKEN_ID and quote_at is None):
             return {**risk, "riskReason": "Contract oracle publish time is unknown"}
         oldest = min(base_at, quote_at) if quote_at is not None else base_at
+        is_long = raw["long"]
         if (
             expiration
             and int(chain.time.timestamp()) - int(oldest.timestamp()) > expiration
         ):
+            # Catalyst liquidation can use a crossed mark even when it is stale.
+            crossed = mark <= liquidation if is_long else mark >= liquidation
+            if crossed:
+                risk["liquidationWarning"] = "at or past liquidation (stale mark)"
             return {**risk, "riskReason": "Contract oracle mark is stale"}
-        is_long = raw["long"]
         tp, sl = _level(raw["tp"]), _level(raw["sl"])
         risk.update(
             entryPriceUsd=_usd(entry, quote_usd),

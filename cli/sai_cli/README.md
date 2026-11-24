@@ -77,7 +77,9 @@ returns the same fields as the CLI's JSON output.
   matching trade state is unavailable, any Keeper liquidation figure is
   labeled as an estimate and has no distance. If only the oracle mark is
   unavailable or stale under the market's contract settings, the threshold
-  can still be shown. A pending after-hours leverage adjustment withholds
+  can still be shown. A stale mark at or past the liquidation threshold
+  carries a warning because a catalyst can liquidate at that price.
+  A pending after-hours leverage adjustment withholds
   gross PnL and TP/SL distances and retains liquidation distance when the
   mark is usable.
 - **Orders.** Pending limit and stop orders list their trigger prices.

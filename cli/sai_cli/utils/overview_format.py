@@ -29,6 +29,8 @@ def _collateral(row: dict[str, Any]) -> str:
 
 def _trigger(row: dict[str, Any], prefix: str) -> str:
     price = row[f"{prefix}PriceUsd"]
+    if prefix == "liquidation" and (warning := row.get("liquidationWarning")):
+        return f"{_value(price)} {warning}"
     distance = row[f"{prefix}DistancePercent"]
     if price is None:
         return "-"
