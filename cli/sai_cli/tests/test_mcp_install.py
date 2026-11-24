@@ -1370,6 +1370,38 @@ def test_codex_install_refuses_to_write_after_an_uncertain_alias_lookup(
     assert env.calls() == GETS + LEGACY_GETS[:1]
 
 
+@pytest.mark.parametrize("args", [("install", "codex"), ("list",)])
+@pytest.mark.parametrize("exit_code", [7, 0])
+def test_codex_lookup_hides_invalid_utf8(
+    env: Env, args: tuple[str, ...], exit_code: int
+):
+    stream = "stderr" if exit_code else "stdout"
+    private = bytes([255]) + SECRET.encode()
+    write_exe(
+        env.bin / "codex",
+        f"import sys\nsys.{stream}.buffer.write({private!r})\nsys.exit({exit_code})\n",
+    )
+
+    result = invoke("mcp", *args)
+
+    if args == ("list",):
+        assert result.exit_code == 0, result.output
+        error = next(
+            row["error"]
+            for row in payload(result)["clients"]
+            if row["client"] == "codex"
+        )
+    else:
+        error = failure(result)
+    diagnostic = "exited 7" if exit_code else "printed invalid JSON"
+    assert f"`codex mcp get sai --json` {diagnostic}" in error
+    assert log.flush()
+    logs = "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
+    for value in (SECRET, "0xff", "position 0", "UnicodeDecodeError"):
+        assert value not in result.output + logs
+    assert not env.codex_path().exists()
+
+
 def claude_entry(argv: list[str], env: dict[str, str] | None = None) -> dict:
     return {"type": "stdio", "command": argv[0], "args": argv[1:], "env": env or {}}
 
