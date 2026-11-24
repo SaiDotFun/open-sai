@@ -9,7 +9,7 @@ from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
-from . import log, settings, storage
+from . import log, paths, settings, storage
 from .errors import Code, SessionError
 
 EXPIRY_WARNING = timedelta(days=3)
@@ -32,13 +32,13 @@ def renewal_fields(result: dict[str, str]) -> dict[str, str]:
         args = ("auth", "import", "--addr", result["evmAddress"])
     endpoint = result.get("endpoint")
     try:
-        configured_endpoint = settings.load().endpoint
+        # A pasted command may run outside this process's Keeper overrides.
+        saved_endpoint = settings.load(env={"SAI_HOME": str(paths.sai_home())}).endpoint
     except settings.SettingsError:
-        # A one-off flag can override an invalid configured endpoint.
-        configured_endpoint = None
+        saved_endpoint = None
     command = shlex.join(("sai", *args))
     guidance = []
-    if endpoint and endpoint != configured_endpoint:
+    if endpoint and endpoint != saved_endpoint:
         command = storage.keeper_command_hint(endpoint, *args)
         origin = log.origin(endpoint)
         show_origin = origin != log.REDACTED_URL and log.redact(origin) == origin

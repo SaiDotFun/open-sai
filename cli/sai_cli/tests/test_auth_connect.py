@@ -7,6 +7,7 @@ is touched.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -26,6 +27,9 @@ from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import TextContent
 from sai_cli.core import keeper, storage
 
 ADDR = "0x" + "b" * 40
@@ -862,6 +866,52 @@ def test_paste_renewal_command_with_the_configured_keeper(
     assert renewed.returncode == 0, renewed.stderr
     assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
     assert env.run("--json", "auth", "status").returncode == 0
+
+
+@pytest.mark.parametrize("path", ["", "/private-recovery-path/query"])
+def test_mcp_renewal_routes_to_keeper_from_server_environment(
+    env: Env, keeper_auth, path: str
+):
+    origin = keeper_auth["endpoint"].removesuffix("/query")
+    endpoint = origin + path
+    args = ("--json", "--endpoint", endpoint, "auth")
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run(*args, "import").returncode == 0
+
+    async def report_session() -> dict[str, Any]:
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "sai_cli", "mcp", "serve"],
+            env={**env.vars(), "SAI_ENDPOINT": endpoint},
+        )
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as client,
+        ):
+            await client.initialize()
+            result = await client.call_tool("mcp_info", {})
+        [content] = result.content
+        assert isinstance(content, TextContent)
+        return json.loads(content.text)["session"]
+
+    report = asyncio.run(report_session())
+    assert report["usable"] is True
+    command = report["renewalCommand"]
+    env.clip.write_text(make_token())
+    if path:
+        assert path not in json.dumps(report)
+        refused = env.run_shell(command)
+        assert refused.returncode != 0
+        assert "Set SAI_RECONCILE_ENDPOINT to the original Keeper URL" in refused.stderr
+        renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    else:
+        assert shlex.split(command) == ["sai", "--endpoint", origin, "auth", "import"]
+        renewed = env.run_shell(command)
+    assert renewed.returncode == 0, renewed.stderr
+    current = env.run(*args, "status")
+    assert current.returncode == 0
+    assert json.loads(current.stdout)["expiresAt"] > report["expiresAt"]
 
 
 def test_legacy_renewal_refuses_another_accounts_clipboard_token(
