@@ -749,12 +749,16 @@ def test_public_intent_status_scrubs_keeper_payload(
             assert public["errorMsg"] == "Keeper reported an intent error."
 
 
-@pytest.mark.parametrize("change", ["synthetic-keeper-text", "position_liquidated"])
-def test_public_history_projects_after_raw_hash_correlation(
+@pytest.mark.parametrize(
+    ("change", "projected"),
+    [("synthetic-keeper-text", None), ("position_liquidated", "position_liquidated")],
+)
+def test_public_history_preserves_liquidation_label(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     change: str,
+    projected: str | None,
 ) -> None:
     opaque = "synthetic-keeper-text"
     intent = RESPONSES["outcome_not_indexed"]["data"]["userIntents"][0]
@@ -768,25 +772,37 @@ def test_public_history_projects_after_raw_hash_correlation(
         "block": {"block": "2142-2", "block_ts": opaque},
         "debug": opaque,
     }
-    compare(
-        cli_pair,
-        tmp_path,
-        monkeypatch,
-        (
-            Step(
-                (
-                    {
-                        "data": {
-                            "userIntents": [{**intent, "txHash": opaque}],
-                            "extra": opaque,
-                        }
-                    },
-                    {"data": {"perp": {"tradeHistory": [history]}}},
-                ),
-                "terminal",
-            ),
-        ),
-    )
+
+    with replay() as (endpoint, replies, _requests):
+        for index, cli in enumerate(cli_pair):
+            home = tmp_path / str(index)
+            home.mkdir(mode=0o700)
+            seed(home, endpoint, monkeypatch, "unknown")
+            replies.clear()
+            replies.extend(
+                [
+                    response({"data": {"userIntents": [{**intent, "txHash": opaque}]}}),
+                    response({"data": {"perp": {"tradeHistory": [history]}}}),
+                ]
+            )
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "status",
+                ADDR,
+                "--key",
+                KEY,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            [row] = json.loads(result.stdout)["matchedTradeHistory"]
+            if index == 0:
+                # The pinned Python CLI returns raw rows. Apply its public projection.
+                row = keeper.safe_intent_history(row)
+            assert row.get("tradeChangeType") == projected
 
 
 @pytest.fixture(scope="module")
