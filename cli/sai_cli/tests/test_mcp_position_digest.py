@@ -2340,6 +2340,29 @@ def test_close_digest_is_refused_when_market_price_disappears(
     asyncio.run(scenario())
 
 
+def test_full_close_digest_is_refused_when_lcd_height_disappears(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    args = {"trade_id": 7}
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            dated = await call(client, "preview_close", args)
+            digest = dated["previewDigest"]
+            position.reported_height = None
+
+            refused = await call(
+                client, "trade_close", {**args, "preview_digest": digest}
+            )
+            assert position.submitted == []
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            replacement = refused["preview"]
+            assert "previewDigest" not in replacement
+            assert replacement == await call(client, "preview_close", args)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("indexed_cap", "pair_cap", "status"),
     [

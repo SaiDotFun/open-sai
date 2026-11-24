@@ -416,12 +416,12 @@ def close_estimates(
 
     raw = state.raw
     try:
-        height = (
-            margin.verified_position_height(lcd, state, trade_id)
-            if rechecked is None
-            else rechecked.height
-        )
         try:
+            height = (
+                margin.verified_position_height(lcd, state, trade_id)
+                if rechecked is None
+                else rechecked.height
+            )
             prices = (
                 margin.perp_prices(lcd, state, height)
                 if rechecked is None
@@ -431,6 +431,8 @@ def close_estimates(
             published_at = (
                 oracle_publication_time(oracle) if isinstance(oracle, dict) else None
             )
+        except margin.PositionChanged:
+            raise
         except READ_ERRORS:
             prices, oracle, published_at = None, None, None
         if (
