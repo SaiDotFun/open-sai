@@ -737,13 +737,12 @@ and skip out-of-window rows before charging the row budget. The scan
 alternates surfaces within a day. Intent reports reserve part of the scan
 budget for finding command starts and anchors across midnight. A report contains
 up to 128 event or gap rows and uses a 96 KiB response budget. When a report
-includes `nextBefore`, pass it to `--before` or the MCP `before` argument.
-For `logs run` and `logs stats`, the value is a cursor. For `logs intent`
-and the MCP tool `logs_intent`, it is an exclusive UTC timestamp. An intent
-report with `truncated: true` can omit `nextBefore` if the scan finds no
-usable cutoff. In that case, inspect the retained files listed by
-`sai --json logs path`. Use those files for events that share the cutoff
-timestamp, too.
+includes a `nextBefore` cursor, pass it to `--before` or the MCP `before`
+argument to resume at the first unread position, including within a shared
+timestamp. Intent cursors use a private local cache of file positions that works
+across CLI invocations. If the cache is cleared, start a new query. If a scan
+returns `truncated: true` without `nextBefore`, inspect the retained files listed
+by `sai --json logs path`.
 
 Use `sai --json logs ...` for machine-readable output. The `intent` and
 `run` reports return arrays `events` and `gaps`. The intent report also
