@@ -868,7 +868,7 @@ def test_doctor_repairs_codex_with_a_normalized_stable_launcher(
             row for row in payload(listed)["clients"] if row["client"] == "codex"
         )
         assert codex["current"] and codex["registrations"][0]["current"]
-        assert codex["registeredCommand"] == [str(launcher), "mcp", "serve"]
+        assert codex["registeredCommand"] == serve(env)
         assert mcp_checks(invoke("doctor", "--offline"))["codex"]["status"] == "pass"
 
 
@@ -1461,6 +1461,24 @@ def test_missing_client_cli_fails_that_client_only(env: Env):
     message = failure(result)
     assert "claude (user): failed" in message and "not on PATH" in message
     assert "cursor (user): added" in message
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory symlink")
+def test_list_hides_the_saved_directory_for_a_normalized_match(env: Env):
+    private_dir = env.root / f"deployment-{SECRET}"
+    private_dir.symlink_to(env.bin, target_is_directory=True)
+    env.write_codex({"sai": claude_entry([str(private_dir / "sai"), "mcp", "serve"])})
+    before = env.codex_path().read_bytes()
+
+    result = invoke("mcp", "list")
+
+    assert result.exit_code == 0
+    assert SECRET not in result.output
+    codex = next(row for row in payload(result)["clients"] if row["client"] == "codex")
+    assert codex["current"] and codex["registeredCommand"] == serve(env)
+    [registration] = codex["registrations"]
+    assert registration["current"] and registration["command"] == serve(env)
+    assert env.codex_path().read_bytes() == before
 
 
 def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):

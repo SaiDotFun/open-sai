@@ -87,13 +87,13 @@ class Registration:
     stdio: bool = True
 
     def shown(self, target: Target | None) -> dict[str, Any]:
-        """The argv to print: in full only when it is the expected command.
+        """Show the expected argv when the saved command matches.
 
-        Any other entry's args may hold a token or a credential URL, so only
-        the command's file name is shown.
+        Saved directories and args can contain private values. An unmatched
+        entry shows only the command's file name.
         """
         if target is not None and self.matches_command(target):
-            return {"command": self.argv}
+            return {"command": target.argv}
         if not self.argv:
             return {"command": []}
         out: dict[str, Any] = {"command": [Path(self.argv[0]).name]}
