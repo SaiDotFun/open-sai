@@ -57,8 +57,8 @@ Otherwise, show the user the preview and the account it names. Get explicit \
 confirmation, then call the trade_* tool with the same arguments and the \
 previewDigest. For a market open, also send its referencePrice.
 - If a trade_* tool returns PREVIEW_MISMATCH or PRICE_MOVED, nothing was \
-submitted. Show the user the new preview in the result. If it provides a \
-previewDigest, get confirmation again before retrying.
+submitted. Show the user any replacement preview. If it has a previewDigest, \
+get confirmation again before retrying. Otherwise follow the error's instructions.
 - "accepted" means Keeper admitted the intent. Use intent_wait with its key \
 to check for a final outcome.
 - If a trade returns code OUTCOME_UNKNOWN, call intent_wait with its \

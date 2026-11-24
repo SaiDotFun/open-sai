@@ -111,6 +111,11 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
                 request = self.read_json()
             except (ConnectionResetError, json.JSONDecodeError):
                 return
+            if request["query"] == keeper.ROUTE:
+                # This replay covers Keeper admission and lifecycle. Its
+                # route data is unavailable to the optional Perp preflight.
+                self.reply({"data": {}})
+                return
             if request["query"] == keeper.SUBMIT:
                 active_key = request["variables"]["input"]["intentKey"]
                 submitted_keys.append(active_key)
