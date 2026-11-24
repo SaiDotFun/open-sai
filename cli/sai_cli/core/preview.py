@@ -352,6 +352,17 @@ def close_estimates(
             if type(ttl) is not int or ttl < 0:
                 raise ValueError("Invalid Perp oracle TTL")
             if ttl and margin.block_timestamp(lcd, height) - min(update_times) > ttl:
+                mode = margin.smart_value(
+                    lcd, state.contract, {"market_order_config": {}}, height=height
+                )
+                queued = mode["fill_at_next_oracle_price"]
+                if type(queued) is not bool:
+                    return result
+                if queued:
+                    return dict.fromkeys(
+                        result,
+                        unavailable("Queued closes settle on a fresh oracle update."),
+                    )
                 stale = unavailable(
                     "Perp rejects the close at the observed stale oracle price."
                 )

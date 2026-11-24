@@ -47,6 +47,7 @@ class Position:
     null_market_price: bool = False
     oracle_quote_age: int | None = None
     oracle_ttl: int = 300
+    fill_at_next_oracle_price: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
     after_hours: bool = False
     risk_block: int = 90
@@ -237,6 +238,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     if position.collateral_price is not None
                     else None
                 )
+            elif "market_order_config" in message:
+                assert message["market_order_config"] == {}
+                assert self.headers.get("x-cosmos-block-height") == str(
+                    position.reported_height
+                )
+                data = {"fill_at_next_oracle_price": position.fill_at_next_oracle_price}
             elif "get_liquidation_price" in message:
                 assert message["get_liquidation_price"] == {
                     "trader": TRADER,
@@ -1483,5 +1490,29 @@ def test_preview_uses_perp_group_and_pair_leverage_limits(
             assert opened["estimates"]["fees"]["status"] == status
             assert opened["estimates"]["liquidationPrice"]["status"] == status
             assert changed["estimates"]["liquidationPrice"]["status"] == status
+
+    asyncio.run(scenario())
+
+
+def test_stale_prices_are_unavailable_for_queued_closes(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.leverage = "20"
+    position.price = "95"
+    position.liquidation_threshold = "96"
+    position.oracle_base_age = 900
+    position.fill_at_next_oracle_price = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            for tool, args in (
+                ("preview_close", {}),
+                ("preview_partial_close", {"percent": 10}),
+            ):
+                quote = await call(client, tool, {"trade_id": 7, **args})
+                result = quote["estimates"]
+                assert result["execution"]["status"] == "unavailable"
+                assert "fresh oracle update" in result["execution"]["reason"]
+                assert result["fees"]["status"] == "unavailable"
 
     asyncio.run(scenario())
