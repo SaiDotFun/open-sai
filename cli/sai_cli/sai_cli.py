@@ -93,34 +93,41 @@ def session(ctx: click.Context) -> dict[str, str]:
 
 def command_path(group: click.Group, args: list[str]) -> list[str]:
     """Find the command names past the options and their values."""
-    names, _ = _command_path_and_tail(group, args)
+    names, _, _ = _command_parts(group, args)
     return names
 
 
-def _command_path_and_tail(
+def _command_parts(
     group: click.Group, args: list[str]
-) -> tuple[list[str], int]:
-    """Find the command names and the index after the last command name."""
+) -> tuple[list[str], int, frozenset[str]]:
+    """Find command names, the argument offset, and explicit setting flags."""
     names: list[str] = []
     current: click.Command = group
-    skip = False
     tail = 0
-    for index, token in enumerate(args):
-        if skip:
-            skip = False
+    flag_keys: set[str] = set()
+    endpoint_options = dict(GLOBAL_FLAGS)
+    options = True
+    indexed = iter(enumerate(args))
+    for index, token in indexed:
+        if options and token == "--":
+            options = False
             continue
-        if not isinstance(current, click.Group):
-            break
-        if token.startswith("-"):
+        if options and token.startswith("-"):
+            option_name, equals, _ = token.partition("=")
             option = next(
                 (
                     param
                     for param in current.params
-                    if isinstance(param, click.Option) and token in param.opts
+                    if isinstance(param, click.Option) and option_name in param.opts
                 ),
                 None,
             )
-            skip = option is not None and not option.is_flag and not option.count
+            if option is not None and not option.is_flag and not option.count:
+                supplied = bool(equals) or next(indexed, None) is not None
+                if supplied and (key := endpoint_options.get(option_name)):
+                    flag_keys.add(key)
+            continue
+        if not isinstance(current, click.Group):
             continue
         found = current.commands.get(token)
         if found is None:
@@ -128,7 +135,8 @@ def _command_path_and_tail(
         names.append(token)
         tail = index + 1
         current = found
-    return names, tail
+        options = True
+    return names, tail, frozenset(flag_keys)
 
 
 def audit_argv(args: list[str], config_set_at: int | None) -> list[log.Arg]:
@@ -302,7 +310,7 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names, tail = _command_path_and_tail(self, argv)
+        names, tail, flag_keys = _command_parts(self, argv)
         quiet = unlogged(names, argv)
         command = " ".join(names) or ("repl" if not argv else None)
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
@@ -326,9 +334,10 @@ class LoggedGroup(SaiGroup):
                 start_logged = True
 
         with (
+            log.setting_flags(flag_keys),
             log.silenced()
             if quiet
-            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex)
+            else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex),
         ):
             if command == "doctor" and not quiet:
                 # Let doctor report directory creation before logging creates

@@ -1510,6 +1510,37 @@ def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):
     assert log.config()[0] is False
 
 
+@pytest.mark.parametrize("source", ["env", "flag", "inline-flag"])
+def test_shadowed_file_endpoint_does_not_disable_audit_logging(
+    home, monkeypatch, source
+):
+    (home / "config.toml").write_text('[keeper]\nendpoint = "https://[invalid"\n')
+    endpoint = "http://127.0.0.1:9/query"
+    config = ["--json", "config", "list"]
+    assert run_cli(*config)[0] == 2
+    assert not read_logs(home)
+
+    with monkeypatch.context() as patch:
+        flags: list[str] = []
+        if source == "flag":
+            flags = ["--endpoint", endpoint]
+        elif source == "inline-flag":
+            flags = [f"--endpoint={endpoint}"]
+        else:
+            patch.setenv("SAI_ENDPOINT", endpoint)
+        code, output = run_cli(*flags, *config)
+        assert code == 0
+        assert json.loads(output)["settings"]["logs.enabled"]["value"] is True
+        code, output = run_cli(*flags, "--json", "logs", "path")
+        assert code == 0 and json.loads(output)["enabled"] is True
+
+    assert run_cli(*config)[0] == 2
+    assert [line["event"] for line in read_logs(home)] == [
+        "command.start",
+        "command.end",
+    ]
+
+
 def test_invalid_logs_settings_never_stop_a_command_or_the_server(
     home, monkeypatch, keeper_stub
 ):

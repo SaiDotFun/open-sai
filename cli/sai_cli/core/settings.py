@@ -16,7 +16,7 @@ import re
 import sys
 import tempfile
 import tomllib
-from collections.abc import Callable, Collection, Generator, Mapping
+from collections.abc import Callable, Collection, Generator, Iterable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -372,15 +372,24 @@ def _override(
     return None
 
 
+def shadowed_file_keys(
+    flag_keys: Iterable[str], env: Mapping[str, str]
+) -> frozenset[str]:
+    """Config file keys superseded by higher layers."""
+    overridden = set(flag_keys)
+    overridden.update(spec.key for spec in SETTINGS if env.get(spec.env, "").strip())
+    if "keeper.endpoint" in overridden:
+        # Even with no explicit WebSocket override, derive it from the HTTP URL.
+        overridden.add("keeper.ws_endpoint")
+    return frozenset(overridden)
+
+
 def read_effective_file(
     path: Path, flags: Mapping[str, str | None], env: Mapping[str, str]
 ) -> tuple[dict[str, Any], list[str]]:
     """Read the config file, skipping values that cannot affect resolution."""
-    overridden = {spec.key for spec in SETTINGS if _override(spec, flags, env)}
-    if "keeper.endpoint" in overridden:
-        # Even with no explicit WebSocket override, derive it from the HTTP URL.
-        overridden.add("keeper.ws_endpoint")
-    return read_file(path, overridden=overridden)
+    flag_keys = (key for key, value in flags.items() if value is not None)
+    return read_file(path, overridden=shadowed_file_keys(flag_keys, env))
 
 
 def resolve(
