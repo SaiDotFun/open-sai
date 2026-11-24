@@ -56,6 +56,7 @@ logs tail --surface mcp` in a terminal reads them ([cli.md](cli.md#logs)).
 | `market_list`, `market_prices` | Markets and current indexed prices |
 | `account_positions`, `account_balances`, `account_history` | Reads for one account |
 | `intent_local`, `intent_status` | Locally recorded intents, and Keeper's record of them |
+| `intent_wait` | Wait for an existing intent key and return its receipt |
 | `preview_open`, `preview_close`, `preview_partial_close`, `preview_tpsl`, `preview_leverage`, `preview_margin` | What a trade would do. Submits nothing. |
 | `trade_open`, `trade_close`, `trade_partial_close`, `trade_tpsl`, `trade_leverage`, `trade_margin` | Submit the previewed trade |
 
@@ -156,6 +157,11 @@ To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Without it the tools close a position.
 
 Call `auth_use` only when the person asks to switch accounts.
+
+After a trade returns its key, call `intent_wait` with that `key` and the
+trade's `addr`. Each call waits up to 10 seconds. On `OUTCOME_UNKNOWN`,
+call it again with the same key and address. A receipt gives the request
+transaction hash and the execution block when Keeper has that evidence.
 
 [trading-safety.md](trading-safety.md) covers what to do after a trade is
 accepted, times out, or returns `OUTCOME_UNKNOWN` or `RECENT_OPEN_PENDING`.

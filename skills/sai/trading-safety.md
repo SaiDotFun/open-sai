@@ -58,10 +58,11 @@ the CLI or the MCP tools. A mistake here spends the person's money.
      fills.
    - Prefer MCP tools `preview_open` and `trade_open` when approval depends
      on a quoted price.
-4. **Accepted is not executed.** `accepted` means Keeper admitted the intent.
-   The trade is pending until its outcome is observed. Follow it with `sai
-   intent status ADDR --key KEY` or tool `intent_status`, and report it as
-   executed only once that shows it.
+4. **Follow the intent to its outcome.** `accepted` means Keeper admitted
+   the intent. Use the CLI command `sai intent wait KEY` or MCP tool
+   `intent_wait` with the same account. Add `--wait` to a live CLI trade
+   to submit once and follow its key in the same command. A successful
+   limit or stop intent confirms placement. Its fill can happen later.
 5. **Never resubmit blindly.** After a timeout, a transport error, or code
    `OUTCOME_UNKNOWN`, the first request may have gone through. Keep the
    intent key and check it before anything else.
@@ -80,8 +81,15 @@ The CLI records each intent's identity locally before it submits. A network
 error after submission leaves the outcome unknown.
 
 - An unknown intent blocks new trades on that account until it is resolved.
-- Resolve it with `sai --json intent status ADDR --key KEY`, or with tools
-  `intent_local` then `intent_status`.
+- Look up a missing key with `sai intent local ADDR` or tool `intent_local`.
+  Then run `sai --json intent wait KEY --addr ADDR --timeout 30` or call
+  `intent_wait` with `key` and `addr`. A timeout returns `unknown` with
+  code `OUTCOME_UNKNOWN`. In the CLI this exits 5. Keep checking the same
+  key.
+- The receipt's `requestTxHash` identifies the submission. For a
+  next-oracle fill, cite `execution.block` for the fill. The receipt
+  includes the indexed position when available and labels the position's
+  cumulative fee totals.
 - To see what happened on this machine, read the logs: `sai --json logs tail
   -n 50 --event intent` shows the intent's status changes by `intentKey`,
   and `--event keeper.request` shows whether the `submit` request was sent
@@ -89,8 +97,8 @@ error after submission leaves the outcome unknown.
   logs are evidence, not the outcome: Keeper's record from `intent status`
   still decides.
 - When Keeper has no record of the key five minutes after submission, the CLI
-  marks the intent `absent` and trading resumes. Keeper expires an unadmitted
-  intent after two minutes, so `absent` means it was not admitted.
+  can mark the local intent `absent` and allow trading again. A delayed
+  admission can still appear.
 - An intent marked `not_sent` failed before the request left the machine. It
   does not block.
 - Tool `trade_open` refuses with `RECENT_OPEN_PENDING` while a recent open is
@@ -135,7 +143,7 @@ sai --as 0xYOUR_ADDR --json trade margin 42 --direction add --amount 5 \
 sai --as 0xYOUR_ADDR --json trade close 42 --dry-run
 sai --as 0xYOUR_ADDR --json trade close 43 --cancel-order --dry-run
 sai --json intent local 0xYOUR_ADDR
-sai --json intent status 0xYOUR_ADDR --key INTENT_KEY
+sai --json intent wait INTENT_KEY --addr 0xYOUR_ADDR --timeout 30
 ```
 
 `--as ADDR` needs `ADDR` to be a connected account (`sai auth list`). Trade
