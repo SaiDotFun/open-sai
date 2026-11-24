@@ -120,13 +120,15 @@ fn key_time(key: &str) -> Option<f64> {
 impl Storage<'_> {
     /// Open and migrate the ledger.
     pub fn open_ledger(&self) -> Result<Connection, StorageError> {
+        self.remaining_busy_timeout()?;
         let path = self.directory()?.join(LEDGER_FILE);
         // Closing a separate descriptor would release this process's SQLite
         // POSIX locks. The enclosing directory is private even on first open.
         let mut connection = Connection::open(&path)?;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
-        connection.busy_timeout(self.busy_timeout)?;
+        connection.busy_timeout(self.remaining_busy_timeout()?)?;
         migrate(&mut connection)?;
+        connection.busy_timeout(self.remaining_busy_timeout()?)?;
         Ok(connection)
     }
 
