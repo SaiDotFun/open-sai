@@ -1222,3 +1222,23 @@ def test_windows_keeps_a_runnable_python_launcher(
     install.pin(wheel_version(python_wheel))
     assert install.launcher.read_bytes() == launcher
     assert profile.read_bytes() == contents
+
+
+@pytest.mark.skipif(not WINDOWS, reason="requires Windows uv launcher copies")
+def test_windows_refuses_a_replaced_uv_launcher(
+    install: Install, replay: Replay
+) -> None:
+    python_wheel = wheel_artifact("BRIDGE")
+    prepare_uv(install, python_wheel, replay)
+    add_shim(replay, wheel_artifact("SHIM"))
+    contents = b"another install occupies this launcher"
+    install.launcher.write_bytes(contents)
+    inside = install.tools / "sai-cli" / "Scripts" / "sai.exe"
+    result = install.run(
+        inside, "--json", "update", "--api-base", replay.base, "--web-base", replay.base
+    )
+    assert result.returncode == 3
+    message = json.loads(result.stdout)["error"]["message"]
+    assert "runs another install" in message
+    assert str(install.launcher) in message and str(inside) in message
+    assert install.launcher.read_bytes() == contents

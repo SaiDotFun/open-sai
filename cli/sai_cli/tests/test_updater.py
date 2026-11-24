@@ -689,6 +689,24 @@ def test_uv_update_obeys_the_standalone_install_lock(uv_dirs):
         assert tool.version() == "0.2.0"
 
 
+@pytest.mark.skipif(os.name == "nt", reason="test uses a foreign POSIX script")
+@needs_uv
+def test_a_foreign_script_mentioning_the_tool_prefix_is_not_its_launcher(uv_dirs):
+    wheels = {"0.1.0": build_wheel("0.1.0"), "0.2.0": build_wheel("0.2.0")}
+    with Stub(release_routes(wheels)) as stub:
+        tool = Tool(uv_dirs, stub.url)
+        tool.install_release("0.1.0")
+        contents = f"#!/bin/sh\n# {tool.prefix}\nexit 19\n"
+        tool.sai.unlink()
+        tool.sai.write_text(contents)
+        outcome = tool.update()
+
+    assert outcome.status == updater.UNSUPPORTED
+    assert str(tool.sai) in outcome.message and str(tool.prefix) in outcome.message
+    assert tool.sai.read_text() == contents
+    assert update.installed_version(tool.prefix) == "0.1.0"
+
+
 @pytest.mark.skipif(os.name == "nt", reason="test replaces a public POSIX symlink")
 @needs_uv
 def test_updating_the_uv_environment_does_not_replace_a_late_competitor(uv_dirs):

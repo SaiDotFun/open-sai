@@ -436,29 +436,26 @@ def _same(left: Path, right: Path) -> bool:
 
 
 def launcher_owner_error(prefix: Path, launcher: Path) -> str | None:
-    """Return why LAUNCHER does not run the install at PREFIX, or None.
-
-    uv links the executable directory's `sai` to the one inside the tool's
-    environment. Two tool directories can share an executable directory, and
-    then the last install owns `sai` while the other's receipt still names
-    it. Updating that other install would take the launcher over.
-    """
+    """Check uv's POSIX link or Windows copy against its tool executable."""
     inside = _executables(prefix)[0]
+    target = launcher
     try:
-        if launcher.is_symlink() or os.name != "nt":
+        info = launcher.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            target = launcher.parent / launcher.readlink()
             if launcher.resolve(strict=True) == inside.resolve(strict=True):
                 return None
-            # Not a link to this environment: a copied script names the
-            # environment's interpreter in its first line.
-            with launcher.open("rb") as handle:
-                head = handle.read(4096)
-            if os.fsencode(str(prefix.resolve())) in head:
+        elif os.name == "nt" and stat.S_ISREG(info.st_mode):
+            # uv copies the executable on Windows. Compare its exact bytes
+            # before relying on the private executable for startup checks.
+            if (
+                info.st_size == inside.stat().st_size
+                and launcher.read_bytes() == inside.read_bytes()
+            ):
                 return None
-            return f"{launcher} runs another install, not the one at {prefix}"
-    except OSError:
-        return f"{launcher} is missing or unreadable"
-    # Windows copies a launcher executable; its owner cannot be read here.
-    return None
+    except (OSError, RuntimeError):
+        return f"{launcher} is missing or unreadable. Expected the uv executable at {inside}"
+    return f"{launcher} runs another install at {target}. Expected the uv executable at {inside}"
 
 
 def destination_error(
