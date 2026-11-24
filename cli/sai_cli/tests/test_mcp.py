@@ -1639,8 +1639,22 @@ print("caller still running", flush=True)
 
 
 @pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
-@pytest.mark.parametrize("keeper_call", ["finishes", "blocks", "client-cancelled"])
-def test_sai_mcp_serve_replies_to_in_flight_request_on_sigint(tmp_path, keeper_call):
+@pytest.mark.parametrize(
+    ("keeper_call", "close_stdin", "stop"),
+    [
+        ("finishes", False, signal.SIGINT),
+        ("blocks", False, signal.SIGINT),
+        ("client-cancelled", False, signal.SIGINT),
+        ("finishes", True, None),
+        ("blocks", True, None),
+        ("blocks", True, signal.SIGINT),
+        ("blocks", True, signal.SIGTERM),
+        ("client-cancelled", True, signal.SIGTERM),
+    ],
+)
+def test_sai_mcp_serve_replies_to_in_flight_request_on_shutdown(
+    tmp_path, keeper_call, close_stdin, stop
+):
     started = Event()
     release = Event()
 
@@ -1703,7 +1717,14 @@ def test_sai_mcp_serve_replies_to_in_flight_request_on_sigint(tmp_path, keeper_c
                     and "cancelled" in cancelled["error"]["message"]
                 )
 
-            process.send_signal(signal.SIGINT)
+            if close_stdin:
+                process.stdin.close()
+                if stop is not None:
+                    # Let the server reach EOF before the client escalates.
+                    with pytest.raises(subprocess.TimeoutExpired):
+                        process.wait(timeout=0.2)
+            if stop is not None:
+                process.send_signal(stop)
             if keeper_call == "finishes":
                 release.set()
             assert process.wait(timeout=4) == 0

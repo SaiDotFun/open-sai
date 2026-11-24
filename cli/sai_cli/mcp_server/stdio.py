@@ -1,4 +1,4 @@
-"""MCP stdio with a bounded drain on process signals."""
+"""MCP stdio with a bounded drain on stdin EOF and process signals."""
 
 from __future__ import annotations
 
@@ -88,7 +88,8 @@ async def run_stdio(server: Server[Any, Any], *, standalone: bool) -> None:
             watchdog.start()
 
     def terminate(_signum: int, _frame: object) -> None:
-        loop.call_soon_threadsafe(begin_shutdown)
+        if not stopping.is_set():
+            loop.call_soon_threadsafe(begin_shutdown)
 
     def write_line(line: str) -> None:
         sys.stdout.buffer.write((line + "\n").encode("utf-8"))
@@ -130,11 +131,11 @@ async def run_stdio(server: Server[Any, Any], *, standalone: bool) -> None:
         async with read_send:
             while True:
                 line = await stdin.readline()
+                if not line:
+                    begin_shutdown()
                 if stopping.is_set():
                     # Keep the SDK session open while it sends outstanding replies.
                     await sleep_forever()
-                if not line:
-                    return
                 try:
                     message = types.JSONRPCMessage.model_validate_json(line)
                 except ValueError as exc:
@@ -196,5 +197,8 @@ async def run_stdio(server: Server[Any, Any], *, standalone: bool) -> None:
             stdin.stop()
     finally:
         output.shutdown(wait=False, cancel_futures=True)
-        signal.signal(signal.SIGTERM, previous_term)
-        signal.signal(signal.SIGINT, previous_int)
+        # The watchdog also covers executor cleanup after the stdio session
+        # returns. Escalation signals must not interrupt that bounded cleanup.
+        if not (standalone and stopping.is_set()):
+            signal.signal(signal.SIGTERM, previous_term)
+            signal.signal(signal.SIGINT, previous_int)
