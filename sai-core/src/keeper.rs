@@ -18,6 +18,7 @@ use crate::{
     log::{self, EventContext, Field, Level},
 };
 
+pub(crate) use public::intent_log_fields;
 pub use public::{public_account_history, public_intent_status};
 pub use queries::*;
 
@@ -86,6 +87,16 @@ impl<'a> Keeper<'a> {
             .into_iter()
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
+        let intent_key = if query == INTENTS {
+            variables.get("key").and_then(Value::as_str).filter(|key| {
+                (1..=128).contains(&key.len())
+                    && key
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+            })
+        } else {
+            None
+        };
         let mut response = ResponseLog::default();
         let (result, interrupted) = tokio::select! {
             biased;
@@ -119,6 +130,7 @@ impl<'a> Keeper<'a> {
                 ("endpoint", Field::Endpoint(self.endpoint.into())),
                 ("endpointId", Field::endpoint_identity(self.endpoint)),
                 ("addr", json!(addr).into()),
+                ("intentKey", json!(intent_key).into()),
                 ("authenticated", json!(token.is_some()).into()),
                 ("durationMs", json!(duration).into()),
                 ("status", json!(status).into()),
@@ -246,16 +258,6 @@ fn graphql_errors(errors: &Value) -> Field {
             })
             .collect(),
     )
-}
-
-pub(crate) fn stringify(value: &Value) -> String {
-    match value {
-        Value::String(text) => text.clone(),
-        Value::Null => "None".into(),
-        Value::Bool(true) => "True".into(),
-        Value::Bool(false) => "False".into(),
-        _ => value.to_string(),
-    }
 }
 
 pub(crate) fn truthy(value: &Value) -> bool {

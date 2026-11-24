@@ -9,7 +9,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     errors::{Code, SaiError},
-    keeper::{self, Keeper, canonical_account, stringify, truthy},
+    keeper::{self, Keeper, canonical_account, truthy},
     log::{EventContext, Field, Level},
     storage::{IntentStatus, StatusUpdateOptions, Storage},
 };
@@ -147,7 +147,7 @@ pub async fn reconcile(
     *rows = Value::Array(matching);
 
     if absent {
-        log_keeper(events, endpoint, addr, key, None);
+        log_keeper(events, endpoint, &account, key, None);
         let local =
             storage.mark_absent(key, endpoint, &account, keeper::ABSENT_AFTER_SECONDS, None)?;
         if let Some(status) = &local {
@@ -158,7 +158,7 @@ pub async fn reconcile(
         }
     } else if let Some(row) = data["userIntents"].get(0).cloned() {
         let outcome = classify_outcome(&row);
-        log_keeper(events, endpoint, addr, key, Some((&row, outcome)));
+        log_keeper(events, endpoint, &account, key, Some((&row, outcome)));
         if outcome != Outcome::Unknown {
             let context = KeyedIntent {
                 storage,
@@ -398,23 +398,29 @@ fn log_keeper(
     key: &str,
     observed: Option<(&Value, Outcome)>,
 ) {
-    let mut fields = vec![
+    let common = [
         ("intentKey", json!(key).into()),
         ("addr", json!(addr).into()),
         ("endpoint", Field::Endpoint(endpoint.into())),
     ];
+    let mut fields = Map::new();
     if let Some((row, outcome)) = observed {
-        for key in ["kind", "lifecycleStep", "execActor", "errorCode", "txHash"] {
-            fields.push((key, row[key].clone().into()));
-        }
-        if !row["errorMsg"].is_null() {
-            fields.push(("errorMsg", Field::Untrusted(stringify(&row["errorMsg"]))));
+        if let Some(row) = row.as_object() {
+            fields = keeper::intent_log_fields(row);
         }
         if outcome == Outcome::TerminalFailed {
-            fields.push(("code", json!(Code::KeeperError).into()));
+            fields.insert("code".into(), json!(Code::KeeperError));
         }
     } else {
-        fields.push(("found", json!(false).into()));
+        fields.insert("found".into(), json!(false));
     }
-    events.event("intent.keeper", Level::Info, fields);
+    events.event(
+        "intent.keeper",
+        Level::Info,
+        common.into_iter().chain(
+            fields
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.clone().into())),
+        ),
+    );
 }

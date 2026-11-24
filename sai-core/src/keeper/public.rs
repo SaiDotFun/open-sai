@@ -7,7 +7,6 @@ use serde_json::{Map, Value, json};
 
 use super::{canonical_account, is_evm_address, truthy};
 use crate::{
-    errors::Code,
     log,
     reconcile::{HISTORY_HINT, LOCAL_PENDING_HINT, PENDING_HINT, UNINDEXED_HINT},
 };
@@ -52,6 +51,7 @@ const STEPS: &[&str] = &[
     "exec_fail",
     "exec_finality_observed",
 ];
+const ACTORS: &[&str] = &["client", "server", "user"];
 const TRADE_CHANGES: &[&str] = &[
     "position_opened",
     "limit_order_created",
@@ -239,6 +239,57 @@ fn keep_intent_key(out: &mut Map<String, Value>, key: &Value) {
     );
 }
 
+fn keep_intent_lifecycle(out: &mut Map<String, Value>, row: &Map<String, Value>) {
+    for (key, allowed) in [
+        ("kind", KINDS),
+        ("lifecycleStep", STEPS),
+        ("execActor", ACTORS),
+    ] {
+        if let Some(field) = row.get(key) {
+            keep(out, key, field, known(field, allowed));
+        }
+    }
+}
+
+fn intent_error_code(row: &Map<String, Value>) -> Option<&str> {
+    let code = row.get("errorCode");
+    if code.is_some_and(truthy)
+        || row.get("errorMsg").is_some_and(truthy)
+        || row.get("lifecycleStep").is_some_and(|step| {
+            known(
+                step,
+                &[
+                    "jwt_failed",
+                    "sign_reject",
+                    "sign_failed",
+                    "exec_req_fail",
+                    "exec_fail",
+                ],
+            )
+        })
+    {
+        Some(
+            code.and_then(Value::as_str)
+                .filter(|code| ERROR_CODES.contains(code))
+                .unwrap_or("KEEPER_ERROR"),
+        )
+    } else {
+        None
+    }
+}
+
+pub(crate) fn intent_log_fields(row: &Map<String, Value>) -> Map<String, Value> {
+    let mut fields = Map::new();
+    keep_intent_lifecycle(&mut fields, row);
+    if let Some(code) = intent_error_code(row) {
+        fields.insert("errorCode".into(), json!(code));
+    }
+    if let Some(hash) = row.get("txHash") {
+        keep_hash(&mut fields, "txHash", hash);
+    }
+    fields
+}
+
 fn intent_record(row: &Map<String, Value>) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut record = Map::new();
@@ -260,14 +311,7 @@ fn intent_record(row: &Map<String, Value>) -> Value {
             }),
         );
     }
-    for (key, allowed) in [
-        ("kind", KINDS),
-        ("lifecycleStep", STEPS),
-        ("execActor", &["client", "server", "user"][..]),
-    ] {
-        let field = value(key);
-        keep(&mut record, key, field, known(field, allowed));
-    }
+    keep_intent_lifecycle(&mut record, row);
     keep(
         &mut record,
         "execBlock",
@@ -276,28 +320,8 @@ fn intent_record(row: &Map<String, Value>) -> Value {
     );
     keep_timestamp(&mut record, "execBlockTs", value("execBlockTs"));
     keep_hash(&mut record, "txHash", value("txHash"));
-    let code = value("errorCode");
-    if truthy(code)
-        || truthy(value("errorMsg"))
-        || known(
-            value("lifecycleStep"),
-            &[
-                "jwt_failed",
-                "sign_reject",
-                "sign_failed",
-                "exec_req_fail",
-                "exec_fail",
-            ],
-        )
-    {
-        record.insert(
-            "errorCode".into(),
-            if known(code, ERROR_CODES) {
-                code.clone()
-            } else {
-                json!(Code::KeeperError)
-            },
-        );
+    if let Some(code) = intent_error_code(row) {
+        record.insert("errorCode".into(), json!(code));
         // This fixed message is shorter than the untrusted-text limit.
         record.insert("errorMsg".into(), json!("Keeper reported an intent error."));
     }
