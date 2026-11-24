@@ -50,17 +50,51 @@ class PositionChanged(SaiError, PreviewRefused):
         self.preview = preview
 
 
+class ExecutionRejected(SaiError, ValueError):
+    """Current Perp state rules out the requested execution."""
+
+    code = Code.PREVIEW_MISMATCH
+
+    def __init__(self, reason: str, preview: dict[str, Any]) -> None:
+        super().__init__(reason, details={"preview": preview})
+        self.preview = preview
+
+
+def _reject_execution(
+    preview: dict[str, Any], values: dict[str, Any], addr: str
+) -> None:
+    if reason := estimates.rejection_reason(values):
+        fresh = {**preview, "addr": addr}
+        _attach_estimates(fresh, values)
+        raise ExecutionRejected(reason, fresh)
+
+
 def _checked(
     before_submit: SubmitCheck,
     preview: dict[str, Any],
     estimate: Estimate | None,
+    *,
+    addr: str,
+    check_execution: bool = True,
 ) -> None:
+    values = estimate(preview) if check_execution and estimate is not None else None
     try:
         before_submit(preview)
     except PreviewRefused as exc:
         if exc.preview is not None and estimate is not None:
-            exc.preview["estimates"] = estimate(exc.preview)
+            _attach_estimates(
+                exc.preview, values if values is not None else estimate(exc.preview)
+            )
         raise
+    if values is not None:
+        _reject_execution(preview, values, addr)
+
+
+def _attach_estimates(preview: dict[str, Any], values: dict[str, Any]) -> None:
+    preview["estimates"] = values
+    if estimates.rejection_reason(values) is not None:
+        preview.pop("quote", None)
+        preview.pop("previewDigest", None)
 
 
 def _ignore(_message: str) -> None:
@@ -80,15 +114,22 @@ def preview_or_submit(
     estimate: Estimate | None = None,
     *,
     allow_concurrent_open: bool = False,
+    check_execution: bool = True,
 ) -> dict[str, Any]:
     """Return the dry-run preview of PAYLOAD, or check and submit it."""
     preview = {"dryRun": True, "intent": payload}
     if dry_run:
         if estimate is not None:
-            preview["estimates"] = estimate(preview)
+            _attach_estimates(preview, estimate(preview))
         return preview
     active = get_session()
-    _checked(before_submit, preview, estimate)
+    _checked(
+        before_submit,
+        preview,
+        estimate,
+        addr=active["evmAddress"],
+        check_execution=check_execution,
+    )
     return intents.submit(
         endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
     )
@@ -188,18 +229,24 @@ def open_trade(
             allow_concurrent_open=allow_concurrent_open,
         )
     if dry_run:
-        if mcp_market:
-            read_market()
-        elif lcd_endpoint is not None:
+        market_error = None
+        if mcp_market or lcd_endpoint is not None:
             try:
-                read_market(estimates.QUOTE_TIMEOUT)
-            except estimates.READ_ERRORS:
-                pass
+                read_market(20 if mcp_market else estimates.QUOTE_TIMEOUT)
+            except estimates.READ_ERRORS as exc:
+                if mcp_market:
+                    market_error = exc
+        execution_estimates = estimate({})
+        if (
+            market_error is not None
+            and estimates.rejection_reason(execution_estimates) is None
+        ):
+            raise market_error
         preview = {
             "dryRun": True,
             "requiresMarketPriceRefresh": True,
             "intent": payload,
-            "estimates": estimate({}),
+            "estimates": execution_estimates,
         }
         if price is not None and not mcp_market:
             preview["referencePrice"] = price
@@ -209,19 +256,24 @@ def open_trade(
     active = get_session()
     if price is not None:
         notify(MARKET_PRICE_NOTICE)
-    read_market()
+    preview = {
+        "dryRun": True,
+        "requiresMarketPriceRefresh": True,
+        "intent": payload,
+    }
+    try:
+        read_market()
+    except estimates.READ_ERRORS:
+        _reject_execution(preview, estimate(preview), active["evmAddress"])
+        raise
     assert reference is not None
     current_price = reference["price"]
     payload["body"]["intentPrice"] = current_price
     _checked(
         before_submit,
-        {
-            "dryRun": True,
-            "requiresMarketPriceRefresh": True,
-            "intent": payload,
-            "referencePrice": current_price,
-        },
+        {**preview, "referencePrice": current_price},
         estimate,
+        addr=active["evmAddress"],
     )
     result = intents.submit(
         endpoint, active, payload, allow_concurrent_open=allow_concurrent_open
@@ -276,7 +328,7 @@ def close_trade(
         pending_order(active["evmAddress"])
         if dry_run:
             return {**preview, "estimates": cancel_estimate(preview)}
-        _checked(before_submit, preview, cancel_estimate)
+        _checked(before_submit, preview, cancel_estimate, addr=active["evmAddress"])
         return intents.submit(endpoint, get_session(), payload)
 
     return _position_intent(
@@ -377,8 +429,15 @@ def _position_intent(
     if dry_run:
         if verified is None:
             preview["positionOwnerVerified"] = False
-        return {**preview, "estimates": estimate(preview)}
-    _checked(before_submit, preview, estimate)
+        _attach_estimates(preview, estimate(preview))
+        return preview
+    _checked(
+        before_submit,
+        preview,
+        estimate,
+        addr=addr,
+        check_execution=not updates_triggers,
+    )
     return intents.submit(endpoint, get_session(), payload)
 
 
@@ -392,17 +451,18 @@ def _estimate_position(
     target: Decimal | None,
     updates_triggers: bool,
 ) -> dict[str, Any]:
-    state, effective, height = None, None, None
+    state = None
     if lcd is not None and verified is not None:
         try:
             state = margin.snapshot(
-                endpoint, lcd, addr, trade_id, indexed=indexed, verified=verified
+                endpoint,
+                lcd,
+                addr,
+                trade_id,
+                indexed=indexed,
+                verified=verified,
+                require_open_market=target is None,
             )
-            if target is not None or updates_triggers:
-                height = margin.verified_position_height(lcd, state, trade_id)
-                effective, _ = margin.leverage_inputs(
-                    lcd, state, trade_id, height=height
-                )
         except estimates.READ_ERRORS:
             pass
     if target is None and not updates_triggers:
@@ -410,10 +470,8 @@ def _estimate_position(
     return estimates.position_estimates(
         lcd or "",
         state,
-        effective,
+        trade_id,
         target=target,
-        updates_triggers=updates_triggers,
-        height=height,
     )
 
 
@@ -438,7 +496,7 @@ def _position_preview(
                 raise
             try:
                 state, inputs, fresh = build()
-                fresh["estimates"] = estimate(state, inputs, fresh)
+                _attach_estimates(fresh, estimate(state, inputs, fresh))
             except margin.TradingNetworkMismatch:
                 raise PositionChanged(
                     f"{exc}. Use an LCD on Keeper's chain and request a new preview."
@@ -456,7 +514,7 @@ def _position_preview(
 
     state, inputs, preview = read_quote()
     if dry_run:
-        preview["estimates"] = estimate(state, inputs, preview)
+        _attach_estimates(preview, estimate(state, inputs, preview))
         return preview
 
     try:
@@ -478,10 +536,14 @@ def _position_preview(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
     if changed or fresh != preview:
-        fresh["estimates"] = estimate(state, inputs, fresh)
+        _attach_estimates(fresh, estimate(state, inputs, fresh))
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
-    if before_submit is not None:
-        _checked(before_submit, fresh, lambda _: estimate(state, inputs, fresh))
+    _checked(
+        before_submit or _accept,
+        fresh,
+        lambda _: estimate(state, inputs, fresh),
+        addr=addr,
+    )
     return fresh
 
 
@@ -504,13 +566,15 @@ def change_margin(
     addr = get_session()["evmAddress"]
 
     def build_preview() -> PositionPreview:
-        state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
+        state = margin.snapshot(
+            endpoint, lcd_endpoint, addr, trade_id, require_open_market=False
+        )
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         if leverage is None:
             raise ValueError("Cannot verify effective leverage for this margin change")
         quote = margin.margin_quote(
             state.raw,
-            state.funds,
+            None,
             state.market,
             direction,
             amount,
@@ -544,8 +608,10 @@ def change_margin(
         estimate=lambda state, inputs, fresh: estimates.position_estimates(
             lcd_endpoint,
             state,
-            _quoted_leverage(inputs),
+            trade_id,
             target=Decimal(fresh["quote"]["requestedLeverage"]),
+            quoted_effective=_quoted_leverage(inputs),
+            require_unchanged=not dry_run,
         ),
     )
     if dry_run:
@@ -627,6 +693,7 @@ def partial_close(
             state,
             trade_id,
             int(fresh["intent"]["body"]["collateral"]["amountUsdc"]),
+            require_unchanged=not dry_run,
         ),
     )
     if dry_run:

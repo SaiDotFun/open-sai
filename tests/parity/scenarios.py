@@ -388,9 +388,11 @@ def loopback(
             "collateral_index": token_index,
         },
         "is_after_hours_market": False,
+        "market_order_config": {"fill_at_next_oracle_price": False},
         "get_collateral_price": "1",
         "get_perp_prices": {"market": {"base_per_quote": "100"}, "collateral": "1"},
         "get_liquidation_price": {"liquidation_price": "60"},
+        "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
         "get_market": {"fee_index": "FeeIndex(0)", "group_index": "GroupIndex(0)"},
         "get_group": {"min_leverage": "1", "max_leverage": "100"},
         "get_pair_custom_max_leverage": "0",
@@ -416,6 +418,7 @@ def loopback(
             "collateral_index": token_index,
         },
         "is_after_hours_market": {"market_index": market_index},
+        "market_order_config": {},
         "get_collateral_price": {"collateral_index": token_index},
         "get_market": {"index": market_index},
         "get_group": {"index": "GroupIndex(0)"},
@@ -428,6 +431,16 @@ def loopback(
             "trade_id": "UserTradeIndex(7)",
             "trader": position["trader"],
             "include_borrowing_fees": True,
+        },
+        "quote_trade": {
+            "trader": position["trader"],
+            "funds": [],
+            "action": {
+                "update_leverage": {
+                    "trade_index": "UserTradeIndex(7)",
+                    "new_leverage": "1.818181818181818182",
+                }
+            },
         },
         "get_fees": {"index": "FeeIndex(0)"},
     }
@@ -728,16 +741,17 @@ def loopback(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        owner_check = (
-                            trade_replay is not None
-                            and name == "get_trade_raw"
-                            and same_variables(
-                                query, {name: {"trader": ADDRESS, "index": 7}}
-                            )
-                        )
-                        if not owner_check and not same_variables(
-                            query, {name: contract_args[name]}
-                        ):
+                        expected = [{name: contract_args[name]}]
+                        # Ownership uses the account address. The next read
+                        # uses Perp's stored owner to pin the quote.
+                        if name == "get_trade_raw":
+                            if scenario == "concurrent-close":
+                                expected.append(
+                                    {name: {"trader": position["trader"], "index": 7}}
+                                )
+                            if trade_replay is not None:
+                                expected.append({name: {"trader": ADDRESS, "index": 7}})
+                        if not any(same_variables(query, args) for args in expected):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         wire.append(WireRequest(name, variables=query))
