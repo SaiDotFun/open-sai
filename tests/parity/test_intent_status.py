@@ -43,6 +43,7 @@ class Reply:
     status: int = 200
     headers: tuple[tuple[str, str], ...] = ()
     body_delay: float = 0
+    header_delay: float = 0
     disconnect: bool = False
 
 
@@ -78,6 +79,12 @@ def replay() -> Iterator[tuple[str, deque[Reply], list[Request]]]:
                 self.close_connection = True
                 return
             self.send_response(reply.status)
+            if reply.header_delay:
+                self.flush_headers()
+                time.sleep(reply.header_delay)
+                self.send_header("Content-Type", "application/json")
+                self.flush_headers()
+                time.sleep(reply.header_delay)
             for name, value in reply.headers:
                 self.send_header(name, value)
             self.send_header("Content-Length", str(len(reply.body)))
@@ -377,6 +384,20 @@ def test_history(
     local: str,
 ) -> None:
     compare(cli_pair, tmp_path, monkeypatch, (Step(history, local),))
+
+
+def test_split_history_headers_keep_the_inactivity_timer_alive(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fill = Reply(response("filled_history").body, header_delay=1.2)
+    compare(
+        cli_pair,
+        tmp_path,
+        monkeypatch,
+        (Step(("outcome_not_indexed", fill), "terminal"),),
+    )
 
 
 def test_empty_history_object_retries(

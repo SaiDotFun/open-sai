@@ -1,19 +1,15 @@
 //! Keeper GraphQL requests and their transport verdicts.
 
 mod queries;
+mod transport;
 
 use std::{
     path::Path,
-    pin::pin,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
 use bech32::{Bech32, primitives::decode::CheckedHrpstring};
-use reqwest::{Client, header};
 use serde_json::{Map, Value, json};
-use tokio::{sync::Notify, time};
-use tower::util::MapResponseLayer;
 
 use crate::{
     endpoint::Endpoint,
@@ -116,48 +112,9 @@ impl<'a> Keeper<'a> {
         log: &mut ResponseLog,
     ) -> Result<Map<String, Value>, SaiError> {
         check_url(self.endpoint)?;
-        let connected = Arc::new(Notify::new());
-        let on_connect = Arc::clone(&connected);
-        let client = Client::builder()
-            .http1_only()
-            .http1_title_case_headers()
-            .redirect(reqwest::redirect::Policy::none())
-            .retry(reqwest::retry::never())
-            .connect_timeout(timeout)
-            .connector_layer(MapResponseLayer::new(move |connection| {
-                on_connect.notify_one();
-                connection
-            }))
-            .user_agent("python-httpx/0.28.1")
-            .build()
-            .map_err(transport_error)?;
-        let mut request = client
-            .post(self.endpoint)
-            .header(header::ACCEPT, "*/*")
-            .header(header::ACCEPT_ENCODING, "gzip, deflate")
-            .header(header::CONNECTION, "keep-alive")
-            .json(&json!({"query": query, "variables": variables}));
-        if let Some(token) = token {
-            request = request.bearer_auth(token);
-        }
-        // reqwest's read timer starts before the connector runs. Start waiting
-        // for a response once TCP and TLS have finished so a stalled connect
-        // goes through the connector's NotSent classification.
-        let mut send = pin!(request.send());
-        let mut response = tokio::select! {
-            biased;
-            result = &mut send => result,
-            () = connected.notified() => time::timeout(timeout, send).await.map_err(|_| request_failed())?,
-        }.map_err(transport_error)?;
-        let status = response.status();
-        let mut bytes = Vec::new();
-        while let Some(chunk) = time::timeout(timeout, response.chunk())
-            .await
-            .map_err(|_| request_failed())?
-            .map_err(transport_error)?
-        {
-            bytes.extend_from_slice(&chunk);
-        }
+        let body = serde_json::to_vec(&json!({"query": query, "variables": variables}))
+            .map_err(|_| request_failed())?;
+        let (status, bytes) = transport::post(self.endpoint, body, token, timeout).await?;
         log.http_status = Some(status.as_u16());
         if !status.is_success() {
             return Err(request_failed());
@@ -223,15 +180,11 @@ fn request_failed() -> SaiError {
     keeper_error("Keeper request failed or returned invalid JSON")
 }
 
-fn transport_error(error: reqwest::Error) -> SaiError {
-    if error.is_connect() {
-        SaiError::new(
-            Code::NotSent,
-            "Could not connect to Keeper; the request was not sent",
-        )
-    } else {
-        request_failed()
-    }
+fn not_sent() -> SaiError {
+    SaiError::new(
+        Code::NotSent,
+        "Could not connect to Keeper; the request was not sent",
+    )
 }
 
 fn graphql_errors(errors: &Value) -> Field {

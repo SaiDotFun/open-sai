@@ -87,6 +87,27 @@ async fn timeout_after_sending_is_a_keeper_error() {
 }
 
 #[tokio::test]
+async fn stalled_request_write_is_a_keeper_error() {
+    let listener = listener();
+    let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
+    let (release, wait) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        let (_stream, _) = listener.accept().unwrap();
+        // Leave the socket open without draining the send buffer.
+        wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+    let variables =
+        Map::from_iter([("payload".into(), Value::String("x".repeat(8 * 1024 * 1024)))]);
+    let error = Keeper::new(&endpoint, EVENTS)
+        .request(INTENTS, variables, None, Duration::from_millis(200))
+        .await
+        .unwrap_err();
+    release.send(()).unwrap();
+    assert_eq!(error.code, Code::KeeperError);
+    server.join().unwrap();
+}
+
+#[tokio::test]
 async fn body_progress_resets_the_read_timeout() {
     let listener = listener();
     let endpoint = format!("http://{}/query", listener.local_addr().unwrap());
