@@ -11,8 +11,8 @@ import sys
 import threading
 import time
 import uuid
-from collections.abc import Generator
-from contextlib import contextmanager
+from collections.abc import Callable, Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -167,7 +167,12 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
 
 
 @contextmanager
-def loopback(scenario: str) -> Generator[Endpoints]:
+def loopback(
+    scenario: str,
+    *,
+    trade_replay: Callable[[WireRequest, str | None], dict[str, Any] | None]
+    | None = None,
+) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
     admission = Admission()
@@ -416,6 +421,23 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     return
                 wire.append(request)
                 name = request.label
+                if trade_replay is not None and name in {
+                    "recordUserIntent",
+                    "userIntents",
+                    "waitUserIntents",
+                    "intentTradeHistory",
+                }:
+                    try:
+                        reply = trade_replay(request, self.headers.get("Authorization"))
+                    except ValueError as exc:
+                        self.reject(str(exc))
+                    else:
+                        if reply is None:
+                            self.close_connection = True
+                        else:
+                            with suppress(BrokenPipeError, ConnectionResetError):
+                                self.reply(reply)
+                    return
                 if name == "recordUserIntent" and scenario == "concurrent-close":
                     self.admit_close(request.variables)
                     return
