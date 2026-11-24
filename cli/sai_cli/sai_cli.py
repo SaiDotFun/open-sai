@@ -7,6 +7,7 @@ import dataclasses
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -842,11 +843,19 @@ def intent_status(ctx: click.Context, addr: str, key: str | None) -> None:
 @click.pass_context
 def intent_wait(ctx: click.Context, key: str, addr: str | None, timeout: float) -> None:
     """Wait for an intent's final outcome and print its receipt."""
+    started = time.monotonic()
     wait.validate_timeout(timeout)
     endpoint = keeper_url(ctx)
     account = addr or ctx.obj["as_addr"]
     if account is None:
-        local = storage.intent_record(endpoint, key)
+        try:
+            with storage.busy_timeout(max(0, started + timeout - time.monotonic())):
+                local = storage.intent_record(endpoint, key)
+        except sqlite3.OperationalError as exc:
+            if not wait.ledger_busy(exc):
+                raise
+            emit_wait(ctx, wait.unknown_result(key, None))
+            return
         if local is not None:
             account = local[0]
         elif storage.session_exists():
@@ -855,7 +864,9 @@ def intent_wait(ctx: click.Context, key: str, addr: str | None, timeout: float) 
                 account = stored["evmAddress"]
     if account is None:
         raise ValueError("Pass --addr with the account that submitted this intent")
-    emit_wait(ctx, wait.for_intent(endpoint, account, key, timeout=timeout))
+    emit_wait(
+        ctx, wait.for_intent(endpoint, account, key, timeout=timeout, started=started)
+    )
 
 
 @intent.command("local")
@@ -913,13 +924,13 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
     outcome = result["outcome"]
     exit_code = ExitCode.OK
     if outcome == "unknown" and not result.get("interrupted"):
+        addr_args = ["--addr", result["addr"]] if result.get("addr") else []
         result["hint"] = storage.keeper_command_hint(
             keeper_url(ctx),
             "intent",
             "wait",
             result["intentKey"],
-            "--addr",
-            result["addr"],
+            *addr_args,
         )
     if isinstance(result.get("message"), str):
         result["message"] = log.redact(result["message"])

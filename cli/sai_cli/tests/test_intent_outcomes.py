@@ -989,6 +989,35 @@ def test_mcp_wait_does_not_block_on_initial_ledger_lookup(keeper_replay):
     assert status(endpoint) == "unknown"
 
 
+def test_cli_wait_budgets_initial_locked_ledger_lookup(keeper_replay):
+    endpoint, _ = keeper_replay
+    reserve(endpoint)
+    with storage.db() as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        started = time.monotonic()
+        with storage.busy_timeout(1):
+            command = CliRunner().invoke(
+                main,
+                [
+                    "--endpoint",
+                    endpoint,
+                    "--json",
+                    "intent",
+                    "wait",
+                    KEY,
+                    "--timeout",
+                    "0.02",
+                ],
+            )
+        assert time.monotonic() - started < 0.5
+    assert command.exit_code == 5, command.output
+    result = json.loads(command.stdout)
+    assert result["error"]["code"] == "OUTCOME_UNKNOWN"
+    assert result["error"]["intentKey"] == KEY
+    assert result["error"]["hint"] == f"sai --endpoint {endpoint} intent wait {KEY}"
+    assert status(endpoint) == "unknown"
+
+
 def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)

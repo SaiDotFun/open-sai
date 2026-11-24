@@ -71,12 +71,15 @@ def for_intent(
     key: str,
     *,
     timeout: float = DEFAULT_TIMEOUT,
+    started: float | None = None,
     clock: Clock = Clock(),
 ) -> dict[str, Any]:
     """Run the CLI wait with the same polling logic as MCP."""
     try:
         return asyncio.run(
-            for_intent_async(endpoint, addr, key, timeout=timeout, clock=clock)
+            for_intent_async(
+                endpoint, addr, key, timeout=timeout, started=started, clock=clock
+            )
         )
     except KeyboardInterrupt:
         try:
