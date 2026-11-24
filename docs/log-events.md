@@ -39,7 +39,12 @@ The writer converts the hash to lowercase and preserves the prefix if present.
 A malformed request hash is omitted and sets `txHashInvalid`.
 The field `txHash` on `intent.submitted` is the request transaction hash when
 Keeper includes it in the admission response. It may appear first on `intent.keeper`.
-The wait entries reserve fields for the intent wait implementation.
+When polling starts, `intent.wait.start` records the intent key and timeout.
+The `intent.wait.end` event records the outcome in `status`, the elapsed
+milliseconds in `durationMs`, and a Sai `code` when assigned.
+In v0.1.2 the wait writer does not populate `txHash`, `txHashInvalid`,
+`fillBlock`, or `error` on that event. Read the wait receipt for
+transaction and fill details.
 
 | Event | Emitter | Levels | Required | Optional |
 | --- | --- | --- | --- | --- |
@@ -51,8 +56,8 @@ The wait entries reserve fields for the intent wait implementation.
 | `intent.status` | `core.storage._log_status` | `info` | `intentKey` (string), `kind` (string), `previous` (string), `status` (string), `addr` (string), `endpoint` (string) | `code` (string), `endpointId` (string) |
 | `intent.submitted` | `core.intents.submit` | `info` | `intentKey` (string), `kind` (string), `addr` (string), `endpoint` (string) | `txHash` (string), `txHashInvalid` (boolean), `endpointId` (string) |
 | `intent.status_write_failed` | `core.intents._record_submission_status` | `warn` | `intentKey` (string), `addr` (string), `endpoint` (string), `status` (string), `errorType` (string), `code` (string) | `endpointId` (string) |
-| `intent.wait.start` | `core intent wait (lane A4)` | `info` | `intentKey` (string) | `addr` (string), `endpoint` (string), `endpointId` (string), `timeoutMs` (integer) |
-| `intent.wait.end` | `core intent wait (lane A4)` | `info`, `warn`, `error` | `intentKey` (string), `status` (string), `durationMs` (integer) | `addr` (string), `endpoint` (string), `endpointId` (string), `txHash` (string), `txHashInvalid` (boolean), `fillBlock` (integer), `code` (string), `error` (string) |
+| `intent.wait.start` | `core.wait.for_intent_async` | `info` | `intentKey` (string) | `addr` (string), `endpoint` (string), `endpointId` (string), `timeoutMs` (integer) |
+| `intent.wait.end` | `core.wait.for_intent_async` | `info`, `warn`, `error` | `intentKey` (string), `status` (string), `durationMs` (integer) | `addr` (string), `endpoint` (string), `endpointId` (string), `txHash` (string), `txHashInvalid` (boolean), `fillBlock` (integer), `code` (string), `error` (string) |
 | `keeper.request` | `core.keeper._log_request` | `info`, `warn` | `operation` (string), `endpoint` (string), `authenticated` (boolean), `durationMs` (integer), `status` (string) | `addr` (string), `intentKey` (string), `endpointId` (string), `code` (string), `error` (string), `httpStatus` (integer), `keeperErrors` (object[]), `keeperErrorCount` (integer) |
 | `log.dropped` | `core.log._write` | `warn` | `count` (integer) | None |
 | `mcp.server_start` | `mcp_server.server.serve` | `info` | `keeper` (string), `websocket` (string), `lcd` (string) | None |
