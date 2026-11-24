@@ -1,18 +1,20 @@
 use std::{
     fmt::Write as _,
     io::{self, Write},
+    time::Instant,
 };
 
 use chrono::Utc;
 use clap::Subcommand;
 use sai_core::{
-    errors::{Code, SaiError},
+    errors::{Code, ExitCode, SaiError},
     keeper,
     log::{EventContext, Field, Level},
     reconcile,
     session::expired,
     settings::{Environment, Flags},
     storage::{IntentStatus, RemovedSession, SessionSummary, Storage, StorageEvent},
+    wait,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -44,6 +46,21 @@ pub enum IntentCommand {
     },
     /// List locally recorded intents for an account.
     Local { addr: String },
+    /// Wait for an intent's final outcome and print its receipt.
+    #[command(arg_required_else_help = true)]
+    Wait {
+        #[arg(value_name = "KEY")]
+        identity: String,
+        /// EVM or Nibiru address that submitted the intent.
+        #[arg(long, conflicts_with = "key")]
+        addr: Option<String>,
+        /// Specific intent key when the positional argument is the account.
+        #[arg(long)]
+        key: Option<String>,
+        /// Maximum wait in seconds.
+        #[arg(long, default_value_t = wait::DEFAULT_TIMEOUT.to_string(), allow_hyphen_values = true)]
+        timeout: String,
+    },
 }
 
 pub fn intent_help(command: &str) -> Option<String> {
@@ -56,6 +73,9 @@ pub fn intent_help(command: &str) -> Option<String> {
         }
         "intent local" => {
             "  List locally recorded intent identities for ADDR.\n\nOptions:\n  --help  Show this message and exit."
+        }
+        "intent wait" => {
+            "  Wait for an intent's final outcome and print its receipt.\n\nOptions:\n  --addr TEXT      EVM or Nibiru address that submitted the intent.\n  --timeout FLOAT  Maximum wait in seconds.  [default: 30.0]\n  --help           Show this message and exit."
         }
         _ => return None,
     };
@@ -151,13 +171,26 @@ pub fn auth(
 
 pub fn intent(
     command: IntentCommand,
+    as_addr: Option<&str>,
     flags: &Flags,
     env: &Environment,
     json: bool,
     events: EventContext<'_>,
-) -> Result<(), SaiError> {
+) -> Result<ExitCode, SaiError> {
     let log_storage = |event: StorageEvent<'_>| storage_event(events, event);
     let storage = Storage::new(&env.home).with_event_sink(&log_storage);
+    let started = Instant::now();
+    let timeout = if let IntentCommand::Wait { timeout, .. } = &command {
+        let seconds = timeout.trim().parse::<f64>().map_err(|_| {
+            SaiError::usage(format!(
+                "Invalid value for '--timeout': {} is not a valid float.",
+                sai_core::settings::repr(timeout)
+            ))
+        })?;
+        Some(wait::validate_timeout(seconds)?)
+    } else {
+        None
+    };
     let settings = load_settings(flags, env)?;
     match command {
         IntentCommand::Status { addr, key } => {
@@ -173,12 +206,130 @@ pub fn intent(
                 &storage,
                 events,
             ))?;
-            emit(&keeper::public_intent_status(&env.home, &data), json)
+            emit(&keeper::public_intent_status(&env.home, &data), json)?;
         }
         IntentCommand::Local { addr } => {
-            emit(&storage.list_pending(settings.endpoint(), &addr)?, json)
+            emit(&storage.list_pending(settings.endpoint(), &addr)?, json)?;
+        }
+        IntentCommand::Wait {
+            identity,
+            addr,
+            key,
+            ..
+        } => {
+            let (key, addr) = match key {
+                Some(key) => (key, Some(identity)),
+                None => (identity, addr),
+            };
+            let timeout = timeout.expect("wait timeout was validated");
+            let endpoint = settings.endpoint();
+            let addr = addr
+                .filter(|addr| !addr.is_empty())
+                .or_else(|| as_addr.map(str::to_owned));
+            let addr = match addr {
+                Some(addr) => Some(addr),
+                None => {
+                    let busy = timeout
+                        .saturating_sub(started.elapsed())
+                        .min(std::time::Duration::from_millis(i32::MAX as u64));
+                    match storage
+                        .clone()
+                        .with_busy_timeout(busy)
+                        .intent_record(endpoint, &key)
+                    {
+                        Ok(Some((addr, _))) => Some(addr),
+                        Ok(None) if storage.session_exists() => {
+                            let session = storage.load_session(None)?;
+                            (session.endpoint() == Some(endpoint))
+                                .then(|| session.addr().to_owned())
+                        }
+                        Ok(None) => None,
+                        Err(error) if wait::ledger_busy(&error) => {
+                            return emit_wait(
+                                wait::unknown_result(&key),
+                                endpoint,
+                                env,
+                                json,
+                                false,
+                            );
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+            .ok_or_else(|| {
+                SaiError::new(
+                    Code::InvalidRequest,
+                    "Pass --addr with the account that submitted this intent",
+                )
+            })?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|_| SaiError::internal())?;
+            let (receipt, recovered) = runtime.block_on(async {
+                tokio::select! {
+                    biased;
+                    signal = tokio::signal::ctrl_c() => (
+                        wait::recovery_result(&env.home, endpoint, &addr, &key, signal.is_ok()), true,
+                    ),
+                    receipt = wait::for_intent(endpoint, &addr, &key, timeout, started, &storage, events) => {
+                        match receipt {
+                            Ok(receipt) => (receipt, false),
+                            Err(_) => (wait::recovery_result(&env.home, endpoint, &addr, &key, false), true),
+                        }
+                    }
+                }
+            });
+            return emit_wait(receipt, endpoint, env, json, recovered);
         }
     }
+    Ok(ExitCode::Ok)
+}
+
+fn emit_wait(
+    wait::ResultReceipt { outcome, mut body }: wait::ResultReceipt,
+    endpoint: &str,
+    env: &Environment,
+    json: bool,
+    recovered: bool,
+) -> Result<ExitCode, SaiError> {
+    let key = body["intentKey"]
+        .as_str()
+        .expect("receipt intent key")
+        .to_owned();
+    if !recovered && outcome == wait::Outcome::Unknown {
+        let mut args = vec!["intent", "wait", &key];
+        if let Some(addr) = body["addr"].as_str().filter(|addr| !addr.is_empty()) {
+            args.extend(["--addr", addr]);
+        }
+        body["hint"] = json!(wait::command_hint(&env.home, endpoint, &args));
+    }
+    let mut exit = ExitCode::Ok;
+    if let Some(code) = outcome.code() {
+        let message = if recovered {
+            "The receipt did not finish. Check the intent status before retrying."
+        } else {
+            body["message"]
+                .as_str()
+                .unwrap_or("The intent outcome is still unknown.")
+        };
+        exit = code.exit_code();
+        if json {
+            let mut error = json!({
+                "code": code,
+                "message": sai_core::log::redact(&env.home, message),
+                "retryable": exit == ExitCode::Rejected,
+                "intentKey": sai_core::log::redact(&env.home, &key),
+            });
+            if let Some(hint) = body["hint"].as_str() {
+                error["hint"] = json!(sai_core::log::redact(&env.home, hint));
+            }
+            body["error"] = error;
+        }
+    }
+    emit(&body, json)?;
+    Ok(exit)
 }
 
 fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {

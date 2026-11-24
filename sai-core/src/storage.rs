@@ -60,6 +60,7 @@ impl From<StorageError> for SaiError {
 }
 
 /// Persisted account sessions and trade reservations under a single Sai home.
+#[derive(Clone)]
 pub struct Storage<'a> {
     pub(crate) trader: PathBuf,
     busy_timeout: Duration,
@@ -105,7 +106,7 @@ pub enum StorageEvent<'a> {
 }
 
 /// Project a stored endpoint onto the same fields as Python's log.origin.
-fn endpoint_origin(endpoint: &str) -> String {
+pub(crate) fn endpoint_origin(endpoint: &str) -> String {
     fn origin(endpoint: &str) -> Option<String> {
         let normalized = endpoint.trim().replace(['\t', '\n', '\r'], "");
         let (scheme, rest) = normalized.split_once("://")?;

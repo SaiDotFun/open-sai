@@ -131,21 +131,22 @@ fn block_time(value: &Value) -> bool {
         .is_some_and(|text| text.chars().count() <= 40 && parse_expiry(text).is_some())
 }
 
+pub(crate) fn request_hash(value: &Value) -> Option<String> {
+    let hash = value.as_str()?;
+    let digits = hash
+        .strip_prefix("0x")
+        .or_else(|| hash.strip_prefix("0X"))
+        .unwrap_or(hash);
+    (digits.len() == 64 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| hash.to_ascii_lowercase())
+}
+
 fn keep_hash(out: &mut Map<String, Value>, key: &str, value: &Value) {
-    if value.is_null() {
-        return;
+    if let Some(hash) = request_hash(value) {
+        out.insert(key.into(), json!(hash));
+    } else if !value.is_null() {
+        out.insert(format!("{key}Invalid"), json!(true));
     }
-    if let Some(hash) = value.as_str() {
-        let digits = hash
-            .strip_prefix("0x")
-            .or_else(|| hash.strip_prefix("0X"))
-            .unwrap_or(hash);
-        if digits.len() == 64 && digits.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            out.insert(key.into(), json!(hash.to_ascii_lowercase()));
-            return;
-        }
-    }
-    out.insert(format!("{key}Invalid"), json!(true));
 }
 
 fn reconcile_fields(out: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -191,7 +192,7 @@ fn keep_intent_key(out: &mut Map<String, Value>, key: &Value) {
     );
 }
 
-fn intent_record(row: &Map<String, Value>) -> Value {
+pub(crate) fn intent_record(row: &Map<String, Value>) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut record = Map::new();
     keep_intent_key(&mut record, value("intentKey"));
@@ -262,7 +263,7 @@ fn intent_record(row: &Map<String, Value>) -> Value {
     Value::Object(record)
 }
 
-fn intent_history(row: &Map<String, Value>) -> Value {
+pub(crate) fn intent_history(row: &Map<String, Value>) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut history = Map::new();
     keep_intent_key(&mut history, value("intentKey"));
@@ -302,4 +303,27 @@ fn intent_history(row: &Map<String, Value>) -> Value {
         history.insert("block".into(), Value::Object(public));
     }
     Value::Object(history)
+}
+
+pub(crate) fn wait_error_code(row: &Value, public: &Value) -> Value {
+    const ADDITIONAL_CODES: &[&str] = &[
+        "withdraw_evm_unconfigured",
+        "invalid_withdraw",
+        "intent_validation_failed",
+        "chain_switch_failed",
+        "gas_estimation_failed",
+        "wallet_rejected",
+        "wallet_sign_failed",
+        "chain_mismatch",
+        "request_pending",
+        "rpc_submission_failed",
+        "sign_failed_unknown",
+        "intent_auth_rejected",
+        "jwt_failed",
+    ];
+    if known(&row["errorCode"], ADDITIONAL_CODES) {
+        row["errorCode"].clone()
+    } else {
+        public["errorCode"].clone()
+    }
 }

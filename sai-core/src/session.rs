@@ -187,7 +187,7 @@ impl Storage<'_> {
     }
 }
 
-fn shell_quote(text: &str) -> String {
+pub(crate) fn shell_quote(text: &str) -> String {
     if !text.is_empty()
         && text
             .bytes()

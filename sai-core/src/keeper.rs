@@ -6,7 +6,10 @@ mod public;
 mod queries;
 mod transport;
 
-use std::time::{Duration, Instant};
+use std::{
+    sync::LazyLock,
+    time::{Duration, Instant},
+};
 
 use bech32::{Bech32, primitives::decode::CheckedHrpstring};
 use serde_json::{Map, Value, json};
@@ -18,6 +21,7 @@ use crate::{
 };
 
 pub use public::public_intent_status;
+pub(crate) use public::{intent_history, intent_record, request_hash, wait_error_code};
 pub use queries::*;
 
 pub const TIMEOUT: Duration = Duration::from_secs(20);
@@ -32,6 +36,7 @@ pub struct Keeper<'a> {
 struct ResponseLog {
     http_status: Option<u16>,
     errors: Option<Field>,
+    error_count: Option<usize>,
 }
 
 impl<'a> Keeper<'a> {
@@ -61,9 +66,15 @@ impl<'a> Keeper<'a> {
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
         let mut response = ResponseLog::default();
-        let result = self
-            .post(query, &variables, token, timeout, &mut response)
-            .await;
+        let wait_read = matches!(query, WAIT_INTENTS | INTENT_HISTORY);
+        let post = self.post(query, &variables, token, timeout, &mut response);
+        let result = if wait_read {
+            tokio::time::timeout(timeout, post)
+                .await
+                .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))
+        } else {
+            post.await
+        };
         let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
             Ok(_) => ("ok", Level::Info, None, None),
@@ -82,6 +93,13 @@ impl<'a> Keeper<'a> {
                 ),
             },
         };
+        static INTENT_KEY: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"\A[A-Za-z0-9_-]{1,128}\z").expect("Keeper log key pattern")
+        });
+        let intent_key = (query == WAIT_INTENTS)
+            .then(|| variables.get("key").and_then(Value::as_str))
+            .flatten()
+            .filter(|key| INTENT_KEY.is_match(key));
         self.events.event(
             "keeper.request",
             level,
@@ -89,6 +107,7 @@ impl<'a> Keeper<'a> {
                 ("operation", json!(queries::operation(query)).into()),
                 ("endpoint", Field::Endpoint(self.endpoint.into())),
                 ("addr", json!(addr).into()),
+                ("intentKey", json!(intent_key).into()),
                 ("authenticated", json!(token.is_some()).into()),
                 ("durationMs", json!(duration).into()),
                 ("status", json!(status).into()),
@@ -99,6 +118,7 @@ impl<'a> Keeper<'a> {
                     "keeperErrors",
                     response.errors.unwrap_or(Field::Scalar(Value::Null)),
                 ),
+                ("keeperErrorCount", json!(response.error_count).into()),
             ],
         );
         result
@@ -125,7 +145,12 @@ impl<'a> Keeper<'a> {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
-            log.errors = Some(graphql_errors(errors));
+            log.errors = if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
+                log.error_count = Some(errors.as_array().map_or(1, Vec::len));
+                Some(wait_graphql_errors(errors))
+            } else {
+                Some(graphql_errors(errors))
+            };
             if query == SUBMIT
                 && !result.get("data").is_some_and(truthy)
                 && errors.as_array().is_some_and(|items| {
@@ -207,6 +232,33 @@ fn graphql_errors(errors: &Value) -> Field {
             })
             .collect(),
     )
+}
+
+fn wait_graphql_errors(errors: &Value) -> Field {
+    const CODES: &[&str] = &[
+        "GRAPHQL_PARSE_FAILED",
+        "GRAPHQL_VALIDATION_FAILED",
+        "INTENT_NOT_ACCEPTED",
+        "BAD_USER_INPUT",
+        "FORBIDDEN",
+        "INTERNAL_SERVER_ERROR",
+        "UNAUTHENTICATED",
+    ];
+    let codes: Vec<_> = errors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+        .filter(|item| item.is_object())
+        .map(|item| {
+            let code = item["extensions"]["code"]
+                .as_str()
+                .filter(|code| CODES.contains(code))
+                .unwrap_or("KEEPER_ERROR");
+            json!({"code": code})
+        })
+        .collect();
+    json!(codes).into()
 }
 
 pub(crate) fn stringify(value: &Value) -> String {
