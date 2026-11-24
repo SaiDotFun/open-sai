@@ -42,3 +42,14 @@ def cli_pair() -> tuple[tuple[str, ...], tuple[str, ...]]:
     if magic not in native_formats or rust_sai.samefile(sys.executable):
         pytest.fail("SAI_PARITY_BIN must point to the compiled Rust sai binary")
     return (python_sai,), (str(rust_sai),)
+
+
+@pytest.fixture
+def wait_cli_pair(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    reference = os.environ.get("SAI_PARITY_WAIT_PYTHON")
+    if reference is None:
+        pytest.skip("set SAI_PARITY_WAIT_PYTHON to the pinned Python sai launcher")
+    monkeypatch.setenv("SAI_PARITY_PYTHON", reference)
+    return request.getfixturevalue("cli_pair")

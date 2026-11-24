@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import time
 from contextlib import closing
@@ -30,17 +29,6 @@ from test_intent_status import (
 REQUEST_BLOCK = 50109595
 FILL_BLOCK = 50109596
 OPAQUE = "fixture-upstream-private-text"
-
-
-@pytest.fixture
-def wait_cli_pair(
-    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
-) -> tuple[CLI, CLI]:
-    reference = os.environ.get("SAI_PARITY_WAIT_PYTHON")
-    if reference is None:
-        pytest.skip("set SAI_PARITY_WAIT_PYTHON to the pinned Python sai launcher")
-    monkeypatch.setenv("SAI_PARITY_PYTHON", reference)
-    return request.getfixturevalue("cli_pair")
 
 
 def intent(name: str, **fields: object) -> dict[str, Any]:
@@ -405,4 +393,45 @@ def test_wait_usage(
         observed.append(
             result.stdout if "--help" in args else json.loads(result.stdout)
         )
+    assert observed[0] == observed[1]
+
+
+def test_wait_bounds_account_lookup_when_ledger_is_locked(
+    wait_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed = []
+    with replay() as (endpoint, _, requests):
+        for index, cli in enumerate(wait_cli_pair):
+            home = tmp_path / str(index) / "sai"
+            seed(home, endpoint, monkeypatch, "unknown")
+            with closing(sqlite3.connect(home / "trader/intents.sqlite3")) as db:
+                db.execute("BEGIN EXCLUSIVE")
+                started = time.monotonic()
+                result = invoke(
+                    cli,
+                    home,
+                    "--endpoint",
+                    endpoint,
+                    "--json",
+                    "intent",
+                    "wait",
+                    KEY,
+                    "--timeout",
+                    "0.05",
+                )
+                assert time.monotonic() - started < 1.0
+            assert result.returncode == 5, result
+            assert result.stderr == b""
+            assert not requests
+            document = json.loads(result.stdout)
+            assert document["outcome"] == "unknown"
+            assert document["addr"] is None
+            assert document["error"]["intentKey"] == KEY
+            assert ledger_state(home) == [
+                (KEY, "unknown", None),
+                ("foreign", "unknown", None),
+            ]
+            observed.append(document)
     assert observed[0] == observed[1]

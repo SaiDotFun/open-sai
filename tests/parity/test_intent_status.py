@@ -14,7 +14,7 @@ import subprocess
 import threading
 import time
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass
 from datetime import datetime
@@ -77,11 +77,14 @@ class Request:
     body: bytes
 
 
+ReplayReply = Reply | Callable[[Request], Reply]
+
+
 @contextmanager
 def replay(
     tls: ssl.SSLContext | None = None,
-) -> Iterator[tuple[str, deque[Reply], list[Request]]]:
-    replies: deque[Reply] = deque()
+) -> Iterator[tuple[str, deque[ReplayReply], list[Request]]]:
+    replies: deque[ReplayReply] = deque()
     requests: list[Request] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -99,6 +102,8 @@ def replay(
                 self.send_error(500, "Unexpected Keeper request")
                 return
             reply = replies.popleft()
+            if callable(reply):
+                reply = reply(requests[-1])
             if reply.disconnect:
                 self.close_connection = True
                 return
@@ -143,20 +148,26 @@ def invoke(
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [*cli, *args],
-        env={
-            "PATH": os.defpath,
-            "HOME": str(home.parent),
-            "SAI_HOME": str(home),
-            "SAI_LOG": "1",
-            "SAI_UPDATE_AUTO": "0",
-            "PYTHONUTF8": "1",
-            **(overrides or {}),
-        },
+        env=cli_environment(home, overrides),
         cwd=home.parent,
         capture_output=True,
         check=False,
         timeout=30,
     )
+
+
+def cli_environment(
+    home: Path, overrides: dict[str, str] | None = None
+) -> dict[str, str]:
+    return {
+        "PATH": os.defpath,
+        "HOME": str(home.parent),
+        "SAI_HOME": str(home),
+        "SAI_LOG": "1",
+        "SAI_UPDATE_AUTO": "0",
+        "PYTHONUTF8": "1",
+        **(overrides or {}),
+    }
 
 
 def read_events(home: Path) -> list[dict[str, Any]]:
