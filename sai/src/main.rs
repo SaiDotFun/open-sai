@@ -1,5 +1,6 @@
 mod config;
 mod local;
+mod mcp_registration;
 
 use std::{env, path::Path, process, time::Instant};
 
@@ -63,6 +64,8 @@ enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Run Sai as an MCP server for agent clients.
+    Mcp(mcp_registration::McpArgs),
 }
 
 impl Cli {
@@ -71,6 +74,7 @@ impl Cli {
         env: &Environment,
         json: bool,
         events: EventContext<'_>,
+        operands: &[String],
     ) -> Result<(), SaiError> {
         let flags = Flags {
             endpoint: self.endpoint,
@@ -90,6 +94,7 @@ impl Cli {
                 local::intent(command, &flags, env, json, events)
             }
             Command::Config { command } => command.run(&flags, env, json),
+            Command::Mcp(args) => args.run(json, operands.iter().any(|arg| arg == "--")),
         }
     }
 }
@@ -158,7 +163,7 @@ fn main() -> process::ExitCode {
             let result = environment
                 .as_ref()
                 .map_err(|error| SaiError::from(error.clone()))
-                .and_then(|env| cli.run(env, json, events));
+                .and_then(|env| cli.run(env, json, events, operands));
             complete(result, command, json, home)
         }
         Err(error) => print_parse_error(&error, command, operands, requested_json, home),
