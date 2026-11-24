@@ -9,6 +9,10 @@ install:
 test:
     uv run pytest
 
+# Compare the Python CLI with SAI_PARITY_BIN, or run the Python self-check
+parity:
+    @uv run python tests/parity/parity.py
+
 check:
     uv run ruff check .
     uv run ruff format --check .
