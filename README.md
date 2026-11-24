@@ -130,9 +130,8 @@ sai mcp uninstall codex
 `install` registers the `sai` on your `PATH`, normally `~/.local/bin/sai`,
 which keeps its path across updates. It refuses a `sai` run through `uvx`,
 because uv cleans that copy out of its cache. Ordinary Claude Code installs
-use its MCP commands and restore the previous entry if replacement fails.
-Codex and Cursor installs edit the Sai entry in their config files.
-Cursor may ask you to enable Sai in its MCP settings. Claude
+use its MCP commands. Codex and Cursor installs edit the Sai entry in their
+config files. Cursor may ask you to enable Sai in its MCP settings. Claude
 Code installs use user scope by default. To register in the project's
 `.mcp.json`, pass `--scope project`.
 
