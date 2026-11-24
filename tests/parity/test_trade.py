@@ -76,16 +76,6 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     return (reference,), candidate
 
 
-@pytest.fixture
-def cancel_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
-    _, candidate = cli_pair
-    reference = os.environ.get("SAI_PARITY_WAIT_PYTHON")
-    if reference is None:
-        pytest.fail("Set SAI_PARITY_WAIT_PYTHON to the Python bdc11da launcher")
-    assert Path(reference).is_file(), "Install the cancellation reference with uv sync"
-    return (reference,), candidate
-
-
 def run(
     cli: CLI,
     root: Path,
@@ -372,9 +362,7 @@ def test_signed_out_submits_nothing(
     args: CLI,
     request: pytest.FixtureRequest,
 ) -> None:
-    if args[:2] == CANCEL[:2]:
-        trade_pair = request.getfixturevalue("cancel_pair")
-    elif args[:2] == CLOSE[:2]:
+    if args[:2] in (CANCEL[:2], CLOSE[:2]):
         trade_pair = request.getfixturevalue("current_trade_pair")
     observations = []
     for index, cli in enumerate(trade_pair):
@@ -431,13 +419,13 @@ def test_close_verifies_position_owner_before_reservation(
 
 @pytest.mark.parametrize("args", [CANCEL, (*CLOSE, "--cancel-order")])
 def test_cancel_dry_run_checks_pending_order(
-    cancel_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI
+    current_trade_pair: tuple[CLI, CLI], tmp_path: Path, args: CLI
 ) -> None:
     unavailable = {
         "status": "unavailable",
         "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
     }
-    for index, cli in enumerate(cancel_pair):
+    for index, cli in enumerate(current_trade_pair):
         with loopback("trade-accepted", cancel_target="pending") as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -473,14 +461,14 @@ def test_cancel_dry_run_checks_pending_order(
     ],
 )
 def test_cancel_refuses_non_pending_target(
-    cancel_pair: tuple[CLI, CLI],
+    current_trade_pair: tuple[CLI, CLI],
     tmp_path: Path,
     target: str,
     message: str,
     dry_run: bool,
 ) -> None:
     args = (*CANCEL, "--dry-run") if dry_run else CANCEL
-    for index, cli in enumerate(cancel_pair):
+    for index, cli in enumerate(current_trade_pair):
         with loopback("trade-accepted", cancel_target=target) as endpoints:
             home = tmp_path / str(index)
             other = target == "other-account"
@@ -511,69 +499,72 @@ def test_cancel_refuses_non_pending_target(
             assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
 
 
-def test_cancel_refuses_an_lcd_response_for_another_owner(
-    cancel_pair: tuple[CLI, CLI], tmp_path: Path
+@pytest.mark.parametrize(
+    ("target", "message", "wire"),
+    [
+        (
+            "foreign-owner",
+            "Contract pending order belongs to a different account",
+            CANCEL_READS,
+        ),
+        (
+            "filled-foreign-owner",
+            "Target is not an open pending order. Preview a market close for a filled position.",
+            CANCEL_READS,
+        ),
+        (
+            "unknown-chain",
+            "Keeper trading route and LCD network do not match",
+            CANCEL_READS[:2],
+        ),
+        (
+            "empty-chain",
+            "Keeper trading route and LCD network do not match",
+            CANCEL_READS[:2],
+        ),
+        (
+            "non-boolean-route",
+            "Keeper trading route and LCD network do not match",
+            CANCEL_READS[:2],
+        ),
+        (
+            "missing-contract",
+            "Keeper trading route has no contract address",
+            CANCEL_READS[:2],
+        ),
+    ],
+)
+def test_cancel_validates_route_and_target_in_python_order(
+    current_trade_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    target: str,
+    message: str,
+    wire: list[str],
 ) -> None:
-    python, rust = cancel_pair
-    with loopback("trade-accepted", cancel_target="foreign-owner") as endpoints:
-        home = tmp_path / "rust"
-        seed_home(home, endpoints, "session")
-        code, output, stderr = run(rust, home, endpoints, CANCEL, python=False)
-        assert (code, stderr) == (1, "")
-        assert output["error"] == {
-            "code": "INVALID_REQUEST",
-            "message": "Trade 7 was not found for this account.",
-            "retryable": False,
-        }
-        assert [request.label for request in endpoints.wire] == CANCEL_READS
-        assert not endpoints.errors
-        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
-
-    # The pinned Python guard accepts an order returned for a different owner.
-    with loopback("trade-accepted", cancel_target="foreign-owner") as endpoints:
-        home = tmp_path / "python"
-        seed_home(home, endpoints, "session")
-        assert run(python, home, endpoints, CANCEL, python=True)[0] == 0
-        assert [request.label for request in endpoints.wire] == [
-            *CANCEL_READS,
-            "recordUserIntent",
-        ]
-
-
-@pytest.mark.parametrize("target", ["unknown-chain", "empty-chain"])
-def test_cancel_requires_matching_known_chain_ids(
-    cancel_pair: tuple[CLI, CLI], tmp_path: Path, target: str
-) -> None:
-    python, rust = cancel_pair
-    with loopback("trade-accepted", cancel_target=target) as endpoints:
-        home = tmp_path / "rust"
-        seed_home(home, endpoints, "session")
-        code, output, stderr = run(rust, home, endpoints, CANCEL, python=False)
-        assert (code, stderr) == (1, "")
-        assert output["error"] == {
-            "code": "INVALID_REQUEST",
-            "message": "Keeper trading route and LCD network do not match",
-            "retryable": False,
-        }
-        assert [request.label for request in endpoints.wire] == CANCEL_READS[:2]
-        assert not endpoints.errors
-        assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
-
-    # The pinned Python guard treats matching absent or empty values as success.
-    with loopback("trade-accepted", cancel_target=target) as endpoints:
-        home = tmp_path / "python"
-        seed_home(home, endpoints, "session")
-        assert run(python, home, endpoints, CANCEL, python=True)[0] == 0
-        assert [request.label for request in endpoints.wire] == [
-            *CANCEL_READS,
-            "recordUserIntent",
-        ]
+    for index, cli in enumerate(current_trade_pair):
+        with loopback("trade-accepted", cancel_target=target) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            assert run(cli, home, endpoints, CANCEL, python=index == 0) == (
+                1,
+                {
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": message,
+                        "retryable": False,
+                    }
+                },
+                "",
+            )
+            assert [request.label for request in endpoints.wire] == wire
+            assert not endpoints.errors
+            assert not (home / "sai" / "trader" / "intents.sqlite3").exists()
 
 
 def test_cancel_rechecks_the_pinned_account_after_reading(
-    cancel_pair: tuple[CLI, CLI], tmp_path: Path
+    current_trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
-    for index, cli in enumerate(cancel_pair):
+    for index, cli in enumerate(current_trade_pair):
         with loopback("trade-cancel-session", cancel_target="pending") as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -704,10 +695,8 @@ def test_trade_submission(
     markets = args == OPEN
     cancel = args == CANCEL
     close = args == CLOSE
-    if close:
+    if close or cancel:
         trade_pair = request.getfixturevalue("current_trade_pair")
-    if cancel:
-        trade_pair = request.getfixturevalue("cancel_pair")
     for index, cli in enumerate(trade_pair):
         with loopback(
             f"trade-{verdict}",

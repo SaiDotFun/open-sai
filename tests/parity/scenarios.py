@@ -262,13 +262,16 @@ def loopback(
     }
     chains = {"unknown-chain": None, "empty-chain": ""}
     chain = chains.get(cancel_target, "cataclysm-1")
+    network = "different-chain" if cancel_target == "missing-contract" else chain
+    enabled = 1 if cancel_target == "non-boolean-route" else True
+    contract = "" if cancel_target == "missing-contract" else CONTRACT
     responses = {
         "oneClickTrading": {
             "data": {
                 "oneClickTrading": {
-                    "enabled": True,
+                    "enabled": enabled,
                     "chainId": chain,
-                    "contractAddress": CONTRACT,
+                    "contractAddress": contract,
                 }
             }
         },
@@ -365,7 +368,8 @@ def loopback(
         "get_trade_raw": {
             "user": (
                 OTHER_ADDRESS
-                if cancel_target == "foreign-owner" or close_target == "contract-owner"
+                if cancel_target in {"foreign-owner", "filled-foreign-owner"}
+                or close_target == "contract-owner"
                 else ADDRESS
                 if cancel_target is not None or pending_order
                 else position["trader"]
@@ -685,8 +689,8 @@ def loopback(
                     self.reply(
                         {
                             "default_node_info": {}
-                            if chain is None
-                            else {"network": chain}
+                            if network is None
+                            else {"network": network}
                         }
                     )
                     return

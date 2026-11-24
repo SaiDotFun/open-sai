@@ -68,16 +68,20 @@ impl Trading<'_> {
             .get("oneClickTrading")
             .ok_or_else(|| incomplete("KeyError"))?;
         let network = lcd.network().await?;
-        let network = network.as_str().filter(|id| !id.trim().is_empty());
-        let chain = text_field(route, "chainId")?;
+        let network = network.as_str().filter(|id| !id.is_empty());
+        let chain = field(route, "enabled")?
+            .as_bool()
+            .filter(|&enabled| enabled)
+            .and_then(|_| route["chainId"].as_str())
+            .filter(|id| !id.is_empty());
         let mismatch = "Keeper trading route and LCD network do not match";
-        if !truthy(field(route, "enabled")?) || chain.trim().is_empty() || network.is_none() {
+        let Some(chain) = chain.filter(|_| network.is_some()) else {
             return Err(invalid(mismatch));
-        }
-        let contract = text_field(route, "contractAddress")?;
-        if contract.trim().is_empty() {
-            return Err(invalid("Keeper trading route has no Perp contract address"));
-        }
+        };
+        let contract = route["contractAddress"]
+            .as_str()
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| invalid("Keeper trading route has no contract address"))?;
         if network != Some(chain) {
             return Err(if confirming {
                 SaiError::new(
