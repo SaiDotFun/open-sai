@@ -7,10 +7,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::{Request, StatusCode, Uri, body::Bytes, client::conn::http1, header};
 use hyper_timeout::TimeoutConnector;
 use hyper_util::{
-    client::{
-        legacy::connect::{Connected, Connection, proxy::Tunnel},
-        proxy::matcher::Matcher,
-    },
+    client::legacy::connect::{Connected, Connection, proxy::Tunnel},
     rt::TokioIo,
 };
 use rustls::{
@@ -26,7 +23,7 @@ use tokio_rustls::TlsConnector;
 use tower::{ServiceExt, service_fn};
 use url::Url;
 
-use super::{ca_dir, not_sent, request_failed};
+use super::{ca_dir, not_sent, proxy, request_failed};
 use crate::errors::SaiError;
 
 trait Socket: AsyncRead + AsyncWrite + Unpin + Send {}
@@ -49,7 +46,7 @@ pub(super) async fn post(
     url.set_fragment(None);
     let destination = url.as_str().parse::<Uri>().map_err(|_| request_failed())?;
     let authority = destination.authority().ok_or_else(request_failed)?;
-    let proxy = Matcher::from_system().intercept(&destination);
+    let proxy = proxy::for_endpoint(&url, &destination);
     let forward = proxy.is_some() && destination.scheme_str() == Some("http");
     let target = if forward {
         destination.clone()

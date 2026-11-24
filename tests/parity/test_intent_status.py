@@ -119,7 +119,7 @@ def invoke(
     cli: CLI,
     home: Path,
     *args: str,
-    trust: dict[str, str] | None = None,
+    overrides: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [*cli, *args],
@@ -130,7 +130,7 @@ def invoke(
             "SAI_LOG": "1",
             "SAI_UPDATE_AUTO": "0",
             "PYTHONUTF8": "1",
-            **(trust or {}),
+            **(overrides or {}),
         },
         cwd=home.parent,
         capture_output=True,
@@ -913,7 +913,7 @@ def test_keeper_tls_trust_matches_httpx(
                 "intent",
                 "status",
                 ADDR,
-                trust=trust,
+                overrides=trust,
             )
             assert result.returncode == (0 if trusted else 4)
             assert not result.stderr
@@ -930,3 +930,68 @@ def test_keeper_tls_trust_matches_httpx(
             )
             observed.append((stdout, list(requests)))
         assert observed[0] == observed[1]
+
+
+@pytest.mark.parametrize(
+    ("host", "exclusion", "bypass"),
+    [
+        ("127.0.0.1", "{host}:{port}", True),
+        ("127.0.0.1", "{host}:{wrong_port}", False),
+        ("localhost", "{host}:{port}", True),
+        ("localhost", "{host}:{wrong_port}", False),
+        ("localhost", "LOCALHOST", True),
+        ("localhost", ".localhost", False),
+        ("localhost", "https://{host}:{port}", False),
+        ("localhost", "http://", True),
+        ("localhost", "http://*:{port}", True),
+        ("localhost", "http://*:{wrong_port}", False),
+        ("127.0.0.1", "not-this-host, *", True),
+        ("127.0.0.1", "", False),
+    ],
+)
+def test_no_proxy_matches_keeper_destination(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    host: str,
+    exclusion: str,
+    bypass: bool,
+) -> None:
+    with (
+        replay() as (keeper_url, keeper_replies, keeper_requests),
+        replay() as (proxy, proxy_replies, proxy_requests),
+    ):
+        endpoint = keeper_url.replace("127.0.0.1", host)
+        port = int(endpoint.rsplit(":", 1)[1].split("/", 1)[0])
+        pattern = exclusion.format(host=host, port=port, wrong_port=port - 1)
+        for index, cli in enumerate(cli_pair):
+            recorded, unexpected = (
+                (keeper_requests, proxy_requests)
+                if bypass
+                else (proxy_requests, keeper_requests)
+            )
+            recorded.clear()
+            (keeper_replies if bypass else proxy_replies).append(response("absent"))
+            result = invoke(
+                cli,
+                tmp_path / str(index),
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "status",
+                ADDR,
+                overrides={
+                    "HTTP_PROXY": proxy.removesuffix("/query"),
+                    "NO_PROXY": pattern,
+                },
+            )
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout) == {"userIntents": []}
+            assert not unexpected
+            assert not (keeper_replies or proxy_replies)
+            assert [(request.path, request.body) for request in recorded] == [
+                (
+                    "/query" if bypass else endpoint,
+                    wire(keeper.INTENTS, user=ADDR, key=None),
+                )
+            ]
