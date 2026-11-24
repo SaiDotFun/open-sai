@@ -1,12 +1,8 @@
 //! Endpoint and expiry checks shared by the CLI and other front ends.
 
-use std::sync::LazyLock;
-
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, Utc, Weekday};
-use regex::Regex;
 
 use crate::{
-    endpoint::Endpoint,
     errors::{Code, SaiError},
     log,
     storage::{Session, SessionError, Storage, StorageError, StorageEvent, endpoint_origin},
@@ -180,11 +176,8 @@ impl Storage<'_> {
     }
 
     pub fn keeper_command_hint(&self, endpoint: &str, args: &[&str]) -> String {
-        static PLAIN_KEEPER_URL: LazyLock<Regex> = LazyLock::new(|| {
-            Regex::new(r"\Ahttps?://(?:[a-zA-Z0-9.-]+|\[[0-9a-fA-F:.]+\])(?::[0-9]+)?/query\z")
-                .expect("valid Keeper URL pattern")
-        });
-        let flag = if PLAIN_KEEPER_URL.is_match(endpoint)
+        let origin = keeper_origin(endpoint);
+        let flag = if origin.as_deref() == Some(endpoint)
             && self
                 .trader
                 .parent()
@@ -192,33 +185,39 @@ impl Storage<'_> {
         {
             shell_quote(endpoint)
         } else {
-            r#""${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}""#
-                .into()
+            let location = keeper_location(origin.as_deref());
+            format!(
+                r#""${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL{location}}}""#
+            )
         };
         format!("sai --endpoint {flag} {}", shell_join(args))
     }
 }
 
+fn keeper_origin(endpoint: &str) -> Option<String> {
+    let origin = endpoint_origin(endpoint);
+    (origin != "[redacted url]").then_some(origin)
+}
+
+fn keeper_location(origin: Option<&str>) -> String {
+    origin.map_or_else(String::new, |origin| format!(" at {origin}"))
+}
+
 pub fn renewal_command(session: &Session) -> String {
-    let mut origin = String::new();
-    let mut prefix = "sai".to_owned();
-    let mut suffix = String::new();
-    if let Some(endpoint) = session.endpoint()
-        && let Some(url) = Endpoint::split(endpoint)
-    {
-        let public_origin = endpoint_origin(endpoint);
-        origin = format!(" at {public_origin}");
-        if matches!(url.path.as_str(), "" | "/" | "/query" | "/graphql")
-            && endpoint == format!("{public_origin}{}", url.path)
-        {
-            prefix.push_str(" --endpoint ");
-            prefix.push_str(&shell_quote(endpoint));
-        }
-    }
-    if prefix == "sai" {
-        suffix =
-            format!(" (reuse the Keeper endpoint{origin} configured when this session was stored)");
-    }
+    let origin = session.endpoint().and_then(keeper_origin);
+    let (prefix, suffix) = match origin.as_deref() {
+        Some(origin) if session.endpoint() == Some(origin) => (
+            format!("sai --endpoint {}", shell_quote(origin)),
+            String::new(),
+        ),
+        origin => (
+            "sai".into(),
+            format!(
+                " (reuse the Keeper endpoint{} configured when this session was stored)",
+                keeper_location(origin)
+            ),
+        ),
+    };
     if session.key_name().is_some() {
         format!(
             "{prefix} auth renew {}{suffix}",

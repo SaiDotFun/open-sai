@@ -192,8 +192,14 @@ def test_auth_login(
             result = env.run_tty(*args, typed=[])
         else:
             result = observed(env.run(*args))
-        results.append(result)
         assert result[0] == expected_code
+        if case == "ud-locked" and env is rust:
+            origin = keeper_auth["endpoint"].split("/fixture-path-key")[0]
+            location = f" at {origin}"
+            assert location in json.loads(result[1])["error"]["hint"]
+            # The origin-only diagnostic includes context alongside the URL variable.
+            result = (result[0], result[1].replace(location, ""), result[2])
+        results.append(result)
         if case == "cast":
             assert result[2] == "Fixture Cast address\nFixture Cast sign\n"
         lookup_addr = (
@@ -233,6 +239,24 @@ def test_auth_login(
     if expected_code == 0:
         assert rust_state["sessions"][addr].pop("keyName") == "dev"
     assert python_state == rust_state
+
+
+@pytest.mark.parametrize("path", ["", "/query", "/fixture-path-key/query"])
+def test_signed_out_recovery_hint_only_shows_the_keeper_origin(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI], path: str
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    origin = "http://127.0.0.1:9"
+    result = rust.run("--json", "--endpoint", origin + path, "auth", "status")
+    assert result.returncode == 6
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "SIGNED_OUT"
+    endpoint = (
+        f'"${{SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
+        if path
+        else origin
+    )
+    assert error["hint"] == f"sai --endpoint {endpoint} auth login NAME"
 
 
 def test_auth_summaries_hide_keeper_path(
@@ -634,7 +658,20 @@ def test_renew_matches_python_without_switching_active_account(
         env.clipboard()
         env.clip.write_text(fixture_token(OTHER))
         assert env.run(*args, "import").returncode == 0
-        results.append(observed(env.run(*args, "renew")))
+        rejected = env.run(*args, "renew")
+        assert rejected.returncode == 1
+        error = json.loads(rejected.stdout)["error"]
+        assert error["code"] == "INVALID_REQUEST"
+        origin = endpoint.removesuffix("/query")
+        recovery = (
+            f"sai auth import (reuse the Keeper endpoint at {origin} configured when this session was stored)"
+            if env is rust
+            else f"sai --endpoint {endpoint} auth import"
+        )
+        assert (
+            error["message"]
+            == f"This session was imported. Run {recovery} with a fresh token."
+        )
         before = session_state(env)
         assert before["sessions"][ADDR]["expiresAt"] == old_expiry
         assert before["active"] == OTHER
@@ -655,7 +692,7 @@ def test_renew_matches_python_without_switching_active_account(
         assert before["sessions"][OTHER] == after["sessions"][OTHER]
         assert after["sessions"][ADDR]["token"] == renewed_token
         assert_unexposed(env, results[-1][1] + results[-1][2], renewed_token)
-    assert results[0:2] == results[2:4]
+    assert results[0] == results[1]
     assert session_state(python) == session_state(rust)
 
 
@@ -773,7 +810,8 @@ def test_expired_session_recovery_matches_python(
 ) -> None:
     args = ("--endpoint", keeper_auth["endpoint"])
     results = []
-    for env in homes(tmp_path, renewal_pair):
+    python, rust = homes(tmp_path, renewal_pair)
+    for env in (python, rust):
         keeper_auth["expires_at"] = "2000-01-01T00:00:00+00:00"
         keeper_auth["token"] = fixture_token(ADDR, 0)
         fake_cast(env)
@@ -790,8 +828,19 @@ def test_expired_session_recovery_matches_python(
         text = env.run(*args, "auth", "status")
         structured = env.run("--json", *args, "auth", "status")
         assert text.returncode == structured.returncode == 6
-        hint = json.loads(structured.stdout)["error"]["hint"]
+        body = json.loads(structured.stdout)["error"]
+        hint = body.pop("hint")
         command = f"renew {ADDR}" if source == "keystore" else "import"
-        assert hint == f"sai --endpoint {keeper_auth['endpoint']} auth {command}"
-        results.append((observed(text), observed(structured)))
+        endpoint = keeper_auth["endpoint"]
+        if env is rust:
+            origin = endpoint.removesuffix("/query")
+            assert hint == (
+                f"sai auth {command} (reuse the Keeper endpoint at {origin}"
+                " configured when this session was stored)"
+            )
+        else:
+            assert hint == f"sai --endpoint {endpoint} auth {command}"
+        results.append(
+            (observed(text), (structured.returncode, body, structured.stderr))
+        )
     assert results[0] == results[1]
