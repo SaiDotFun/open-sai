@@ -148,6 +148,7 @@ BROKEN_WHEN_INSTALLED = (
         "deleted-cwd",
         "deleted-cwd-relative",
         "denied-project",
+        "command-denied-background",
     ],
 )
 def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
@@ -161,6 +162,8 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
     project = uv_dirs / "project"
     project.mkdir()
     denied = mode == "denied-project"
+    background_denied = mode == "command-denied-background"
+    background = mode == "background" or background_denied
     name = OLD_COMMAND if denied else "sai"
     config = project / ".mcp.json" if denied else home / ".claude.json"
     entry = {
@@ -200,6 +203,14 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
                 }
             )
         )
+    if background_denied:
+        settings = project / ".claude/settings.json"
+        settings.parent.mkdir()
+        settings.write_text(
+            json.dumps(
+                {"deniedMcpServers": [{"serverCommand": [OLD_COMMAND, *entry["args"]]}]}
+            )
+        )
     wheels = {
         "0.1.0": build_wheel("0.1.0"),
         "0.2.0": build_wheel("0.2.0", server_body),
@@ -219,9 +230,13 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         args = ["update", "--api-base", stub.url, "--web-base", stub.url]
         if mode == "json":
             args.insert(0, "--json")
-        if mode == "background":
+        if background:
             args.append("--background")
-        monkeypatch.chdir(project)
+        if background_denied:
+            monkeypatch.setenv(updater.MCP_POLICY_CWD, str(project))
+            monkeypatch.chdir(updater.NEUTRAL_DIR)
+        else:
+            monkeypatch.chdir(project)
         if mode == "deleted-cwd-relative":
             monkeypatch.setenv("SAI_HOME", "../sai-home")
             monkeypatch.setenv("SAI_LOG", "false")
@@ -246,8 +261,11 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             },
             OTHER: other,
         }
-        assert json.loads(config.read_text())["mcpServers"] == expected
-        if mode == "background":
+        if denied or background_denied:
+            assert config.read_text() == original
+        else:
+            assert json.loads(config.read_text())["mcpServers"] == expected
+        if background:
             assert cursor.read_text() == original
         elif mode.startswith("deleted-cwd"):
             assert not project.exists()
@@ -274,16 +292,27 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             if (event := json.loads(line))["event"] == "update.mcp_repair"
         ]
         assert len(repair) == 1
-        assert repair[0]["background"] is (mode == "background")
-        assert repair[0]["clients"][0]["client"] == "claude"
-        assert repair[0]["clients"][0]["status"] == ("warn" if denied else "fixed")
+        assert repair[0]["background"] is background
+        claude = repair[0]["clients"][0]
+        assert claude["client"] == "claude"
+        if denied or background_denied:
+            assert claude["status"] == "warn"
+            assert claude["policyBlocked"] is True
+            assert claude["changes"] == []
+            assert state["result"]["mcp"] == repair[0]["clients"]
+        else:
+            assert claude["status"] == "fixed"
         if denied:
             clients = {client["client"]: client for client in repair[0]["clients"]}
             assert set(clients) == {"claude", "codex", "cursor"}
             assert all(client["legacyName"] == name for client in clients.values())
             assert f"kept the existing {name} name" in result.stdout
-        message = "Repaired Sai MCP registrations for claude"
-        if mode == "background":
+        message = (
+            "Skipped a Claude Code MCP repair because of deny rules."
+            if denied or background_denied
+            else "Repaired Sai MCP registrations for claude"
+        )
+        if background:
             assert result.output == ""
             notices: list[str] = []
             # This check just ran. The next terminal command announces it once.
@@ -301,7 +330,7 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
             assert json.loads(result.stdout)["mcp"] == state["result"]["mcp"]
         else:
             assert message in result.stdout
-        if mode != "background":
+        if not background:
             assert updater.notice(state, "0.2.0") is None
         output = result.output + json.dumps(repair) + json.dumps(updater.read_state())
         for value in (OTHER, SECRET, "private.example"):
@@ -1559,17 +1588,19 @@ def test_spawn_starts_a_detached_process_in_a_neutral_directory(tmp_path, monkey
     code = (
         "import json, os, pathlib; "
         f"pathlib.Path({str(marker)!r}).write_text(json.dumps("
-        '[os.getsid(0), os.getcwd(), os.environ["SAI_HOME"]]))'
+        f'[os.getsid(0), os.getcwd(), os.environ["SAI_HOME"], '
+        f"os.environ[{updater.MCP_POLICY_CWD!r}]]))"
     )
     updater.spawn([sys.executable, "-I", "-c", code])
     deadline = time.monotonic() + 30
     while not marker.exists() and time.monotonic() < deadline:
         time.sleep(0.05)
     time.sleep(0.1)
-    session, cwd, home = json.loads(marker.read_text())
+    session, cwd, home, policy_cwd = json.loads(marker.read_text())
     assert session != os.getsid(0)
     assert cwd == updater.NEUTRAL_DIR != str(tmp_path)
     assert home == str(tmp_path / "relative-home")
+    assert policy_cwd == str(tmp_path)
 
 
 @pytest.mark.parametrize(

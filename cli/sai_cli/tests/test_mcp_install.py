@@ -338,6 +338,7 @@ def test_doctor_preserves_denied_registration_names(env: Env):
     env.cursor_path().parent.mkdir()
     for path in (claude, cursor):
         path.write_text(json.dumps({"mcpServers": {OLD_COMMAND: entry}}))
+    original_claude = claude.read_bytes()
     env.write_codex({OLD_COMMAND: denied_codex})
 
     result = invoke("doctor", "--offline")
@@ -345,17 +346,124 @@ def test_doctor_preserves_denied_registration_names(env: Env):
     assert result.exit_code == 0, result.output
     checks = mcp_checks(result)
     assert set(checks) == set(mcp_install.CLIENTS)
-    for check in checks.values():
-        assert check["status"] == "warn" and check["changes"]
+    for name, check in checks.items():
+        assert check["status"] == "warn"
+        if name == "claude":
+            assert not check.get("changes")
+            assert "deny rule matches" in check["summary"]
+        else:
+            assert check["changes"]
         assert OLD_COMMAND in check["summary"]
+    assert claude.read_bytes() == original_claude
     expected = {**entry, "command": str(env.sai), "args": ["mcp", "serve"]}
-    for path in (claude, cursor):
-        assert json.loads(path.read_text())["mcpServers"] == {OLD_COMMAND: expected}
+    assert json.loads(cursor.read_text())["mcpServers"] == {OLD_COMMAND: expected}
     assert tomlkit.parse(env.codex_path().read_text()).unwrap()["mcp_servers"] == {
         OLD_COMMAND: {**expected, "enabled": False, "enabled_tools": []},
     }
     assert all(path.read_bytes() == content for path, content in policies.items())
     assert SECRET not in result.output
+
+
+@pytest.mark.parametrize(
+    ("source", "match", "blocked"),
+    [
+        ("user", "exact", True),
+        ("project", "exact", True),
+        ("local", "exact", True),
+        ("managed-cache", "exact", True),
+        ("git-root", "exact", True),
+        ("git-worktree", "exact", True),
+        ("another-project", "exact", True),
+        ("user", "name", True),
+        ("user", "expanded", True),
+        ("user", "different-arg", False),
+        ("user", "different-arity", False),
+        ("user", "invalid-file", True),
+    ],
+)
+def test_doctor_respects_claude_deny_rules(env, monkeypatch, source, match, blocked):
+    command = [OLD_COMMAND, "--endpoint", "https://private.example/" + SECRET]
+    entry = claude_entry(command, {"CUSTOM": SECRET})
+    other_project = env.root / "other-project"
+    registration = {"mcpServers": {"sai": entry}}
+    if source == "another-project":
+        other_project.mkdir()
+        registration["projects"] = {str(other_project): {}}
+    original = json.dumps(registration).encode()
+    config = env.home / ".claude.json"
+    config.write_bytes(original)
+    if source == "git-root":
+        (env.project / ".git").mkdir()
+        nested = env.project / "nested"
+        nested.mkdir()
+        monkeypatch.chdir(nested)
+    if source == "git-worktree":
+        metadata = other_project / ".git/worktrees/project"
+        metadata.mkdir(parents=True)
+        (metadata / "commondir").write_text("../..\n")
+        (env.project / ".git").write_text(f"gitdir: {metadata}\n")
+    settings = {
+        "user": env.home / ".claude/settings.json",
+        "project": env.project / ".claude/settings.json",
+        "local": env.project / ".claude/settings.local.json",
+        "managed-cache": env.home / ".claude/remote-settings.json",
+        "git-root": env.project / ".claude/settings.local.json",
+        "git-worktree": other_project / ".claude/settings.local.json",
+        "another-project": other_project / ".claude/settings.json",
+    }[source]
+    rule = {
+        "exact": {"serverCommand": command},
+        "name": {"serverName": "sai"},
+        "expanded": {"serverCommand": [*command[:-1], "${POSSIBLY_SECRET}"]},
+        "different-arg": {"serverCommand": [*command[:-1], "different"]},
+        "different-arity": {"serverCommand": command + ["--json"]},
+        "invalid-file": {},
+    }[match]
+    settings.parent.mkdir()
+    policy = json.dumps({"deniedMcpServers": [rule], "env": {"OTHER": SECRET}})
+    if match == "invalid-file":
+        policy += "}"
+    settings.write_text(policy)
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 0, result.output
+    check = mcp_checks(result)["claude"]
+    if blocked:
+        assert config.read_bytes() == original
+        assert check["status"] == "warn"
+        reason = "Could not check" if match == "invalid-file" else "deny rule matches"
+        assert reason in check["summary"]
+        assert not check.get("changes")
+    else:
+        assert check["status"] == "fixed"
+        assert env.claude_json()["mcpServers"]["sai"] == {
+            **entry,
+            "command": str(env.sai),
+            "args": ["mcp", "serve", *command[1:]],
+        }
+    assert settings.read_text() == policy
+    assert all(call[1] == "get" for call in env.calls())
+    assert SECRET not in result.output
+    assert "private.example" not in result.output
+
+
+def test_claude_reads_managed_policy_files_and_visible_json_drop_ins(tmp_path):
+    main = tmp_path / "managed-settings.json"
+    main.write_text(json.dumps({"deniedMcpServers": [{"serverName": "sai"}]}))
+    drop_ins = tmp_path / "managed-settings.d"
+    drop_ins.mkdir()
+    command = [OLD_COMMAND, "--json"]
+    drop_in = drop_ins / "98-company.json"
+    drop_in.write_text(json.dumps({"deniedMcpServers": [{"serverCommand": command}]}))
+    (drop_ins / ".hidden.json").write_text("invalid")
+    (drop_ins / "README").write_text("invalid")
+
+    files = mcp_install.managed_claude_files(tmp_path)
+    assert files == [main, drop_in]
+    assert mcp_install.claude_denied(files, "user", "sai", ["sai", "mcp", "serve"])
+    assert mcp_install.claude_denied(files, "user", OLD_COMMAND, command)
+    assert not mcp_install.claude_denied(files, "user", OLD_COMMAND, command[:1])
 
 
 @pytest.mark.parametrize("canonical_exists", [False, True])

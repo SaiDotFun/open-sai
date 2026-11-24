@@ -68,6 +68,7 @@ CHECK_INTERVAL = 24 * 60 * 60
 # this long instead of a day later.
 RETRY_INTERVAL = 15 * 60
 TOOL_LOCK_NAME = ".sai-cli-update.lock"
+MCP_POLICY_CWD = "SAI_UPDATE_POLICY_CWD"
 # A copy of the tool's environment, kept beside it while an update that has
 # no verified wheel to go back to replaces it.
 SNAPSHOT_PREFIX = ".sai-cli-rollback-"
@@ -599,6 +600,7 @@ class Outcome:
                 "status": check.status,
                 "changes": list(check.changes),
                 **({"pinned": True} if check.pinned else {}),
+                **({"policyBlocked": True} if check.policy_blocked else {}),
                 **(
                     {"legacyName": mcp_install.RETIRED_NAME}
                     if check.legacy_name
@@ -1090,9 +1092,17 @@ def update_now(options: Options | None = None) -> Outcome:
 def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> Outcome:
     """Keep registration errors separate from the verified install outcome."""
     notes: list[str] = []
-    cwd = None
+    cwd = policy_cwd = None
     if background:
         notes.append("background")
+        scheduled_from = os.environ.get(MCP_POLICY_CWD)
+        if scheduled_from and Path(scheduled_from).is_absolute():
+            policy_cwd = Path(scheduled_from)
+        else:
+            try:
+                policy_cwd = Path.cwd()
+            except OSError:
+                pass
     else:
         try:
             cwd = Path.cwd()
@@ -1101,7 +1111,9 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
     checks: list[mcp_install.RegistrationCheck] = []
     try:
         target = mcp_install.launcher_target(str(launcher), {})
-        checks = mcp_install.check_registrations(target, fix=True, cwd=cwd)
+        checks = mcp_install.check_registrations(
+            target, fix=True, cwd=cwd, policy_cwd=policy_cwd
+        )
     except Exception:  # noqa: BLE001 - the installation has already succeeded
         notes.append("failed")
     outcome = replace(
@@ -1109,7 +1121,10 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
         mcp=tuple(
             check
             for check in checks
-            if check.status in ("fixed", "fail") or check.pinned or check.legacy_name
+            if check.status in ("fixed", "fail")
+            or check.pinned
+            or check.legacy_name
+            or check.policy_blocked
         ),
         mcp_notes=tuple(notes),
     )
@@ -1136,6 +1151,7 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
 def mcp_notice(results: Any, notes: Any = None) -> str:
     """Summarize this update's repairs using only known client names."""
     repaired, failed, pinned, legacy = [], [], [], []
+    claude_policy_blocked = False
     for entry in results if isinstance(results, list) else []:
         if (
             not isinstance(entry, dict)
@@ -1151,9 +1167,11 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         keeps_name = entry.get("legacyName") == mcp_install.RETIRED_NAME
         if keeps_name:
             legacy.append(entry["client"])
+        blocked = entry.get("client") == "claude" and entry.get("policyBlocked") is True
+        claude_policy_blocked |= blocked
         # Older update records used warn exclusively for a pinned launcher.
         if entry.get("pinned") is True or (
-            entry.get("status") == "warn" and not keeps_name
+            entry.get("status") == "warn" and not keeps_name and not blocked
         ):
             pinned.append(entry["client"])
     messages = []
@@ -1166,6 +1184,11 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         )
     if pinned:
         messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
+    if claude_policy_blocked:
+        messages.append(
+            "Skipped a Claude Code MCP repair because of deny rules."
+            " Run `sai doctor` for details."
+        )
     if legacy:
         messages.append(
             f"Sai MCP kept the existing {mcp_install.RETIRED_NAME} name"
@@ -1256,7 +1279,11 @@ def spawn(command: Sequence[str]) -> None:
         "stderr": subprocess.DEVNULL,
         "close_fds": True,
         "cwd": NEUTRAL_DIR,
-        "env": {**os.environ, "SAI_HOME": str(update.sai_home())},
+        "env": {
+            **os.environ,
+            "SAI_HOME": str(update.sai_home()),
+            MCP_POLICY_CWD: str(Path.cwd()),
+        },
     }
     if sys.platform == "win32":
         options["creationflags"] = (

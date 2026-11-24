@@ -166,6 +166,10 @@ class ClientError(Exception):
     """A client command or config file failed; the message is safe to print."""
 
 
+class ClaudeMcpPolicyError(ClientError):
+    """Repair cannot proceed under the client's deny rules."""
+
+
 @dataclass(frozen=True)
 class RegistrationCheck:
     client: str
@@ -175,6 +179,7 @@ class RegistrationCheck:
     changes: tuple[str, ...] = ()
     pinned: bool = False
     legacy_name: bool = False
+    policy_blocked: bool = False
 
 
 def normalize_client(name: str) -> str:
@@ -300,6 +305,74 @@ def load_json(path: Path) -> dict[str, Any] | None:
     if not isinstance(data, dict):
         raise ClientError(f"could not read {path}: not a JSON object")
     return data
+
+
+def managed_claude_files(directory: Path) -> list[Path]:
+    """The system policy file and visible JSON drop-ins."""
+    files = [directory / "managed-settings.json"]
+    try:
+        files.extend(
+            path
+            for path in (directory / "managed-settings.d").iterdir()
+            if path.suffix == ".json" and not path.name.startswith(".")
+        )
+    except FileNotFoundError:
+        pass
+    return files
+
+
+def main_checkout(root: Path) -> Path | None:
+    """Find a linked worktree's shared checkout for Claude's local settings."""
+    marker = root / ".git"
+    if not marker.is_file():
+        return None
+    _, separator, git_dir = (
+        marker.read_text(encoding="utf-8").strip().partition("gitdir: ")
+    )
+    if not separator or not git_dir:
+        return None
+    metadata = root / git_dir
+    try:
+        common = (metadata / "commondir").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    shared = (metadata / common).resolve()
+    if shared.name != ".git":
+        raise ClaudeMcpPolicyError(
+            "Could not locate Claude Code's shared local settings"
+        )
+    return shared.parent
+
+
+def claude_denied(paths: list[Path], scope: str, name: str, argv: list[str]) -> bool:
+    """Match Claude's deny lists against the entry before any launcher change."""
+    for path in paths:
+        data = load_json(path) or {}
+        rules = data.get("deniedMcpServers", [])
+        disabled = data.get("disabledMcpjsonServers", []) if scope == "project" else []
+        if not isinstance(rules, list) or not isinstance(disabled, list):
+            raise ClaudeMcpPolicyError("Could not check Claude Code MCP deny rules")
+        if name in disabled:
+            return True
+        for rule in rules:
+            if not isinstance(rule, dict):
+                continue
+            if rule.get("serverName") == name:
+                return True
+            command = rule.get("serverCommand")
+            # Claude expands both sides. Settings can set values outside
+            # Sai's environment, so treat an expansion as a potential match.
+            if (
+                isinstance(command, list)
+                and len(command) == len(argv)
+                and all(
+                    isinstance(denied, str)
+                    and (denied == actual or "${" in denied or "${" in actual)
+                    for denied, actual in zip(command, argv, strict=True)
+                )
+            ):
+                return True
+    return False
 
 
 def entry_registration(
@@ -498,6 +571,75 @@ class Claude(Client):
     def config_path(self) -> Path:
         configured = self.environ.get("CLAUDE_CONFIG_DIR")
         return (Path(configured) if configured else self.home) / ".claude.json"
+
+    def deny_settings_paths(self, scope: str, cwd: Path | None) -> list[Path]:
+        config = self.home_dir()
+        paths = [config / "settings.json", config / "remote-settings.json"]
+        projects = {cwd} if cwd is not None else set()
+        if scope == "user":
+            # A shared registration can be denied in another Claude project.
+            known = (load_json(self.config_path()) or {}).get("projects")
+            if isinstance(known, dict):
+                projects.update(
+                    Path(path) for path in known if Path(path).is_absolute()
+                )
+        settings_dirs = set(projects)
+        shared_local = set()
+        for project in projects:
+            # Newer Claude releases can keep settings at the Git root.
+            root = next(
+                (
+                    parent
+                    for parent in (project, *project.parents)
+                    if (parent / ".git").exists()
+                ),
+                None,
+            )
+            if root is not None:
+                settings_dirs.add(root)
+                if (checkout := main_checkout(root)) is not None:
+                    shared_local.add(checkout)
+        paths.extend(
+            project / ".claude" / name
+            for project in settings_dirs
+            for name in ("settings.json", "settings.local.json")
+        )
+        paths.extend(
+            project / ".claude/settings.local.json" for project in shared_local
+        )
+        if sys.platform == "darwin":
+            directories = [Path("/Library/Application Support/ClaudeCode")]
+        elif sys.platform == "win32":
+            directories = [
+                Path(self.environ.get("ProgramFiles", r"C:\Program Files"))
+                / "ClaudeCode"
+            ]
+        else:
+            directories = [Path("/etc/claude-code")]
+            if self.environ.get("WSL_DISTRO_NAME"):
+                directories.append(Path("/mnt/c/Program Files/ClaudeCode"))
+        for directory in directories:
+            paths.extend(managed_claude_files(directory))
+        return paths
+
+    def check_repair_policy(
+        self, scope: str, name: str, argv: list[str], policy_cwd: Path | None
+    ) -> None:
+        try:
+            denied = claude_denied(
+                self.deny_settings_paths(scope, policy_cwd or self.cwd),
+                scope,
+                name,
+                argv,
+            )
+        except (ClientError, OSError, ValueError):
+            raise ClaudeMcpPolicyError(
+                "Could not check Claude Code MCP deny rules"
+            ) from None
+        if denied:
+            raise ClaudeMcpPolicyError(
+                "A Claude Code MCP deny rule matches the existing entry"
+            )
 
     def registrations(self, name: str = NAME) -> list[Registration]:
         # Never `claude mcp get`: it starts the server to check its health.
@@ -1138,7 +1280,7 @@ def repair_path(client: Client, scope: str) -> Path:
 
 
 def replace_registration(
-    client: Client, stale: StaleRegistration, target: Target
+    client: Client, stale: StaleRegistration, target: Target, policy_cwd: Path | None
 ) -> None:
     """Repair the existing entry without changing its name or client policy."""
     scope, name = stale.registration.scope, stale.name
@@ -1156,6 +1298,8 @@ def replace_registration(
     path = repair_path(client, scope)
     config = read_client_config(client, scope, path)
     entry = repair_entry(config.entries, stale)
+    if isinstance(client, Claude):
+        client.check_repair_policy(scope, name, stale.registration.argv, policy_cwd)
     entry["command"], entry["args"] = launcher, stale.args
     # Publish a complete entry in one rename. In particular, Claude must
     # never observe a replacement that is missing its profile or endpoints.
@@ -1166,7 +1310,12 @@ def replace_registration(
 
 
 def check_registration(
-    client: Client, target: Target | None, *, fix: bool, compare_profile: bool
+    client: Client,
+    target: Target | None,
+    *,
+    fix: bool,
+    compare_profile: bool,
+    policy_cwd: Path | None,
 ) -> RegistrationCheck:
     """Inspect recognized Sai registrations without exposing client data."""
     name = client.name
@@ -1204,7 +1353,7 @@ def check_registration(
         and Path(reg.argv[0]).resolve() != Path(target.argv[0]).resolve()
         for reg, issue in inspected
     )
-    changes, failures = [], []
+    changes, failures, blocked = [], [], []
     for issue in stale:
         scope = issue.registration.scope
         if issue.args is None or scope in client.read_only_scopes:
@@ -1217,7 +1366,9 @@ def check_registration(
             failures.append((issue.reason, "Run `sai doctor` with fixes enabled"))
         else:
             try:
-                replace_registration(client, issue, target)
+                replace_registration(client, issue, target, policy_cwd)
+            except ClaudeMcpPolicyError as exc:
+                blocked.append(f"Skipped {scope} repair. {exc}")
             except (ClientError, OSError, ValueError, TOMLKitError, TypeError):
                 failures.append(
                     (
@@ -1251,13 +1402,21 @@ def check_registration(
             )
     if failures:
         summary, hint = failures[0]
+        if blocked:
+            summary += ". " + ". ".join(blocked)
         if legacy_name:
             summary += f". {legacy_warning}"
         return RegistrationCheck(
-            name, "fail", summary, hint, tuple(changes), legacy_name=legacy_name
+            name,
+            "fail",
+            summary,
+            hint,
+            tuple(changes),
+            legacy_name=legacy_name,
+            policy_blocked=bool(blocked),
         )
-    if pinned or different_profile or legacy_name:
-        warnings = []
+    if pinned or different_profile or legacy_name or blocked:
+        warnings = blocked
         if pinned:
             warnings.append("Sai uses a pinned launcher from a different install")
         if different_profile:
@@ -1272,6 +1431,7 @@ def check_registration(
             changes=tuple(changes),
             pinned=pinned,
             legacy_name=legacy_name,
+            policy_blocked=bool(blocked),
         )
     if not changes:
         return RegistrationCheck(name, "pass", "Sai registration is current")
@@ -1281,12 +1441,23 @@ def check_registration(
 
 
 def check_registrations(
-    target: Target | None, *, fix: bool, cwd: Path | None, compare_profile: bool = False
+    target: Target | None,
+    *,
+    fix: bool,
+    cwd: Path | None,
+    compare_profile: bool = False,
+    policy_cwd: Path | None = None,
 ) -> list[RegistrationCheck]:
     """Report only for detected clients, without running any registered server."""
     clients = make_clients(Path.home(), os.environ, cwd)
     return [
-        check_registration(client, target, fix=fix, compare_profile=compare_profile)
+        check_registration(
+            client,
+            target,
+            fix=fix,
+            compare_profile=compare_profile,
+            policy_cwd=policy_cwd,
+        )
         for client in clients.values()
         if client.detected()[0]
     ]
