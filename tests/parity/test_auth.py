@@ -432,6 +432,7 @@ def interrupt_prompt(
     *,
     raw_mode: bool = False,
     before_interrupt: Callable[[int], None] | None = None,
+    directed_signal: signal.Signals = signal.SIGINT,
 ) -> tuple[int, str, str]:
     master, slave = pty.openpty()
     if raw_mode:
@@ -464,7 +465,7 @@ def interrupt_prompt(
         if terminal_ctrl_c:
             os.write(master, b"\x03")
         else:
-            proc.send_signal(signal.SIGINT)
+            proc.send_signal(directed_signal)
         stdout, _ = proc.communicate(timeout=3)
         assert termios.tcgetattr(master) == original
         assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags
@@ -510,6 +511,23 @@ def test_import_ctrl_c_restores_an_inherited_raw_terminal(
     assert code == 1
     assert stdout == ""
     assert stderr.endswith("\nAborted!\n")
+
+
+@pytest.mark.parametrize("raw_mode", [False, True])
+def test_terminating_import_prompt_restores_the_terminal(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI], raw_mode: bool
+) -> None:
+    _, rust = homes(tmp_path, cli_pair)
+    code, stdout, _ = interrupt_prompt(
+        rust,
+        ("auth", "import"),
+        terminal_ctrl_c=False,
+        raw_mode=raw_mode,
+        directed_signal=signal.SIGTERM,
+    )
+    assert code == -signal.SIGTERM
+    assert stdout == ""
+    assert not session_state(rust)["sessions"]
 
 
 @pytest.mark.parametrize("json_output", [False, True])

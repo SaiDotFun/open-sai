@@ -256,6 +256,33 @@ async fn import(
     env: &Environment,
     json: bool,
 ) -> Result<(), SaiError> {
+    let mut terminate = signal(SignalKind::terminate()).map_err(|_| SaiError::internal())?;
+    let result = tokio::select! {
+        biased;
+        _ = terminate.recv() => None,
+        result = import_with_interrupt(storage, flags, env, json) => Some(result),
+    };
+    // The import future has been dropped, restoring the terminal if it was in use.
+    result.unwrap_or_else(|| terminate_import())
+}
+
+fn terminate_import() -> ! {
+    // SAFETY: Restore the default disposition for SIGTERM before raising it
+    // in this process. Tokio's handler would otherwise consume it again.
+    unsafe {
+        if libc::signal(libc::SIGTERM, libc::SIG_DFL) != libc::SIG_ERR {
+            libc::raise(libc::SIGTERM);
+        }
+    }
+    std::process::exit(128 + libc::SIGTERM);
+}
+
+async fn import_with_interrupt(
+    storage: &Storage<'_>,
+    flags: &Flags,
+    env: &Environment,
+    json: bool,
+) -> Result<(), SaiError> {
     let mut interrupt = signal(SignalKind::interrupt()).map_err(|_| SaiError::internal())?;
     let (token, summary) = tokio::select! {
         biased;
