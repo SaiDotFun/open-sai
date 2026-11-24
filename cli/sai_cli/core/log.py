@@ -197,7 +197,16 @@ def _off(raw: str | None) -> bool:
     return bool(text) and text not in _TRUE
 
 
-_config_cache: dict[tuple[Any, ...], tuple[bool, int]] = {}
+_ConfigStat = tuple[int, int, int, int, int]
+_config_cache: dict[tuple[Any, ...], tuple[float, tuple[bool, int]]] = {}
+
+
+def _config_stat(path: Path) -> _ConfigStat | None:
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns, info.st_size)
 
 
 def invalidate_config() -> None:
@@ -216,27 +225,22 @@ def resolve_config(
     Each key resolves on its own, environment first. With logging turned
     off, `logs.keep_days` is not validated. Otherwise any logs value that is
     invalid, or a config file that cannot be read or parsed, turns logging
-    off. The answer is cached until the file or the values change.
+    off. The answer is cached by file metadata and environment values.
     """
     from . import settings
 
     path = root / settings.FILE_NAME
     try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        text = ""
-    except (OSError, UnicodeError):
+        signature = _config_stat(path)
+    except OSError:
         return (False, DEFAULT_KEEP_DAYS)
-    # An external edit can leave the file's size and timestamps unchanged.
-    key = (
-        str(path),
-        hashlib.sha256(text.encode("utf-8")).digest(),
-        raw_enabled,
-        raw_keep,
-    )
+    key = (str(path), signature, raw_enabled, raw_keep)
+    checked_at = time.monotonic()
     cached = _config_cache.get(key)
-    if cached is not None:
-        return cached
+    # Expire unchanged entries too, for filesystems with coarse timestamps
+    # and Windows versions that report creation time as ctime.
+    if cached is not None and checked_at - cached[0] < RECHECK_SECONDS:
+        return cached[1]
 
     def pick(name: str, raw: str | None, file: Mapping[str, Any]) -> Any:
         if raw is not None and raw.strip():
@@ -248,7 +252,7 @@ def resolve_config(
 
     value = (False, DEFAULT_KEEP_DAYS)
     try:
-        file, _warnings = settings.parse_file(text, path)
+        file, _warnings = settings.read_file(path)
         if pick("logs.enabled", raw_enabled, file) is True:
             # Only now does the other value matter.
             value = (True, int(pick("logs.keep_days", raw_keep, file)))
@@ -256,7 +260,7 @@ def resolve_config(
         value = (False, DEFAULT_KEEP_DAYS)
     if len(_config_cache) > 64:
         _config_cache.clear()
-    _config_cache[key] = value
+    _config_cache[key] = (checked_at, value)
     return value
 
 

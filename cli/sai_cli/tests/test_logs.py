@@ -1133,21 +1133,68 @@ def test_disabled_in_the_config_file_writes_nothing(home, keeper_stub):
     assert events(home, "something")
 
 
-def test_log_config_refreshes_after_a_same_size_rewrite(home):
-    path = home / "config.toml"
-    path.write_text("[logs]\nenabled = true \n")
+def rewrite_with_same_mtime(path: Path, replacement: str) -> None:
     before = path.stat()
-    assert log.resolve_config(home, None, None)[0] is True
-
-    path.write_text("[logs]\nenabled = false\n")
-    os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
-    after = path.stat()
+    path.write_text(replacement)
+    deadline = time.monotonic() + 3
+    while True:
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = path.stat()
+        if after.st_ctime_ns != before.st_ctime_ns:
+            break
+        if time.monotonic() >= deadline:
+            pytest.fail("Filesystem did not update ctime after the rewrite")
+        time.sleep(0.01)
     assert (after.st_ino, after.st_size, after.st_mtime_ns) == (
         before.st_ino,
         before.st_size,
         before.st_mtime_ns,
     )
+
+
+@posix_only
+def test_log_config_refreshes_after_a_same_size_rewrite(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true \n")
+    assert log.resolve_config(home, None, None)[0] is True
+    rewrite_with_same_mtime(path, "[logs]\nenabled = false\n")
     assert log.resolve_config(home, None, None)[0] is False
+
+
+def test_log_writer_reads_unchanged_config_once(home):
+    path = home / "config.toml"
+    path.write_text("[logs]\nenabled = true\n")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """\
+import sys
+from sai_cli.core import log
+
+reads = 0
+
+def count_config_reads(event, args):
+    global reads
+    if event == "open" and args[0] == sys.argv[1]:
+        reads += 1
+
+sys.addaudithook(count_config_reads)
+for index in range(20):
+    log.event("test.config", index=index)
+assert log.flush(10)
+print(reads)
+""",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "SAI_LOG": "1", "SAI_LOG_KEEP_DAYS": "14"},
+    )
+    assert len(events(home, "test.config")) == 20
+    assert int(result.stdout) == 1
 
 
 def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):
