@@ -56,6 +56,8 @@ class Position:
     lcd_chain_id: str | None = None
     lcd_chain_ids: deque[str] = field(default_factory=deque)
     collateral: int = 4_000_000
+    available_balance: int = 10_000_000
+    pinned_balance: int | None = None
     trader: str = TRADER
     contract_owner: str | None = TRADER
     contract_position_unavailable: bool = False
@@ -71,6 +73,8 @@ class Position:
     quoted_max_leverage: int | None = None
     pair_leverage: str | None = "0"
     liquidation_threshold: str = "60"
+    quoted_liquidation_threshold: str | None = None
+    quote_error_height: int | None = None
     block_timestamp: int = 2_000_000_000
     oracle_base_age: int | None = 0
     null_market_price: bool = False
@@ -84,6 +88,7 @@ class Position:
     risk_block: int = 90
     cap: str | None = "5"
     caps_on_position_read: deque[str | None] = field(default_factory=deque)
+    collateral_on_position_read: deque[int | None] = field(default_factory=deque)
     reported_height: int | None = 120
     cache_contract_queries: bool = False
     drop_pinned_height: bool = False
@@ -238,6 +243,10 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 if position.logout_on_position_read:
                     assert storage.delete_session(ADDR) == ADDR
                     position.logout_on_position_read = False
+                if position.collateral_on_position_read:
+                    collateral = position.collateral_on_position_read.popleft()
+                    if collateral is not None:
+                        position.collateral = collateral
                 if position.caps_on_position_read:
                     cap = position.caps_on_position_read.popleft()
                     if cap is not None:
@@ -310,10 +319,49 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     position.reported_height
                 )
                 data = {"liquidation_price": position.liquidation_threshold}
+            elif "quote_trade" in message:
+                assert not position.fill_at_next_oracle_price
+                assert self.headers.get("x-cosmos-block-height") == str(
+                    position.reported_height
+                )
+                quote = message["quote_trade"]
+                leverage = quote["action"]["update_leverage"]["new_leverage"]
+                assert quote == {
+                    "trader": TRADER,
+                    "funds": [],
+                    "action": {
+                        "update_leverage": {
+                            "trade_index": "UserTradeIndex(7)",
+                            "new_leverage": leverage,
+                        }
+                    },
+                }
+                threshold = position.quoted_liquidation_threshold
+                if threshold is not None:
+                    assert leverage == "20"
+                    if Decimal(str(position.price)) <= Decimal(threshold):
+                        self.reply(
+                            {
+                                "code": 2,
+                                "message": f"Generic error: liquidation price reached. "
+                                f"Liq price {threshold}, current price 1: query wasm contract failed",
+                            },
+                            status=500,
+                            bare_height=position.quote_error_height,
+                        )
+                        return
+                data = {"data": None, "attributes": [], "events": [], "messages": []}
             elif "get_exchange_balance" in message:
+                balance = message["get_exchange_balance"]
+                assert keeper.same_account(TRADER, balance["user"])
+                assert balance["collateral_index"] == "TokenIndex(1)"
+                pinned = self.headers.get("x-cosmos-block-height") is not None
+                available = position.available_balance
+                if pinned and position.pinned_balance is not None:
+                    available = position.pinned_balance
                 data = {
                     "collateral_index": "TokenIndex(1)",
-                    "available_to_trade": "10000000",
+                    "available_to_trade": str(available),
                 }
             elif "is_after_hours_market" in message:
                 assert message["is_after_hours_market"] == {
@@ -395,7 +443,12 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.reply({"data": data}, height)
 
         def reply(
-            self, value: dict[str, Any], height: int | None = None, *, status: int = 200
+            self,
+            value: dict[str, Any],
+            height: int | None = None,
+            *,
+            status: int = 200,
+            bare_height: int | None = None,
         ) -> None:
             requested_height = self.headers.get("x-cosmos-block-height")
             if requested_height is not None and height is not None:
@@ -406,6 +459,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
             self.send_header("Content-Length", str(len(data)))
             if height is not None:
                 self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
+            if bare_height is not None:
+                self.send_header("x-cosmos-block-height", str(bare_height))
             self.end_headers()
             self.wfile.write(data)
 
@@ -556,6 +611,7 @@ def test_mcp_contract_outage_returns_unverified_preview(position_service, action
             position.contract_position_unavailable = False
             position.preview_inputs = True
             position.keeper_market_open = False
+            position.null_market_price = True
             verified = await call(client, f"preview_{action}", args)
             assert verified["intent"] == preview["intent"]
             assert len(verified["previewDigest"]) == 64
@@ -984,6 +1040,7 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
         async with connected_client(base_url) as client:
             preview = await call(client, f"preview_{tool}", args)
             assert preview["quote"]["afterHoursLeverageCap"] == "5"
+            position.cap_query_heights.clear()
             # Both rebuilt quotes see 5x. The cap changes as the final
             # contract position read starts, with the stored trade intact.
             position.caps_on_position_read.extend([None, None, "4"])
@@ -994,13 +1051,15 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
             )
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
-            assert position.cap_query_heights == [
-                None,
+            expected_heights = [
                 None,
                 None,
                 "121" if reported_height is not None else None,
                 None,
             ]
+            if tool == "margin" and reported_height is not None:
+                expected_heights.append("121")
+            assert position.cap_query_heights == expected_heights
             fresh = result["preview"]
             assert fresh["previewDigest"] != preview["previewDigest"]
             assert (
@@ -2092,13 +2151,14 @@ def test_preview_uses_perp_group_and_pair_leverage_limits(
     asyncio.run(scenario())
 
 
-def test_stale_prices_are_unavailable_for_queued_closes(position_service):
+@pytest.mark.parametrize(("price", "age"), [("95", 900), ("95", 100), ("99", 100)])
+def test_queued_closes_defer_settlement_to_the_next_tick(position_service, price, age):
     position, base_url = position_service
     position.preview_inputs = True
     position.leverage = "20"
-    position.price = "95"
+    position.price = price
     position.liquidation_threshold = "96"
-    position.oracle_base_age = 900
+    position.oracle_base_age = age
     position.fill_at_next_oracle_price = True
 
     async def scenario():
@@ -2112,40 +2172,61 @@ def test_stale_prices_are_unavailable_for_queued_closes(position_service):
                 assert result["execution"]["status"] == "unavailable"
                 assert "fresh oracle update" in result["execution"]["reason"]
                 assert result["fees"]["status"] == "unavailable"
+                assert result["liquidationPrice"]["status"] == "unavailable"
 
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize("order_type", ["limit", "stop"])
-def test_pending_open_estimates_follow_perp_market_state(position_service, order_type):
+@pytest.mark.parametrize("order_type", ["market", "limit", "stop"])
+def test_open_previews_follow_perp_market_state(position_service, order_type):
     position, base_url = position_service
     position.preview_inputs = True
-    position.keeper_market_open = False
-    position.market_trading_state = "closed"
+    position.keeper_market_open = order_type == "market"
+    position.market_trading_state = "open" if order_type == "market" else "closed"
     args = {
         "market_id": 0,
         "side": "long",
         "order_type": order_type,
-        "price": "100",
         "amount": "10",
         "leverage": "2",
         "slippage": "1",
     }
+    if order_type != "market":
+        args["price"] = "100"
 
     async def scenario():
         async with connected_client(base_url) as client:
             quote = await call(client, "preview_open", args)
             assert quote["estimates"]["fees"]["status"] == "estimate"
             assert quote["estimates"]["worstCaseFill"]["status"] == "bound"
-            position.keeper_market_open = True
             position.market_trading_state = "close_only"
-            quote = await call(client, "preview_open", args)
-            for field in ("fees", "liquidationPrice", "worstCaseFill"):
-                item = quote["estimates"][field]
-                assert item["status"] == "unavailable"
-                assert "close-only" in item["reason"]
+            for indexed_open in (True, False):
+                position.keeper_market_open = indexed_open
+                quote = await call(client, "preview_open", args)
+                assert_rejected_preview(quote, "MarketClosed", "close-only")
+
+            if order_type == "market":
+                position.market_trading_state = "closed"
+                quote = await call(client, "preview_open", args)
+                assert_rejected_preview(quote, "MarketClosed", "closed market")
+            assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+def assert_rejected_preview(quote: dict[str, Any], code: str, reason: str) -> None:
+    assert "quote" not in quote
+    assert "previewDigest" not in quote
+    estimates = quote["estimates"]
+    execution = estimates["execution"]
+    assert execution["status"] == "would_be_rejected"
+    assert execution["code"] == code
+    assert reason in execution["reason"]
+    for key in ("fees", "liquidationPrice", "worstCaseFill"):
+        assert estimates[key] == {
+            "status": "unavailable",
+            "reason": execution["reason"],
+        }
 
 
 @pytest.mark.parametrize(
@@ -2154,8 +2235,11 @@ def test_pending_open_estimates_follow_perp_market_state(position_service, order
         ("97", False, 100, "LiquidationReached"),
         ("98.4", False, None, "LiquidationReached"),
         ("97", False, 900, "OraclePriceStale"),
+        ("99", False, 301, "OraclePriceStale"),
+        ("99", False, 300, None),
         ("99", False, None, None),
         ("97", True, None, None),
+        ("97", True, 900, None),
     ],
 )
 def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
@@ -2178,10 +2262,12 @@ def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
             estimates = quote["estimates"]
             liq = estimates["liquidationPrice"]
             if code:
-                assert estimates["execution"]["status"] == "would_be_rejected"
-                assert estimates["execution"]["code"] == code
-                assert liq["status"] == "unavailable"
-                assert "price" not in liq
+                reason = (
+                    "stale oracle"
+                    if code == "OraclePriceStale"
+                    else "prospective liquidation threshold"
+                )
+                assert_rejected_preview(quote, code, reason)
             else:
                 assert liq["status"] == "estimate"
                 assert liq["price"] == "98.4"
@@ -2189,5 +2275,305 @@ def test_leverage_preview_checks_prospective_liquidation_at_oracle_price(
                 if queued:
                     assert estimates["execution"]["status"] == "unavailable"
                     assert "fresh oracle update" in estimates["execution"]["reason"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    (
+        "action",
+        "args",
+        "price",
+        "age",
+        "close_only",
+        "code",
+        "reason",
+    ),
+    [
+        (
+            "margin",
+            {"direction": "remove", "amount": "50"},
+            "95",
+            100,
+            False,
+            "LiquidationReached",
+            "prospective liquidation threshold",
+        ),
+        (
+            "leverage",
+            {"leverage": "5"},
+            "99",
+            100,
+            False,
+            "InsufficientDepositBalance",
+            "100.000000 USDC",
+        ),
+        (
+            "margin",
+            {"direction": "add", "amount": "100"},
+            "99",
+            100,
+            False,
+            "InsufficientDepositBalance",
+            "100.000000 USDC",
+        ),
+        (
+            "margin",
+            {"direction": "remove", "amount": "50"},
+            "99",
+            301,
+            False,
+            "OraclePriceStale",
+            "stale oracle",
+        ),
+        (
+            "margin",
+            {"direction": "remove", "amount": "50"},
+            "99",
+            301,
+            True,
+            "MarketClosed",
+            "close-only",
+        ),
+        (
+            "leverage",
+            {"leverage": "5"},
+            "99",
+            301,
+            True,
+            "MarketClosed",
+            "close-only",
+        ),
+    ],
+)
+def test_cli_and_mcp_have_the_same_position_rejection(
+    position_service, action, args, price, age, close_only, code, reason
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.price = price
+    position.available_balance = 100_000_000
+    position.pinned_balance = 0
+    position.oracle_base_age = age
+    if close_only:
+        position.keeper_market_open = False
+        position.market_trading_state = "close_only"
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(client, f"preview_{action}", {"trade_id": 7, **args})
+            assert_rejected_preview(quote, code, reason)
+
+    asyncio.run(scenario())
+    flags = []
+    for name, value in args.items():
+        flags.extend((f"--{name}", value))
+    result = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            f"{base_url}/query",
+            "--lcd-endpoint",
+            base_url,
+            "trade",
+            action,
+            "7",
+            *flags,
+            "--dry-run",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert_rejected_preview(json.loads(result.stdout), code, reason)
+    assert position.submitted == []
+
+
+def test_margin_refuses_position_drift_during_rejection_check(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            request = {"trade_id": 7, "direction": "add", "amount": "1"}
+            quote = await call(client, "preview_margin", request)
+            # Both rebuilt quotes and the position comparison still match.
+            # The rejection check's own position read sees the resized trade.
+            position.collateral_on_position_read.extend([None, None, None, 3_000_000])
+            result = await call(
+                client,
+                "trade_margin",
+                {**request, "preview_digest": quote["previewDigest"]},
+            )
+            assert result["code"] == "PREVIEW_MISMATCH"
+            assert "final preview check" in result["error"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(("target", "required"), [("5", "100"), ("4", "150")])
+def test_leverage_submit_rechecks_balance_after_confirmation(
+    position_service, target, required
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.pinned_balance = 100_000_000
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client, "preview_leverage", {"trade_id": 7, "leverage": "5"}
+            )
+            assert quote["estimates"]["liquidationPrice"]["status"] == "estimate"
+            assert quote["previewDigest"]
+
+            position.pinned_balance = 0
+            refused = await call(
+                client,
+                "trade_leverage",
+                {
+                    "trade_id": 7,
+                    "leverage": target,
+                    "preview_digest": quote["previewDigest"],
+                },
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert_rejected_preview(
+                refused["preview"],
+                "InsufficientDepositBalance",
+                f"{required}.000000 USDC",
+            )
+            assert (
+                refused["error"]
+                == refused["preview"]["estimates"]["execution"]["reason"]
+            )
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("tool", "args"),
+    [
+        ("leverage", {"leverage": "5"}),
+        ("margin", {"direction": "add", "amount": "100"}),
+    ],
+)
+def test_queued_leverage_warns_about_funding_at_fill(position_service, tool, args):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.available_balance = 99_000_000
+    position.fill_at_next_oracle_price = True
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            request = {"trade_id": 7, **args}
+            quote = await call(client, f"preview_{tool}", request)
+            execution = quote["estimates"]["execution"]
+            assert execution["status"] == "unavailable"
+            assert "100.000000 USDC" in execution["warning"]
+            assert "99.000000 USDC" in execution["warning"]
+            assert "Perp checks funding at fill" in execution["warning"]
+            result = await call(
+                client,
+                f"trade_{tool}",
+                {**request, "preview_digest": quote["previewDigest"]},
+            )
+            assert result["status"] == "accepted"
+            assert len(position.submitted) == 1
+            assert position.submitted[0]["body"] == quote["intent"]["body"]
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("price", "queued", "rejected"),
+    [
+        ("90", False, True),
+        ("92.2", False, True),
+        ("93", False, False),
+        ("90", True, False),
+    ],
+)
+def test_leverage_checks_stored_liquidation_before_after_hours_cap(
+    position_service, price, queued, rejected
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    position.cap = "5"
+    position.price = price
+    position.oracle_base_age = 100
+    position.liquidation_threshold = "92.2"
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client,
+                "preview_margin",
+                {"trade_id": 7, "direction": "remove", "amount": "50"},
+            )
+            if rejected:
+                assert_rejected_preview(quote, "LiquidationReached", "stored leverage")
+            else:
+                assert (
+                    "after-hours guard"
+                    in quote["estimates"]["liquidationPrice"]["reason"]
+                )
+                assert quote["previewDigest"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("price", "queued", "rejected", "quote_error_height"),
+    [
+        ("96.10", False, True, None),
+        ("96.20", False, True, 120),
+        ("96.21", False, False, None),
+        ("96.10", True, False, None),
+        ("96.10", False, False, 121),
+    ],
+)
+def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
+    position_service, price, queued, rejected, quote_error_height
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.price = price
+    position.oracle_base_age = 100
+    # The 20x position has $50 of collateral. With $2 of accrued borrowing,
+    # Perp's liquidation threshold moves from $96 to $96.20.
+    position.quoted_liquidation_threshold = "96.20"
+    position.quote_error_height = quote_error_height
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            quote = await call(
+                client,
+                "preview_margin",
+                {"trade_id": 7, "direction": "remove", "amount": "50"},
+            )
+            if rejected:
+                assert_rejected_preview(
+                    quote, "LiquidationReached", "prospective liquidation threshold"
+                )
+            else:
+                assert quote["estimates"]["liquidationPrice"]["price"] == "96"
+                assert quote["previewDigest"]
+            assert position.submitted == []
 
     asyncio.run(scenario())

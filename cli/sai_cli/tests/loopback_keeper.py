@@ -63,6 +63,9 @@ class PositionKeeperHandler(KeeperHandler):
         prefix = "/cosmwasm/wasm/v1/contract/nibi1fixture/smart/"
         assert path.startswith(prefix)
         request = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
+        if "get_trade_raw" not in request:
+            self.send_error(400, "unsupported contract query")
+            return
         trade = request["get_trade_raw"]
         self.reply(
             {

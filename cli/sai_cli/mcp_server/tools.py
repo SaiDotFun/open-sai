@@ -143,20 +143,24 @@ def describe(exc: Exception) -> dict[str, Any]:
         )
     if isinstance(exc, Refused):
         extra = {} if exc.preview is None else {"preview": exc.preview}
-        return error(failure.message, failure.code, **extra, **exc.extra)
+        reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
+        return error(reason or failure.message, failure.code, **extra, **exc.extra)
+    if isinstance(exc, trading.ExecutionRejected):
+        return error(failure.message, failure.code, preview=exc.preview)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
             return error(failure.message, Code.PREVIEW_MISMATCH)
-        if estimates.close_oracle_time_unknown(exc.preview.get("estimates", {})):
-            return error(
-                exc.preview["estimates"]["execution"]["reason"],
-                Code.PREVIEW_MISMATCH,
-                preview=confirmation.with_digest(exc.preview),
-            )
+        values = exc.preview.get("estimates", {})
+        reason = estimates.rejection_reason(values)
+        if estimates.close_oracle_time_unknown(values):
+            reason = values["execution"]["reason"]
         return error(
-            "The position, quote, or route changed during confirmation, so nothing was"
-            " submitted. Show the user the latest preview, get their confirmation"
-            " again, then retry with its previewDigest.",
+            reason
+            or (
+                "The position, quote, or route changed during confirmation, so nothing was"
+                " submitted. Show the user the latest preview, get their confirmation"
+                " again, then retry with its previewDigest."
+            ),
             Code.PREVIEW_MISMATCH,
             preview=confirmation.with_digest(exc.preview),
         )
