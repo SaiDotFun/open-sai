@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cell::Cell,
     env,
     ffi::OsString,
@@ -9,7 +10,15 @@ use std::{
 };
 
 use chrono::Utc;
-use rustyline::{Config, Editor, error::ReadlineError, history::MemHistory};
+use rustyline::{
+    Config, Context, Editor, Helper,
+    completion::Completer,
+    error::ReadlineError,
+    highlight::Highlighter,
+    hint::{Hinter, HistoryHinter},
+    history::MemHistory,
+    validate::Validator,
+};
 use sai_core::{
     errors::{Code, SaiError},
     settings::Flags,
@@ -17,6 +26,30 @@ use sai_core::{
 
 thread_local! {
     static ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[derive(Default)]
+struct HistorySuggestions(HistoryHinter);
+
+impl Helper for HistorySuggestions {}
+impl Validator for HistorySuggestions {}
+
+impl Highlighter for HistorySuggestions {
+    fn highlight_hint<'a>(&self, hint: &'a str) -> Cow<'a, str> {
+        Cow::Owned(format!("\x1b[38;5;240m{hint}\x1b[0m"))
+    }
+}
+
+impl Completer for HistorySuggestions {
+    type Candidate = String;
+}
+
+impl Hinter for HistorySuggestions {
+    type Hint = String;
+
+    fn hint(&self, line: &str, position: usize, context: &Context<'_>) -> Option<String> {
+        self.0.hint(line, position, context)
+    }
 }
 
 pub fn active() -> bool {
@@ -214,7 +247,10 @@ fn open_history(directory: &Path) -> io::Result<File> {
         .open(path)
 }
 
-fn load_history(file: &mut File, editor: &mut Editor<(), MemHistory>) -> Result<(), SaiError> {
+fn load_history(
+    file: &mut File,
+    editor: &mut Editor<HistorySuggestions, MemHistory>,
+) -> Result<(), SaiError> {
     let mut stored = Vec::new();
     file.read_to_end(&mut stored)
         .map_err(|_| SaiError::internal())?;
@@ -255,12 +291,13 @@ pub fn run(
         io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none_or(|value| value.is_empty()),
     );
     let terminal = io::stdin().is_terminal();
-    let mut session: Option<(Editor<(), MemHistory>, File)> = if terminal {
+    let mut session = if terminal {
         let config = Config::builder()
             .max_history_size(usize::MAX)
             .map_err(|_| SaiError::internal())?
             .build();
         let mut editor = Editor::with_config(config).map_err(|_| SaiError::internal())?;
+        editor.set_helper(Some(HistorySuggestions::default()));
         let mut history = open_history(&directory).map_err(|_| SaiError::internal())?;
         load_history(&mut history, &mut editor)?;
         Some((editor, history))

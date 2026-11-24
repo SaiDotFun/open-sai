@@ -743,6 +743,11 @@ def test_repl_keeps_terminal_history_and_recovers_from_interrupt(
                 os.write(master, b"config get keeper.endpoint\r")
                 recv(master, pending, b"https://sai-keeper.nibiru.fi/query")
                 recv(master, pending, "❯".encode())
+                os.write(master, b"config get keeper.end")
+                recv(master, pending, b"point")
+                os.write(master, b"\x1b[C\r")
+                recv(master, pending, b"https://sai-keeper.nibiru.fi/query")
+                recv(master, pending, "❯".encode())
                 os.write(master, b"\x04")
                 assert process.wait(timeout=8) == 0
             finally:
