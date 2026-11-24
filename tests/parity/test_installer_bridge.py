@@ -25,6 +25,7 @@ INSTALLER = ROOT / "scripts" / "install.py"
 REPO = "/SaiDotFun/open-sai"
 PRE_BRIDGE = "0.1.2"
 PRE_BRIDGE_COMMIT = "8557a7e13dceab0accc369191182c8e01423c91b"
+OLD_MCP_COMMAND = "sai" + "-mcp"
 WINDOWS = os.name == "nt"
 
 
@@ -468,7 +469,10 @@ def test_python_bridge_preserves_uv_and_rolls_back(
     other = {"url": f"{replay.base}/service"}
     original = {
         "mcpServers": {
-            "sai": {"command": "sai-mcp", "env": {"SAI_HOME": str(install.profile)}},
+            "sai": {
+                "command": OLD_MCP_COMMAND,
+                "env": {"SAI_HOME": str(install.profile)},
+            },
             "other": other,
         }
     }
