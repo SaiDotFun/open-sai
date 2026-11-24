@@ -518,7 +518,10 @@ def test_python_bridge_rejects_cross_origin_manifest_redirect(
         replay.redirects[manifest] = f"http://127.0.0.1:{other.server_port}/SHA256SUMS"
         result = install.update(replay)
     assert result.returncode == 1
-    assert "redirected outside its download hosts" in result.stderr
+    assert (
+        "redirected outside its download hosts"
+        in json.loads(result.stdout)["error"]["message"]
+    )
     install.pin(wheel_version(python_wheel))
 
 
@@ -549,12 +552,18 @@ def test_windows_keeps_a_runnable_python_launcher(
         script = INSTALLER
     prepare_uv(install, python_wheel, replay, script)
     profile, contents = save_profile(install, replay)
+    launcher = install.launcher.read_bytes()
     version = add_shim(replay, wheel)
     result = install.update(replay)
     assert result.returncode == (1 if pre_bridge else 3), (result.stdout, result.stderr)
-    assert f"sai-cli=={PRE_BRIDGE}" in result.stderr or (
-        pre_bridge and "Native Sai supports Linux and macOS" in result.stderr
+    message = json.loads(result.stdout)["error"]["message"]
+    expected = (
+        "Native Sai supports Linux and macOS"
+        if pre_bridge
+        else f"sai-cli=={PRE_BRIDGE}"
     )
+    assert expected in message
     assert not any(f"/sai-{version}-" in path for path in replay.requests)
     install.pin(PRE_BRIDGE)
+    assert install.launcher.read_bytes() == launcher
     assert profile.read_bytes() == contents
