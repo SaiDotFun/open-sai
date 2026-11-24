@@ -495,13 +495,13 @@ def test_tampered_session_cannot_be_unlocked(env: Env) -> None:
     assert "Cannot unlock session; run `sai auth import`" in result.stderr
 
 
-def typed_data(**overrides) -> dict:
+def typed_data(*, chain_id: int | None = None, **overrides) -> dict:
+    domain: dict[str, str | int] = {"name": "Sai", "version": "1"}
     data: dict[str, Any] = {
         "types": {
             "EIP712Domain": [
                 {"name": "name", "type": "string"},
                 {"name": "version", "type": "string"},
-                {"name": "chainId", "type": "uint256"},
             ],
             "UserTradingSession": [
                 {"name": "account", "type": "address"},
@@ -511,7 +511,7 @@ def typed_data(**overrides) -> dict:
             ],
         },
         "primaryType": "UserTradingSession",
-        "domain": {"name": "Sai", "version": "1", "chainId": 6900},
+        "domain": domain,
         "message": {
             "account": ADDR,
             "challenge": "0x" + NONCE,
@@ -519,6 +519,9 @@ def typed_data(**overrides) -> dict:
             "expiresAt": (datetime.now(UTC) + timedelta(minutes=5)).isoformat(),
         },
     }
+    if chain_id is not None:
+        data["types"]["EIP712Domain"].append({"name": "chainId", "type": "uint256"})
+        domain["chainId"] = chain_id
     for key, value in overrides.items():
         section, _, field = key.partition("__")
         if field:
@@ -598,7 +601,7 @@ def keeper_auth():
                     "nonce": nonce,
                     "evmAddress": state["challenge_addr"] or variables["address"],
                     "expiresAt": expiry,
-                    "chainId": 6900,
+                    "chainId": "6900",
                     "typedData": typed,
                 }
                 state.update(issued=issued, pending=True)
@@ -611,9 +614,13 @@ def keeper_auth():
                 )
                 state["pending"] = False
                 issued = state.get("issued")
-                chain_matches = issued is not None and (
-                    issued["typedData"]["domain"].get("chainId") == issued["chainId"]
-                )
+                chain_matches = False
+                if issued is not None:
+                    domain = issued["typedData"]["domain"]
+                    chain_matches = (
+                        "chainId" not in domain
+                        or str(domain["chainId"]) == issued["chainId"]
+                    )
                 if live and chain_matches and variables == fixture_exchange(state):
                     reply = {
                         "data": {
@@ -688,6 +695,21 @@ def test_keeper_fixture_rejects_a_consumed_challenge(keeper_auth) -> None:
     assert accepted["createUserIntentSession"]["evmAddress"] == ADDR
     with pytest.raises(keeper.KeeperError, match="Keeper rejected the request"):
         keeper.request(endpoint, keeper.SESSION, exchange)
+
+
+def test_keeper_fixture_accepts_challenge_without_signed_chain_id(keeper_auth) -> None:
+    typed = keeper_auth["typed"]
+    typed["domain"].pop("chainId", None)
+    typed["types"]["EIP712Domain"] = [
+        field for field in typed["types"]["EIP712Domain"] if field["name"] != "chainId"
+    ]
+    endpoint = keeper_auth["endpoint"]
+    challenge = keeper.request(endpoint, keeper.CHALLENGE, {"address": ADDR})
+    issued = challenge["createUserIntentAuthChallenge"]
+    assert "chainId" not in issued["typedData"]["domain"]
+    accepted = keeper.request(endpoint, keeper.SESSION, fixture_exchange(keeper_auth))
+    assert accepted["createUserIntentSession"]["evmAddress"] == ADDR
+    assert issued["chainId"] == "6900"
 
 
 def fake_cast(

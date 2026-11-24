@@ -148,7 +148,8 @@ def test_auth_login(
             "/query", "/fixture-path-key/query"
         )
     addr = OTHER if case == "wrong-session-address" else ADDR
-    keeper_auth["typed"] = typed_data(message__account=addr)
+    chain_id = 6900 if case in {"empty-domain", "wrong-typed-chain"} else None
+    keeper_auth["typed"] = typed_data(chain_id=chain_id, message__account=addr)
     if case == "substituted":
         keeper_auth["typed"]["primaryType"] = "Permit"
     if case == "empty-domain":
