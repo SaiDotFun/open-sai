@@ -26,8 +26,8 @@ class QueryHeightMismatch(SaiError, ValueError):
     code = Code.PREVIEW_MISMATCH
 
 
-def _get_json(url: str, timeout: float = 20) -> dict[str, Any]:
-    return _get_json_at_height(url, timeout)[0]
+def _get_json(url: str, timeout: float = 20, *, fresh: bool = False) -> dict[str, Any]:
+    return _get_json_at_height(url, timeout, fresh=fresh)[0]
 
 
 def _get_json_at_height(
@@ -69,12 +69,18 @@ def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
 
 
 def smart_value(
-    lcd: str, contract: str, message: dict[str, Any], *, height: str | None = None
+    lcd: str,
+    contract: str,
+    message: dict[str, Any],
+    *,
+    height: str | None = None,
+    fresh: bool = False,
 ) -> Any:
     """Read a CosmWasm smart query, including scalar and array responses."""
     url = _smart_url(lcd, contract, message)
     if height is None:
-        return _get_json(url).get("data")
+        result = _get_json(url, fresh=True) if fresh else _get_json(url)
+        return result.get("data")
     return _get_json_at_height(url, height=height)[0].get("data")
 
 
@@ -136,13 +142,18 @@ def _same_position(prior: dict[str, Any], latest: dict[str, Any]) -> bool:
 
 
 def position_unchanged(
-    lcd: str, state: PositionSnapshot, trade_id: int, quoted_leverage: dict[str, Any]
+    lcd: str, state: PositionSnapshot, trade_id: int, quoted_inputs: dict[str, Any]
 ) -> bool:
-    """Recheck the position and effective-leverage inputs after quoting."""
+    """Recheck the on-chain quote inputs at the final position's block."""
     latest, height = _latest_position(lcd, state, trade_id)
     if not _same_position(state.raw, latest):
         return False
     _, inputs = leverage_inputs(lcd, state, trade_id, height=height)
+    quoted_leverage = {
+        key: value
+        for key, value in quoted_inputs.items()
+        if key != "collateralPriceUsd"
+    }
     if inputs != quoted_leverage:
         return False
     if height is None:
@@ -150,7 +161,12 @@ def position_unchanged(
             "Cannot confirm the position and leverage at the same block."
             " Retry with an LCD that reports the contract query height."
         )
-    return True
+    if "collateralPriceUsd" not in quoted_inputs:
+        return True
+    return (
+        str(collateral_price(lcd, state, height=height))
+        == quoted_inputs["collateralPriceUsd"]
+    )
 
 
 def snapshot(endpoint: str, lcd: str, addr: str, trade_id: int) -> PositionSnapshot:
@@ -215,6 +231,18 @@ def contract_decimal(value: Any) -> Decimal:
         raise TypeError("Expected a contract decimal string")
     return (
         Decimal(0) if value == "0" else intents.positive(value, "Contract quote input")
+    )
+
+
+def collateral_price(
+    lcd: str, state: PositionSnapshot, *, height: str | None = None
+) -> Decimal:
+    query = {
+        "get_collateral_price": {"collateral_index": state.raw["collateral_index"]}
+    }
+    # A replacement preview must see the new price even after a cached quote.
+    return contract_decimal(
+        smart_value(lcd, state.contract, query, height=height, fresh=True)
     )
 
 

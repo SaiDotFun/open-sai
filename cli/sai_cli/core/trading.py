@@ -209,10 +209,8 @@ def _position_preview(
     if dry_run:
         return preview
 
-    state, leverage_inputs, fresh = build()
-    changed = not margin.position_unchanged(
-        lcd_endpoint, state, trade_id, leverage_inputs
-    )
+    state, inputs, fresh = build()
+    changed = not margin.position_unchanged(lcd_endpoint, state, trade_id, inputs)
     if changed:
         try:
             _, _, fresh = build()
@@ -332,9 +330,10 @@ def partial_close(
         )
         delta = int(payload["body"]["collateral"]["amountUsdc"])
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
+        notional = partial.notional_quote(lcd_endpoint, state, delta, leverage)
         return (
             state,
-            inputs,
+            {**inputs, "collateralPriceUsd": notional["collateralPriceUsd"]},
             {
                 "dryRun": True,
                 "intent": payload,
@@ -343,7 +342,7 @@ def partial_close(
                     "collateralBefore": str(raw["collateral_amount"]),
                     "leverageBefore": str(raw["leverage"]),
                     **inputs,
-                    **partial.notional_quote(lcd_endpoint, state, delta, leverage),
+                    **notional,
                 },
             },
         )

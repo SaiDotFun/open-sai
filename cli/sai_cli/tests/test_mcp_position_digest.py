@@ -43,6 +43,8 @@ class Position:
     drop_pinned_height: bool = False
     cap_query_heights: list[str | None] = field(default_factory=list)
     collateral_price: str | None = "1"
+    prices_on_position_read: deque[str | None] = field(default_factory=deque)
+    price_query_heights: list[str | None] = field(default_factory=list)
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
     )
@@ -113,9 +115,6 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 return
             prefix = "/cosmwasm/wasm/v1/contract/nibi1contract/smart/"
             assert path.startswith(prefix)
-            if position.cache_contract_queries and self.path in cached_replies:
-                self.reply({"data": cached_replies[self.path]})
-                return
             message = json.loads(base64.b64decode(unquote(path[len(prefix) :])))
             if "get_trade_raw" in message:
                 if position.caps_on_position_read:
@@ -124,6 +123,16 @@ def position_service() -> Iterator[tuple[Position, str]]:
                         position.cap = cap
                         if position.reported_height is not None:
                             position.reported_height += 1
+                if position.prices_on_position_read:
+                    price = position.prices_on_position_read.popleft()
+                    if price is not None:
+                        position.collateral_price = price
+                        if position.reported_height is not None:
+                            position.reported_height += 1
+            if position.cache_contract_queries and self.path in cached_replies:
+                self.reply({"data": cached_replies[self.path]})
+                return
+            if "get_trade_raw" in message:
                 data = {
                     "user": TRADER,
                     "user_trade_index": "UserTradeIndex(7)",
@@ -163,6 +172,9 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 assert message == {
                     "get_collateral_price": {"collateral_index": "TokenIndex(1)"}
                 }
+                position.price_query_heights.append(
+                    self.headers.get("x-cosmos-block-height")
+                )
                 data = position.collateral_price
                 if position.oracle_position_updates:
                     update = position.oracle_position_updates.popleft()
@@ -453,6 +465,47 @@ def test_trade_confirms_through_lcd_cache_and_refuses_unverified_heights(
 
             position.drop_pinned_height = False
             accepted = await call(client, f"trade_{tool}", trade)
+            assert accepted["status"] == "accepted", accepted
+            assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+def test_partial_close_rechecks_oracle_at_the_final_position_height(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    position.cache_contract_queries = True
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            assert preview["quote"]["closedNotionalUsd"] == "250"
+            position.prices_on_position_read.extend([None, None, "0.98"])
+            result = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert result.get("code") == "PREVIEW_MISMATCH", result
+            assert position.submitted == []
+            assert position.price_query_heights == [None, None, None, "121", None]
+            fresh = result["preview"]
+            assert fresh["quote"]["collateralPriceUsd"] == "0.98"
+            assert fresh["quote"]["closedNotionalUsd"] == "245"
+            assert fresh["intent"] == preview["intent"]
+            assert fresh["previewDigest"] != preview["previewDigest"]
+            assert fresh == await call(client, "preview_partial_close", args)
+
+            accepted = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
             assert accepted["status"] == "accepted", accepted
             assert len(position.submitted) == 1
 

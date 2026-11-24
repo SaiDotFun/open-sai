@@ -27,15 +27,8 @@ def notional_quote(
     """Quote the requested slice with the Perp after-hours rule and oracle."""
     raw = state.raw
     stored_leverage = Decimal(str(raw["leverage"]))
-    collateral_index = raw["collateral_index"]
     try:
-        price = margin.contract_decimal(
-            margin.smart_value(
-                lcd,
-                state.contract,
-                {"get_collateral_price": {"collateral_index": collateral_index}},
-            )
-        )
+        price = margin.collateral_price(lcd, state)
     except (ValueError, TypeError):
         price = None
 
