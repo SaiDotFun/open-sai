@@ -226,7 +226,7 @@ fn storage_event(events: EventContext<'_>, event: StorageEvent<'_>) {
 }
 
 // Match the spaces Python emits with json.dumps(indent=None).
-struct InlineJson;
+pub(crate) struct InlineJson;
 
 impl Formatter for InlineJson {
     fn begin_array_value<W: Write + ?Sized>(
@@ -253,7 +253,7 @@ impl Formatter for InlineJson {
     }
 }
 
-pub(crate) fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
+fn emit(value: &impl Serialize, json: bool) -> Result<(), SaiError> {
     let mut bytes = Vec::new();
     if json {
         value.serialize(&mut serde_json::Serializer::with_formatter(

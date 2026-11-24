@@ -98,6 +98,19 @@ mode = "text"
 wire = ["tokenPricesUsd"]
 
 [[case]]
+name = "market-prices-raw-numbers"
+args = ["--json","market","prices"]
+server = "read-number-spelling"
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "market-prices-raw-numbers-text"
+args = ["market","prices"]
+mode = "text"
+server = "read-number-spelling"
+wire = ["tokenPricesUsd"]
+
+[[case]]
 name = "market-keeper-error"
 args = ["--json","market","prices"]
 server = "keeper-error"
@@ -265,6 +278,14 @@ name = "watch-balances"
 args = ["--json","watch","balances","{addr}"]
 mode = "jsonl"
 server = "watch"
+expect = 1
+wire = ["ws:init","ws:userBalances"]
+
+[[case]]
+name = "watch-balances-raw-numbers"
+args = ["--json","watch","balances","{addr}"]
+mode = "jsonl"
+server = "watch-number-spelling"
 expect = 1
 wire = ["ws:init","ws:userBalances"]
 

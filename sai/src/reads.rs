@@ -1,3 +1,5 @@
+mod output;
+
 use std::{
     fmt::Write as _,
     io::{self, Write as _},
@@ -16,11 +18,7 @@ use sai_core::{
 };
 use serde_json::{Map, Number, Value, json};
 
-use crate::{
-    Cli, load_settings,
-    local::{ascii_json, emit},
-    usage,
-};
+use crate::{Cli, load_settings, usage};
 
 pub(crate) fn help(command: &str) -> Option<String> {
     let mut names = command.split(' ');
@@ -129,7 +127,7 @@ impl AccountCommand {
                     &Subscription::Balances(addr),
                     || eprintln!("{}", stream::CONNECTED),
                 ))?;
-                return emit(&payload, json);
+                return output::read(&payload, json);
             }
         };
         read(
@@ -156,7 +154,7 @@ fn read(
     // Python exposes Keeper's data object directly, with its original units
     // and nullability. The intent-status projection applies to reconciled rows.
     let data = runtime()?.block_on(keeper.request(query, variables, None, keeper::TIMEOUT))?;
-    emit(&data, json)
+    output::read(&data, json)
 }
 
 #[derive(Subcommand)]
@@ -308,7 +306,7 @@ async fn print_snapshots(connection: &mut Connection) -> Result<Failure, SaiErro
             Ok(payload) => payload,
             Err(failure) => return Ok(failure),
         };
-        writeln!(io::stdout().lock(), "{}", ascii_json(&payload.to_string()))
+        writeln!(io::stdout().lock(), "{}", output::line(&payload)?)
             .map_err(|_| SaiError::internal())?;
     }
 }

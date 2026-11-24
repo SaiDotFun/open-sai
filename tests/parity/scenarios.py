@@ -244,7 +244,7 @@ def loopback(scenario: str) -> Generator[Endpoints]:
 
     class Handler(BaseHTTPRequestHandler):
         def reply(self, value: object, status_code: int = 200) -> None:
-            body = json.dumps(value).encode()
+            body = value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -319,6 +319,17 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                         self.reject(f"Wrong Keeper variables for {name}")
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif (
+                        scenario == "read-number-spelling" and name == "tokenPricesUsd"
+                    ):
+                        self.reply(
+                            b'{"data":{"oracle":{"tokenPricesUsd":['
+                            b'{"priceUsd":0.000001},{"priceUsd":1.2300},'
+                            b'{"priceUsd":0.00001230},{"priceUsd":1e16},'
+                            b'{"priceUsd":-0.00},{"priceUsd":1e400},'
+                            b'{"priceUsd":18446744073709551616123456},'
+                            b'{"priceUsd":"1.2300"}]}}}'
+                        )
                     elif scenario == "read-partial-error":
                         self.reply(
                             {**responses[name], "errors": [{"message": "partial read"}]}
@@ -443,10 +454,14 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                     errors.append("Watch did not reconnect after the two-second delay")
                     return
                 payload = {"data": {"userBalances": [{"amount": str(count)}]}}
-            connection.send(
-                json.dumps({"id": request_id, "type": "next", "payload": payload})
-            )
-            if scenario == "watch":
+            message = json.dumps({"id": request_id, "type": "next", "payload": payload})
+            if scenario == "watch-number-spelling":
+                message = (
+                    f'{{"id":{json.dumps(request_id)},"type":"next",'
+                    '"payload":{"data":{"userBalances":[{"amount":1E-7}]}}}'
+                )
+            connection.send(message)
+            if scenario in {"watch", "watch-number-spelling"}:
                 connection.send(json.dumps({"id": request_id, "type": "complete"}))
             if scenario == "watch-reconnect" and count == 1:
                 disconnected_at = time.monotonic()
