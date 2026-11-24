@@ -97,7 +97,7 @@ def invoke(
     home: Path,
     env: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    result = subprocess.run(
         restricted([*binary, *args]),
         cwd=home,
         env=env,
@@ -108,6 +108,13 @@ def invoke(
         umask=0o022,
         check=False,
     )
+    check_sandbox_exit(result.returncode)
+    return result
+
+
+def check_sandbox_exit(exit_code: int) -> None:
+    if exit_code in {-signal.SIGSYS, 128 + signal.SIGSYS}:
+        raise ValueError("attempted a blocked host socket")
 
 
 def mcp_exchange(
@@ -151,6 +158,9 @@ def mcp_exchange(
                     while True:
                         line = lines.get(timeout=max(0, deadline - time.monotonic()))
                         if line is None:
+                            check_sandbox_exit(
+                                proc.wait(timeout=max(0, deadline - time.monotonic()))
+                            )
                             raise ValueError("MCP server closed stdout before replying")
                         received.append(line)
                         message = json.loads(line)
@@ -165,6 +175,7 @@ def mcp_exchange(
                 ) is not None:
                     received.append(line)
                 code = proc.wait(timeout=max(0, deadline - time.monotonic()))
+                check_sandbox_exit(code)
             except queue.Empty:
                 raise ValueError("MCP exchange timed out") from None
             except (UnicodeError, json.JSONDecodeError):

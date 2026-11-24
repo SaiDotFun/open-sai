@@ -38,6 +38,20 @@ jobs:
       - name: Install dependencies from uv.lock
         run: uv sync --locked --all-groups
 
+      - name: Allow the parity runner to create a loopback namespace
+        run: |
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          unshare -Urn ip link set lo up
+
       - run: uv run pytest
 
       - name: Check parity fixtures against Python

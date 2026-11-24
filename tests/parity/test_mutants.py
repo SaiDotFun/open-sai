@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import socket
 import subprocess
 import sys
 from pathlib import Path
@@ -116,3 +117,26 @@ def test_reference_uses_real_uv_with_home_dependent_shim(tmp_path: Path) -> None
         in fake_only.stderr
     )
     assert "| Command |" not in fake_only.stdout
+
+
+def test_candidate_cannot_connect_to_host_unix_socket(tmp_path: Path) -> None:
+    with socket.socket(socket.AF_UNIX) as host:
+        host.bind(str(tmp_path / "unix-socket.sock"))
+        host.listen()
+        run = run_mutant(tmp_path, "unix-socket", "config-list")
+        host.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            host.accept()
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "candidate attempted a blocked host socket" in run.stdout
+
+
+def test_candidate_cannot_send_to_host_unix_datagram_peer(tmp_path: Path) -> None:
+    with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as host:
+        host.bind(str(tmp_path / "unix-datagram-pair.sock"))
+        run = run_mutant(tmp_path, "unix-datagram-pair", "config-list")
+        host.setblocking(False)
+        with pytest.raises(BlockingIOError):
+            host.recv(64)
+    assert run.returncode == 1, run.stdout + run.stderr
+    assert "candidate attempted a blocked host socket" in run.stdout

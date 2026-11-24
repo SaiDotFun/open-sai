@@ -9,10 +9,11 @@ SAI_PARITY_BIN=/absolute/path/to/sai uv run python tests/parity/parity.py --case
 ```
 
 Run on Linux with user and network namespaces, `unshare` and `setpriv`
-from util-linux, and `ip` from iproute2. The driver brings up loopback in a
+from util-linux, `ip` from iproute2, and `libseccomp.so.2`. The driver brings up loopback in a
 fresh network namespace and launches both CLIs without network administration
 privileges. Unroutable IPv4 or IPv6 attempts fail the case, even if the CLI
-catches the socket error. The driver stops at startup if it cannot establish
+catches the socket error. A seccomp filter also blocks Unix and virtual-machine
+sockets that could reach a host service. The driver stops at startup if it cannot establish
 the isolated network or find a native `uv` executable that runs with a
 temporary home.
 

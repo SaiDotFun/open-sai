@@ -117,6 +117,15 @@ elif MUTATION == "ws-projection":
     stream.PRICE = stream.PRICE.replace(" block_ts", "")  # ty: ignore[invalid-assignment]
 elif MUTATION == "ledger-milliseconds":
     change_reservation_clock()
+elif MUTATION == "unix-socket":
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.connect(str(Path(sys.argv[0]).with_suffix(".sock")))
+elif MUTATION == "unix-datagram-pair":
+    left, right = socket.socketpair(
+        socket.AF_UNIX, socket.SOCK_DGRAM | socket.SOCK_CLOEXEC
+    )
+    with left, right:
+        left.sendto(b"parity mutant", str(Path(sys.argv[0]).with_suffix(".sock")))
 elif MUTATION.startswith("network-"):
     # The namespace prevents these documentation addresses from being routed.
     # Swallow the expected failure to ensure parity notices the attempt.

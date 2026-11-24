@@ -43,6 +43,14 @@ def enter_loopback() -> None:
     if result.returncode:
         raise ValueError("Parity could not enable loopback in its network namespace")
     unroutable_packets()
+    probe = subprocess.run(
+        restricted([sys.executable, "-c", "pass"]),
+        capture_output=True,
+        check=False,
+        timeout=5,
+    )
+    if probe.returncode:
+        raise ValueError("Parity could not install the libseccomp host-socket filter")
 
 
 def restricted(argv: list[str]) -> list[str]:
@@ -53,6 +61,8 @@ def restricted(argv: list[str]) -> list[str]:
         "--no-new-privs",
         "--bounding-set=-all",
         "--",
+        sys.executable,
+        str(Path(__file__).with_name("socket_filter.py")),
         *argv,
     ]
 
