@@ -5,6 +5,8 @@ The root Cargo workspace contains `sai-core/` for shared behavior and
 `cli/sai_cli/` remains the released implementation while Rust gains parity.
 The scaffold exposes `sai --version` and a read-only `sai config list --json`
 that reports the config path and which recognized keys are present.
+The local commands `sai auth status`, `list`, `use`, and `logout`, and
+`sai intent local ADDR`, share Python's session files and intent database.
 
 ## Port Order
 
@@ -50,6 +52,11 @@ through a dedicated JSONL writer so diagnostics stay off MCP stdout.
 Run `just rust-build` for a debug binary and `just rust-test` for workspace
 tests. Rust CI runs formatting, Clippy, and tests. Use homebox for development
 builds and a CI platform matrix to build and exercise release archives.
+
+Run the storage parity tests with `cargo test --locked -p sai --test
+storage_parity -- --include-ignored`. This requires `uv`. Set
+`SAI_PYTHON_REFERENCE` to the absolute path of the pinned Python checkout.
+By default the tests use the Python package in this workspace.
 
 Native archives and compatible shim wheels ship on the existing
 `sai-cli/v*` tags with SHA-256 checksums. Each shim version fetches and
