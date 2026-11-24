@@ -262,6 +262,49 @@ def doctor_checks(checks: Any) -> None:
                 )
 
 
+def overview_clocks(
+    value: Any, normalize: Normalize, fetched: datetime | None = None
+) -> None:
+    """Check age against the matching fetch before normalizing either value."""
+    if isinstance(value, list):
+        for item in value:
+            overview_clocks(item, normalize, fetched)
+        return
+    if not isinstance(value, dict):
+        return
+    if "fetchedAt" in value:
+        stamp = value["fetchedAt"]
+        if stamp is None:
+            fetched = None
+        else:
+            if not timestamp(stamp):
+                raise ValueError("Invalid overview fetch timestamp")
+            fetched = datetime.fromisoformat(stamp)
+            if (
+                normalize.started_at is None
+                or normalize.ended_at is None
+                or not normalize.started_at <= fetched.timestamp() <= normalize.ended_at
+            ):
+                raise ValueError("Overview fetch timestamp is outside the invocation")
+            value["fetchedAt"] = "<fetchedAt>"
+    if "sourceAgeSeconds" in value:
+        source, age = value["sourceAt"], value["sourceAgeSeconds"]
+        if source is None:
+            if age is not None:
+                raise ValueError("Overview reported an age without a source timestamp")
+        else:
+            if not timestamp(source) or type(age) is not float or fetched is None:
+                raise ValueError("Invalid overview source timestamp or age")
+            elapsed = (fetched - datetime.fromisoformat(source)).total_seconds()
+            if not abs(age - elapsed) <= 0.00051:
+                raise ValueError(
+                    "Overview age disagrees with its fetch and source times"
+                )
+            value["sourceAgeSeconds"] = "<sourceAgeSeconds>"
+    for item in value.values():
+        overview_clocks(item, normalize, fetched)
+
+
 def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
     if raw == "":
         return ""
@@ -301,6 +344,8 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         for field in ("message", "hint"):
             if isinstance(error.get(field), str):
                 error[field] = normalize.intent_refs(error[field])
+    if command == "account overview":
+        overview_clocks(value, normalize)
     if command == "doctor" and isinstance(value, dict):
         replace_if(value, "generatedAt", timestamp)
         doctor_checks(value.get("checks"))

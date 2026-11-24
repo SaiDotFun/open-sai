@@ -1,0 +1,157 @@
+"""Replay the account overview's Keeper and height-pinned LCD reads."""
+
+from __future__ import annotations
+
+import base64
+import json
+import re
+from datetime import UTC, datetime, timedelta
+from typing import Any
+from urllib.parse import parse_qs, unquote
+
+from keeper_wire import WireRequest, same_variables
+from sai_cli.core import keeper
+from sai_cli.tests.loopback import fixture
+from sai_cli.tests.test_overview import RISK_BLOCK, populate_trades
+
+ORACLE = "nibi1oraclefixture"
+BLOCKS = "/cosmos/base/tendermint/v1beta1/blocks/"
+SMART = "/cosmwasm/wasm/v1/contract/"
+
+
+class OverviewReplay:
+    def __init__(self, scenario: str, addr: str, contract: str):
+        self.scenario = scenario
+        self.addr = addr
+        self.contract = contract
+        anchor = datetime.now(UTC).replace(microsecond=0) - timedelta(seconds=3)
+        recorded = fixture("mainnet_account_overview.json")
+        self.state: dict[str, Any] = {
+            "riskTime": anchor.isoformat(),
+            "markTime": (anchor - timedelta(seconds=17)).isoformat(),
+            "recorded": recorded,
+            "contractTrades": {},
+            "oracleRates": {},
+            "contractMarkets": {},
+            "http": {},
+        }
+        long, _ = populate_trades(self.state)
+        if scenario == "overview-stale":
+            rate = self.state["oracleRates"][
+                long["perpBorrowing"]["baseToken"]["id"], 0
+            ]
+            rate["rate"]["base_per_quote"] = "45"
+            rate["rate"]["base_last_update_time"] -= 400
+            rate["base"]["price_block_time_ms"] -= 400_000
+        self.balances = recorded["balances"]
+        self.balances["data"]["userBalances"].append(
+            {
+                "usd_value": 12.125,
+                "lastUpdatedBlock": RISK_BLOCK,
+                "token_info": {"type": "sai", "name": "USDC Unsettled on Sai"},
+            }
+        )
+        self.trades = self.state["http"][keeper.OVERVIEW_TRADES]
+        self.orders = self.state["http"][keeper.PENDING_MARKET_ORDERS]
+
+    def keeper(self, name: str, variables: Any) -> dict[str, Any] | None:
+        args = {
+            "overviewTrades": {"trader": self.addr, "limit": 100, "offset": 0},
+            "pendingMarketOrders": {"trader": self.addr, "limit": 100, "offset": 0},
+            "tokenPricesUsd": {},
+            "userIntents": {"user": self.addr},
+        }
+        if name not in args:
+            return None
+        if not same_variables(variables, args[name]):
+            raise ValueError(f"Wrong Keeper variables for {name}")
+        if self.scenario == "overview-partial" and name in {
+            "pendingMarketOrders",
+            "tokenPricesUsd",
+        }:
+            return {"errors": [{"message": "synthetic unavailable section"}]}
+        return {
+            "overviewTrades": self.trades,
+            "pendingMarketOrders": self.orders,
+            "tokenPricesUsd": fixture("mainnet_prices_http.json"),
+            "userIntents": {"data": {"userIntents": []}},
+        }[name]
+
+    def lcd(
+        self, path: str, query_string: str, requested_height: str | None
+    ) -> tuple[WireRequest, dict[str, Any], int | None] | None:
+        if path.startswith(BLOCKS):
+            height = path.removeprefix(BLOCKS)
+            if height != "latest" or requested_height is not None:
+                raise ValueError("Unexpected overview block lookup")
+            self.check_nonce(query_string)
+            return (
+                WireRequest("lcd:latest"),
+                {
+                    "block": {
+                        "header": {
+                            "height": str(RISK_BLOCK),
+                            "chain_id": "cataclysm-1",
+                            "time": self.state["riskTime"],
+                        }
+                    }
+                },
+                None,
+            )
+        if not path.startswith(SMART):
+            return None
+        self.check_nonce(query_string)
+        if requested_height != str(RISK_BLOCK):
+            raise ValueError("Overview smart query was not pinned to the anchor height")
+        contract, encoded = path.removeprefix(SMART).split("/smart/")
+        query = json.loads(base64.b64decode(unquote(encoded), validate=True))
+        [name] = query
+        args = query[name]
+        expected = {
+            "get_base_size_seed_status": {},
+            "live_trades_by_user": {
+                "trader": self.addr,
+                "start_after": None,
+                "limit": 100,
+            },
+            "get_trade": {"trader": self.addr, "index": args.get("index")},
+            "get_market": {"index": args.get("index")},
+            "get_oracle_address": {},
+            "get_exchange_rate_stamped": {
+                "base": args.get("base"),
+                "quote": args.get("quote"),
+            },
+            "get_group": {"index": "GroupIndex(0)"},
+        }
+        if not same_variables(args, expected[name]):
+            raise ValueError(f"Wrong LCD variables for {name}")
+        served = RISK_BLOCK
+        if name == "get_trade" and self.scenario == "overview-wrong-height":
+            served -= 1
+        if name == "get_trade":
+            data = self.state["contractTrades"][args["index"]]
+        elif name == "get_market":
+            data = self.state["contractMarkets"][args["index"]]
+        elif name == "get_exchange_rate_stamped":
+            data = self.state["oracleRates"][args["base"], args["quote"]]
+        else:
+            data = {
+                "get_base_size_seed_status": "complete",
+                "live_trades_by_user": [
+                    {"trade_index": index}
+                    for index in sorted(self.state["contractTrades"])
+                ],
+                "get_oracle_address": ORACLE,
+                "get_group": {"stale_price_expiration_secs": 300},
+            }[name]
+        if contract != (
+            ORACLE if name == "get_exchange_rate_stamped" else self.contract
+        ):
+            raise ValueError("Overview queried the wrong contract")
+        return WireRequest(name, variables=args), {"data": data}, served
+
+    @staticmethod
+    def check_nonce(query: str) -> None:
+        [nonce] = parse_qs(query, strict_parsing=True)["_sai_query"]
+        if not re.fullmatch(r"[a-f0-9]{32}", nonce):
+            raise ValueError("Expected a fresh LCD query nonce")

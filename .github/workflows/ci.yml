@@ -158,6 +158,14 @@ jobs:
           path: .parity-python
           persist-credentials: false
 
+      - name: Check out the Python account overview reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba80525da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: 53ef4fb70f30bd8c340749b131f509d65ab86ed4
+          path: .parity-overview-python
+          persist-credentials: false
+
       - name: Install uv and Python for parity
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -167,6 +175,7 @@ jobs:
       - run: |
           uv sync --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
+          uv sync --project .parity-overview-python --locked --all-groups
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo build --locked --bin sai
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -176,3 +185,21 @@ jobs:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
         run: uv run --locked pytest tests/parity
+
+      - name: Compare account overview in a loopback network namespace
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_OVERVIEW_PYTHON: ${{ github.workspace }}/.parity-overview-python/.venv/bin/sai
+        run: |
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          uv run --locked python tests/parity/parity.py --case 'account-overview-*' --case account-bare

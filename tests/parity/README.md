@@ -116,3 +116,13 @@ within a run. An event with the wrong call ID or an output with a different
 intent key can therefore differ even when both IDs have valid shapes.
 `LOG_VOLATILE_FIELDS` in `compare.py` assigns normalization rules to the
 volatile fields listed in `docs/log-events.json` and to generated intent keys.
+
+## Account Overview Reference
+
+The `account-overview-*` and `account-bare` cases use Python main at
+`53ef4fb70f30bd8c340749b131f509d65ab86ed4` (v0.1.2 plus the LCD
+deadline fix in PR #119). Rust CI installs that reference separately.
+Set `SAI_PARITY_OVERVIEW_PYTHON` to its `sai` executable for local runs.
+The cases validate height-pinned requests and compare section errors,
+source timestamps, risk values, and persisted state. Fetch timestamps and
+ages are checked against the invocation and then normalized.

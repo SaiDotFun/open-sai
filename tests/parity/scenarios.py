@@ -14,6 +14,7 @@ import uuid
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -22,6 +23,7 @@ from urllib.parse import unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
+from overview_scenarios import OverviewReplay
 from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
@@ -78,6 +80,11 @@ class Endpoints:
     interrupt_ready: threading.Event = field(default_factory=threading.Event)
     interrupt_closed: threading.Event = field(default_factory=threading.Event)
     keeper_path: str = "/query"
+    overview_expiry: str = field(
+        default_factory=lambda: (
+            datetime.now(UTC) + timedelta(hours=49, minutes=30)
+        ).isoformat()
+    )
 
     @property
     def keeper(self) -> str:
@@ -146,12 +153,28 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
             sessions[0]["token"] = HISTORY_SESSION_TOKEN
         if seed == "accounts":
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
+    if seed in {"overview-session", "overview-expiry"}:
+        expires_at = (
+            endpoints.overview_expiry
+            if seed == "overview-expiry"
+            else session["expiresAt"]
+        )
+        claim = base64.urlsafe_b64encode(b'{"iat":946684800}').decode()
+        sessions.append(
+            {
+                **session,
+                "token": f"fixture.{claim}.signature",
+                "endpoint": endpoints.keeper,
+                "expiresAt": expires_at,
+                "keyName": "fixture",
+            }
+        )
     subprocess.run(
         [sys.executable, "-c", SEED],
         input=json.dumps(
             {
                 "sessions": sessions,
-                "ledger": seed == "ledger",
+                "ledger": seed in {"ledger", "overview-session"},
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
@@ -177,6 +200,11 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "/query/fixture-path-key?key=fixture-query-key"
         if scenario == "keeper-echo-error"
         else "/query"
+    )
+    overview = (
+        OverviewReplay(scenario, ADDRESS, CONTRACT)
+        if scenario.startswith("overview-")
+        else None
     )
     markets = fixture("mainnet_markets_http.json")
     prices = fixture("mainnet_prices_http.json")
@@ -284,6 +312,8 @@ def loopback(scenario: str) -> Generator[Endpoints]:
         "perpTrades": {"data": {"perpTrades": [position]}},
         "tokenPricesUsd": fixture("mainnet_price_ws_payload.json"),
     }
+    if overview is not None:
+        queue_payloads["userBalancesWithBlock"] = overview.balances
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
     contracts = {
@@ -345,13 +375,18 @@ def loopback(scenario: str) -> Generator[Endpoints]:
 
     class Handler(BaseHTTPRequestHandler):
         def reply(
-            self, value: object, status_code: int = 200, *, lcd: bool = False
+            self,
+            value: object,
+            status_code: int = 200,
+            *,
+            lcd: bool = False,
+            height: int = 120,
         ) -> None:
             body = value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             if lcd:
-                self.send_header("grpc-metadata-x-cosmos-block-height", "120")
+                self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -419,6 +454,18 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 if name == "recordUserIntent" and scenario == "concurrent-close":
                     self.admit_close(request.variables)
                     return
+                if overview is not None:
+                    if self.headers.get("Authorization") is not None:
+                        self.reject("Unexpected authorization on overview read")
+                        return
+                    try:
+                        response = overview.keeper(name, request.variables)
+                    except ValueError as exc:
+                        self.reject(str(exc))
+                        return
+                    if response is not None:
+                        self.reply(response)
+                        return
                 if name in responses:
                     if not same_variables(request.variables, variables.get(name, {})):
                         self.reject(f"Wrong Keeper variables for {name}")
@@ -496,6 +543,27 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                 pass
             self.reject("Unsupported Keeper request")
 
+        def drip_lcd(self) -> None:
+            started = time.monotonic()
+            try:
+                self.send_response(200)
+                self.send_header(
+                    "grpc-metadata-x-cosmos-block-height",
+                    self.headers["x-cosmos-block-height"],
+                )
+                self.end_headers()
+                while time.monotonic() - started < 4:
+                    self.wfile.write(b" ")
+                    time.sleep(0.02)
+                errors.append(
+                    "Overview left a trickling LCD response open after its deadline"
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                if not 1.7 <= time.monotonic() - started < 3:
+                    errors.append(
+                        "Overview disconnected outside the LCD request deadline"
+                    )
+
         def do_GET(self) -> None:
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
@@ -503,6 +571,28 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             path = urlsplit(self.path).path
             if path.startswith(scope):
                 path = path.removeprefix(scope)
+                if overview is not None:
+                    try:
+                        entry = overview.lcd(
+                            path,
+                            urlsplit(self.path).query,
+                            self.headers.get("x-cosmos-block-height"),
+                        )
+                    except (ValueError, KeyError, TypeError) as exc:
+                        self.reject(f"Invalid overview LCD request: {exc}")
+                        return
+                    if entry is not None:
+                        request, response, height = entry
+                        wire.append(request)
+                        if (
+                            scenario == "overview-deadline"
+                            and request.label == "get_trade"
+                            and request.variables["index"] == 0
+                        ):
+                            self.drip_lcd()
+                            return
+                        self.reply(response, lcd=height is not None, height=height or 0)
+                        return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
                     self.reply({"default_node_info": {"network": "cataclysm-1"}})
