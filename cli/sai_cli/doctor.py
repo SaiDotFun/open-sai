@@ -1204,11 +1204,7 @@ def check_lcd(ctx: Context) -> Check:
     url = public_url(ctx.config.lcd_endpoint)
     start = time.monotonic()
     try:
-        node = margin._get_json(
-            f"{ctx.config.lcd_endpoint.rstrip('/')}"
-            "/cosmos/base/tendermint/v1beta1/node_info",
-            timeout=NETWORK_TIMEOUT,
-        )
+        node = margin.node_info(ctx.config.lcd_endpoint, timeout=NETWORK_TIMEOUT)
     except ValueError as exc:
         return Check(
             "lcd",

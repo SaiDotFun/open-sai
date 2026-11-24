@@ -17,6 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from click.testing import CliRunner
@@ -953,6 +954,7 @@ class Stub:
         self.on_intents: Any = None
         self.queries: list[str] = []
         self.paths: list[str] = []
+        self.lcd_paths: list[str] = []
 
 
 @pytest.fixture
@@ -1006,7 +1008,8 @@ def http_stub() -> Iterator[tuple[str, Stub]]:
             self.reply({"data": {"oneClickTrading": route}})
 
         def do_GET(self):
-            assert self.path.endswith("/cosmos/base/tendermint/v1beta1/node_info")
+            state.lcd_paths.append(self.path)
+            assert urlsplit(self.path).path.endswith(margin.NODE_INFO_PATH)
             info = {} if state.network is None else {"network": state.network}
             self.reply({"default_node_info": info})
 
@@ -1066,11 +1069,15 @@ def free_port() -> int:
 
 
 def test_network_checks_pass_against_stubs(http_stub):
-    base, _state = http_stub
+    base, state = http_stub
     ws, stop = ws_stub(ack=True)
     try:
         checks = doctor.run_checks(
-            ctx(f"{base}/query", ws_override=ws, lcd_endpoint=base)
+            ctx(
+                f"{base}/query",
+                ws_override=ws,
+                lcd_endpoint=f"{base}/fixture-lcd-path/?key=fixture-lcd-query",
+            )
         )
     finally:
         stop()
@@ -1090,6 +1097,9 @@ def test_network_checks_pass_against_stubs(http_stub):
     assert by_id["websocket"].status == "pass"
     assert by_id["lcd"].status == "pass"
     assert by_id["lcd"].details["network"] == "cataclysm-1"
+    assert state.lcd_paths == [
+        f"/fixture-lcd-path{margin.NODE_INFO_PATH}?key=fixture-lcd-query"
+    ]
 
 
 def test_lcd_without_a_network_fails(http_stub):

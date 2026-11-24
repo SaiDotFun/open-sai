@@ -17,7 +17,7 @@ from decimal import Decimal
 from secrets import token_hex
 from threading import BoundedSemaphore, Thread
 from typing import Any, Literal
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
 
@@ -27,6 +27,7 @@ from .errors import Code, SaiError
 MAINNET_LCD = "https://lcd.nibiru.fi"
 BLOCK_HEIGHT_HEADER = "x-cosmos-block-height"
 BLOCK_PATH = "/cosmos/base/tendermint/v1beta1/blocks/"
+NODE_INFO_PATH = "/cosmos/base/tendermint/v1beta1/node_info"
 INDEX_RETRY_DELAYS = (0.25, 0.5)
 INDEX_RETRY_BUDGET = 2.0
 INDEX_LAG = (
@@ -109,10 +110,9 @@ async def _resolve_lcd_host(
 
 
 def _get_before_deadline(
-    url: str,
+    url: httpx.URL,
     deadline: float,
     headers: dict[str, str] | None,
-    params: dict[str, str] | None,
 ) -> httpx.Response:
     async def request() -> httpx.Response:
         remaining = deadline - time.monotonic()
@@ -120,7 +120,7 @@ def _get_before_deadline(
             raise TimeoutError("LCD read deadline exceeded")
         async with asyncio.timeout(remaining):
             async with httpx.AsyncClient(timeout=None) as client:
-                return await client.get(url, headers=headers, params=params)
+                return await client.get(url, headers=headers)
 
     with closing(asyncio.new_event_loop()) as loop:
         loop.getaddrinfo = _resolve_lcd_host
@@ -152,11 +152,18 @@ def _get_json_at_height(
         headers = {BLOCK_HEIGHT_HEADER: height} if height is not None else None
         # The mainnet LCD caches by URI and can omit metadata on a hit.
         # Give every confirmation read a fresh URI, including the height anchor.
-        params = {"_sai_query": token_hex(16)} if fresh or height is not None else None
+        request_url = httpx.URL(url)
+        if fresh or height is not None:
+            query = request_url.query
+            separator = b"&" if query else b""
+            nonce = token_hex(16).encode("ascii")
+            request_url = request_url.copy_with(
+                query=query + separator + b"_sai_query=" + nonce
+            )
         if deadline is None:
-            response = httpx.get(url, timeout=timeout, headers=headers, params=params)
+            response = httpx.get(request_url, timeout=timeout, headers=headers)
         else:
-            response = _get_before_deadline(url, deadline, headers, params)
+            response = _get_before_deadline(request_url, deadline, headers)
         response.raise_for_status()
         result = response.json()
         if not isinstance(result, dict):
@@ -189,12 +196,21 @@ def _get_json_at_height(
     return result, query_height
 
 
+def _lcd_url(lcd: str, route: str) -> str:
+    parts = urlsplit(lcd)
+    return urlunsplit(parts._replace(path=parts.path.rstrip("/") + route))
+
+
+def node_info(lcd: str, timeout: float = 20) -> dict[str, Any]:
+    return _get_json(_lcd_url(lcd, NODE_INFO_PATH), timeout)
+
+
 def _smart_url(lcd: str, contract: str, message: dict[str, Any]) -> str:
     encoded = quote(
         base64.b64encode(json.dumps(message, separators=(",", ":")).encode()).decode(),
         safe="",
     )
-    return f"{lcd.rstrip('/')}/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}"
+    return _lcd_url(lcd, f"/cosmwasm/wasm/v1/contract/{contract}/smart/{encoded}")
 
 
 def smart_value(
@@ -215,7 +231,7 @@ def smart_value(
 
 def block_header(lcd: str, height: int | str, *, deadline: float) -> dict[str, Any]:
     result, _ = _get_json_at_height(
-        f"{lcd.rstrip('/')}{BLOCK_PATH}{height}",
+        _lcd_url(lcd, f"{BLOCK_PATH}{height}"),
         fresh=height == "latest",
         deadline=deadline,
     )
@@ -392,9 +408,7 @@ def position_unchanged(
 
 def block_timestamp(lcd: str, height: str) -> int:
     """Read the UTC timestamp of a specific LCD block."""
-    result = _get_json(
-        f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/blocks/{height}"
-    )
+    result = _get_json(_lcd_url(lcd, f"{BLOCK_PATH}{height}"))
     block = result.get("sdk_block") or result.get("block")
     if not isinstance(block, dict):
         raise TypeError("LCD block header is unavailable")
@@ -407,7 +421,7 @@ def block_timestamp(lcd: str, height: str) -> int:
 
 def trading_contract(endpoint: str, lcd: str) -> str:
     route = keeper.request(endpoint, keeper.ROUTE)["oneClickTrading"]
-    node = _get_json(f"{lcd.rstrip('/')}/cosmos/base/tendermint/v1beta1/node_info")
+    node = node_info(lcd)
     info = node.get("default_node_info")
     if (
         not route["enabled"]
