@@ -42,11 +42,16 @@ def test_open_and_partial_close_payload():
     )
     assert payload["body"]["market"] == {"marketIndex": "MarketIndex(3)"}
     trade = {"id": 7, "collateralAmount": 10_000_001, "leverage": 2}
-    result = intents.partial_intent(trade, 50, Decimal(1))
+    result = intents.partial_intent(trade, 50)
     assert result["body"]["collateral"] == {"amountUsdc": "5000000", "amountUsd": "5"}
     assert result["body"]["leverageDelta"] == "0"
-    with pytest.raises(ValueError):
-        intents.partial_intent(trade, 99, Decimal(2))
+
+
+@pytest.mark.parametrize(("amount", "leverage"), [(1, "2"), (3, "0.5")])
+def test_partial_close_rejects_zero_reduction_or_remainder(amount, leverage):
+    trade = {"id": 7, "collateralAmount": amount, "leverage": leverage}
+    with pytest.raises(ValueError, match="Reduction rounds to zero or leaves no open"):
+        intents.partial_intent(trade, 99)
 
 
 def test_tpsl_has_keeper_field_patch():

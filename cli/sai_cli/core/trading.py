@@ -635,32 +635,19 @@ def partial_close(
 ) -> dict[str, Any]:
     """Reduce an open USDC position by a whole percentage.
 
-    The reduction is sized from contract state, checked against the market's
-    minimum position size, and re-checked before submitting.
+    The reduction is sized from contract state and re-checked before submitting.
     """
     addr = get_session()["evmAddress"]
 
     def build_preview() -> PositionPreview:
         state = margin.snapshot(endpoint, lcd_endpoint, addr, trade_id)
         raw = state.raw
-        market_id = state.market["marketId"]
-        markets = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
-        candidates = [
-            item
-            for item in markets
-            if item["marketId"] == market_id
-            and item["collateralToken"]["symbol"] == "USDC"
-        ]
-        if len(candidates) != 1 or not candidates[0]["isOpen"]:
-            raise ValueError("Open market data not available")
         position = {
             "id": trade_id,
             "collateralAmount": raw["collateral_amount"],
             "leverage": raw["leverage"],
         }
-        payload = intents.partial_intent(
-            position, percent, Decimal(str(candidates[0]["minPositionSizeUSD"]))
-        )
+        payload = intents.partial_intent(position, percent)
         delta = int(payload["body"]["collateral"]["amountUsdc"])
         leverage, inputs = margin.leverage_inputs(lcd_endpoint, state, trade_id)
         notional = partial.notional_quote(lcd_endpoint, state, delta, leverage)
