@@ -536,3 +536,29 @@ fn repeating_the_key_reports_only_the_extra_operand() {
         "Got unexpected extra argument (logs.enabled)"
     );
 }
+
+#[test]
+fn usage_errors_keep_json_at_every_supported_option_position() {
+    let home = tempdir().unwrap();
+    for args in [
+        ["--json", "intent", "status"],
+        ["intent", "--json", "status"],
+        ["intent", "status", "--json"],
+        ["auth", "--json", "use"],
+        ["auth", "use", "--json"],
+    ] {
+        let output = sai(home.path()).args(args).output().unwrap();
+        assert_eq!(output.status.code(), Some(2));
+        assert!(output.stderr.is_empty());
+        let body: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(body["error"]["code"], "INVALID_REQUEST");
+        assert_eq!(body["error"]["message"], "Missing argument 'ADDR'.");
+    }
+    let output = sai(home.path())
+        .args(["intent", "status", "--", "--json", "extra"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}

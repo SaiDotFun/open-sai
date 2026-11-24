@@ -75,12 +75,7 @@ fn main() -> process::ExitCode {
     let (command, operands) = command_path(&argv);
     let environment = Environment::from_process();
     let home = environment.as_ref().ok().map(|env| env.home.as_path());
-    let requested_json = json_requested(&argv)
-        || (matches!(command.split(' ').next(), Some("auth" | "intent"))
-            && operands
-                .iter()
-                .take_while(|arg| *arg != "--")
-                .any(|arg| arg == "--json"));
+    let requested_json = json_requested(&argv);
     let started = Instant::now();
     let writer = if command == "logs"
         || argv
@@ -165,6 +160,11 @@ fn json_requested(args: &[String]) -> bool {
                 args.next();
             }
             "--" => break,
+            "auth" | "intent" => {
+                return args
+                    .take_while(|arg| *arg != "--")
+                    .any(|arg| arg == "--json");
+            }
             arg if !arg.starts_with('-') => break,
             _ => {}
         }
