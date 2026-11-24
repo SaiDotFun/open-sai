@@ -268,8 +268,12 @@ def loopback(scenario: str) -> Generator[Endpoints]:
             "data": {"perp": {"tradeHistory": True}, "extra": 1}
         }
 
+    responses["intentTradeHistory"] = responses["tradeHistory"]
+    responses["waitUserIntents"] = responses["userIntents"]
     variables = {
         "tradeHistory": {"trader": ADDRESS},
+        "intentTradeHistory": {"trader": ADDRESS, "limit": 25, "offset": 0},
+        "waitUserIntents": {"user": ADDRESS, "key": INTENT, "includeAction": True},
         "trades": {"trader": ADDRESS},
         "trade": {"trader": ADDRESS, "id": 7},
         "borrowing": {"market": borrowing["marketId"], "collateral": collateral["id"]},

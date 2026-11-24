@@ -17,13 +17,14 @@ import copy
 import hashlib
 import json
 import logging
+import sqlite3
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, localcontext
 from typing import Any
 
-from ..core import intents, keeper, overview, reconcile, storage, stream, trading
+from ..core import intents, keeper, overview, reconcile, storage, stream, trading, wait
 from ..core import log as sai_log
 from ..core import preview as estimates
 from ..core import session as sessions
@@ -412,6 +413,39 @@ def intent_status(
     account = resolve_addr(settings, addr)
     data = reconcile.reconcile(settings.endpoint, account["addr"], key)
     return {**account, **reconcile.status_report(data)}
+
+
+async def intent_wait(
+    settings: Settings, key: str, addr: str | None, timeout: float, started: float
+) -> dict[str, Any]:
+    timeout = min(wait.validate_timeout(timeout), wait.MCP_MAX_TIMEOUT)
+    try:
+        with storage.busy_timeout(0):
+            local = (
+                storage.intent_record(settings.endpoint, key) if addr is None else None
+            )
+        account = (
+            {"addr": local[0], "addrSource": "ledger"}
+            if local
+            else resolve_addr(settings, addr)
+        )
+        result = await wait.for_intent_async(
+            settings.endpoint,
+            account["addr"],
+            key,
+            timeout=timeout,
+            started=started,
+        )
+    except sqlite3.OperationalError as exc:
+        if not wait.ledger_busy(exc):
+            raise
+        account = {}
+        result = wait.unknown_result(key, addr)
+    if result["outcome"] == "unknown":
+        result["hint"] = (
+            "Call intent_wait again with the same key and address. Do not resubmit."
+        )
+    return {**account, **result}
 
 
 # Preview binding

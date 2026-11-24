@@ -54,7 +54,23 @@ query($trader:String!, $limit:Int!, $offset:Int!) {
 POSITION = """query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }"""
 ROUTE = """query { oneClickTrading { enabled chainId contractAddress } }"""
 HISTORY = """query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }"""
+INTENT_HISTORY = """query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
+                 limit:$limit, offset:$offset) {
+      id intentKey tradeChangeType txHash evmTxHash block { block block_ts }
+      marketOrder { orderReqBlock orderReqTxHash orderExecBlock sequence execPrice collateralAmount }
+      openingFeeUsd closingFeeUsd borrowingFeeUsd
+      trade {
+        id trader tradeType isOpen isLong collateralAmount openCollateralAmount
+        leverage openPrice closePrice tp sl openBlock { block } closeBlock { block }
+        perpBorrowing { marketId collateralToken { symbol } }
+      }
+    }
+  }
+}"""
 INTENTS = """query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
+WAIT_INTENTS = """query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }"""
 CHALLENGE = """mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }"""
 SESSION = """mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }"""
 SUBMIT = """mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }"""
@@ -306,7 +322,9 @@ OPERATIONS = {
     POSITION: "position",
     ROUTE: "route",
     HISTORY: "history",
+    INTENT_HISTORY: "history",
     INTENTS: "intents",
+    WAIT_INTENTS: "intents",
     CHALLENGE: "challenge",
     SESSION: "session",
     SUBMIT: "submit",
@@ -445,7 +463,9 @@ def _log_request(
             None,
         )
         intent_key = (
-            (variables or {}).get("key") if query == INTENTS and trace_intent else None
+            (variables or {}).get("key")
+            if query in (INTENTS, WAIT_INTENTS) and trace_intent
+            else None
         )
         log.event(
             "keeper.request",
@@ -498,6 +518,42 @@ def _request(
         raise NotSent("Could not connect to Keeper; the request was not sent") from exc
     except (httpx.HTTPError, ValueError) as exc:
         raise KeeperError("Keeper request failed or returned invalid JSON") from exc
+    return _response_data(query, result, outcome)
+
+
+async def read_async(
+    client: httpx.AsyncClient,
+    endpoint: str,
+    query: str,
+    variables: dict[str, Any],
+) -> dict[str, Any]:
+    """Read Keeper without a worker thread or an authentication token."""
+    started = time.monotonic()
+    outcome: dict[str, Any] = {"status": "error", "code": Code.KEEPER_ERROR}
+    try:
+        check_url(endpoint, "Keeper")
+        response = await client.post(
+            endpoint, json={"query": query, "variables": variables}
+        )
+        outcome["httpStatus"] = response.status_code
+        response.raise_for_status()
+        data = _response_data(query, response.json(), outcome)
+        outcome["status"] = "ok"
+        del outcome["code"]
+        return data
+    except (httpx.HTTPError, ValueError) as exc:
+        outcome["error"] = "Keeper request failed or returned invalid JSON"
+        raise KeeperError(outcome["error"]) from exc
+    except KeeperError as exc:
+        outcome["error"] = str(exc)
+        raise
+    finally:
+        _log_request(
+            endpoint, query, variables, None, started, outcome, trace_intent=True
+        )
+
+
+def _response_data(query: str, result: Any, outcome: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise KeeperError("Keeper returned an invalid response")
     if result.get("errors"):
