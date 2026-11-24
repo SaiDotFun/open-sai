@@ -89,11 +89,17 @@ def liquidation(
         }
 
 
-def minimum_fee_usd(schedule: dict[str, Any]) -> int:
-    """Floor Perp's USD minimum fee to base units."""
-    minimum = int(schedule["min_position_size_usd"])
+def minimum_position_size_usd_base_units(value: int | str) -> int:
+    """Keeper and Perp both report the market minimum in millionths of a dollar."""
+    minimum = int(value)
     if minimum < 0:
         raise ValueError("Invalid minimum position size")
+    return minimum
+
+
+def minimum_fee_usd(schedule: dict[str, Any]) -> int:
+    """Floor Perp's USD minimum fee to base units."""
+    minimum = minimum_position_size_usd_base_units(schedule["min_position_size_usd"])
     opening = margin.contract_decimal(schedule["open_fee_p"])
     trigger = margin.contract_decimal(schedule["trigger_order_fee_p"])
     return int(minimum * (2 * opening + trigger))

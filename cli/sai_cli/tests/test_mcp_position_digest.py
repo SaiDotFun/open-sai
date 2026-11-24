@@ -62,6 +62,7 @@ class Position:
     collateral_price: str | None = "1"
     close_fee: str = "0.002"
     minimum_position_microusd: str = "1"
+    keeper_minimum_position_microusd: int = 1
     preview_inputs: bool = False
     malformed_node_info: bool = False
     price: float | str = 100.5
@@ -82,7 +83,6 @@ def position_service() -> Iterator[tuple[Position, str]]:
         "isOpen": True,
         "minLeverage": 1,
         "maxLeverage": 100,
-        "minPositionSizeUSD": 1,
         "collateralToken": {"id": 1, "symbol": "USDC"},
     }
 
@@ -105,10 +105,13 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     }
                 }
             else:
-                market_row = market
+                market_row = {
+                    **market,
+                    "minPositionSizeUSD": position.keeper_minimum_position_microusd,
+                }
                 if position.preview_inputs:
                     market_row = {
-                        **market,
+                        **market_row,
                         "price": position.price,
                         "isOpen": position.keeper_market_open,
                         "maxLeverage": position.max_leverage
@@ -398,6 +401,58 @@ async def call(
     block = result.content[0]
     assert isinstance(block, TextContent)
     return json.loads(block.text)
+
+
+@pytest.mark.parametrize(
+    ("minimum", "accepted"),
+    [(3_999_999, True), (4_000_000, True), (4_000_001, False)],
+)
+def test_partial_close_compares_keeper_minimum_in_usd_base_units(
+    position_service: tuple[Position, str],
+    tmp_path,
+    monkeypatch,
+    minimum: int,
+    accepted: bool,
+) -> None:
+    position, base_url = position_service
+    position.keeper_minimum_position_microusd = minimum
+    monkeypatch.setenv("SAI_HOME", str(tmp_path))
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(
+                client, "preview_partial_close", {"trade_id": 7, "percent": 50}
+            )
+            result = CliRunner().invoke(
+                main,
+                [
+                    "--json",
+                    "--endpoint",
+                    f"{base_url}/query",
+                    "--lcd-endpoint",
+                    base_url,
+                    "trade",
+                    "partial-close",
+                    "7",
+                    "--percent",
+                    "50",
+                    "--dry-run",
+                ],
+            )
+            if accepted:
+                assert result.exit_code == 0, result.output
+                assert json.loads(result.stdout)["intent"] == preview["intent"]
+                assert preview["quote"]["closedNotionalUsd"] == "4"
+            else:
+                assert result.exit_code == 1, result.output
+                assert preview["code"] == "INVALID_REQUEST"
+                assert "market minimum" in preview["error"]
+                error = json.loads(result.output)["error"]
+                assert error["code"] == "INVALID_REQUEST"
+                assert error["message"] == preview["error"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(

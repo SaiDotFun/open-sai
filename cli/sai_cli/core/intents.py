@@ -152,14 +152,14 @@ def tpsl_intent(
 
 
 def partial_intent(
-    trade: dict[str, Any], percent: int, min_size: Decimal
+    trade: dict[str, Any], percent: int, min_size_usd_base_units: int
 ) -> dict[str, Any]:
     if percent < 1 or percent > 99:
         raise ValueError("Partial close percentage must be from 1 to 99")
     amount = Decimal(str(trade["collateralAmount"]))
     leverage = Decimal(str(trade["leverage"]))
     delta = (amount * percent / 100).to_integral_value(rounding=ROUND_DOWN)
-    if delta <= 0 or (amount - delta) / Decimal(1_000_000) * leverage < min_size:
+    if delta <= 0 or (amount - delta) * leverage < min_size_usd_base_units:
         raise ValueError(
             "Reduction is too small or leaves less than the market minimum"
         )

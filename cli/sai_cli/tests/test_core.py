@@ -41,11 +41,11 @@ def test_open_and_partial_close_payload():
     )
     assert payload["body"]["market"] == {"marketIndex": "MarketIndex(3)"}
     trade = {"id": 7, "collateralAmount": 10_000_001, "leverage": 2}
-    result = intents.partial_intent(trade, 50, Decimal(1))
+    result = intents.partial_intent(trade, 50, 1_000_000)
     assert result["body"]["collateral"] == {"amountUsdc": "5000000", "amountUsd": "5"}
     assert result["body"]["leverageDelta"] == "0"
     with pytest.raises(ValueError):
-        intents.partial_intent(trade, 99, Decimal(2))
+        intents.partial_intent(trade, 99, 2_000_000)
 
 
 def test_tpsl_has_keeper_field_patch():
