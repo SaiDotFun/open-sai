@@ -385,6 +385,17 @@ wire = ["oneClickTrading", "ws:init", "node_info"]
 state = { "logs/.endpoint-key#@mode" = 384 }
 
 [[case]]
+name = "doctor-keeper-error-codes"
+args = ["--json", "doctor"]
+accepted_divergence = "lcd-origin-only"
+seed = "session"
+server = "doctor-graphql-errors"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+absent_log_text = ["opaque Keeper diagnostic", "unvalidated"]
+state = { "logs/cli.jsonl#2.event" = "keeper.request", "logs/cli.jsonl#2.keeperErrorCount" = 4, "logs/cli.jsonl#2.keeperErrors" = [{ code = "GRAPHQL_VALIDATION_FAILED" }, { code = "KEEPER_ERROR" }, { code = "KEEPER_ERROR" }] }
+
+[[case]]
 name = "doctor-lcd-unreachable"
 args = ["--json", "doctor", "--no-fix", "--lcd-endpoint", "{http}/private-fixture-credential"]
 accepted_divergence = "lcd-origin-only"

@@ -502,9 +502,10 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             b'{"priceUsd":18446744073709551616123456},'
                             b'{"priceUsd":"1.2300"}]}}}'
                         )
-                    elif (
-                        scenario == "history-graphql-errors" and name == "tradeHistory"
-                    ):
+                    elif (scenario, name) in {
+                        ("history-graphql-errors", "tradeHistory"),
+                        ("doctor-graphql-errors", "oneClickTrading"),
+                    }:
                         self.reply(
                             {
                                 **responses[name],
