@@ -130,7 +130,10 @@ fn get_set_and_unset_use_click_envelopes_and_text() {
         read_json(&output),
         json!({"key": "update.auto", "value": false, "path": path})
     );
-    assert_eq!(output.stderr, b"Warning: SAI_UPDATE_AUTO is set and overrides update.auto in the file\n");
+    assert_eq!(
+        output.stderr,
+        b"Warning: SAI_UPDATE_AUTO is set and overrides update.auto in the file\n"
+    );
 
     let output = sai(root.path())
         .args(["config", "get", "update.auto"])
@@ -167,9 +170,7 @@ fn invalid_value_and_unknown_key_are_usage_errors() {
         assert!(output.stdout.is_empty());
         let stderr = String::from_utf8(output.stderr).unwrap();
         assert!(stderr.starts_with("Usage: sai config "));
-        assert!(
-            stderr.contains("Valid keys: keeper.endpoint, keeper.ws_endpoint")
-        );
+        assert!(stderr.contains("Valid keys: keeper.endpoint, keeper.ws_endpoint"));
     }
     assert!(!root.path().join("config.toml").exists());
     assert!(!root.path().join(".config.lock").exists());
@@ -296,8 +297,7 @@ fn multiline_inline_table_is_invalid_in_toml_1_0() {
 fn oversized_unknown_integers_do_not_hide_known_keys() {
     let home = tempdir().unwrap();
     let path = home.path().join("config.toml");
-    let contents =
-        include_str!("fixtures/config-oversized-unknown-integer.toml");
+    let contents = include_str!("fixtures/config-oversized-unknown-integer.toml");
     fs::write(&path, contents).unwrap();
     let output = sai(home.path())
         .args(["--json", "config", "list"])

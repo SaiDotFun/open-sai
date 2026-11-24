@@ -1,8 +1,6 @@
 use std::{fs, path::Path, sync::Barrier, thread};
 
-use sai_core::settings::{
-    self, Environment, Flags, KEYS, Key, Settings, Source,
-};
+use sai_core::settings::{self, Environment, Flags, KEYS, Key, Settings, Source};
 use serde_json::json;
 use tempfile::tempdir;
 
@@ -36,9 +34,7 @@ fn resolves_all_layers_and_uses_websocket_from_the_same_or_higher_layer() {
     assert_eq!(from_env.source(Key::LcdEndpoint), Source::File);
     assert_eq!(from_env.source(Key::LogsKeepDays), Source::Default);
     let flags = Flags {
-        endpoint: Some(
-            "HTTP://user:pw@localhost:42/a/../b?key=secret#fragment".into(),
-        ),
+        endpoint: Some("HTTP://user:pw@localhost:42/a/../b?key=secret#fragment".into()),
         ..Flags::default()
     };
     let from_flag = Settings::load(&flags, &env).unwrap();
@@ -75,11 +71,18 @@ fn file_type_errors_are_reported_before_overrides_except_for_logging() {
     assert_eq!(resolved.value(Key::LogsEnabled), &json!(false));
     assert_eq!(resolved.source(Key::LogsEnabled), Source::Invalid);
     assert_eq!(resolved.source(Key::LogsKeepDays), Source::Invalid);
-    assert_eq!(resolved.warnings, [
-        format!("{}: 'logs' must be a table, such as [logs]; logging is off until it is fixed", env.path().display()),
-        format!("{}: ignoring unknown setting 'theme'", env.path().display()),
-        "SAI_LOG_KEEP_DAYS: invalid value for logs.keep_days; logging is off until it is fixed".to_owned(),
-    ]);
+    assert_eq!(
+        resolved.warnings,
+        [
+            format!(
+                "{}: 'logs' must be a table, such as [logs]; logging is off until it is fixed",
+                env.path().display()
+            ),
+            format!("{}: ignoring unknown setting 'theme'", env.path().display()),
+            "SAI_LOG_KEEP_DAYS: invalid value for logs.keep_days; logging is off until it is fixed"
+                .to_owned(),
+        ]
+    );
 }
 
 #[test]
@@ -137,9 +140,9 @@ fn edits_keep_formatting_and_annotations_and_do_not_touch_a_no_op() {
     );
     assert!(settings::unset(&config, key).unwrap());
     let unset = fs::read_to_string(&config).unwrap();
-    assert!(unset.contains(
-        "# endpoint = \"https://sai-keeper.nibiru.fi/query\"  # pinned\n# bottom"
-    ));
+    assert!(
+        unset.contains("# endpoint = \"https://sai-keeper.nibiru.fi/query\"  # pinned\n# bottom")
+    );
     let previous = fs::metadata(&config).unwrap().modified().unwrap();
     assert!(!settings::unset(&config, key).unwrap());
     assert_eq!(fs::metadata(&config).unwrap().modified().unwrap(), previous);
@@ -150,9 +153,11 @@ fn edits_keep_formatting_and_annotations_and_do_not_touch_a_no_op() {
         &key.parse_value("https://another.example/q").unwrap(),
     )
     .unwrap();
-    assert!(fs::read_to_string(&config).unwrap().contains(
-        "endpoint = \"https://another.example/q\"  # pinned\n# bottom"
-    ));
+    assert!(
+        fs::read_to_string(&config)
+            .unwrap()
+            .contains("endpoint = \"https://another.example/q\"  # pinned\n# bottom")
+    );
 }
 
 #[test]
@@ -188,13 +193,9 @@ fn reads_nonstandard_toml_sections_but_refuses_to_rewrite_them() {
         fs::write(&path, input).unwrap();
         assert!(Settings::load(&Flags::default(), &env).is_ok());
         assert!(
-            settings::set(
-                &path,
-                key,
-                &key.parse_value("https://new.example").unwrap()
-            )
-            .unwrap_err()
-            .is_uneditable()
+            settings::set(&path, key, &key.parse_value("https://new.example").unwrap())
+                .unwrap_err()
+                .is_uneditable()
         );
         assert!(settings::unset(&path, key).unwrap_err().is_uneditable());
         assert_eq!(fs::read_to_string(&path).unwrap(), input);
@@ -222,8 +223,7 @@ fn concurrent_edits_keep_changes_and_private_modes() {
             let ready = &ready;
             scope.spawn(move || {
                 ready.wait();
-                settings::set(path, key, &key.parse_value(raw).unwrap())
-                    .unwrap();
+                settings::set(path, key, &key.parse_value(raw).unwrap()).unwrap();
             });
         }
     });
@@ -231,8 +231,7 @@ fn concurrent_edits_keep_changes_and_private_modes() {
     for (key, raw) in keys {
         assert_eq!(resolved.value(key), &key.parse_value(raw).unwrap());
     }
-    let mode =
-        |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&env.home), 0o700);
     assert_eq!(mode(&path), 0o600);
     assert_eq!(mode(&env.home.join(".config.lock")), 0o600);
@@ -244,8 +243,7 @@ fn oversized_retention_values_keep_json_precision_and_can_be_edited() {
     let env = fixture(home.path(), &[]);
     let path = env.path();
     let huge = "184467440737095516160001234";
-    let initial =
-        format!("[logs]\nkeep_days = {huge}  # still keep this note\n");
+    let initial = format!("[logs]\nkeep_days = {huge}  # still keep this note\n");
     fs::write(&path, &initial).unwrap();
     let resolved = Settings::load(&Flags::default(), &env).unwrap();
     assert_eq!(resolved.value(Key::LogsKeepDays).to_string(), huge);
@@ -272,12 +270,9 @@ fn adding_to_an_explicit_table_keeps_its_subtable_separate() {
     let home = tempdir().unwrap();
     let path = home.path().join("config.toml");
     for gap in ["", "\n"] {
-        let input = format!(
-            "[keeper]\n# note\n{gap}[keeper.future]\nfield = 'unchanged'\n"
-        );
+        let input = format!("[keeper]\n# note\n{gap}[keeper.future]\nfield = 'unchanged'\n");
         fs::write(&path, input).unwrap();
-        settings::set(&path, Key::KeeperEndpoint, &json!("https://new.example"))
-            .unwrap();
+        settings::set(&path, Key::KeeperEndpoint, &json!("https://new.example")).unwrap();
         assert_eq!(
             fs::read_to_string(&path).unwrap(),
             "[keeper]\n# note\nendpoint = \"https://new.example\"\n\n[keeper.future]\nfield = 'unchanged'\n"

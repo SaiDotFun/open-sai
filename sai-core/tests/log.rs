@@ -33,8 +33,7 @@ fn finish(writer: LogWriter) {
 }
 
 #[test]
-fn redaction_applies_to_nested_text_url_origins_arguments_and_untrusted_errors()
-{
+fn redaction_applies_to_nested_text_url_origins_arguments_and_untrusted_errors() {
     let home = tempdir().unwrap();
     let opaque = "opaque-synthetic-token-for-rust-log-tests";
     remember([opaque.to_owned()]);
@@ -42,12 +41,30 @@ fn redaction_applies_to_nested_text_url_origins_arguments_and_untrusted_errors()
     let jwt = "eyJabcdefghi.abcdefghij.abcdefghij";
     let signature = "a".repeat(130);
     let digest = "b".repeat(64);
-    writer.event(Surface::Mcp, "fixture.started", Level::Info, [
-        ("nested", json!({opaque: [jwt, &signature, &digest]}).into()),
-        ("url", Field::Endpoint("https://bob:fixture@EXAMPLE.com:443/path?hide=1".into())),
-        ("argv", Field::argv(["--endpoint=https://bob:fixture@EXAMPLE.com:443/path?hide=1 more text".into()])),
-        ("error", Field::Untrusted(format!("Bad {digest} https://example.com/key and private text"))),
-    ]);
+    writer.event(
+        Surface::Mcp,
+        "fixture.started",
+        Level::Info,
+        [
+            ("nested", json!({opaque: [jwt, &signature, &digest]}).into()),
+            (
+                "url",
+                Field::Endpoint("https://bob:fixture@EXAMPLE.com:443/path?hide=1".into()),
+            ),
+            (
+                "argv",
+                Field::argv([
+                    "--endpoint=https://bob:fixture@EXAMPLE.com:443/path?hide=1 more text".into(),
+                ]),
+            ),
+            (
+                "error",
+                Field::Untrusted(format!(
+                    "Bad {digest} https://example.com/key and private text"
+                )),
+            ),
+        ],
+    );
     finish(writer);
 
     let events = read(home.path(), "mcp");
@@ -73,10 +90,7 @@ fn redaction_applies_to_nested_text_url_origins_arguments_and_untrusted_errors()
     assert_eq!(events[0]["version"], env!("CARGO_PKG_VERSION"));
     assert_eq!(events[0]["runId"].as_str().unwrap().len(), 32);
     assert!(events[0]["seq"].is_u64());
-    assert!(
-        chrono::DateTime::parse_from_rfc3339(events[0]["ts"].as_str().unwrap())
-            .is_ok()
-    );
+    assert!(chrono::DateTime::parse_from_rfc3339(events[0]["ts"].as_str().unwrap()).is_ok());
 }
 
 #[test]
@@ -124,8 +138,7 @@ fn retention_prunes_sai_files_once_per_day_across_writers() {
     let home = tempdir().unwrap();
     let logs = home.path().join("logs");
     fs::create_dir(&logs).unwrap();
-    fs::write(home.path().join("config.toml"), "[logs]\nkeep_days = 2\n")
-        .unwrap();
+    fs::write(home.path().join("config.toml"), "[logs]\nkeep_days = 2\n").unwrap();
     let today = Utc::now().date_naive();
     let yesterday = today - Days::new(1);
     let older = today - Days::new(2);
@@ -144,12 +157,7 @@ fn retention_prunes_sai_files_once_per_day_across_writers() {
     logger.event(Surface::Cli, "fixture", Level::Info, []);
     finish(logger);
     assert!(!stale.exists());
-    assert!(
-        recent.exists()
-            && unrelated.exists()
-            && invalid.exists()
-            && link.exists()
-    );
+    assert!(recent.exists() && unrelated.exists() && invalid.exists() && link.exists());
 
     // A second writer leaves the file in place until the marker expires.
     fs::write(&stale, "").unwrap();
@@ -197,15 +205,13 @@ fn output_modes_are_private_and_log_files_do_not_follow_links_or_fifos() {
     }
     finish(logger);
     assert_eq!(fs::read_to_string(&external).unwrap(), "sentinel");
-    let mode =
-        |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let mode = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode(&logs), 0o700);
     assert_eq!(mode(&logs.join(".pruned")), 0o600);
 
     fs::remove_file(&symlink_path).unwrap();
     fs::write(&symlink_path, "").unwrap();
-    fs::set_permissions(&symlink_path, fs::Permissions::from_mode(0o644))
-        .unwrap();
+    fs::set_permissions(&symlink_path, fs::Permissions::from_mode(0o644)).unwrap();
     let logger = writer(home.path());
     logger.event(Surface::Cli, "fixture", Level::Info, []);
     finish(logger);

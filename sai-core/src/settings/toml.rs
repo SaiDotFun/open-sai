@@ -29,10 +29,7 @@ impl ParsedDocument {
                 // whitespace, and comments still locate the original bytes.
                 let mut masked = text.to_owned();
                 for (span, _) in &oversized {
-                    masked.replace_range(
-                        span.clone(),
-                        &format!("0{}", " ".repeat(span.len() - 1)),
-                    );
+                    masked.replace_range(span.clone(), &format!("0{}", " ".repeat(span.len() - 1)));
                 }
                 let document = Document::parse(masked)?;
                 Ok(Self {
@@ -79,8 +76,7 @@ fn oversized_integers(text: &str) -> Option<Vec<(Range<usize>, BigInt)>> {
                 error.kind(),
                 IntErrorKind::PosOverflow | IntErrorKind::NegOverflow
             )
-            && let Some(value) =
-                BigInt::parse_bytes(decoded.as_bytes(), radix.value())
+            && let Some(value) = BigInt::parse_bytes(decoded.as_bytes(), radix.value())
         {
             values.push((event.span().start()..event.span().end(), value));
         }

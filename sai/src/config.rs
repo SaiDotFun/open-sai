@@ -1,9 +1,7 @@
 use std::{fmt::Write as _, io};
 
 use clap::Subcommand;
-use sai_core::settings::{
-    self, Environment, Flags, KEYS, Key, Settings, SettingsError,
-};
+use sai_core::settings::{self, Environment, Flags, KEYS, Key, Settings, SettingsError};
 use serde::Serialize;
 use serde_json::{Map, Value, json, ser::Formatter};
 
@@ -20,27 +18,28 @@ pub enum ConfigCommand {
 }
 
 impl ConfigCommand {
-    pub fn run(
-        self,
-        flags: &Flags,
-        env: &Environment,
-        json: bool,
-    ) -> Result<(), Error> {
+    pub fn run(self, flags: &Flags, env: &Environment, json: bool) -> Result<(), Error> {
         let path = env.path();
         let path = path.as_path();
         match self {
             Self::List => {
                 let resolved = load(flags, env)?;
                 if json {
-                    let entries: Map<String, Value> = KEYS.into_iter().map(|key| {
-                        let spec = key.spec();
-                        (spec.name.into(), json!({
-                            "value": key.public_value(resolved.value(key)),
-                            "source": resolved.source(key).as_str(),
-                            "env": spec.env,
-                            "default": key.public_value(&key.default_value()),
-                        }))
-                    }).collect();
+                    let entries: Map<String, Value> = KEYS
+                        .into_iter()
+                        .map(|key| {
+                            let spec = key.spec();
+                            (
+                                spec.name.into(),
+                                json!({
+                                    "value": key.public_value(resolved.value(key)),
+                                    "source": resolved.source(key).as_str(),
+                                    "env": spec.env,
+                                    "default": key.public_value(&key.default_value()),
+                                }),
+                            )
+                        })
+                        .collect();
                     println!(
                         "{}",
                         format_json(&json!({"path": path, "settings": entries}))
@@ -49,13 +48,9 @@ impl ConfigCommand {
                     println!("# {}", path.display());
                     for key in KEYS {
                         let spec = key.spec();
-                        let value =
-                            format_json(&key.public_value(resolved.value(key)));
+                        let value = format_json(&key.public_value(resolved.value(key)));
                         let source = resolved.source(key).as_str();
-                        println!(
-                            "{} = {value}  # {source}, {}",
-                            spec.name, spec.env
-                        );
+                        println!("{} = {value}  # {source}, {}", spec.name, spec.env);
                     }
                 }
             }
@@ -81,18 +76,13 @@ impl ConfigCommand {
             Self::Set { key, value } => {
                 let key = parse_key(&key)?;
                 let value = key.parse_value(&value).map_err(|error| {
-                    Error::usage(format!(
-                        "{error}. Valid keys: {}",
-                        settings::valid_keys()
-                    ))
+                    Error::usage(format!("{error}. Valid keys: {}", settings::valid_keys()))
                 })?;
                 settings::set(path, key, &value).map_err(Error::settings)?;
                 if json {
                     println!(
                         "{}",
-                        format_json(
-                            &json!({"key": key.spec().name, "value": value, "path": path})
-                        )
+                        format_json(&json!({"key": key.spec().name, "value": value, "path": path}))
                     );
                 } else {
                     println!("Set {} in {}", key.spec().name, path.display());
@@ -101,8 +91,7 @@ impl ConfigCommand {
             }
             Self::Unset { key } => {
                 let key = parse_key(&key)?;
-                let removed =
-                    settings::unset(path, key).map_err(Error::settings)?;
+                let removed = settings::unset(path, key).map_err(Error::settings)?;
                 if json {
                     println!(
                         "{}",
@@ -208,12 +197,8 @@ pub fn print_help(command: &str, stderr: bool) -> bool {
         "config list" => {
             "Show every setting with its value and source.\n\n  The source is flag, env, file, default, or derived. URLs are shown without\n  credentials; `sai config get` prints the exact value."
         }
-        "config set" => {
-            "Set KEY to VALUE in the config file, keeping its comments."
-        }
-        "config unset" => {
-            "Remove KEY from the config file so the default applies again."
-        }
+        "config set" => "Set KEY to VALUE in the config file, keeping its comments.",
+        "config unset" => "Remove KEY from the config file so the default applies again.",
         _ => return false,
     };
     let commands = if command == "config" {
@@ -248,10 +233,7 @@ impl Formatter for Spaced {
         }
     }
 
-    fn begin_object_value<W: ?Sized + io::Write>(
-        &mut self,
-        output: &mut W,
-    ) -> io::Result<()> {
+    fn begin_object_value<W: ?Sized + io::Write>(&mut self, output: &mut W) -> io::Result<()> {
         output.write_all(b": ")
     }
 

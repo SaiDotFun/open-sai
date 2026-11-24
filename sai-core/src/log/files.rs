@@ -62,19 +62,12 @@ impl LogDir {
         };
         use std::os::unix::fs::MetadataExt;
 
-        let mut flags = OFlags::WRONLY
-            | OFlags::APPEND
-            | OFlags::CREATE
-            | OFlags::NOFOLLOW
-            | OFlags::NONBLOCK;
+        let mut flags =
+            OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK;
         flags.set(OFlags::EXCL, exclusive);
-        let file =
-            File::from(openat(&self.0, name, flags, Mode::RUSR | Mode::WUSR)?);
+        let file = File::from(openat(&self.0, name, flags, Mode::RUSR | Mode::WUSR)?);
         let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.nlink() > 1
-            || metadata.uid() != geteuid().as_raw()
-        {
+        if !metadata.is_file() || metadata.nlink() > 1 || metadata.uid() != geteuid().as_raw() {
             return Err(io::ErrorKind::PermissionDenied.into());
         }
         restrict(&file, &metadata)?;
@@ -135,11 +128,7 @@ impl LogDir {
     }
 
     #[cfg(unix)]
-    fn remove_expired(
-        &self,
-        keep_days: u64,
-        today: NaiveDate,
-    ) -> io::Result<()> {
+    fn remove_expired(&self, keep_days: u64, today: NaiveDate) -> io::Result<()> {
         use rustix::fs::{AtFlags, Dir, FileType, statat, unlinkat};
 
         for entry in Dir::read_from(&self.0)? {
@@ -149,12 +138,9 @@ impl LogDir {
                 .to_str()
                 .ok()
                 .is_some_and(|name| expired(name, keep_days, today))
-                && statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(
-                    |stat| {
-                        FileType::from_raw_mode(stat.st_mode)
-                            == FileType::RegularFile
-                    },
-                )
+                && statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(|stat| {
+                    FileType::from_raw_mode(stat.st_mode) == FileType::RegularFile
+                })
             {
                 let _ = unlinkat(&self.0, name, AtFlags::empty());
             }
@@ -163,11 +149,7 @@ impl LogDir {
     }
 
     #[cfg(not(unix))]
-    fn remove_expired(
-        &self,
-        keep_days: u64,
-        today: NaiveDate,
-    ) -> io::Result<()> {
+    fn remove_expired(&self, keep_days: u64, today: NaiveDate) -> io::Result<()> {
         for entry in fs::read_dir(&self.0)? {
             let entry = entry?;
             if entry
@@ -222,7 +204,6 @@ fn expired(name: &str, keep_days: u64, today: NaiveDate) -> bool {
     NaiveDate::parse_from_str(date, "%Y-%m-%d").is_ok_and(|date| {
         date.format("%Y-%m-%d").to_string().len() == 10
             && date.year_ce().0
-            && (today - date).num_days()
-                >= i64::try_from(keep_days).unwrap_or(i64::MAX)
+            && (today - date).num_days() >= i64::try_from(keep_days).unwrap_or(i64::MAX)
     })
 }

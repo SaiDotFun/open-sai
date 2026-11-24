@@ -20,9 +20,8 @@ use super::remember;
 
 // This label is shared by the v0.1 test-backend format. File permissions
 // protect these sessions. The key derivation input is public.
-static KEY: LazyLock<[u8; 32]> = LazyLock::new(|| {
-    Sha256::digest(b"sai-cli keyring-backend test; not a secret").into()
-});
+static KEY: LazyLock<[u8; 32]> =
+    LazyLock::new(|| Sha256::digest(b"sai-cli keyring-backend test; not a secret").into());
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(super) struct FileStamp {
@@ -71,9 +70,7 @@ fn read_tokens(current: &Path, legacy: &Path) -> Option<Vec<String>> {
     if current_envelope.is_none()
         && let Some(old) = read(legacy).ok()?
     {
-        if old.get("version")?.as_u64()? != 2
-            || old.get("backend")?.as_str()? != "test"
-        {
+        if old.get("version")?.as_u64()? != 2 || old.get("backend")?.as_str()? != "test" {
             return None;
         }
         let session = decrypt(&old, b"sai-session-v2-test")?;

@@ -35,11 +35,9 @@ pub const EXIT_FLUSH: Duration = Duration::from_millis(300);
 const COMMON: [&str; 8] = [
     "ts", "level", "event", "surface", "pid", "version", "runId", "seq",
 ];
-static RUN_ID: LazyLock<String> =
-    LazyLock::new(|| Uuid::new_v4().simple().to_string());
+static RUN_ID: LazyLock<String> = LazyLock::new(|| Uuid::new_v4().simple().to_string());
 static SEQUENCE: AtomicU64 = AtomicU64::new(1);
-static KNOWN: LazyLock<Mutex<Arc<[String]>>> =
-    LazyLock::new(|| Mutex::new(Arc::new([])));
+static KNOWN: LazyLock<Mutex<Arc<[String]>>> = LazyLock::new(|| Mutex::new(Arc::new([])));
 
 #[derive(Clone, Copy)]
 pub enum Surface {
@@ -154,9 +152,7 @@ impl LogWriter {
             fields
                 .into_iter()
                 .filter_map(|(key, field)| {
-                    if COMMON.contains(&key)
-                        || matches!(&field, Field::Scalar(Value::Null))
-                    {
+                    if COMMON.contains(&key) || matches!(&field, Field::Scalar(Value::Null)) {
                         None
                     } else {
                         Some((key.into(), field))
@@ -270,8 +266,7 @@ fn write(directory: &LogDir, event: Event, tokens: &[String], queue: &Queue) {
 }
 
 fn json_ascii(value: &Map<String, Value>) -> String {
-    let encoded =
-        serde_json::to_string(value).expect("serializing JSON to a buffer");
+    let encoded = serde_json::to_string(value).expect("serializing JSON to a buffer");
     let mut escaped = String::with_capacity(encoded.len());
     for c in encoded.chars() {
         if c >= '\u{7f}' {

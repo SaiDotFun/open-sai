@@ -9,8 +9,7 @@ pub(super) fn from_process() -> Option<PathBuf> {
 
 fn sai_home(sai: Option<PathBuf>, home: Option<PathBuf>) -> Option<PathBuf> {
     // Path.home() is evaluated in Python even when SAI_HOME is set.
-    let home = home
-        .filter(|path| !path.as_os_str().as_encoded_bytes().starts_with(b"~"))?;
+    let home = home.filter(|path| !path.as_os_str().as_encoded_bytes().starts_with(b"~"))?;
     Some(normalize(&sai.unwrap_or_else(|| home.join(".sai"))))
 }
 

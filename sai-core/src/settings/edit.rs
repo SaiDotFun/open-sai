@@ -9,10 +9,7 @@ use serde_json::Value;
 use toml_edit::{Item, Table};
 
 use super::toml::ParsedDocument;
-use super::{
-    Key, MAINNET_WS, SettingsError, os_message, parse_error, read_text,
-    table_error,
-};
+use super::{Key, MAINNET_WS, SettingsError, os_message, parse_error, read_text, table_error};
 
 const TEMPLATE: &str = include_str!("../settings-template.toml");
 const LOCK_NAME: &str = ".config.lock";
@@ -59,8 +56,7 @@ fn edit_file(
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-            .map_err(writing)?;
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(writing)?;
     }
     let lock = options.open(parent.join(LOCK_NAME)).map_err(writing)?;
     lock.lock().map_err(writing)?;
@@ -85,8 +81,8 @@ fn edit(
     new: Option<&Value>,
 ) -> Result<Option<String>, SettingsError> {
     let text = text.unwrap_or(TEMPLATE);
-    let parsed = ParsedDocument::parse(text)
-        .map_err(|error| parse_error(path, text, &error, true))?;
+    let parsed =
+        ParsedDocument::parse(text).map_err(|error| parse_error(path, text, &error, true))?;
     let document = &parsed.document;
     let (section, name) = key.section_and_name();
     let new_line = |value: &Value| format!("{name} = {}", toml_value(value));
@@ -103,9 +99,7 @@ fn edit(
         }));
     };
     let table = match item {
-        Item::Table(table) if !table.is_implicit() && !table.is_dotted() => {
-            table
-        }
+        Item::Table(table) if !table.is_implicit() && !table.is_dotted() => table,
         item if item.is_table_like() => return Err(uneditable(section, path)),
         _ => {
             return Err(SettingsError::invalid(format!(
@@ -128,8 +122,7 @@ fn edit(
         .into_iter()
         .filter(|&offset| offset > header.start)
         .min();
-    let body_end =
-        next_header.map_or(text.len(), |offset| line_start(text, offset));
+    let body_end = next_header.map_or(text.len(), |offset| line_start(text, offset));
     let body = &text[body_start..body_end];
     let content = body.trim_end();
     let append_at = if content.is_empty() {
@@ -137,22 +130,17 @@ fn edit(
     } else {
         line_end(&text[..body_end], body_start + content.len())
     };
-    let insert_gap = next_header
-        .is_some_and(|offset| children.contains(&offset))
-        && append_at == body_end;
+    let insert_gap =
+        next_header.is_some_and(|offset| children.contains(&offset)) && append_at == body_end;
     let placeholder = format!("# {name} = {}", placeholder_value(key));
 
     if let Some((key, item)) = table.get_key_value(name) {
         if let Some(value) = item.as_value() {
-            let range = parsed
-                .value_span(value.span().expect("parsed value has a span"));
+            let range = parsed.value_span(value.span().expect("parsed value has a span"));
             if let Some(new) = new {
                 return Ok(Some(replace(text, range, &toml_value(new))));
             }
-            let start = line_start(
-                text,
-                key.span().expect("parsed key has a span").start,
-            );
+            let start = line_start(text, key.span().expect("parsed key has a span").start);
             let end = line_end(text, range.end);
             let note = inline_note(&text[range.end..end]);
             return Ok(Some(replace(
@@ -170,9 +158,7 @@ fn edit(
                 item.as_array_of_tables().map(|tables| {
                     tables
                         .iter()
-                        .flat_map(|table| {
-                            table_ranges(text, table, document.as_table())
-                        })
+                        .flat_map(|table| table_ranges(text, table, document.as_table()))
                         .collect()
                 })
             })
@@ -199,15 +185,12 @@ fn edit(
     for line in body.split_inclusive('\n') {
         let next = offset + line.len();
         let trimmed = line.trim();
-        if trimmed.starts_with(&prefix)
-            && !values.iter().any(|range| range.contains(&offset))
-        {
+        if trimmed.starts_with(&prefix) && !values.iter().any(|range| range.contains(&offset)) {
             let note = trimmed
                 .strip_prefix(&placeholder)
                 .map(str::trim)
                 .filter(|note| note.starts_with('#'));
-            let suffix =
-                note.map_or_else(String::new, |note| format!("  {note}"));
+            let suffix = note.map_or_else(String::new, |note| format!("  {note}"));
             return Ok(Some(replace(
                 text,
                 offset..next,
@@ -267,13 +250,11 @@ fn table_ranges(text: &str, table: &Table, root: &Table) -> Vec<Range<usize>> {
         })
         .collect::<Vec<_>>();
     if table.is_dotted() {
-        ranges.extend(table.get_values().into_iter().filter_map(
-            |(keys, value)| {
-                let start = line_start(text, keys.first()?.span()?.start);
-                let end = line_end(text, value.span()?.end);
-                Some(start..end)
-            },
-        ));
+        ranges.extend(table.get_values().into_iter().filter_map(|(keys, value)| {
+            let start = line_start(text, keys.first()?.span()?.start);
+            let end = line_end(text, value.span()?.end);
+            Some(start..end)
+        }));
     }
     ranges.sort_by_key(|range| range.start);
     ranges

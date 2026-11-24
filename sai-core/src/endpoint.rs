@@ -24,8 +24,7 @@ impl Endpoint {
         {
             return None;
         }
-        let (authority, rest) =
-            rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
+        let (authority, rest) = rest.split_at(rest.find(['/', '?', '#']).unwrap_or(rest.len()));
         if authority.is_empty() {
             return None;
         }
@@ -43,9 +42,7 @@ impl Endpoint {
                 }
             } else {
                 let (address, zone) = host.split_once('%').unwrap_or((host, ""));
-                if Ipv6Addr::from_str(address).is_err()
-                    || (host.contains('%') && zone.is_empty())
-                {
+                if Ipv6Addr::from_str(address).is_err() || (host.contains('%') && zone.is_empty()) {
                     return None;
                 }
             }
@@ -77,8 +74,7 @@ impl Endpoint {
             .unwrap_or(("", &self.authority));
         let (host, port) = match host_port.split_once('[') {
             Some((_, bracketed)) => {
-                let (host, tail) =
-                    bracketed.split_once(']').unwrap_or((bracketed, ""));
+                let (host, tail) = bracketed.split_once(']').unwrap_or((bracketed, ""));
                 (host, tail.split_once(':').map(|(_, port)| port))
             }
             None => host_port

@@ -133,8 +133,7 @@ impl Key {
                 if digits.is_empty() {
                     return Err(self.expected("a whole number, 1 or more"));
                 }
-                serde_json::from_str(digits)
-                    .map_err(|_| self.expected("a whole number, 1 or more"))
+                serde_json::from_str(digits).map_err(|_| self.expected("a whole number, 1 or more"))
             }
         }
     }
@@ -150,8 +149,7 @@ impl Key {
     }
 
     pub fn public_value(self, value: &Value) -> Value {
-        if let (Kind::Url(_), Some(endpoint)) =
-            (self.spec().kind, value.as_str())
+        if let (Kind::Url(_), Some(endpoint)) = (self.spec().kind, value.as_str())
             && let Some(endpoint) = Endpoint::split(endpoint)
         {
             let (host, port) = endpoint.host_port();
@@ -189,9 +187,7 @@ impl Key {
         let Kind::Url(schemes) = self.spec().kind else {
             unreachable!()
         };
-        if Endpoint::split(value)
-            .is_some_and(|url| schemes.contains(&url.scheme.as_str()))
-        {
+        if Endpoint::split(value).is_some_and(|url| schemes.contains(&url.scheme.as_str())) {
             return Ok(json!(value));
         }
         Err(self.expected(&format!(
@@ -200,15 +196,11 @@ impl Key {
         )))
     }
 
-    fn read_value(
-        self,
-        item: &Item,
-        document: &ParsedDocument,
-    ) -> Result<Value, SettingsError> {
+    fn read_value(self, item: &Item, document: &ParsedDocument) -> Result<Value, SettingsError> {
         match self.spec().kind {
-            Kind::Url(_) => self.check_url(
-                item.as_str().ok_or_else(|| self.expected("a URL string"))?,
-            ),
+            Kind::Url(_) => {
+                self.check_url(item.as_str().ok_or_else(|| self.expected("a URL string"))?)
+            }
             Kind::Bool => item
                 .as_bool()
                 .map(Value::Bool)
@@ -344,9 +336,8 @@ impl Environment {
     }
 
     pub fn from_process() -> Result<Self, SettingsError> {
-        let home = home::from_process().ok_or_else(|| {
-            SettingsError::invalid("Cannot find the home directory".into())
-        })?;
+        let home = home::from_process()
+            .ok_or_else(|| SettingsError::invalid("Cannot find the home directory".into()))?;
         Ok(Self::new(home, |name| env::var(name).ok()))
     }
 
@@ -386,10 +377,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    pub fn load(
-        flags: &Flags,
-        env: &Environment,
-    ) -> Result<Self, SettingsError> {
+    pub fn load(flags: &Flags, env: &Environment) -> Result<Self, SettingsError> {
         let path = env.path();
         let file = FileSettings::read(&path)?;
         let mut resolved = Self {
@@ -398,15 +386,12 @@ impl Settings {
         };
         for key in KEYS {
             let index = key as usize;
-            let (value, source) =
-                pick(key, flags, env, file.entries[index].as_ref());
+            let (value, source) = pick(key, flags, env, file.entries[index].as_ref());
             resolved.entries[index] = match value {
                 Ok(value) => (value, source),
                 Err(_) if key.is_log() => {
-                    let already_off = resolved.value(Key::LogsEnabled).as_bool()
-                        == Some(false);
-                    let source =
-                        if already_off { source } else { Source::Invalid };
+                    let already_off = resolved.value(Key::LogsEnabled).as_bool() == Some(false);
+                    let source = if already_off { source } else { Source::Invalid };
                     if source == Source::Invalid && env.value(key).is_some() {
                         resolved.warnings.push(format!(
                             "{}: invalid value for {}; logging is off until it is fixed",
@@ -422,21 +407,15 @@ impl Settings {
                     } else {
                         key.spec().env
                     };
-                    return Err(SettingsError::invalid(format!(
-                        "{origin}: {error}"
-                    )));
+                    return Err(SettingsError::invalid(format!("{origin}: {error}")));
                 }
             };
         }
         let http = Key::KeeperEndpoint;
         let ws = Key::KeeperWsEndpoint;
-        if resolved.value(ws).is_null()
-            || resolved.source(ws) > resolved.source(http)
-        {
-            let endpoint = Endpoint::split(resolved.endpoint())
-                .expect("validated Keeper URL");
-            resolved.entries[ws as usize] =
-                (json!(endpoint.websocket()), Source::Derived);
+        if resolved.value(ws).is_null() || resolved.source(ws) > resolved.source(http) {
+            let endpoint = Endpoint::split(resolved.endpoint()).expect("validated Keeper URL");
+            resolved.entries[ws as usize] = (json!(endpoint.websocket()), Source::Derived);
         }
         if [Key::LogsEnabled, Key::LogsKeepDays]
             .into_iter()
@@ -494,36 +473,29 @@ impl FileSettings {
                 for (name, item) in table.iter() {
                     let name = format!("{section}.{name}");
                     let Some(key) = find_key(&name) else {
-                        file.warnings.push(format!(
-                            "{path}: ignoring unknown setting {}",
-                            repr(&name)
-                        ));
+                        file.warnings
+                            .push(format!("{path}: ignoring unknown setting {}", repr(&name)));
                         continue;
                     };
                     let entry = key.read_value(item, &parsed);
                     if let Err(ref error) = entry {
                         if !key.is_log() {
-                            return Err(SettingsError::invalid(format!(
-                                "{path}: {error}"
-                            )));
+                            return Err(SettingsError::invalid(format!("{path}: {error}")));
                         }
-                        file.warnings.push(format!(
-                            "{path}: {error}; logging is off until it is fixed"
-                        ));
+                        file.warnings
+                            .push(format!("{path}: {error}; logging is off until it is fixed"));
                     }
                     file.entries[key as usize] = Some(entry);
                 }
             } else if section == "logs" {
                 let message = table_error(section);
                 for key in [Key::LogsEnabled, Key::LogsKeepDays] {
-                    file.entries[key as usize] =
-                        Some(Err(SettingsError::invalid(message.clone())));
+                    file.entries[key as usize] = Some(Err(SettingsError::invalid(message.clone())));
                 }
                 file.warnings.push(format!(
                     "{path}: {message}; logging is off until it is fixed"
                 ));
-            } else if KEYS.iter().any(|key| key.section_and_name().0 == section)
-            {
+            } else if KEYS.iter().any(|key| key.section_and_name().0 == section) {
                 return Err(SettingsError::invalid(format!(
                     "{path}: {}",
                     table_error(section)
@@ -543,12 +515,7 @@ fn table_error(section: &str) -> String {
     format!("{} must be a table, such as [{section}]", repr(section))
 }
 
-fn pick(
-    key: Key,
-    flags: &Flags,
-    env: &Environment,
-    file: Option<&Entry>,
-) -> (Entry, Source) {
+fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (Entry, Source) {
     if let Some(raw) = flags.value(key) {
         (key.parse_value(raw), Source::Flag)
     } else if let Some(raw) = env.value(key) {
@@ -605,20 +572,14 @@ fn os_message(error: &io::Error) -> String {
 }
 
 // Report positions without quoting input lines, which can contain credentials.
-fn parse_error(
-    path: &Path,
-    input: &str,
-    error: &TomlError,
-    editing: bool,
-) -> SettingsError {
+fn parse_error(path: &Path, input: &str, error: &TomlError, editing: bool) -> SettingsError {
     let span = error.span().unwrap_or(input.len()..input.len());
     let message = error.message();
     let duplicate = message == "duplicate key";
     let mut offset = span.start;
     if duplicate
         && !editing
-        && let Some(line) =
-            input.get(offset..).and_then(|rest| rest.lines().next())
+        && let Some(line) = input.get(offset..).and_then(|rest| rest.lines().next())
         && let Ok(document) = ParsedDocument::parse(line)
         && let Some(end) = document
             .document
@@ -647,9 +608,7 @@ fn parse_error(
                 "Key {} already exists.",
                 json!(key.trim_matches(['"', '\'']))
             )
-        } else if string_error
-            && let Some(c) = character.filter(|c| c.is_ascii_control())
-        {
+        } else if string_error && let Some(c) = character.filter(|c| c.is_ascii_control()) {
             format!(
                 "Control characters (codes less than 0x1f and 0x7f) are not allowed in strings, use \\u{:04x} instead at line {line} col {}",
                 u32::from(c),
@@ -665,9 +624,7 @@ fn parse_error(
     } else {
         let description = if string_error && character.is_none() {
             "Unterminated string".into()
-        } else if string_error
-            && let Some(c) = character.filter(|c| c.is_ascii_control())
-        {
+        } else if string_error && let Some(c) = character.filter(|c| c.is_ascii_control()) {
             format!("Illegal character {}", repr(&c.to_string()))
         } else if message.starts_with("unclosed table") {
             "Expected ']' at the end of a table declaration".into()

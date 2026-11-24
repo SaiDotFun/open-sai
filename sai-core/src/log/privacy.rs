@@ -16,19 +16,14 @@ const MAX_ITEMS: usize = 64;
 pub const EVENT_CHARS: usize = 12 * 1024;
 const EVENT_NODES: usize = 512;
 
-static JWT: LazyLock<Regex> = LazyLock::new(|| {
-    regex(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}")
-});
-static URL: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"[A-Za-z][A-Za-z0-9+.-]*://\S*"));
-static URL_REST: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"(?s)[A-Za-z][A-Za-z0-9+.-]*://.*"));
+static JWT: LazyLock<Regex> =
+    LazyLock::new(|| regex(r"eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"));
+static URL: LazyLock<Regex> = LazyLock::new(|| regex(r"[A-Za-z][A-Za-z0-9+.-]*://\S*"));
+static URL_REST: LazyLock<Regex> = LazyLock::new(|| regex(r"(?s)[A-Za-z][A-Za-z0-9+.-]*://.*"));
 static HOST: LazyLock<Regex> =
     LazyLock::new(|| regex(r"\A(?:[A-Za-z0-9.-]+|\[[0-9A-Fa-f:.]+\])\z"));
-static LONG_HEX: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"(?:0x)?[0-9A-Fa-f]{100,}"));
-static HEX: LazyLock<Regex> =
-    LazyLock::new(|| regex(r"(?:0x)?[0-9A-Fa-f]{64,}"));
+static LONG_HEX: LazyLock<Regex> = LazyLock::new(|| regex(r"(?:0x)?[0-9A-Fa-f]{100,}"));
+static HEX: LazyLock<Regex> = LazyLock::new(|| regex(r"(?:0x)?[0-9A-Fa-f]{64,}"));
 
 fn regex(pattern: &str) -> Regex {
     Regex::new(pattern).expect("valid log redaction pattern")
@@ -49,9 +44,7 @@ impl From<Value> for Field {
     fn from(value: Value) -> Self {
         match value {
             Value::String(value) => Self::Text(value),
-            Value::Array(items) => {
-                Self::Array(items.into_iter().map(Self::from).collect())
-            }
+            Value::Array(items) => Self::Array(items.into_iter().map(Self::from).collect()),
             Value::Object(items) => Self::Object(
                 items
                     .into_iter()
@@ -68,22 +61,13 @@ impl Field {
         Self::Array(args.into_iter().take(MAX_ITEMS).map(Self::Arg).collect())
     }
 
-    pub(super) fn snapshot(
-        self,
-        budget: &mut Budget,
-        tokens: &[String],
-        depth: usize,
-    ) -> Self {
+    pub(super) fn snapshot(self, budget: &mut Budget, tokens: &[String], depth: usize) -> Self {
         budget.chars = budget.chars.saturating_sub(16);
         budget.nodes = budget.nodes.saturating_sub(1);
         match self {
             Self::Text(text) => Self::Text(copy_text(&text, budget, tokens)),
-            Self::Untrusted(text) => {
-                Self::Untrusted(copy_text(&text, budget, tokens))
-            }
-            Self::Endpoint(text) => {
-                Self::Endpoint(copy_text(&text, budget, tokens))
-            }
+            Self::Untrusted(text) => Self::Untrusted(copy_text(&text, budget, tokens)),
+            Self::Endpoint(text) => Self::Endpoint(copy_text(&text, budget, tokens)),
             Self::Arg(text) => Self::Arg(copy_text(&text, budget, tokens)),
             Self::Scalar(Value::Number(number))
                 if number.is_i64()
@@ -102,19 +86,12 @@ impl Field {
                 let mut copied = Vec::new();
                 for (index, (key, value)) in items.into_iter().enumerate() {
                     if index >= MAX_ITEMS || budget.full() {
-                        copied.push((
-                            CUT.into(),
-                            Self::Scalar(Value::from(count - index)),
-                        ));
+                        copied.push((CUT.into(), Self::Scalar(Value::from(count - index))));
                         break;
                     }
                     budget.chars = budget.chars.saturating_sub(16);
                     budget.nodes = budget.nodes.saturating_sub(1);
-                    let key = copy_text(
-                        prefix(&key, MAX_UNTRUSTED + 1),
-                        budget,
-                        tokens,
-                    );
+                    let key = copy_text(prefix(&key, MAX_UNTRUSTED + 1), budget, tokens);
                     let item = if budget.full() {
                         Self::Text(CUT.into())
                     } else {
@@ -129,10 +106,7 @@ impl Field {
                 let mut copied = Vec::new();
                 for (index, value) in items.into_iter().enumerate() {
                     if index >= MAX_ITEMS || budget.full() {
-                        copied.push(Self::Text(format!(
-                            "{CUT} {} more items",
-                            count - index
-                        )));
+                        copied.push(Self::Text(format!("{CUT} {} more items", count - index)));
                         break;
                     }
                     copied.push(value.snapshot(budget, tokens, depth + 1));
@@ -146,22 +120,16 @@ impl Field {
     pub(super) fn clean(self, tokens: &[String]) -> Value {
         match self {
             Self::Text(text) => Value::String(scrub(&text, tokens, &URL, false)),
-            Self::Untrusted(text) => {
-                Value::String(scrub(&text, tokens, &URL_REST, true))
-            }
-            Self::Arg(text) => {
-                Value::String(scrub(&text, tokens, &URL_REST, false))
-            }
+            Self::Untrusted(text) => Value::String(scrub(&text, tokens, &URL_REST, true)),
+            Self::Arg(text) => Value::String(scrub(&text, tokens, &URL_REST, false)),
             Self::Endpoint(text) => Value::String(origin(&text)),
-            Self::Array(items) => Value::Array(
-                items.into_iter().map(|item| item.clean(tokens)).collect(),
-            ),
+            Self::Array(items) => {
+                Value::Array(items.into_iter().map(|item| item.clean(tokens)).collect())
+            }
             Self::Object(items) => Value::Object(
                 items
                     .into_iter()
-                    .map(|(key, value)| {
-                        (scrub(&key, tokens, &URL, false), value.clean(tokens))
-                    })
+                    .map(|(key, value)| (scrub(&key, tokens, &URL, false), value.clean(tokens)))
                     .collect::<Map<_, _>>(),
             ),
             Self::Scalar(value) => value,

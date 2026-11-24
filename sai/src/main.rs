@@ -59,9 +59,10 @@ fn main() -> ExitCode {
     let environment = Environment::from_process();
     let started = Instant::now();
     let writer = if command == "logs"
-        || argv.iter().any(|flag| {
-            matches!(flag.as_str(), "--help" | "--version" | "--skill")
-        }) {
+        || argv
+            .iter()
+            .any(|flag| matches!(flag.as_str(), "--help" | "--version" | "--skill"))
+    {
         None
     } else {
         environment
@@ -107,9 +108,7 @@ fn main() -> ExitCode {
                     lcd_endpoint: cli.lcd_endpoint,
                 };
                 match cli.command {
-                    Command::Config { command } => {
-                        command.run(&flags, env, cli.json)
-                    }
+                    Command::Config { command } => command.run(&flags, env, cli.json),
                 }
             }),
         Err(error) => {
@@ -142,8 +141,7 @@ fn finish(
     (code, error): (u8, Option<String>),
 ) -> ExitCode {
     if let Some(writer) = writer {
-        let duration_ms =
-            (started.elapsed().as_secs_f64() * 1_000.0).round() as u64;
+        let duration_ms = (started.elapsed().as_secs_f64() * 1_000.0).round() as u64;
         let level = if code == 0 { Level::Info } else { Level::Warn };
         let mut fields = vec![
             ("command", command),
@@ -167,9 +165,7 @@ fn config_command(args: &[String]) -> &'static str {
             continue;
         }
         match arg.as_str() {
-            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => {
-                skip = true
-            }
+            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
             "logs" => return "logs",
             "config" => {
                 return match args
@@ -200,11 +196,7 @@ fn context_text(error: &clap::Error, kind: ContextKind) -> Option<&str> {
     }
 }
 
-fn usage_error(
-    error: &clap::Error,
-    command: &str,
-    argv: &[String],
-) -> Option<Error> {
+fn usage_error(error: &clap::Error, command: &str, argv: &[String]) -> Option<Error> {
     let arg = context_text(error, ContextKind::InvalidArg);
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => {
@@ -224,19 +216,14 @@ fn usage_error(
                     .cloned()
                     .collect::<Vec<_>>();
                 if extra.len() > 1 {
-                    format!(
-                        "Got unexpected extra arguments ({})",
-                        extra.join(" ")
-                    )
+                    format!("Got unexpected extra arguments ({})", extra.join(" "))
                 } else {
                     format!("Got unexpected extra argument ({argument})")
                 }
             }
         }
         ErrorKind::MissingRequiredArgument => {
-            let Some(ContextValue::Strings(args)) =
-                error.get(ContextKind::InvalidArg)
-            else {
+            let Some(ContextValue::Strings(args)) = error.get(ContextKind::InvalidArg) else {
                 return None;
             };
             let first = args.first()?.trim_matches(['<', '>']);
@@ -251,17 +238,10 @@ fn usage_error(
     Some(Error::usage(message))
 }
 
-fn print_parse_error(
-    error: &clap::Error,
-    command: &str,
-    argv: &[String],
-) -> (u8, Option<String>) {
+fn print_parse_error(error: &clap::Error, command: &str, argv: &[String]) -> (u8, Option<String>) {
     match error.kind() {
-        ErrorKind::DisplayHelp if config::print_help(command, false) => {
-            (0, None)
-        }
-        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-        | ErrorKind::MissingSubcommand
+        ErrorKind::DisplayHelp if config::print_help(command, false) => (0, None),
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
             if command == "config" =>
         {
             config::print_help(command, true);
@@ -273,9 +253,7 @@ fn print_parse_error(
                     let usage = usage.to_string();
                     let path = usage.trim_start_matches("Usage: sai").trim();
                     if path == "config" || path.starts_with("config ") {
-                        if path == command
-                            || path.starts_with(&format!("{command} "))
-                        {
+                        if path == command || path.starts_with(&format!("{command} ")) {
                             command
                         } else {
                             "config"
@@ -287,9 +265,7 @@ fn print_parse_error(
                 _ => command,
             };
             if let Some(usage) = usage_error(error, usage_command, argv) {
-                if error.kind() == ErrorKind::InvalidValue
-                    && usage_command.is_empty()
-                {
+                if error.kind() == ErrorKind::InvalidValue && usage_command.is_empty() {
                     eprintln!("Error: {}", usage.message);
                     return (usage.code, None);
                 }
