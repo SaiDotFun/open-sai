@@ -186,6 +186,13 @@ server = "history-invalid"
 wire = ["tradeHistory"]
 
 [[case]]
+name = "account-history-error-codes"
+args = ["--json","account","history","{addr}"]
+server = "history-graphql-errors"
+expect = 1
+wire = ["tradeHistory"]
+
+[[case]]
 name = "account-balances"
 args = ["--json","account","balances","{addr}"]
 wire = ["ws:init","ws:userBalances"]

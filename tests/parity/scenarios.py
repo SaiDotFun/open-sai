@@ -389,6 +389,28 @@ def loopback(scenario: str) -> Generator[Endpoints]:
                             b'{"priceUsd":18446744073709551616123456},'
                             b'{"priceUsd":"1.2300"}]}}}'
                         )
+                    elif (
+                        scenario == "history-graphql-errors" and name == "tradeHistory"
+                    ):
+                        self.reply(
+                            {
+                                **responses[name],
+                                "errors": [
+                                    {
+                                        "message": "opaque Keeper diagnostic",
+                                        "extensions": {
+                                            "code": "GRAPHQL_VALIDATION_FAILED"
+                                        },
+                                    },
+                                    {
+                                        "message": "opaque Keeper diagnostic",
+                                        "extensions": {"code": "unvalidated"},
+                                    },
+                                    {"message": "opaque Keeper diagnostic"},
+                                    {"extensions": {"code": "FORBIDDEN"}},
+                                ],
+                            }
+                        )
                     elif scenario == "read-partial-error":
                         self.reply(
                             {**responses[name], "errors": [{"message": "partial read"}]}
