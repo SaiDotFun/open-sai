@@ -248,6 +248,36 @@ mod tests {
     }
 
     #[test]
+    fn cancel_confirmation_refusal_carries_the_market_close_warning() {
+        use crate::trade::close_preview;
+
+        let account = "0xaa00000000000000000000000000000000000001";
+        let old = close_preview("8", true).unwrap();
+        let current = close_preview("7", true).unwrap();
+        let digest = preview_digest(&old, Some(account));
+        let refusal = Confirmation::new(&digest, None)
+            .unwrap()
+            .verify(&current, account)
+            .unwrap_err();
+        assert_eq!(refusal.code, Code::PreviewMismatch);
+        let replacement = &refusal.details.unwrap()["preview"];
+        assert_eq!(replacement["intent"]["target"]["userTradeId"], "7");
+        assert_eq!(
+            replacement["previewDigest"],
+            preview_digest(&current, Some(account))
+        );
+        for name in ["fees", "liquidationPrice", "worstCaseFill"] {
+            assert_eq!(
+                replacement["estimates"][name],
+                json!({
+                    "status": "unavailable",
+                    "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
+                })
+            );
+        }
+    }
+
+    #[test]
     fn refuses_price_movement_that_decimal_context_rounds_to_the_limit() {
         let account = "0xaa00000000000000000000000000000000000001";
         let mut preview = TradePreview::new(TradeIntent::new(

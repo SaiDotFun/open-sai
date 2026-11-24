@@ -82,6 +82,9 @@ impl TradePreview {
         if let Some(warning) = self.warning {
             output["warning"] = json!(warning);
         }
+        if self.intent.kind == "CANCEL_PENDING_TRADE" {
+            output["estimates"] = cancel::estimates();
+        }
         output
     }
 

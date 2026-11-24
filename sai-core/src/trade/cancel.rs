@@ -29,17 +29,7 @@ impl Trading<'_> {
         self.storage
             .check_active_trade(session, self.keeper.endpoint())?;
         self.check_pending_order(session, preview).await?;
-        let unavailable = json!({
-            "status": "unavailable",
-            "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
-        });
-        let mut output = preview.output(Some(session.addr()));
-        output["estimates"] = json!({
-            "fees": unavailable,
-            "liquidationPrice": unavailable,
-            "worstCaseFill": unavailable,
-        });
-        Ok(output)
+        Ok(preview.output(Some(session.addr())))
     }
 
     pub(super) async fn check_pending_order(
@@ -107,6 +97,18 @@ impl Trading<'_> {
         }
         Ok(())
     }
+}
+
+pub(super) fn estimates() -> Value {
+    let unavailable = json!({
+        "status": "unavailable",
+        "reason": "A pending order can fill before cancellation executes. Perp may close a filled position at market.",
+    });
+    json!({
+        "fees": unavailable,
+        "liquidationPrice": unavailable,
+        "worstCaseFill": unavailable,
+    })
 }
 
 async fn read_cancel_target(
