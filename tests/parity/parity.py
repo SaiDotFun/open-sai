@@ -381,7 +381,9 @@ def observe(
             text = path.read_text(encoding="utf-8")
             if any(value in text for value in case.absent_log_text):
                 raise ValueError("Fixture credential appeared in a log")
-    files = snapshot(home / "sai", normalize)
+    files = snapshot(
+        home / "sai", normalize, raw_config=case.seed == "doctor-malformed-toml"
+    )
     if case.client_seed:
         if SECRET in result.stdout or SECRET in result.stderr:
             raise ValueError("Client config value escaped into CLI output")

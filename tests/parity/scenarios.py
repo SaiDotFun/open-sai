@@ -132,6 +132,11 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
     sai_home.mkdir(mode=0o700)
     if seed == "empty":
         return
+    if seed == "doctor-malformed-toml":
+        config = sai_home / "config.toml"
+        config.write_text("[keeper\n")
+        config.chmod(0o600)
+        return
     if seed == "doctor-invalid-endpoint":
         config = sai_home / "config.toml"
         config.write_text('[keeper]\nendpoint = "https://fixture.invalid:bad/api"\n')

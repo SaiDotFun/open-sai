@@ -317,6 +317,7 @@ pub struct SettingsError {
     message: String,
     uneditable: bool,
     invalid_endpoint: bool,
+    malformed_toml: bool,
 }
 
 impl SettingsError {
@@ -325,6 +326,7 @@ impl SettingsError {
             message,
             uneditable: false,
             invalid_endpoint: false,
+            malformed_toml: false,
         }
     }
 
@@ -334,6 +336,10 @@ impl SettingsError {
 
     pub fn is_invalid_endpoint(&self) -> bool {
         self.invalid_endpoint
+    }
+
+    pub fn is_malformed_toml(&self) -> bool {
+        self.malformed_toml
     }
 
     fn with_context(mut self, origin: &str) -> Self {
@@ -795,7 +801,9 @@ fn parse_error(path: &Path, input: &str, error: &TomlError, editing: bool) -> Se
         };
         format!("{description} ({location})")
     };
-    SettingsError::invalid(format!("Cannot parse {}: {detail}", path.display()))
+    let mut error = SettingsError::invalid(format!("Cannot parse {}: {detail}", path.display()));
+    error.malformed_toml = true;
+    error
 }
 
 pub use edit::{set, unset};

@@ -662,7 +662,9 @@ def read_log(path: Path, day: str) -> list[dict[str, Any]]:
     return records
 
 
-def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
+def snapshot(
+    root: Path, normalize: Normalize, *, raw_config: bool = False
+) -> dict[str, Entry]:
     if not root.exists() and not root.is_symlink():
         return {}
     entries: dict[str, Entry] = {}
@@ -689,7 +691,11 @@ def snapshot(root: Path, normalize: Normalize) -> dict[str, Entry]:
                         raise ValueError("Log file modes differ within a surface")
                     records.extend(read_log(path, match["day"]))
                     continue
-                data = content(path, name, normalize)
+                data = (
+                    path.read_bytes()
+                    if raw_config and name == "config.toml"
+                    else content(path, name, normalize)
+                )
             except (InvalidReservationTime, InvalidLogTime):
                 raise
             except (ValueError, KeyError, TypeError, sqlite3.Error, InvalidTag) as exc:

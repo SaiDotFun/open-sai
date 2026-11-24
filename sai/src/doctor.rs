@@ -318,7 +318,9 @@ fn config_check(flags: &Flags, env: &Environment) -> (Check, Option<Settings>, b
         Ok(result) => result,
         Err(error) => {
             let message = error.to_string();
-            let message = if error.is_invalid_endpoint() {
+            let message = if error.is_malformed_toml() {
+                "config.toml is not valid TOML"
+            } else if error.is_invalid_endpoint() {
                 message
                     .strip_prefix(&format!("{}: ", env.path().display()))
                     .unwrap_or(&message)

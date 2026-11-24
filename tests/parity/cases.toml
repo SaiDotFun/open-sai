@@ -419,6 +419,13 @@ expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 
 [[case]]
+name = "doctor-malformed-toml"
+args = ["--json", "doctor", "--offline", "--no-fix"]
+seed = "doctor-malformed-toml"
+expect = 1
+state = { "trader" = "<absent>", "logs" = "<absent>" }
+
+[[case]]
 name = "doctor-near-expiry"
 args = ["--json", "doctor", "--offline", "--no-fix"]
 seed = "doctor-near-expiry"
