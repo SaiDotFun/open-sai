@@ -41,6 +41,8 @@ struct Pending {
     old: Option<String>,
     new: String,
     #[serde(skip_serializing_if = "Option::is_none")]
+    launcher: Option<(u64, u64)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     launcher_switch: Option<LauncherSwitch>,
 }
 
@@ -428,6 +430,12 @@ impl Standalone {
         };
         let record = self.root.join(RECORD);
         let launcher = self.launcher_identity()?;
+        let expected = pending
+            .launcher
+            .ok_or_else(|| "the pending Sai install record has no launcher identity".to_owned())?;
+        if (launcher.0, launcher.1) != expected {
+            return Err("the Sai launcher changed during the interrupted install".into());
+        }
         let active = self.selected_directory()?;
         let invalid =
             || "the pending Sai install record names a missing or invalid binary".to_owned();
@@ -520,6 +528,7 @@ impl Standalone {
             let pending = Pending {
                 old: Some(old.clone()),
                 new,
+                launcher: Some((launcher.0, launcher.1)),
                 launcher_switch: None,
             };
             state::atomic_json(&record, &pending).map_err(io_error)?;

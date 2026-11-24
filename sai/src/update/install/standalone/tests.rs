@@ -22,9 +22,13 @@ fn recovery_rolls_back_a_first_install_without_an_old_target() {
     let selector = root.join(SELECTOR);
     symlink(Path::new(&new).join("sai"), &selector).unwrap();
     symlink(Path::new(ROOT).join(SELECTOR), &launcher).unwrap();
-    let original = launcher_entry(&launcher).unwrap();
+    let original = launcher_entry(&launcher).unwrap().unwrap();
     let record = root.join(RECORD);
-    state::atomic_json(&record, &serde_json::json!({"old": null, "new": new})).unwrap();
+    state::atomic_json(
+        &record,
+        &serde_json::json!({"old": null, "new": new, "launcher": [original.0, original.1]}),
+    )
+    .unwrap();
 
     let install = Standalone::discover(&binary).unwrap();
     let _lock = state::try_lock(&install.lock_path()).unwrap().unwrap();
@@ -34,7 +38,7 @@ fn recovery_rolls_back_a_first_install_without_an_old_target() {
             .unwrap_err()
             .contains("first Sai install was rolled back")
     );
-    assert_eq!(launcher_entry(&launcher).unwrap(), original);
+    assert_eq!(launcher_entry(&launcher).unwrap(), Some(original));
     assert!(!selector.is_symlink());
     assert!(!record.exists());
     assert!(binary.is_file());
@@ -176,6 +180,7 @@ fn recovery_cleans_up_after_publishing_the_competing_launcher() {
     let mut pending = Pending {
         old: Some(old),
         new: format!("0.2.0-{}", "b".repeat(64)),
+        launcher: None,
         launcher_switch: Some(LauncherSwitch {
             staged: LAUNCHER_STAGE.into(),
             expected,

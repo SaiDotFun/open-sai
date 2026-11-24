@@ -458,8 +458,15 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
     selector.unlink()
     selector.symlink_to(staged.relative_to(root))
     record = root / "pending.json"
+    owner = standalone.launcher.lstat()
     record.write_text(
-        json.dumps({"old": standalone.executable.parent.name, "new": interrupted}),
+        json.dumps(
+            {
+                "old": standalone.executable.parent.name,
+                "new": interrupted,
+                "launcher": [owner.st_dev, owner.st_ino],
+            }
+        ),
         encoding="utf-8",
     )
     with releases({}, tags=(standalone.installed,)) as server:
@@ -472,6 +479,52 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
         assert json.loads(changed.stdout)["status"] == "current"
     assert standalone.launcher.resolve() == standalone.executable
     assert not record.exists()
+
+
+@pytest.mark.parametrize("has_previous", [False, True], ids=["first", "upgrade"])
+@pytest.mark.parametrize("record_identity", [True, False], ids=["recorded", "legacy"])
+def test_interrupted_rollback_refuses_a_replacement_launcher(
+    standalone: NativeInstall, has_previous: bool, record_identity: bool
+) -> None:
+    root = standalone.executable.parent.parent
+    candidate = root / f"{NEW}-{'a' * 64}" / "sai"
+    candidate.parent.mkdir()
+    shutil.copy2(standalone.executable, candidate)
+    selector = root / "current"
+    selector.unlink()
+    selector.symlink_to(candidate.relative_to(root))
+    selected = selector.lstat()
+
+    launcher = standalone.launcher
+    original = launcher.lstat()
+    link = launcher.readlink()
+    record = root / "pending.json"
+    journal: dict[str, str | list[int] | None] = {
+        "old": standalone.executable.parent.name if has_previous else None,
+        "new": candidate.parent.name,
+    }
+    if record_identity:
+        journal["launcher"] = [original.st_dev, original.st_ino]
+    pending = json.dumps(journal)
+    record.write_text(pending, encoding="utf-8")
+    launcher.rename(launcher.with_name("original-launcher"))
+    launcher.symlink_to(link)
+    replacement = launcher.lstat()
+    assert not os.path.samestat(replacement, original)
+
+    with releases({}) as server:
+        result = standalone.update(server)
+        assert not server.reads
+    assert result.returncode == 1, result.stdout
+    message = json.loads(result.stdout)["error"]["message"]
+    if record_identity:
+        assert "launcher changed during the interrupted install" in message
+    else:
+        assert "pending Sai install record has no launcher identity" in message
+    assert os.path.samestat(launcher.lstat(), replacement)
+    assert os.path.samestat(selector.lstat(), selected)
+    assert launcher.resolve(strict=True) == candidate
+    assert record.read_text(encoding="utf-8") == pending
 
 
 @pytest.mark.parametrize("has_previous", [False, True], ids=["first", "upgrade"])
