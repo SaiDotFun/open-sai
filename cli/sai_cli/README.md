@@ -384,6 +384,8 @@ close`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
 and live `watch` streams. Run any command with `--help` for details. Trading
 requires a funded account; funding is performed separately. Trade commands
 support `--dry-run` to inspect the local semantic request.
+Commands that act on an existing position verify ownership for the connected
+account before showing a preview or sending an intent.
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
 requiring refresh and may include an optional supplied reference. A partial
