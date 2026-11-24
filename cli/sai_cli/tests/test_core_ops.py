@@ -62,6 +62,17 @@ def test_load_active_session_checks_endpoint_and_expiry():
         session.load_active_session(ENDPOINT)
 
 
+def test_renewal_guidance_omits_an_origin_with_a_known_token():
+    token = "synthetic-session-token-for-renewal"
+    stored = session_for(endpoint=f"https://{token}.example.invalid")
+    stored.update(token=token, source="imported")
+    storage.save_session(stored)
+
+    fields = session.renewal_fields(stored)
+    assert "SAI_RECONCILE_ENDPOINT" in fields["renewalCommand"]
+    assert fields["renewalGuidance"] == "Reuse the Keeper endpoint used to sign in."
+
+
 def test_passphrase_session_is_refused_without_a_prompt():
     # A session from an older version that encrypted it with a passphrase.
     path = storage.directory() / "session.json"

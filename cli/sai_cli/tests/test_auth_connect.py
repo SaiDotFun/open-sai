@@ -7,6 +7,7 @@ is touched.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import inspect
@@ -14,6 +15,7 @@ import json
 import os
 import pty
 import secrets
+import shlex
 import subprocess
 import sys
 import termios
@@ -28,7 +30,10 @@ from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from sai_cli.core import keeper
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp.types import TextContent
+from sai_cli.core import keeper, storage
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
@@ -95,6 +100,23 @@ class Env:
             text=True,
             env=self.vars(),
             timeout=30,
+        )
+
+    def run_shell(
+        self, command: str, **overrides: str
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            ["/bin/sh", "-c", command],
+            env={
+                **self.vars(),
+                "PATH": f"{self.bin}{os.pathsep}{Path(sys.executable).parent}",
+                **overrides,
+            },
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
         )
 
     def run_tty(
@@ -962,10 +984,133 @@ def test_cli_status_and_list_report_expiry_warnings(env: Env):
     row = json.loads(result.stdout)["accounts"][0]
     assert row["expiryWarning"] == json.loads(status.stdout)["expiryWarning"]
     renewal = row["renewalCommand"]
-    assert renewal.startswith('sai --endpoint "${SAI_RECONCILE_ENDPOINT:?')
-    assert "auth import" in renewal
-    assert keeper.MAINNET_HTTP not in renewal
+    assert renewal == f"sai --endpoint {keeper.MAINNET_HTTP} auth import --addr {ADDR}"
     assert status.stderr == result.stderr == ""
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_paste_renewal_command_with_the_configured_keeper(
+    env: Env, keeper_auth, configured: bool
+):
+    endpoint = keeper.MAINNET_HTTP
+    shell = {"SAI_ENDPOINT": keeper_auth["endpoint"]}
+    if configured:
+        endpoint = f"{keeper_auth['endpoint']}/private-path"
+        assert env.run("config", "set", "keeper.endpoint", endpoint).returncode == 0
+        shell["SAI_RECONCILE_ENDPOINT"] = endpoint
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run("auth", "import").returncode == 0
+    report = json.loads(env.run("--json", "auth", "status").stdout)
+    command = report["renewalCommand"]
+    if configured:
+        assert "SAI_RECONCILE_ENDPOINT" in command
+        assert endpoint not in command
+    else:
+        assert command == f"sai --endpoint {endpoint} auth import --addr {ADDR}"
+
+    env.clip.write_text(make_token())
+    renewed = env.run_shell(command, **shell)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
+    assert env.run("--json", "auth", "status").returncode == 0
+
+
+@pytest.mark.parametrize("path", ["", "/private-recovery-path/query"])
+def test_mcp_renewal_routes_to_keeper_from_server_environment(
+    env: Env, keeper_auth, path: str
+):
+    origin = keeper_auth["endpoint"].removesuffix("/query")
+    endpoint = origin + path
+    args = ("--json", "--endpoint", endpoint, "auth")
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run(*args, "import").returncode == 0
+
+    async def report_session() -> dict[str, Any]:
+        params = StdioServerParameters(
+            command=sys.executable,
+            args=["-m", "sai_cli", "mcp", "serve"],
+            env={**env.vars(), "SAI_ENDPOINT": endpoint},
+        )
+        async with (
+            stdio_client(params) as (read, write),
+            ClientSession(read, write) as client,
+        ):
+            await client.initialize()
+            result = await client.call_tool("mcp_info", {})
+        [content] = result.content
+        assert isinstance(content, TextContent)
+        return json.loads(content.text)["session"]
+
+    report = asyncio.run(report_session())
+    assert report["usable"] is True
+    command = report["renewalCommand"]
+    env.clip.write_text(make_token())
+    if path:
+        assert path not in json.dumps(report)
+        refused = env.run_shell(command)
+        assert refused.returncode != 0
+        assert "Set SAI_RECONCILE_ENDPOINT to the original Keeper URL" in refused.stderr
+        renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    else:
+        assert shlex.split(command) == [
+            "sai",
+            "--endpoint",
+            origin,
+            "auth",
+            "import",
+            "--addr",
+            ADDR,
+        ]
+        renewed = env.run_shell(command)
+    assert renewed.returncode == 0, renewed.stderr
+    current = env.run(*args, "status")
+    assert current.returncode == 0
+    assert json.loads(current.stdout)["expiresAt"] > report["expiresAt"]
+
+
+@pytest.mark.parametrize("source", [None, "imported"])
+def test_renewal_refuses_another_accounts_clipboard_token(
+    env: Env, monkeypatch: pytest.MonkeyPatch, source: str | None
+):
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    stored = {
+        "evmAddress": ADDR,
+        "token": make_token(hours=48),
+        "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        "endpoint": keeper.MAINNET_HTTP,
+    }
+    if source is not None:
+        stored["source"] = source
+    storage.save_session(stored)
+    env.clipboard()
+    report = json.loads(env.run("--json", "auth", "status").stdout)
+    command = report["renewalCommand"]
+    assert shlex.split(command) == [
+        "sai",
+        "--endpoint",
+        keeper.MAINNET_HTTP,
+        "auth",
+        "import",
+        "--addr",
+        ADDR,
+    ]
+    before = storage.load_accounts()
+
+    wrong_token = make_token(OTHER)
+    env.clip.write_text(wrong_token)
+    refused = env.run_shell(command)
+    assert refused.returncode == 1
+    assert "different account than --addr" in refused.stderr
+    assert storage.load_accounts() == before
+    assert env.clip.read_text() == wrong_token
+
+    env.clip.write_text(make_token("0x" + ADDR[2:].upper()))
+    renewed = env.run_shell(command)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["expiresAt"] > report["expiresAt"]
+    assert storage.load_accounts()["active"] == ADDR
 
 
 @pytest.mark.parametrize("json_output", [False, True])
@@ -973,19 +1118,28 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     env.clipboard()
     env.clip.write_text(make_token(hours=48))
     assert env.run("auth", "import").returncode == 0
-    primary, secondary = pty.openpty()
     flags = ["--json"] if json_output else []
+    result, error = run_expiry_notice_on_terminal(
+        env, *flags, "config", "get", "keeper.endpoint"
+    )
+    assert "expires in" not in result.stdout
+    if json_output:
+        assert error == ""
+    else:
+        assert len(error.splitlines()) == 1
+        assert "expires in" in error
+        assert error.splitlines()[0].endswith(
+            f"Run sai --endpoint {keeper.MAINNET_HTTP} auth import --addr {ADDR}"
+        )
+
+
+def run_expiry_notice_on_terminal(
+    env: Env, *args: str
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    primary, secondary = pty.openpty()
     try:
         result = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "sai_cli",
-                *flags,
-                "config",
-                "get",
-                "keeper.endpoint",
-            ],
+            [sys.executable, "-m", "sai_cli", *args],
             env={**env.vars(), "CI": "1"},
             stdin=secondary,
             stderr=secondary,
@@ -1002,15 +1156,67 @@ def test_expiry_notice_uses_stderr_on_a_terminal(env: Env, json_output: bool):
     finally:
         os.close(primary)
         os.close(secondary)
-    assert "expires in" not in result.stdout
-    if json_output:
-        assert error == ""
-    else:
-        assert len(error.splitlines()) == 1
-        assert "expires in" in error
-        assert 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?' in error
-        assert "auth import" in error
-        assert keeper.MAINNET_HTTP not in error
+    return result, error
+
+
+@pytest.mark.parametrize("auth", ["status", "list"])
+def test_expiry_notice_with_path_endpoint(env: Env, keeper_auth, auth: str):
+    endpoint = f"{keeper_auth['endpoint']}/private-path"
+    args = ("--endpoint", endpoint, "auth")
+    env.clipboard()
+    env.clip.write_text(make_token(hours=48))
+    assert env.run(*args, "import").returncode == 0
+
+    result, error = run_expiry_notice_on_terminal(env, *args, auth)
+    assert len(error.splitlines()) == 1
+    assert f"{ADDR} expires in" in error
+    assert "private-path" not in result.stdout + error
+    data = json.loads(result.stdout)
+    row = data if auth == "status" else data["accounts"][0]
+    assert row["addr"] == ADDR
+    command = row["renewalCommand"]
+    assert error.splitlines()[0].endswith(f" Run {command}")
+
+    env.clip.write_text(make_token(hours=720))
+    renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    assert renewed.returncode == 0, renewed.stderr
+    assert json.loads(renewed.stdout)["addr"] == ADDR
+    current = env.run("--json", *args, "status")
+    assert current.returncode == 0
+    assert "expiryWarning" not in json.loads(current.stdout)
+
+
+def test_legacy_expiry_notice_with_invalid_subject_guides_sign_in(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("SAI_HOME", str(env.home))
+    addr = ADDR[:-4] + "\n\r\x1b\u2028"
+    stored = {
+        "evmAddress": addr,
+        "token": make_token(addr, hours=48),
+        "expiresAt": (datetime.now(UTC) + timedelta(hours=48)).isoformat(),
+        "endpoint": keeper.MAINNET_HTTP,
+    }
+    storage.save_session(stored)
+
+    result, warning = run_expiry_notice_on_terminal(env, "auth", "status")
+    report = json.loads(result.stdout)
+    assert "renewalCommand" not in report
+    assert (
+        report["renewalGuidance"] == "Stored session address is invalid. Sign in again."
+    )
+    assert warning.splitlines() == [
+        f"{report['expiryWarning']} {report['renewalGuidance']}"
+    ]
+    assert rf"{ADDR[:-4]}\n\r\x1b\u2028" in warning
+
+    stored["expiresAt"] = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+    storage.save_session(stored)
+    expired = env.run("--json", "auth", "status")
+    assert expired.returncode == 6
+    failure = json.loads(expired.stdout)["error"]
+    assert failure["message"] == report["renewalGuidance"]
+    assert "hint" not in failure
 
 
 @pytest.mark.parametrize(
@@ -1029,14 +1235,39 @@ def test_session_hint_preserves_endpoint_context_without_exposing_credentials(
     status = env.run(*args, "status")
     row = json.loads(status.stdout)
     assert row["endpoint"] == origin
-    assert f"reuse the Keeper endpoint at {origin}" in row["renewalCommand"]
+    assert shlex.split(row["renewalCommand"]) == [
+        "sai",
+        "--endpoint",
+        "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}",
+        "auth",
+        "import",
+        "--addr",
+        ADDR,
+    ]
+    assert f"Reuse the Keeper endpoint at {origin}" in row["renewalGuidance"]
     refused = env.run(*args, "renew")
     assert refused.returncode == 1
-    assert "reuse the Keeper endpoint" in login_error(refused)
+    assert f"Reuse the Keeper endpoint at {origin}" in login_error(refused)
     assert (
         "synthetic-test-credential"
         not in status.stdout + refused.stdout + refused.stderr
     )
+
+    env.clip.write_text(make_token())
+    command = row["renewalCommand"]
+    missing_endpoint = env.run_shell(command)
+    assert missing_endpoint.returncode != 0
+    assert (
+        "Set SAI_RECONCILE_ENDPOINT to the original Keeper URL"
+        in missing_endpoint.stderr
+    )
+
+    renewed = env.run_shell(command, SAI_RECONCILE_ENDPOINT=endpoint)
+    assert renewed.returncode == 0, renewed.stderr
+    assert "synthetic-test-credential" not in renewed.stdout + renewed.stderr
+    current = env.run(*args, "status")
+    assert current.returncode == 0
+    assert json.loads(current.stdout)["expiresAt"] > row["expiresAt"]
 
 
 def test_renew_json_shows_only_the_keeper_origin(env: Env, keeper_auth):
