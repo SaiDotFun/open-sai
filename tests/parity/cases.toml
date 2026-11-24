@@ -512,6 +512,7 @@ wire = ["borrowings", "oneClickTrading", "node_info", "get_market", "get_group",
 [[case]]
 name = "trade-close"
 args = ["--json","trade","close","7","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-cancel"
@@ -523,10 +524,12 @@ wire = ["oneClickTrading", "node_info", "get_trade_raw"]
 [[case]]
 name = "trade-tpsl"
 args = ["--json","trade","tpsl","7","--take-profit","110","--clear-stop-loss","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-leverage"
 args = ["--json","trade","leverage","7","--leverage","5","--dry-run"]
+expect = 6
 
 [[case]]
 name = "trade-margin"
@@ -556,5 +559,5 @@ name = "trade-concurrent-close"
 args = ["--json", "trade", "close", "7"]
 seed = "session"
 server = "concurrent-close"
-wire = ["recordUserIntent"]
+wire = ["trade", "recordUserIntent", "trade"]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

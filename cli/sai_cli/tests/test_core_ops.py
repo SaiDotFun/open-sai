@@ -11,6 +11,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
+from loopback_keeper import position_data
 from sai_cli.core import keeper, margin, reconcile, session, storage, stream, trading
 from websockets.sync.server import ServerConnection, serve
 from websockets.typing import Subprotocol
@@ -119,6 +120,9 @@ class FakeKeeper:
                     "evmAddress": ADDR,
                 }
             }
+        if query == keeper.POSITION and query not in self.answers:
+            assert variables is not None
+            return position_data(variables)
         return json.loads(json.dumps(self.answers[query]))
 
     def intent(self) -> dict[str, Any]:
@@ -291,7 +295,7 @@ def test_preview_is_exactly_what_is_submitted(
 ):
     fake = FakeKeeper()
     monkeypatch.setattr(keeper, "request", fake)
-    preview = action(ENDPOINT, no_session, dry_run=True, **args)
+    preview = action(ENDPOINT, session_for, dry_run=True, **args)
     assert preview["dryRun"] is True
     result = action(ENDPOINT, session_for, dry_run=False, **args)
     assert result["status"] == "accepted"

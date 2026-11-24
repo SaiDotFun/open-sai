@@ -10,6 +10,20 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 
+def position_data(variables: dict[str, Any]) -> dict[str, Any]:
+    """Return the selected account's synthetic position in a Keeper response."""
+    return {
+        "perp": {
+            "trade": {
+                "id": variables["id"],
+                "trader": variables["trader"],
+                "isOpen": True,
+                "tradeType": "trade",
+            }
+        }
+    }
+
+
 class KeeperHandler(BaseHTTPRequestHandler):
     def read_json(self) -> dict[str, Any]:
         return json.loads(self.rfile.read(int(self.headers["Content-Length"])))

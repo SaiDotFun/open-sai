@@ -27,6 +27,7 @@ from typing import Any
 import httpx
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import position_data
 from mcp.server.fastmcp.exceptions import ToolError
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
@@ -183,8 +184,10 @@ def keeper_stub() -> Iterator[tuple[str, Keeper]]:
             state.paths.append(self.path)
             state.authorizations.append(self.headers.get("Authorization"))
             query = body["query"]
-            if state.errors is not None:
-                value: dict[str, Any] = {"errors": state.errors}
+            if query == keeper.POSITION:
+                value: dict[str, Any] = {"data": position_data(body["variables"])}
+            elif state.errors is not None:
+                value = {"errors": state.errors}
             elif "recordUserIntent" in query and state.ack_tx_hash is not None:
                 envelope = body["variables"]["input"]
                 value = {
@@ -692,7 +695,7 @@ def test_admission_rejection_keeps_its_code_and_key_in_cli_and_logs(home, keeper
     assert storage.list_pending(base, ADDR)[0]["status"] == "rejected"
     assert events(home, "intent.status")[0]["intentKey"] == key
     for event in ("keeper.request", "intent.status", "command.end"):
-        assert events(home, event)[0]["code"] == error["code"]
+        assert events(home, event)[-1]["code"] == error["code"]
 
 
 def test_command_path_skips_options_and_their_values():
@@ -1946,7 +1949,7 @@ def test_logs_intent_joins_cli_and_mcp_and_reads_keeper(home, keeper_stub):
             endpoint.removesuffix("/query"): "http://127.0.0.1:43210",
         },
     )
-    assert state.authorizations == [f"Bearer {token}"]
+    assert state.authorizations == [None, f"Bearer {token}"]
     record = {
         "intentKey": key,
         "kind": "CLOSE_POSITION",

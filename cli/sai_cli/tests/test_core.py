@@ -8,6 +8,7 @@ from decimal import Decimal
 import httpx
 import pytest
 from click.testing import CliRunner
+from loopback_keeper import KeeperHandler, keeper_server, position_data
 from sai_cli.core import intents, keeper, margin, storage
 from sai_cli.sai_cli import main
 
@@ -134,35 +135,45 @@ def test_keeper_only_classifies_explicit_rejection(monkeypatch):
         keeper.request("https://example.com", keeper.SUBMIT)
 
 
-def test_cli_dry_run_does_not_create_session_or_send():
+def test_cli_position_dry_run_requires_a_session():
     result = CliRunner().invoke(main, ["--json", "trade", "close", "4", "--dry-run"])
-    assert result.exit_code == 0
-    assert '"CLOSE_POSITION"' in result.output
+    assert result.exit_code == 6
+    assert json.loads(result.stdout)["error"]["code"] == "SIGNED_OUT"
     assert not storage.home().exists()
 
 
 def test_cli_dry_run_names_the_account_it_would_use(session):
-    session = {**session, "endpoint": "http://127.0.0.1:1/query"}
-    other = {**session, "evmAddress": "0x" + "c" * 40, "token": "other-token"}
-    storage.save_session(session)
-    storage.save_session(other)
-    args = [
-        "--endpoint",
-        session["endpoint"],
-        "--json",
-        "trade",
-        "close",
-        "4",
-        "--dry-run",
-    ]
-    active = CliRunner().invoke(main, args)
-    assert json.loads(active.output)["addr"] == other["evmAddress"]
-    chosen = CliRunner().invoke(main, ["--as", session["evmAddress"], *args])
-    assert json.loads(chosen.output)["addr"] == session["evmAddress"]
-    assert "token" not in active.output + chosen.output
-    missing = CliRunner().invoke(main, ["--as", "0x" + "d" * 40, *args])
-    assert missing.exit_code != 0
-    assert "is not connected" in missing.output
+    class Handler(KeeperHandler):
+        def do_POST(self):
+            body = self.read_json()
+            if body["query"] == keeper.ROUTE:
+                self.reply({"errors": [{"message": "Route unavailable"}]})
+                return
+            assert body["query"] == keeper.POSITION
+            self.reply({"data": position_data(body["variables"])})
+
+    with keeper_server(Handler) as base:
+        session = {**session, "endpoint": f"{base}/query"}
+        other = {**session, "evmAddress": "0x" + "c" * 40, "token": "other-token"}
+        storage.save_session(session)
+        storage.save_session(other)
+        args = [
+            "--endpoint",
+            session["endpoint"],
+            "--json",
+            "trade",
+            "close",
+            "4",
+            "--dry-run",
+        ]
+        active = CliRunner().invoke(main, args)
+        assert json.loads(active.output)["addr"] == other["evmAddress"]
+        chosen = CliRunner().invoke(main, ["--as", session["evmAddress"], *args])
+        assert json.loads(chosen.output)["addr"] == session["evmAddress"]
+        assert "token" not in active.output + chosen.output
+        missing = CliRunner().invoke(main, ["--as", "0x" + "d" * 40, *args])
+        assert missing.exit_code != 0
+        assert "is not connected" in missing.output
 
 
 def test_trade_session_stays_on_the_account_it_first_loaded(session):

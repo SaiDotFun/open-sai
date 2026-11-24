@@ -23,7 +23,7 @@ from typing import Any
 
 import pytest
 from click.testing import CliRunner
-from loopback_keeper import KeeperHandler, keeper_server
+from loopback_keeper import KeeperHandler, keeper_server, position_data
 from mcp.server.fastmcp import FastMCP
 from mcp.types import TextContent
 from sai_cli.core import keeper, log, reconcile, settings, storage, wait
@@ -110,6 +110,9 @@ def keeper_replay(submitted_keys: list[str]) -> Iterator[tuple[str, deque[Reply]
             try:
                 request = self.read_json()
             except (ConnectionResetError, json.JSONDecodeError):
+                return
+            if request["query"] == keeper.POSITION:
+                self.reply({"data": position_data(request["variables"])})
                 return
             if request["query"] == keeper.SUBMIT:
                 active_key = request["variables"]["input"]["intentKey"]

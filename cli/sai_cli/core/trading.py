@@ -279,13 +279,14 @@ def close_trade(
         _checked(before_submit, preview, cancel_estimate)
         return intents.submit(endpoint, get_session(), payload)
 
-    return preview_or_submit(
+    return _position_intent(
         endpoint,
         get_session,
         payload,
         dry_run,
         before_submit,
-        lambda _: _estimate_position(endpoint, lcd_endpoint, get_session, trade_id),
+        lcd_endpoint,
+        trade_id,
     )
 
 
@@ -306,15 +307,15 @@ def set_tpsl(
     payload = intents.tpsl_intent(
         trade_id, take_profit, stop_loss, clear_take_profit, clear_stop_loss
     )
-    return preview_or_submit(
+    return _position_intent(
         endpoint,
         get_session,
         payload,
         dry_run,
         before_submit,
-        lambda _: _estimate_position(
-            endpoint, lcd_endpoint, get_session, trade_id, updates_triggers=True
-        ),
+        lcd_endpoint,
+        trade_id,
+        updates_triggers=True,
     )
 
 
@@ -331,30 +332,58 @@ def set_leverage(
     """Set target leverage without changing TP or SL."""
     payload = intents.leverage_intent(trade_id, leverage)
 
-    def estimate(_preview: dict[str, Any]) -> dict[str, Any]:
-        return _estimate_position(
-            endpoint, lcd_endpoint, get_session, trade_id, target=Decimal(leverage)
-        )
+    return _position_intent(
+        endpoint,
+        get_session,
+        payload,
+        dry_run,
+        before_submit,
+        lcd_endpoint,
+        trade_id,
+        target=Decimal(leverage),
+    )
 
+
+def _position_intent(
+    endpoint: str,
+    get_session: SessionLoader,
+    payload: dict[str, Any],
+    dry_run: bool,
+    before_submit: SubmitCheck,
+    lcd: str | None,
+    trade_id: int,
+    *,
+    target: Decimal | None = None,
+    updates_triggers: bool = False,
+) -> dict[str, Any]:
+    active = get_session()
+    addr = active["evmAddress"]
+    indexed = margin.indexed_position(endpoint, addr, trade_id)
     return preview_or_submit(
-        endpoint, get_session, payload, dry_run, before_submit, estimate
+        endpoint,
+        lambda: active,
+        payload,
+        dry_run,
+        before_submit,
+        lambda _: _estimate_position(
+            endpoint, lcd, addr, trade_id, indexed, target, updates_triggers
+        ),
     )
 
 
 def _estimate_position(
     endpoint: str,
     lcd: str | None,
-    get_session: SessionLoader,
+    addr: str,
     trade_id: int,
-    *,
-    target: Decimal | None = None,
-    updates_triggers: bool = False,
+    indexed: dict[str, Any],
+    target: Decimal | None,
+    updates_triggers: bool,
 ) -> dict[str, Any]:
     state, effective, height = None, None, None
     if lcd is not None:
         try:
-            addr = get_session()["evmAddress"]
-            state = margin.snapshot(endpoint, lcd, addr, trade_id)
+            state = margin.snapshot(endpoint, lcd, addr, trade_id, indexed=indexed)
             if target is not None or updates_triggers:
                 height = margin.verified_position_height(lcd, state, trade_id)
                 effective, _ = margin.leverage_inputs(
