@@ -126,12 +126,13 @@ in the browser. Keeper issues it for 30 days in production. It authorizes
 every trade kind on the account's deposited funds, and Keeper cannot revoke it
 yet: signing out of Sai Web clears only the browser copy, not the CLI's.
 
-`auth import` stores a token copied from Sai Web. The **Connect Sai CLI /
-MCP** button that copies it is in review
-(https://github.com/SaiDotFun/sai-web/pull/1591); until it ships, use
-`auth login NAME` below.
+On Sai Web Mainnet, open the wallet menu and select **Connect Sai CLI / MCP**
+beside **Send to phone**. The button appears for the selected, connected
+wallet with an active trading session. Check the expiry, click **Copy session
+token**, and run the `sai auth import` command shown in the dialog. The command
+specifies the Mainnet endpoint.
 
-- With a terminal, it asks for the token at a hidden prompt. Press Enter
+- With a terminal, paste the token at the hidden prompt or press Enter
   without typing to read the clipboard.
 - Without a terminal, as when an agent runs it, it reads the clipboard with the
   first command that works: `pbpaste`, `wl-paste`, `xclip`, or `powershell.exe
