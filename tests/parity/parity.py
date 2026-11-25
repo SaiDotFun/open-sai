@@ -36,6 +36,7 @@ from compare import (
     config_text,
     first_difference,
     ledger,
+    mask_overview_stdout,
     rewrite_mcp_fields,
     snapshot,
     stderr_category,
@@ -45,7 +46,6 @@ from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
-from sai_cli.core import log
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import (
@@ -82,7 +82,7 @@ class Case:
     absent_log_text: list[str] | None = None
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
-    expected_overview_help: str | None = None
+    overview_expected: dict[str, Any] | None = None
     exact_output: bool = False
 
     @property
@@ -329,6 +329,27 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
             raise ValueError(f"Persisted state differs from expectation at {selector}")
 
 
+def check_overview_fields(fields: dict[str, Any], output: Any) -> None:
+    absent = object()
+    for selector, expected in fields.items():
+        value = output
+        for key in selector.split("."):
+            if isinstance(value, dict):
+                value = value.get(key, absent)
+            elif isinstance(value, list) and key == "@len":
+                value = len(value)
+            elif isinstance(value, list) and key.isdecimal() and int(key) < len(value):
+                value = value[int(key)]
+            else:
+                value = absent
+        if first_difference(
+            value, None if expected == "<null>" else expected, selector
+        ):
+            raise ValueError(
+                f"Overview field {selector} differs from the fixture expectation"
+            )
+
+
 def observe(
     case: Case,
     binary: list[str],
@@ -387,9 +408,10 @@ def observe(
             result = interrupt_command(
                 binary, args, home, env, ready=endpoints.interrupt_ready
             )
-            if case.server != "interrupt-http" and not endpoints.interrupt_closed.wait(
-                4
-            ):
+            if case.server not in {
+                "interrupt-http",
+                "overview-interrupt-http",
+            } and not endpoints.interrupt_closed.wait(4):
                 raise ValueError("WebSocket did not close after SIGINT")
         finally:
             endpoints.interrupt_closed.set()
@@ -462,8 +484,11 @@ def observe(
         else:
             state[f"{filename}#{entry}"] = "<absent>"
     check_state(state, files)
+    display = result.stdout
+    if case.command == "account overview" and case.mode == "text":
+        display = mask_overview_stdout(display, case.mode)
     try:
-        output = stdout(result.stdout, case.mode, case.command, normalize)
+        output = stdout(display, case.mode, case.command, normalize)
         if contender:
             output = {
                 "first": output,
@@ -477,6 +502,8 @@ def observe(
         raise ValueError(
             f"Invalid {case.mode} stdout (exit {result.returncode})"
         ) from None
+    if case.overview_expected:
+        check_overview_fields(case.overview_expected, output)
     if case.mode == "mcp":
         check_mcp_calls(output, case.mcp_profile)
     stderr = stderr_category(result.stderr)
@@ -491,7 +518,9 @@ def observe(
         "account",
         "watch",
     }
-    raw = (result.stdout.encode(), result.stderr.encode()) if exact else None
+    if case.command == "account overview" and case.mode == "json":
+        display = mask_overview_stdout(display, case.mode)
+    raw = (display.encode(), result.stderr.encode()) if exact else None
     return Observation(result.returncode, output, stderr, files, raw)
 
 
@@ -596,45 +625,6 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
         if a.kind == b.kind and (found := first_difference(a.data, b.data, name)):
             diffs.append(found)
     return diffs
-
-
-def matches_overview_help_difference(
-    reference: Observation, candidate: Observation
-) -> bool:
-    if reference.raw is None or candidate.raw is None:
-        return False
-    overview_line = (
-        b"  overview   Show Sai funds, positions, orders, local blockers, and...\n"
-    )
-    stdout_bytes, stderr = reference.raw
-    adjusted_stderr = stderr.replace(overview_line, b"", 1)
-    # Keep all other output and event fields under the usual comparison.
-    if adjusted_stderr == stderr or adjusted_stderr != candidate.raw[1]:
-        return False
-    name = "logs/cli.jsonl"
-    entry = reference.files.get(name)
-    if entry is None or len(entry.data) != 2:
-        return False
-    start, end = entry.data
-    if end.get("event") != "command.end":
-        return False
-    original, adjusted = [
-        log.clean(
-            log.untrusted(text.partition(b"\nError: ")[2].decode().removesuffix("\n")),
-            (),
-        )
-        for text in (stderr, adjusted_stderr)
-    ]
-    if end.get("error") != original:
-        return False
-    files = {
-        **reference.files,
-        name: replace(entry, data=[start, {**end, "error": adjusted}]),
-    }
-    adjusted_reference = replace(
-        reference, files=files, raw=(stdout_bytes, adjusted_stderr)
-    )
-    return not differences(adjusted_reference, candidate)
 
 
 def safe_observe(
@@ -843,13 +833,6 @@ def run_case(
             allow_deferred_trade=case.mcp_deferred_trade_exception,
         )
     diffs = differences(left, right)
-    if (
-        diffs
-        and case.expected_overview_help
-        and matches_overview_help_difference(left, right)
-    ):
-        diffs = []
-        expected = case.expected_overview_help
     if reference_exit != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {reference_exit}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
@@ -942,8 +925,13 @@ def main() -> int:
     mismatches = 0
     expected_differences = 0
     tools: dict[str, str] = {}
+    overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
-        if case.mode == "mcp":
+        if overview_reference and (
+            case.name == "account-bare" or case.command == "account overview"
+        ):
+            oracle = [str(Path(overview_reference).absolute())]
+        elif case.mode == "mcp":
             oracle = mcp_reference
         elif case.command == "mcp uninstall":
             oracle = [uninstall_python]
