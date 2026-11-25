@@ -73,8 +73,10 @@ pub async fn login(
     terminal: bool,
     warn: impl Fn(&str),
 ) -> Result<Session, LoginError> {
-    if let Some(addr) = expected.filter(|addr| !is_evm_address(addr)) {
-        return Err(invalid(format!("Not an EVM addr: {addr}")));
+    if expected.is_some_and(|addr| !is_evm_address(addr)) {
+        return Err(invalid(
+            "Invalid value for '--addr': expected an EVM address.".into(),
+        ));
     }
     let path = home.join(".foundry/keystores").join(name);
     let has_keystore = path.is_file();
@@ -138,9 +140,7 @@ pub async fn login(
     if let Some(wallet) = wallet {
         return Err(invalid(wallet.state_hint(name)));
     }
-    Err(invalid(format!(
-        "No key named {name}: there is no Foundry keystore ~/.foundry/keystores/{name}. Run `cast wallet list` to see keystores, or connect with `sai auth import`."
-    )))
+    Err(invalid("Invalid value for 'NAME': no wallet found. Run `cast wallet list` to see keystores, or connect with `sai auth import`.".into()))
 }
 
 fn invalid(message: String) -> LoginError {
@@ -184,7 +184,7 @@ async fn ud_wallet(name: &str) -> Result<Option<UdWallet>, String> {
     if !installed("ud") {
         return Ok(None);
     }
-    let tool = format!("`ud evm wallet show {name}`");
+    let tool = "`ud evm wallet show`";
     let mut command = Command::new("ud");
     command
         .args(["evm", "wallet", "show", name])

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -17,7 +18,7 @@ import tomlkit
 from click.testing import CliRunner
 from sai_cli import mcp_install
 from sai_cli import sai_cli as cli
-from sai_cli.core import log
+from sai_cli.core import log, updater
 from sai_cli.sai_cli import main
 from test_update import GIT, make_prefix
 
@@ -29,7 +30,7 @@ OTHER = "otherserver-private-name"
 # Both fakes record argv to $FAKE_LOG and keep state where the real client
 # would, so a second run sees the first run's change.
 FAKE_CLAUDE = """
-import json, os, sys
+import json, os, shutil, subprocess, sys
 from pathlib import Path
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(sys.argv) + "\\n")
@@ -44,7 +45,13 @@ path = (
 data = json.loads(path.read_text()) if path.exists() else {}
 holder = data
 if scope == "local":
-    holder = data.setdefault("projects", {}).setdefault(str(Path.cwd()), {})
+    git = shutil.which("git")
+    root = Path.cwd()
+    if git is not None:
+        found = subprocess.run([git, "rev-parse", "--show-toplevel"], capture_output=True)
+        if found.returncode == 0:
+            root = Path(os.fsdecode(found.stdout.strip()))
+    holder = data.setdefault("projects", {}).setdefault(str(root), {})
 servers = holder.setdefault("mcpServers", {})
 name = args[args.index("--scope") + 2]
 if args[1] == "remove":
@@ -71,9 +78,9 @@ import tomlkit
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(sys.argv) + "\\n")
 args = sys.argv[1:]
-assert args[:2] == ["mcp", "get"], args
 name = args[2]
 config = Path(os.environ["CODEX_HOME"]) / "config.toml"
+assert args[:2] == ["mcp", "get"], args
 state = tomlkit.parse(config.read_text()).unwrap() if config.exists() else {}
 # Stands in for Codex's own project rules: a project entry Codex would load
 # from this directory is given in ./fake-codex-project.json.
@@ -87,6 +94,10 @@ else:
     if entry is None:
         sys.stderr.write(f"Error: No MCP server named '{name}' found.\\n")
         sys.exit(1)
+    for i in range(4, len(args), 2):
+        assert args[i] == "-c"
+        key, value = args[i + 1].split("=", 1)
+        entry[key.removeprefix(f"mcp_servers.{name}.")] = tomlkit.parse(f"item = {value}").unwrap()["item"]
     transport = dict(entry)
     data = {"enabled": transport.pop("enabled", True), "transport": transport}
     for key in ("enabled_tools", "disabled_tools"):
@@ -297,7 +308,9 @@ def test_doctor_reports_claude_and_repairs_codex_and_cursor_registrations(
     assert report.exit_code == (1 if expected == "fail" else 0), report.output
     checks = mcp_checks(report)
     assert set(checks) == set(mcp_install.CLIENTS)
-    assert {check["status"] for check in checks.values()} == {expected}
+    claude_status = "warn" if kind == "stable" else expected
+    assert checks["claude"]["status"] == claude_status
+    assert checks["codex"]["status"] == checks["cursor"]["status"] == expected
     assert [path.read_bytes() for path in files] == before
     assert {call[1] for call in env.calls()} == {"get"}
 
@@ -308,7 +321,7 @@ def test_doctor_reports_claude_and_repairs_codex_and_cursor_registrations(
     )
     checks = mcp_checks(result)
     assert {name: check["status"] for name, check in checks.items()} == {
-        "claude": expected,
+        "claude": claude_status,
         "codex": status,
         "cursor": status,
     }
@@ -317,7 +330,11 @@ def test_doctor_reports_claude_and_repairs_codex_and_cursor_registrations(
     else:
         assert files[0].read_bytes() == before[0]
         assert not checks["claude"].get("changes")
-        assert f"--scope user --repair-existing {name}" in checks["claude"]["fix"]
+        if name == OLD_COMMAND:
+            assert f"--scope user --repair-existing {name}" in checks["claude"]["fix"]
+        else:
+            assert "claude mcp remove" not in checks["claude"]["fix"]
+            assert f"claude mcp add --scope user {name}" in checks["claude"]["fix"]
         entries = doctor_entries(env)
         for registrations in (entries["codex"], entries["cursor"]):
             assert registrations == {
@@ -464,29 +481,20 @@ def test_doctor_reports_exact_claude_repairs_for_each_scope(env: Env, monkeypatc
     assert check["status"] == "fail" and not check.get("changes")
     assert [user_file.read_bytes(), project_file.read_bytes()] == before
     commands = check["fix"].split("`")[1::2]
-    assert set(commands) == {
-        f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
-        for scope, name in (("user", "sai"), ("project", "sai"), ("local", OLD_COMMAND))
-    }
-    for command in commands:
-        repair = invoke(*command.split()[1:])
-        assert repair.exit_code == 0, repair.output
-        assert actions(repair) == {"claude": "replaced"}
-        assert SECRET not in repair.output
-    user = env.claude_json()
-    local = user["projects"][str(env.project)]
-    project = json.loads(project_file.read_text())
-    expected = {**old, "command": str(env.sai), "args": ["mcp", "serve", *suffix]}
-    for scope in (user, project):
-        assert scope["mcpServers"] == {
-            "sai": expected,
-            OTHER: {"command": "untouched"},
-        }
-    assert local["mcpServers"] == {
-        OLD_COMMAND: expected,
-        "sai": claude_entry(serve(env)),
-    }
-    assert user["preference"] is True
+    for scope in ("user", "project", "local"):
+        assert f"Remove the existing {scope} sai entry" in check["fix"]
+        assert "claude mcp remove" not in check["fix"]
+        add = f"claude mcp add --scope {scope} sai --env=SAI_HOME={home}"
+        if scope != "local":
+            add += " '--env=<NAME>=<value>'"
+        add += f" -- {shlex.quote(str(env.sai))} mcp serve"
+        if scope != "local":
+            add += " --endpoint '<original-argument>'"
+        assert any(add in command for command in commands)
+    assert (
+        f"sai mcp install --client claude --scope local --repair-existing {OLD_COMMAND}"
+        in commands
+    )
     assert {call[1] for call in env.calls()} == {"get"}
     for private_value in (SECRET, OTHER, "private.example"):
         assert private_value not in result.output
@@ -503,7 +511,7 @@ def test_claude_repair_stages_a_complete_entry_before_atomic_publication(
     entry = claude_entry(
         [OLD_COMMAND, *suffix], {"SAI_HOME": pinned_home, "CUSTOM": SECRET}
     )
-    original = {"mcpServers": {"sai": entry, OTHER: {"command": "untouched"}}}
+    original = {"mcpServers": {OLD_COMMAND: entry, OTHER: {"command": "untouched"}}}
     config = env.home / ".claude.json"
     config.write_text(json.dumps(original))
     # Observe the actual os.replace syscall boundary without modifying Sai.
@@ -514,7 +522,7 @@ from pathlib import Path
 
 from sai_cli.sai_cli import main
 
-config, marker = map(Path, sys.argv[1:])
+config, marker = map(Path, sys.argv[1:3])
 
 def interrupt_write(event, args):
     if event == "os.rename" and Path(args[1]) == config:
@@ -523,13 +531,13 @@ def interrupt_write(event, args):
 
 sys.addaudithook(interrupt_write)
 main.main(
-    ["mcp", "install", "--client", "claude", "--repair-existing", "sai"],
+    ["mcp", "install", "--client", "claude", "--repair-existing", sys.argv[3]],
     prog_name="sai",
 )
 """
 
     result = subprocess.run(
-        [sys.executable, "-c", code, str(config), str(marker)],
+        [sys.executable, "-c", code, str(config), str(marker), OLD_COMMAND],
         check=False,
         capture_output=True,
         text=True,
@@ -540,7 +548,7 @@ main.main(
     assert result.returncode != 0
     assert json.loads(marker.read_text()) == {
         "mcpServers": {
-            "sai": {
+            OLD_COMMAND: {
                 **entry,
                 "command": str(env.sai),
                 "args": ["mcp", "serve", *suffix],
@@ -590,7 +598,11 @@ def test_doctor_compares_sai_home_without_printing_or_rewriting_it(
     assert check["status"] == status
     assert ("SAI_HOME" in check["summary"]) == (status == "warn")
     assert profiles["different"] not in result.output
-    assert profiles["current"] not in json.dumps(check)
+    assert profiles["current"] not in check["summary"]
+    if expected == "current" and actual is None:
+        assert f"--env=SAI_HOME={profiles['current']}" in check["fix"]
+    if status == "warn" and isinstance(actual, str):
+        assert "--env=SAI_HOME=<original-SAI_HOME>" in check["fix"]
     assert path.read_text() == original
 
 
@@ -816,6 +828,130 @@ def test_doctor_updates_symlink_referent_and_keeps_link(env: Env, client: str):
     assert stat.S_IMODE(referent.stat().st_mode) == 0o640
 
 
+@pytest.mark.parametrize(
+    "writer", ["none", "other-server", "remove-entry", "replace-entry"]
+)
+def test_doctor_does_not_write_a_rejected_codex_repair(env: Env, writer: str):
+    original_entry = (
+        f'[mcp_servers."{OLD_COMMAND}"] # keep this\n'
+        f'command = "{OLD_COMMAND}"\n'
+        'args = ["--endpoint", "http://127.0.0.1:8765"]\n'
+        f'env = {{ CUSTOM = "{SECRET}" }}\n'
+    )
+    unrelated = '\n[mcp_servers.other]\ncommand = "other"\n'
+    source = original_entry + unrelated
+    after, state = {
+        "none": (source, "The original Sai entry is unchanged."),
+        "other-server": (
+            source + "\n[mcp_servers.newer_server]\ncustom_setting = true\n",
+            "The original Sai entry is unchanged.",
+        ),
+        "remove-entry": (unrelated, "The Sai entry is missing."),
+        "replace-entry": (
+            original_entry.replace(f'command = "{OLD_COMMAND}"', 'command = "new"')
+            + unrelated,
+            "The Sai entry was changed by another process.",
+        ),
+    }[writer]
+    config = env.codex_path()
+    config.write_bytes(source.encode())
+    before = config.stat()
+    # Reject the proposed launcher and verify it never reached the live file.
+    # A concurrent writer may still update the file while Codex reads it.
+    reject = f"""
+    if entry["command"] == {str(env.sai)!r}:
+        assert config.read_bytes() == {source.encode()!r}
+        if {writer != "none"!r}:
+            config.write_bytes({after.encode()!r})
+        sys.stderr.write({SECRET!r})
+        sys.exit(3)
+"""
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "    transport = dict(entry)", reject + "    transport = dict(entry)"
+        ),
+    )
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 1, result.output
+    check = mcp_checks(result)["codex"]
+    assert check["status"] == "fail"
+    assert "Codex rejected the proposed repair." in check["summary"]
+    assert state in check["summary"]
+    assert not check.get("changes")
+    assert config.read_bytes() == after.encode()
+    if writer == "none":
+        current = config.stat()
+        assert (current.st_ino, current.st_mtime_ns) == (
+            before.st_ino,
+            before.st_mtime_ns,
+        )
+    assert list(env.codex_home.iterdir()) == [config]
+    assert any("-c" in call for call in env.calls())
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+    assert SECRET not in result.output
+
+
+@pytest.mark.parametrize("has_policy", [False, True])
+def test_doctor_prints_redacted_codex_restore_command(env: Env, has_policy: bool):
+    saved_keys = (
+        "ROUND4_MOCK_PRIVATE_KEYNAME",
+        "SAI_RESTORE_FIXTURE",
+        "sk-fixture-token-used-as-a-key",
+    )
+    original = {
+        "command": str(env.root / SECRET / OLD_COMMAND),
+        "args": [f"--endpoint=https://fixture.invalid/{SECRET}"],
+        "env": dict.fromkeys(saved_keys, SECRET),
+    }
+    if has_policy:
+        original.update(enabled=False, enabled_tools=[])
+    env.write_codex({"sai": original})
+    before = env.codex_path().read_bytes()
+    reject = f"""
+    if entry["command"] == {str(env.sai)!r}:
+        sys.stderr.write({SECRET!r})
+        sys.exit(3)
+"""
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "    transport = dict(entry)", reject + "    transport = dict(entry)"
+        ),
+    )
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 1
+    check = mcp_checks(result)["codex"]
+    assert "The original Sai entry is unchanged." in check["summary"]
+    [command] = check["fix"].split("`")[1::2]
+    assert shlex.split(command) == [
+        "codex",
+        "mcp",
+        "add",
+        "sai",
+        *(["--env", "<NAME>=<value>"] * len(saved_keys)),
+        "--",
+        "<original-launcher>",
+        "--endpoint=<original-value>",
+    ]
+    assert ("Codex config.toml" in check["fix"]) is has_policy
+    count = f"The saved entry has {len(saved_keys)} environment assignments."
+    assert count in check["fix"]
+    text_result = CliRunner().invoke(main, ["doctor", "--offline"])
+    assert text_result.exit_code == 1
+    assert count in text_result.output
+    assert text_result.output.count("--env '<NAME>=<value>'") == len(saved_keys)
+    logs = "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
+    outputs = result.output + text_result.output + logs + env.log.read_text()
+    assert all(private not in outputs for private in (SECRET, *saved_keys))
+    assert env.codex_path().read_bytes() == before
+    assert list(env.codex_home.iterdir()) == [env.codex_path()]
+
+
 def test_doctor_reports_same_stale_codex_project_entry_after_repairing_user(env: Env):
     entry = {"command": OLD_COMMAND, "args": []}
     override = env.project / "fake-codex-project.json"
@@ -872,6 +1008,39 @@ def test_doctor_repairs_codex_with_a_normalized_stable_launcher(
         assert mcp_checks(invoke("doctor", "--offline"))["codex"]["status"] == "pass"
 
 
+def test_codex_install_replaces_launcher_with_a_missing_path_component(env: Env):
+    missing = env.root / "removed-directory"
+    launcher = missing / ".." / "bin" / "sai"
+    env.write_codex({"sai": claude_entry([str(launcher), *serve(env)[1:]])})
+
+    listed = invoke("mcp", "list")
+    assert listed.exit_code == 0, listed.output
+    codex = next(row for row in payload(listed)["clients"] if row["client"] == "codex")
+    assert codex["registered"] and not codex["current"]
+    assert not codex["registrations"][0]["current"]
+
+    installed = invoke("mcp", "install", "codex")
+    assert installed.exit_code == 0, installed.output
+    assert actions(installed) == {"codex": "replaced"}
+    entry = tomlkit.parse(env.codex_path().read_text())["mcp_servers"]["sai"]
+    assert entry["command"] == str(env.sai)
+
+
+def test_codex_install_rejects_a_matching_broken_explicit_launcher(env: Env):
+    launcher = env.root / "removed-directory" / ".." / "bin" / "sai"
+    argv = [str(launcher), *serve(env)[1:]]
+    env.write_codex({"sai": claude_entry(argv, {"CUSTOM": SECRET})})
+    original = env.codex_path().read_bytes()
+
+    result = invoke("mcp", "install", "codex", "--", *argv)
+
+    assert "requested server launcher is missing or not executable" in failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    assert row["action"] == "failed" and not row["changed"]
+    assert env.codex_path().read_bytes() == original
+    assert not env.calls()
+
+
 def test_install_uses_each_clients_registration_backend(env: Env):
     result = invoke("mcp", "install", "claude", "codex", "cursor")
     assert result.exit_code == 0, result.output
@@ -904,20 +1073,25 @@ def test_rerun_is_unchanged_and_runs_no_add(env: Env):
     assert env.calls() == GETS
 
 
-def test_install_replaces_an_old_entry(env: Env):
-    (env.home / ".claude.json").write_text(
+def test_install_reports_old_claude_entry_and_still_replaces_codex(env: Env):
+    config = env.home / ".claude.json"
+    config.write_text(
         json.dumps({"mcpServers": {"sai": {"command": OLD_COMMAND, "args": []}}})
     )
+    before = config.read_bytes()
     env.write_codex({"sai": {"type": "stdio", "command": OLD_COMMAND, "args": []}})
     result = invoke("mcp", "install", "claude", "codex")
-    assert actions(result) == {"claude": "replaced", "codex": "replaced"}
-    sai = str(env.sai)
-    assert env.calls() == [
-        ["mcp", "remove", "--scope", "user", "sai"],
-        ["mcp", "add", "--scope", "user", "sai", "--", sai, "mcp", "serve"],
-        *GETS,
-        *CHECK,
-    ]
+    assert "differs from the requested settings" in failure(result)
+    details = payload(result)["error"]["details"]
+    assert [row["action"] for row in details["results"]] == ["failed", "replaced"]
+    assert details["results"][1]["changed"]
+    assert config.read_bytes() == before
+    assert env.calls() == GETS + CHECK
+    env.clear()
+    explicit = invoke("mcp", "install", "claude", "--repair-existing", "sai")
+    assert "differs from the requested settings" in failure(explicit)
+    assert config.read_bytes() == before
+    assert not env.calls()
 
 
 @pytest.mark.parametrize("repair_first", [False, True])
@@ -1056,9 +1230,12 @@ def test_claude_install_leaves_a_disabled_canonical_project_entry_in_place(
 @pytest.mark.skipif(
     os.name == "nt", reason="Claude uses worktree-local settings on Windows"
 )
-@pytest.mark.parametrize("name", [OLD_COMMAND, "sai"])
+@pytest.mark.parametrize(
+    ("name", "entry_scope"),
+    [(OLD_COMMAND, "project"), ("sai", "project"), (OLD_COMMAND, "user")],
+)
 def test_claude_install_honors_settings_from_the_main_checkout(
-    env: Env, monkeypatch: pytest.MonkeyPatch, name: str
+    env: Env, monkeypatch: pytest.MonkeyPatch, name: str, entry_scope: str
 ):
     git = shutil.which("git", path=os.defpath)
     assert git is not None
@@ -1083,22 +1260,40 @@ def test_claude_install_honors_settings_from_the_main_checkout(
         subprocess.run(
             [git, "-C", str(env.project), *args], check=True, capture_output=True
         )
-    policy = env.project / ".claude" / "settings.local.json"
-    policy.parent.mkdir()
-    policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
-    config = linked / ".mcp.json"
-    config.write_text(json.dumps({"mcpServers": {name: claude_entry(serve(env))}}))
-    before = config.read_bytes(), policy.read_bytes()
+    data: dict[str, Any] = {"mcpServers": {name: claude_entry(serve(env))}}
+    if entry_scope == "user":
+        config = env.home / ".claude.json"
+        data["projects"] = {
+            str(env.project): {"disabledMcpServers": [name]},
+            str(linked): {"disabledMcpServers": []},
+        }
+        paths = [config]
+    else:
+        config = linked / ".mcp.json"
+        policy = env.project / ".claude" / "settings.local.json"
+        policy.parent.mkdir()
+        policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
+        paths = [config, policy]
+    config.write_text(json.dumps(data))
+    before = [path.read_bytes() for path in paths]
     monkeypatch.chdir(linked)
     scope = "user" if name == OLD_COMMAND else "project"
+
+    listed = invoke("mcp", "list")
+    assert listed.exit_code == 0, listed.output
+    claude = next(
+        row for row in payload(listed)["clients"] if row["client"] == "claude"
+    )
+    assert claude["disabled"] and not claude["current"]
+    assert claude["registrations"][0]["disabled"]
+    env.clear()
 
     result = invoke("mcp", "install", "claude", "--scope", scope)
 
     message = failure(result)
-    assert "claude (project): failed" in message and "disabled" in message
+    assert f"claude ({entry_scope}): failed" in message and "disabled" in message
     assert name in message and "Review MCP approvals" in message
-    assert (config.read_bytes(), policy.read_bytes()) == before
-    assert not (env.home / ".claude.json").exists()
+    assert [path.read_bytes() for path in paths] == before
     assert not env.calls()
 
 
@@ -1212,6 +1407,526 @@ def test_claude_install_reports_an_explicit_command_blocked_by_a_legacy_alias(
     assert not env.calls()
 
 
+def claude_add_command(hint: str) -> str:
+    [command] = [
+        part for part in hint.split("`")[1::2] if part.startswith("claude mcp add ")
+    ]
+    return command
+
+
+def test_claude_manual_commands_are_copyable(env: Env, monkeypatch: pytest.MonkeyPatch):
+    profile = env.root / "a profile"
+    monkeypatch.setenv("SAI_HOME", str(profile))
+    config = env.home / ".claude.json"
+    config.write_text(
+        json.dumps(
+            {"mcpServers": {"sai": {**claude_entry(serve(env)), "cwd": "/custom"}}}
+        )
+    )
+    before = config.read_bytes()
+    result = invoke("mcp", "install", "claude")
+    assert "differs from the requested settings" in failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    assert config.read_bytes() == before
+    assert not env.calls()
+    command = claude_add_command(row["fix"])
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell is not None
+    assert f"The user sai entry in {config} differs in env, cwd." in row["fix"]
+    config.write_text('{"mcpServers": {}}')
+    subprocess.run([shell, "-c", command], cwd=env.project, check=True)
+    assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
+        serve(env), {"SAI_HOME": str(profile)}
+    )
+
+
+@pytest.mark.parametrize("profile", ["relative profile", "~/profile with spaces"])
+def test_claude_printed_profile_matches_normal_install(
+    env: Env, monkeypatch: pytest.MonkeyPatch, profile: str
+):
+    monkeypatch.setenv("SAI_HOME", profile)
+    config = env.home / ".claude.json"
+    config.write_text(
+        json.dumps({"mcpServers": {"sai": claude_entry(["old-launcher"])}})
+    )
+    expected_home = os.path.abspath(os.path.expanduser(profile))
+    result = invoke("mcp", "install", "claude")
+    failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    commands = row["fix"].split("`")[1::2]
+    assert any(
+        shlex.quote(f"--env=SAI_HOME={expected_home}") in cmd for cmd in commands
+    )
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    monkeypatch.delenv("SAI_HOME")
+    config.write_text('{"mcpServers": {}}')
+    command = claude_add_command(row["fix"])
+    subprocess.run([shell, "-c", command], cwd=env.home, check=True)
+    assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": expected_home}
+    monkeypatch.setenv("SAI_HOME", profile)
+    assert actions(invoke("mcp", "install", "claude")) == {"claude": "unchanged"}
+
+
+@pytest.mark.parametrize("unavailable", ["missing", "not-executable"])
+def test_claude_advice_checks_the_launcher_before_manual_removal(
+    env: Env, unavailable: str
+):
+    config = env.home / ".claude.json"
+    original = json.dumps({"mcpServers": {"sai": claude_entry(["old-launcher"])}})
+    config.write_text(original)
+    result = invoke("mcp", "install", "claude")
+    failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    hint = row["fix"]
+    [check, add] = hint.split("`")[1::2]
+    assert (
+        check
+        == f"test -f {shlex.quote(str(env.sai))} && test -x {shlex.quote(str(env.sai))}"
+    )
+    assert hint.index(check) < hint.index("Remove the existing") < hint.index(add)
+    assert "Continue only if it succeeds." in hint
+    assert "claude mcp remove" not in hint
+
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    subprocess.run([shell, "-c", check], check=True)
+    if unavailable == "missing":
+        env.sai.unlink()
+    else:
+        env.sai.chmod(0o600)
+    assert subprocess.run([shell, "-c", check], check=False).returncode != 0
+    assert config.read_text() == original and not env.calls()
+
+
+def test_claude_printed_add_uses_the_absolute_launcher_and_inline_profile(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+):
+    profile = env.root / "inline profile"
+    monkeypatch.setenv("SAI_HOME", str(profile))
+    config = env.home / ".claude.json"
+    before = json.dumps({"mcpServers": {"sai": claude_entry(["old-launcher"])}})
+    config.write_text(before)
+    result = invoke("mcp", "install", "claude")
+    failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    command = claude_add_command(row["fix"])
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "sai",
+        f"--env=SAI_HOME={profile}",
+        "--",
+        *serve(env),
+    ]
+    assert config.read_text() == before and not env.calls()
+
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    client_bin = env.root / "client bin"
+    client_bin.mkdir()
+    shutil.copy2(env.bin / "claude", client_bin / "claude")
+    monkeypatch.delenv("SAI_HOME")
+    monkeypatch.setenv("PATH", str(client_bin))
+    config.write_text('{"mcpServers": {}}')
+    subprocess.run([shell, "-c", command], cwd=env.project, check=True)
+    assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
+        serve(env), {"SAI_HOME": str(profile)}
+    )
+
+
+@pytest.mark.parametrize("surface", ["install", "doctor"])
+def test_claude_local_report_reads_the_git_root_entry(
+    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+):
+    git = shutil.which("git", path=os.defpath)
+    assert git
+    subprocess.run([git, "-C", str(env.project), "init", "--quiet"], check=True)
+    nested = env.project / "nested checkout"
+    nested.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
+    monkeypatch.chdir(nested)
+    root_entry = claude_entry(["missing-root-wrapper"])
+    nested_entry = claude_entry(serve(env))
+    original = {
+        "projects": {
+            str(env.project): {"mcpServers": {"sai": root_entry}},
+            str(nested): {"mcpServers": {"sai": nested_entry}},
+        }
+    }
+    (env.home / ".claude.json").write_text(json.dumps(original))
+
+    if surface == "doctor":
+        result = invoke("doctor", "--offline")
+        check = mcp_checks(result)["claude"]
+        assert "points to a missing command" in check["summary"]
+        fix = check["fix"]
+    else:
+        result = invoke("mcp", "install", "claude", "--scope", "local")
+        assert "differs from the requested settings" in failure(result)
+        [row] = payload(result)["error"]["details"]["results"]
+        fix = row["fix"]
+    assert env.claude_json() == original
+    command = claude_add_command(fix)
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "local",
+        "sai",
+        "--",
+        *serve(env),
+    ]
+    assert "claude mcp remove" not in fix
+    assert "directory you normally use" in fix
+
+
+@pytest.mark.parametrize("surface", ["install", "doctor", "update"])
+def test_claude_report_names_the_relative_config_without_changing_directory(
+    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+):
+    git = shutil.which("git", path=os.defpath)
+    assert git
+    subprocess.run([git, "-C", str(env.project), "init", "--quiet"], check=True)
+    nested = env.project / "subdir"
+    nested.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "profile")
+    monkeypatch.chdir(nested)
+    nested_file = nested / "profile" / ".claude.json"
+    root_file = env.project / "profile" / ".claude.json"
+    for path, entry in (
+        (nested_file, claude_entry(["missing-wrapper"], {"PRIVATE": SECRET})),
+        (root_file, claude_entry(serve(env))),
+    ):
+        path.parent.mkdir()
+        path.write_text(
+            json.dumps({"projects": {str(env.project): {"mcpServers": {"sai": entry}}}})
+        )
+    files = (nested_file, root_file)
+    before = [path.read_bytes() for path in files]
+
+    if surface == "install":
+        result = invoke("mcp", "install", "claude", "--scope", "local")
+        failure(result)
+        [row] = payload(result)["error"]["details"]["results"]
+        assert row["path"] == str(nested_file)
+        fix = row["fix"]
+    elif surface == "doctor":
+        fix = mcp_checks(invoke("doctor", "--offline"))["claude"]["fix"]
+    else:
+        outcome = updater.repair_after_update(
+            updater.Outcome(updater.UPDATED, "updated"), env.sai, False
+        )
+        fix = updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes)
+    assert f"The local sai entry in {nested_file} differs in command, args, env." in fix
+    assert str(root_file) not in fix and SECRET not in fix
+    command = claude_add_command(fix)
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "local",
+        "sai",
+        "--env=<NAME>=<value>",
+        "--",
+        *serve(env),
+    ]
+    assert "claude mcp remove" not in fix
+    assert "Remove the existing local sai entry" in fix
+    assert [path.read_bytes() for path in files] == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Claude uses a local key on Windows")
+@pytest.mark.parametrize("surface", ["install", "doctor", "update"])
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("disabled_at_root", [False, True])
+def test_claude_uses_the_main_checkout_toggle_for_the_local_entry(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    linked: bool,
+    disabled_at_root: bool,
+):
+    git = shutil.which("git", path=os.defpath)
+    assert git
+    worktree = env.root / "linked worktree"
+    directory = worktree if linked else env.project / "nested"
+    for args in (
+        ["init", "--quiet"],
+        [
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "--quiet",
+            "--allow-empty",
+            "-m",
+            "Initial commit",
+        ],
+    ):
+        subprocess.run([git, "-C", str(env.project), *args], check=True)
+    if linked:
+        subprocess.run(
+            [
+                git,
+                "-C",
+                str(env.project),
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                str(worktree),
+            ],
+            check=True,
+        )
+    else:
+        directory.mkdir()
+    monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
+    monkeypatch.chdir(directory)
+    projects: dict[str, dict[str, Any]] = {
+        str(env.project): {"mcpServers": {"sai": claude_entry(["missing-wrapper"])}},
+        str(directory): {"mcpServers": {"sai": claude_entry(serve(env))}},
+    }
+    toggle_key = env.project if disabled_at_root else directory
+    projects[str(toggle_key)]["disabledMcpServers"] = ["sai"]
+    original = {"projects": projects}
+    (env.home / ".claude.json").write_text(json.dumps(original))
+
+    if surface == "doctor":
+        check = mcp_checks(invoke("doctor", "--offline"))["claude"]
+        message = check["summary"] + " " + check["fix"]
+    elif surface == "update":
+        outcome = updater.repair_after_update(
+            updater.Outcome(updater.UPDATED, "updated"), env.sai, False
+        )
+        message = updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes)
+    else:
+        result = invoke("mcp", "install", "claude", "--scope", "local")
+        failure(result)
+        message = result.output
+    if disabled_at_root:
+        assert "Claude Code has disabled" in message
+        assert "claude mcp add" not in message
+    else:
+        assert "claude mcp add --scope local sai" in message
+        assert "disabled" not in message
+    assert env.claude_json() == original
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+
+@pytest.mark.parametrize("background", [False, True])
+def test_update_ignores_a_healthy_claude_profile_pin(env: Env, background: bool):
+    config = env.home / ".claude.json"
+    profile = env.root / "pinned profile"
+    original = {
+        "mcpServers": {"sai": claude_entry(serve(env), {"SAI_HOME": str(profile)})}
+    }
+    config.write_text(json.dumps(original))
+
+    updated = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, background
+    )
+
+    assert updated.mcp_results() == []
+    assert "Claude Code" not in updater.mcp_notice(
+        updated.mcp_results(), updated.mcp_notes
+    )
+    assert env.claude_json() == original
+    assert not any(call[1] in ("add", "remove") for call in env.calls())
+
+
+@pytest.mark.parametrize("background", [False, True])
+@pytest.mark.parametrize("has_env", [False, True])
+def test_update_leaves_a_working_claude_endpoint_override_alone(
+    env: Env, background: bool, has_env: bool
+):
+    config = env.home / ".claude.json"
+    overrides = {"SAI_LCD_ENDPOINT": "http://127.0.0.1:26657"} if has_env else {}
+    entry = claude_entry(
+        [*serve(env), "--endpoint", "http://127.0.0.1:8765/graphql"], overrides
+    )
+    config.write_text(json.dumps({"mcpServers": {"sai": entry}}))
+    before = config.read_bytes()
+
+    outcome = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, background
+    )
+
+    assert outcome.mcp_results() == []
+    assert "Claude Code" not in updater.mcp_notice(
+        outcome.mcp_results(), outcome.mcp_notes
+    )
+    assert config.read_bytes() == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+
+@pytest.mark.parametrize("surface", ["install", "doctor", "background"])
+def test_claude_replacement_advice_preserves_saved_server_options(
+    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+):
+    config = env.home / ".claude.json"
+    monkeypatch.setenv("SAI_HOME", str(env.root / "other-profile"))
+    profile = "profiles/paper"
+    endpoint = "http://127.0.0.1:8765/graphql"
+    ws_endpoint = f"wss://private.example/{SECRET}"
+    saved_args = [
+        "mcp",
+        "serve",
+        "--endpoint",
+        endpoint,
+        f"--ws-endpoint={ws_endpoint}",
+    ]
+    private_key = "FIXTURE_CREDENTIAL_AS_ENV_KEY"
+    options = {"SAI_HOME": profile, private_key: SECRET}
+    config.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "sai": claude_entry(["missing-wrapper", *saved_args], options)
+                }
+            }
+        )
+    )
+    before = config.read_bytes()
+
+    if surface == "install":
+        result = invoke("mcp", "install", "claude")
+        failure(result)
+        [row] = payload(result)["error"]["details"]["results"]
+        fix, diagnostic = row["fix"], result.output
+    elif surface == "doctor":
+        result = invoke("doctor", "--offline")
+        fix, diagnostic = mcp_checks(result)["claude"]["fix"], result.output
+    else:
+        outcome = updater.repair_after_update(
+            updater.Outcome(updater.UPDATED, "updated"), env.sai, True
+        )
+        results = outcome.mcp_results()
+        saved_results = json.loads(json.dumps(results))
+        fix = updater.mcp_notice(saved_results, outcome.mcp_notes)
+        diagnostic = fix + json.dumps(results)
+        del saved_results[0]["manualRepairs"][0]["serverArgs"]
+        assert "claude mcp add" not in updater.mcp_notice(
+            saved_results, outcome.mcp_notes
+        )
+    assert all(
+        value not in diagnostic for value in (SECRET, private_key, "private.example")
+    )
+    redacted_profile = profile if surface == "background" else "<original-SAI_HOME>"
+    if surface != "background":
+        assert profile not in diagnostic
+    assert (
+        fix.index("Fill in the placeholders")
+        < fix.index("Continue only if it succeeds")
+        < fix.index("Remove the existing")
+    )
+    assert "claude mcp remove" not in fix
+    assert config.read_bytes() == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+    command = shlex.split(claude_add_command(fix))
+    assert command == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "sai",
+        f"--env=SAI_HOME={redacted_profile}",
+        "--env=<NAME>=<value>",
+        "--",
+        *serve(env),
+        "--endpoint",
+        "<original-argument>",
+        "--ws-endpoint=<original-argument>",
+    ]
+    replacements = {
+        "--env=SAI_HOME=<original-SAI_HOME>": f"--env=SAI_HOME={profile}",
+        "--env=<NAME>=<value>": f"--env={private_key}={SECRET}",
+        "<original-argument>": endpoint,
+        "--ws-endpoint=<original-argument>": f"--ws-endpoint={ws_endpoint}",
+    }
+    config.write_text('{"mcpServers": {}}')
+    subprocess.run([replacements.get(arg, arg) for arg in command], check=True)
+    assert env.claude_json()["mcpServers"]["sai"] == claude_entry(
+        [str(env.sai), *saved_args], options
+    )
+
+
+def test_update_commands_keep_the_profile_of_a_stale_claude_entry(env: Env):
+    profile = env.root / "pinned profile"
+    original = {
+        "mcpServers": {
+            "sai": claude_entry(["old-launcher"], {"SAI_HOME": str(profile)})
+        }
+    }
+    (env.home / ".claude.json").write_text(json.dumps(original))
+    updated = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, True
+    )
+    notice = updater.mcp_notice(updated.mcp_results(), updated.mcp_notes)
+    assert shlex.quote(f"--env=SAI_HOME={profile}") in notice
+    assert env.claude_json() == original
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "${HOME}/fixture profile",
+        "${SAI_PROFILE:-fixture-profile}",
+        "relative profile",
+        "",
+        None,
+    ],
+)
+def test_update_keeps_the_saved_claude_profile(
+    env: Env, monkeypatch: pytest.MonkeyPatch, profile: str | None
+):
+    config = env.project / ".mcp.json"
+    fallback = env.root / "active profile"
+    monkeypatch.setenv("SAI_HOME", str(fallback))
+    saved_env = {"SAI_HOME": profile} if profile is not None else {}
+    original = {"mcpServers": {"sai": claude_entry(["missing-wrapper"], saved_env)}}
+    config.write_text(json.dumps(original))
+    before = config.read_bytes()
+
+    updated = updater.repair_after_update(
+        updater.Outcome(updater.UPDATED, "updated"), env.sai, False
+    )
+    notice = updater.mcp_notice(updated.mcp_results(), updated.mcp_notes)
+    command = claude_add_command(notice)
+    expected = profile if profile is not None else str(fallback)
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "project",
+        "sai",
+        f"--env=SAI_HOME={expected}",
+        "--",
+        *serve(env),
+    ]
+    assert config.read_bytes() == before
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+
+    shell = shutil.which("sh", path=os.defpath)
+    assert shell
+    config.write_text('{"mcpServers": {}}')
+    subprocess.run([shell, "-c", command], cwd=env.project, check=True)
+    assert json.loads(config.read_text())["mcpServers"]["sai"]["env"] == {
+        "SAI_HOME": expected
+    }
+
+
 def test_repair_existing_refuses_to_create_a_claude_registration(env: Env):
     args = ("mcp", "install", "--client", "claude", "--repair-existing", OLD_COMMAND)
     config = env.home / ".claude.json"
@@ -1240,7 +1955,8 @@ def test_doctor_reports_remote_claude_entries_without_a_launcher_repair(env: Env
     result = invoke("doctor", "--offline")
     check = mcp_checks(result)["claude"]
     assert check["status"] == "fail"
-    assert "Review the remote Sai registration" in check["fix"]
+    assert "claude mcp remove" not in check["fix"]
+    assert "differs in command, args, url, type" in check["fix"]
     assert "--repair-existing" not in check["fix"]
     assert SECRET not in result.output
     assert config.read_text() == original
@@ -1252,7 +1968,7 @@ def test_explicit_claude_repair_preserves_arguments_or_requires_reset(env, unsup
     routing = ["--endpoint", f"https://private.example/{SECRET}"]
     args = [*routing, "--bad-flag"] if unsupported else routing
     entry = claude_entry(["missing-wrapper", *args], {"CUSTOM": SECRET})
-    original = json.dumps({"mcpServers": {"sai": entry}})
+    original = json.dumps({"mcpServers": {OLD_COMMAND: entry}})
     config.write_text(original)
 
     report = invoke("doctor", "--offline")
@@ -1266,7 +1982,7 @@ def test_explicit_claude_repair_preserves_arguments_or_requires_reset(env, unsup
     result = invoke(*command.split()[1:])
     assert result.exit_code == 0, result.output
     assert env.claude_json()["mcpServers"] == {
-        "sai": {
+        OLD_COMMAND: {
             **entry,
             "command": str(env.sai),
             "args": ["mcp", "serve", *([] if unsupported else routing)],
@@ -1394,10 +2110,16 @@ def test_sai_home_is_the_only_env_carried(env: Env, monkeypatch):
     assert tomlkit.parse(env.codex_path().read_text())["mcp_servers"]["sai"]["env"] == {
         "SAI_HOME": str(sai_home)
     }
-    # A registration without SAI_HOME differs and is replaced.
+    # A registration with a different SAI_HOME needs a manual update in Claude.
     monkeypatch.delenv("SAI_HOME")
     again = invoke("mcp", "install", "claude", "codex", "cursor")
-    assert set(actions(again).values()) == {"replaced"}
+    assert "differs from the requested settings" in failure(again)
+    assert [row["action"] for row in payload(again)["error"]["details"]["results"]] == [
+        "failed",
+        "replaced",
+        "replaced",
+    ]
+    assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_HOME": str(sai_home)}
     assert "env" not in json.loads(env.cursor_path().read_text())["mcpServers"]["sai"]
 
 
@@ -1521,7 +2243,7 @@ def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
         invoke("mcp", "uninstall"),
     ]
     rows = {r["client"]: r for r in payload(outputs[0])["clients"]}
-    assert rows["claude"]["registeredCommand"] == [OLD_COMMAND]
+    assert rows["claude"]["registeredCommand"] == ["<hidden>"]
     assert rows["claude"]["current"] is False
     assert rows["claude"]["scope"] == "user"
     # The codex entry runs the right command but carries an extra env name.
@@ -1712,11 +2434,11 @@ def test_extra_env_is_stale_and_replaced(env: Env):
     assert rows["codex"]["staleEnv"] == ["SAI_LCD_ENDPOINT"]
     assert endpoint not in listed.stdout + listed.stderr
     result = invoke("mcp", "install", "claude", "codex")
-    assert actions(result) == {"claude": "replaced", "codex": "replaced"}
-    assert endpoint not in result.stdout + result.stderr
-    assert env.claude_json()["mcpServers"]["sai"]["env"] == {}
-    again = invoke("mcp", "install", "claude", "codex")
-    assert set(actions(again).values()) == {"unchanged"}
+    assert "differs from the requested settings" in failure(result)
+    assert endpoint not in result.output
+    assert env.claude_json()["mcpServers"]["sai"]["env"] == {"SAI_ENDPOINT": endpoint}
+    again = invoke("mcp", "install", "codex")
+    assert actions(again) == {"codex": "unchanged"}
 
 
 def test_disabled_codex_entry_is_not_current_and_is_replaced(env: Env):
@@ -1751,7 +2473,7 @@ def test_list_shows_every_scope_and_the_effective_one(env: Env):
     assert row["registrations"] == [
         {
             "scope": "project",
-            "command": [OLD_COMMAND],
+            "command": ["<hidden>"],
             "current": False,
             "effective": True,
         },
@@ -1844,8 +2566,12 @@ def test_cursor_gives_up_when_the_file_keeps_changing(env: Env, monkeypatch):
     assert [p.name for p in path.parent.iterdir()] == ["mcp.json"]
 
 
-def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: Env):
-    wrapper = ["/opt/bin/wrap", "--url", f"https://user:{SECRET}@host.example/mcp"]
+def test_registered_launcher_and_args_are_hidden_when_the_command_differs(env: Env):
+    wrapper = [
+        f"/opt/bin/wrap-{SECRET}",
+        "--url",
+        f"https://user:{SECRET}@host.example/mcp",
+    ]
     (env.home / ".claude.json").write_text(
         json.dumps({"mcpServers": {"sai": claude_entry(wrapper)}})
     )
@@ -1860,9 +2586,11 @@ def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: En
     )
     listed = invoke("mcp", "list")
     rows = {r["client"]: r for r in payload(listed)["clients"]}
-    assert rows["claude"]["registeredCommand"] == ["wrap"]
+    assert rows["claude"]["registeredCommand"] == ["<hidden>"]
     assert rows["claude"]["args"] == "<hidden>"
-    assert rows["claude"]["registrations"][0]["args"] == "<hidden>"
+    [registration] = rows["claude"]["registrations"]
+    assert registration["command"] == ["<hidden>"]
+    assert registration["args"] == "<hidden>"
     assert rows["codex"]["registeredCommand"] == serve(env)
     assert "args" not in rows["codex"]
     outputs = [
@@ -1874,7 +2602,7 @@ def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: En
     removed = payload(outputs[-1])["results"][0]
     assert (removed["action"], removed["command"], removed["args"]) == (
         "removed",
-        ["wrap"],
+        ["<hidden>"],
         "<hidden>",
     )
     for result in outputs:
@@ -1917,7 +2645,7 @@ def test_codex_project_override_is_effective_and_not_edited(env: Env):
     assert row["registrations"] == [
         {
             "scope": "project",
-            "command": ["old-wrapper"],
+            "command": ["<hidden>"],
             "args": "<hidden>",
             "current": False,
             "effective": True,
@@ -2015,20 +2743,112 @@ def test_codex_project_tool_filter_is_an_override(env: Env):
     assert "Client registrations changed." not in message
 
 
-def test_reconnect_is_needed_when_a_remove_ran_before_a_failed_add(env: Env):
-    (env.home / ".claude.json").write_text(
-        json.dumps({"mcpServers": {"sai": claude_entry([OLD_COMMAND])}})
+@pytest.mark.parametrize("scope", ["user", "project", "local"])
+@pytest.mark.parametrize("output_mode", ["text", "json", "installer"])
+def test_claude_install_reports_scoped_commands_without_credentials(
+    env: Env, monkeypatch: pytest.MonkeyPatch, scope: str, output_mode: str
+):
+    profile = env.root / "selected profile"
+    monkeypatch.setenv("SAI_HOME", str(profile))
+    launcher = write_exe(env.root / f"launcher-{SECRET}", "raise SystemExit(9)")
+    command = [str(launcher), "--credential", SECRET]
+    entry = claude_entry(command, {"PRIVATE_TOKEN": SECRET})
+    data = {"mcpServers": {"sai": entry, OTHER: {"command": "untouched"}}}
+    config = (
+        env.project / ".mcp.json" if scope == "project" else env.home / ".claude.json"
     )
-    fails_add = FAKE_CLAUDE.replace(
-        "args = sys.argv[1:]\n",
-        "args = sys.argv[1:]\nif args[1] == 'add':\n    sys.exit(3)\n",
+    if scope == "local":
+        data = {"projects": {str(env.project): data}}
+    config.write_text(json.dumps(data))
+    before = config.read_bytes()
+    args = ["mcp", "install", "claude", "--scope", scope, "--", *command]
+    if output_mode == "installer":
+        client = mcp_install.make_clients(env.home, os.environ, env.project)["claude"]
+        target, _ = mcp_install.server_target(
+            command, os.environ, env.home, str(env.root)
+        )
+        installed = mcp_install.install_one(client, scope, target, dry_run=False)
+        row = installed.to_json()
+        assert not installed.changed
+        output = json.dumps(row)
+    elif output_mode == "json":
+        result = invoke(*args)
+        assert "differs from the requested settings" in failure(result)
+        details = payload(result)["error"]["details"]
+        assert not details["reconnectNeeded"]
+        [row] = details["results"]
+        assert not row["changed"]
+        output = result.output
+    else:
+        result = CliRunner().invoke(main, args)
+        assert result.exit_code == 1
+        row = {"action": "failed", "fix": result.output}
+        output = result.output
+    assert row["action"] == "failed"
+    assert "claude mcp remove" not in row["fix"]
+    assert f"Remove the existing {scope} sai entry" in row["fix"]
+    assert f"The {scope} sai entry in {config} differs in env." in row["fix"]
+    assert (
+        f"claude mcp add --scope {scope} sai {shlex.quote(f'--env=SAI_HOME={profile}')}"
+        f" '--env=<NAME>=<value>' -- {shlex.quote(str(env.sai))}"
+        " '<original-argument>' '<original-argument>'"
+    ) in row["fix"]
+    assert "substitute your requested command" in row["fix"]
+    assert SECRET not in output and OTHER not in output
+    assert config.read_bytes() == before
+    assert not env.calls()
+
+
+@pytest.mark.parametrize("as_module", [False, True])
+def test_claude_custom_advice_uses_the_invoked_sai_without_sai_on_path(
+    env: Env, as_module: bool
+):
+    env.sai.unlink()
+    invoked = write_exe(
+        env.root / "invoked sai", "from sai_cli.sai_cli import main\nmain()"
     )
-    write_exe(env.bin / "claude", fails_add)
-    result = invoke("mcp", "install", "claude")
-    message = failure(result)
-    assert "claude (user): failed" in message
-    assert "Client registrations changed." in message
-    details = payload(result)["error"]["details"]
-    assert details["reconnectNeeded"] is True
-    [row] = details["results"]
-    assert row["action"] == "failed" and row["changed"] is True
+    invocation = [sys.executable, "-m", "sai_cli"] if as_module else [str(invoked)]
+    custom = write_exe(env.root / f"custom-{SECRET}", "raise SystemExit(9)")
+    config = env.home / ".claude.json"
+    config.write_text(json.dumps({"mcpServers": {"sai": claude_entry(["old"])}}))
+    before = config.read_bytes()
+
+    result = subprocess.run(
+        [
+            *invocation,
+            "--json",
+            "mcp",
+            "install",
+            "claude",
+            "--",
+            str(custom),
+            "--credential",
+            SECRET,
+        ],
+        cwd=env.project,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    [row] = json.loads(result.stdout)["error"]["details"]["results"]
+    command = claude_add_command(row["fix"])
+    assert shlex.split(command) == [
+        "claude",
+        "mcp",
+        "add",
+        "--scope",
+        "user",
+        "sai",
+        "--",
+        *invocation,
+        "mcp",
+        "serve",
+    ]
+    executable = shlex.quote(invocation[0])
+    assert f"test -f {executable} && test -x {executable}" in row["fix"]
+    assert "__main__.py" not in row["fix"]
+    assert "substitute your requested command after --" in row["fix"]
+    assert SECRET not in result.stdout + result.stderr
+    assert config.read_bytes() == before and not env.calls()

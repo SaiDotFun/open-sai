@@ -35,6 +35,10 @@ SQLITE_SCHEMA_REQUIREMENT = (
 )
 SIDECARS = ("-wal", "-shm", "-journal")
 DURATION = re.compile(r"(?<= in )\d+(?= ms\b)")
+DOCTOR_GENERATED_AT = re.compile(r'("generatedAt":)"([^"\\]+)"')
+DOCTOR_DURATION_MS = re.compile(r'(?<="durationMs":)(?:0|[1-9]\d*)(?=[,}])')
+DOCTOR_BUILD_VERSION = re.compile(rf'("(?:version|installed)":"){VERSION.pattern}(?=")')
+DOCTOR_DISPLAY_VERSION = re.compile(rf"(?<=sai ){VERSION.pattern}(?=[ ;]|$)")
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
 SQLITE_TRIVIA = r"[ \t\n\f\r]+|--[^\n]*|/\*[\s\S]*?(?:\*/|$)"
@@ -255,6 +259,7 @@ class Normalize:
                 result[field] = self.identity(rule, item)
         if result.get("event") == "update.check":
             replace_if(result, "installed", is_version)
+            replace_if(result, "installKind", development_install)
         if result.get("event") == "doctor.result":
             doctor_checks(result.get("checks"))
         if (
@@ -267,7 +272,16 @@ class Normalize:
         if result.get("event") == "command.end" and isinstance(
             result.get("error"), str
         ):
-            result["error"] = self.intent_refs(result["error"])
+            error = result["error"]
+            # A command hint can be clipped by logging midway through a
+            # fixture path, before the full home can be normalized.
+            message, separator, omitted = error.rpartition("... [")
+            if separator and re.fullmatch(r"[0-9]+ more characters\]", omitted):
+                parent = f"{Path(self.home).parent}/"
+                index = message.rfind(parent)
+                if index >= 0 and self.home.startswith(message[index:]):
+                    error = f"{message[:index]}<HOME>{separator}{omitted}"
+            result["error"] = self.intent_refs(error)
         return result
 
     def log_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -351,6 +365,18 @@ def doctor_report(value: dict[str, Any]) -> None:
         replace_if(sai, "version", is_version)
         if isinstance(install := sai.get("install"), dict):
             doctor_provenance(install)
+
+
+def mask_doctor_stream(raw: str) -> str:
+    """Mask clock and build values without changing serialization or layout."""
+    raw = DOCTOR_GENERATED_AT.sub(
+        lambda match: f'{match[1]}"<generatedAt>"' if timestamp(match[2]) else match[0],
+        raw,
+    )
+    raw = DOCTOR_DURATION_MS.sub('"<durationMs>"', raw)
+    raw = DOCTOR_BUILD_VERSION.sub(r"\g<1><version>", raw)
+    raw = DOCTOR_DISPLAY_VERSION.sub("<version>", raw)
+    return DURATION.sub("<durationMs>", raw)
 
 
 def rewrite_mcp_fields(text: str, updates: dict[str, Any]) -> str:
@@ -460,7 +486,16 @@ def normalize_overview_table(match: re.Match[str]) -> str:
 def mask_overview_stdout(raw: str, mode: str) -> str:
     """Mask clock values in place so serialization and table layout stay comparable."""
     if mode == "json":
-        raw = re.sub(r'(?<!\\)("fetchedAt"\s*:\s*)"[^"]+"', r'\1"<fetchedAt>"', raw)
+        fetch_pattern = r'(?<!\\)("fetchedAt"\s*:\s*)"([^"]+)"'
+        fetched = {stamp for _, stamp in re.findall(fetch_pattern, raw)}
+        raw = re.sub(fetch_pattern, r'\1"<fetchedAt>"', raw)
+        raw = re.sub(
+            r'(?<!\\)("sourceAt"\s*:\s*)"([^"]+)"',
+            lambda match: (
+                f'{match[1]}"<fetchedAt>"' if match[2] in fetched else match[0]
+            ),
+            raw,
+        )
         return re.sub(
             r'(?<!\\)("sourceAgeSeconds"\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
             r'\1"<sourceAgeSeconds>"',
@@ -500,9 +535,24 @@ def overview_clocks(
             ):
                 raise ValueError("Overview fetch timestamp is outside the invocation")
             value["fetchedAt"] = "<fetchedAt>"
+            if "sourceAt" in value and "sourceAgeSeconds" not in value:
+                if value["sourceAt"] != stamp:
+                    raise ValueError(
+                        "Overview section source time differs from its fetch"
+                    )
+                value["sourceAt"] = "<fetchedAt>"
     if "sourceAgeSeconds" in value:
         source, age = value["sourceAt"], value["sourceAgeSeconds"]
-        if source is None:
+        if value.get("sourceAtBasis") == "fetchedAt":
+            if (
+                age is not None
+                or fetched is None
+                or not timestamp(source)
+                or datetime.fromisoformat(source) != fetched
+            ):
+                raise ValueError("Invalid overview fetch-time source")
+            value["sourceAt"] = "<fetchedAt>"
+        elif source is None:
             if age is not None:
                 raise ValueError("Overview reported an age without a source timestamp")
         else:
@@ -575,6 +625,10 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
                 replace_if(source, "observedAt", timestamp)
     if command == "skill source" and isinstance(value, dict):
         replace_if(value, "cliVersion", is_version)
+        if isinstance(path := value.get("path"), str) and (
+            Path(path).is_absolute() or path.startswith("<HOME>/")
+        ):
+            value["path"] = "<package-location>"
     if (
         command == "logs path"
         and isinstance(value, dict)
@@ -592,7 +646,36 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         )
     if command == "update" and isinstance(value, dict):
         replace_if(value, "installed", is_version)
+        install = value.get("install")
+        if (
+            isinstance(install, dict)
+            and development_install(install.get("kind"))
+            and isinstance(install.get("prefix"), str)
+            and Path(install["prefix"]).is_absolute()
+        ):
+            kind, url = install["kind"], install.get("url")
+            install.update({"kind": "<development install>", "prefix": "<prefix>"})
+            if (
+                kind == "checkout"
+                and isinstance(url, str)
+                and url.startswith("file:///")
+                or kind == "other"
+                and "url" in install
+                and url is None
+            ):
+                install["url"] = "<development origin>"
+            update = value.get("update")
+            if isinstance(update, dict) and update.get("note") in {
+                "This is a source checkout; pull, then run `uv sync`.",
+                "This launcher is managed outside sai. Use its installer to update.",
+            }:
+                update["note"] = "<development install guidance>"
     return value
+
+
+def development_install(kind: object) -> bool:
+    # The Python checkout and the unregistered Rust build have different owners.
+    return kind in ("checkout", "other")
 
 
 def stderr_category(raw: str) -> tuple[str, ...]:

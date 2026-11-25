@@ -145,7 +145,7 @@ fn signed_out_auth_hint_shows_only_the_keeper_origin() {
 #[test]
 fn auth_output_shows_only_the_origin_but_checks_the_full_endpoint() {
     let home = tempdir().unwrap();
-    let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture#secret";
+    let endpoint = "http://fixture-user:fixture-password@[::1]:9345/private?key=fixture";
     Storage::new(home.path())
         .save_session(Session::new(
             String::from("synthetic-session").into(),
@@ -203,7 +203,7 @@ fn local_commands_reject_an_invalid_lcd_setting_before_accessing_storage() {
         &["intent", "local", ADDR][..],
     ] {
         let output = rust(home.path()).args(args).output().unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert_eq!(output.stderr, expected.as_bytes());
     }
@@ -223,7 +223,7 @@ fn url_validation_rejects_malformed_authorities_without_echoing_them() {
             .args(["auth", "list"])
             .output()
             .unwrap();
-        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(output.status.code(), Some(2));
         assert!(output.stdout.is_empty());
         assert!(output.stderr == b"Error: SAI_LCD_ENDPOINT: Invalid value for lcd.endpoint: expected a URL starting with https:// or http://\n");
     }
@@ -235,9 +235,9 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
     let marker = "synthetic-secret-setting-value";
     for (variable, key, code) in [
         ("SAI_UPDATE_AUTO", "update.auto", 1),
-        ("SAI_ENDPOINT", "keeper.endpoint", 1),
-        ("SAI_WS_ENDPOINT", "keeper.ws_endpoint", 1),
-        ("SAI_LCD_ENDPOINT", "lcd.endpoint", 1),
+        ("SAI_ENDPOINT", "keeper.endpoint", 2),
+        ("SAI_WS_ENDPOINT", "keeper.ws_endpoint", 2),
+        ("SAI_LCD_ENDPOINT", "lcd.endpoint", 2),
         ("SAI_LOG", "logs.enabled", 0),
         ("SAI_LOG_KEEP_DAYS", "logs.keep_days", 0),
     ] {
@@ -275,23 +275,23 @@ fn invalid_settings_diagnostics_omit_supplied_values() {
 }
 
 #[test]
-#[ignore = "requires uv and a Python reference checkout"]
+#[ignore = "requires uv and the Python v0.1.2 reference checkout"]
 fn invalid_settings_match_python_for_local_commands() {
     let home = tempdir().unwrap();
     let config = home.path().join("config.toml");
-    for invalid in [
-        "[lcd]\nendpoint = false\n",
-        "[update]\nauto = 'off'\n",
-        "[keeper]\nws_endpoint = 'http://localhost'\n",
+    for (invalid, code) in [
+        ("[lcd]\nendpoint = false\n", 2),
+        ("[update]\nauto = 'off'\n", 1),
+        ("[keeper]\nws_endpoint = 'http://localhost'\n", 2),
     ] {
         fs::write(&config, invalid).unwrap();
-        parity(home.path(), &["--json", "auth", "list"], 1);
-        parity(home.path(), &["--json", "auth", "status"], 1);
-        parity(home.path(), &["--json", "intent", "local", ADDR], 1);
+        parity(home.path(), &["--json", "auth", "list"], code);
+        parity(home.path(), &["--json", "auth", "status"], code);
+        parity(home.path(), &["--json", "intent", "local", ADDR], code);
     }
     fs::remove_file(config).unwrap();
     for flag in ["--ws-endpoint", "--lcd-endpoint"] {
-        parity(home.path(), &["--json", flag, "invalid", "auth", "list"], 1);
+        parity(home.path(), &["--json", flag, "invalid", "auth", "list"], 2);
     }
     assert!(!home.path().join("trader").exists());
 

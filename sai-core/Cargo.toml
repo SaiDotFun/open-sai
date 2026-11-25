@@ -23,6 +23,7 @@ http-body-util.workspace = true
 hyper.workspace = true
 hyper-timeout.workspace = true
 hyper-util.workspace = true
+idna = "1"
 rustls.workspace = true
 ring.workspace = true
 rustls-native-certs.workspace = true
@@ -31,7 +32,7 @@ webpki-roots.workspace = true
 x509-cert.workspace = true
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
 tempfile.workspace = true
 thiserror = "2"

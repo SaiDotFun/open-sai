@@ -19,7 +19,7 @@ import sqlite3
 import traceback
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal, localcontext
+from decimal import Decimal
 from typing import Any
 
 from ..core import (
@@ -120,6 +120,37 @@ def error(message: str, code: str, **extra: Any) -> dict[str, Any]:
     return {"error": message, "code": code, **extra}
 
 
+def preview_mismatch(
+    message: str, preview: dict[str, Any] | None = None, **extra: Any
+) -> dict[str, Any]:
+    if preview is None or "previewDigest" not in preview:
+        return error(
+            message,
+            Code.PREVIEW_MISMATCH,
+            quoteStatus="unavailable",
+            recovery={
+                "action": "request_preview",
+                "message": (
+                    "Check the reported cause. If the trade is still possible, call"
+                    " the matching preview tool and get confirmation before retrying."
+                ),
+            },
+            **({"preview": preview} if preview is not None else {}),
+            **extra,
+        )
+    return error(
+        message,
+        Code.PREVIEW_MISMATCH,
+        preview=preview,
+        quoteStatus="available",
+        recovery={
+            "action": "confirm_preview",
+            "message": "Show the replacement preview and get confirmation before retrying.",
+        },
+        **extra,
+    )
+
+
 def describe(exc: Exception) -> dict[str, Any]:
     """Format the shared classification using the MCP response fields."""
     failure = describe_error(exc)
@@ -142,25 +173,31 @@ def describe(exc: Exception) -> dict[str, Any]:
             intentKeys=exc.keys,
         )
     if isinstance(exc, Refused):
-        extra = {} if exc.preview is None else {"preview": exc.preview}
         reason = estimates.rejection_reason((exc.preview or {}).get("estimates", {}))
+        if failure.code == Code.PREVIEW_MISMATCH:
+            return preview_mismatch(reason or failure.message, exc.preview, **exc.extra)
+        extra = {} if exc.preview is None else {"preview": exc.preview}
         return error(reason or failure.message, failure.code, **extra, **exc.extra)
     if isinstance(exc, trading.ExecutionRejected):
-        return error(failure.message, failure.code, preview=exc.preview)
+        return preview_mismatch(failure.message, exc.preview)
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
-            return error(failure.message, Code.PREVIEW_MISMATCH)
-        reason = estimates.rejection_reason(exc.preview.get("estimates", {}))
-        return error(
+            return preview_mismatch(failure.message)
+        values = exc.preview.get("estimates", {})
+        reason = estimates.rejection_reason(values)
+        if estimates.close_oracle_time_unknown(values):
+            reason = values["execution"]["reason"]
+        return preview_mismatch(
             reason
             or (
                 "The position, quote, or route changed during confirmation, so nothing was"
                 " submitted. Show the user the latest preview, get their confirmation"
                 " again, then retry with its previewDigest."
             ),
-            Code.PREVIEW_MISMATCH,
-            preview=confirmation.with_digest(exc.preview),
+            confirmation.with_digest(exc.preview),
         )
+    if failure.code == Code.PREVIEW_MISMATCH:
+        return preview_mismatch(failure.message)
     if isinstance(exc, storage.IntentReservationError):
         if key := failure.intent_key:
             return error(
@@ -394,7 +431,7 @@ def market_list(settings: Settings) -> dict[str, Any]:
 
 
 def market_prices(settings: Settings) -> dict[str, Any]:
-    return keeper.request(settings.endpoint, keeper.PRICES)
+    return keeper.market_prices(settings.endpoint)
 
 
 def account_positions(settings: Settings, addr: str | None) -> dict[str, Any]:
@@ -516,17 +553,9 @@ def bound(
         if reference is None or slippage is None:
             return
         current = Decimal(str(preview["referencePrice"]))
-        fraction = Decimal(slippage).scaleb(-2)
-        lower = estimates.slippage_price(reference, fraction, False)
-        upper = estimates.slippage_price(reference, fraction, True)
-        if not lower <= current <= upper:
-            with localcontext() as context:
-                context.prec = 90
-                moved = abs(current - reference) / reference * 100
-                message = PRICE_MOVED.format(
-                    moved=format(moved.quantize(Decimal("0.0001")), "f"),
-                    slippage=slippage,
-                )
+        moved = estimates.market_price_move(reference, current, slippage)
+        if moved is not None:
+            message = PRICE_MOVED.format(moved=moved, slippage=slippage)
             raise Refused(message, Code.PRICE_MOVED, fresh)
 
     return check
@@ -557,9 +586,11 @@ def finish(
     if not dry_run:
         return {**result, "addr": load.pinned}
     preview = {**result, "addr": load.account()}
-    if preview.get("positionOwnerVerified") is False:
-        return preview
-    return confirmation.with_digest(preview)
+    return (
+        confirmation.with_digest(preview)
+        if confirmation.is_confirmable(preview)
+        else preview
+    )
 
 
 # Trading: each action previews with dry_run and submits without it. A
@@ -597,12 +628,15 @@ def open_trade(
     check = submit_check(
         load, dry_run, preview_digest, reference_price, slippage if market else None
     )
-    if not dry_run:
+
+    def check_pending(preview: dict[str, Any]) -> None:
+        bound(load, preview_digest, reference_price)(preview)
         storage.check_open_pending(
             settings.endpoint,
             load()["evmAddress"],
             allow_concurrent_open=allow_concurrent_open,
         )
+
     notices: list[str] = []
     result = trading.open_trade(
         settings.endpoint,
@@ -620,12 +654,28 @@ def open_trade(
         lcd_endpoint=settings.lcd_endpoint,
         mcp_market=True,
         notify=notices.append,
+        before_price_refresh=check_pending,
         before_submit=check,
         allow_concurrent_open=allow_concurrent_open,
     )
     if notices:
         result["notices"] = notices
-    return finish(load, dry_run, result)
+    if not dry_run:
+        return finish(load, dry_run, result)
+    preview = {**result, "addr": load.account()}
+    if preview["addr"] is not None:
+        return (
+            confirmation.with_digest(preview)
+            if confirmation.is_confirmable(preview)
+            else preview
+        )
+    preview["confirmationStatus"] = "informational"
+    if estimates.rejection_reason(result.get("estimates", {})) is None:
+        preview["recovery"] = {
+            "action": "connect_and_preview",
+            "message": "Connect a Sai account, then call preview_open again for that account.",
+        }
+    return preview
 
 
 def close_trade(
@@ -748,4 +798,7 @@ def partial_close(
         dry_run=dry_run,
         before_submit=check,
     )
+    quote = result.get("quote")
+    if dry_run and quote is not None and quote.get("effectiveLeverage") is None:
+        return {**result, "addr": load.account()}
     return finish(load, dry_run, result)

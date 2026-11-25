@@ -15,6 +15,7 @@ const MISMATCH: &str = "The trade no longer matches the preview the user confirm
 pub struct Confirmation<'a> {
     digest: &'a str,
     reference_price: Option<(&'a str, BigUint)>,
+    position_cli: bool,
 }
 
 impl<'a> Confirmation<'a> {
@@ -30,11 +31,30 @@ impl<'a> Confirmation<'a> {
         Ok(Self {
             digest,
             reference_price,
+            position_cli: false,
         })
+    }
+
+    pub fn for_position_cli(digest: &'a str) -> Self {
+        Self {
+            digest,
+            reference_price: None,
+            position_cli: true,
+        }
+    }
+
+    pub(super) fn is_position_cli(&self) -> bool {
+        self.position_cli
     }
 
     fn verify_digest(&self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
         if !self.digest_matches(preview, account)? {
+            if self.position_cli {
+                return Err(SaiError::new(
+                    Code::PreviewMismatch,
+                    "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting.",
+                ));
+            }
             return Err(refusal(
                 preview,
                 account,
@@ -285,7 +305,7 @@ mod tests {
             preview.quote = input.get("quote").cloned();
             preview.estimates = Some(data["estimates"].clone());
             if kind == "CLOSE_POSITION" {
-                preview.close_owner_verified = Some(true);
+                preview.position_owner_verified = Some(true);
             }
             if let Some(route) = input.get("positionRoute") {
                 preview.position_route = Some(crate::trade::position::PositionRoute {

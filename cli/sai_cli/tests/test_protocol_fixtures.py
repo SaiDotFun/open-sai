@@ -54,9 +54,16 @@ def test_cli_replays_observed_mainnet_http(monkeypatch, args, file, field):
     monkeypatch.setattr(httpx, "post", post)
     result = CliRunner().invoke(main, ["--json", *args])
     assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == golden["data"]
+    expected = copy.deepcopy(golden["data"])
+    if field == "oracle":
+        for row in expected["oracle"]["tokenPricesUsd"]:
+            block = row["lastUpdatedBlock"]
+            if block["block_ts"] == "1970-01-01T00:00:00Z":
+                block["block_ts"] = None
+    decoded = json.loads(result.output)
+    assert decoded == expected
     assert len(calls) == 1
-    assert field in json.loads(result.output)
+    assert field in decoded
 
 
 def test_cli_replays_synthetic_positions(monkeypatch, synthetic):

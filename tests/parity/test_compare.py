@@ -14,6 +14,7 @@ from compare import (
     Normalize,
     first_difference,
     ledger,
+    mask_doctor_stream,
     mask_overview_stdout,
     snapshot,
     sqlite_schema,
@@ -29,6 +30,26 @@ def test_case_command_skips_global_options() -> None:
     )
 
     assert case.command == "config list"
+
+
+def test_doctor_stream_masks_clock_and_build_values_and_keeps_other_bytes() -> None:
+    text = "warn    lcd        http://127.0.0.1:9090 answered in 14 ms; another chain\n"
+    assert mask_doctor_stream(text) == text.replace("14 ms", "<durationMs> ms")
+    raw = (
+        '{"generatedAt":"2026-11-24T01:00:00.123Z","checks":[{"id":"lcd",'
+        '"durationMs":14,"details":{"matchesKeeperChain":false}}]}\n'
+    )
+    expected = raw.replace("2026-11-24T01:00:00.123Z", "<generatedAt>").replace(
+        '"durationMs":14', '"durationMs":"<durationMs>"'
+    )
+    assert mask_doctor_stream(raw) == expected
+    malformed = '{"generatedAt":"invalid","durationMs":14.5}\n'
+    assert mask_doctor_stream(malformed) == malformed
+    build = '{"version":"0.1.2","summary":"sai 0.1.2 installed"}\n'
+    assert (
+        mask_doctor_stream(build)
+        == '{"version":"<version>","summary":"sai <version> installed"}\n'
+    )
 
 
 def test_start_log_compares_command_and_argv_shape(tmp_path: Path) -> None:
@@ -100,6 +121,22 @@ def test_log_ids_preserve_joins_and_sequence(
         first_difference(reference, Normalize(tmp_path).log_records(candidate), "logs")
         == "logs[0].event"
     )
+
+
+def test_log_error_normalizes_truncated_fixture_home(tmp_path: Path) -> None:
+    def error(home: str, clipped: str) -> str:
+        result = Normalize(tmp_path / home).log_event(
+            {
+                "event": "command.end",
+                "ts": "2026-11-24T01:00:00.000Z",
+                "error": f"Fix: --env=SAI_HOME={tmp_path / clipped}... [20 more characters]",
+            }
+        )
+        return result["error"]
+
+    expected = "Fix: --env=SAI_HOME=<HOME>... [20 more characters]"
+    assert error("reference", "refer") == error("candidate", "candi") == expected
+    assert error("reference", "unrelated") != expected
 
 
 def test_snapshot_compares_log_endpoint_key_mode_and_length(tmp_path: Path) -> None:

@@ -15,7 +15,7 @@ use sai_core::{
         stream::{self, Connection, Failure, Subscription},
     },
     log::{EventContext, Field, Level},
-    settings::{Environment, Flags, repr},
+    settings::{Environment, Flags, Key},
 };
 use serde_json::{Map, Number, Value, json};
 
@@ -194,8 +194,11 @@ fn read(
 ) -> Result<(), SaiError> {
     let settings = load_settings(flags, env)?;
     let keeper = Keeper::new(settings.endpoint(), events);
-    let data =
+    let mut data =
         runtime()?.block_on(keeper.read_until(query, variables, keeper::TIMEOUT, interrupted()))?;
+    if query == keeper::PRICES {
+        keeper::normalize_market_price_timestamps(&mut data);
+    }
     if query == keeper::HISTORY {
         output::read(&keeper::public_account_history(&env.home, &data), json)
     } else {
@@ -247,12 +250,7 @@ impl WatchCommand {
 }
 
 fn parse_token_id(input: &str) -> Result<Number, SaiError> {
-    let invalid = || {
-        SaiError::usage(format!(
-            "Invalid value for 'TOKEN_ID': {} is not a valid integer.",
-            repr(input)
-        ))
-    };
+    let invalid = || SaiError::usage("Invalid value for 'TOKEN_ID': expected an integer.");
     let input = input.trim();
     let digits = input.strip_prefix(['+', '-']).unwrap_or(input);
     if digits.is_empty()
@@ -279,7 +277,8 @@ fn stream_endpoint(
     flags: &Flags,
     env: &Environment,
 ) -> Result<String, SaiError> {
-    if let Some(endpoint) = override_endpoint.filter(|endpoint| !endpoint.is_empty()) {
+    if let Some(endpoint) = override_endpoint {
+        Key::KeeperWsEndpoint.parse_value(&endpoint)?;
         return Ok(endpoint);
     }
     Ok(load_settings(flags, env)?.ws_endpoint().to_owned())

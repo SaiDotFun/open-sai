@@ -353,6 +353,9 @@ async def preview_open(
     referencePrice. Submit refreshes the price and checks it against the
     referencePrice from the preview.
 
+    If recovery.action is connect_and_preview, connect a Sai account
+    and call preview_open again before asking for confirmation.
+
     Args:
         market_id: Market id from market_list.
         side: long or short.
@@ -405,12 +408,15 @@ async def trade_open(
     confirmation first. `accepted` means Keeper admitted the intent, not
     that it executed.
 
-    Refuses without submitting: PREVIEW_MISMATCH when the intent differs
-    from the confirmed preview, and, for a market order, PRICE_MOVED when
-    Keeper's current price moved from reference_price by more than the
-    slippage percent. Both return a new preview to show the user. Also
-    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or
-    pending. Check its key with intent_status before retrying.
+    Returns PREVIEW_MISMATCH without submitting when the live terms differ
+    from the confirmed preview or Perp would reject the order. For a market
+    order, PRICE_MOVED means the refreshed price moved from reference_price
+    by more than the slippage percent. Show the replacement preview if it
+    includes a previewDigest. If preview is absent or has no digest, call
+    preview_open again before asking the user to confirm.
+
+    RECENT_OPEN_PENDING means an earlier open is still unknown, accepted,
+    or pending. Check its key with intent_status before retrying.
 
     Args:
         market_id: Market id from market_list.
@@ -655,9 +661,13 @@ async def trade_margin(
     """Submit a margin change. Call preview_margin, show the user the quote,
     and get confirmation first.
 
-    The digest covers the intent and the quote, so it refuses with
-    PREVIEW_MISMATCH and a new preview if the position changed since the
-    confirmed quote. The amount is a quote, not a cap.
+    The digest covers the intent and the quote. The actual margin change
+    can exceed the quoted amount.
+
+    On PREVIEW_MISMATCH, follow recovery.action. With quoteStatus=available,
+    show the replacement preview and get confirmation. With
+    quoteStatus=unavailable, request a fresh preview before asking for
+    confirmation.
 
     Args:
         trade_id: Trade id from account_positions.
@@ -713,8 +723,10 @@ async def trade_partial_close(
     """Submit a partial close. Call preview_partial_close, show the user the
     preview, and get confirmation first.
 
-    Refuses with PREVIEW_MISMATCH and a new preview if the position changed
-    since the confirmed reduction was sized.
+    On PREVIEW_MISMATCH, follow recovery.action. With quoteStatus=available,
+    show the replacement preview and get confirmation. With
+    quoteStatus=unavailable, request a fresh preview before asking for
+    confirmation.
 
     Args:
         trade_id: Trade id from account_positions.

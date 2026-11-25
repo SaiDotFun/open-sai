@@ -8,7 +8,7 @@ import json
 from decimal import Decimal
 from typing import Any
 
-from .preview import rejection_reason
+from .preview import close_oracle_time_unknown, rejection_reason
 
 
 def canonical_price(value: object) -> str:
@@ -51,7 +51,20 @@ def preview_digest(preview: dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def is_confirmable(preview: dict[str, Any]) -> bool:
+    """Require a verified route and a reference price for market opens."""
+    return (
+        "positionRoute" in preview
+        and preview.get("positionOwnerVerified") is not False
+        and (
+            not preview.get("requiresMarketPriceRefresh")
+            or preview.get("referencePrice") is not None
+        )
+    )
+
+
 def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
-    if rejection_reason(preview.get("estimates", {})) is not None:
+    values = preview.get("estimates", {})
+    if rejection_reason(values) is not None or close_oracle_time_unknown(values):
         return {key: value for key, value in preview.items() if key != "previewDigest"}
     return {**preview, "previewDigest": preview_digest(preview)}

@@ -183,8 +183,7 @@ impl Trading<'_> {
 pub(super) fn id(value: &str, parameter: &str) -> Result<BigInt, SaiError> {
     let invalid = || {
         SaiError::usage(format!(
-            "Invalid value for '{parameter}': {} is not a valid integer.",
-            crate::settings::repr(value)
+            "Invalid value for '{parameter}': expected an integer."
         ))
     };
     let text = value.trim();

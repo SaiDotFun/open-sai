@@ -13,17 +13,21 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, replace
+from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from stat import S_IMODE
 from typing import Any
 
 import pytest
+from compare import is_version
 from sai_cli.core import keeper, log, reconcile, storage
 from sai_cli.tests.loopback import graphql_ws
 from websockets.http11 import Request as UpgradeRequest
@@ -43,6 +47,15 @@ NIBI = RESPONSES["pending_exec"]["data"]["userIntents"][0]["nibiAddress"]
 OTHER = "0x" + "b" * 40
 OTHER_NIBI = "nibi1hwamhwamhwamhwamhwamhwamhwamhwamc9gs8a"
 CLI = tuple[str, ...]
+
+
+@pytest.fixture
+def c11_cli_pair(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> tuple[CLI, CLI]:
+    version = invoke(cli_pair[0], tmp_path / "version-home", "--version")
+    assert version.returncode == 0, version.stderr
+    if version.stdout.strip() != b"sai, version 0.1.2":
+        pytest.skip("C11 uses the Python v0.1.2 reference in tests/parity/README.md")
+    return cli_pair
 
 
 @dataclass(frozen=True)
@@ -144,14 +157,17 @@ def invoke(
     home: Path,
     *args: str,
     overrides: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    umask: int = -1,
 ) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
         [*cli, *args],
         env=cli_environment(home, overrides),
-        cwd=home.parent,
+        cwd=cwd or home.parent,
         capture_output=True,
         check=False,
         timeout=30,
+        umask=umask,
     )
 
 
@@ -169,14 +185,308 @@ def cli_environment(
     }
 
 
-def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any]]:
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+@pytest.mark.parametrize(
+    "source",
+    [
+        "http-flag",
+        "http-env",
+        "http-config",
+        "http-flag-space",
+        "http-env-space",
+        "http-config-space",
+        "http-flag-control",
+        "http-flag-leading-space",
+        "http-flag-ipvfuture",
+        "ws-fragment",
+        "ws-global-empty",
+        "ws-local-empty",
+        "ws-config-empty",
+        "ws-invalid-scheme",
+        "ws-invalid-port",
+        "ws-backslash-authority",
+    ],
+)
+def test_c11_rejects_endpoints_before_network_io(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path, source: str, json_output: bool
+) -> None:
+    upgrades: list[str] = []
+
+    def reject_stream(connection: ServerConnection) -> None:
+        # An unexpected upgrade ends the CLI immediately after connection_init.
+        connection.recv(timeout=5)
+        connection.send('{"type":"connection_error"}')
+
+    def record_upgrade(_connection: ServerConnection, request: UpgradeRequest) -> None:
+        upgrades.append(request.path)
+
+    with (
+        replay() as (http, _replies, requests),
+        graphql_ws(reject_stream, process_request=record_upgrade) as ws,
+    ):
+        for index, cli in enumerate(c11_cli_pair):
+            home = tmp_path / str(index)
+            home.mkdir(mode=0o700)
+            config = home / "config.toml"
+            flags = ["--json"] if json_output else []
+            env = {"SAI_ENDPOINT": http, "SAI_WS_ENDPOINT": ws}
+            if source.startswith("http-"):
+                command = ["market", "list"]
+                detail = "Invalid value for keeper.endpoint: remove the URL fragment"
+                layer, _, malformed = source.removeprefix("http-").partition("-")
+                value = http + ("#" if layer == "env" else "#client")
+                if malformed == "ipvfuture":
+                    value = "https://[v1.foo]/query"
+                    detail = (
+                        "Invalid value for keeper.endpoint: expected a URL "
+                        "starting with https:// or http://"
+                    )
+                elif malformed:
+                    detail = (
+                        "Invalid value for keeper.endpoint: URL contains whitespace "
+                        "or control characters"
+                    )
+                    value = {
+                        "space": http + "/has space",
+                        "control": http + "/has\x80control",
+                        "leading-space": " " + http,
+                    }[malformed]
+                if layer == "flag":
+                    flags += ["--endpoint", value]
+                    origin = "--endpoint"
+                elif layer == "env":
+                    env["SAI_ENDPOINT"] = value
+                    origin = "SAI_ENDPOINT"
+                else:
+                    config.write_text(f'[keeper]\nendpoint = "{value}"\n')
+                    origin = str(config)
+            else:
+                command = ["watch", "balances", ADDR]
+                detail = (
+                    "Invalid value for keeper.ws_endpoint: expected a URL starting "
+                    "with wss:// or ws://"
+                )
+                if source == "ws-fragment":
+                    command = [
+                        "account",
+                        "balances",
+                        ADDR,
+                        "--ws-endpoint",
+                        ws + "#client",
+                    ]
+                    detail = (
+                        "Invalid value for keeper.ws_endpoint: remove the URL fragment"
+                    )
+                    origin = ""
+                elif source == "ws-global-empty":
+                    flags += ["--ws-endpoint", ""]
+                    origin = "--ws-endpoint"
+                elif source == "ws-local-empty":
+                    command += ["--ws-endpoint", ""]
+                    origin = ""
+                elif source == "ws-config-empty":
+                    config.write_text('[keeper]\nws_endpoint = ""\n')
+                    origin = str(config)
+                else:
+                    invalid_ws = {
+                        "ws-invalid-scheme": http,
+                        "ws-invalid-port": "ws://127.0.0.1:65536/query",
+                        "ws-backslash-authority": ws.replace(
+                            "/query", "\\example/query"
+                        ),
+                    }[source]
+                    command = ["account", "balances", ADDR, "--ws-endpoint", invalid_ws]
+                    origin = ""
+            message = f"{origin}: {detail}" if origin else detail
+            result = invoke(cli, home, *flags, *command, overrides=env)
+            assert requests == []
+            assert upgrades == []
+            assert result.returncode == 2, (result.stdout, result.stderr)
+            if json_output:
+                assert result.stderr == b""
+                assert json.loads(result.stdout) == {
+                    "error": {
+                        "code": "INVALID_REQUEST",
+                        "message": message,
+                        "retryable": False,
+                    }
+                }
+            else:
+                assert result.stdout == b""
+                assert result.stderr == f"Error: {message}\n".encode()
+
+
+@pytest.mark.parametrize(
+    ("host", "accepted"),
+    [
+        ("☃.localhost", False),
+        ("ｂücher.example", False),
+        ("bu\u0308cher.example", False),
+        ("b·cher.example", False),
+        ("bücher._example", False),
+        ("bücher..example", False),
+        ("K_.example", False),
+        ("K..example", False),
+        ("K.example", True),
+        ("Bücher.example", True),
+        ("例え。テスト.", True),
+        ("l·l.example", True),
+        ("bücher.xn--bcher-kva", True),
+        ("bücher.xn--n3h", False),
+        ("999.0.0.1", False),
+        ("127.0.0.01", False),
+        ("192.168.001.1", False),
+        ("0177.0.0.1", False),
+        ("127.0.256.1", False),
+        ("127.0.0.1", True),
+        ("0.0.0.0", True),
+        ("255.255.255.255", True),
+        ("host_1.localhost", True),
+        ("123.45.67.example", True),
+    ],
+)
+def test_c11_http_hostname(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path, host: str, accepted: bool
+) -> None:
+    endpoint = f"https://{host}/query"
+    for index, cli in enumerate(c11_cli_pair):
+        result = invoke(
+            cli,
+            tmp_path / str(index),
+            "--json",
+            "--endpoint",
+            endpoint,
+            "config",
+            "get",
+            "keeper.endpoint",
+            overrides={"SAI_LOG": "0"},
+        )
+        assert result.stderr == b""
+        assert result.returncode == (0 if accepted else 2)
+        if accepted:
+            assert json.loads(result.stdout) == {
+                "key": "keeper.endpoint",
+                "value": endpoint,
+                "source": "flag",
+            }
+        else:
+            assert json.loads(result.stdout) == {
+                "error": {
+                    "code": "INVALID_REQUEST",
+                    "message": (
+                        "--endpoint: Invalid value for keeper.endpoint: expected "
+                        "a URL starting with https:// or http://"
+                    ),
+                    "retryable": False,
+                }
+            }
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX symlinks and directory modes")
+def test_c11_log_writer_leaves_symlink_target_untouched(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    # A Keeper read would create both the log and its endpoint key in a fresh home.
+    data = {"perp": {"borrowings": []}}
+    for index, cli in enumerate(c11_cli_pair):
+        target = tmp_path / f"target-{index}"
+        target.mkdir(mode=0o750)
+        home = tmp_path / f"home-{index}"
+        home.symlink_to(target, target_is_directory=True)
+        with replay() as (endpoint, replies, requests):
+            replies.append(response({"data": data}))
+            result = invoke(
+                cli, home, "--json", "--endpoint", endpoint, "market", "list"
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert json.loads(result.stdout) == data
+            assert result.stderr == b""
+            assert [request.body for request in requests] == [wire(keeper.MARKETS)]
+        assert home.is_symlink()
+        assert S_IMODE(target.stat().st_mode) == 0o750
+        assert list(target.iterdir()) == []
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX umask and directory modes")
+@pytest.mark.parametrize("writer", ["logs", "config", "trader", "existing-home"])
+def test_c11_first_write_restores_owner_directory_mode(
+    c11_cli_pair: tuple[CLI, CLI], tmp_path: Path, writer: str
+) -> None:
+    profiles = []
+    for index, cli in enumerate(c11_cli_pair):
+        parent = tmp_path / str(index) / "ancestor"
+        home = parent / "home"
+        inherited_home = writer == "existing-home"
+        if inherited_home:
+            home.mkdir(parents=True, mode=0o750)
+        overrides = {} if writer == "logs" else {"SAI_LOG": "0"}
+        with replay() as (endpoint, replies, requests):
+            flags = ["--json", "--endpoint", endpoint]
+            if writer == "logs":
+                # Reject the key before reading settings while the log thread
+                # creates the profile at first use.
+                args = ["config", "get", "unknown"]
+            elif writer == "trader":
+                args = ["intent", "status", ADDR, "--key", KEY]
+                replies.append(response({"data": {"userIntents": []}}))
+            else:
+                args = ["config", "set", "logs.keep_days", "14"]
+            result = invoke(
+                cli, home, *flags, *args, overrides=overrides, cwd=tmp_path, umask=0o777
+            )
+            assert result.returncode == (2 if writer == "logs" else 0), result.stdout
+            assert result.stderr == b""
+            assert not replies
+            assert len(requests) == (writer == "trader")
+        if not inherited_home:
+            assert S_IMODE(parent.parent.stat().st_mode) == 0o700
+            assert S_IMODE(parent.stat().st_mode) == 0o700
+        assert S_IMODE(home.stat().st_mode) == (0o750 if inherited_home else 0o700)
+        if writer in {"logs", "trader"}:
+            assert S_IMODE((home / writer).stat().st_mode) == 0o700
+        profiles.append(
+            {
+                str(child.relative_to(home)): S_IMODE(child.stat().st_mode)
+                for child in home.rglob("*")
+            }
+        )
+    assert profiles[0] == profiles[1]
+
+
+@cache
+def cli_version(cli: CLI) -> str:
+    with tempfile.TemporaryDirectory(prefix="sai-parity-version-") as directory:
+        result = invoke(cli, Path(directory) / "sai", "--version")
+    assert result.returncode == 0, result.stderr
+    version = result.stdout.decode().split()[-1]
+    assert is_version(version)
+    return version
+
+
+def read_events(
+    home: Path, cli: CLI, *, c4_reference: bool = False, rust: bool = False
+) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
         for line in path.read_bytes().splitlines()
     ]
     groups: dict[str, list[int]] = {}
+    version = cli_version(cli)
     for event in events:
+        assert event["version"] == version
+        event["version"] = "<version>"
+        if isinstance(argv := event.get("argv"), list):
+            # These cases invoke intent status and auth status only. Compare
+            # the safe words and preserve argument count after projection.
+            safe = {"--json", "--endpoint", "intent", "auth", "status", "--key"}
+            if rust:
+                assert all(arg in safe or arg == "[redacted]" for arg in argv)
+            event["argv"] = [arg if arg in safe else "[redacted]" for arg in argv]
+        if "error" in event:
+            if rust:
+                assert event["error"] == "[redacted]"
+            event["error"] = "[redacted]"
         if c4_reference:
             # The C4 pin predates the v2 envelope and keyed endpoint identity.
             for field in ("schema", "commandId", "endpointId"):
@@ -189,6 +499,38 @@ def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any
             if dynamic in event:
                 assert isinstance(event[dynamic], str if dynamic == "ts" else int)
                 event[dynamic] = "<dynamic>"
+        # C4's Python reference wrote v1 rows. The C9b cases compare
+        # these v2 fields directly against the newer Python writer.
+        for field in ("schema", "commandId", "endpointId"):
+            event.pop(field, None)
+        if c4_reference and event["event"] == "keeper.request":
+            event.pop("intentKey", None)
+            if "keeperErrors" in event:
+                event.update(
+                    log.keeper_error_fields(
+                        event["keeperErrors"],
+                        retained=True,
+                        total=event.get("keeperErrorCount"),
+                    )
+                )
+        if c4_reference and event["event"] == "intent.keeper":
+            if not rust:
+                event["addr"] = keeper.canonical_account(event["addr"])
+            if (code := keeper.intent_error_code(event)) is not None:
+                event["errorCode"] = code
+            event.pop("errorMsg", None)
+            for field, allowed in (
+                ("kind", keeper.INTENT_KINDS),
+                ("lifecycleStep", keeper.INTENT_STEPS),
+                ("execActor", keeper.INTENT_ACTORS),
+            ):
+                if event.get(field) not in allowed:
+                    event.pop(field, None)
+            tx, invalid = keeper.request_hash(event.pop("txHash", None))
+            if tx is not None:
+                event["txHash"] = tx
+            if invalid:
+                event["txHashInvalid"] = True
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
     return events
 
@@ -200,6 +542,9 @@ def read_state(home: Path) -> tuple[Any, ...]:
         if path.relative_to(home).as_posix()
         not in {"logs/.endpoint-key", "logs/.endpoint-key.lock"}
     }
+    for name in ("logs/.endpoint-key", "logs/.endpoint-key.lock"):
+        if name in files:
+            assert files.pop(name) & 0o777 == 0o600
     db = home / "trader/intents.sqlite3"
     if not db.exists():
         return (files,)
@@ -263,25 +608,6 @@ def public_intent_output(output: bytes, *, compact: bool) -> bytes:
     return (
         json.dumps(log.clean(public), indent=None if compact else 2) + "\n"
     ).encode()
-
-
-def legacy_status_events(home: Path, *, reference: bool) -> list[dict[str, Any]]:
-    """Compare event payloads across the two reference versions."""
-    events = read_events(home, c4_reference=True)
-    for event in events:
-        if event["event"] == "keeper.request":
-            event.pop("intentKey", None)
-        elif reference and event["event"] == "intent.keeper":
-            public = keeper.safe_intent_record(event)
-            for field in ("kind", "lifecycleStep", "execActor", "errorCode", "txHash"):
-                event.pop(field, None)
-                if field in public:
-                    event[field] = public[field]
-            event.pop("errorMsg", None)
-            if public.get("txHashInvalid"):
-                event["txHashInvalid"] = True
-            event["addr"] = keeper.canonical_account(event["addr"])
-    return events
 
 
 def compare(
@@ -366,7 +692,9 @@ def compare(
                         state,
                     )
                 )
-            observed.append((runs, legacy_status_events(home, reference=index == 0)))
+            observed.append(
+                (runs, read_events(home, cli, c4_reference=True, rust=index == 1))
+            )
         assert observed[0] == observed[1]
 
 
@@ -567,7 +895,6 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
         ((Reply(b"malformed"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
         ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
-        (({"data": {"userIntents": [None]}},), "unknown", "INTERNAL_ERROR"),
     ],
 )
 def test_request_and_data_failures(
@@ -581,6 +908,55 @@ def test_request_and_data_failures(
     compare(
         cli_pair, tmp_path, monkeypatch, (Step(replies, local, code=1, error=error),)
     )
+
+
+@pytest.mark.parametrize("with_record", [False, True], ids=["null-only", "mixed"])
+def test_c11_intent_status_skips_null_records(
+    c11_cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_record: bool,
+) -> None:
+    record = RESPONSES["started"]["data"]["userIntents"][0]
+    documents = []
+    for index, cli in enumerate(c11_cli_pair):
+        home = tmp_path / str(index)
+        with replay() as (endpoint, replies, requests):
+            seed(home, endpoint, monkeypatch, "unknown")
+            ledger = read_state(home)[1:]
+            rows = [None, record, None] if with_record else [None]
+            replies.append(response({"data": {"userIntents": rows}}))
+            result = invoke(
+                cli,
+                home,
+                "--json",
+                "--endpoint",
+                endpoint,
+                "intent",
+                "status",
+                ADDR,
+                "--key",
+                KEY,
+            )
+            assert result.returncode == 0, (result.stdout, result.stderr)
+            assert result.stderr == b""
+            assert [request.body for request in requests] == [
+                wire(keeper.INTENTS, user=ADDR, key=KEY)
+            ]
+        document = json.loads(result.stdout)
+        if with_record:
+            [intent] = document["userIntents"]
+            assert intent["intentKey"] == KEY
+            assert intent["lifecycleStep"] == "intent_start"
+        else:
+            assert document == {"userIntents": []}
+            events = read_events(home, cli)
+            assert all(event["event"] != "intent.keeper" for event in events)
+        # Even an expired local reservation stays unknown when Keeper sent
+        # a nonempty list with no usable record.
+        assert read_state(home)[1:] == ledger
+        documents.append(document)
+    assert documents[0] == documents[1]
 
 
 @pytest.mark.parametrize("operation", ["intents", "history"])
@@ -636,7 +1012,7 @@ def test_intent_status_logs_only_public_graphql_codes(
                 assert document["outcome"] == "pending"
             [event] = [
                 event
-                for event in read_events(home)
+                for event in read_events(home, cli)
                 if event["event"] == "keeper.request"
                 and event["operation"] == operation
             ]
@@ -674,7 +1050,10 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
             outputs.append(
-                (result.stdout, legacy_status_events(home, reference=index == 0))
+                (
+                    result.stdout,
+                    read_events(home, cli, c4_reference=True, rust=index == 1),
+                )
             )
         assert outputs[0] == outputs[1]
 
@@ -743,6 +1122,20 @@ def test_cli_errors_share_one_envelope(
             )
             assert payload["error"].pop("hint") == expected_hint
             outputs.append(payload)
+        elif args[0] == "--bad-option":
+            if index == 0:
+                assert "--bad-option" in payload["error"]["message"]
+                payload["error"]["message"] = "No such option."
+            outputs.append(payload)
+        elif args[1:] == ("config", "get", "invalid"):
+            if index == 0:
+                message = payload["error"]["message"]
+                assert "Valid keys: " in message
+                payload["error"]["message"] = (
+                    "Invalid value for 'KEY': unknown setting. Valid keys: "
+                    + message.split("Valid keys: ", 1)[1]
+                )
+            outputs.append(payload)
         else:
             outputs.append(result.stdout)
     assert outputs[0] == outputs[1]
@@ -807,7 +1200,19 @@ def test_expired_auth_status(
                 'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
             )
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        observed.append((payload, read_events(home)))
+        events = read_events(home, cli, rust=index == 1)
+        [start] = [event for event in events if event["event"] == "command.start"]
+        command_words = ["auth", "status"]
+        # The C4 reference predates auth argument privacy. Assert each form
+        # before comparing the remaining fields and expiry events.
+        expected_argv = (
+            ["--json", "--endpoint", "[redacted]", *command_words]
+            if index == 0
+            else command_words
+        )
+        assert start["argv"] == expected_argv
+        start["argv"] = command_words
+        observed.append((payload, events))
     assert observed[0] == observed[1]
 
 
@@ -1133,10 +1538,10 @@ def assert_watch_disconnect(
         f"Disconnected ({error_type}); data may be stale; reconnecting in 2s\n".encode()
     )
     assert [
-        (event["code"], event["errorType"])
-        for event in read_events(home)
+        (event["level"], event["code"], event["errorType"], event["endpoint"])
+        for event in read_events(home, cli)
         if event["event"] == "watch.disconnected"
-    ] == [("STREAM_ERROR", error_type)]
+    ] == [("warn", "STREAM_ERROR", error_type, ws.removesuffix("/query"))]
 
 
 @pytest.mark.parametrize(
@@ -1150,6 +1555,16 @@ def assert_watch_disconnect(
         ("Sec-WebSocket-Accept", (), "InvalidHeader"),
         ("Sec-WebSocket-Accept", ("first", "second"), "InvalidHeader"),
         ("Sec-WebSocket-Accept", ("wrong",), "InvalidHeaderValue"),
+        (
+            "Sec-WebSocket-Protocol",
+            ("graphql-transport-ws", "graphql-transport-ws"),
+            "InvalidHeader",
+        ),
+        (
+            "Sec-WebSocket-Protocol",
+            ("graphql-transport-ws, other",),
+            "InvalidHeader",
+        ),
     ],
 )
 def test_watch_reports_rejected_upgrade(

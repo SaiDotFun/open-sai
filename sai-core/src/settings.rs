@@ -2,6 +2,7 @@
 
 mod edit;
 mod home;
+mod hostname;
 mod toml;
 
 use std::{
@@ -106,8 +107,7 @@ impl Key {
     pub fn parse(name: &str) -> Result<Self, SettingsError> {
         find_key(name).ok_or_else(|| {
             SettingsError::invalid(format!(
-                "Unknown setting {}. Valid keys: {}",
-                repr(name),
+                "Invalid value for 'KEY': unknown setting. Valid keys: {}",
                 valid_keys()
             ))
         })
@@ -117,19 +117,17 @@ impl Key {
         let text = raw.trim();
         let name = self.spec().name;
         match self.spec().kind {
-            Kind::Url(_) => self.check_url(text),
+            Kind::Url(_) => self.check_url(raw),
             Kind::Bool => match parse_bool(text) {
                 Some(value) => Ok(Value::Bool(value)),
                 None => Err(SettingsError::invalid(format!(
-                    "Invalid value {} for {name}: expected true or false",
-                    repr(raw)
+                    "Invalid value for {name}: expected true or false"
                 ))),
             },
             Kind::Days => {
                 if text.is_empty() || !text.bytes().all(|c| c.is_ascii_digit()) {
                     return Err(SettingsError::invalid(format!(
-                        "Invalid value {} for {name}: expected a whole number, 1 or more",
-                        repr(raw)
+                        "Invalid value for {name}: expected a whole number, 1 or more"
                     )));
                 }
                 let digits = text.trim_start_matches('0');
@@ -192,7 +190,29 @@ impl Key {
         let Kind::Url(schemes) = self.spec().kind else {
             unreachable!()
         };
-        if Endpoint::split(value).is_some_and(|url| schemes.contains(&url.scheme.as_str())) {
+        let invalid = |reason| {
+            SettingsError::endpoint(format!("Invalid value for {}: {reason}", self.spec().name))
+        };
+        if self != Self::LcdEndpoint && value.contains('#') {
+            return Err(invalid("remove the URL fragment"));
+        }
+        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+            return Err(invalid("URL contains whitespace or control characters"));
+        }
+        if Endpoint::split(value).is_some_and(|url| {
+            let (host, port) = url.host_port();
+            let authority = url.authority.rsplit('@').next().unwrap_or_default();
+            schemes.contains(&url.scheme.as_str())
+                && !host.is_empty()
+                && port.is_ok()
+                && !url.authority.contains('\\')
+                && (schemes[0] != "https" || hostname::valid_http_host(authority, &host))
+                && (self != Self::KeeperWsEndpoint
+                    || url
+                        .authority
+                        .rsplit_once('@')
+                        .is_none_or(|(userinfo, _)| userinfo.contains(':')))
+        }) {
             return Ok(json!(value));
         }
         Err(self.expected(&format!(
@@ -203,26 +223,8 @@ impl Key {
 
     /// Validate server endpoints for diagnostics and registration repair.
     pub fn check_diagnostic_url(self, value: &str) -> Result<(), SettingsError> {
-        if !matches!(self.spec().kind, Kind::Url(_)) {
-            return Ok(());
-        }
-        let bad = |reason| {
-            let mut error =
-                SettingsError::invalid(format!("Invalid value for {}: {reason}", self.spec().name));
-            error.invalid_endpoint = true;
-            error
-        };
-        if self != Self::LcdEndpoint && value.contains('#') {
-            return Err(bad("remove the URL fragment"));
-        }
-        if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
-            return Err(bad("URL contains whitespace or control characters"));
-        }
-        self.check_url(value)?;
-        let url = Endpoint::split(value).expect("URL checked");
-        let (host, port) = url.host_port();
-        if host.is_empty() || port.is_err() || url.authority.contains('\\') {
-            return Err(self.invalid_env_value());
+        if matches!(self.spec().kind, Kind::Url(_)) {
+            self.check_url(value)?;
         }
         Ok(())
     }
@@ -230,7 +232,9 @@ impl Key {
     fn read_value(self, item: &Item, document: &ParsedDocument) -> Result<Value, SettingsError> {
         match self.spec().kind {
             Kind::Url(_) => {
-                self.check_url(item.as_str().ok_or_else(|| self.expected("a URL string"))?)
+                self.check_url(item.as_str().ok_or_else(|| {
+                    SettingsError::endpoint(self.expected("a URL string").message)
+                })?)
             }
             Kind::Bool => item
                 .as_bool()
@@ -319,6 +323,13 @@ impl SettingsError {
         }
     }
 
+    fn endpoint(message: String) -> Self {
+        Self {
+            invalid_endpoint: true,
+            ..Self::invalid(message)
+        }
+    }
+
     pub fn is_uneditable(&self) -> bool {
         self.uneditable
     }
@@ -349,6 +360,11 @@ impl From<SettingsError> for crate::errors::SaiError {
     fn from(error: SettingsError) -> Self {
         if error.is_uneditable() {
             Self::usage(error.to_string())
+        } else if error.invalid_endpoint {
+            Self {
+                show_usage: false,
+                ..Self::usage(error.to_string())
+            }
         } else {
             Self::new(crate::errors::Code::InvalidRequest, error.to_string())
         }
@@ -499,9 +515,16 @@ impl Settings {
                 Err(error) if key.is_log() => {
                     let already_off = resolved.value(Key::LogsEnabled).as_bool() == Some(false);
                     let source = if already_off { source } else { Source::Invalid };
-                    if source == Source::Invalid && env.is_set(key) {
+                    if source == Source::Invalid
+                        && let Some(raw) = env.raw(key)
+                    {
+                        let detail = if raw.to_str().is_none() {
+                            format!("invalid value for {}", key.spec().name)
+                        } else {
+                            error.to_string()
+                        };
                         resolved.warnings.push(format!(
-                            "{}: {error}; logging is off until it is fixed",
+                            "{}: {detail}; logging is off until it is fixed",
                             key.spec().env
                         ));
                     }
@@ -659,10 +682,18 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
     if let Some(raw) = flags.value(key) {
         (key.parse_value(raw), Source::Flag)
     } else if let Some(raw) = env.raw(key) {
-        let value = raw
-            .to_str()
-            .and_then(|raw| key.parse_value(raw).ok())
-            .ok_or_else(|| key.invalid_env_value());
+        let value = raw.to_str().map_or_else(
+            || Err(key.invalid_env_value()),
+            |raw| {
+                key.parse_value(raw).map_err(|error| {
+                    if error.invalid_endpoint {
+                        error
+                    } else {
+                        key.invalid_env_value()
+                    }
+                })
+            },
+        );
         (value, Source::Env)
     } else if let Some(value) = file {
         (value.clone(), Source::File)
@@ -673,6 +704,10 @@ fn pick(key: Key, flags: &Flags, env: &Environment, file: Option<&Entry>) -> (En
 
 /// The writer uses file and environment settings independently of CLI flags.
 pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
+    Some(log_keep_value(env)?.as_u64().unwrap_or(u64::MAX))
+}
+
+pub(crate) fn log_keep_value(env: &Environment) -> Option<Value> {
     let file = FileSettings::read(&env.path()).ok()?;
     let flags = Flags::default();
     let value = |key: Key| {
@@ -681,7 +716,7 @@ pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
             .ok()
     };
     if value(Key::LogsEnabled)?.as_bool()? {
-        Some(value(Key::LogsKeepDays)?.as_u64().unwrap_or(u64::MAX))
+        value(Key::LogsKeepDays)
     } else {
         None
     }
@@ -795,4 +830,4 @@ fn parse_error(path: &Path, input: &str, error: &TomlError, editing: bool) -> Se
     error
 }
 
-pub use edit::{set, unset};
+pub use edit::{edit_setting, set, unset};

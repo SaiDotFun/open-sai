@@ -1,40 +1,45 @@
 use std::{
-    fs::{self, OpenOptions},
+    fs::OpenOptions,
     io::{self, Write},
     ops::Range,
     path::Path,
+    sync::atomic::AtomicBool,
 };
 
 use serde_json::Value;
 use toml_edit::{Item, Table};
 
+use crate::interrupt;
+
 use super::toml::ParsedDocument;
 use super::{Key, MAINNET_WS, SettingsError, os_message, parse_error, read_raw_text, table_error};
+use crate::paths;
 
 const TEMPLATE: &str = include_str!("../settings-template.toml");
 const LOCK_NAME: &str = ".config.lock";
 
 pub fn set(path: &Path, key: Key, value: &Value) -> Result<(), SettingsError> {
-    edit_file(path, |text| {
-        let new = edit(text, path, key, Some(value))?;
-        Ok(new)
-    })?;
-    Ok(())
+    edit_setting(path, key, Some(value), None).map(|_| ())
 }
 
 pub fn unset(path: &Path, key: Key) -> Result<bool, SettingsError> {
-    edit_file(path, |text| edit(text, path, key, None))
+    edit_setting(path, key, None, None)
 }
 
-fn edit_file(
+pub fn edit_setting(
     path: &Path,
-    edit: impl FnOnce(Option<&str>) -> Result<Option<String>, SettingsError>,
+    key: Key,
+    value: Option<&Value>,
+    interrupt: Option<&AtomicBool>,
 ) -> Result<bool, SettingsError> {
     let parent = path
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
     let writing = |error: io::Error| {
+        if interrupt.is_some() && error.kind() == io::ErrorKind::Interrupted {
+            return SettingsError::invalid("Aborted".into());
+        }
         SettingsError::invalid(format!(
             "Cannot write {}: {}",
             path.display(),
@@ -42,26 +47,19 @@ fn edit_file(
         ))
     };
 
-    let mut directory = fs::DirBuilder::new();
-    directory.recursive(true);
+    interrupt::check(interrupt).map_err(writing)?;
     let mut options = OpenOptions::new();
     options.read(true).write(true).create(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
-        directory.mode(0o700);
+        use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    directory.create(parent).map_err(writing)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).map_err(writing)?;
-    }
+    paths::profile(parent).map_err(writing)?;
     let lock = options.open(parent.join(LOCK_NAME)).map_err(writing)?;
-    lock.lock().map_err(writing)?;
+    interrupt::lock(&lock, interrupt).map_err(writing)?;
     let text = read_raw_text(path)?;
-    let Some(new) = edit(text.as_deref())? else {
+    let Some(new) = edit(text.as_deref(), path, key, value)? else {
         return Ok(false);
     };
 
@@ -70,6 +68,7 @@ fn edit_file(
         .tempfile_in(parent)
         .map_err(writing)?;
     temp.write_all(new.as_bytes()).map_err(writing)?;
+    interrupt::check(interrupt).map_err(writing)?;
     temp.persist(path).map_err(|error| writing(error.error))?;
     Ok(true)
 }
