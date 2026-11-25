@@ -68,6 +68,12 @@ def test_bare_leaf_prints_full_help_and_json_usage(
         if args == ("trade", "open"):
             # Issue 231 tracks the --market help and symbol support.
             return re.sub(rb"(?m)^  --market [^\n]*\n", b"", help_text)
+        if args == ("trade", "margin"):
+            # The new option widens the option column and wraps other help text.
+            without_cap = re.sub(
+                rb"(?m)^  --max-collateral-usd [^\n]*\n +[^\n]*\n", b"", help_text
+            )
+            return b" ".join(without_cap.split())
         return help_text
 
     errors = []
@@ -83,7 +89,10 @@ def test_bare_leaf_prints_full_help_and_json_usage(
 
         assert bare.returncode == machine.returncode == 2
         assert bare.stdout == machine.stderr == b""
-        assert comparable(bare.stderr) == comparable(expected.stdout)
+        if label == "python":
+            assert bare.stderr == expected.stdout
+        else:
+            assert comparable(bare.stderr) == comparable(expected.stdout)
         error = json.loads(machine.stdout)["error"]
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith("Missing ")

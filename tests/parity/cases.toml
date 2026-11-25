@@ -1272,6 +1272,7 @@ exact_output = true
 
 [[case]]
 name = "bare-help-trade-margin"
+accepted_difference = "Issue #231 adds --max-collateral-usd to Python main."
 args = ["trade", "margin"]
 mode = "text"
 expect = 2

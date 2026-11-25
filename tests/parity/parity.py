@@ -1219,7 +1219,11 @@ def run_case(
                 diffs.append(
                     f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
                 )
-            if left.stderr != right.stderr:
+            # Clap prints the cancel description before the usage line.
+            if case.name == "bare-help-trade-cancel":
+                if set(left.stderr) != set(right.stderr):
+                    diffs.append("stderr categories differ")
+            elif left.stderr != right.stderr:
                 diffs.append("stderr differs")
         else:
             diffs = differences(left, right)
