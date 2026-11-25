@@ -1108,6 +1108,23 @@ def test_legacy_collateral_uses_the_pinned_oracle_price_for_pnl(replay):
     assert row["collateralPriceSource"]["queryBlock"] == RISK_BLOCK
 
 
+def test_overview_requires_collateral_price_publish_time(replay):
+    long, _ = populate_trades(replay)
+    long["perpBorrowing"]["collateralToken"] = {"id": 2, "symbol": "stNIBI"}
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+    install_oracle_quote(replay, 2, 0, mark="0.04")
+    replay["oracleRates"][2, 0]["rate"]["base_last_update_time"] = None
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    row = positions["data"]["items"][0]
+    assert positions["membership"]["status"] == "verified"
+    assert row["riskStatus"] == "partial"
+    assert row["riskReason"] == "Collateral oracle publish time is unknown"
+    assert row["markPriceUsd"] == 100
+    assert row["unrealizedPnlUsd"] is None
+    assert positions["data"]["unrealizedPnlUsd"] is None
+
+
 @pytest.mark.parametrize("gap", ["keeper", "contract", "index_seeding"])
 def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
     if gap == "keeper":

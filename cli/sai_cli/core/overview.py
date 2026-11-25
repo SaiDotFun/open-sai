@@ -676,13 +676,21 @@ def _contract_risk(
                     **risk,
                     "riskReason": "Pinned collateral USD price is unavailable",
                 }
+            published = _oracle_time(
+                collateral_rate.get("base_last_update_time"), chain
+            )
+            if published is None:
+                return {
+                    **risk,
+                    "riskReason": "Collateral oracle publish time is unknown",
+                }
             conversion = price / scale
             risk["collateralPriceSource"] = {
                 "fetchedAt": collateral_fetched,
                 "queryBlock": chain.height,
                 **_oracle_source(
                     collateral_oracle["base"],
-                    _oracle_time(collateral_rate.get("base_last_update_time"), chain),
+                    published,
                     chain,
                     collateral_fetched,
                 ),
