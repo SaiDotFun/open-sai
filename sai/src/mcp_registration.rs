@@ -1411,10 +1411,10 @@ impl Clients {
         fix.push('.');
 
         if !entry.stdio {
-            let transport = match entry.raw["type"].as_str() {
-                Some(kind @ ("http" | "sse" | "streamable-http")) => kind,
-                _ => "remote",
-            };
+            let transport = entry.raw["type"]
+                .as_str()
+                .filter(|kind| matches!(*kind, "http" | "sse" | "streamable-http"))
+                .unwrap_or("remote");
             let endpoint = entry.raw["url"]
                 .as_str()
                 .map(|url| format!(" at {}", sai_core::log::origin(url)))
