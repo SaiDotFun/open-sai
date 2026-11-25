@@ -1107,10 +1107,16 @@ def _issued_at(stored: dict[str, str]) -> datetime | None:
 
 
 def _session_info(
-    stored: dict[str, str] | None, endpoint: str, now: datetime
+    stored: dict[str, str] | None, account_key: str, endpoint: str, now: datetime
 ) -> dict[str, Any]:
     if stored is None:
         return {"connected": False}
+    try:
+        session.session_address(stored, account_key)
+    except SessionError as exc:
+        raise SaiError(
+            "Stored session has an invalid address", Code.INCOMPLETE_DATA
+        ) from exc
     matches = stored.get("endpoint") == endpoint
     return {
         "connected": True,
@@ -1179,7 +1185,7 @@ def account_overview(settings: Settings, addr: str | None = None) -> dict[str, A
                 ) from exc
         session_read = datetime.now(UTC)
         session_section = _read(
-            lambda: _session_info(stored, settings.endpoint, session_read)
+            lambda: _session_info(stored, key, settings.endpoint, session_read)
         )
         if "data" in session_section:
             session_section["fetchedAt"] = session_read.isoformat()

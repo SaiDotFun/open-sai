@@ -723,6 +723,28 @@ def test_overview_rejects_invalid_addresses_before_reading(replay, source):
     assert server.loggable("account_overview", mcp_args) == ({}, 0)
 
 
+def test_explicit_overview_ignores_session_for_a_different_address(replay):
+    save_session(replay, addr=OTHER)
+    accounts = storage.load_accounts()
+    accounts["sessions"][ADDR] = accounts["sessions"].pop(OTHER)
+    accounts["active"] = ADDR
+    storage._save_accounts(accounts)
+
+    result = cli(replay, "account", "overview", "--json", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay, addr=ADDR)):
+        assert report["addr"] == ADDR
+        assert report["balances"]["data"]["balance"]["usd"] == 150.813685
+        assert report["session"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in report["session"]
+        assert OTHER not in json.dumps(report)
+    assert [
+        args["user"]
+        for query, args in replay["calls"]
+        if query == stream.BALANCES_WITH_BLOCK
+    ] == [ADDR, ADDR]
+
+
 def test_mcp_overview_rejects_a_non_string_address_before_reading(replay):
     invalid = {"value": "synthetic-overview-address"}
     server = create_server(replay["config"])
