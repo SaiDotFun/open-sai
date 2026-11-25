@@ -476,7 +476,7 @@ def position_unchanged(
     latest, height = _latest_position(lcd, state, trade_id)
     if not _same_position(state.raw, latest):
         return False
-    _, inputs = leverage_inputs(lcd, state, trade_id, height=height)
+    effective_leverage, inputs = leverage_inputs(lcd, state, trade_id, height=height)
     quoted_leverage = {
         key: value
         for key, value in quoted_inputs.items()
@@ -488,6 +488,11 @@ def position_unchanged(
         raise ValueError(
             "Cannot confirm the position and leverage at the same block."
             " Retry with an LCD that reports the contract query height."
+        )
+    if effective_leverage is None:
+        raise PositionChanged(
+            "Cannot verify effective leverage at the position's block."
+            " Request a new preview once the leverage inputs are readable."
         )
     if "collateralPriceUsd" not in quoted_inputs:
         return True
@@ -534,10 +539,6 @@ def trading_route(endpoint: str, lcd: str) -> PositionRoute:
     return {"chainId": chain_id, "contractAddress": contract}
 
 
-def trading_contract(endpoint: str, lcd: str) -> str:
-    return trading_route(endpoint, lcd)["contractAddress"]
-
-
 @dataclass(frozen=True)
 class VerifiedPosition:
     route: PositionRoute
@@ -545,10 +546,16 @@ class VerifiedPosition:
 
 
 def verify_position_owner(
-    endpoint: str, lcd: str, addr: str, trade_id: int
+    endpoint: str,
+    lcd: str,
+    addr: str,
+    trade_id: int,
+    *,
+    route: PositionRoute | None = None,
 ) -> VerifiedPosition:
     """Read the live target and check its trade index and owner."""
-    route = trading_route(endpoint, lcd)
+    if route is None:
+        route = trading_route(endpoint, lcd)
     raw = smart_value(
         lcd,
         route["contractAddress"],
@@ -790,20 +797,23 @@ def _same_margin(raw: dict[str, Any], position: dict[str, Any]) -> bool:
     ) and float(str(raw.get("leverage"))) == float(position["leverage"])
 
 
+def margin_amount_usdc(amount: str) -> int:
+    requested = intents.positive(amount, "Margin amount")
+    scaled_amount = requested * 1_000_000
+    if scaled_amount != scaled_amount.to_integral_value():
+        raise ValueError("Margin amount must have at most six decimal places")
+    return int(scaled_amount)
+
+
 def margin_quote(
     raw: dict[str, Any],
     funds: dict[str, Any] | None,
     market: dict[str, Any],
     direction: str,
-    amount: str,
+    delta: int,
     *,
     effective_leverage: Decimal,
 ) -> dict[str, str]:
-    requested = intents.positive(amount, "Margin amount")
-    scaled_amount = requested * 1_000_000
-    if scaled_amount != scaled_amount.to_integral_value():
-        raise ValueError("Margin amount must have at most six decimal places")
-    delta = int(scaled_amount)
     collateral = int(raw["collateral_amount"])
     leverage_before = intents.positive(str(raw["leverage"]), "Current leverage")
     if effective_leverage <= 0:

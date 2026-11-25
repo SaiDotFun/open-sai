@@ -200,7 +200,7 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         config.write_text('[keeper]\nendpoint = "https://fixture.invalid:bad/api"\n')
         config.chmod(0o600)
         return
-    if seed == "doctor-ledger-v0":
+    if seed in {"doctor-ledger-v0", "doctor-loose-profile"}:
         trader = sai_home / "trader"
         trader.mkdir(mode=0o700)
         with sqlite3.connect(path := trader / "intents.sqlite3") as conn:
@@ -210,16 +210,13 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
                 " entity TEXT NOT NULL)"
             )
         path.chmod(0o600)
-        return
-    if seed == "doctor-loose-profile":
-        sai_home.chmod(0o750)
-        config = sai_home / "config.toml"
-        config.write_text("[logs]\nenabled = false\n")
-        config.chmod(0o600)
-        trader = sai_home / "trader"
-        trader.mkdir(mode=0o755)
-        history = trader / "history"
-        history.touch(mode=0o644)
+        if seed == "doctor-loose-profile":
+            sai_home.chmod(0o750)
+            config = sai_home / "config.toml"
+            config.write_text("[logs]\nenabled = false\n")
+            config.chmod(0o600)
+            trader.chmod(0o755)
+            (trader / "history").touch(mode=0o644)
         return
     if seed == "legacy":
         shutil.copytree(HERE / "v0.1.0", sai_home, dirs_exist_ok=True)
@@ -351,6 +348,8 @@ def loopback(
     | None = None,
     market_price: float | None = None,
     cancel_target: str | None = None,
+    close_target: str | None = None,
+    lcd_query: bool = False,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -384,12 +383,17 @@ def loopback(
         "position-equivalent-owner": ADDRESS.upper(),
         "quote-foreign-keeper-owner": OTHER_ADDRESS,
     }.get(scenario, position["trader"])
+    if close_target == "keeper-owner":
+        trader = OTHER_ADDRESS
     trade = {
         **position,
         "trader": trader,
         "perpBorrowing": {**borrowing, "collateralToken": collateral},
     }
-    if scenario in {"position-wrong-index", "quote-wrong-position-index"}:
+    if close_target == "keeper-index" or scenario in {
+        "position-wrong-index",
+        "quote-wrong-position-index",
+    }:
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
     if scenario == "mcp-reads":
@@ -415,14 +419,20 @@ def loopback(
     contract = (
         "nibi1replacementfixture"
         if scenario == "position-contract-changed"
+        else ""
+        if cancel_target == "missing-contract"
         else CONTRACT
     )
+    network = "different-chain" if cancel_target == "missing-contract" else chain
+    enabled = 1 if cancel_target == "non-boolean-route" else True
     responses = {
         "oneClickTrading": {
             "data": {
                 "oneClickTrading": {
-                    "enabled": True,
-                    "chainId": chain,
+                    "enabled": enabled,
+                    "chainId": None
+                    if scenario == "doctor-lcd-unknown-keeper-chain"
+                    else chain,
                     "contractAddress": contract,
                 }
             }
@@ -522,12 +532,17 @@ def loopback(
         "get_trade_raw": {
             "user": (
                 OTHER_ADDRESS
-                if cancel_target == "foreign-owner"
+                if cancel_target in {"foreign-owner", "filled-foreign-owner"}
+                or close_target == "contract-owner"
                 else ADDRESS
                 if cancel_target is not None or pending_order
                 else trader
             ),
-            "user_trade_index": "UserTradeIndex(7)",
+            "user_trade_index": (
+                "UserTradeIndex(8)"
+                if close_target == "contract-index"
+                else "UserTradeIndex(7)"
+            ),
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
@@ -616,6 +631,7 @@ def loopback(
                 cancel_trader
                 if scenario in {"pending-order", "concurrent-close"}
                 or cancel_target is not None
+                or close_target is not None
                 else trader
             ),
             "index": 7,
@@ -1047,9 +1063,14 @@ def loopback(
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
                 return
-            url = urlsplit(self.path)
-            path = url.path
+            request_url = urlsplit(self.path)
+            path = request_url.path
             if path.startswith(scope):
+                if lcd_query and parse_qs(request_url.query).get("project") != [
+                    "fixture"
+                ]:
+                    self.reject("Missing LCD project query parameter")
+                    return
                 path = path.removeprefix(scope)
                 if overview is not None:
                     try:
@@ -1092,6 +1113,12 @@ def loopback(
                     wire.append(WireRequest("node_info"))
                     self.reply({}, 503)
                     return
+                if scenario == "doctor-lcd-chain-mismatch":
+                    prefix, separator, _ = path.partition(NODE_INFO)
+                    if separator:
+                        wire.append(WireRequest("node_info"))
+                        self.reply({"default_node_info": {"network": prefix[1:]}})
+                        return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
                     if scenario == "position-wrong-chain":
@@ -1102,8 +1129,12 @@ def loopback(
                     self.reply(
                         {
                             "default_node_info": {}
-                            if chain is None
-                            else {"network": chain}
+                            if network is None
+                            else {
+                                "network": "invalid chain ID"
+                                if scenario == "doctor-lcd-invalid-chain"
+                                else network
+                            }
                         }
                     )
                     return
@@ -1143,7 +1174,7 @@ def loopback(
                         if (
                             scenario == "position-equivalent-owner"
                             and name == "get_trade_raw"
-                            and "_sai_query" in parse_qs(url.query)
+                            and "_sai_query" in parse_qs(request_url.query)
                         ):
                             expected = {**expected, "trader": position["trader"]}
                         allowed = [{name: expected}]
@@ -1187,7 +1218,7 @@ def loopback(
                                 return
                         wire.append(WireRequest(name, variables=query))
                         if scenario in POSITION_SCENARIOS:
-                            self.position_query(name, url.query)
+                            self.position_query(name, request_url.query)
                             return
                         if (
                             name == "get_pair_custom_max_leverage"

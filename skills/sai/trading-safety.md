@@ -26,26 +26,23 @@ the CLI or the MCP tools. A mistake here spends the person's money.
      confirmation, and check that the preview's `addr` is the account the
      person named. Trade IDs are per account and per network: `trade close
      42` elsewhere closes a different position.
-3. **Show the worst-case fill from the preview.** Two checks apply to market opens,
-   and neither holds the fill to the quoted price plus one slippage.
-   - The quote check, MCP only: `trade_open` refuses with `PRICE_MOVED` when
-     the price it reads at submit differs from the confirmed
-     `reference_price` by more than the slippage.
-   - The fill bound, CLI and MCP: the submitted intent carries the price read
-     at submit, not the confirmed one, and the contract applies the full
-     slippage around that submitted price.
+3. **Show the worst-case fill from the preview.** Two slippage checks apply
+   to a market open confirmed by digest in the CLI or MCP.
+   - At submit, Sai refreshes the price and returns `PRICE_MOVED` if it
+     differs from the confirmed `referencePrice` by more than the
+     slippage. Pass the reference with `--price` in the CLI or
+     `reference_price` in MCP.
+   - At execution, Perp applies the same slippage around the refreshed
+     price carried in the intent.
    - Together: a long confirmed at 60,000 with 1% slippage passes the quote
-     check at 60,600, and can then fill up to 61,206. Through MCP the worst
-     case is the confirmed price moved by the slippage twice,
+     check at 60,600 and can then fill up to 61,206. The worst case moves
+     the confirmed price by the slippage twice,
      `reference × (1 + s)²` for a long and `reference × (1 − s)²` for a
-     short. A CLI dry run estimates the fill using one application of
-     slippage to the current Keeper price or to the supplied `--price`.
-     The live CLI uses the price it reads at submit, so this estimate can
-     move between dry run and submit.
+     short.
    - Before asking for confirmation, give the person the reported
      `estimates.worstCaseFill` and explain its status.
-   - No order type gives a hard price ceiling. To keep an MCP market long
-     under a ceiling `C` from reference `R`, the slippage must satisfy
+   - To keep a confirmed market long under a ceiling `C` from reference
+     `R`, the slippage must satisfy
      `R × (1 + s)² ≤ C`, so `s ≤ sqrt(C / R) − 1`, rounded down. For a
      ceiling of 60,600 from 60,000 that is `s ≤ 0.498%`: 0.49% gives a worst
      case of 60,589.44, while 0.5% already allows 60,601.50. For a short with
@@ -59,8 +56,6 @@ the CLI or the MCP tools. A mistake here spends the person's money.
      A long stop at 100 with 1% slippage can fill up to 101. If the oracle
      gaps to 105, the contract rejects a fill outside that bound.
    - Keeper's full and partial close intents carry no slippage limit.
-   - Prefer MCP tools `preview_open` and `trade_open` when approval depends
-     on a quoted price.
 4. **Follow the intent to its outcome.** `accepted` means Keeper admitted
    the intent. Use the CLI command `sai intent wait KEY` or MCP tool
    `intent_wait` with the same account. Add `--wait` to a live CLI trade
@@ -137,23 +132,23 @@ and follow the same recovery rules for `NOT_SENT`, `ADMISSION_REJECTED`,
 
 ## Digest Confirmation in MCP
 
-A preview for a connected account returns `previewDigest`. If a signed-out
-`preview_open` returns `addr: null`, preview again for the connected account
-after sign-in, then ask for confirmation. A `trade_*` call must send the
-confirmed preview's digest as
-input `preview_digest`, and a market `trade_open` must also send the
+For confirmation, use an account-bound preview with a `previewDigest`.
+If `preview_open` returns `recovery.action` set to `connect_and_preview`,
+connect an account and preview again. A `trade_*` call must pass the preview
+digest as input `preview_digest`, and a market `trade_open` must also pass the
 preview's `referencePrice` as `reference_price`. The server rebuilds the
 trade and refuses with `PREVIEW_MISMATCH` or `PRICE_MOVED` when the account,
 intent, position quote, or quoted price fails the confirmation check.
-Nothing is submitted on a refusal. Use the replacement `preview` only if
-Sai can verify the quote. For a partial close, check that
-`quote.collateralPriceUsd` has a value. A USDC estimate can still have a
-digest when that field is `null`.
+The server refuses submission. Show the replacement preview and ask for
+confirmation if it has a `previewDigest`. If the quote is unavailable,
+follow the result's recovery instructions.
 
-If the replacement is missing or lacks a verifiable quote, wait until Sai
-can verify the quote and call the matching `preview_*` tool again. Ask for
-confirmation only when the preview shows a verifiable quote, including the
-collateral price for a partial close. Discard the old digest.
+For a partial close, ask for confirmation when the preview has a digest
+and both `quote.effectiveLeverage` and `quote.collateralPriceUsd` have
+values. When effective leverage is unreadable, the preview gives a fallback
+estimate and omits the digest. An estimate may still carry a digest while
+the collateral price is `null`. If either value is missing, wait until it
+is readable and request a fresh preview.
 
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
@@ -229,23 +224,29 @@ sai --json intent wait INTENT_KEY --addr 0xYOUR_ADDR --timeout 30
 output names the account in field `addr`. Add the same `--endpoint URL` to
 both calls, as rule 2 says; the examples leave it out to stay short.
 
-### When It Is Safe to Drop `--dry-run`
+### Confirm a CLI Trade
 
-For `trade partial-close` and `trade margin`, read `previewDigest` from the
-JSON dry run. After the person confirms the quote, replace `--dry-run` with
-`--preview-digest DIGEST` using the digest from that preview. The CLI
-refuses to submit if the live quote differs. If it refuses, run a fresh dry
-run and get confirmation again before submitting with the new digest.
+After the person confirms the JSON dry run, repeat the same command with
+`--preview-digest DIGEST` in place of `--dry-run`, using the preview's
+`previewDigest`. For a market open, also pass the preview's
+`referencePrice` as `--price`. Keep the same account, Keeper endpoint,
+and trade arguments.
 
-Without a digest, the CLI rebuilds the trade from current state. Drop
-`--dry-run` only when the person's approval covers what the live command
-will send.
+```bash
+sai --endpoint KEEPER_URL --as ADDR --json trade open --market 0 --side long \
+  --type market --amount 2 --leverage 2 --slippage 1 --dry-run
+sai --endpoint KEEPER_URL --as ADDR --json trade open --market 0 --side long \
+  --type market --amount 2 --leverage 2 --slippage 1 \
+  --preview-digest DIGEST --price REFERENCE_PRICE
+```
 
-- **Limit and stop opens, `tpsl`, `leverage`, `close`, and `--cancel-order`**
-  send exactly the arguments shown. Drop `--dry-run` once the person has
-  confirmed the account, the network, and those arguments. For limit
-  and stop opens, include the bound from rule 3 in the confirmation.
+Copy `DIGEST` and `REFERENCE_PRICE` from the dry run after approval.
+If the dry run omits `previewDigest`, or submission returns
+`PREVIEW_MISMATCH` or `PRICE_MOVED`, obtain a fresh, confirmable dry run
+and get confirmation again before submitting.
 
+- **Limit and stop opens.** Keep the trigger `--price` from the dry run
+  and show the fill bound from rule 3.
 - **Partial close** takes a percentage. Without a digest, the CLI computes
   the reduction from the position at submit. If the person saw "close 50%,
   about 50 USDC" and the position doubles before submit, the live command
@@ -273,8 +274,6 @@ will send.
   tell the person the after-hours guard can deduct fees before Perp applies
   the target leverage. Perp determines the direction from effective leverage
   at execution.
-- **Market open** fills from the price at submit. Give the worst case from
-  rule 3 before asking.
 
 In every case, run the dry run again right before submitting if the person
 took a while to answer, and ask again when it differs.

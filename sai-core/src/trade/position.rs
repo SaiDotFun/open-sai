@@ -15,7 +15,7 @@ use crate::{
 };
 
 use super::{
-    Trading,
+    TradePreview, Trading,
     actions::{incomplete, invalid},
     positive_decimal,
 };
@@ -37,11 +37,33 @@ pub(super) struct Snapshot {
 
 pub(super) enum SnapshotError {
     Owner(&'static str),
+    IndexMismatch,
     Unavailable,
+}
+
+pub(super) enum ContractPositionError {
+    Owner,
+    Read(SaiError),
+}
+
+impl From<SaiError> for ContractPositionError {
+    fn from(error: SaiError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl From<ContractPositionError> for SaiError {
+    fn from(error: ContractPositionError) -> Self {
+        match error {
+            ContractPositionError::Owner => invalid(CONTRACT_OWNER),
+            ContractPositionError::Read(error) => error,
+        }
+    }
 }
 
 const KEEPER_OWNER: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER: &str = "Contract position belongs to a different account";
+const ROUTE_MISMATCH: &str = "Keeper trading route and LCD network do not match";
 
 impl From<SaiError> for SnapshotError {
     fn from(_: SaiError) -> Self {
@@ -49,48 +71,105 @@ impl From<SaiError> for SnapshotError {
     }
 }
 
-pub(super) fn contract_owner_error() -> SaiError {
-    invalid(CONTRACT_OWNER)
+impl PositionRoute {
+    pub(super) fn from_keeper(route: &Value) -> Result<Self, SaiError> {
+        let chain = field(route, "enabled")?
+            .as_bool()
+            .filter(|&enabled| enabled)
+            .and_then(|_| route["chainId"].as_str())
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| invalid(ROUTE_MISMATCH))?;
+        let contract = route["contractAddress"]
+            .as_str()
+            .filter(|address| !address.is_empty())
+            .ok_or_else(|| invalid("Keeper trading route has no contract address"))?;
+        Ok(Self {
+            chain_id: chain.into(),
+            contract_address: contract.into(),
+        })
+    }
+
+    pub(super) fn verify_network(&self, network: &str, confirming: bool) -> Result<(), SaiError> {
+        if network != self.chain_id {
+            return Err(if confirming {
+                SaiError::new(
+                    Code::PreviewMismatch,
+                    format!(
+                        "{ROUTE_MISMATCH}. Use an LCD on Keeper's chain and request a new preview."
+                    ),
+                )
+            } else {
+                invalid(ROUTE_MISMATCH)
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Trading<'_> {
+    pub(super) async fn keeper_position_route(&self) -> Result<Value, SaiError> {
+        let mut data = self
+            .keeper
+            .request(ROUTE, Map::new(), None, TIMEOUT)
+            .await?;
+        data.get_mut("oneClickTrading")
+            .map(Value::take)
+            .ok_or_else(|| incomplete("KeyError"))
+    }
+
     pub(super) async fn position_route(
         &self,
         lcd: &Lcd<'_>,
         confirming: bool,
     ) -> Result<PositionRoute, SaiError> {
-        let route = self
-            .keeper
-            .request(ROUTE, Map::new(), None, TIMEOUT)
-            .await?;
-        let route = route
-            .get("oneClickTrading")
-            .ok_or_else(|| incomplete("KeyError"))?;
+        let data = self.keeper_position_route().await?;
         let network = lcd.network().await?;
-        let network = network.as_str().filter(|id| !id.trim().is_empty());
-        let chain = text_field(route, "chainId")?;
-        let mismatch = "Keeper trading route and LCD network do not match";
-        if !truthy(field(route, "enabled")?) || chain.trim().is_empty() || network.is_none() {
-            return Err(invalid(mismatch));
+        let route = PositionRoute::from_keeper(&data)?;
+        route.verify_network(&network, confirming)?;
+        Ok(route)
+    }
+
+    pub(super) async fn verify_contract_owner(
+        lcd: &Lcd<'_>,
+        addr: &str,
+        id: &Value,
+        route: PositionRoute,
+    ) -> Result<(PositionRoute, Value), ContractPositionError> {
+        let (raw, _) = lcd
+            .position(&route.contract_address, addr, id, Read::Fresh)
+            .await?;
+        if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
+            return Err(invalid(&format!("Unable to verify contract position {id}")).into());
         }
-        let contract = text_field(route, "contractAddress")?;
-        if contract.trim().is_empty() {
-            return Err(invalid("Keeper trading route has no Perp contract address"));
+        if !same_account(addr, raw.get("user")) {
+            return Err(ContractPositionError::Owner);
         }
-        if network != Some(chain) {
-            return Err(if confirming {
-                SaiError::new(
-                    Code::PreviewMismatch,
-                    format!("{mismatch}. Use an LCD on Keeper's chain and request a new preview."),
-                )
-            } else {
-                invalid(mismatch)
-            });
-        }
-        Ok(PositionRoute {
-            chain_id: chain.into(),
-            contract_address: contract.into(),
-        })
+        Ok((route, raw))
+    }
+
+    pub(super) async fn verify_position_owner(
+        &self,
+        lcd: &Lcd<'_>,
+        addr: &str,
+        id: &Value,
+        confirming: bool,
+    ) -> Result<PositionRoute, SaiError> {
+        let route = self.position_route(lcd, confirming).await?;
+        let (route, _) = Self::verify_contract_owner(lcd, addr, id, route).await?;
+        Ok(route)
+    }
+
+    pub async fn close_position_preview(
+        &self,
+        session: &crate::storage::Session,
+        preview: &TradePreview,
+    ) -> Result<Value, SaiError> {
+        self.storage
+            .check_active_trade(session, self.keeper.endpoint())?;
+        Ok(self
+            .prepare_preview(preview.clone(), Some(session), super::PreviewMode::Cli)
+            .await?
+            .output(Some(session.addr())))
     }
 
     pub(super) async fn indexed_position(
@@ -183,8 +262,10 @@ impl Trading<'_> {
             if !same_account(addr, raw.get("user")) {
                 return Err(SnapshotError::Owner(CONTRACT_OWNER));
             }
-            if raw["user_trade_index"] != format!("UserTradeIndex({id})")
-                || raw["market_index"] != format!("MarketIndex({market_id})")
+            if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
+                return Err(SnapshotError::IndexMismatch);
+            }
+            if raw["market_index"] != format!("MarketIndex({market_id})")
                 || raw["collateral_index"] != token
             {
                 return Err(SnapshotError::Unavailable);
@@ -269,8 +350,10 @@ impl Snapshot {
         if !same_account(trader, latest.get("user")) {
             return Err(SnapshotError::Owner(CONTRACT_OWNER));
         }
+        if latest["user_trade_index"] != format!("UserTradeIndex({id})") {
+            return Err(SnapshotError::IndexMismatch);
+        }
         if [
-            "user_trade_index",
             "market_index",
             "collateral_index",
             "collateral_amount",
