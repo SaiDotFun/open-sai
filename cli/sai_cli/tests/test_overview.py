@@ -17,11 +17,17 @@ from typing import Any
 from urllib.parse import unquote, urlsplit
 
 import pytest
+import uvicorn
 from click.testing import CliRunner
 from mcp.types import TextContent
 from sai_cli.core import keeper, overview, reconcile, settings, storage, stream
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Route, WebSocketRoute
+from starlette.websockets import WebSocket
 from websockets.sync.server import serve
 from websockets.typing import Subprotocol
 
@@ -309,7 +315,7 @@ def static_fields(value: Any) -> Any:
         return {
             key: static_fields(item)
             for key, item in value.items()
-            if key not in {"fetchedAt", "sourceAgeSeconds"}
+            if key not in {"fetchedAt", "sourceAgeSeconds", "stale"}
             and not (
                 key == "sourceAt"
                 and item is not None
@@ -336,6 +342,7 @@ def test_replays_mainnet_and_preserves_freshness_on_both_surfaces(replay):
     assert data["balance"]["sourceAt"] == decoded["balances"]["fetchedAt"]
     assert data["balance"]["sourceAtBasis"] == "fetchedAt"
     assert data["balance"]["sourceAgeSeconds"] is None
+    assert data["balance"]["stale"] is None
     assert data["balance"]["sourceBlock"] == 49819589
     assert data["unsettled"]["sourceAt"] is None
     assert datetime.fromisoformat(decoded["balances"]["fetchedAt"]).tzinfo == UTC
@@ -1151,3 +1158,73 @@ def test_next_oracle_pending_intent_remains_a_local_trade_blocker(replay):
     assert [(row["status"], row["scope"]) for row in result["data"]] == [
         ("pending", "allTrades")
     ]
+
+
+def test_balance_commands_report_fresh_and_stale_source_blocks(replay):
+    async def query(request: Request) -> JSONResponse:
+        body = await request.json()
+        return JSONResponse(replay["http"][body["query"]])
+
+    async def balances(ws: WebSocket) -> None:
+        await ws.accept(subprotocol="graphql-transport-ws")
+        assert await ws.receive_json() == {"type": "connection_init"}
+        await ws.send_json({"type": "connection_ack"})
+        request = await ws.receive_json()
+        assert request["payload"]["query"] == stream.BALANCES_WITH_BLOCK
+        await ws.send_json({"id": "1", "type": "next", "payload": replay["ws"]})
+        await ws.close()
+
+    app = Starlette(
+        routes=[
+            Route("/query", query, methods=["POST"]),
+            WebSocketRoute("/query", balances),
+        ]
+    )
+    rows = replay["ws"]["data"]["userBalances"]
+    by_name = {row["token_info"]["name"]: row for row in rows}
+    by_name["USDC on Sai"]["lastUpdatedBlock"] = RISK_BLOCK
+    by_name["USDC Credits on Sai"]["lastUpdatedBlock"] = MARK_BLOCK
+    with socket.create_server(("127.0.0.1", 0)) as listener:
+        origin = f"127.0.0.1:{listener.getsockname()[1]}"
+        config = uvicorn.Config(app, log_level="error", ws="websockets-sansio")
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, kwargs={"sockets": [listener]})
+        thread.start()
+        replay["config"] = replace(
+            replay["config"],
+            endpoint=f"http://{origin}/query",
+            ws_endpoint=f"ws://{origin}/query",
+        )
+        try:
+            for command in (("overview", "--as", ADDR), ("balances", ADDR)):
+                human = cli(replay, "account", *command)
+                assert human.exit_code == 0, human.output
+                assert f"block {RISK_BLOCK}" in human.stdout
+                stale_row = next(
+                    line
+                    for line in human.stdout.splitlines()
+                    if f"block {MARK_BLOCK}" in line
+                )
+                assert "old" in stale_row and "stale" in stale_row
+
+                machine = cli(replay, "--json", "account", *command)
+                assert machine.exit_code == 0, machine.output
+                response = json.loads(machine.stdout)
+                if command[0] == "overview":
+                    result = response["balances"]["data"]
+                    fresh, stale = result["balance"], result["credits"]
+                else:
+                    result = {
+                        row["sourceBlock"]: row
+                        for row in response["data"]["userBalances"]
+                    }
+                    fresh, stale = result[RISK_BLOCK], result[MARK_BLOCK]
+                assert fresh["sourceBlock"] == RISK_BLOCK
+                assert fresh["stale"] is False
+                assert 0 <= fresh["sourceAgeSeconds"] < overview.BALANCE_STALE_SECONDS
+                assert stale["sourceBlock"] == MARK_BLOCK
+                assert stale["stale"] is True
+                assert stale["sourceAgeSeconds"] > overview.BALANCE_STALE_SECONDS
+        finally:
+            server.should_exit = True
+            thread.join(timeout=10)

@@ -22,6 +22,36 @@ def _source(row: dict[str, Any]) -> str:
     return UNKNOWN
 
 
+def _balance_source(row: dict[str, Any]) -> str:
+    height = row["sourceBlock"]
+    source = f"block {height}" if height is not None else "block unknown"
+    age = row["sourceAgeSeconds"]
+    if age is None:
+        return f"{source} (age unknown)"
+    minutes, seconds = divmod(int(age), 60)
+    hours, minutes = divmod(minutes, 60)
+    elapsed = f"{hours}h {minutes}m" if hours else f"{minutes}m {seconds}s"
+    return f"{source} ({elapsed} old{' · stale' if row['stale'] else ''})"
+
+
+def show_balances(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        print("No balance rows returned.")
+        return
+    ReplSkin("sai").table(
+        ["Balance", "USD", "Source (Age)"],
+        [
+            [
+                row["token_info"]["name"],
+                _value(row["usd_value"]),
+                _balance_source(row),
+            ]
+            for row in rows
+        ],
+        max_col_width=72,
+    )
+
+
 def _collateral(row: dict[str, Any]) -> str:
     if row["collateralUsd"] is not None:
         return _value(row["collateralUsd"])
@@ -80,7 +110,7 @@ def show(result: dict[str, Any]) -> None:
                 [
                     "Unsettled Teller" if key == "unsettled" else key.title(),
                     _value(row["usd"]),
-                    _source(row),
+                    _balance_source(row),
                 ]
                 for key, row in balances.items()
             ],

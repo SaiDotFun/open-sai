@@ -23,6 +23,7 @@ MAX_PAGES = 20
 LCD_BUDGET_SECONDS = 8.0
 LCD_REQUEST_SECONDS = 2.0
 MEMBERSHIP_MAX_AGE_SECONDS = 60
+BALANCE_STALE_SECONDS = 300
 _LCD_SLOTS = BoundedSemaphore(8)
 BALANCE_KEYS = {
     "USDC on Sai": "balance",
@@ -206,6 +207,37 @@ def _block_source(
     if at is None and lookup is not None and isinstance(height, int) and height > 0:
         at = lookup(height)
     return {"sourceBlock": height, **_age(at, fetched)}
+
+
+def balance_stale(age_seconds: float | None) -> bool | None:
+    return age_seconds > BALANCE_STALE_SECONDS if age_seconds is not None else None
+
+
+def balance_snapshot(
+    settings: Settings, ws: str, addr: str, *, notify: Callable[[str], None]
+) -> dict[str, Any]:
+    response = stream.snapshot(
+        ws, stream.BALANCES_WITH_BLOCK, {"user": addr}, notify=notify
+    )
+    fetched = datetime.now(UTC).isoformat()
+
+    @cache
+    def chain() -> ChainRead | None:
+        return _chain_read(settings)
+
+    @cache
+    def lookup(height: int) -> datetime | None:
+        source = chain()
+        return source.block_time(height) if source is not None else None
+
+    # A separately configured WebSocket may serve another chain.
+    balance_lookup = lookup if ws == stream.derive_ws(settings.endpoint) else None
+    for row in response["data"]["userBalances"]:
+        stamp = _block_source(
+            {"block": row.get("lastUpdatedBlock")}, fetched, balance_lookup
+        )
+        row.update(stamp, stale=balance_stale(stamp["sourceAgeSeconds"]))
+    return response
 
 
 def _balances(settings: Settings, addr: str) -> dict[str, dict[str, Any]]:

@@ -11,3 +11,7 @@ difference = "Trade open accepts case-insensitive market symbols and reports amb
 [gap.cancel-command]
 owner = "#231"
 difference = "Trade cancel and close --cancel-order share the dry run, digest confirmation, pending-order check, and wait path. Rust cancel already exists and still needs --preview-digest and matching help."
+
+[gap.balance-source-age]
+owner = "#231"
+difference = "Account overview and account balances show the source block and age, mark ages over five minutes stale, and report an unknown age when block time cannot be verified."

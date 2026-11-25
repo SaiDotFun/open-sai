@@ -1045,6 +1045,8 @@ def account_overview(ctx: click.Context, addr: str | None, json_output: bool) ->
         result = overview.account_overview(settings(ctx), addr or ctx.obj["as_addr"])
     except overview.AccountUnavailable as exc:
         raise SessionError(f"{exc}. Pass --as ADDR explicitly.") from exc
+    for row in result["balances"].get("data", {}).values():
+        row["stale"] = overview.balance_stale(row["sourceAgeSeconds"])
     if ctx.obj["json"]:
         emit(ctx, result)
     else:
@@ -1075,15 +1077,12 @@ def history(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def balances(ctx: click.Context, addr: str, ws_endpoint: str | None) -> None:
     """Read one account balance snapshot from Keeper's subscription."""
-    emit(
-        ctx,
-        stream.snapshot(
-            ws_url(ctx, ws_endpoint),
-            stream.BALANCES,
-            {"user": addr},
-            notify=warn,
-        ),
-    )
+    ws = ws_url(ctx, ws_endpoint)
+    snapshot = overview.balance_snapshot(settings(ctx), ws, addr, notify=warn)
+    if ctx.obj["json"]:
+        emit(ctx, snapshot)
+    else:
+        overview_format.show_balances(snapshot["data"]["userBalances"])
 
 
 @main.group()

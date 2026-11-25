@@ -42,7 +42,10 @@ sai --json watch price 3
   and `queuedMarketOrders`. Check each section's fetch time, source age,
   and `error`. A section can fail when the command exits 0.
 - `account positions ADDR` returns `perp.trades`, including pending orders.
-  `account balances ADDR` returns one snapshot in `data.userBalances`.
+  `account balances ADDR` shows source block and age in text mode and returns
+  one snapshot in JSON field `data.userBalances`. Both balance reads mark a
+  source more than five minutes old as stale. An unverifiable block time has
+  an unknown age.
   `account history ADDR` returns `perp.tradeHistory`.
 - `watch price TOKEN_ID`, `watch positions ADDR`, and `watch balances
   ADDR` stream JSON lines until interrupted. A stream reconnects after a
