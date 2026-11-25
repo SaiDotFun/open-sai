@@ -1,0 +1,5 @@
+# Python main behavior for the Rust port. The release manifest compares v0.1.2.
+
+[gap.collateral-previews]
+owner = "#231"
+difference = "Leverage and margin dry runs show before and after collateral in USDC and oracle-valued USD in text and JSON. Margin adds can size the quote with --max-collateral-usd."

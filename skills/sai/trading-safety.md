@@ -220,6 +220,13 @@ sai --json intent local 0xYOUR_ADDR
 sai --json intent wait INTENT_KEY --addr 0xYOUR_ADDR --timeout 30
 ```
 
+Leverage and margin dry runs show collateral before and after in USDC and USD.
+For a margin add, pass `--max-collateral-usd 5` with `--amount 1` to reduce
+the quoted add as needed to stay within $5 of estimated total collateral.
+Pass the same cap on submission. Perp settles the target leverage and can
+produce a different collateral amount if the position or oracle price moves.
+
+
 `--as ADDR` needs `ADDR` to be a connected account (`sai auth list`). Trade
 output names the account in field `addr`. Add the same `--endpoint URL` to
 both calls, as rule 2 says; the examples leave it out to stay short.

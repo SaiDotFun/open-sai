@@ -1298,6 +1298,16 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     output = {"addr": account, **result}
     if confirmation.is_confirmable(output):
         output = confirmation.with_digest(output)
+    if not ctx.obj["json"] and (collateral := output.get("collateral")):
+
+        def value(side: str) -> str:
+            usd = collateral[f"{side}Usd"]
+            dollars = f"${usd}" if usd is not None else "USD unavailable"
+            return f"{collateral[f'{side}Usdc']} USDC ({dollars})"
+
+        click.echo(f"Estimated collateral: {value('before')} → {value('after')}")
+        if output.get("warning"):
+            click.echo(output["warning"])
     emit(ctx, output)
 
 
@@ -1600,6 +1610,7 @@ def trade_leverage(
                 trade_id=trade_id,
                 leverage=leverage,
                 dry_run=dry_run,
+                show_collateral=True,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
@@ -1628,6 +1639,11 @@ def lcd_trade_settings(
     help="USDC amount for a leverage quote, not an execution cap.",
 )
 @click.option(
+    "--max-collateral-usd",
+    type=TRADE_DECIMAL,
+    help="Reduce a margin add to fit this estimated total collateral in USD.",
+)
+@click.option(
     "--lcd-endpoint",
     help="Nibiru REST endpoint for exact contract state. Defaults to the"
     " lcd.endpoint setting.",
@@ -1641,6 +1657,7 @@ def trade_margin(
     trade_id: int,
     direction: str,
     amount: str,
+    max_collateral_usd: str | None,
     lcd_endpoint: str | None,
     dry_run: bool,
     preview_digest: str | None,
@@ -1659,6 +1676,8 @@ def trade_margin(
                 trade_id=trade_id,
                 direction=direction,
                 amount=amount,
+                max_collateral_usd=max_collateral_usd,
+                show_collateral=True,
                 lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
                 before_submit=trade_submit_check(loader(ctx), preview_digest),

@@ -200,6 +200,7 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         },
         "get_pair_custom_max_leverage": "8" if mode == "pair-cap" else "0",
         "get_fees": {"open_fee_p": "0.001"},
+        "get_collateral_price": "1.01",
         "get_perp_prices": {
             "market": {
                 "base_per_quote": {
@@ -227,6 +228,7 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
         "get_group": {"index": "GroupIndex(0)"},
         "get_pair_custom_max_leverage": {"index": 3},
         "get_fees": {"index": "FeeIndex(0)"},
+        "get_collateral_price": {"collateral_index": "TokenIndex(0)"},
         "get_perp_prices": {
             "market_index": "MarketIndex(3)",
             "collateral_index": "TokenIndex(0)",
@@ -566,11 +568,26 @@ def test_position_update_dry_run(
             assert document["dryRun"] is True
             assert document["intent"] == intent(command)
             assert document["estimates"] == expected
-            outputs.append(output)
             wire = PYTHON_QUOTE_WIRE if implementation == "python" else QUOTE_WIRE
             if command == LEVERAGE:
                 wire = QUOTE_WIRE[:-1]
-            assert [entry.label for entry in endpoints.wire] == wire + suffix
+            expected_wire = wire + suffix
+            if (
+                command == LEVERAGE
+                and expected["liquidationPrice"]["status"] == "estimate"
+                and implementation == "python"
+            ):
+                # Issue 231 tracks the collateral field against current Python.
+                assert document.pop("collateral") == {
+                    "beforeUsdc": "20.000000",
+                    "afterUsdc": "10.000000",
+                    "beforeUsd": "20.2",
+                    "afterUsd": "10.1",
+                }
+                expected_wire += ["get_collateral_price"]
+                output = (json.dumps(document, sort_keys=True) + "\n").encode()
+            outputs.append(output)
+            assert [entry.label for entry in endpoints.wire] == expected_wire
             assert not endpoints.errors
             assert not (home / "sai/trader/intents.sqlite3").exists()
     assert outputs[0] == outputs[1]

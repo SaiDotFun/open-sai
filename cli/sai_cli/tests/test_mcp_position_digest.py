@@ -3450,3 +3450,97 @@ def test_margin_checks_perps_borrowing_inclusive_leverage_quote(
             assert position.submitted == []
 
     asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("command", "after"),
+    [
+        (["leverage", "7", "--leverage", "1.6"], "5.000000"),
+        (
+            [
+                "margin",
+                "7",
+                "--direction",
+                "add",
+                "--amount",
+                "2",
+                "--max-collateral-usd",
+                "5",
+            ],
+            "4.950494",
+        ),
+        (
+            ["margin", "7", "--direction", "remove", "--amount", "1"],
+            "3.000000",
+        ),
+    ],
+    ids=["leverage", "capped-add", "remove"],
+)
+def test_cli_collateral_preview(position_service, command, after):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = True
+    position.collateral_price = "1.01"
+    save_session(f"{base_url}/query")
+    args = position_cli_args(base_url, [*command, "--dry-run"])
+    cli = CliRunner()
+
+    result = cli.invoke(main, args)
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.stdout)
+    collateral = preview["collateral"]
+    assert collateral == {
+        "beforeUsdc": "4.000000",
+        "afterUsdc": after,
+        "beforeUsd": "4.04",
+        "afterUsd": format((Decimal(after) * Decimal("1.01")).normalize(), "f"),
+    }
+    if "--max-collateral-usd" in command:
+        assert preview["quote"]["maxCollateralUsd"] == "5"
+        assert Decimal(collateral["afterUsd"]) <= 5
+
+    result = cli.invoke(main, args[1:])
+    assert result.exit_code == 0, result.output
+    assert (
+        f"Estimated collateral: 4.000000 USDC ($4.04) → "
+        f"{after} USDC (${collateral['afterUsd']})"
+    ) in result.stdout
+    assert not position.submitted
+
+
+def test_cli_capped_margin_requotes_when_oracle_moves(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = True
+    save_session(f"{base_url}/query")
+    args = position_cli_args(
+        base_url,
+        [
+            "margin",
+            "7",
+            "--direction",
+            "add",
+            "--amount",
+            "2",
+            "--max-collateral-usd",
+            "5",
+        ],
+    )
+    cli = CliRunner()
+    result = cli.invoke(main, [*args, "--dry-run"])
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.stdout)
+
+    position.collateral_price = "1.01"
+    result = cli.invoke(main, [*args, "--preview-digest", preview["previewDigest"]])
+    assert result.exit_code == ExitCode.REJECTED, result.output
+    assert json.loads(result.stdout)["error"]["code"] == "PREVIEW_MISMATCH"
+    assert not position.submitted
+
+    result = cli.invoke(main, [*args, "--dry-run"])
+    assert result.exit_code == 0, result.output
+    preview = json.loads(result.stdout)
+    result = cli.invoke(main, [*args, "--preview-digest", preview["previewDigest"]])
+    assert result.exit_code == 0, result.output
+    (submitted,) = position.submitted
+    assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]

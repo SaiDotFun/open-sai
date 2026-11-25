@@ -484,7 +484,18 @@ the direction. When the after-hours guard is pending,
 before the leverage change. Keeper submits the target leverage. Perp uses
 effective leverage at execution to determine the direction and amount.
 `--dry-run` reads live state and prints the quote without submitting an
-intent. Use `--lcd-endpoint` to select the matching network's
+intent. The preview shows collateral before and after in USDC and USD. In
+JSON, those values appear in `collateral.beforeUsdc`, `collateral.afterUsdc`,
+`collateral.beforeUsd`, and `collateral.afterUsd`. The USD fields are null
+when the collateral oracle price is unavailable.
+
+Use `--max-collateral-usd 5` with `trade margin --direction add --amount 1`
+to quote an add of up to 1 USDC with at most $5 of estimated total
+collateral. The CLI rounds down to whole base units and reduces the amount
+if needed. Pass the same cap when submitting. The contract executes the
+target leverage, so collateral at execution can differ from the quote.
+
+Use `--lcd-endpoint` to select the matching network's
 Nibiru REST service; the CLI checks that its chain matches Keeper.
 Margin changes and partial closes briefly re-read Keeper and the contract if
 their position data disagree. If the mismatch persists, the command stops
