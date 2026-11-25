@@ -353,6 +353,7 @@ pub(super) fn check(
         }
         if Storage::new(home)
             .with_busy_timeout(TIMEOUT)
+            .with_preserved_ledger_modes()
             .open_ledger()
             .is_err()
         {
@@ -491,7 +492,8 @@ fn reconcile_pending(
     let storage = Storage::new(ledger.home)
         .with_event_sink(&sink)
         .with_busy_timeout(TIMEOUT)
-        .with_ledger_deadline(deadline);
+        .with_ledger_deadline(deadline)
+        .with_preserved_ledger_modes();
     let result = rt.block_on(async {
         for key in keys {
             if !ledger.unchanged() {

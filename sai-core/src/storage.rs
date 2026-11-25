@@ -82,6 +82,7 @@ pub struct Storage<'a> {
     pub(crate) trader: PathBuf,
     busy_timeout: Duration,
     ledger_deadline: Option<Instant>,
+    preserve_ledger_modes: bool,
     events: Option<&'a (dyn Fn(StorageEvent<'_>) + Sync)>,
 }
 
@@ -181,6 +182,7 @@ impl<'a> Storage<'a> {
             trader: sai_home.as_ref().join("trader"),
             busy_timeout: Duration::from_secs(10),
             ledger_deadline: None,
+            preserve_ledger_modes: false,
             events: None,
         }
     }
@@ -194,6 +196,12 @@ impl<'a> Storage<'a> {
     /// Bound ledger writes during one doctor reconciliation run.
     pub fn with_ledger_deadline(mut self, deadline: Instant) -> Self {
         self.ledger_deadline = Some(deadline);
+        self
+    }
+
+    /// Open only an existing ledger without changing its mode or its directory's mode.
+    pub fn with_preserved_ledger_modes(mut self) -> Self {
+        self.preserve_ledger_modes = true;
         self
     }
 

@@ -247,6 +247,49 @@ def test_doctor_needs_trader_data_to_tighten_sai_home(
                 assert "moving the profile to a dedicated directory" in check["fix"]
 
 
+@pytest.mark.parametrize("writable", [True, False], ids=["writable", "read-only"])
+def test_doctor_preserves_shared_trader_modes_during_migration(
+    wave_clis: tuple[str, str], tmp_path: Path, writable: bool
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        trader = home / "sai/trader"
+        trader.mkdir(parents=True)
+        trader.chmod(0o755)
+        notes = trader / "notes.txt"
+        notes.write_text("another application")
+        path = trader / "intents.sqlite3"
+        with sqlite3.connect(path) as ledger:
+            ledger.execute(
+                "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL,"
+                " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+                " entity TEXT NOT NULL)"
+            )
+        mode = 0o644 if writable else 0o400
+        path.chmod(mode)
+        before = path.read_bytes()
+
+        result = run_cli(binary, home, "--json", "doctor", "--offline")
+        report = json.loads(result.stdout)
+        checks = report if writable else report["error"]["details"]
+        by_id = {check["id"]: check for check in checks["checks"]}
+        assert by_id["home"]["status"] == "warn"
+        assert "dedicated directory" in by_id["home"]["fix"]
+        if not writable:
+            assert stat.S_IMODE(path.stat().st_mode) == mode
+        assert stat.S_IMODE(trader.stat().st_mode) == 0o755
+        assert notes.read_text() == "another application"
+        if writable:
+            assert stat.S_IMODE(path.stat().st_mode) == mode
+            assert result.returncode == 0
+            assert by_id["intents"]["status"] == "fixed"
+            assert by_id["intents"]["details"]["userVersion"] == 1
+        else:
+            assert result.returncode == 1
+            assert by_id["intents"]["status"] == "fail"
+            assert path.read_bytes() == before
+
+
 def test_doctor_lcd_keeps_the_query_after_the_node_info_path(
     wave_clis: tuple[str, str], tmp_path: Path
 ) -> None:
