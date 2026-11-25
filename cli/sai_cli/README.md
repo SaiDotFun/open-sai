@@ -558,11 +558,12 @@ and never prints the session token. Without fixes it reads the ledger from a
 temporary copy, so it writes nothing at all.
 
 Doctor can repair stale Codex and Cursor launchers. For a differing Claude
-Code `sai` entry, doctor prints the guarded replacement command. The add
-uses the expected absolute launcher and default arguments. Supply any custom
-arguments or environment settings you want to keep. The command changes to
-the project or local scope's directory before editing. For a stale legacy alias, doctor can suggest
-an explicit `--repair-existing` command that preserves compatible arguments.
+Code `sai` entry, doctor prints a launcher check and a scoped `claude mcp add`
+command. Fill in any placeholders from the saved config before removing the
+entry. Run the check, remove the old entry in Claude, and run the add from
+the project directory where Claude uses the entry. For a stale legacy alias,
+doctor can suggest an explicit `--repair-existing` command that preserves
+compatible arguments.
 
 Each check reports `pass`, `fixed`, `warn`, `fail`, or `skipped` and
 may include a fix. `sai --json doctor` returns `schemaVersion`,
