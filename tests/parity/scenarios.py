@@ -1238,6 +1238,14 @@ def loopback(
                         request, response, height = entry
                         wire.append(request)
                         if (
+                            scenario
+                            in {"overview-lcd-fails", "overview-fill-and-lcd-fail"}
+                            and request.label == "get_trade"
+                            and request.variables["index"] == 0
+                        ):
+                            self.reply({}, 503)
+                            return
+                        if (
                             scenario == "overview-deadline"
                             and request.label == "get_trade"
                             and request.variables["index"] == 0

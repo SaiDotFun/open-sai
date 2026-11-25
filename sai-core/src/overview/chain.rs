@@ -182,6 +182,7 @@ fn contract_address(value: &Value) -> Option<&str> {
 
 pub(super) struct ContractReads<'a> {
     pub(super) chain: &'a Chain<'a>,
+    pub(super) trade_read_failed: bool,
     timed_out: AtomicBool,
     groups: HashMap<String, Option<u64>>,
     rates: HashMap<(u64, u64), Option<(Value, Stamp)>>,
@@ -193,6 +194,7 @@ impl<'a> ContractReads<'a> {
     pub(super) fn new(chain: &'a Chain<'a>) -> Self {
         Self {
             chain,
+            trade_read_failed: false,
             timed_out: AtomicBool::new(false),
             groups: HashMap::new(),
             rates: HashMap::new(),
@@ -203,6 +205,15 @@ impl<'a> ContractReads<'a> {
 
     pub(super) fn deadline_expired(&self) -> bool {
         self.timed_out.load(Ordering::Relaxed) || Instant::now() >= self.chain.deadline
+    }
+
+    pub(super) async fn trade(&mut self, addr: &str, index: &Value) -> Option<Value> {
+        let position = self
+            .query(None, json!({"get_trade": {"trader": addr, "index": index}}))
+            .await
+            .filter(|position| position["trade"].is_object());
+        self.trade_read_failed |= position.is_none();
+        position
     }
 
     pub(super) async fn query(&self, contract: Option<&str>, message: Value) -> Option<Value> {

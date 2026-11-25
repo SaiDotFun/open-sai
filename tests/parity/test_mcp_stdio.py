@@ -953,6 +953,42 @@ def test_overview_balance_snapshot_deadline_survives_pings(
         assert not endpoints.errors
 
 
+@pytest.mark.parametrize(
+    ("scenario", "items", "fill_failed", "lcd_failed"),
+    [
+        ("overview-fill-check-fails", 0, True, False),
+        ("overview-fill-check-malformed", 0, True, False),
+        ("overview-lcd-fails", 2, False, True),
+        ("overview-lcd-malformed", 2, False, True),
+        ("overview-fill-and-lcd-fail", 2, True, True),
+    ],
+)
+def test_overview_surfaces_failed_position_checks(
+    native: Path,
+    tmp_path: Path,
+    scenario: str,
+    items: int,
+    fill_failed: bool,
+    lcd_failed: bool,
+) -> None:
+    with (
+        loopback(scenario) as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=20) as stdio,
+    ):
+        report = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        positions = report["positions"]
+        assert positions["membership"]["status"] == "verified"
+        assert len(positions["data"]["items"]) == items
+        assert positions["data"]["unrealizedPnlUsd"] is None
+        error = positions["error"]
+        assert error["code"] == "INCOMPLETE_DATA"
+        assert ("Keeper fill check failed" in error["message"]) == fill_failed
+        assert ("LCD position read failed" in error["message"]) == lcd_failed
+        if items:
+            assert positions["data"]["items"][1]["riskStatus"] == "verified"
+        assert not endpoints.errors
+
+
 def write_intent_trail(home: Path, endpoints: Endpoints, count: int) -> dict[str, Any]:
     stamp = "2026-11-19T12:00:00.000Z"
     logs = home / "sai/logs"

@@ -34,26 +34,31 @@ async fn load(
     risk: &mut Value,
 ) -> Option<()> {
     let chain = reads.chain;
-    let position = reads
-        .query(
-            None,
-            json!({"get_trade": {"trader": addr, "index": trade["id"]}}),
-        )
-        .await?;
+    let position = reads.trade(addr, &trade["id"]).await?;
     let fetched = now();
     let raw = position.get("trade")?;
-    if !agrees(trade, raw)? {
+    let Some(matches) = agrees(trade, raw) else {
+        reads.trade_read_failed = true;
+        return None;
+    };
+    if !matches {
         inconsistent(risk, "Keeper and contract trade values differ");
         return Some(());
     }
 
     let market = &trade["perpBorrowing"];
-    let liquidation = decimal(position.get("liquidation_price")?)?;
-    let entry = decimal(raw.get("open_price")?)?;
+    let (Some(liquidation), Some(entry)) = (
+        decimal(&position["liquidation_price"]),
+        decimal(&raw["open_price"]),
+    ) else {
+        reads.trade_read_failed = true;
+        return None;
+    };
     let base_id = market["baseToken"]["id"].as_u64()?;
     let quote_id = market["quoteToken"]["id"].as_u64()?;
     let adjustment = crate::keeper::truthy(&position["needs_after_hours_trigger"]);
     if liquidation.sign() == Sign::Minus || entry.sign() != Sign::Plus {
+        reads.trade_read_failed = true;
         return None;
     }
     let mut source = json!({"fetchedAt": iso(fetched), "sourceBlock": chain.height});

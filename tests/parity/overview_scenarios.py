@@ -84,6 +84,9 @@ class OverviewReplay:
         )
         self.trades = self.state["http"][keeper.OVERVIEW_TRADES]
         self.orders = self.state["http"][keeper.PENDING_MARKET_ORDERS]
+        if scenario in {"overview-fill-check-fails", "overview-fill-check-malformed"}:
+            self.trades["data"]["perp"]["trades"].clear()
+            self.state["contractTrades"].clear()
         queued = self.orders["data"]["perp"]["marketOrders"][0]
         queued["orderReqTxHash"] = "A" * 64
         if scenario == "overview-tainted":
@@ -129,6 +132,13 @@ class OverviewReplay:
             "tokenPricesUsd",
         }:
             return {"errors": [{"message": "synthetic unavailable section"}]}
+        if name == "userIntents" and self.scenario in {
+            "overview-fill-check-fails",
+            "overview-fill-and-lcd-fail",
+        }:
+            return {"errors": [{"message": "synthetic fill check failure"}]}
+        if name == "userIntents" and self.scenario == "overview-fill-check-malformed":
+            return {"data": {"userIntents": [{}]}}
         return {
             "overviewTrades": self.trades,
             "pendingMarketOrders": self.orders,
@@ -189,6 +199,8 @@ class OverviewReplay:
             served -= 1
         if name == "get_trade":
             data = self.state["contractTrades"][args["index"]]
+            if self.scenario == "overview-lcd-malformed" and args["index"] == 0:
+                data = {"trade": {}}
         elif name == "get_market":
             data = self.state["contractMarkets"][args["index"]]
         elif name == "get_exchange_rate_stamped":

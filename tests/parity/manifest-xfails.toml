@@ -33,6 +33,10 @@ signature = "3015bd9644405895117cd0327cfc123b38b5e0e37c50552bd40893a97a0e1b92"
 owner = "#211"
 signature = "fc7b588d1bf24ecc42b258d68e40ffeb6b0fa4eb512342011fd57f25c99dba55"
 
+[gap."case:account-overview-conflicting-height"]
+owner = "#175"
+signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
+
 [gap."case:account-overview-confirmation-fails"]
 owner = "#211"
 signature = "740ca26b317d7ea13fbb52915b7b81a87574d4c15b3b92c72f8bb07f10366678"
@@ -68,6 +72,10 @@ signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
 [gap."case:account-overview-signed-out-leaf-json"]
 owner = "#211"
 signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
+
+[gap."case:account-overview-wrong-height"]
+owner = "#175"
+signature = "b93612e5f1b90c92fc651cb9f6d79cf9dac19bc9276449af9ddc40fb305e66c7"
 
 [gap."case:auth-import-rejected-operand-json"]
 owner = "#211"
