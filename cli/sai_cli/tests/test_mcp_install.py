@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import stat
 import subprocess
@@ -71,9 +72,9 @@ import tomlkit
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write(json.dumps(sys.argv) + "\\n")
 args = sys.argv[1:]
-assert args[:2] == ["mcp", "get"], args
 name = args[2]
 config = Path(os.environ["CODEX_HOME"]) / "config.toml"
+assert args[:2] == ["mcp", "get"], args
 state = tomlkit.parse(config.read_text()).unwrap() if config.exists() else {}
 # Stands in for Codex's own project rules: a project entry Codex would load
 # from this directory is given in ./fake-codex-project.json.
@@ -87,6 +88,10 @@ else:
     if entry is None:
         sys.stderr.write(f"Error: No MCP server named '{name}' found.\\n")
         sys.exit(1)
+    for i in range(4, len(args), 2):
+        assert args[i] == "-c"
+        key, value = args[i + 1].split("=", 1)
+        entry[key.removeprefix(f"mcp_servers.{name}.")] = tomlkit.parse(f"item = {value}").unwrap()["item"]
     transport = dict(entry)
     data = {"enabled": transport.pop("enabled", True), "transport": transport}
     for key in ("enabled_tools", "disabled_tools"):
@@ -816,6 +821,130 @@ def test_doctor_updates_symlink_referent_and_keeps_link(env: Env, client: str):
     assert stat.S_IMODE(referent.stat().st_mode) == 0o640
 
 
+@pytest.mark.parametrize(
+    "writer", ["none", "other-server", "remove-entry", "replace-entry"]
+)
+def test_doctor_does_not_write_a_rejected_codex_repair(env: Env, writer: str):
+    original_entry = (
+        f'[mcp_servers."{OLD_COMMAND}"] # keep this\n'
+        f'command = "{OLD_COMMAND}"\n'
+        'args = ["--endpoint", "http://127.0.0.1:8765"]\n'
+        f'env = {{ CUSTOM = "{SECRET}" }}\n'
+    )
+    unrelated = '\n[mcp_servers.other]\ncommand = "other"\n'
+    source = original_entry + unrelated
+    after, state = {
+        "none": (source, "The original Sai entry is unchanged."),
+        "other-server": (
+            source + "\n[mcp_servers.newer_server]\ncustom_setting = true\n",
+            "The original Sai entry is unchanged.",
+        ),
+        "remove-entry": (unrelated, "The Sai entry is missing."),
+        "replace-entry": (
+            original_entry.replace(f'command = "{OLD_COMMAND}"', 'command = "new"')
+            + unrelated,
+            "The Sai entry was changed by another process.",
+        ),
+    }[writer]
+    config = env.codex_path()
+    config.write_bytes(source.encode())
+    before = config.stat()
+    # Reject the proposed launcher and verify it never reached the live file.
+    # A concurrent writer may still update the file while Codex reads it.
+    reject = f"""
+    if entry["command"] == {str(env.sai)!r}:
+        assert config.read_bytes() == {source.encode()!r}
+        if {writer != "none"!r}:
+            config.write_bytes({after.encode()!r})
+        sys.stderr.write({SECRET!r})
+        sys.exit(3)
+"""
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "    transport = dict(entry)", reject + "    transport = dict(entry)"
+        ),
+    )
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 1, result.output
+    check = mcp_checks(result)["codex"]
+    assert check["status"] == "fail"
+    assert "Codex rejected the proposed repair." in check["summary"]
+    assert state in check["summary"]
+    assert not check.get("changes")
+    assert config.read_bytes() == after.encode()
+    if writer == "none":
+        current = config.stat()
+        assert (current.st_ino, current.st_mtime_ns) == (
+            before.st_ino,
+            before.st_mtime_ns,
+        )
+    assert list(env.codex_home.iterdir()) == [config]
+    assert any("-c" in call for call in env.calls())
+    assert all(call[:2] == ["mcp", "get"] for call in env.calls())
+    assert SECRET not in result.output
+
+
+@pytest.mark.parametrize("has_policy", [False, True])
+def test_doctor_prints_redacted_codex_restore_command(env: Env, has_policy: bool):
+    saved_keys = (
+        "ROUND4_MOCK_PRIVATE_KEYNAME",
+        "SAI_RESTORE_FIXTURE",
+        "sk-fixture-token-used-as-a-key",
+    )
+    original = {
+        "command": str(env.root / SECRET / OLD_COMMAND),
+        "args": [f"--endpoint=https://fixture.invalid/{SECRET}"],
+        "env": dict.fromkeys(saved_keys, SECRET),
+    }
+    if has_policy:
+        original.update(enabled=False, enabled_tools=[])
+    env.write_codex({"sai": original})
+    before = env.codex_path().read_bytes()
+    reject = f"""
+    if entry["command"] == {str(env.sai)!r}:
+        sys.stderr.write({SECRET!r})
+        sys.exit(3)
+"""
+    write_exe(
+        env.bin / "codex",
+        FAKE_CODEX.replace(
+            "    transport = dict(entry)", reject + "    transport = dict(entry)"
+        ),
+    )
+
+    result = invoke("doctor", "--offline")
+
+    assert result.exit_code == 1
+    check = mcp_checks(result)["codex"]
+    assert "The original Sai entry is unchanged." in check["summary"]
+    [command] = check["fix"].split("`")[1::2]
+    assert shlex.split(command) == [
+        "codex",
+        "mcp",
+        "add",
+        "sai",
+        *(["--env", "<NAME>=<value>"] * len(saved_keys)),
+        "--",
+        "<original-launcher>",
+        "--endpoint=<original-value>",
+    ]
+    assert ("Codex config.toml" in check["fix"]) is has_policy
+    count = f"The saved entry has {len(saved_keys)} environment assignments."
+    assert count in check["fix"]
+    text_result = CliRunner().invoke(main, ["doctor", "--offline"])
+    assert text_result.exit_code == 1
+    assert count in text_result.output
+    assert text_result.output.count("--env '<NAME>=<value>'") == len(saved_keys)
+    logs = "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
+    outputs = result.output + text_result.output + logs + env.log.read_text()
+    assert all(private not in outputs for private in (SECRET, *saved_keys))
+    assert env.codex_path().read_bytes() == before
+    assert list(env.codex_home.iterdir()) == [env.codex_path()]
+
+
 def test_doctor_reports_same_stale_codex_project_entry_after_repairing_user(env: Env):
     entry = {"command": OLD_COMMAND, "args": []}
     override = env.project / "fake-codex-project.json"
@@ -870,6 +999,39 @@ def test_doctor_repairs_codex_with_a_normalized_stable_launcher(
         assert codex["current"] and codex["registrations"][0]["current"]
         assert codex["registeredCommand"] == serve(env)
         assert mcp_checks(invoke("doctor", "--offline"))["codex"]["status"] == "pass"
+
+
+def test_codex_install_replaces_launcher_with_a_missing_path_component(env: Env):
+    missing = env.root / "removed-directory"
+    launcher = missing / ".." / "bin" / "sai"
+    env.write_codex({"sai": claude_entry([str(launcher), *serve(env)[1:]])})
+
+    listed = invoke("mcp", "list")
+    assert listed.exit_code == 0, listed.output
+    codex = next(row for row in payload(listed)["clients"] if row["client"] == "codex")
+    assert codex["registered"] and not codex["current"]
+    assert not codex["registrations"][0]["current"]
+
+    installed = invoke("mcp", "install", "codex")
+    assert installed.exit_code == 0, installed.output
+    assert actions(installed) == {"codex": "replaced"}
+    entry = tomlkit.parse(env.codex_path().read_text())["mcp_servers"]["sai"]
+    assert entry["command"] == str(env.sai)
+
+
+def test_codex_install_rejects_a_matching_broken_explicit_launcher(env: Env):
+    launcher = env.root / "removed-directory" / ".." / "bin" / "sai"
+    argv = [str(launcher), *serve(env)[1:]]
+    env.write_codex({"sai": claude_entry(argv, {"CUSTOM": SECRET})})
+    original = env.codex_path().read_bytes()
+
+    result = invoke("mcp", "install", "codex", "--", *argv)
+
+    assert "requested server launcher is missing or not executable" in failure(result)
+    [row] = payload(result)["error"]["details"]["results"]
+    assert row["action"] == "failed" and not row["changed"]
+    assert env.codex_path().read_bytes() == original
+    assert not env.calls()
 
 
 def test_install_uses_each_clients_registration_backend(env: Env):
@@ -1056,9 +1218,12 @@ def test_claude_install_leaves_a_disabled_canonical_project_entry_in_place(
 @pytest.mark.skipif(
     os.name == "nt", reason="Claude uses worktree-local settings on Windows"
 )
-@pytest.mark.parametrize("name", [OLD_COMMAND, "sai"])
+@pytest.mark.parametrize(
+    ("name", "entry_scope"),
+    [(OLD_COMMAND, "project"), ("sai", "project"), (OLD_COMMAND, "user")],
+)
 def test_claude_install_honors_settings_from_the_main_checkout(
-    env: Env, monkeypatch: pytest.MonkeyPatch, name: str
+    env: Env, monkeypatch: pytest.MonkeyPatch, name: str, entry_scope: str
 ):
     git = shutil.which("git", path=os.defpath)
     assert git is not None
@@ -1083,22 +1248,40 @@ def test_claude_install_honors_settings_from_the_main_checkout(
         subprocess.run(
             [git, "-C", str(env.project), *args], check=True, capture_output=True
         )
-    policy = env.project / ".claude" / "settings.local.json"
-    policy.parent.mkdir()
-    policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
-    config = linked / ".mcp.json"
-    config.write_text(json.dumps({"mcpServers": {name: claude_entry(serve(env))}}))
-    before = config.read_bytes(), policy.read_bytes()
+    data: dict[str, Any] = {"mcpServers": {name: claude_entry(serve(env))}}
+    if entry_scope == "user":
+        config = env.home / ".claude.json"
+        data["projects"] = {
+            str(env.project): {"disabledMcpServers": [name]},
+            str(linked): {"disabledMcpServers": []},
+        }
+        paths = [config]
+    else:
+        config = linked / ".mcp.json"
+        policy = env.project / ".claude" / "settings.local.json"
+        policy.parent.mkdir()
+        policy.write_text(json.dumps({"disabledMcpjsonServers": [name]}))
+        paths = [config, policy]
+    config.write_text(json.dumps(data))
+    before = [path.read_bytes() for path in paths]
     monkeypatch.chdir(linked)
     scope = "user" if name == OLD_COMMAND else "project"
+
+    listed = invoke("mcp", "list")
+    assert listed.exit_code == 0, listed.output
+    claude = next(
+        row for row in payload(listed)["clients"] if row["client"] == "claude"
+    )
+    assert claude["disabled"] and not claude["current"]
+    assert claude["registrations"][0]["disabled"]
+    env.clear()
 
     result = invoke("mcp", "install", "claude", "--scope", scope)
 
     message = failure(result)
-    assert "claude (project): failed" in message and "disabled" in message
+    assert f"claude ({entry_scope}): failed" in message and "disabled" in message
     assert name in message and "Review MCP approvals" in message
-    assert (config.read_bytes(), policy.read_bytes()) == before
-    assert not (env.home / ".claude.json").exists()
+    assert [path.read_bytes() for path in paths] == before
     assert not env.calls()
 
 
@@ -1521,7 +1704,7 @@ def test_list_reads_only_the_sai_entry_and_prints_no_secrets(env: Env):
         invoke("mcp", "uninstall"),
     ]
     rows = {r["client"]: r for r in payload(outputs[0])["clients"]}
-    assert rows["claude"]["registeredCommand"] == [OLD_COMMAND]
+    assert rows["claude"]["registeredCommand"] == ["<hidden>"]
     assert rows["claude"]["current"] is False
     assert rows["claude"]["scope"] == "user"
     # The codex entry runs the right command but carries an extra env name.
@@ -1751,7 +1934,7 @@ def test_list_shows_every_scope_and_the_effective_one(env: Env):
     assert row["registrations"] == [
         {
             "scope": "project",
-            "command": [OLD_COMMAND],
+            "command": ["<hidden>"],
             "current": False,
             "effective": True,
         },
@@ -1844,8 +2027,12 @@ def test_cursor_gives_up_when_the_file_keeps_changing(env: Env, monkeypatch):
     assert [p.name for p in path.parent.iterdir()] == ["mcp.json"]
 
 
-def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: Env):
-    wrapper = ["/opt/bin/wrap", "--url", f"https://user:{SECRET}@host.example/mcp"]
+def test_registered_launcher_and_args_are_hidden_when_the_command_differs(env: Env):
+    wrapper = [
+        f"/opt/bin/wrap-{SECRET}",
+        "--url",
+        f"https://user:{SECRET}@host.example/mcp",
+    ]
     (env.home / ".claude.json").write_text(
         json.dumps({"mcpServers": {"sai": claude_entry(wrapper)}})
     )
@@ -1860,9 +2047,11 @@ def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: En
     )
     listed = invoke("mcp", "list")
     rows = {r["client"]: r for r in payload(listed)["clients"]}
-    assert rows["claude"]["registeredCommand"] == ["wrap"]
+    assert rows["claude"]["registeredCommand"] == ["<hidden>"]
     assert rows["claude"]["args"] == "<hidden>"
-    assert rows["claude"]["registrations"][0]["args"] == "<hidden>"
+    [registration] = rows["claude"]["registrations"]
+    assert registration["command"] == ["<hidden>"]
+    assert registration["args"] == "<hidden>"
     assert rows["codex"]["registeredCommand"] == serve(env)
     assert "args" not in rows["codex"]
     outputs = [
@@ -1874,7 +2063,7 @@ def test_registered_args_are_hidden_unless_they_are_the_expected_command(env: En
     removed = payload(outputs[-1])["results"][0]
     assert (removed["action"], removed["command"], removed["args"]) == (
         "removed",
-        ["wrap"],
+        ["<hidden>"],
         "<hidden>",
     )
     for result in outputs:
@@ -1917,7 +2106,7 @@ def test_codex_project_override_is_effective_and_not_edited(env: Env):
     assert row["registrations"] == [
         {
             "scope": "project",
-            "command": ["old-wrapper"],
+            "command": ["<hidden>"],
             "args": "<hidden>",
             "current": False,
             "effective": True,
