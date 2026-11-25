@@ -2097,7 +2097,9 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
         for client in CUTOVER_CLIENTS:
             check(
                 f"Rollback update MCP {client}",
-                lambda client=client: mcp.verify(client),
+                lambda client=client: mcp.verify(
+                    client, cursor_alias=client == "cursor"
+                ),
             )
         check(
             "Rollback update repoints the stale Cursor alias", mcp.verify_cursor_alias
