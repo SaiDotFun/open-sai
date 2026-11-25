@@ -47,6 +47,24 @@ uv run pytest tests/parity/test_intent_wait.py tests/parity/test_trade_wait.py
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command awaiting a fixture or a native implementation.
 
+## Release Cutover Results
+
+The required Rust job runs the full manifest and the focused comparisons
+against the same `sai-cli/v0.1.2` executable. Run the manifest locally with
+`parity.py --reference /absolute/path/to/released/sai --cutover` and set
+`SAI_PARITY_BIN` to the native executable.
+
+Each `CUTOVER_ROW` in the CI log carries a stable ID, a result, and the
+observed difference paths. `case:` IDs use names in `cases.toml`, `cli:` IDs
+use deferred command names, and `mcp:` IDs use tool names. The MCP result
+includes tool metadata and requires a matching `tools/call` transcript.
+
+[`manifest-xfails.toml`](manifest-xfails.toml) records the owner and hash of
+each reviewed difference signature. An exact match reports `XFAIL`. A changed
+signature, unexpected pass, or unused entry fails the required job. Owners
+remove their entries in the same change that repairs the corresponding gaps.
+`M2-unassigned` entries include proposed issue titles for triage.
+
 ## Auth Security Parity
 
 The namespace matrix compares rejected import operands and malformed stored

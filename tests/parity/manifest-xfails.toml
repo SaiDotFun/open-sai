@@ -1,2 +1,410 @@
 # Reviewed differences against sai-cli/v0.1.2. Stable IDs are case:, cli:, and mcp:.
-[gap]
+# Remove an entry in the same change that fixes its gap.
+
+[gap."case:account-overview-deadline"]
+owner = "M2-unassigned"
+signature = "8749297fb5d37dbe2caca07b154c6914887e01981089a7489f962742f2e87cde"
+title = "Record the release account overview deadline and section error differences"
+
+[gap."case:account-overview-expiry"]
+owner = "M2-unassigned"
+signature = "80742ec47b346ff43bd2ff5973d293f075aa6c8c4fcdbca7985b89ec7888663b"
+title = "Record the release account overview renewal guidance differences"
+
+[gap."case:account-overview-expiry-text"]
+owner = "M2-unassigned"
+signature = "238a1cbd0ebdf3f6339cfcddb79c0366dd06d441e091ae7c836755fac404f8ea"
+title = "Record the release account overview renewal guidance differences"
+
+[gap."case:account-overview-pnl-total"]
+owner = "M2-unassigned"
+signature = "3d7ae1d6125239457cb30f321a81195ecb5e89993b32a6131b35758926b128fa"
+title = "Record the release account overview PnL total difference"
+
+[gap."case:auth-import-rejected-operand-json"]
+owner = "M2-unassigned"
+signature = "853ee70da894855b1c4f648299818bf2bd2b19fd89d3b799f43c521ec21d240a"
+title = "Match the JSON auth import rejection diagnostic"
+
+[gap."case:auth-list"]
+owner = "#126"
+signature = "d97f5db700d2ae1fdb689f548d91792f29f7db47962c3015ddc25c660992f555"
+
+[gap."case:auth-logout"]
+owner = "M2-unassigned"
+signature = "2dcf47cd086569f0e8009ee1c3da43251d5780245713f70797e2fc1f31541990"
+title = "Match auth logout session lock permissions and command events"
+
+[gap."case:auth-status-signed-in"]
+owner = "#126"
+signature = "fdb79dbbcdc9e390008b6081dca0e66ef5599af8251e6079596d6a5ebd705da1"
+
+[gap."case:auth-status-signed-out"]
+owner = "M2-unassigned"
+signature = "d6a06a2c530a428b0fa4fbf99f390d488a189db456e1cd4f434af3111328b30b"
+title = "Match the signed-out auth status hint and event fields"
+
+[gap."case:auth-status-v0-1-0"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:auth-use"]
+owner = "M2-unassigned"
+signature = "2dcf47cd086569f0e8009ee1c3da43251d5780245713f70797e2fc1f31541990"
+title = "Match auth use session lock permissions and command events"
+
+[gap."case:auth-use-invalid-expiry-json"]
+owner = "#171"
+signature = "32ba51ed888d0bab587a3095ea6b908817a8fb0def9a35b163ea68cab314f6c8"
+
+[gap."case:auth-use-invalid-expiry-text"]
+owner = "#171"
+signature = "041bbb80bab23a42c6be942d2b7be627c156469cc329e9e4eb7506653267589d"
+
+[gap."case:config-get-default"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-get-env"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-get-file"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-get-text"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-invalid-value"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-list"]
+owner = "M2-unassigned"
+signature = "971d4aa2db9bd09ed0bc1220bd54e7373894e5374445995f6788f6beca25b553"
+title = "Match the LCD default and command logs in config list"
+
+[gap."case:config-set"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-set-existing"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-unknown-key"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:config-unset"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:doctor-keeper-error-codes"]
+owner = "M2-unassigned"
+signature = "48a6a38415a3e190fb4b3b6019b06c599d0d9524d9c9aa1c823914091c4d6c07"
+title = "Match v0.1.2 Doctor LCD endpoint display"
+
+[gap."case:doctor-lcd-unreachable"]
+owner = "M2-unassigned"
+signature = "5d397100d11bb0110f975f883c28babbd4cdeb993f7d306d67d987a909d33a51"
+title = "Track the intentional redaction in Doctor LCD diagnostics"
+
+[gap."case:doctor-mcp-verification-failure"]
+owner = "#153"
+signature = "ca96cfa545dc0040e233d2101fdbc93e79531c67b1c8c8b820fcfc6c38e009de"
+
+[gap."case:doctor-near-expiry"]
+owner = "M2-unassigned"
+signature = "54ca7d1421483ec721adc8150ca2f505f82aee0abd121011a5dc0339ff2d9040"
+title = "Match the Doctor guidance for near-expiry sessions"
+
+[gap."case:doctor-network"]
+owner = "M2-unassigned"
+signature = "8de1ca995156865cafadc42ac151a6c98ff8137bee662690e52a1235e7174d3b"
+title = "Match v0.1.2 Doctor LCD endpoint display"
+
+[gap."case:doctor-network-with-logging"]
+owner = "M2-unassigned"
+signature = "8de1ca995156865cafadc42ac151a6c98ff8137bee662690e52a1235e7174d3b"
+title = "Match v0.1.2 Doctor LCD endpoint display"
+
+[gap."case:doctor-reconcile-absent-intent"]
+owner = "M2-unassigned"
+signature = "8de1ca995156865cafadc42ac151a6c98ff8137bee662690e52a1235e7174d3b"
+title = "Match v0.1.2 Doctor LCD endpoint display"
+
+[gap."case:doctor-ws-no-subprotocol"]
+owner = "M2-unassigned"
+signature = "8de1ca995156865cafadc42ac151a6c98ff8137bee662690e52a1235e7174d3b"
+title = "Match v0.1.2 Doctor LCD endpoint display"
+
+[gap."case:doctor-ws-timeout"]
+owner = "M2-unassigned"
+signature = "48a6a38415a3e190fb4b3b6019b06c599d0d9524d9c9aa1c823914091c4d6c07"
+title = "Match v0.1.2 Doctor LCD endpoint display"
+
+[gap."case:help"]
+owner = "#172"
+signature = "e7387194b4a226fff6df6558bc5b434c4e8aa5812d87744358f2036fde2c578e"
+
+[gap."case:intent-local-empty"]
+owner = "#126"
+signature = "ed518cbaab9125250d77fb5b4c64d8c2942abf004e93592767d2be07ed1d741e"
+
+[gap."case:intent-local-reserved"]
+owner = "#126"
+signature = "fdb79dbbcdc9e390008b6081dca0e66ef5599af8251e6079596d6a5ebd705da1"
+
+[gap."case:intent-status"]
+owner = "M2-unassigned"
+signature = "c212230fdadbbc22e7c961d48d0f293bd5ba517ebc3a3e3f301b3a34aef313f7"
+title = "Match v0.1.2 trade history correlation in intent status"
+
+[gap."case:intent-wait"]
+owner = "#126"
+signature = "232bce9f1250b2f2ade81afd343d8abeb5d3003a4c8d822b3bccd5a8cf88b11a"
+
+[gap."case:logs-path"]
+owner = "#126"
+signature = "5eb8fa4068c9389a295fc616d54e8fa24659994331d3369d8fa70fd3217d7b66"
+
+[gap."case:logs-tail"]
+owner = "#126"
+signature = "ccd73a3db71df1ce6a937cc8e9d090f9656ef6d3aa60f9acbb5bdf41c1b91942"
+
+[gap."case:mcp-account-intent-reads"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-argument-validation"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-info-public-endpoints"]
+owner = "#175"
+signature = "4bf5a076cfaf0942c743b0aeb1df51ae49db20c8219bc0b67f8797c7bd1790fa"
+
+[gap."case:mcp-initialize-legacy"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-initialize-newer"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-keeper-errors"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-market-number-spelling"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-session-refusals"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-session-reloads"]
+owner = "#175"
+signature = "5586596fdcfc51847847bc9650cca812eebe44d020c85c083ad5f84910106e6a"
+
+[gap."case:mcp-stream-error"]
+owner = "#175"
+signature = "f7322be88c5c7755581f4e2b04b3e58387689f71b7c2ff2272e96d972f0d9281"
+
+[gap."case:mcp-tool-inventory"]
+owner = "#175"
+signature = "4bf5a076cfaf0942c743b0aeb1df51ae49db20c8219bc0b67f8797c7bd1790fa"
+
+[gap."case:skill-flag"]
+owner = "#126"
+signature = "88c0a8a98ce6579308beedc1bed31ea604aa6b3dcdd40620acd08fc797f70cc4"
+
+[gap."case:skill-page"]
+owner = "#126"
+signature = "64e1fc68a463316b8294e7ba2894b53c13cee58786002cdee4055f8758a7bdc6"
+
+[gap."case:skill-show"]
+owner = "#126"
+signature = "64e1fc68a463316b8294e7ba2894b53c13cee58786002cdee4055f8758a7bdc6"
+
+[gap."case:skill-source"]
+owner = "#126"
+signature = "6be287fc891c504202a872c1acd75b7b78c75043d577e3a47228c878b0324b09"
+
+[gap."case:trade-close"]
+owner = "#174"
+signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
+
+[gap."case:trade-concurrent-close"]
+owner = "#174"
+signature = "d518ac78c9d1ecad4abfb7e0b9fe5f28b0da1c07948bdb2bea5398239818f1ab"
+
+[gap."case:trade-leverage"]
+owner = "#173"
+signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
+
+[gap."case:trade-margin"]
+owner = "#118"
+signature = "c5e48ac8a991bd0d15801a76cdd133e022e22232933f09ed86f2c072d1d4960b"
+
+[gap."case:trade-partial-close"]
+owner = "#118"
+signature = "ad9d52990a88f2fee9917f920d8e96dadb44d3dd4ffc4318cb5e585ce1118e6c"
+
+[gap."case:trade-tpsl"]
+owner = "#173"
+signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
+
+[gap."case:update-check"]
+owner = "#121"
+signature = "aa084a74046ea87d28d112c00e0e9fcda9b869b907f960bdeea4691cfec22608"
+
+[gap."case:version"]
+owner = "M2-unassigned"
+signature = "e7387194b4a226fff6df6558bc5b434c4e8aa5812d87744358f2036fde2c578e"
+title = "Match the released sai --version output"
+
+[gap."cli:auth import"]
+owner = "#171"
+signature = "47f0b57e56808a71b0a9dcaaa33967ca717df5d95af42e220a655bee52e719d7"
+
+[gap."cli:auth login"]
+owner = "#171"
+signature = "9dc0061e2046aebcd27faa13d80fff05eabf47e03a2dc1b7dd9654e2be5b786f"
+
+[gap."cli:auth renew"]
+owner = "#171"
+signature = "239418fc6b03abbc915c3b34c45a8dad8d9a15812487eb6dee32b3e0e616a5a4"
+
+[gap."cli:intent wait"]
+owner = "#171"
+signature = "0793bbb2b4b7cd7b1a4da3a694625621c770447bed6ef14d2840069f3ace9bec"
+
+[gap."cli:logs intent"]
+owner = "#126"
+signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
+
+[gap."cli:logs run"]
+owner = "#126"
+signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
+
+[gap."cli:logs stats"]
+owner = "#126"
+signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
+
+[gap."cli:mcp uninstall"]
+owner = "#193"
+signature = "b4ab34d65a9935a9283ad21ce76afe5160eb375f9ed239f6dce9bd7938502d78"
+
+[gap."cli:skill install"]
+owner = "#126"
+signature = "8caa35d02c69de313a00a6e21cf0b861dd1796702f1887716d0929af3584f53e"
+
+[gap."mcp:account_balances"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:account_history"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:account_overview"]
+owner = "#175"
+signature = "554d3d1dfe764044cbb8d8798e14147db26741eb4c649dbd0100ab8f1fa4e367"
+
+[gap."mcp:account_positions"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:auth_list"]
+owner = "#196"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:auth_status"]
+owner = "#196"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:auth_use"]
+owner = "#196"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:intent_local"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:intent_status"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:intent_wait"]
+owner = "#196"
+signature = "554d3d1dfe764044cbb8d8798e14147db26741eb4c649dbd0100ab8f1fa4e367"
+
+[gap."mcp:logs_intent"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:market_list"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:market_prices"]
+owner = "#175"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:mcp_info"]
+owner = "M2-unassigned"
+signature = "255710e2b7bfc3fb9ce9e85a48842f25544da49533dd203961b9b585caeb2556"
+title = "Track v0.1.2 mcp_info endpoint, availability, and inventory differences"
+
+[gap."mcp:preview_close"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:preview_leverage"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:preview_margin"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:preview_open"]
+owner = "#176"
+signature = "d6c72f2c20b761e7bdbb3b5e05c883e3d082e9d3076d4f67138767891d7cd15c"
+
+[gap."mcp:preview_partial_close"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:preview_tpsl"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:trade_close"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:trade_leverage"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:trade_margin"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:trade_open"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:trade_partial_close"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."mcp:trade_tpsl"]
+owner = "#176"
+signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"

@@ -68,6 +68,8 @@ class ManifestGaps:
             "status": status,
             "owner": gap.owner if gap else None,
             "signature": signature if differences else None,
+            "expected_signature": gap.signature if gap else None,
+            "title": (gap.title or None) if gap else None,
             "differences": differences,
         }
         print("CUTOVER_ROW " + json.dumps(evidence, sort_keys=True), flush=True)
