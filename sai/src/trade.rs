@@ -32,6 +32,8 @@ pub enum TradeCommand {
         cancel_order: bool,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -59,6 +61,8 @@ pub enum TradeCommand {
         clear_stop_loss: bool,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -72,6 +76,8 @@ pub enum TradeCommand {
         leverage: String,
         #[arg(long)]
         dry_run: bool,
+        #[arg(long)]
+        preview_digest: Option<String>,
         /// Wait up to 30 seconds for the intent outcome.
         #[arg(long)]
         wait: bool,
@@ -176,6 +182,8 @@ pub struct Open {
     allow_concurrent_open: bool,
     #[arg(long)]
     dry_run: bool,
+    #[arg(long)]
+    preview_digest: Option<String>,
     /// Wait up to 30 seconds for the intent outcome.
     #[arg(long)]
     wait: bool,
@@ -357,102 +365,117 @@ pub fn run(
                 ..
             }
     );
-    let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price) = match command {
-        TradeCommand::Open(open) => (
-            open.preview()?,
-            open.dry_run,
-            open.wait,
-            open.allow_concurrent_open,
-            open.price.is_some(),
-        ),
-        TradeCommand::Close {
-            trade_id,
-            cancel_order,
-            dry_run,
-            wait,
-        } => (
-            close_preview(&trade_id, cancel_order)?,
-            dry_run,
-            wait,
-            false,
-            false,
-        ),
-        TradeCommand::Cancel {
-            trade_id,
-            dry_run,
-            wait,
-        } => (close_preview(&trade_id, true)?, dry_run, wait, false, false),
-        TradeCommand::Margin {
-            position,
-            direction,
-            amount,
-        } => {
-            let direction = match direction.as_str() {
-                "add" => MarginDirection::Add,
-                "remove" => MarginDirection::Remove,
-                _ => {
-                    return Err(SaiError::usage(format!(
-                        "Invalid value for '--direction': {} is not one of 'add', 'remove'.",
-                        repr(&direction),
-                    )));
-                }
-            };
-            return position.run(
-                &trading,
-                &settings,
-                account,
-                PositionAction::Margin {
-                    direction,
-                    amount: &amount,
-                },
-                &waiting,
-            );
-        }
-        TradeCommand::PartialClose { position, percent } => {
-            return position.run(
-                &trading,
-                &settings,
-                account,
-                PositionAction::PartialClose {
-                    percent: trade::parse_partial_close_percent(&percent)?,
-                },
-                &waiting,
-            );
-        }
-        TradeCommand::Tpsl {
-            trade_id,
-            take_profit,
-            stop_loss,
-            clear_take_profit,
-            clear_stop_loss,
-            dry_run,
-            wait,
-        } => (
-            trade::tpsl_preview(
-                &trade_id,
-                take_profit.as_deref(),
-                stop_loss.as_deref(),
+    let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price, preview_digest) =
+        match command {
+            TradeCommand::Open(open) => (
+                open.preview()?,
+                open.dry_run,
+                open.wait,
+                open.allow_concurrent_open,
+                open.price.is_some(),
+                open.preview_digest,
+            ),
+            TradeCommand::Close {
+                trade_id,
+                cancel_order,
+                dry_run,
+                preview_digest,
+                wait,
+            } => (
+                close_preview(&trade_id, cancel_order)?,
+                dry_run,
+                wait,
+                false,
+                false,
+                preview_digest,
+            ),
+            TradeCommand::Cancel {
+                trade_id,
+                dry_run,
+                wait,
+            } => (
+                close_preview(&trade_id, true)?,
+                dry_run,
+                wait,
+                false,
+                false,
+                None,
+            ),
+            TradeCommand::Margin {
+                position,
+                direction,
+                amount,
+            } => {
+                let direction = match direction.as_str() {
+                    "add" => MarginDirection::Add,
+                    "remove" => MarginDirection::Remove,
+                    _ => {
+                        return Err(SaiError::usage(format!(
+                            "Invalid value for '--direction': {} is not one of 'add', 'remove'.",
+                            repr(&direction),
+                        )));
+                    }
+                };
+                return position.run(
+                    &trading,
+                    &settings,
+                    account,
+                    PositionAction::Margin {
+                        direction,
+                        amount: &amount,
+                    },
+                    &waiting,
+                );
+            }
+            TradeCommand::PartialClose { position, percent } => {
+                return position.run(
+                    &trading,
+                    &settings,
+                    account,
+                    PositionAction::PartialClose {
+                        percent: trade::parse_partial_close_percent(&percent)?,
+                    },
+                    &waiting,
+                );
+            }
+            TradeCommand::Tpsl {
+                trade_id,
+                take_profit,
+                stop_loss,
                 clear_take_profit,
                 clear_stop_loss,
-            )?,
-            dry_run,
-            wait,
-            false,
-            false,
-        ),
-        TradeCommand::Leverage {
-            trade_id,
-            leverage,
-            dry_run,
-            wait,
-        } => (
-            trade::leverage_preview(&trade_id, &leverage)?,
-            dry_run,
-            wait,
-            false,
-            false,
-        ),
-    };
+                dry_run,
+                preview_digest,
+                wait,
+            } => (
+                trade::tpsl_preview(
+                    &trade_id,
+                    take_profit.as_deref(),
+                    stop_loss.as_deref(),
+                    clear_take_profit,
+                    clear_stop_loss,
+                )?,
+                dry_run,
+                wait,
+                false,
+                false,
+                preview_digest,
+            ),
+            TradeCommand::Leverage {
+                trade_id,
+                leverage,
+                dry_run,
+                preview_digest,
+                wait,
+            } => (
+                trade::leverage_preview(&trade_id, &leverage)?,
+                dry_run,
+                wait,
+                false,
+                false,
+                preview_digest,
+            ),
+        };
     let session = match trading.load_session(account) {
         Ok(session) => Some(session),
         Err(error) if dry_run && !cancelling && account.is_none() && session_error(error.code) => {
@@ -492,6 +515,7 @@ pub fn run(
     let track = |addr: &str, key: &str| waiting.track(addr, key);
     let options = SubmitOptions {
         allow_concurrent_open,
+        confirmation: preview_digest.as_deref().map(trade::Confirmation::for_cli),
         on_reserved: wait_for_trade.then_some(&track),
         ..SubmitOptions::default()
     };
@@ -654,7 +678,7 @@ impl Position {
                 confirmation: self
                     .preview_digest
                     .as_deref()
-                    .map(trade::Confirmation::for_position_cli),
+                    .map(trade::Confirmation::for_cli),
                 on_reserved: wait_for_trade.then_some(&track),
                 ..SubmitOptions::default()
             })

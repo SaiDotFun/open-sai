@@ -27,7 +27,7 @@ pub(super) fn unknown() -> Value {
 }
 
 impl Trading<'_> {
-    pub(super) async fn estimate_position_update(
+    pub(in crate::trade) async fn estimate_position_update(
         &self,
         preview: &mut TradePreview,
         addr: &str,

@@ -5,8 +5,16 @@ use regex::Regex;
 use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 
-use super::{TradePreview, position::PositionRoute};
-use crate::errors::{Code, SaiError};
+use super::{
+    PreviewMode, TradePreview, Trading,
+    actions::invalid,
+    position::{Lcd, PositionRoute},
+};
+use crate::{
+    errors::{Code, SaiError},
+    keeper::TIMEOUT,
+    storage::Session,
+};
 
 const NEEDS_DIGEST: &str = "preview_digest is required: call the matching preview_* tool, show the user the preview, get confirmation, then pass its previewDigest";
 const MISMATCH: &str = "The trade no longer matches the preview the user confirmed, so nothing was submitted. Show the user this new preview, get their confirmation again, then retry with its previewDigest.";
@@ -15,7 +23,7 @@ const MISMATCH: &str = "The trade no longer matches the preview the user confirm
 pub struct Confirmation<'a> {
     digest: &'a str,
     reference_price: Option<(&'a str, BigUint)>,
-    position_cli: bool,
+    cli: bool,
 }
 
 impl<'a> Confirmation<'a> {
@@ -31,25 +39,25 @@ impl<'a> Confirmation<'a> {
         Ok(Self {
             digest,
             reference_price,
-            position_cli: false,
+            cli: false,
         })
     }
 
-    pub fn for_position_cli(digest: &'a str) -> Self {
+    pub fn for_cli(digest: &'a str) -> Self {
         Self {
             digest,
             reference_price: None,
-            position_cli: true,
+            cli: true,
         }
     }
 
-    pub(super) fn is_position_cli(&self) -> bool {
-        self.position_cli
+    pub(super) fn is_cli(&self) -> bool {
+        self.cli
     }
 
     fn verify_digest(&self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
         if !self.digest_matches(preview, account)? {
-            if self.position_cli {
+            if self.cli {
                 return Err(SaiError::new(
                     Code::PreviewMismatch,
                     "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting.",
@@ -76,10 +84,12 @@ impl<'a> Confirmation<'a> {
         if self.digest_matches(&current, account)? {
             return Ok(());
         }
-        Err(SaiError::new(
-            Code::PreviewMismatch,
-            "The trade no longer matches the preview the user confirmed. Request a fresh preview before submitting.",
-        ))
+        let message = if self.cli {
+            "The trade no longer matches the confirmed preview. Request a new preview before submitting."
+        } else {
+            "The trade no longer matches the preview the user confirmed. Request a fresh preview before submitting."
+        };
+        Err(SaiError::new(Code::PreviewMismatch, message))
     }
 
     fn digest_matches(&self, preview: &TradePreview, account: &str) -> Result<bool, SaiError> {
@@ -138,6 +148,110 @@ impl<'a> Confirmation<'a> {
                         "The market price moved {moved}% from the confirmed referencePrice, more than the {slippage}% slippage, so nothing was submitted. Show the user this new preview, get their confirmation again, then retry with its previewDigest and referencePrice."
                     ),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_unavailable_target<T>(
+        &self,
+        preview: &TradePreview,
+        account: &str,
+        route: &PositionRoute,
+        result: Result<T, SaiError>,
+    ) -> Result<T, SaiError> {
+        if result.is_err() {
+            self.verify_route_digest(preview, account, route)?;
+        }
+        result
+    }
+}
+
+impl Trading<'_> {
+    pub(super) async fn prepare_cli_confirmation(
+        &self,
+        session: &Session,
+        preview: &TradePreview,
+        confirmation: &Confirmation<'_>,
+    ) -> Result<TradePreview, SaiError> {
+        let lcd = self.lcd_endpoint.map(Lcd).ok_or_else(|| {
+            let message = match preview.intent.kind {
+                "OPEN_TRADE" => "Cannot verify the trade route without an LCD",
+                "CANCEL_PENDING_TRADE" => "Cannot verify the pending order without an LCD",
+                _ => "Cannot verify the position without an LCD",
+            };
+            invalid(message)
+        })?;
+        let route = self.position_route(&lcd, true).await?;
+        let mut prepared = preview.clone();
+        prepared.position_route = Some(route.clone());
+        let addr = session.addr();
+        match preview.intent.kind {
+            "OPEN_TRADE" => {
+                self.estimate_preview(&mut prepared, Some(session), PreviewMode::Cli, None)
+                    .await?;
+                if self.position_route(&lcd, true).await? != route {
+                    return Err(SaiError::new(
+                        Code::PreviewMismatch,
+                        "The trading route changed while checking the open. Request a new preview before submitting.",
+                    ));
+                }
+            }
+            "CANCEL_PENDING_TRADE" => {
+                let target = self
+                    .check_pending_target(session, preview, &lcd, &route)
+                    .await;
+                confirmation.check_unavailable_target(preview, addr, &route, target)?;
+            }
+            _ => {
+                let id = preview.position_id()?;
+                let target = async {
+                    let indexed = self.indexed_position(addr, &id, TIMEOUT).await?;
+                    let verified =
+                        Self::verify_contract_owner(&lcd, addr, &id, route.clone()).await?;
+                    Ok((indexed, verified))
+                }
+                .await;
+                let (indexed, verified) =
+                    confirmation.check_unavailable_target(preview, addr, &route, target)?;
+                if preview.is_market_close() {
+                    let (_, estimates) = self
+                        .estimate_verified_close(&lcd, addr, &id, indexed, verified)
+                        .await?;
+                    prepared.estimates = Some(estimates);
+                } else if !preview.intent.body["requestedLeverage"].is_null() {
+                    self.estimate_position_update(
+                        &mut prepared,
+                        addr,
+                        &id,
+                        Some(verified.0),
+                        indexed,
+                        Some(verified.1),
+                    )
+                    .await?;
+                }
+            }
+        }
+        Ok(prepared)
+    }
+}
+
+impl TradePreview {
+    pub(super) fn check_cli_execution(&self, account: &str) -> Result<(), SaiError> {
+        if let Some(estimates) = &self.estimates {
+            let execution = &estimates["execution"];
+            if (execution["status"] == "would_be_rejected"
+                || execution["code"] == "OraclePublicationTimeUnknown")
+                && let Some(reason) = execution["reason"].as_str()
+            {
+                let mut preview = self.cli_preview_output(Some(account));
+                if let Some(fields) = preview.as_object_mut() {
+                    fields.shift_remove("quote");
+                }
+                return Err(SaiError {
+                    details: Some(Box::new(Map::from_iter([("preview".into(), preview)]))),
+                    ..SaiError::new(Code::PreviewMismatch, reason)
+                });
             }
         }
         Ok(())

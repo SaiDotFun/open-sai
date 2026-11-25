@@ -7,7 +7,7 @@ use crate::{
     trade::{
         TradePreview, Trading,
         actions::invalid,
-        position::{ContractPositionError, Lcd, Snapshot, SnapshotError},
+        position::{ContractPositionError, Lcd, PositionRoute, Snapshot, SnapshotError},
     },
 };
 
@@ -20,21 +20,25 @@ const UNKNOWN: &str = "Cannot verify the position and Perp liquidation inputs at
 const GUARDED: &str = "The after-hours guard can change or close this position.";
 const UNKNOWN_ORACLE_TIME: &str = "The oracle price publication time is unknown.";
 
+fn unavailable_close() -> Value {
+    json!({
+        "execution": unavailable(UNKNOWN),
+        "fees": unavailable(UNKNOWN),
+        "liquidationPrice": not_applicable("A full close leaves no position."),
+        "worstCaseFill": {
+            "status": "unbounded",
+            "reason": "This Keeper intent carries no slippage limit.",
+        },
+    })
+}
+
 impl Trading<'_> {
     pub(super) async fn close_estimates(
         &self,
         preview: &mut TradePreview,
         session: Option<&Session>,
     ) -> Result<Value, SaiError> {
-        let mut result = json!({
-            "execution": unavailable(UNKNOWN),
-            "fees": unavailable(UNKNOWN),
-            "liquidationPrice": not_applicable("A full close leaves no position."),
-            "worstCaseFill": {
-                "status": "unbounded",
-                "reason": "This Keeper intent carries no slippage limit.",
-            },
-        });
+        let result = unavailable_close();
         preview.position_owner_verified = session.map(|_| false);
         preview.position_route = None;
         let (Some(endpoint), Some(session), Some(target)) =
@@ -49,33 +53,51 @@ impl Trading<'_> {
         let Ok(route) = self.position_route(&lcd, false).await else {
             return Ok(result);
         };
-        let (route, raw) = match Self::verify_contract_owner(&lcd, account, &id, route).await {
+        let verified = match Self::verify_contract_owner(&lcd, account, &id, route).await {
             Ok(verified) => verified,
             Err(error @ ContractPositionError::Owner) => return Err(error.into()),
             Err(ContractPositionError::Read(_)) => return Ok(result),
         };
+        let route = verified.0.clone();
+        let (known_owner, result) = self
+            .estimate_verified_close(&lcd, account, &id, indexed, verified)
+            .await?;
+        if known_owner {
+            preview.position_owner_verified = Some(true);
+            preview.position_route = Some(route);
+        }
+        Ok(result)
+    }
+
+    pub(in crate::trade) async fn estimate_verified_close(
+        &self,
+        lcd: &Lcd<'_>,
+        account: &str,
+        id: &Value,
+        indexed: Value,
+        (route, raw): (PositionRoute, Value),
+    ) -> Result<(bool, Value), SaiError> {
+        let mut result = unavailable_close();
         let quote = async {
             let state = self
-                .position_snapshot(&lcd, account, &id, route.clone(), indexed, Some(raw))
+                .position_snapshot(lcd, account, id, route, indexed, Some(raw))
                 .await?;
-            if let Some(height) = state.verified_height(&lcd, &id).await? {
-                let quote_lcd = QuoteLcd::new(endpoint, state.route.contract_address.clone());
-                Self::quote_close(&quote_lcd, &lcd, &state, &id, &height, &mut result).await;
+            if let Some(height) = state.verified_height(lcd, id).await? {
+                let quote_lcd = QuoteLcd::new(lcd.0, state.route.contract_address.clone());
+                Self::quote_close(&quote_lcd, lcd, &state, id, &height, &mut result).await;
             } else {
                 unknown_oracle_time(&mut result);
             }
             Ok(())
         };
         match quote.await {
-            Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
-            Err(SnapshotError::IndexMismatch) => return Ok(result),
+            Err(SnapshotError::Owner(message)) => Err(invalid(message)),
+            Err(SnapshotError::IndexMismatch) => Ok((false, result)),
             Ok(()) | Err(SnapshotError::Unavailable) => {
                 // Missing estimate inputs do not invalidate the verified owner and index.
-                preview.position_owner_verified = Some(true);
-                preview.position_route = Some(route);
+                Ok((true, result))
             }
         }
-        Ok(result)
     }
 
     async fn quote_close(

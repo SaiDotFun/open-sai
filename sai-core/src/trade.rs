@@ -344,13 +344,31 @@ impl<'a> Trading<'a> {
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
         let confirming = options.confirmation.is_some();
-        let route = self
-            .basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
-            .await?;
-        let checked_route = route.is_some();
+        let cli_confirmation = options.confirmation.as_ref().filter(|confirmation| {
+            confirmation.is_cli()
+                && (matches!(
+                    preview.intent.kind,
+                    "OPEN_TRADE" | "CLOSE_POSITION" | "CANCEL_PENDING_TRADE"
+                ) || preview.is_standalone_position_update())
+        });
+        let cli_preview = if let Some(confirmation) = cli_confirmation {
+            Some(
+                self.prepare_cli_confirmation(session, preview, confirmation)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let route = if cli_preview.is_none() {
+            self.basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
+                .await?
+        } else {
+            None
+        };
+        let checked_route = route.is_some() || cli_preview.is_some();
         let market = preview.requires_market_price_refresh();
         let mut market_row = None;
-        let update = if preview.is_standalone_position_update() {
+        let update = if cli_preview.is_none() && preview.is_standalone_position_update() {
             Some(
                 self.preflight_position_update(account, preview, options.confirmation.is_some())
                     .await?,
@@ -359,7 +377,9 @@ impl<'a> Trading<'a> {
             None
         };
         let mut prepared;
-        let preview = if market || confirming && checked_route {
+        let preview = if let Some(preview) = &cli_preview {
+            preview
+        } else if market || confirming && checked_route {
             prepared = preview.clone();
             prepared.position_route = route;
             if market {
@@ -412,6 +432,9 @@ impl<'a> Trading<'a> {
                 *fresh = replacement.confirmed_output(Some(account));
             }
             return Err(error);
+        }
+        if cli_preview.is_some() {
+            preview.check_cli_execution(account)?;
         }
 
         let (key, stamp) = intent_identity();

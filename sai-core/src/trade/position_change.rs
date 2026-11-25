@@ -163,7 +163,7 @@ impl Trading<'_> {
         let cli = options
             .confirmation
             .as_ref()
-            .is_none_or(Confirmation::is_position_cli);
+            .is_none_or(Confirmation::is_cli);
         let current = self
             .quote_for_position(&lcd, addr, &id, action, confirming)
             .await?;
