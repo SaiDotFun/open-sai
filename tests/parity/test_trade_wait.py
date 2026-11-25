@@ -450,6 +450,10 @@ def test_position_size_wait_v012(
                 "waitUserIntents",
                 "intentTradeHistory",
             ]
+            if index == 0 and outcome == "filled":
+                fill = result["receipt"]["fill"]
+                assert fill.pop("price") is None
+                assert fill.pop("sizeCollateralBaseUnits") is None
             observations.append(normalized(result, key))
     assert observations[0] == observations[1]
 
