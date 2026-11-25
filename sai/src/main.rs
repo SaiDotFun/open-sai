@@ -128,7 +128,9 @@ impl Cli {
             ),
             Command::Doctor(args) => args.run(flags, env, json, events, start_log),
             Command::Market { command } => command.run(&flags, env, json, events),
-            Command::Account { command } => command.run(&flags, env, json, events),
+            Command::Account { command } => {
+                command.run(self.account.as_deref(), &flags, env, json, events)
+            }
             Command::Watch { command } => command.run(&flags, env, events),
             Command::Trade { command } => {
                 return trade::run(command, self.account.as_deref(), &flags, env, json, events);
@@ -340,7 +342,7 @@ fn usage(command: &str) -> String {
         "config get" | "config unset" => " KEY",
         "config set" => " KEY VALUE",
         "config list" | "auth status" | "auth list" | "auth import" | "doctor" | "mcp list"
-        | "mcp serve" | "market list" | "market prices" | "trade open" => "",
+        | "mcp serve" | "market list" | "market prices" | "trade open" | "account overview" => "",
         "mcp install" => " [CLIENTS]...",
         "auth login" => " NAME",
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
@@ -530,6 +532,7 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
     let mut options = true;
     let mut positional = Vec::new();
     let websocket = command.starts_with("watch ") || command == "account balances";
+    let overview = command == "account overview";
     while let Some(arg) = operands.next() {
         match arg {
             "--" if options => options = false,
@@ -553,7 +556,11 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
                 operands.next();
             }
             arg if options && websocket && arg.starts_with("--ws-endpoint=") => {}
-            "--json" if options && command.starts_with("intent ") => {}
+            "--as" if options && overview => {
+                operands.next();
+            }
+            arg if options && overview && arg.starts_with("--as=") => {}
+            "--json" if options && (overview || command.starts_with("intent ")) => {}
             _ => positional.push(arg),
         }
     }
