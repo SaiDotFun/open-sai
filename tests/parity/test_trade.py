@@ -662,7 +662,7 @@ def test_non_ascii_market_id_is_an_accepted_parity_divergence(
                 assert code == 2
                 assert (
                     result["error"]["message"]
-                    == "Invalid value for '--market': '٣' is not a valid integer."
+                    == "Invalid value for '--market': expected an integer."
                 )
             assert not endpoints.wire
             assert not rows(home)
@@ -918,15 +918,35 @@ def test_concurrent_close_sends_once(
             assert not endpoints.errors
 
 
+@pytest.mark.parametrize(
+    ("scenario", "args", "kind"),
+    [
+        ("concurrent-close", CLOSE, "CLOSE_POSITION"),
+        (
+            "margin-interrupted",
+            ("trade", "margin", "7", "--direction", "add", "--amount", "1"),
+            "UPDATE_TRADE",
+        ),
+        (
+            "partial-interrupted",
+            ("trade", "partial-close", "7", "--percent", "50"),
+            "DECREASE_POSITION_SIZE",
+        ),
+    ],
+)
 def test_interrupt_after_dispatch_reports_reserved_key(
-    current_trade_pair: tuple[CLI, CLI], tmp_path: Path
+    current_trade_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    scenario: str,
+    args: CLI,
+    kind: str,
 ) -> None:
     for index, cli in enumerate(current_trade_pair):
-        with loopback("concurrent-close") as endpoints:
+        with loopback(scenario) as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
             with subprocess.Popen(
-                [*cli, "--json", *CLOSE],
+                [*cli, "--json", *args],
                 cwd=home,
                 env={
                     **child_env(home, endpoints),
@@ -940,8 +960,9 @@ def test_interrupt_after_dispatch_reports_reserved_key(
             ) as child:
                 try:
                     assert endpoints.admission.arrived.wait(5)
-                    [(key, _, status, *_)] = rows(home)
-                    assert status == "unknown"
+                    [(key, intent_kind, status, entity, *_)] = rows(home)
+                    assert (intent_kind, status, entity) == (kind, "unknown", "7")
+                    assert key == endpoints.admission.key
                     child.send_signal(signal.SIGINT)
                     stdout, stderr = child.communicate(timeout=5)
                     assert (child.returncode, stderr) == (5, "")
@@ -954,14 +975,19 @@ def test_interrupt_after_dispatch_reports_reserved_key(
                         child.kill()
                     endpoints.admission.release.set()
             assert rows(home)[0][2] == "unknown"
-            code, result, _ = run(cli, home, endpoints, CLOSE, python=index == 0)
+            code, result, _ = run(cli, home, endpoints, args, python=index == 0)
             assert code == 1
             assert result["error"]["intentKey"] == key
-            assert [entry.label for entry in endpoints.wire] == [
-                *CLOSE_READS,
-                "recordUserIntent",
-                *CLOSE_READS,
-            ]
+            assert [request.label for request in endpoints.wire].count(
+                "recordUserIntent"
+            ) == 1
+            assert not endpoints.errors
+            if scenario == "concurrent-close":
+                assert [entry.label for entry in endpoints.wire] == [
+                    *CLOSE_READS,
+                    "recordUserIntent",
+                    *CLOSE_READS,
+                ]
 
 
 @pytest.mark.parametrize("first", [0, 1], ids=["python-sends", "rust-sends"])

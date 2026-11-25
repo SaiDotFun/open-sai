@@ -34,7 +34,7 @@ impl Trading<'_> {
                 "reason": "This Keeper intent carries no slippage limit.",
             },
         });
-        preview.close_owner_verified = session.map(|_| false);
+        preview.position_owner_verified = session.map(|_| false);
         preview.position_route = None;
         let (Some(endpoint), Some(session), Some(target)) =
             (self.lcd_endpoint, session, &preview.intent.target)
@@ -68,7 +68,7 @@ impl Trading<'_> {
             Err(SnapshotError::IndexMismatch) => return Ok(result),
             Ok(()) | Err(SnapshotError::Unavailable) => {
                 // Missing estimate inputs do not invalidate the verified owner and index.
-                preview.close_owner_verified = Some(true);
+                preview.position_owner_verified = Some(true);
                 preview.position_route = Some(route);
             }
         }

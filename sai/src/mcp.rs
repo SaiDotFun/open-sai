@@ -43,6 +43,13 @@ static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
 });
 
+pub(crate) fn argument_schema(name: &str) -> Option<&'static Map<String, Value>> {
+    let tool = TOOLS.iter().find(|tool| tool.name == name)?;
+    tool.input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+}
+
 #[derive(Args)]
 pub(crate) struct ServeArgs {
     #[arg(long, help = "Override the Keeper GraphQL HTTP endpoint")]
@@ -515,7 +522,7 @@ fn log_call(
             }
         } else if tool.is_some_and(|tool| tool.name != "logs_intent") {
             let field = match value {
-                Value::String(text) if validated(key) => Field::Arg(text.clone()),
+                Value::String(_) if validated(key) => Field::redacted_argument(),
                 Value::Number(_) | Value::Bool(_) | Value::Null if validated(key) => {
                     Field::Scalar(value.clone())
                 }

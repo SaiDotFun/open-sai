@@ -26,9 +26,11 @@ namespace-dependent candidate tests with
 loopback prerequisites.
 
 The default run compares Python with Python. Set `SAI_PARITY_BIN` to an
-executable path or a command on `PATH` to compare a port. Arguments belong in
-`cases.toml`. The runner prints a Markdown report to stdout and exits 1 if
-any selected case differs or fails its expectations.
+executable path or a command on `PATH` to compare a port. Set
+`SAI_PARITY_PYTHON` to the `sai` executable installed from a pinned Python
+checkout to override the reference. Arguments belong in `cases.toml`. The
+runner prints a Markdown report to stdout and exits 1 if any selected case
+differs or fails its expectations.
 
 The intent wait and trade `--wait` replays use Python commit
 `bdc11da6c9938aa0371835d921f27d45daa77c36`, the main merge of PR #70. Set the
@@ -37,8 +39,14 @@ compare the Keeper route, LCD checks, submission, and wait requests. They
 also check that a filled target produces zero mutations for both submit
 modes. The dry-run case compares each CLI with and without `--wait`.
 
+The TP/SL and leverage wait cases use Python main at
+`20493c984e3398756365ea1a2b8786a7a0115a11`. They check the request and
+execution blocks, admission and chain failure codes, the 30-second
+deadline, and intent-key recovery after Ctrl-C.
+
 ```sh
 SAI_PARITY_WAIT_PYTHON=/absolute/path/to/pinned/.venv/bin/sai \
+SAI_PARITY_POSITION_WAIT_PYTHON=/absolute/path/to/position-wait-pin/.venv/bin/sai \
 SAI_PARITY_BIN=/absolute/path/to/rust/sai \
 uv run pytest tests/parity/test_intent_wait.py tests/parity/test_trade_wait.py
 ```
@@ -46,6 +54,8 @@ uv run pytest tests/parity/test_intent_wait.py tests/parity/test_trade_wait.py
 `PASS` means the selected invocation or MCP tool call matched. `LISTED`
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command awaiting a fixture or a native implementation.
+`ACCEPTED` means each implementation met its recorded expectations for an
+intentional difference.
 
 ## Auth Security Parity
 
@@ -128,6 +138,10 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   form `file#object.key.0.field`, with zero-based list indexes. Use
   `file#@mode` to assert a mode, or `"<absent>"` to assert that a file or
   field is missing.
+- The `output` table pins normalized stdout fields using dotted paths.
+  `mcp_calls` sends specific tool calls after initialization. If a case sets
+  `retry_expect`, the runner invokes the same command again in the same
+  home and checks both outputs under `first` and `retry`.
 - Keep the coverage inventory current. The runner checks that each leaf
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
@@ -149,6 +163,29 @@ contains one `unknown` row tied to the actual request before releasing the
 reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
+
+## Position Trade Reference
+
+The margin and partial-close cases use Python commit
+`275df9c60af376ba7d884863fb00b011cd07ae02`, including the ownership check
+from [PR 148](https://github.com/SaiDotFun/open-sai/pull/148) and route
+binding from [PR 150](https://github.com/SaiDotFun/open-sai/pull/150).
+The cases compare canonical ownership, the requested index, quote decimals,
+and preview digests. Rust checks the Keeper trader and index before contacting
+the LCD. Foreign-owner and stale-digest cases require zero reservations and
+submissions.
+
+The standalone runner projects out Python-only estimates when comparing to
+Rust. It checks Python's estimate reads and Rust's quote reads separately.
+The stale-index case records Python's retries and Rust's immediate refusal.
+The wrong-chain cases account for the indexed reads Rust logs before the LCD
+network check. They still compare the rest of each log.
+
+```sh
+SAI_PARITY_PYTHON=/path/to/pinned/.venv/bin/sai \
+  SAI_PARITY_BIN=/path/to/rust/sai \
+  uv run python tests/parity/parity.py --case 'trade-margin*' --case 'trade-partial-close*'
+```
 
 ## Installer and Python Bridge Cases
 
@@ -240,6 +277,7 @@ checked on both sides.
 | --- | --- |
 | Text and structured output | The run's absolute temporary home path |
 | Stdout from `--version`, `skill source`, `update --check`, `doctor`, and MCP initialization | Running or installed CLI versions at the documented fields |
+| `skill source` | Absolute package directory containing the bundled skill files. |
 | Doctor checks | `generatedAt` and check durations, including durations embedded in network-check summaries |
 | Doctor provenance | Source checkout path, commit, and dirty flag |
 | `update.json` | `checkedAt` |
@@ -269,6 +307,44 @@ Set `SAI_PARITY_OVERVIEW_PYTHON` to its `sai` executable for local runs.
 The cases validate height-pinned requests and compare section errors,
 source timestamps, risk values, and persisted state. Fetch timestamps and
 ages are checked against the invocation and then normalized.
+
+## C9b Python Reference
+
+Commit `bdc11da6c9938aa0371835d921f27d45daa77c36` is the Python
+reference for logs, skill management, and the REPL. It contains the logging
+v2 schema from PR #69 and the paging fixes from PR #93. In CI,
+`test_local_commands.py` uses the installed Python in the current checkout.
+To reproduce the pinned comparison, install Python from that commit and set
+`SAI_C9B_PARITY_PYTHON` to its `sai` launcher. The C4 tests still use
+`SAI_PARITY_PYTHON` for the older Keeper baseline.
+
+The dense intent attribution test also matches Python `sai-cli/v0.1.2`
+at commit `8557a7e`. With 1,025 distinct anchors, Rust carries a compact
+file range in its cursor and still returns a row linked to an anchor on
+an earlier page.
+
+Accepted C9b divergences from the pinned Python reference
+
+- Rust names the rejected option or argument without echoing its value.
+  `skill show` errors still list the valid pages. Python v0.1.2 quotes
+  rejected values in diagnostics.
+- Rust allowlists command names, flags, and known-safe values in fresh
+  and retained `argv`. It replaces other values and free-form error log
+  text with `[redacted]`. It shows only the origin of a structured endpoint
+  when it parses. Python v0.1.2 retains arbitrary argument and error text.
+- Rust `logs tail` strips credentials, paths, queries, and fragments from
+  URLs throughout retained rows, including arguments and nested fields.
+  The pinned Python reference prints the retained values. Current Python
+  strips them after PR #157.
+- Rust `logs intent` resumes at the first unread file positions when a
+  page ends and retains attribution from both the initial scan and anchors
+  discovered in later scans.
+  The pinned Python reference can omit events that share the last displayed
+  timestamp. Current Python keeps the remaining events after PR #157.
+  Rust also returns attributed command starts on their retained page when
+  the scan budget ends before that file. The pinned Python reference may
+  include those starts on an earlier page. UTC timestamps passed directly
+  to `--before` remain exclusive.
 
 ## Shared-Home Trade Replays
 

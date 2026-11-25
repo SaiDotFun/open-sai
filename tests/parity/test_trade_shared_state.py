@@ -396,8 +396,8 @@ WAIT_REASONS = {
     "cancel": "pull/122",
     "margin": "issues/174",
     "partial-close": "issues/174",
-    "tpsl": "issues/173",
-    "leverage": "issues/173",
+    "tpsl": "pull/197",
+    "leverage": "pull/197",
 }
 REPO_URL = "https://github.com/SaiDotFun/open-sai"
 
@@ -406,13 +406,17 @@ def command_help(
     home: Home, runner: Runtime, group: str, command: str, flag: str | None = None
 ) -> str | None:
     result = home.invoke(runner, group, command, "--help")
+    stderr_lines = result.stderr.splitlines()
     if (
         runner.rust
         and result.returncode == 2
-        and any(
-            f"unrecognized subcommand '{name}'" in result.stderr
-            or f"Error: No such command '{name}'." in result.stderr.splitlines()
-            for name in (group, command)
+        and (
+            "Error: No such command." in stderr_lines
+            or any(
+                f"unrecognized subcommand '{name}'" in result.stderr
+                or f"Error: No such command '{name}'." in stderr_lines
+                for name in (group, command)
+            )
         )
     ):
         help_text = None
@@ -531,12 +535,17 @@ def test_trade_wait_replays_pending_then_receipt(
     with loopback(action.server, trade_replay=replay) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
-        trade_help(home, writer, action_name)
+        required_wait = action_name in ("tpsl", "leverage")
+        if not required_wait:
+            trade_help(home, writer, action_name)
         if command_help(home, writer, "trade", action.args[0], "--wait") is None:
+            reference = f"{REPO_URL}/{WAIT_REASONS[action_name]}"
+            if required_wait:
+                pytest.fail(
+                    f"Missing required trade {action_name} --wait ({reference})"
+                )
             assert writer.rust
-            pytest.skip(
-                f"Rust trade {action_name} --wait awaits {REPO_URL}/{WAIT_REASONS[action_name]}"
-            )
+            pytest.skip(f"Rust trade {action_name} --wait awaits {reference}")
         result = home.json(writer, "trade", *action.args, "--wait")
         key = result["intentKey"]
         assert result["outcome"] == action.outcome

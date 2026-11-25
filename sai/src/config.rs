@@ -84,7 +84,12 @@ impl ConfigCommand {
                 let value = key.parse_value(&value).map_err(|error| {
                     SaiError::usage(format!("{error}. Valid keys: {}", settings::valid_keys()))
                 })?;
-                settings::set(path, key, &value)?;
+                settings::edit_setting(
+                    path,
+                    key,
+                    Some(&value),
+                    crate::repl::interrupt_flag().as_deref(),
+                )?;
                 if let Some(path) = json_path {
                     println!(
                         "{{\"key\": {}, \"value\": {}, \"path\": {path}}}",
@@ -98,7 +103,12 @@ impl ConfigCommand {
             }
             Self::Unset { key } => {
                 let key = parse_key(&key)?;
-                let removed = settings::unset(path, key)?;
+                let removed = settings::edit_setting(
+                    path,
+                    key,
+                    None,
+                    crate::repl::interrupt_flag().as_deref(),
+                )?;
                 if let Some(path) = json_path {
                     println!(
                         "{{\"key\": {}, \"removed\": {removed}, \"path\": {path}}}",

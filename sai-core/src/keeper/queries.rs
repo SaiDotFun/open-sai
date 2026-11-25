@@ -47,6 +47,27 @@ pub(super) fn operation(query: &str) -> &'static str {
     }
 }
 
+pub(crate) fn is_log_operation(name: &str) -> bool {
+    [
+        CHALLENGE,
+        HISTORY,
+        INTENTS,
+        MARKET,
+        MARKETS,
+        POSITION,
+        POSITIONS,
+        OVERVIEW_TRADES,
+        PENDING_MARKET_ORDERS,
+        PRICES,
+        ROUTE,
+        SESSION,
+        SUBMIT,
+        "",
+    ]
+    .into_iter()
+    .any(|query| operation(query) == name)
+}
+
 pub(crate) const OVERVIEW_TRADES: &str = "
 query($trader:String!, $limit:Int!, $offset:Int!) {
   perp {

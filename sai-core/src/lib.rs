@@ -2,6 +2,7 @@ pub mod auth;
 mod endpoint;
 pub mod errors;
 pub mod files;
+pub mod interrupt;
 pub mod keeper;
 mod lcd;
 pub mod log;

@@ -36,15 +36,18 @@ CLEAR_SL = ("trade", "tpsl", "7", "--clear-stop-loss")
 SET_BOTH = ("trade", "tpsl", "7", "--take-profit", "110.0100", "--stop-loss", "90.0100")
 LEVERAGE = ("trade", "leverage", "7", "--leverage", "10.00")
 UPDATE_WIRE = ["trade", "oneClickTrading", "node_info", "get_trade_raw"]
-QUOTE_WIRE = [
-    "trade",
-    "oneClickTrading",
-    "node_info",
-    "borrowing",
-    "get_trade_raw",
+QUOTE_ESTIMATE_WIRE = [
     "get_exchange_balance",
     "get_trade_raw",
     "is_after_hours_market",
+]
+QUOTE_WIRE = [*UPDATE_WIRE, "borrowing", *QUOTE_ESTIMATE_WIRE]
+# PR 148's Python preview reads the borrowing before checking the contract owner.
+PYTHON_QUOTE_WIRE = [
+    *UPDATE_WIRE[:-1],
+    "borrowing",
+    "get_trade_raw",
+    *QUOTE_ESTIMATE_WIRE,
 ]
 LEVERAGE_WIRE = ["get_market", "get_group", "get_pair_custom_max_leverage"]
 ORACLE_WIRE = ["get_fees", "get_perp_prices"]
@@ -532,7 +535,8 @@ def test_position_update_dry_run(
             assert (
                 dry_run_bytes(cli, home, endpoints, command) == (golden + "\n").encode()
             )
-            assert [entry.label for entry in endpoints.wire] == QUOTE_WIRE + suffix
+            wire = PYTHON_QUOTE_WIRE if implementation == "python" else QUOTE_WIRE
+            assert [entry.label for entry in endpoints.wire] == wire + suffix
             assert not endpoints.errors
             assert not (home / "sai/trader/intents.sqlite3").exists()
 
