@@ -48,6 +48,7 @@ auth-status-v0-1-0
 auth-use
 auth-use-invalid-expiry-json
 auth-use-invalid-expiry-text
+auth-use-missing
 config-get-default
 config-get-env
 config-get-file

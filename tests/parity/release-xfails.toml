@@ -2,5 +2,5 @@
 # Each scenario has one owner. Run without --release-xfails to inspect its paths.
 
 [pull_request."126"]
-"test_intent_status.py::test_expired_auth_status[/query]" = "771d53d592c846c350bf505078655e6a90bda1fda1923fdc71e0c85ffcc946a9"
-"test_intent_status.py::test_expired_auth_status[/private/query]" = "771d53d592c846c350bf505078655e6a90bda1fda1923fdc71e0c85ffcc946a9"
+"test_intent_status.py::test_expired_auth_status[/query]" = "c43cbf66b54ebecd9512d3368242a9d7456299e152a5bb4323776cdfaad55052"
+"test_intent_status.py::test_expired_auth_status[/private/query]" = "c43cbf66b54ebecd9512d3368242a9d7456299e152a5bb4323776cdfaad55052"
