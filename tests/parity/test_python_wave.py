@@ -329,3 +329,59 @@ def test_invalid_update_override_wins_over_invalid_file_value(
         assert str(config) not in message
         valid = run_cli(binary, home, "--json", *command)
         assert valid.returncode == 0
+
+
+def test_repl_omits_rejected_auth_and_imports_from_history(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    import pty
+
+    from test_local_commands import read_terminal
+
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        home.mkdir()
+        master, slave = pty.openpty()
+        with subprocess.Popen(
+            [binary],
+            cwd=home,
+            env={
+                "HOME": str(home),
+                "SAI_HOME": str(home / "sai"),
+                "SAI_LOG": "false",
+                "SAI_UPDATE_AUTO": "false",
+                "PATH": os.defpath,
+                "TERM": "xterm-256color",
+            },
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+        ) as process:
+            os.close(slave)
+            pending = bytearray()
+            prompt = "❯".encode()
+            try:
+                read_terminal(master, pending, prompt)
+                for line, message in (
+                    (
+                        b"auth import synthetic-repl-private-value",
+                        b"Unexpected arguments",
+                    ),
+                    (b"auth use synthetic-rejected-account", b"Requested account"),
+                    (b"auth import --help", b"Usage:"),
+                    (b"auth use --help synthetic-unused-help-operand", b"Usage:"),
+                    (b"auth list", b"accounts"),
+                ):
+                    os.write(master, line + b"\r")
+                    read_terminal(master, pending, message)
+                    read_terminal(master, pending, prompt)
+                os.write(master, b"\x04")
+                assert process.wait(timeout=8) == 0
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                os.close(master)
+        history = (home / "sai/trader/history").read_text()
+        assert "synthetic-" not in history
+        assert "auth import" not in history
+        assert "+auth list\n" in history

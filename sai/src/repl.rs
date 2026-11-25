@@ -460,7 +460,7 @@ pub fn run(
     home: &Path,
     flags: &Flags,
     account: Option<&str>,
-    mut dispatch: impl FnMut(Vec<OsString>),
+    mut dispatch: impl FnMut(Vec<OsString>) -> bool,
 ) -> Result<(), SaiError> {
     let directory = history_directory(home).map_err(|_| SaiError::internal())?;
     banner(
@@ -517,19 +517,10 @@ pub fn run(
     }
 
     loop {
-        let line = if let Some((editor, history, search)) = &mut session {
+        let line = if let Some((editor, _, search)) = &mut session {
             *search.lock().map_err(|_| SaiError::internal())? = HistorySearch::default();
             match editor.readline("◆ sai ❯ ") {
-                Ok(line) => {
-                    if !line.is_empty()
-                        && editor
-                            .add_history_entry(&line)
-                            .map_err(|_| SaiError::internal())?
-                    {
-                        record_history(history, &line).map_err(|_| SaiError::internal())?;
-                    }
-                    line
-                }
+                Ok(line) => line,
                 Err(ReadlineError::Interrupted) => continue,
                 #[cfg(unix)]
                 Err(ReadlineError::Signal(rustyline::error::Signal::Interrupt)) => continue,
@@ -553,25 +544,45 @@ pub fn run(
                 Err(_) => return Err(SaiError::internal()),
             }
         };
-        let line = line.trim();
-        if matches!(line, "exit" | "quit") {
+        let args = match arguments(line.trim()) {
+            Ok(args) if !args.is_empty() => args,
+            Ok(_) => continue,
+            Err(error) => {
+                eprintln!("Error: {}", error.message);
+                continue;
+            }
+        };
+        let (command, _) = crate::command_path(&args);
+        let auth = crate::is_auth_attempt(&command, &args);
+        let mut remember = || -> Result<(), SaiError> {
+            if let Some((editor, history, _)) = &mut session
+                && editor
+                    .add_history_entry(&line)
+                    .map_err(|_| SaiError::internal())?
+            {
+                record_history(history, &line).map_err(|_| SaiError::internal())?;
+            }
+            Ok(())
+        };
+        if !auth {
+            remember()?;
+        }
+        if matches!(line.trim(), "exit" | "quit") {
             break;
         }
-        match arguments(line) {
-            Ok(arguments) if !arguments.is_empty() => {
-                interrupt.store(false, Ordering::Relaxed);
-                let previous = INTERRUPT.replace(Some(Arc::clone(&interrupt)));
-                dispatch(
-                    forwarded
-                        .iter()
-                        .cloned()
-                        .chain(arguments.into_iter().map(OsString::from))
-                        .collect(),
-                );
-                INTERRUPT.set(previous);
-            }
-            Ok(_) => {}
-            Err(error) => eprintln!("Error: {}", error.message),
+        let record_auth = command.starts_with("auth ") && command != "auth import";
+        interrupt.store(false, Ordering::Relaxed);
+        let previous = INTERRUPT.replace(Some(Arc::clone(&interrupt)));
+        let succeeded = dispatch(
+            forwarded
+                .iter()
+                .cloned()
+                .chain(args.into_iter().map(OsString::from))
+                .collect(),
+        );
+        INTERRUPT.set(previous);
+        if record_auth && succeeded {
+            remember()?;
         }
     }
     Ok(())
