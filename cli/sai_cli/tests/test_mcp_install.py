@@ -1419,13 +1419,20 @@ def test_claude_report_names_the_relative_config_without_changing_directory(
 
 
 @pytest.mark.skipif(os.name == "nt", reason="Claude uses a local key on Windows")
-@pytest.mark.parametrize("surface", ["install", "doctor"])
-def test_claude_reports_the_main_checkout_local_entry_from_a_linked_worktree(
-    env: Env, monkeypatch: pytest.MonkeyPatch, surface: str
+@pytest.mark.parametrize("surface", ["install", "doctor", "update"])
+@pytest.mark.parametrize("linked", [False, True])
+@pytest.mark.parametrize("disabled_at_root", [False, True])
+def test_claude_uses_the_main_checkout_toggle_for_the_local_entry(
+    env: Env,
+    monkeypatch: pytest.MonkeyPatch,
+    surface: str,
+    linked: bool,
+    disabled_at_root: bool,
 ):
     git = shutil.which("git", path=os.defpath)
     assert git
-    linked = env.root / "linked worktree"
+    worktree = env.root / "linked worktree"
+    directory = worktree if linked else env.project / "nested"
     for args in (
         ["init", "--quiet"],
         [
@@ -1439,30 +1446,53 @@ def test_claude_reports_the_main_checkout_local_entry_from_a_linked_worktree(
             "-m",
             "Initial commit",
         ],
-        ["worktree", "add", "--quiet", "--detach", str(linked)],
     ):
         subprocess.run([git, "-C", str(env.project), *args], check=True)
+    if linked:
+        subprocess.run(
+            [
+                git,
+                "-C",
+                str(env.project),
+                "worktree",
+                "add",
+                "--quiet",
+                "--detach",
+                str(worktree),
+            ],
+            check=True,
+        )
+    else:
+        directory.mkdir()
     monkeypatch.setenv("PATH", os.pathsep.join([str(env.bin), os.defpath]))
-    monkeypatch.chdir(linked)
-    original = {
-        "projects": {
-            str(env.project): {
-                "mcpServers": {"sai": claude_entry(["missing-wrapper"])}
-            },
-            str(linked): {"mcpServers": {"sai": claude_entry(serve(env))}},
-        }
+    monkeypatch.chdir(directory)
+    projects: dict[str, dict[str, Any]] = {
+        str(env.project): {"mcpServers": {"sai": claude_entry(["missing-wrapper"])}},
+        str(directory): {"mcpServers": {"sai": claude_entry(serve(env))}},
     }
+    toggle_key = env.project if disabled_at_root else directory
+    projects[str(toggle_key)]["disabledMcpServers"] = ["sai"]
+    original = {"projects": projects}
     (env.home / ".claude.json").write_text(json.dumps(original))
 
     if surface == "doctor":
         check = mcp_checks(invoke("doctor", "--offline"))["claude"]
-        assert (
-            "local sai: Sai registration points to a missing command"
-            in check["summary"]
+        message = check["summary"] + " " + check["fix"]
+    elif surface == "update":
+        outcome = updater.repair_after_update(
+            updater.Outcome(updater.UPDATED, "updated"), env.sai, False
         )
+        message = updater.mcp_notice(outcome.mcp_results(), outcome.mcp_notes)
     else:
         result = invoke("mcp", "install", "claude", "--scope", "local")
-        assert "differs from the requested settings" in failure(result)
+        failure(result)
+        message = result.output
+    if disabled_at_root:
+        assert "Claude Code has disabled" in message
+        assert "claude mcp add" not in message
+    else:
+        assert "claude mcp add --scope local sai" in message
+        assert "disabled" not in message
     assert env.claude_json() == original
     assert all(call[:2] == ["mcp", "get"] for call in env.calls())
 

@@ -204,6 +204,7 @@ class RegistrationCheck:
     pinned: bool = False
     legacy_name: bool = False
     manual_repairs: tuple[ClaudeRepair, ...] = ()
+    disabled: bool = False
 
 
 def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
@@ -675,9 +676,10 @@ class Claude(Client):
         # Never `claude mcp get`: it starts the server to check its health.
         data = load_json(self.config_path())
         projects = (data or {}).get("projects")
+        project_dir = self.scope_directory("local")
         project = (
-            projects.get(str(self.cwd))
-            if self.cwd is not None and isinstance(projects, dict)
+            projects.get(str(project_dir))
+            if project_dir is not None and isinstance(projects, dict)
             else None
         )
         project = project if isinstance(project, dict) else None
@@ -689,11 +691,7 @@ class Claude(Client):
             found.append(self.read_entry(user, "user", name, disabled))
         if self.cwd is None:
             return self.ordered([r for r in found if r is not None])
-        local_key = str(self.scope_directory("local"))
-        local_project = projects.get(local_key) if isinstance(projects, dict) else None
-        local = servers(local_project if isinstance(local_project, dict) else None).get(
-            name
-        )
+        local = servers(project).get(name)
         if local is not None:
             found.append(self.read_entry(local, "local", name, disabled))
         shared = servers(load_json(self.cwd / ".mcp.json")).get(name)
@@ -1549,7 +1547,15 @@ def check_claude_differences(
     repairs = []
     differences = []
     manual = []
+    disabled = False
     for name, reg in found:
+        if reg.disabled:
+            disabled = True
+            differences.append(
+                f"{reg.scope} {name}: Claude Code has disabled this registration"
+            )
+            manual.append("Review MCP approvals and settings in Claude Code.")
+            continue
         issue = stale_by_scope.get((name, reg.scope))
         expected = target
         if name == NAME:
@@ -1560,9 +1566,7 @@ def check_claude_differences(
                 expected = replace(expected, env=saved_env)
             if issue is None and (expected is None or reg.matches(expected)):
                 continue
-            if reg.disabled:
-                manual.append("Review MCP approvals and settings in Claude Code.")
-            elif expected is None:
+            if expected is None:
                 manual.append("Install a stable Sai launcher on PATH.")
             else:
                 home = expected.env.get("SAI_HOME")
@@ -1609,6 +1613,7 @@ def check_claude_differences(
         " ".join(dict.fromkeys(manual)),
         legacy_name=legacy_name,
         manual_repairs=entries,
+        disabled=disabled,
     )
 
 

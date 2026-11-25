@@ -573,6 +573,7 @@ class Outcome:
                 "status": check.status,
                 "changes": list(check.changes),
                 **({"pinned": True} if check.pinned else {}),
+                **({"disabled": True} if check.disabled else {}),
                 **(
                     {
                         "manualRepairs": [
@@ -1133,6 +1134,7 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
             or check.pinned
             or check.legacy_name
             or check.manual_repairs
+            or check.disabled
         ),
         mcp_notes=tuple(notes),
     )
@@ -1161,6 +1163,7 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
     repaired, failed, pinned, legacy = [], [], [], []
     claude_manual: list[mcp_install.ClaudeRepair] = []
     old_claude_notice = False
+    claude_disabled = False
     for entry in results if isinstance(results, list) else []:
         if (
             not isinstance(entry, dict)
@@ -1199,7 +1202,9 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
                 and repair.get("scope") in mcp_install.UNINSTALL_SCOPES
                 and repair.get("name") in mcp_install.SERVER_NAMES
             )
-        if entry.get("status") == "fail" and not manual:
+        disabled = entry["client"] == "claude" and entry.get("disabled") is True
+        claude_disabled |= disabled
+        if entry.get("status") == "fail" and not manual and not disabled:
             failed.append(entry["client"])
         keeps_name = entry.get("legacyName") == mcp_install.RETIRED_NAME
         if keeps_name:
@@ -1214,6 +1219,7 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
             and not keeps_name
             and not old_blocked
             and not manual
+            and not disabled
         ):
             pinned.append(entry["client"])
     messages = []
@@ -1226,6 +1232,10 @@ def mcp_notice(results: Any, notes: Any = None) -> str:
         )
     if pinned:
         messages.append(f"Sai MCP uses a pinned launcher for {', '.join(pinned)}.")
+    if claude_disabled:
+        messages.append(
+            "Claude Code has disabled a Sai MCP registration. Review MCP approvals and settings in Claude Code."
+        )
     if claude_manual:
         messages.append(
             "Claude Code MCP registrations need manual repair. "
