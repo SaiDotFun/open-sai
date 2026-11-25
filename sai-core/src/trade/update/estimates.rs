@@ -71,7 +71,10 @@ async fn leverage_execution(
     }
     let queued = read(json!({"market_order_config": {}})).await.ok()?["fill_at_next_oracle_price"]
         .as_bool()?;
-    let group_query = json!({"get_group": {"index": pair.get("group_index")?}});
+    let group_query = || {
+        pair.get("group_index")
+            .map(|index| json!({"get_group": {"index": index}}))
+    };
     let oracle_price = if queued {
         None
     } else {
@@ -82,7 +85,7 @@ async fn leverage_execution(
         .ok()?;
         let oracle = &prices["market"];
         if let Some(published) = oracle_publication_time(oracle)? {
-            let group = read(group_query.clone()).await.ok()?;
+            let group = read(group_query()?).await.ok()?;
             let ttl = group["stale_price_expiration_secs"].as_u64()?;
             if ttl > 0
                 && i128::from(lcd.block_timestamp(height).await.ok()?) - i128::from(published)
@@ -125,7 +128,7 @@ async fn leverage_execution(
         ));
     }
 
-    let group = read(group_query).await.ok()?;
+    let group = read(group_query()?).await.ok()?;
     let min = contract_decimal(group.get("min_leverage")?).ok()?;
     let max = contract_decimal(group.get("max_leverage")?).ok()?;
     let cap = read(json!({"get_pair_custom_max_leverage": {
