@@ -338,10 +338,10 @@ Before tagging, merge a version bump that aligns the Python package, Cargo
 workspace, and shim on the same release version. Use the Python spelling
 `X.Y.ZrcN` in the shim for release candidates. Run the
 [Release workflow](.github/workflows/release.yml) manually on the candidate
-commit with the planned tag, then complete the
-[upgrade and downgrade rehearsal](#rehearse-an-upgrade-and-downgrade).
-The manual workflow checks the planned version, smokes the native binaries
-on all four runners, and uploads the `sai-release-candidate` Actions artifact.
+commit with the planned tag. The workflow checks the package versions, runs
+the Python tests and the four native smoke jobs, and uploads the
+`sai-release-candidate` Actions artifact. Complete the rehearsal below for
+the planned tag before publishing.
 
 Run `just release X.Y.Z` on `main` to check the tree and preview the Git
 commands. Add `--run` to create and push the tag. The tag workflow checks that
@@ -364,12 +364,30 @@ package remains the published Python distribution during this stage of the
 handoff. The shim keeps the same package name and is exercised in CI until
 the handoff release can use that filename for the shim.
 
+### Rehearse a Release Candidate
+
+Use `sai-cli/vX.Y.Z-rc.N` as the planned tag for the manual run. After it
+passes, download its candidate
+artifact. From the artifact directory, verify the checksums and start the
+full Python wheel in an isolated uv environment. The version output should
+report `X.Y.ZrcN`.
+
+```bash
+sha256sum --check --strict SHA256SUMS
+SAI_HOME="$(mktemp -d)" uv run --isolated --no-project \
+  --with ./sai_cli-X.Y.ZrcN-py3-none-any.whl sai --version
+```
+
+On `main`, run `just release X.Y.Z-rc.N` to check the package versions and
+preview the tag commands.
+
 ### Rehearse an Upgrade and Downgrade
 
-After the version bump lands on `main`, build the candidate and run the
-rehearsal with `--strict` before tagging. Replace `X.Y.Z` with the version in
-`pyproject.toml`. The release gate requires a Linux
-host that can create a loopback-only network namespace with `unshare` and
+For a stable release, build the candidate on `main` and run the rehearsal
+with `--strict` before tagging. The rehearsal exercises stable release
+discovery and takes a wheel with the `X.Y.Z` version from `pyproject.toml`.
+The release gate requires a Linux host that can create a loopback-only
+network namespace with `unshare` and
 `ip`. The script also needs Python 3.11 or later, `uv`, `claude`, and
 `codex` on `PATH`, and network access to GitHub and the Python package
 index. Use executables that can run with a fresh home directory.
