@@ -523,6 +523,9 @@ impl Standalone {
             }
             self.require_launcher(&launcher)?;
             self.publish(stage, &new)?;
+            let binary = self
+                .target(&new)
+                .ok_or_else(|| "the verified replacement binary is missing".to_owned())?;
             let record = self.root.join(RECORD);
             let pending = Pending {
                 old: Some(old.clone()),
@@ -533,7 +536,7 @@ impl Standalone {
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let switched = async {
                 self.switch_selector(&launcher, &old, Some(&pending.new))?;
-                smoke::verify(&self.launcher, home.path(), target, None).await?;
+                smoke::verify_as(&binary, &self.launcher, home.path(), target).await?;
                 self.require_launcher(&launcher)?;
                 if self.selected_directory()?.as_deref() != Some(pending.new.as_str()) {
                     return Err("the Sai selector changed during the update".into());

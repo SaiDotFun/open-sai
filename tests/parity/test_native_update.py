@@ -57,13 +57,19 @@ from pathlib import Path
 
 def run():
     args = sys.argv[1:]
+    public = Path(os.environ["FIXTURE_STABLE_LAUNCHER"])
+    location = Path(__file__).resolve()
+    in_stable = location.parent.parent.name == ".sai-native" and (
+        location.parent.name.startswith(f"{VERSION}-")
+    )
+    in_stable = in_stable or sys.prefix == os.environ.get("FIXTURE_STABLE_UV_PREFIX")
     if args == ["--version"]:
+        if FAIL == "replace-launcher" and in_stable:
+            public.with_name("competitor").replace(public)
         print(f"sai {VERSION}")
     elif args == ["config", "get", "update.auto"]:
         print("true")
     elif args == ["mcp", "serve"]:
-        in_stable = sys.argv[0] == os.environ.get("FIXTURE_STABLE_LAUNCHER")
-        in_stable = in_stable or sys.prefix == os.environ.get("FIXTURE_STABLE_UV_PREFIX")
         if FAIL == "trial" or (FAIL == "installed" and in_stable):
             return 9
         request = json.loads(sys.stdin.readline())
@@ -445,6 +451,24 @@ def test_failed_smoke_check_keeps_or_restores_standalone(
     )
     assert standalone.state()["result"]["rolledBack"] is (phase == "installed")
     assert not (standalone.executable.parent.parent / "pending.json").exists()
+
+
+def test_standalone_smoke_does_not_execute_a_replacement_launcher(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    invoked = tmp_path / "competing-launcher-invoked"
+    competitor = standalone.launcher.with_name("competitor")
+    script = f"#!{sys.executable}\nfrom pathlib import Path\nPath({str(invoked)!r}).touch()\n"
+    competitor.write_text(script, encoding="utf-8")
+    competitor.chmod(0o700)
+    with releases(
+        assets(NEW, archive_name(), archive(fail="replace-launcher"))
+    ) as server:
+        result = standalone.update(server)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not invoked.exists()
+    assert standalone.launcher.read_text(encoding="utf-8") == script
+    assert (standalone.executable.parent.parent / "pending.json").exists()
 
 
 def test_check_leaves_interrupted_install_for_next_mutating_update(

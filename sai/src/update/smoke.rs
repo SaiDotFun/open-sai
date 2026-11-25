@@ -1,4 +1,4 @@
-use std::{ffi::OsStr, path::Path, process::Stdio, time::Duration};
+use std::{ffi::OsStr, os::unix::process::CommandExt, path::Path, process::Stdio, time::Duration};
 
 use semver::Version;
 use serde_json::{Value, json};
@@ -62,7 +62,10 @@ fn sai(path: &Path, home: &Path, shim_base: Option<&str>) -> Command {
 }
 
 pub(super) async fn version(path: &Path, home: &Path, shim_base: Option<&str>) -> Result<Version> {
-    let mut command = sai(path, home, shim_base);
+    reported_version(sai(path, home, shim_base)).await
+}
+
+async fn reported_version(mut command: Command) -> Result<Version> {
     command.arg("--version");
     let stdout = output(command, "`sai --version`", VERIFY_TIMEOUT).await?;
     stdout
@@ -79,20 +82,41 @@ pub(super) async fn verify(
     expected: &Version,
     shim_base: Option<&str>,
 ) -> Result<()> {
-    if version(path, home, shim_base).await? != *expected {
+    verify_commands(|| sai(path, home, shim_base), expected).await
+}
+
+pub(super) async fn verify_as(
+    path: &Path,
+    launcher: &Path,
+    home: &Path,
+    expected: &Version,
+) -> Result<()> {
+    verify_commands(
+        || {
+            let mut command = sai(path, home, None);
+            command.as_std_mut().arg0(launcher);
+            command
+        },
+        expected,
+    )
+    .await
+}
+
+async fn verify_commands(make_command: impl Fn() -> Command, expected: &Version) -> Result<()> {
+    if reported_version(make_command()).await? != *expected {
         return Err(format!("`sai --version` did not report {expected}"));
     }
-    let mut command = sai(path, home, shim_base);
+    let mut command = make_command();
     command.args(["config", "get", "update.auto"]);
     output(command, "`sai config get update.auto`", VERIFY_TIMEOUT).await?;
-    timeout(VERIFY_TIMEOUT, mcp(path, home, shim_base))
+    timeout(VERIFY_TIMEOUT, mcp(make_command()))
         .await
         .map_err(|_| "`sai mcp serve` timed out during initialization".to_owned())?
 }
 
-async fn mcp(path: &Path, home: &Path, shim_base: Option<&str>) -> Result<()> {
+async fn mcp(mut command: Command) -> Result<()> {
     let invalid = || "`sai mcp serve` did not initialize".to_owned();
-    let mut child = sai(path, home, shim_base)
+    let mut child = command
         .args(["mcp", "serve"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
