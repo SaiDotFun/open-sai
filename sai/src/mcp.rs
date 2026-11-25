@@ -38,6 +38,8 @@ use uuid::Uuid;
 
 use crate::reads::output;
 
+pub(crate) use install::launcher_path;
+
 const MCP_WAIT_LIMIT: Duration = Duration::from_secs(10);
 const INSTRUCTIONS: &str = include_str!("mcp/instructions.txt");
 // Wire metadata captured from Python main at 1c671b231b0fc968a44ec8dd520e67ea28e25b7f.

@@ -386,7 +386,9 @@ fn install_info() -> (Check, Value, bool) {
     let provenance = if let Some(root) = checkout {
         json!({"kind": "source-checkout", "path": root, "git": mcp::checkout_state(root)})
     } else {
-        json!({"kind": "installed", "path": executable})
+        let launcher = crate::mcp::launcher_path(&executable);
+        let directory = launcher.as_deref().unwrap_or(&executable).parent();
+        json!({"kind": "installed", "path": directory})
     };
     let launchers = mcp::launchers_on_path();
     let mut details = json!({"version": VERSION, "provenance": provenance, "onPath": launchers});
