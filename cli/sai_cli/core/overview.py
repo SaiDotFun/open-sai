@@ -776,6 +776,21 @@ def _membership_check(
     }
 
 
+def _total_pnl(values: list[float | None]) -> float | None:
+    """Use Neumaier summation on every supported Python version."""
+    total = correction = 0.0
+    for value in values:
+        if value is None:
+            return None
+        next_total = total + value
+        if abs(total) >= abs(value):
+            correction += (total - next_total) + value
+        else:
+            correction += (value - next_total) + total
+        total = next_total
+    return total + correction if correction and math.isfinite(correction) else total
+
+
 def _trade_sections(
     settings: Settings,
     addr: str,
@@ -851,8 +866,8 @@ def _trade_sections(
         pnls = [row["unrealizedPnlUsd"] for row in items]
         positions["data"] = {
             "items": items,
-            "unrealizedPnlUsd": sum(pnls, 0.0)
-            if complete and membership_complete and None not in pnls
+            "unrealizedPnlUsd": _total_pnl(pnls)
+            if complete and membership_complete
             else None,
             "unrealizedPnlBasis": "grossBeforeFees",
         }

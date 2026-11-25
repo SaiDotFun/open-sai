@@ -38,11 +38,68 @@ pub struct Keeper<'a> {
     events: EventContext<'a>,
 }
 
+enum RequestMode {
+    Standard,
+    Interruptible,
+    Bounded,
+}
+
 #[derive(Default)]
 struct ResponseLog {
     http_status: Option<u16>,
     errors: Option<Field>,
     error_count: Option<usize>,
+}
+
+type RequestOutcome<'a> = (&'static str, Level, Option<Code>, Option<&'a str>);
+const INTERRUPTED_READ: RequestOutcome<'static> =
+    ("error", Level::Warn, Some(Code::InternalError), None);
+
+struct RequestEvent<'a> {
+    endpoint: &'a str,
+    events: EventContext<'a>,
+    operation: &'static str,
+    addr: Option<&'a str>,
+    intent_key: Option<&'a str>,
+    authenticated: bool,
+    started: Instant,
+    log_cancelled: bool,
+}
+
+impl RequestEvent<'_> {
+    fn emit(&self, (status, level, code, error): RequestOutcome<'_>, response: ResponseLog) {
+        let duration = (self.started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
+        self.events.event(
+            "keeper.request",
+            level,
+            [
+                ("operation", json!(self.operation).into()),
+                ("endpoint", Field::Endpoint(self.endpoint.into())),
+                ("endpointId", Field::endpoint_identity(self.endpoint)),
+                ("addr", json!(self.addr).into()),
+                ("intentKey", json!(self.intent_key).into()),
+                ("authenticated", json!(self.authenticated).into()),
+                ("durationMs", json!(duration).into()),
+                ("status", json!(status).into()),
+                ("code", json!(code).into()),
+                ("error", json!(error).into()),
+                ("httpStatus", json!(response.http_status).into()),
+                (
+                    "keeperErrors",
+                    response.errors.unwrap_or(Field::Scalar(Value::Null)),
+                ),
+                ("keeperErrorCount", json!(response.error_count).into()),
+            ],
+        );
+    }
+}
+
+impl Drop for RequestEvent<'_> {
+    fn drop(&mut self) {
+        if self.log_cancelled {
+            self.emit(INTERRUPTED_READ, ResponseLog::default());
+        }
+    }
 }
 
 impl<'a> Keeper<'a> {
@@ -68,12 +125,12 @@ impl<'a> Keeper<'a> {
             token,
             timeout,
             std::future::pending(),
-            false,
+            RequestMode::Standard,
         )
         .await
     }
 
-    /// Make an interruptible public read.
+    /// Make a public read and log an interruption if its caller drops the pending future.
     pub async fn read_until(
         &self,
         query: &str,
@@ -81,8 +138,15 @@ impl<'a> Keeper<'a> {
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
     ) -> Result<Map<String, Value>, SaiError> {
-        self.request_with(query, variables, None, timeout, interrupt, false)
-            .await
+        self.request_with(
+            query,
+            variables,
+            None,
+            timeout,
+            interrupt,
+            RequestMode::Interruptible,
+        )
+        .await
     }
 
     /// Bound the entire request for an intent wait. Status reads use socket inactivity timeouts.
@@ -98,7 +162,7 @@ impl<'a> Keeper<'a> {
             None,
             timeout,
             std::future::pending(),
-            true,
+            RequestMode::Bounded,
         )
         .await
     }
@@ -110,7 +174,7 @@ impl<'a> Keeper<'a> {
         token: Option<&str>,
         timeout: Duration,
         interrupt: impl Future<Output = SaiError>,
-        bounded: bool,
+        mode: RequestMode,
     ) -> Result<Map<String, Value>, SaiError> {
         let started = Instant::now();
         let token = token.filter(|token| !token.is_empty());
@@ -121,10 +185,27 @@ impl<'a> Keeper<'a> {
             .into_iter()
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
+        static INTENT_KEY: LazyLock<regex::Regex> = LazyLock::new(|| {
+            regex::Regex::new(r"\A[A-Za-z0-9_-]{1,128}\z").expect("Keeper log key pattern")
+        });
+        let intent_key = matches!(query, INTENTS | WAIT_INTENTS)
+            .then(|| variables.get("key").and_then(Value::as_str))
+            .flatten()
+            .filter(|key| INTENT_KEY.is_match(key));
+        let mut event = RequestEvent {
+            endpoint: self.endpoint,
+            events: self.events,
+            operation: queries::operation(query),
+            addr,
+            intent_key,
+            authenticated: token.is_some(),
+            started,
+            log_cancelled: matches!(mode, RequestMode::Interruptible),
+        };
         let mut response = ResponseLog::default();
         let post = async {
             let post = self.post(query, &variables, token, timeout, &mut response);
-            if bounded {
+            if matches!(mode, RequestMode::Bounded) {
                 tokio::time::timeout(timeout, post)
                     .await
                     .unwrap_or_else(|_| Err(keeper_error("Keeper read deadline expired")))
@@ -137,9 +218,8 @@ impl<'a> Keeper<'a> {
             error = interrupt => (Err(error), true),
             result = post => (result, false),
         };
-        let duration = (started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
         let (status, level, code, error) = match &result {
-            Err(_) if interrupted => ("error", Level::Warn, Some(Code::InternalError), None),
+            Err(_) if interrupted => INTERRUPTED_READ,
             Ok(_) => ("ok", Level::Info, None, None),
             Err(error) => match error.code {
                 Code::NotSent => ("not_sent", Level::Warn, Some(error.code), None),
@@ -152,39 +232,12 @@ impl<'a> Keeper<'a> {
                     } else {
                         code
                     }),
-                    Some(error.message.clone()),
+                    Some(error.message.as_str()),
                 ),
             },
         };
-        static INTENT_KEY: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r"\A[A-Za-z0-9_-]{1,128}\z").expect("Keeper log key pattern")
-        });
-        let intent_key = matches!(query, INTENTS | WAIT_INTENTS)
-            .then(|| variables.get("key").and_then(Value::as_str))
-            .flatten()
-            .filter(|key| INTENT_KEY.is_match(key));
-        self.events.event(
-            "keeper.request",
-            level,
-            [
-                ("operation", json!(queries::operation(query)).into()),
-                ("endpoint", Field::Endpoint(self.endpoint.into())),
-                ("endpointId", Field::endpoint_identity(self.endpoint)),
-                ("addr", json!(addr).into()),
-                ("intentKey", json!(intent_key).into()),
-                ("authenticated", json!(token.is_some()).into()),
-                ("durationMs", json!(duration).into()),
-                ("status", json!(status).into()),
-                ("code", json!(code).into()),
-                ("error", json!(error).into()),
-                ("httpStatus", json!(response.http_status).into()),
-                (
-                    "keeperErrors",
-                    response.errors.unwrap_or(Field::Scalar(Value::Null)),
-                ),
-                ("keeperErrorCount", json!(response.error_count).into()),
-            ],
-        );
+        event.log_cancelled = false;
+        event.emit((status, level, code, error), response);
         result
     }
 
@@ -241,6 +294,10 @@ impl<'a> Keeper<'a> {
 
 fn check_url(endpoint: &str) -> Result<(), SaiError> {
     check_transport(endpoint, ProbeEndpoint::Keeper).map_err(keeper_error)
+}
+
+pub(crate) fn check_lcd_url(endpoint: &str) -> Result<(), &'static str> {
+    check_transport(endpoint, ProbeEndpoint::Lcd)
 }
 
 enum ProbeEndpoint {

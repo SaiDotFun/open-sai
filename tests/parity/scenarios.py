@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
 from keeper_wire import WireRequest, graphql_request, same_variables
+from overview_scenarios import OverviewReplay
 from sai_cli.tests.loopback import fixture, graphql_ws, http_server
 from websockets.exceptions import ConnectionClosed
 from websockets.http11 import Request, Response
@@ -58,6 +59,13 @@ data = json.load(sys.stdin)
 for session in data["sessions"]:
     storage.save_session(session)
 if data["ledger"]:
+    if data.get("accepted_blockers"):
+        for key, kind, entity in (
+            ("accepted-close", "CLOSE_POSITION", "1"),
+            ("accepted-open", "OPEN_TRADE", ""),
+        ):
+            storage.pending(key, data["endpoint"], data["address"], kind, entity)
+            storage.set_status(key, data["endpoint"], data["address"], "accepted")
     storage.pending(data["key"], data["endpoint"], data["address"], "CLOSE_POSITION", "7")
     with storage.db() as conn:
         conn.execute("UPDATE intents SET created_at=946684800")
@@ -86,6 +94,11 @@ class Endpoints:
     interrupt_ready: threading.Event = field(default_factory=threading.Event)
     interrupt_closed: threading.Event = field(default_factory=threading.Event)
     keeper_path: str = "/query"
+    overview_expiry: str = field(
+        default_factory=lambda: (
+            datetime.now(UTC) + timedelta(hours=49, minutes=30)
+        ).isoformat()
+    )
 
     @property
     def keeper(self) -> str:
@@ -204,6 +217,27 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
             sessions.append({**sessions[0], "evmAddress": OTHER_ADDRESS})
         if seed == "invalid-expiry":
             sessions[0]["expiresAt"] = "synthetic-expiry-credential-marker"
+    if seed in {"overview-session", "overview-expiry", "overview-blockers"}:
+        session = session_fixture(endpoints, "session")
+        expires_at = (
+            endpoints.overview_expiry
+            if seed == "overview-expiry"
+            else session["expiresAt"]
+        )
+        claim = base64.urlsafe_b64encode(b'{"iat":946684800}').decode()
+        sessions.append(
+            {
+                **session,
+                "token": f"fixture.{claim}.signature",
+                "endpoint": endpoints.keeper,
+                "expiresAt": expires_at,
+                **(
+                    {"source": "imported"}
+                    if seed == "overview-expiry"
+                    else {"keyName": "fixture"}
+                ),
+            }
+        )
     if seed == "doctor-ledger-session":
         config = sai_home / "config.toml"
         config.write_text("[logs]\nenabled = false\n")
@@ -212,7 +246,9 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         home,
         endpoints,
         sessions,
-        ledger=seed in {"ledger", "doctor-ledger-session"},
+        ledger=seed
+        in {"ledger", "doctor-ledger-session", "overview-session", "overview-blockers"},
+        accepted_blockers=seed == "overview-blockers",
         disable_logs=seed in {"doctor-near-expiry", "doctor-ledger-session"},
     )
     if seed == "invalid-expiry":
@@ -236,6 +272,7 @@ def write_seed(
     sessions: list[dict[str, Any]],
     *,
     ledger: bool = False,
+    accepted_blockers: bool = False,
     disable_logs: bool = False,
 ) -> None:
     env = child_env(home, endpoints)
@@ -247,6 +284,7 @@ def write_seed(
             {
                 "sessions": sessions,
                 "ledger": ledger,
+                "accepted_blockers": accepted_blockers,
                 "key": INTENT,
                 "endpoint": endpoints.keeper,
                 "address": ADDRESS,
@@ -279,6 +317,11 @@ def loopback(
         "/query/fixture-path-key?key=fixture-query-key"
         if scenario == "keeper-echo-error"
         else "/query"
+    )
+    overview = (
+        OverviewReplay(scenario, ADDRESS, CONTRACT)
+        if scenario.startswith("overview-")
+        else None
     )
     markets = fixture("mainnet_markets_http.json")
     prices = fixture("mainnet_prices_http.json")
@@ -414,6 +457,8 @@ def loopback(
         "perpTrades": {"data": {"perpTrades": [position]}},
         "tokenPricesUsd": fixture("mainnet_price_ws_payload.json"),
     }
+    if overview is not None:
+        queue_payloads["userBalancesWithBlock"] = overview.balances
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
     cancel_trader = OTHER_ADDRESS if cancel_target == "other-account" else ADDRESS
@@ -536,18 +581,27 @@ def loopback(
 
     class Handler(BaseHTTPRequestHandler):
         def reply(
-            self, value: object, status_code: int = 200, *, lcd: bool = False
+            self,
+            value: object,
+            status_code: int = 200,
+            *,
+            lcd: bool = False,
+            height: int = 120,
+            duplicate_height: int | None = None,
         ) -> None:
             body = value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             if lcd:
-                height = "120"
                 if scenario == "quote-height-mismatch" and self.headers.get(
                     "x-cosmos-block-height"
                 ):
-                    height = "121"
-                self.send_header("grpc-metadata-x-cosmos-block-height", height)
+                    height = 121
+                self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
+            if duplicate_height is not None:
+                self.send_header(
+                    "grpc-metadata-x-cosmos-block-height", str(duplicate_height)
+                )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -682,6 +736,25 @@ def loopback(
                 ):
                     self.reply({"data": {"perp": {"trade": None}}})
                     return
+                if overview is not None:
+                    if self.headers.get("Authorization") is not None:
+                        self.reject("Unexpected authorization on overview read")
+                        return
+                    try:
+                        response = overview.keeper(name, request.variables, wire)
+                    except ValueError as exc:
+                        self.reject(str(exc))
+                        return
+                    if response is not None:
+                        if (
+                            scenario == "overview-interrupt-http"
+                            and name == "overviewTrades"
+                        ):
+                            interrupt_ready.set()
+                            interrupt_closed.wait(8)
+                        else:
+                            self.reply(response)
+                        return
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
                     self.admit_trade(request.variables)
                     return
@@ -804,6 +877,27 @@ def loopback(
                 pass
             self.reject("Unsupported Keeper request")
 
+        def drip_lcd(self) -> None:
+            started = time.monotonic()
+            try:
+                self.send_response(200)
+                self.send_header(
+                    "grpc-metadata-x-cosmos-block-height",
+                    self.headers["x-cosmos-block-height"],
+                )
+                self.end_headers()
+                while time.monotonic() - started < 4:
+                    self.wfile.write(b" ")
+                    time.sleep(0.02)
+                errors.append(
+                    "Overview left a trickling LCD response open after its deadline"
+                )
+            except (BrokenPipeError, ConnectionResetError):
+                if not 1.7 <= time.monotonic() - started < 3:
+                    errors.append(
+                        "Overview disconnected outside the LCD request deadline"
+                    )
+
         def do_GET(self) -> None:
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
@@ -811,6 +905,40 @@ def loopback(
             path = urlsplit(self.path).path
             if path.startswith(scope):
                 path = path.removeprefix(scope)
+                if overview is not None:
+                    try:
+                        entry = overview.lcd(
+                            path,
+                            urlsplit(self.path).query,
+                            self.headers.get("x-cosmos-block-height"),
+                        )
+                    except (ValueError, KeyError, TypeError) as exc:
+                        self.reject(f"Invalid overview LCD request: {exc}")
+                        return
+                    if entry is not None:
+                        request, response, height = entry
+                        wire.append(request)
+                        if (
+                            scenario == "overview-deadline"
+                            and request.label == "get_trade"
+                            and request.variables["index"] == 0
+                        ):
+                            self.drip_lcd()
+                            return
+                        duplicate_height = (
+                            height - 1
+                            if height is not None
+                            and scenario == "overview-conflicting-height"
+                            and request.label == "get_trade"
+                            else None
+                        )
+                        self.reply(
+                            response,
+                            lcd=height is not None,
+                            height=height or 0,
+                            duplicate_height=duplicate_height,
+                        )
+                        return
                 if (
                     scenario == "doctor-lcd-unreachable"
                     and path == "/private-fixture-credential" + NODE_INFO
