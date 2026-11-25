@@ -284,8 +284,6 @@ MAX_CURSOR_STATES = 128
 MAX_CURSOR_CACHE_BYTES = 16 * 1024 * 1024
 MAX_CURSOR_FILE_BYTES = 1024 * 1024
 MAX_CURSOR_STATE_BYTES = 8 * 1024 * 1024
-# Leave space in the cursor for the snapshot and attribution evidence.
-MAX_CURSOR_LINKS = MAX_CURSOR_FILE_BYTES // 128
 LinkPositions = dict[str, set[log.RowPosition]]
 LINK_TAG = re.compile(r"[0-9a-f]{16}")
 LINK_REF = re.compile(r"[0-9a-f]{16}(?:[0-9a-f]{16})?")
@@ -386,13 +384,8 @@ def _prune_cursor_states(opened: log.LogDir, keep: str, oldest: str) -> None:
 
 
 def _write_cursor_state(
-    root: Path | None, raw: bytes, snapshot: log.FileSnapshot
+    root: Path | None, data: bytes, snapshot: log.FileSnapshot
 ) -> str:
-    if len(raw) > MAX_CURSOR_STATE_BYTES:
-        raise _narrow_query()
-    data = zlib.compress(raw)
-    if len(data) > MAX_CURSOR_FILE_BYTES:
-        raise _narrow_query()
     name = f"{max(snapshot)[0].isoformat()}_{hashlib.sha256(data).hexdigest()}"
     for opened in _cursor_directories(root, create=True):
         with opened:
@@ -501,6 +494,8 @@ def _save_intent_cursor(
     links: LinkPositions,
     search: _LinkSearch,
     root: Path | None,
+    *,
+    required_tags: set[str],
 ) -> None:
     if base := report.get("nextBefore"):
         if (
@@ -513,31 +508,50 @@ def _save_intent_cursor(
         def fields(row: log.RowPosition) -> tuple[int, int, int, int]:
             return row.day.toordinal(), row.slot, row.offset, row.size
 
-        raw = json.dumps(
+        files = [
             (
-                list(map(fields, positions)),
-                [
-                    (
-                        day.toordinal(),
-                        slot,
-                        extent.size,
-                        extent.device,
-                        extent.inode,
-                        extent.modified,
-                    )
-                    for (day, slot), extent in sorted(snapshot.items())
-                ],
-                [
-                    (tag, *fields(row))
-                    for tag, refs in sorted(links.items())
-                    for row in sorted(refs)
-                ],
-                (sorted(search.wanted), sorted(search.settled), search.forgotten),
-            ),
-            separators=(",", ":"),
-        ).encode()
+                day.toordinal(),
+                slot,
+                extent.size,
+                extent.device,
+                extent.inode,
+                extent.modified,
+            )
+            for (day, slot), extent in sorted(snapshot.items())
+        ]
+
+        def pack(refs: LinkPositions) -> bytes | None:
+            raw = json.dumps(
+                (
+                    list(map(fields, positions)),
+                    files,
+                    [
+                        (tag, *fields(row))
+                        for tag, rows in sorted(refs.items())
+                        for row in sorted(rows)
+                    ],
+                    (sorted(search.wanted), sorted(search.settled), search.forgotten),
+                ),
+                separators=(",", ":"),
+            ).encode()
+            if len(raw) > MAX_CURSOR_STATE_BYTES:
+                return None
+            data = zlib.compress(raw)
+            return data if len(data) <= MAX_CURSOR_FILE_BYTES else None
+
+        data = pack(links)
+        if data is None:
+            required = {
+                tag: refs for tag, refs in links.items() if tag[:16] in required_tags
+            }
+            if len(required) < len(links):
+                # Future pages can look up evicted links from the snapshot.
+                search.forgotten = True
+                data = pack(required)
+        if data is None:
+            raise _narrow_query()
         report["nextBefore"] = (
-            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, raw, snapshot)
+            base + CURSOR_STATE_SUFFIX + _write_cursor_state(root, data, snapshot)
         )
 
 
@@ -570,12 +584,30 @@ def _run_scope_tag(tag: str, scope: Scope) -> str:
     return tag + _link_tag("scope", (*scope, ""))
 
 
-def _candidate_tag(line: LogLine, key: str) -> str | None:
+def _conflicting_invocation_tag(tag: str) -> str:
+    return tag + "0000000000000000"
+
+
+def _matches_link_scope(line: LogLine, addr: str | None, identity: str | None) -> bool:
+    endpoint_id = line.get("endpointId")
+    return (addr is None or _address(line) in (None, addr)) and (
+        identity is None
+        or (
+            endpoint_id in (None, identity)
+            and (line.get("endpoint") is None or endpoint_id == identity)
+        )
+    )
+
+
+def _candidate_tag(
+    line: LogLine, key: str, addr: str | None, identity: str | None
+) -> str | None:
     if line.get("event") == "log.dropped":
         run = _id(line, "runId")
         return _link_tag("run", run) if run else None
     if (
         (not _has_intent(line, key) or _scope(line) is None)
+        and _matches_link_scope(line, addr, identity)
         and (match := _invocation(line)) is not None
         and line.get("intentKey") in (None, key)
     ):
@@ -779,6 +811,7 @@ def intent(
     anchors = sorted((line for _, line in evidence.values()), key=log.event_order)
     identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
     scope, ambiguous = _select_scope(anchors, chosen_addr, identity)
+    link_addr, link_identity = scope or (chosen_addr, identity)
     direct = [line for line in anchors if scope is not None and _scope(line) == scope]
     invocations = {match for line in direct if (match := _invocation(line))}
     conflicting = {
@@ -849,6 +882,8 @@ def intent(
         pending = links.get(tag, set()) - checked
         if run and scope is not None:
             pending.update(links.get(_run_scope_tag(tag, scope), set()) - checked)
+        if invocation is not None:
+            pending.update(links.get(_conflicting_invocation_tag(tag), set()) - checked)
 
         def decisive(anchor: LogLine) -> bool:
             if not is_anchor(anchor) or (anchor_scope := _scope(anchor)) is None:
@@ -913,10 +948,9 @@ def intent(
         candidates = {
             candidate
             for _, _, row in rows[index:]
-            if (candidate := _candidate_tag(row, key)) is not None
+            if (candidate := _candidate_tag(row, key, chosen_addr, identity))
+            is not None
         } | {tag}
-        if len(candidates) > MAX_CURSOR_LINKS:
-            raise _narrow_query()
         search.settled.intersection_update(candidates)
         search.wanted = candidates - search.settled
         replay = position
@@ -949,17 +983,7 @@ def intent(
         elif (
             (match := _invocation(line)) is not None
             and line.get("intentKey") in (None, key)
-            and (
-                scope is None
-                or (
-                    _address(line) in (None, scope[0])
-                    and (
-                        line.get("endpoint") is None
-                        or line.get("endpointId") == scope[1]
-                    )
-                    and line.get("endpointId") in (None, scope[1])
-                )
-            )
+            and _matches_link_scope(line, link_addr, link_identity)
         ):
             if match in conflicting:
                 continue
@@ -1011,7 +1035,7 @@ def intent(
         needed = {
             tag
             for _, _, line in remaining_rows
-            if (tag := _candidate_tag(line, key)) is not None
+            if (tag := _candidate_tag(line, key, chosen_addr, identity)) is not None
         }
         if complete_scan and not searching:
             # The entire unread range was visible. Drop links it cannot use.
@@ -1035,16 +1059,14 @@ def intent(
                 )
             )
             if anchor_scope := _scope(line):
+                matches_query = _matches_link_scope(line, chosen_addr, identity)
                 for kind, value in (
                     ("invocation", _invocation(line)),
                     ("run", _id(line, "runId")),
                 ):
                     if value is None:
                         continue
-                    if kind == "run" and (
-                        (chosen_addr is not None and anchor_scope[0] != chosen_addr)
-                        or (identity is not None and anchor_scope[1] != identity)
-                    ):
+                    if kind == "run" and not matches_query:
                         continue
                     tag = _link_tag(kind, value)
                     proof = tag, anchor_scope
@@ -1060,20 +1082,16 @@ def intent(
                         ) or (not complete_scan and not unread and not search.forgotten)
                     if retain and proof not in proofs:
                         proofs.add(proof)
-                        ref_tag = (
-                            _run_scope_tag(tag, anchor_scope) if kind == "run" else tag
-                        )
+                        ref_tag = tag
+                        if kind == "run":
+                            ref_tag = _run_scope_tag(tag, anchor_scope)
+                        elif not matches_query:
+                            # One incompatible scope suffices to disqualify
+                            # this invocation for the requested scope.
+                            ref_tag = _conflicting_invocation_tag(tag)
+                            if ref_tag in links:
+                                continue
                         links.setdefault(ref_tag, set()).add(position)
-        if sum(map(len, links.values())) > MAX_CURSOR_LINKS:
-            required_tags = (
-                search_tags | search.settled | (needed if not searching else set())
-            )
-            links = {
-                tag: refs for tag, refs in links.items() if tag[:16] in required_tags
-            }
-            search.forgotten = True
-            if sum(map(len, links.values())) > MAX_CURSOR_LINKS:
-                raise _narrow_query()
         _save_intent_cursor(
             report,
             [position for position, _ in summaries.values()],
@@ -1081,6 +1099,9 @@ def intent(
             links,
             search,
             root,
+            required_tags=search_tags
+            | search.settled
+            | (needed if not searching else set()),
         )
     if report.get("truncated") and "nextBefore" not in report:
         report["more"] = "Inspect the retained files from sai logs path."

@@ -3577,7 +3577,7 @@ def test_intent_cursor_caches_run_proofs_only_for_requested_scope(home):
         "intentKey": "KEY",
         "endpointId": "h1_" + "a" * 64,
     }
-    addresses = [f"0x{i:040x}" for i in range(log_queries.MAX_CURSOR_LINKS + 1)]
+    addresses = [f"0x{i:040x}" for i in range(8250)]
     with log.file_path("cli", day, root).open("wb") as stream:
         stream.writelines(log.encode({**anchor, "addr": addr}) for addr in addresses)
         stream.write(
@@ -3600,21 +3600,61 @@ def test_intent_cursor_caches_run_proofs_only_for_requested_scope(home):
     assert gaps == [gap]
 
 
-def test_intent_cursor_rejects_oversize_link_search_on_first_page(home):
+@pytest.mark.parametrize("addr", [ADDR, None])
+def test_intent_cursor_bounds_same_millisecond_candidates_by_scope_and_bytes(
+    home, addr
+):
     root = home / "logs"
     root.mkdir()
     day = date(2026, 11, 24)
-    row = {"ts": f"{day}T11:00:00.000Z", "event": "command.end", "runId": "run"}
+    ts = f"{day}T11:00:00.000Z"
+    linked = {
+        "ts": ts,
+        "event": "command.end",
+        "runId": "target",
+        "commandId": "target",
+    }
+    anchor = {
+        **linked,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    noise = {"ts": ts, "event": "command.end", "runId": "noise", "addr": OTHER}
     with log.file_path("cli", day, root).open("wb") as stream:
-        stream.write(log.encode(row) * log.MAX_SCAN_ROWS)
-        stream.writelines(
-            log.encode({**row, "commandId": f"command-{i}"})
-            for i in range(log_queries.MAX_CURSOR_LINKS + 1)
+        stream.write(log.encode(anchor))
+        stream.write(
+            log.encode({"ts": ts, "event": "command.start"}) * log.MAX_SCAN_ROWS
         )
+        stream.writelines(
+            log.encode({**noise, "commandId": f"command-{i}"}) for i in range(8192)
+        )
+        stream.write(log.encode(linked))
 
-    code, output = run_cli("--json", "logs", "intent", "KEY", "--offline")
-    assert code == 2 and "Start a narrower intent log query" in output
-    assert "nextBefore" not in json.loads(output)
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    if addr:
+        args += ("--addr", addr)
+    code, output = run_cli(*args)
+    assert code == 0
+    page = json.loads(output)
+    assert page["events"] == [] and page["truncated"]
+    _, _, name = page["nextBefore"].partition(log_queries.CURSOR_STATE_SUFFIX)
+    saved = (root / ".intent-cursors" / name).read_bytes()
+    _, _, _, (wanted, _, _) = json.loads(zlib.decompress(saved))
+    assert len(wanted) == (1 if addr else 8193)
+    assert len(saved) < log_queries.MAX_CURSOR_FILE_BYTES
+
+    events = []
+    cursors = set()
+    while before := page.get("nextBefore"):
+        assert before not in cursors and len(cursors) < 8
+        cursors.add(before)
+        code, output = run_cli(*args, "--before", before)
+        assert code == 0
+        page = json.loads(output)
+        events.extend(page["events"])
+    assert events == [linked, anchor]
 
 
 @pytest.mark.parametrize("case", ["run", "scoped_run", "conflicting_invocation"])
