@@ -72,6 +72,7 @@ GLOBAL_FLAGS = (
     ("--ws-endpoint", "keeper.ws_endpoint"),
     ("--lcd-endpoint", "lcd.endpoint"),
 )
+LCD_TRADE_COMMANDS = frozenset({"trade margin", "trade partial-close"})
 
 
 def settings(ctx: click.Context) -> sai_settings.Settings:
@@ -92,33 +93,59 @@ def session(ctx: click.Context) -> dict[str, str]:
 
 
 def command_path(group: click.Group, args: list[str]) -> list[str]:
-    """Return the known command names before the leaf's arguments."""
+    """Find the command names past the options and their values."""
+    names, _, _ = _command_parts(group, args)
+    return names
+
+
+def _command_parts(
+    group: click.Group, args: list[str]
+) -> tuple[list[str], list[str], frozenset[str]]:
+    """Find command names, safe audit names, and explicit setting flags."""
     names: list[str] = []
+    audit_names: list[str] = []
     current: click.Command = group
-    skip = False
-    for token in args:
-        if skip:
-            skip = False
+    flag_keys: set[str] = set()
+    endpoint_options = dict(GLOBAL_FLAGS)
+    options = True
+    tokens = iter(args)
+    for token in tokens:
+        if options and token == "--":
+            options = False
             continue
-        if not isinstance(current, click.Group):
-            break
-        if token.startswith("-"):
+        if options and token.startswith("-"):
+            option_name, equals, _ = token.partition("=")
             option = next(
                 (
                     param
                     for param in current.params
-                    if isinstance(param, click.Option) and token in param.opts
+                    if isinstance(param, click.Option)
+                    and option_name in (*param.opts, *param.secondary_opts)
                 ),
                 None,
             )
-            skip = option is not None and not option.is_flag and not option.count
+            if option is None:
+                continue
+            if option.is_flag or option.count:
+                audit_names.append(option_name)
+            else:
+                # An empty assignment keeps the next option or command name
+                # from being read as a value in retained audit rows.
+                audit_names.append(f"{option_name}=")
+                supplied = bool(equals) or next(tokens, None) is not None
+                if supplied and (key := endpoint_options.get(option_name)):
+                    flag_keys.add(key)
+            continue
+        if not isinstance(current, click.Group):
             continue
         found = current.commands.get(token)
         if found is None:
             break
         names.append(token)
+        audit_names.append(token)
         current = found
-    return names
+        options = True
+    return names, audit_names, frozenset(flag_keys)
 
 
 def auth_attempt(names: list[str], argv: list[str]) -> bool:
@@ -145,7 +172,7 @@ def json_requested(argv: Sequence[str]) -> bool:
 
 
 def cli_failure(exc: Exception) -> SaiError:
-    if isinstance(exc, sai_settings.InvalidEndpoint):
+    if isinstance(exc, sai_settings.InvalidSetting):
         return SaiError(str(exc), Code.INVALID_REQUEST, exit_code=ExitCode.USAGE)
     if isinstance(exc, click.ClickException):
         return SaiError(
@@ -270,7 +297,7 @@ class LoggedGroup(SaiGroup):
         **extra: Any,
     ) -> Any:
         argv = list(sys.argv[1:] if args is None else args)
-        names = command_path(self, argv)
+        names, audit_names, flag_keys = _command_parts(self, argv)
         private_args = auth_attempt(names, argv)
         quiet = unlogged(names, argv)
         if names == ["doctor"] and not quiet:
@@ -279,20 +306,25 @@ class LoggedGroup(SaiGroup):
             quiet = not can_log_to_profile()
         command = " ".join(names) or ("repl" if not argv else None)
         # Keep only command words for auth, even if a parent parser fails.
-        logged_argv = names if private_args else argv
+        logged_argv = names if private_args else audit_names
         surface = {"mcp serve": "mcp", "update": "update"}.get(command or "", "cli")
         started = time.monotonic()
         exit_code: int = ExitCode.OK
         failure: SaiError | None = None
         start_logged = False
+        obj = extra.get("obj")
+        if not isinstance(obj, dict):
+            obj = extra["obj"] = {}
+        obj["command"] = command
 
         def log_start() -> None:
             nonlocal start_logged
             if not quiet and not start_logged:
-                log.event("command.start", argv=log.argv(logged_argv[:64]))
+                log.event("command.start", argv=logged_argv[:64])
                 start_logged = True
 
         with (
+            log.setting_flags(flag_keys),
             log.silenced()
             if quiet
             else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex),
@@ -303,10 +335,7 @@ class LoggedGroup(SaiGroup):
             if command == "doctor" and not quiet:
                 # Let doctor report directory creation before logging creates
                 # the profile to record its first event.
-                extra["obj"] = {
-                    **(extra.get("obj") or {}),
-                    "doctor_log_start": log_start,
-                }
+                obj["doctor_log_start"] = log_start
             else:
                 log_start()
             if command == "mcp serve":
@@ -335,7 +364,9 @@ class LoggedGroup(SaiGroup):
                     if safe_usage is not None:
                         raise safe_usage from None
                     raise
-                show_failure(safe_usage or exc, failure, json_requested(argv))
+                show_failure(
+                    safe_usage or exc, failure, obj.get("json", json_requested(argv))
+                )
             else:
                 # With standalone mode disabled, Click returns explicit exit codes.
                 if isinstance(result, int):
@@ -411,14 +442,11 @@ def main(
     passed = (endpoint, ws_endpoint, lcd_endpoint)
     flags = {key: value for (_, key), value in zip(GLOBAL_FLAGS, passed, strict=True)}
     ctx.obj.update(flags=flags, settings=None, json=json_output, as_addr=as_addr)
-    if ctx.invoked_subcommand not in {
-        "account",
-        "auth",
-        "doctor",
-        "mcp",
-        "logs",
-        "skill",
-    }:
+    if (
+        ctx.invoked_subcommand
+        not in {"account", "auth", "doctor", "mcp", "logs", "skill"}
+        and ctx.obj.get("command") not in LCD_TRADE_COMMANDS
+    ):
         session_notice(ctx, as_addr)
     if ctx.invoked_subcommand != "account" and auto_update_applies(
         ctx.invoked_subcommand, json_output
@@ -535,6 +563,7 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
         if line in ("exit", "quit"):
             break
         args: list[str] = []
+        command_obj: dict[str, Any] = {}
         try:
             args = repl_args(line)
             if args:
@@ -542,6 +571,7 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
                     args=[*forwarded_flags(ctx.obj), *args],
                     prog_name="sai",
                     standalone_mode=False,
+                    obj=command_obj,
                 )
                 names = command_path(main, args)
                 if (
@@ -554,7 +584,9 @@ def repl(ctx: click.Context, pt_input: Any = None, pt_output: Any = None) -> Non
         except (click.Abort, KeyboardInterrupt):
             click.echo("Interrupted", err=True)
         except Exception as exc:  # noqa: BLE001 - keep the REPL open
-            show_failure(exc, cli_failure(exc), json_requested(args))
+            show_failure(
+                exc, cli_failure(exc), command_obj.get("json", json_requested(args))
+            )
 
 
 @main.group()
@@ -1514,6 +1546,16 @@ position_digest_option = click.option(
 )
 
 
+def lcd_trade_settings(
+    ctx: click.Context, lcd_endpoint: str | None
+) -> sai_settings.Settings:
+    """Apply a position command's LCD flag before resolving its settings."""
+    if lcd_endpoint is not None:
+        ctx.obj["flags"]["lcd.endpoint"] = lcd_endpoint
+    session_notice(ctx, ctx.obj["as_addr"])
+    return settings(ctx)
+
+
 @trade.command("margin")
 @click.argument("trade_id", type=TRADE_INT)
 @click.option("--direction", type=click.Choice(["add", "remove"]), required=True)
@@ -1545,16 +1587,17 @@ def trade_margin(
 
     The amount is a quote, not a cap: collateral can change before execution.
     """
+    resolved = lcd_trade_settings(ctx, lcd_endpoint)
     try:
         emit_trade(
             ctx,
             trading.change_margin(
-                keeper_url(ctx),
+                resolved.endpoint,
                 loader(ctx),
                 trade_id=trade_id,
                 direction=direction,
                 amount=amount,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
                 before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
@@ -1584,15 +1627,16 @@ def partial_close(
     preview_digest: str | None,
 ) -> None:
     """Reduce an open USDC position by a whole percentage."""
+    resolved = lcd_trade_settings(ctx, lcd_endpoint)
     try:
         emit_trade(
             ctx,
             trading.partial_close(
-                keeper_url(ctx),
+                resolved.endpoint,
                 loader(ctx),
                 trade_id=trade_id,
                 percent=percent,
-                lcd_endpoint=lcd_url(ctx, lcd_endpoint),
+                lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
                 before_submit=position_submit_check(loader(ctx), preview_digest),
             ),
@@ -1632,7 +1676,7 @@ def doctor_command(
     It reports stale Claude Code registrations with a command to repair
     each existing entry. It never deletes or rewrites the session, and
     never prints its token. Each check prints pass, fixed, warn, fail, or
-    skipped. Doctor exits 1 if any check still fails.
+    skipped. Doctor exits 2 for invalid settings and 1 for other failed checks.
     """
     from . import doctor
 
@@ -1678,7 +1722,7 @@ def doctor_command(
             report,
             code,
             details=doctor.report(checks) if ctx.obj["json"] else None,
-            exit_code=ExitCode.USAGE if config_check.invalid_endpoint else None,
+            exit_code=ExitCode.USAGE if config_check.invalid_setting else None,
         )
     if ctx.obj["json"]:
         click.echo(doctor.render_json(doctor.report(checks)))
@@ -1733,17 +1777,11 @@ def watch_price(ctx: click.Context, token_id: int, ws_endpoint: str | None) -> N
 def ws_url(ctx: click.Context, ws_endpoint: str | None) -> str:
     """The command's --ws-endpoint, else the resolved WebSocket setting."""
     if ws_endpoint is not None:
-        sai_settings.check_value("keeper.ws_endpoint", ws_endpoint)
+        sai_settings.check_value(
+            "keeper.ws_endpoint", ws_endpoint, source="--ws-endpoint"
+        )
         return ws_endpoint
     return settings(ctx).ws_endpoint
-
-
-def lcd_url(ctx: click.Context, lcd_endpoint: str | None) -> str:
-    """The command's --lcd-endpoint, else the resolved LCD setting."""
-    if lcd_endpoint is not None:
-        sai_settings.check_value("lcd.endpoint", lcd_endpoint)
-        return lcd_endpoint
-    return settings(ctx).lcd_endpoint
 
 
 def watch_stream(ws_endpoint: str, query: str, variables: dict[str, Any]) -> None:
@@ -2371,7 +2409,7 @@ def logs_intent(
     """Show an intent's CLI and MCP trail and its current Keeper record."""
     endpoint = ctx.obj["flags"].get("keeper.endpoint") if offline else keeper_url(ctx)
     if offline and endpoint is not None:
-        sai_settings.check_value("keeper.endpoint", endpoint)
+        sai_settings.check_value("keeper.endpoint", endpoint, source="--endpoint")
     account = addr if addr is not None else ctx.obj["as_addr"]
     report = log_queries.intent(
         key, endpoint=endpoint, addr=account, offline=offline, before=before

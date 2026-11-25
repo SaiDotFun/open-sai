@@ -31,6 +31,7 @@ import threading
 import time
 from collections.abc import Callable, Generator, Sequence
 from contextlib import contextmanager
+from contextvars import copy_context
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from importlib import metadata
@@ -76,7 +77,7 @@ class Check:
     details: dict[str, Any] = field(default_factory=dict)
     duration_ms: int = 0
     changes: list[str] = field(default_factory=list)
-    invalid_endpoint: bool = False
+    invalid_setting: bool = False
     _lcd_chain_id: str | None = field(default=None, repr=False)
 
     def to_json(self) -> dict[str, Any]:
@@ -113,42 +114,34 @@ CheckFn = Callable[[Context], "Check | Sequence[Check]"]
 def check_config(
     flags: dict[str, str | None],
 ) -> tuple[Check, Settings | None]:
-    """Validate file settings before resolving flag and environment overrides."""
+    """Validate the settings that apply to this invocation."""
     path = settings.config_path(os.environ)
-    fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
+    file_fix = "Edit config.toml in the Sai home directory and rerun `sai doctor`"
+    fix = file_fix
     try:
-        values, warnings = settings.read_file(path)
-    except settings.ConfigError as exc:
-        return Check(
-            "config",
-            "fail",
-            exc.diagnostic,
-            fix,
-            invalid_endpoint=isinstance(exc, settings.InvalidEndpoint),
-        ), None
-    try:
+        values, warnings = settings.read_effective_file(path, flags, os.environ)
+        fix = "Check the settings listed by `sai config --help`"
         config = settings.resolve(flags, os.environ, values)
-    except settings.InvalidEndpoint as exc:
+    except settings.ConfigError as exc:
+        return Check("config", "fail", exc.diagnostic, fix), None
+    except settings.InvalidSetting as exc:
         return Check(
             "config",
             "fail",
             str(exc),
-            "Check the settings listed by `sai config --help`",
-            invalid_endpoint=True,
-        ), None
-    except ValueError:
-        return Check(
-            "config",
-            "fail",
-            "A flag or environment setting is invalid",
-            "Check the settings listed by `sai config --help`",
+            fix,
+            invalid_setting=True,
         ), None
     invalid = [
         key for key, value in values.items() if isinstance(value, settings.Invalid)
     ]
     if invalid:
         return Check(
-            "config", "fail", f"Invalid config.toml settings: {', '.join(invalid)}", fix
+            "config",
+            "fail",
+            f"Invalid settings in {path}: {', '.join(invalid)}",
+            file_fix,
+            invalid_setting=True,
         ), config
     invalid_env = [
         f"{spec.env} ({spec.key})"
@@ -165,7 +158,7 @@ def check_config(
         ), config
     if warnings:
         return Check(
-            "config", "warn", "config.toml contains unknown settings", fix
+            "config", "warn", "config.toml contains unknown settings", file_fix
         ), config
     return Check("config", "pass", "Config file settings are valid"), config
 
@@ -1094,7 +1087,7 @@ def reconcile_keys(
         except Exception as exc:  # noqa: BLE001 - reported, not raised
             outcome["error"] = type(exc).__name__
 
-    thread = threading.Thread(target=work, daemon=True)
+    thread = threading.Thread(target=copy_context().run, args=(work,), daemon=True)
     thread.start()
     thread.join(deadline)
     gate.shut()
@@ -1492,7 +1485,7 @@ def run_network(ctx: Context, deadline: float) -> list[Check]:
         results[name] = timed(name, fn, ctx)
 
     threads = [
-        threading.Thread(target=work, args=(name, fn), daemon=True)
+        threading.Thread(target=copy_context().run, args=(work, name, fn), daemon=True)
         for name, fn in NETWORK_CHECKS
     ]
     end = time.monotonic() + deadline

@@ -20,6 +20,7 @@ import tracemalloc
 import zlib
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from datetime import UTC, date, datetime, timedelta
 from hashlib import sha256
 from http.server import ThreadingHTTPServer
@@ -39,6 +40,7 @@ from sai_cli.core import session as sessions
 from sai_cli.core.log_events import SCHEMA_VERSION, VOLATILE_FIELDS, valid_event
 from sai_cli.mcp_server import server
 from sai_cli.sai_cli import command_path, main
+from sai_cli.tests.loopback import graphql_ws
 
 ADDR = "0x" + "b" * 40
 OTHER = "0x" + "c" * 40
@@ -490,8 +492,94 @@ def test_urls_with_awkward_characters_do_not_reach_the_log(home, keeper_stub):
     for secret in (PATH_KEY, URL_KEY, "it's", "api_key"):
         assert secret not in raw, secret
     start = events(home, "command.start")[0]
-    assert start["argv"] == ["--endpoint", site, "--json", "market", "prices"]
+    assert start["argv"] == ["--endpoint=", "--json", "market", "prices"]
     assert events(home, "mcp.tool_call")[0]["arguments"] == {"addr": site}
+
+
+@pytest.mark.parametrize("command", [("config", "list"), ("mcp", "serve")])
+@pytest.mark.parametrize("flag", ["--endpoint", "--ws-endpoint", "--lcd-endpoint"])
+@pytest.mark.parametrize("inline", [False, True])
+def test_command_start_redacts_malformed_endpoint_flags(home, command, flag, inline):
+    marker = "fixture-endpoint-credential"
+    endpoint = f"keeper.invalid/graphql?credential={marker}"
+    option = [f"{flag}={endpoint}"] if inline else [flag, endpoint]
+    if command == ("mcp", "serve"):
+        args = ["--json", *command, *option]
+        expected = ["--json", *command, f"{flag}="]
+    else:
+        args = ["--json", *option, *command]
+        expected = ["--json", f"{flag}=", *command]
+
+    assert run_cli(*args)[0] == 2
+    assert events(home, "command.start")[0]["argv"] == expected
+    assert marker not in raw_logs(home)
+
+
+@pytest.mark.parametrize("key", settings.KEYS)
+def test_command_start_redacts_rejected_config_set_values(home, key):
+    marker = "fixture-config-credential"
+    args = ["--json", "config", "set", "--", key]
+
+    assert run_cli(*args, marker)[0] == 2
+    assert events(home, "command.start")[0]["argv"] == ["--json", "config", "set"]
+    assert marker not in raw_logs(home)
+
+
+def test_command_start_omits_valid_config_set_arguments(home):
+    marker = "fixture-config-credential"
+    args = ["--json", "config", "set", "keeper.endpoint", "--"]
+    url = f"https://keeper.invalid/graphql?credential={marker}"
+
+    assert run_cli(*args, url)[0] == 0
+    assert events(home, "command.start")[0]["argv"] == ["--json", "config", "set"]
+    assert "keeper.invalid" not in raw_logs(home)
+    assert marker not in raw_logs(home)
+
+
+@pytest.mark.parametrize(
+    ("prefix", "inline", "template"),
+    [
+        (("--endpoint",), False, "ftp://{marker}.invalid"),
+        (("config", "set", "keeper.endpoint"), False, "ftp://{marker}.invalid"),
+        (("mcp", "serve", "--ws-endpoint"), True, "https://{marker}.invalid"),
+        (("--lcd-endpoint",), True, "wss://{marker}.invalid"),
+        (("--endpoint",), False, "https://{marker}.invalid/#fragment"),
+    ],
+)
+def test_command_start_redacts_rejected_parseable_endpoints(
+    home, prefix, inline, template
+):
+    marker = "fixture-rejected-endpoint"
+    endpoint = template.format(marker=marker)
+    suffix = ("config", "list") if prefix[0].startswith("--") else ()
+    if inline:
+        args = [*prefix[:-1], f"{prefix[-1]}={endpoint}"]
+    else:
+        args = [*prefix, endpoint]
+    shown = (
+        [*prefix[:-1], f"{prefix[-1]}="]
+        if prefix[-1].startswith("--")
+        else list(prefix[:-1])
+    )
+
+    assert run_cli("--json", *args, *suffix)[0] == 2
+    assert events(home, "command.start")[0]["argv"] == ["--json", *shown, *suffix]
+    assert marker not in raw_logs(home)
+
+
+@pytest.mark.parametrize("account_arg", [("--as", "--endpoint"), ("--as=--endpoint",)])
+def test_command_start_omits_values_when_an_operand_looks_like_a_flag(
+    home, account_arg
+):
+    marker = "fixture-flag-shaped-operand-credential"
+    args = ["--json", *account_arg, "--endpoint", marker, "config", "list"]
+
+    assert run_cli(*args)[0] == 2
+    start = events(home, "command.start")[0]
+    expected = ["--json", "--as=", "--endpoint=", "config", "list"]
+    assert start["argv"] == expected
+    assert log.decode_row(json.dumps(start).encode())["argv"] == expected
+    assert marker not in raw_logs(home)
 
 
 def test_urls_are_reduced_to_their_origin():
@@ -561,6 +649,7 @@ def test_no_token_or_url_credential_reaches_a_log_line(home, keeper_stub):
     assert "code" in call(mcp, "auth_use", {"addr": OPAQUE_TOKEN})
     # A known parameter holding a credential URL, then unknown parameters.
     assert "perp" in call(mcp, "account_positions", {"addr": with_password})
+    assert "perp" in call(mcp, "account_positions", {"addr": SIGNATURE})
     stray = {"endpoint": with_password, "token": OPAQUE_TOKEN, "sig": SIGNATURE}
     with pytest.raises(ToolError, match="market_prices"):
         asyncio.run(mcp.call_tool("market_prices", stray))
@@ -655,7 +744,7 @@ def test_command_start_and_end_record_argv_exit_code_and_duration(home, keeper_s
     start, request, end = read_logs(home)
     assert start["event"] == "command.start" and start["command"] == "market prices"
     site = base.removesuffix("/query")
-    assert start["argv"] == ["--endpoint", site, "--json", "market", "prices"]
+    assert start["argv"] == ["--endpoint=", "--json", "market", "prices"]
     assert request["event"] == "keeper.request"
     assert request["command"] == "market prices"
     assert request["operation"] == "prices" and request["status"] == "ok"
@@ -879,7 +968,7 @@ def test_a_url_that_does_not_parse_neither_fails_nor_hides_the_error(home):
     requests = events(home, "keeper.request")
     assert [line["endpoint"] for line in requests] == [log.REDACTED_URL] * 2
     start = events(home, "command.start")[0]
-    assert start["argv"] == ["--json", "intent", "local", log.REDACTED_URL]
+    assert start["argv"] == ["--json", "intent", "local"]
 
 
 def test_intent_lifecycle_is_logged_from_reservation_to_terminal(home, keeper_stub):
@@ -1088,7 +1177,7 @@ def test_doctor_logs_its_outcome_and_no_fix_logs_nothing(home, monkeypatch):
     assert run_cli("doctor", "--offline", "--lcd-endpoint", lcd)[0] == 0
     result = events(home, "doctor.result")[0]
     start = events(home, "command.start")[0]
-    assert start["argv"][-2:] == ["--lcd-endpoint", lcd_origin]
+    assert start["argv"] == ["doctor", "--offline", "--lcd-endpoint="]
     output = raw_logs(home)
     assert PATH_KEY not in output and URL_KEY not in output
     assert result["overall"] == "warn" and result["offline"] is True
@@ -1124,6 +1213,65 @@ def test_doctor_logs_the_invalid_request_code_for_a_failed_config_check(
         check["id"] == "config" and check["status"] == "fail"
         for check in result["checks"]
     )
+
+
+def test_doctor_workers_log_with_an_endpoint_flag_shadowing_the_file(
+    home, monkeypatch, keeper_stub
+):
+    endpoint, state = keeper_stub
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    (home / "config.toml").write_text('[keeper]\nendpoint = "https://[invalid"\n')
+    save_session(endpoint)
+    storage.pending("doctor-fixture-key", endpoint, ADDR, "CLOSE_POSITION", "7")
+    state.intents = [
+        {
+            "intentKey": "doctor-fixture-key",
+            "kind": "CLOSE_POSITION",
+            "lifecycleStep": "exec_fail",
+            "execActor": "server",
+            "evmAddress": ADDR,
+        }
+    ]
+
+    def ack(connection):
+        assert json.loads(connection.recv())["type"] == "connection_init"
+        connection.send(json.dumps({"type": "connection_ack"}))
+
+    with graphql_ws(ack) as websocket:
+        code, output = run_cli(
+            "--json",
+            "--endpoint",
+            endpoint,
+            "--ws-endpoint",
+            websocket,
+            "--lcd-endpoint",
+            endpoint.removesuffix("/query"),
+            "doctor",
+        )
+
+    assert code == 0, output
+    checks = {check["id"]: check["status"] for check in json.loads(output)["checks"]}
+    assert checks["keeper"] == "pass"
+    assert checks["intents"] == "fixed"
+    start = events(home, "command.start")[0]
+    requests = events(home, "keeper.request")
+    assert sorted(row["operation"] for row in requests) == ["intents", "route"]
+    assert {row["commandId"] for row in requests} == {start["commandId"]}
+
+
+def test_copied_log_context_stays_silenced_after_the_parent_exits(home):
+    with log.silenced():
+        context = copy_context()
+
+    worker = threading.Thread(target=context.run, args=(log.event, "test.late"))
+    worker.start()
+    worker.join()
+
+    assert log.flush(60)
+    assert not (home / "logs").exists()
 
 
 # Retention
@@ -1448,6 +1596,37 @@ def test_settings_that_cannot_be_read_turn_logging_off(home, monkeypatch):
     assert log.config()[0] is False
 
 
+@pytest.mark.parametrize("source", ["env", "flag", "inline-flag"])
+def test_shadowed_file_endpoint_does_not_disable_audit_logging(
+    home, monkeypatch, source
+):
+    (home / "config.toml").write_text('[keeper]\nendpoint = "https://[invalid"\n')
+    endpoint = "http://127.0.0.1:9/query"
+    config = ["--json", "config", "list"]
+    assert run_cli(*config)[0] == 2
+    assert not read_logs(home)
+
+    with monkeypatch.context() as patch:
+        flags: list[str] = []
+        if source == "flag":
+            flags = ["--endpoint", endpoint]
+        elif source == "inline-flag":
+            flags = [f"--endpoint={endpoint}"]
+        else:
+            patch.setenv("SAI_ENDPOINT", endpoint)
+        code, output = run_cli(*flags, *config)
+        assert code == 0
+        assert json.loads(output)["settings"]["logs.enabled"]["value"] is True
+        code, output = run_cli(*flags, "--json", "logs", "path")
+        assert code == 0 and json.loads(output)["enabled"] is True
+
+    assert run_cli(*config)[0] == 2
+    assert [line["event"] for line in read_logs(home)] == [
+        "command.start",
+        "command.end",
+    ]
+
+
 def test_invalid_logs_settings_never_stop_a_command_or_the_server(
     home, monkeypatch, keeper_stub
 ):
@@ -1455,21 +1634,22 @@ def test_invalid_logs_settings_never_stop_a_command_or_the_server(
     the MCP server still start, with or without logging turned off."""
     base, _state = keeper_stub
     for on in ("0", "1", None):
-        monkeypatch.setenv("SAI_LOG_KEEP_DAYS", "fourteen")
+        bad_retention = "9" * 5000 if on == "1" else "fourteen"
+        monkeypatch.setenv("SAI_LOG_KEEP_DAYS", bad_retention)
         if on is None:
             monkeypatch.delenv("SAI_LOG", raising=False)
         else:
             monkeypatch.setenv("SAI_LOG", on)
         resolved = settings.load({"keeper.endpoint": base})
         assert resolved.logs_enabled is False and resolved.endpoint == base
-        assert resolved.sources["logs.keep_days"] == ("env" if on == "0" else "invalid")
+        assert resolved.sources["logs.keep_days"] == "invalid"
         result = CliRunner().invoke(
             main, ["--endpoint", base, "--json", "market", "prices"]
         )
         assert result.exit_code == 0
         assert json.loads(result.stdout) == {"oracle": {"tokenPricesUsd": []}}
-        # Off by choice: the other value is not looked at, so no warning.
-        assert ("logging is off" in result.stderr) == (on != "0")
+        assert "SAI_LOG_KEEP_DAYS: invalid value for logs.keep_days" in result.stderr
+        assert bad_retention not in result.stderr
         mcp = server.create_server(resolved)
         assert "oracle" in call(mcp, "market_prices")
     monkeypatch.delenv("SAI_LOG_KEEP_DAYS")
