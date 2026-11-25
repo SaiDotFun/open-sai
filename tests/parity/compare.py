@@ -40,6 +40,9 @@ DOCTOR_GENERATED_AT = re.compile(r'("generatedAt":)"([^"\\]+)"')
 DOCTOR_DURATION_MS = re.compile(r'(?<="durationMs":)(?:0|[1-9]\d*)(?=[,}])')
 DOCTOR_BUILD_VERSION = re.compile(rf'("(?:version|installed)":"){VERSION.pattern}(?=")')
 DOCTOR_DISPLAY_VERSION = re.compile(rf"(?<=sai ){VERSION.pattern}(?=[ ;]|$)")
+DOCTOR_CHECKOUT_GIT = re.compile(
+    r'("git":\{"commit":")[0-9a-f]{40}(","dirty":)(?:true|false)(?=\})'
+)
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
 SQLITE_TRIVIA = r"[ \t\n\f\r]+|--[^\n]*|/\*[\s\S]*?(?:\*/|$)"
@@ -378,7 +381,7 @@ def doctor_report(value: dict[str, Any]) -> None:
             doctor_provenance(install)
 
 
-def mask_doctor_stream(raw: str) -> str:
+def mask_doctor_stream(raw: str, *, checkout: bool = False) -> str:
     """Mask clock and build values without changing serialization or layout."""
     raw = DOCTOR_GENERATED_AT.sub(
         lambda match: f'{match[1]}"<generatedAt>"' if timestamp(match[2]) else match[0],
@@ -387,6 +390,8 @@ def mask_doctor_stream(raw: str) -> str:
     raw = DOCTOR_DURATION_MS.sub('"<durationMs>"', raw)
     raw = DOCTOR_BUILD_VERSION.sub(r"\g<1><version>", raw)
     raw = DOCTOR_DISPLAY_VERSION.sub("<version>", raw)
+    if checkout:
+        raw = DOCTOR_CHECKOUT_GIT.sub(r'\g<1><commit>\g<2>"<dirty>"', raw)
     return DURATION.sub("<durationMs>", raw)
 
 

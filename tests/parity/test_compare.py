@@ -52,6 +52,17 @@ def test_doctor_stream_masks_clock_and_build_values_and_keeps_other_bytes() -> N
     )
 
 
+def test_release_doctor_stream_masks_each_checkouts_git_state() -> None:
+    sha = "a" * 40
+    raw = f'{{"git":{{"commit":"{sha}","dirty":false}},"summary":"other chain"}}'
+    other = raw.replace(sha, "b" * 40).replace("false", "true")
+    expected = '{"git":{"commit":"<commit>","dirty":"<dirty>"},"summary":"other chain"}'
+    assert mask_doctor_stream(raw) == raw
+    assert mask_doctor_stream(raw, checkout=True) == expected
+    assert mask_doctor_stream(other, checkout=True) == expected
+    assert mask_doctor_stream(raw.replace(sha, "invalid"), checkout=True) != expected
+
+
 def test_start_log_compares_command_and_argv_shape(tmp_path: Path) -> None:
     normalize = Normalize(tmp_path)
     start = {

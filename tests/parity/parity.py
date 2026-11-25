@@ -590,7 +590,7 @@ def observe(
     diagnostic = result.stderr
     if case.command == "doctor" and case.exact_output:
         if case.mode == "json":
-            display = mask_doctor_stream(display)
+            display = mask_doctor_stream(display, checkout=cutover)
         display = normalize.text(display)
         diagnostic = normalize.text(mask_doctor_stream(diagnostic))
     raw = None
