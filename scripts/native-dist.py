@@ -15,16 +15,10 @@ from itertools import product
 from pathlib import Path
 from typing import Any
 
-from check_release import check_tag, native_versions, pyproject_version
+from check_release import check_tag, native_versions, pyproject_version, tag_error
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from shim.src.sai_cli.sai_cli import (
-    TARGET_CPU,
-    TARGET_OS,
-    archive_name,
-    native_target,
-)
 
 
 def make_archive(binary: Path, destination: Path) -> None:
@@ -43,6 +37,8 @@ def make_archive(binary: Path, destination: Path) -> None:
 
 
 def archive_names(release: str) -> set[str]:
+    from shim.src.sai_cli.sai_cli import TARGET_CPU, TARGET_OS, archive_name
+
     targets = product(set(TARGET_CPU.values()), TARGET_OS.values())
     return {archive_name(release, f"{cpu}-{os}") for cpu, os in targets}
 
@@ -72,6 +68,23 @@ def check_files(directory: Path, expected: set[str], label: str) -> None:
         )
 
 
+def python_package_digests(directory: Path, version: str) -> dict[str, str]:
+    # Wheel and sdist builders normalize the PEP 440 spelling of release candidates.
+    names = package_names(version.replace("-rc.", "rc"))
+    check_files(directory, names, "full Python distribution")
+    return digests(directory, names)
+
+
+def stage_files(output: Path, *sources: tuple[Path, dict[str, str]]) -> None:
+    output.mkdir(parents=True)
+    manifest = {}
+    for source, hashes in sources:
+        for name in hashes:
+            shutil.copyfile(source / name, output / name)
+        manifest.update(hashes)
+    (output / "SHA256SUMS").write_text(manifest_text(manifest), encoding="ascii")
+
+
 def stage_release(
     native: Path,
     python: Path,
@@ -89,16 +102,11 @@ def stage_release(
     ):
         raise ValueError("native bundle does not match its SHA256SUMS")
 
-    # Wheel and sdist builders normalize the PEP 440 spelling of release candidates.
-    python_names = package_names(python_version.replace("-rc.", "rc"))
-    check_files(python, python_names, "full Python distribution")
-    hashes = digests(python, python_names)
-    hashes.update({name: native_hashes[name] for name in archives})
-    output.mkdir(parents=True)
-    for source, names in ((native, archives), (python, python_names)):
-        for name in names:
-            shutil.copyfile(source / name, output / name)
-    (output / "SHA256SUMS").write_text(manifest_text(hashes), encoding="ascii")
+    stage_files(
+        output,
+        (native, {name: native_hashes[name] for name in archives}),
+        (python, python_package_digests(python, python_version)),
+    )
 
 
 def check_attestation(
@@ -152,6 +160,10 @@ def main() -> None:
     stage.add_argument("python", type=Path)
     stage.add_argument("output", type=Path)
     stage.add_argument("--tag", help="require matching versions for publication")
+    python_stage = commands.add_parser("stage-python-release")
+    python_stage.add_argument("python", type=Path)
+    python_stage.add_argument("output", type=Path)
+    python_stage.add_argument("--tag", help="require the matching Python version")
     attestation = commands.add_parser("check-attestation")
     attestation.add_argument("directory", type=Path)
     attestation.add_argument("tag_object")
@@ -167,8 +179,18 @@ def run(args: argparse.Namespace) -> None:
     if args.command == "check-attestation":
         check_attestation(args.directory, args.tag_object, json.load(sys.stdin))
         return
+    if args.command == "stage-python-release":
+        version = pyproject_version()
+        if args.tag and (error := tag_error(args.tag, version)):
+            raise ValueError(error)
+        stage_files(
+            args.output, (args.python, python_package_digests(args.python, version))
+        )
+        return
     release, shim = native_versions()
     if args.command == "archive":
+        from shim.src.sai_cli.sai_cli import archive_name, native_target
+
         if args.target != native_target():
             raise ValueError("the archive must be built on a runner for its target")
         args.directory.mkdir(parents=True, exist_ok=True)

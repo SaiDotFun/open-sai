@@ -334,9 +334,9 @@ Each component of this repository releases under its own tag prefix. The CLI
 uses `sai-cli/vX.Y.Z`, where `X.Y.Z` is the version in `pyproject.toml`, and
 `sai-cli/vX.Y.Z-rc.N` for a pre-release.
 
-Before tagging, merge a version bump that aligns the Python package, Cargo
-workspace, and shim on the same release version. Use the Python spelling
-`X.Y.ZrcN` in the shim for release candidates. Run the
+For the default native release, merge a version bump that aligns the Python
+package, Cargo workspace, and shim on the same release version. In the shim,
+use `X.Y.ZrcN` for release candidates. Run the
 [Release workflow](.github/workflows/release.yml) manually on the candidate
 commit with the planned tag. The workflow checks the package versions, runs
 the Python tests and the four native smoke jobs, and uploads the
@@ -363,6 +363,20 @@ smoke tests run on macOS 15, the tested support floor. The full Python
 package remains the published Python distribution during this stage of the
 handoff. The shim keeps the same package name and is exercised in CI until
 the handoff release can use that filename for the shim.
+
+### Release Python Only
+
+Use this mode for a full Python release before the native distribution is
+ready. Bump the Python package version and run the manual Release workflow
+with the planned tag and the `python-only` option enabled. Its candidate
+artifact contains the full Python wheel, sdist, and `SHA256SUMS`.
+
+Preview the tag on `main` with `just release X.Y.Z --python-only`. Add
+`--run` when the rehearsal is complete. The command records
+`Sai-Release-Mode: python-only` in the annotated `sai-cli/vX.Y.Z` tag.
+The workflow uses the Python version and omits the native build. The Python
+files keep their usual download URLs and publish together in one immutable
+release.
 
 ### Rehearse a Release Candidate
 

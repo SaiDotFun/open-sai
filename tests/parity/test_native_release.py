@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import runpy
+import shutil
 import subprocess
 import sys
 import tomllib
@@ -77,6 +78,38 @@ def test_stages_only_native_archives_and_the_full_python_packages(candidate) -> 
     assert {path.name for path in output.iterdir()} == names | {"SHA256SUMS"}
     for path in python.iterdir():
         assert (output / path.name).read_bytes() == path.read_bytes()
+    assert (output / "SHA256SUMS").read_text() == manifest(output, names)
+
+
+def test_stages_python_only_without_cargo_or_shim(tmp_path: Path) -> None:
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    for name in ("native-dist.py", "check_release.py"):
+        shutil.copyfile(ROOT / "scripts" / name, scripts / name)
+    (tmp_path / "pyproject.toml").write_text('[project]\nversion = "1.2.4-rc.1"\n')
+    python = tmp_path / "python"
+    python.mkdir()
+    names = packages("1.2.4rc1")
+    for name in names:
+        (python / name).write_text(f"full Python {name}")
+
+    output = tmp_path / "release"
+    result = subprocess.run(
+        [
+            sys.executable,
+            scripts / "native-dist.py",
+            "stage-python-release",
+            python,
+            output,
+            "--tag",
+            "sai-cli/v1.2.4-rc.1",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert {path.name for path in output.iterdir()} == names | {"SHA256SUMS"}
     assert (output / "SHA256SUMS").read_text() == manifest(output, names)
 
 

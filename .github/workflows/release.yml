@@ -10,6 +10,8 @@ on:
       - '.github/workflows/native-dist.yml'
       - 'scripts/check_release.py'
       - 'scripts/native-dist.py'
+      - 'scripts/release.py'
+      - 'cli/sai_cli/tests/test_release.py'
       - 'tests/parity/test_native_release.py'
   workflow_dispatch:
     inputs:
@@ -17,6 +19,10 @@ on:
         description: 'Planned tag (sai-cli/vX.Y.Z). This run only stages artifacts.'
         required: true
         type: string
+      python-only:
+        description: 'Rehearse only the full Python wheel and sdist.'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -29,6 +35,9 @@ jobs:
   python:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    outputs:
+      mode: ${{ steps.plan.outputs.mode }}
+      tag-object: ${{ steps.plan.outputs.tag-object }}
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
@@ -43,26 +52,52 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Check tag provenance
-        if: github.event_name == 'push'
+      - name: Check tag provenance and select release mode
+        id: plan
+        env:
+          PYTHON_ONLY: ${{ inputs.python-only }}
         shell: bash
         run: |
-          built="$(git rev-parse HEAD)"
-          test "$built" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
-          test "$built" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
-          git rev-list --first-parent origin/main | grep -Fx "$built" >/dev/null
-          uv run --no-project python scripts/check_release.py "$TAG" \
-            --built "$built" --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          mode=native
+          tag_object=
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            built="$(git rev-parse HEAD)"
+            test "$built" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
+            test "$built" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+            git rev-list --first-parent origin/main | grep -Fx "$built" >/dev/null
+            tag_object="$(git rev-parse "refs/tags/$TAG")"
+            mode="$(uv run --no-project python scripts/check_release.py "$TAG" --print-mode \
+              --built "$built" --tag-object "$tag_object" --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY")"
+          elif [[ "$PYTHON_ONLY" == true ]]; then
+            mode=python-only
+          fi
+          printf 'mode=%s\ntag-object=%s\n' "$mode" "$tag_object" >> "$GITHUB_OUTPUT"
 
       - name: Check package versions
         if: github.event_name != 'pull_request'
+        env:
+          RELEASE_MODE: ${{ steps.plan.outputs.mode }}
         run: |
-          uv run --no-project python scripts/native-dist.py check-tag "$TAG"
+          if [[ "$RELEASE_MODE" == python-only ]]; then
+            uv run --no-project python scripts/check_release.py "$TAG"
+          else
+            uv run --no-project python scripts/native-dist.py check-tag "$TAG"
+          fi
 
       - name: Install dependencies from uv.lock
         run: uv sync --locked --all-groups
 
-      - run: uv run pytest
+      - name: Run Python tests
+        env:
+          RELEASE_MODE: ${{ steps.plan.outputs.mode }}
+        shell: bash
+        run: |
+          args=()
+          if [[ "$RELEASE_MODE" == python-only ]]; then
+            # Native staging tests use the current Cargo and shim versions.
+            args+=(--ignore=tests/parity/test_native_release.py)
+          fi
+          uv run pytest "${args[@]}"
 
       # Same command as "just build-check".
       - name: Check that the wheel and sdist ship the skill directory
@@ -82,15 +117,23 @@ jobs:
 
   native:
     needs: python
+    if: needs.python.outputs.mode == 'native'
     uses: ./.github/workflows/native-dist.yml
 
   assemble:
-    name: Assemble release candidate
+    name: Assemble release candidate (${{ matrix.mode }})
     needs: [python, native]
+    if: >-
+      ${{ !cancelled() && needs.python.result == 'success' &&
+          (needs.native.result == 'success' || needs.python.outputs.mode == 'python-only') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    strategy:
+      matrix:
+        mode: ${{ fromJSON(github.event_name == 'pull_request' && '["native","python-only"]' || format('["{0}"]', needs.python.outputs.mode)) }}
     env:
       TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+      RELEASE_MODE: ${{ matrix.mode }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -104,6 +147,7 @@ jobs:
           name: sai-full-python
           path: dist/python
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: matrix.mode == 'native'
         with:
           name: sai-native-ci
           path: dist/native
@@ -114,28 +158,34 @@ jobs:
           if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
             args+=(--tag "$TAG")
           fi
-          uv run --no-project python scripts/native-dist.py stage-release \
-            dist/native dist/python dist/release "${args[@]}"
+          if [[ "$RELEASE_MODE" == python-only ]]; then
+            uv run --no-project python scripts/native-dist.py stage-python-release \
+              dist/python dist/release "${args[@]}"
+          else
+            uv run --no-project python scripts/native-dist.py stage-release \
+              dist/native dist/python dist/release "${args[@]}"
+          fi
       - name: Check release checksums
         working-directory: dist/release
         run: sha256sum --check --strict SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: sai-release-candidate
+          name: ${{ github.event_name == 'pull_request' && matrix.mode == 'python-only' && 'sai-python-release-candidate' || 'sai-release-candidate' }}
           path: dist/release/
           if-no-files-found: error
           compression-level: 0
 
   publish:
     name: Publish immutable release
-    if: github.event_name == 'push' && github.ref_type == 'tag'
-    needs: assemble
+    if: ${{ !cancelled() && needs.assemble.result == 'success' && github.event_name == 'push' && github.ref_type == 'tag' }}
+    needs: [python, assemble]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
       contents: write
     env:
       TAG: ${{ github.ref_name }}
+      TAG_OBJECT: ${{ needs.python.outputs.tag-object }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -153,11 +203,12 @@ jobs:
         working-directory: dist/release
         run: sha256sum --check --strict SHA256SUMS
 
-      # --verify-tag checks existence. Recheck the peeled remote commit before uploading.
-      - name: Check that the remote tag is still the built commit
+      # --verify-tag checks existence. Recheck the annotation and its commit.
+      - name: Check that the remote tag still matches the build
         run: |
           uv run --no-project python scripts/check_release.py "$TAG" \
-            --built "$(git rev-parse HEAD)" --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+            --built "$(git rev-parse HEAD)" --tag-object "$TAG_OBJECT" \
+            --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
 
       - name: Require immutable releases
         env:
@@ -198,7 +249,7 @@ jobs:
 
   verify:
     name: Verify immutable release
-    needs: [assemble, publish]
+    needs: [python, assemble, publish]
     # A dry run proves the verifier's permissions against an existing immutable release.
     if: >-
       ${{ !cancelled() && needs.assemble.result == 'success' &&
@@ -211,6 +262,7 @@ jobs:
       attestations: read
     env:
       TAG: ${{ github.event_name == 'push' && github.ref_name || 'sai-cli/v0.1.3' }}
+      TAG_OBJECT: ${{ needs.python.outputs.tag-object }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -237,7 +289,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
-          tag_object="$(git rev-parse "refs/tags/$TAG")"
+          tag_object="${TAG_OBJECT:-$(git rev-parse "refs/tags/$TAG")}"
           # GitHub may take a few seconds to generate the release attestation.
           for delay in 0 5 15 30; do
             sleep "$delay"
