@@ -22,6 +22,16 @@ MAX_PAGES = 20
 LCD_BUDGET_SECONDS = 8.0
 LCD_REQUEST_SECONDS = 2.0
 MEMBERSHIP_MAX_AGE_SECONDS = 60
+PAGINATION_ERROR = "The paginated list could not be confirmed and may be incomplete"
+CONTRACT_RISK_ERROR = "Could not read matching contract risk data at one block"
+CONTRACT_READ_ERRORS = (
+    KeyError,
+    TypeError,
+    ValueError,
+    OSError,
+    OverflowError,
+    DecimalException,
+)
 _LCD_SLOTS = BoundedSemaphore(8)
 BALANCE_KEYS = {
     "USDC on Sai": "balance",
@@ -452,6 +462,7 @@ class ContractReads:
     def __init__(self, chain: ChainRead) -> None:
         self.chain = chain
         self.timed_out = False
+        self.trade_read_failed = False
         self.groups: dict[str, int | None] = {}
         self.rates: dict[tuple[int, int], tuple[dict[str, Any], str] | None] = {}
         self.markets: dict[int, dict[str, Any] | None] = {}
@@ -512,7 +523,6 @@ def _contract_risk(
         return {"riskStatus": "unavailable", "riskReason": "No matching LCD block"}
     chain = reads.chain
     market = trade["perpBorrowing"]
-    risk: dict[str, Any] = {"riskStatus": "unavailable"}
     try:
         result = reads.query({"get_trade": {"trader": addr, "index": trade["id"]}})
         fetched = datetime.now(UTC).isoformat()
@@ -530,19 +540,23 @@ def _contract_risk(
             raise TypeError("Expected a boolean after-hours flag")
         if liquidation < 0 or entry <= 0:
             raise ValueError("Invalid contract trade price")
-        risk = {
-            "riskStatus": "partial",
-            "afterHoursLeverageAdjustmentPending": adjustment,
-            "riskSource": {
-                "fetchedAt": fetched,
-                "sourceBlock": chain.height,
-                **_age(chain.time, fetched),
-            },
-            "liquidationPriceQuote": _number(float(liquidation)),
-            "liquidationPriceUsd": _number(float(liquidation))
-            if quote_id == USD_TOKEN_ID
-            else None,
-        }
+        liquidation_quote = _number(float(liquidation))
+    except CONTRACT_READ_ERRORS:
+        reads.trade_read_failed = True
+        return {"riskStatus": "unavailable", "riskReason": CONTRACT_RISK_ERROR}
+
+    risk: dict[str, Any] = {
+        "riskStatus": "partial",
+        "afterHoursLeverageAdjustmentPending": adjustment,
+        "riskSource": {
+            "fetchedAt": fetched,
+            "sourceBlock": chain.height,
+            **_age(chain.time, fetched),
+        },
+        "liquidationPriceQuote": liquidation_quote,
+        "liquidationPriceUsd": liquidation_quote if quote_id == USD_TOKEN_ID else None,
+    }
+    try:
         contract_market = reads.market(market["marketId"])
         if contract_market is None:
             raise ValueError("Contract market is unavailable")
@@ -673,11 +687,8 @@ def _contract_risk(
             "unrealizedPnlUsd": _usd(pnl * amount, conversion),
             "unrealizedPnlPercent": float(pnl * 100),
         }
-    except (KeyError, TypeError, ValueError, OSError, OverflowError, DecimalException):
-        return {
-            **risk,
-            "riskReason": "Could not read matching contract risk data at one block",
-        }
+    except CONTRACT_READ_ERRORS:
+        return {**risk, "riskReason": CONTRACT_RISK_ERROR}
 
 
 def _trade_row(
@@ -761,10 +772,7 @@ def _trade_row(
 
 
 def _mark_incomplete(section: dict[str, Any]) -> None:
-    section["error"] = _failure(
-        Code.INCOMPLETE_DATA,
-        "The paginated list could not be confirmed and may be incomplete",
-    )
+    section["error"] = _failure(Code.INCOMPLETE_DATA, PAGINATION_ERROR)
 
 
 def _live_trade_ids(chain: ChainRead | None, addr: str) -> set[int] | None:
@@ -801,19 +809,26 @@ def _live_trade_ids(chain: ChainRead | None, addr: str) -> set[int] | None:
     return None
 
 
-def _fill_awaits_indexing(endpoint: str, addr: str) -> bool:
-    """Read Keeper's provisional outcome without reconciling local intent state."""
+def _fill_awaits_indexing(endpoint: str, addr: str) -> bool | None:
+    """Return whether a fill awaits indexing, or None if the check fails."""
     try:
         rows = keeper.request(endpoint, keeper.INTENTS, {"user": addr}, timeout=3)[
             "userIntents"
         ]
+        if not isinstance(rows, list):
+            return None
+        for row in rows:
+            for field in ("kind", "execActor", "lifecycleStep"):
+                _text(row[field])
+            if row["errorCode"] is not None:
+                _text(row["errorCode"])
         return any(
-            row.get("errorCode") == reconcile.OUTCOME_NOT_INDEXED
+            row["errorCode"] == reconcile.OUTCOME_NOT_INDEXED
             and reconcile.classify_outcome(row) == "pending"
             for row in rows
         )
-    except (keeper.KeeperError, KeyError, TypeError, AttributeError):
-        return False
+    except (keeper.KeeperError, KeyError, TypeError):
+        return None
 
 
 def _membership_check(
@@ -871,7 +886,7 @@ def _trade_sections(
             _skipped_prices("Positions and pending orders could not be loaded."),
         )
     trades = snapshot["data"].rows
-    unindexed_fill = _fill_awaits_indexing(settings.endpoint, addr)
+    fill_check = _fill_awaits_indexing(settings.endpoint, addr)
     prices = (
         _read(lambda: _prices(settings.endpoint))
         if trades
@@ -903,32 +918,44 @@ def _trade_sections(
     for section in (positions, orders):
         if "data" in section:
             section["fetchedAt"] = snapshot["fetchedAt"]
-            if not complete:
-                _mark_incomplete(section)
+    if "data" in orders and not complete:
+        _mark_incomplete(orders)
     items = positions.get("data", [])
     if "data" in positions:
-        membership_complete = membership["status"] == "verified" and not unindexed_fill
-        if complete and not membership_complete:
-            if unindexed_fill:
-                message = "Keeper reports a fill awaiting indexing. Positions may be incomplete."
+        membership_complete = membership["status"] == "verified" and fill_check is False
+        issues = []
+        if fill_check is None:
+            issues.append("Keeper fill check failed. Positions may be incomplete.")
+        elif complete and not membership_complete:
+            if fill_check:
+                issues.append(
+                    "Keeper reports a fill awaiting indexing. Positions may be incomplete."
+                )
             elif membership["status"] == "stale":
-                message = "The live position check used a stale LCD block. Positions may be incomplete."
+                issues.append(
+                    "The live position check used a stale LCD block. Positions may be incomplete."
+                )
             else:
-                message = "The indexed positions could not be confirmed against the live contract list."
-            positions["error"] = _failure(Code.INCOMPLETE_DATA, message)
-        elif (
-            "error" not in positions
-            and contract_reads is not None
-            and (
+                issues.append(
+                    "The indexed positions could not be confirmed against the live contract list."
+                )
+        if contract_reads is not None:
+            deadline_expired = (
                 contract_reads.timed_out
                 or time.monotonic() >= contract_reads.chain.deadline
             )
-            and any(row["riskStatus"] != "verified" for row in items)
-        ):
-            positions["error"] = _failure(
-                Code.INCOMPLETE_DATA,
-                "An LCD deadline expired. Position risk is partial.",
-            )
+            if deadline_expired and any(
+                row["riskStatus"] != "verified" for row in items
+            ):
+                issues.append("An LCD deadline expired. Position risk is partial.")
+            elif contract_reads.trade_read_failed:
+                issues.append("LCD position read failed. Position risk is partial.")
+        if issues:
+            if not complete:
+                issues.insert(0, f"{PAGINATION_ERROR}.")
+            positions["error"] = _failure(Code.INCOMPLETE_DATA, " ".join(issues))
+        elif not complete:
+            _mark_incomplete(positions)
         pnls = [row["unrealizedPnlUsd"] for row in items]
         positions["data"] = {
             "items": items,

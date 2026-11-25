@@ -1063,6 +1063,45 @@ def test_unconfirmed_empty_position_list_has_no_total(replay, gap):
     assert snapshot["error"]["code"] == "INCOMPLETE_DATA"
 
 
+@pytest.mark.parametrize(
+    ("fill_check", "lcd_trade"),
+    [
+        ("error", None),
+        ("malformed", None),
+        (None, "missing"),
+        (None, "malformed"),
+        ("error", "missing"),
+    ],
+)
+def test_overview_reports_failed_fill_and_lcd_position_checks(
+    replay, fill_check, lcd_trade
+):
+    if fill_check == "error":
+        replay["http"][keeper.INTENTS] = {"errors": [{"message": "fill check failed"}]}
+    elif fill_check == "malformed":
+        replay["http"][keeper.INTENTS] = {"data": {"userIntents": [{}]}}
+    if lcd_trade is not None:
+        populate_trades(replay)
+        replay["liveTradeIds"] = [0, 1]
+        if lcd_trade == "missing":
+            del replay["contractTrades"][0]
+        else:
+            replay["contractTrades"][0] = {"trade": {}}
+
+    positions = mcp(replay, addr=ADDR)["positions"]
+    assert positions["membership"]["status"] == "verified"
+    assert positions["data"]["unrealizedPnlUsd"] is None
+    items = positions["data"]["items"]
+    if lcd_trade is None:
+        assert items == []
+    else:
+        assert [row["riskStatus"] for row in items] == ["unavailable", "verified"]
+    error = positions["error"]
+    assert error["code"] == "INCOMPLETE_DATA"
+    assert ("Keeper fill check failed" in error["message"]) == (fill_check is not None)
+    assert ("LCD position read failed" in error["message"]) == (lcd_trade is not None)
+
+
 @pytest.mark.parametrize("has_positions", [False, True])
 def test_stale_live_membership_keeps_block_provenance_but_withholds_total(
     replay, has_positions
