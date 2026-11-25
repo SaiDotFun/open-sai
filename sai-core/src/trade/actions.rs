@@ -39,6 +39,14 @@ pub struct OpenTrade<'a> {
 
 impl OpenTrade<'_> {
     pub fn preview(&self) -> Result<TradePreview, SaiError> {
+        self.build_preview(false)
+    }
+
+    pub fn confirmed_cli_preview(&self) -> Result<TradePreview, SaiError> {
+        self.build_preview(true)
+    }
+
+    fn build_preview(&self, confirmed_cli: bool) -> Result<TradePreview, SaiError> {
         let market = id(self.market, "--market")?;
         if market.sign() == num_bigint::Sign::Minus {
             return Err(invalid("Market index must not be negative"));
@@ -55,7 +63,22 @@ impl OpenTrade<'_> {
         if amount % 10u128.pow(12) != 0 {
             return Err(invalid("Amount must have at most six decimal places"));
         }
-        if self.slippage != "0"
+        if confirmed_cli {
+            let valid = positive_decimal(self.slippage, "Slippage")
+                .is_ok_and(|value| value <= 100 * 10u128.pow(18))
+                && self
+                    .slippage
+                    .split_once('.')
+                    .is_none_or(|(_, fraction)| fraction.trim_end_matches('0').len() <= 16);
+            if !valid {
+                return Err(SaiError {
+                    show_usage: false,
+                    ..SaiError::usage(
+                        "Slippage (--slippage) must be greater than 0 and at most 100 percent, with at most 18 decimal places and only zeros after the 16th place",
+                    )
+                });
+            }
+        } else if self.slippage != "0"
             && (positive_decimal(self.slippage, "Slippage")? > 100 * 10u128.pow(18)
                 || self
                     .slippage

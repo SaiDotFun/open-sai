@@ -1,4 +1,4 @@
-"""TP/SL and leverage from v0.1.2 (8557a7e) and ownership from PR 148 (c6d85c2)."""
+"""TP/SL and leverage from v0.1.2 (8557a7e) ownership from PR 148, and leverage estimates from 7c7b00d."""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import subprocess
+import sys
 from collections.abc import Generator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler
@@ -49,8 +50,14 @@ PYTHON_QUOTE_WIRE = [
     "get_trade_raw",
     *QUOTE_ESTIMATE_WIRE,
 ]
-LEVERAGE_WIRE = ["get_market", "get_group", "get_pair_custom_max_leverage"]
-ORACLE_WIRE = ["get_fees", "get_perp_prices"]
+LEVERAGE_MARKET_WIRE = ["get_market", "market_order_config"]
+LEVERAGE_ORACLE_WIRE = ["get_perp_prices", "get_group", "block"]
+LEVERAGE_LIMITS_WIRE = [
+    "is_after_hours_market",
+    "get_group",
+    "get_pair_custom_max_leverage",
+]
+LEVERAGE_WIRE = LEVERAGE_MARKET_WIRE + LEVERAGE_ORACLE_WIRE + LEVERAGE_LIMITS_WIRE
 CHAIN = "cataclysm-1"
 HEIGHT = "120"
 ENTRY = "100.000000000000000000"
@@ -58,8 +65,13 @@ SHORT_ENTRY = "100.000000000000000001"
 OUTSIDE = "The leverage request is outside the market's collateral or leverage limits."
 GUARDED = "The after-hours guard can change or close this position."
 UNKNOWN = "Cannot verify that the Perp after-hours guard is inactive."
+UNKNOWN_LEVERAGE = (
+    "Cannot verify the Perp execution inputs and after-hours guard at one block."
+)
 STALE = "Perp rejects the leverage change at the observed stale oracle price."
-LIQUIDATION = "The observed oracle price is past the prospective liquidation threshold."
+LIQUIDATION = (
+    "The observed oracle price has reached the prospective liquidation threshold."
+)
 QUEUED = "Queued leverage changes settle on a fresh oracle update."
 MISSING_CAP = {
     "code": 3,
@@ -201,6 +213,7 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
             }
         },
         "market_order_config": {"fill_at_next_oracle_price": mode == "queued"},
+        "quote_trade": {"data": None, "attributes": [], "events": [], "messages": []},
     }
     lcd_variables = {
         "get_trade_raw": {"trader": ADDRESS, "index": 7},
@@ -219,6 +232,16 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
             "collateral_index": "TokenIndex(0)",
         },
         "market_order_config": {},
+        "quote_trade": {
+            "trader": ADDRESS,
+            "funds": [],
+            "action": {
+                "update_leverage": {
+                    "trade_index": "UserTradeIndex(7)",
+                    "new_leverage": "10.00",
+                }
+            },
+        },
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -396,14 +419,18 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         check=False,
     )
     assert (result.returncode, result.stderr) == (0, b"")
-    liq = json.loads(result.stdout)["estimates"]["liquidationPrice"]
+    preview = json.loads(result.stdout)
+    # The ownership fixture predates CLI confirmations.
+    if command != LEVERAGE:
+        preview.pop("previewDigest", None)
+        preview.pop("positionRoute", None)
+    serialized = (json.dumps(preview, sort_keys=command == LEVERAGE) + "\n").encode()
+    liq = preview["estimates"]["liquidationPrice"]
     if entry := liq.get("entry"):
         observed_at = entry["observedAt"]
         assert timestamp(observed_at)
-        return result.stdout.replace(
-            json.dumps(observed_at).encode(), b'"<timestamp>"', 1
-        )
-    return result.stdout
+        return serialized.replace(json.dumps(observed_at).encode(), b'"<timestamp>"', 1)
+    return serialized
 
 
 @pytest.mark.parametrize(
@@ -428,7 +455,7 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         (
             LEVERAGE,
             "group-fallback",
-            LEVERAGE_WIRE + ORACLE_WIRE,
+            LEVERAGE_WIRE + ["get_fees", "quote_trade"],
             estimates(QUOTED_LIQUIDATION),
         ),
         (
@@ -441,24 +468,20 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
             LEVERAGE,
             "cap-unavailable",
             LEVERAGE_WIRE,
-            estimates(
-                unavailable(
-                    "Position entry price or projected collateral is unavailable."
-                )
-            ),
+            dict.fromkeys(estimates({}), unavailable(UNKNOWN_LEVERAGE)),
         ),
         (
             LEVERAGE,
             "queued",
-            LEVERAGE_WIRE + ORACLE_WIRE + ["market_order_config"],
+            LEVERAGE_MARKET_WIRE + LEVERAGE_LIMITS_WIRE + ["get_fees"],
             {**estimates(QUOTED_LIQUIDATION), "execution": unavailable(QUEUED)},
         ),
         (
             LEVERAGE,
             "stale",
-            LEVERAGE_WIRE + ORACLE_WIRE + ["market_order_config", "get_group", "block"],
+            LEVERAGE_MARKET_WIRE + LEVERAGE_ORACLE_WIRE,
             {
-                **estimates(unavailable(STALE)),
+                **dict.fromkeys(estimates({}), unavailable(STALE)),
                 "execution": {
                     "status": "would_be_rejected",
                     "code": "OraclePriceStale",
@@ -469,9 +492,9 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         (
             LEVERAGE,
             "liquidation",
-            LEVERAGE_WIRE + ORACLE_WIRE + ["market_order_config", "get_group", "block"],
+            LEVERAGE_WIRE + ["get_fees"],
             {
-                **estimates(unavailable(LIQUIDATION)),
+                **dict.fromkeys(estimates({}), unavailable(LIQUIDATION)),
                 "execution": {
                     "status": "would_be_rejected",
                     "code": "LiquidationReached",
@@ -479,13 +502,18 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
                 },
             },
         ),
-        (LEVERAGE, "short", LEVERAGE_WIRE + ORACLE_WIRE, estimates(SHORT_LIQUIDATION)),
+        (
+            LEVERAGE,
+            "short",
+            LEVERAGE_WIRE + ["get_fees", "quote_trade"],
+            estimates(SHORT_LIQUIDATION),
+        ),
         (
             LEVERAGE,
             "short-liquidation",
-            LEVERAGE_WIRE + ORACLE_WIRE + ["market_order_config", "get_group", "block"],
+            LEVERAGE_WIRE + ["get_fees"],
             {
-                **estimates(unavailable(LIQUIDATION)),
+                **dict.fromkeys(estimates({}), unavailable(LIQUIDATION)),
                 "execution": {
                     "status": "would_be_rejected",
                     "code": "LiquidationReached",
@@ -519,26 +547,33 @@ def test_position_update_dry_run(
     suffix: list[str],
     expected: dict[str, Any],
 ) -> None:
-    # Compare ordered JSON after normalizing the one dynamic timestamp.
-    golden = json.dumps(
-        {
-            "addr": ADDRESS,
-            "dryRun": True,
-            "intent": intent(command),
-            "estimates": expected,
-        }
-    )
-    for implementation, cli in runners(cli_pair):
+    if command == LEVERAGE:
+        # Compare the full current preview, including the route and digest.
+        implementations = [
+            ("python", (str(Path(sys.executable).with_name("sai")),)),
+            ("rust", cli_pair[1]),
+        ]
+    else:
+        implementations = runners(cli_pair)
+    outputs = []
+    for implementation, cli in implementations:
         home = tmp_path / implementation
         with update_loopback(mode) as endpoints:
             seed_home(home, endpoints, "session")
-            assert (
-                dry_run_bytes(cli, home, endpoints, command) == (golden + "\n").encode()
-            )
+            output = dry_run_bytes(cli, home, endpoints, command)
+            document = json.loads(output)
+            assert document["addr"] == ADDRESS
+            assert document["dryRun"] is True
+            assert document["intent"] == intent(command)
+            assert document["estimates"] == expected
+            outputs.append(output)
             wire = PYTHON_QUOTE_WIRE if implementation == "python" else QUOTE_WIRE
+            if command == LEVERAGE:
+                wire = QUOTE_WIRE[:-1]
             assert [entry.label for entry in endpoints.wire] == wire + suffix
             assert not endpoints.errors
             assert not (home / "sai/trader/intents.sqlite3").exists()
+    assert outputs[0] == outputs[1]
 
 
 @pytest.mark.parametrize("mode", ["cap-wrong-height", "cap-missing-height"])
@@ -553,12 +588,12 @@ def test_pair_cap_fallback_requires_the_pinned_height(
             rust, tmp_path / "rust", endpoints, (*LEVERAGE, "--dry-run"), python=False
         )
         assert (code, stderr) == (0, "")
-        assert output["estimates"] == estimates(
-            unavailable("Position entry price or projected collateral is unavailable.")
+        assert output["estimates"] == dict.fromkeys(
+            estimates({}), unavailable(UNKNOWN_LEVERAGE)
         )
-        assert [
-            request.label for request in endpoints.wire
-        ] == QUOTE_WIRE + LEVERAGE_WIRE
+        assert [request.label for request in endpoints.wire] == QUOTE_WIRE[
+            :-1
+        ] + LEVERAGE_WIRE
         assert not endpoints.errors
         assert not (tmp_path / "rust/sai/trader/intents.sqlite3").exists()
 

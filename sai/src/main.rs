@@ -430,7 +430,12 @@ fn usage(command: &str) -> String {
         "logs path" | "logs tail" | "logs stats" => "",
         "logs intent" => " KEY",
         "logs run" => " ID",
-        "trade close" | "trade cancel" | "trade margin" | "trade partial-close" => " TRADE_ID",
+        "trade close"
+        | "trade cancel"
+        | "trade leverage"
+        | "trade tpsl"
+        | "trade margin"
+        | "trade partial-close" => " TRADE_ID",
         "intent wait" => " KEY",
         "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -582,13 +587,27 @@ fn usage_error(error: &clap::Error, command: &str) -> Option<SaiError> {
             let Some(ContextValue::Strings(args)) = error.get(ContextKind::InvalidArg) else {
                 return None;
             };
-            let first = args.first()?.trim_matches(['<', '>']);
-            if matches!(command, "trade margin" | "trade partial-close")
-                && let Some(error) = trade::missing_position_option(first)
-            {
-                return Some(error);
+            // Click reports an omitted positional argument before defaulted options.
+            if let Some(positional) = args.iter().find(|arg| arg.starts_with('<')) {
+                format!(
+                    "Missing argument {}.",
+                    repr(positional.trim_matches(['<', '>']))
+                )
+            } else {
+                let first = args.first()?;
+                if matches!(command, "trade margin" | "trade partial-close")
+                    && let Some(error) = trade::missing_position_option(first)
+                {
+                    return Some(error);
+                }
+                let option = first.split_whitespace().next()?;
+                if command == "trade open"
+                    && let Some(error) = trade::missing_open_option(option)
+                {
+                    return Some(error);
+                }
+                format!("Missing option {}.", repr(option))
             }
-            format!("Missing argument {}.", repr(first))
         }
         ErrorKind::InvalidValue if context_text(error, ContextKind::InvalidValue) == Some("") => {
             let argument = arg?.split_whitespace().next()?;
@@ -602,6 +621,14 @@ fn usage_error(error: &clap::Error, command: &str) -> Option<SaiError> {
         _ => return None,
     };
     Some(SaiError::usage(message))
+}
+
+fn clap_help(command: &str) -> Option<String> {
+    let args = std::iter::once("sai")
+        .chain(command.split_whitespace())
+        .chain(std::iter::once("--help"));
+    let help = Cli::command().try_get_matches_from(args).err()?;
+    (help.kind() == ErrorKind::DisplayHelp).then(|| help.to_string().trim_end_matches('\n').into())
 }
 
 fn print_parse_error(
@@ -620,10 +647,13 @@ fn print_parse_error(
             .or_else(|| local::intent_help(command))
             .or_else(|| auth::help(command))
             .or_else(|| reads::help(command))
+            .or_else(|| trade::help(command))
     };
     match error.kind() {
         ErrorKind::DisplayHelp => {
-            if let Some(help) = help() {
+            if command == "trade" {
+                println!("{}", trade::group_help(true));
+            } else if let Some(help) = help() {
                 println!("{help}");
             } else {
                 let _ = error.print();
@@ -634,42 +664,20 @@ fn print_parse_error(
             println!("sai, version {}", env!("CARGO_PKG_VERSION"));
             return (ExitCode::Ok, None);
         }
-        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
-            if matches!(command, "logs" | "skill")
-                && let Some(help) = help()
-            {
-                return complete(Err(SaiError::usage(help)), Some(command), json, home);
-            }
-            if command == "intent wait" && json {
-                return complete(
-                    Err(SaiError::usage("Missing argument 'KEY'.")),
-                    Some(command),
-                    true,
-                    home,
-                );
-            }
-            if matches!(
-                command,
-                "config" | "intent" | "intent wait" | "auth" | "market" | "account" | "watch"
-            ) && let Some(help) = help()
-            {
-                let error = SaiError::usage(help);
-                if json || matches!(command, "market" | "account" | "watch") {
-                    return complete(Err(error), Some(command), json, home);
-                }
-                eprintln!("{}", error.message);
-                return (ExitCode::Usage, Some(error));
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
+            if !command.is_empty() && operands.is_empty() =>
+        {
+            let message = match command {
+                "auth" => Some("Invalid arguments to auth.".into()),
+                "trade" => Some(trade::group_help(false)),
+                _ => help().or_else(|| clap_help(command)),
+            };
+            if let Some(message) = message {
+                return complete(Err(SaiError::usage(message)), Some(command), json, home);
             }
         }
         ErrorKind::MissingRequiredArgument if !json && operands.is_empty() => {
-            let command_help = if matches!(command, "logs run" | "logs intent") {
-                help()
-            } else if matches!(command, "auth login" | "auth use") {
-                auth::help(command)
-            } else {
-                reads::help(command)
-            };
-            if let Some(help) = command_help {
+            if let Some(help) = help().or_else(|| clap_help(command)) {
                 eprintln!("{help}");
                 return (ExitCode::Usage, None);
             }

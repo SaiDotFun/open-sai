@@ -122,6 +122,28 @@ impl TradePreview {
         output
     }
 
+    /// Include only confirmations that the CLI can use to submit.
+    pub fn cli_preview_output(&self, account: Option<&str>) -> Value {
+        let mut output = self.output(account);
+        if let Some(route) = &self.position_route {
+            output["positionRoute"] = json!(route);
+            let execution = &output["estimates"]["execution"];
+            let rejected = execution["status"] == "would_be_rejected";
+            let missing_oracle = execution["code"] == "OraclePublicationTimeUnknown";
+            if rejected && let Some(fields) = output.as_object_mut() {
+                fields.shift_remove("quote");
+            }
+            if self.position_owner_verified != Some(false)
+                && (!self.requires_market_price_refresh() || self.reference_price.is_some())
+                && !rejected
+                && !missing_oracle
+            {
+                output["previewDigest"] = json!(preview_digest(self, account));
+            }
+        }
+        output
+    }
+
     pub fn is_market_close(&self) -> bool {
         self.intent.kind == "CLOSE_POSITION"
     }
@@ -139,12 +161,14 @@ impl TradePreview {
     }
 }
 
+type ReservationCallback<'a> = dyn Fn(&str, &str) + Sync + 'a;
+
 #[derive(Default)]
 pub struct SubmitOptions<'a> {
     pub allow_concurrent_open: bool,
     pub confirmation: Option<Confirmation<'a>>,
-    /// Receive the committed reservation key before Keeper can see the request.
-    pub on_reserved: Option<&'a (dyn Fn(&str) + Sync)>,
+    /// Receive the pinned account and committed key before dispatch to Keeper.
+    pub on_reserved: Option<&'a ReservationCallback<'a>>,
 }
 
 #[derive(Serialize)]
@@ -325,13 +349,31 @@ impl<'a> Trading<'a> {
         let account = session.addr();
         self.storage.check_active_trade(session, endpoint)?;
         let confirming = options.confirmation.is_some();
-        let route = self
-            .basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
-            .await?;
-        let checked_route = route.is_some();
+        let cli_confirmation = options.confirmation.as_ref().filter(|confirmation| {
+            confirmation.is_cli()
+                && (matches!(
+                    preview.intent.kind,
+                    "OPEN_TRADE" | "CLOSE_POSITION" | "CANCEL_PENDING_TRADE"
+                ) || preview.is_standalone_position_update())
+        });
+        let cli_preview = if let Some(confirmation) = cli_confirmation {
+            Some(
+                self.prepare_cli_confirmation(session, preview, confirmation)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let route = if cli_preview.is_none() {
+            self.basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
+                .await?
+        } else {
+            None
+        };
+        let checked_route = route.is_some() || cli_preview.is_some();
         let market = preview.requires_market_price_refresh();
         let mut market_row = None;
-        let update = if preview.is_standalone_position_update() {
+        let update = if cli_preview.is_none() && preview.is_standalone_position_update() {
             Some(
                 self.preflight_position_update(account, preview, options.confirmation.is_some())
                     .await?,
@@ -340,7 +382,9 @@ impl<'a> Trading<'a> {
             None
         };
         let mut prepared;
-        let preview = if market || confirming && checked_route {
+        let preview = if let Some(preview) = &cli_preview {
+            preview
+        } else if market || confirming && checked_route {
             prepared = preview.clone();
             prepared.position_route = route;
             if market {
@@ -394,6 +438,12 @@ impl<'a> Trading<'a> {
             }
             return Err(error);
         }
+        if cli_preview.is_some()
+            || preview.margin_change
+            || preview.intent.kind == "DECREASE_POSITION_SIZE"
+        {
+            preview.check_cli_execution(account, confirming)?;
+        }
 
         let (key, stamp) = intent_identity();
         let intent = &preview.intent;
@@ -421,7 +471,7 @@ impl<'a> Trading<'a> {
                 }
             })?;
         if let Some(on_reserved) = options.on_reserved {
-            on_reserved(&key);
+            on_reserved(account, &key);
         }
 
         let mut semantic = json!({"intentSchemaVersion": "v0", "tsIntentInit": stamp});
