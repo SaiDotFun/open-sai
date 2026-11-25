@@ -73,7 +73,6 @@ def test_unconfirmed_trade_checks_execution_before_reserving(
 def test_partial_close_with_unreadable_leverage_cannot_be_confirmed(
     pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _, rust = pair
     scenario = "position-malformed-after-hours-cap"
     with loopback(scenario) as endpoints, monkeypatch.context() as env:
         home = tmp_path / "python-preview"
@@ -107,17 +106,18 @@ def test_partial_close_with_unreadable_leverage_cannot_be_confirmed(
                 assert not rows(home)
                 assert not endpoints.errors
 
-    with loopback(scenario) as endpoints:
-        home = tmp_path / "rust-preview"
-        seed_home(home, endpoints, "session")
-        code, preview, stderr = run(
-            rust, home, endpoints, (*PARTIAL, "--dry-run"), python=False
-        )
-        assert (code, stderr) == (0, "")
-        assert preview["quote"] == expected["quote"]
-        assert "previewDigest" not in preview
-        assert not endpoints.errors
-        assert not rows(home)
+    for index, cli in enumerate(pair):
+        with loopback(scenario) as endpoints:
+            home = tmp_path / f"preview-{index}"
+            seed_home(home, endpoints, "session")
+            code, preview, stderr = run(
+                cli, home, endpoints, (*PARTIAL, "--dry-run"), python=index == 0
+            )
+            assert (code, stderr) == (0, "")
+            assert preview["quote"] == expected["quote"]
+            assert "previewDigest" not in preview
+            assert not endpoints.errors
+            assert not rows(home)
 
 
 @pytest.mark.parametrize(
