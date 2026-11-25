@@ -561,7 +561,9 @@ impl WaitTrade<'_> {
             };
             let metadata = match result {
                 Ok(Value::Object(mut metadata)) => {
-                    metadata.remove("message");
+                    // The receipt supplies the address after the submission metadata.
+                    metadata.shift_remove("addr");
+                    metadata.shift_remove("message");
                     Some(metadata)
                 }
                 Ok(_) => return Err(SaiError::internal()),
