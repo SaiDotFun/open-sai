@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 from compare import Normalize
+from manifest_gaps import ManifestGaps
 from release_mismatch import difference_signature, differing_paths
 
 
@@ -46,3 +47,26 @@ def test_fixture_port_changes_preserve_only_the_known_fingerprint(
     assert signature(40001, "") == signature(40002, "")
     assert signature(40001, "") != signature(40001, "/wrong")
     assert signature(40001, "") != signature(40001, "0")
+
+
+def test_cutover_reports_keys_only_as_fingerprints(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    path = tmp_path / "gaps.toml"
+    path.write_text("[gap]\n")
+    marker = "synthetic-sensitive-key"
+    payload = "synthetic-sensitive-value"
+    for reference, candidate in [
+        ({"error": {}}, {"error": {marker: payload}}),
+        ({"error": {marker: payload}}, {"error": {}}),
+        ({"error": {marker: "old"}}, {"error": {marker: payload}}),
+    ]:
+        differences = differing_paths(reference, candidate, "parity.output")
+        _, detail = ManifestGaps(path).result("case:credential-mutant", differences)
+        report = capsys.readouterr().out + detail
+        assert "parity.output.error[key-sha256:" in report
+        assert marker not in report
+        assert payload not in report
+    known = differing_paths({}, {marker: payload}, "parity.output")
+    changed = differing_paths({}, {marker + "-other": payload}, "parity.output")
+    assert difference_signature(known) != difference_signature(changed)
