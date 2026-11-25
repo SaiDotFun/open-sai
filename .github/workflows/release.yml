@@ -159,6 +159,21 @@ jobs:
           uv run --no-project python scripts/check_release.py "$TAG" \
             --built "$(git rev-parse HEAD)" --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
 
+      - name: Require immutable releases
+        env:
+          GH_TOKEN: ${{ secrets.SAI_RELEASE_SETTINGS_TOKEN }}
+        shell: bash
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::Set SAI_RELEASE_SETTINGS_TOKEN with repository Administration read access."
+            exit 1
+          fi
+          if ! enabled="$(gh api "repos/$GITHUB_REPOSITORY/immutable-releases" --jq '.enabled == true')" ||
+             [[ "$enabled" != true ]]; then
+            echo "::error::GitHub did not confirm that immutable releases are enabled."
+            exit 1
+          fi
+
       # gh creates a draft, attaches every asset, then publishes it.
       - name: Create the GitHub Release
         env:

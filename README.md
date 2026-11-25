@@ -348,8 +348,14 @@ commands. Add `--run` to create and push the tag. The tag workflow checks that
 the tagged commit is on main's first-parent history. It publishes the full
 Python wheel and sdist, four native archives, and one `SHA256SUMS` file in
 one immutable release. After publication, it checks the tag and every file
-against GitHub's signed release attestation. Keep immutable releases enabled
-in the repository settings. Sai does not sign the binaries separately.
+against GitHub's signed release attestation. Sai does not sign the binaries
+separately.
+
+Before tagging, enable immutable releases in the repository settings and set
+the Actions secret `SAI_RELEASE_SETTINGS_TOKEN` to a fine-grained token scoped
+to this repository with Administration read access. The workflow checks the
+setting with that token immediately before publication and stops if GitHub
+cannot confirm it is enabled. The usual Actions token publishes the release.
 
 Native Linux builds and smoke tests use glibc 2.35 on x86_64 and arm64.
 Native macOS builds target macOS 11 on Intel and Apple silicon. The hosted
