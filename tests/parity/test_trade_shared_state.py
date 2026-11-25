@@ -325,7 +325,14 @@ class Action:
     outcome: str = "succeeded"
 
     def replay(self, **options: Any) -> TradeReplay:
-        return TradeReplay(self.kind, self.entity, self.change, **options)
+        leverage_target = self.args[-1] if self.args[0] == "leverage" else None
+        return TradeReplay(
+            self.kind,
+            self.entity,
+            self.change,
+            leverage_target=leverage_target,
+            **options,
+        )
 
 
 ACTIONS = {

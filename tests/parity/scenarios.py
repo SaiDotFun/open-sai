@@ -784,7 +784,12 @@ def loopback(
             "action": {
                 "update_leverage": {
                     "trade_index": "UserTradeIndex(7)",
-                    "new_leverage": "1.818181818181818182",
+                    "new_leverage": (
+                        trade_replay.leverage_target
+                        if trade_replay is not None
+                        and trade_replay.leverage_target is not None
+                        else "1.818181818181818182"
+                    ),
                 }
             },
         },
