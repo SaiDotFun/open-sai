@@ -55,6 +55,19 @@ def auth_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
 
 
 @pytest.fixture
+def auth_privacy_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
+    reference = os.environ.get("SAI_PARITY_AUTH_PRIVACY_PYTHON")
+    if reference is None:
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            pytest.fail("native parity CI must supply SAI_PARITY_AUTH_PRIVACY_PYTHON")
+        pytest.skip("set SAI_PARITY_AUTH_PRIVACY_PYTHON to the auth privacy reference")
+    executable = shutil.which(reference)
+    if executable is None:
+        pytest.fail("SAI_PARITY_AUTH_PRIVACY_PYTHON must name an executable")
+    return (executable,), cli_pair[1]
+
+
+@pytest.fixture
 def renewal_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     # Renewal output changes in both implementations, so use the Python checkout.
     return (str(Path(sys.executable).with_name("sai")),), cli_pair[1]
@@ -101,8 +114,6 @@ def assert_unexposed(env: Env, output: str, *secrets: str) -> None:
         ("auth", "login"),
         ("auth", "use"),
         ("--json", "auth", "login"),
-        ("--json", "auth", "login", "--addr"),
-        ("--json", "auth", "login", "--account", "dev"),
     ],
 )
 def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> None:
@@ -110,6 +121,81 @@ def test_auth_usage(tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI) -> No
     expected = observed(python.run(*args))
     assert expected[0] == (0 if "--help" in args else 2)
     assert observed(rust.run(*args)) == expected
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("--json", "auth", "login", "--addr"),
+        ("--json", "auth", "login", "--account", "dev"),
+        ("auth", "use", ADDR, "synthetic-rejected-extra-operand"),
+        ("--json", "auth", "use", ADDR, "synthetic-rejected-extra-operand"),
+    ],
+    ids=["missing-option-value", "unknown-option", "extra-text", "extra-json"],
+)
+def test_auth_parse_errors_are_private(
+    tmp_path: Path, auth_privacy_pair: tuple[CLI, CLI], args: CLI
+) -> None:
+    python, rust = homes(tmp_path, auth_privacy_pair)
+    expected = observed(python.run(*args))
+    assert expected[0] == 2
+    assert "synthetic-rejected-extra-operand" not in expected[1] + expected[2]
+    assert observed(rust.run(*args)) == expected
+
+
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_auth_use_missing(
+    tmp_path: Path, auth_privacy_pair: tuple[CLI, CLI], flags: CLI
+) -> None:
+    marker = "synthetic-unregistered-account-operand"
+    python, rust = homes(tmp_path, auth_privacy_pair)
+    expected = observed(python.run(*flags, "auth", "use", marker))
+    assert expected[0] == 1
+    assert "Requested account is not connected" in expected[1] + expected[2]
+    assert marker not in expected[1] + expected[2]
+    assert observed(rust.run(*flags, "auth", "use", marker)) == expected
+
+
+@pytest.mark.parametrize(
+    ("args", "command_words", "parse_error"),
+    [
+        (("--json", "--as", "{private}", "auth", "list"), ["auth", "list"], None),
+        (("auth", "use", "{private}"), ["auth", "use"], None),
+        (("{private}", "auth", "import"), [], "Invalid arguments to auth."),
+        (
+            ("auth", "use", "--{private}"),
+            ["auth", "use"],
+            "No such option for auth.",
+        ),
+    ],
+    ids=["root-value", "leaf-value", "unrecognized-root-operand", "unknown-option"],
+)
+def test_auth_logs_omit_argument_values(
+    tmp_path: Path,
+    auth_privacy_pair: tuple[CLI, CLI],
+    args: CLI,
+    command_words: list[str],
+    parse_error: str | None,
+) -> None:
+    marker = "synthetic-auth-argument-value"
+    for env in homes(tmp_path, auth_privacy_pair):
+        env.extra_env["SAI_LOG"] = "1"
+        result = env.run(*(arg.replace("{private}", marker) for arg in args))
+        assert_unexposed(env, result.stdout + result.stderr, marker)
+        if parse_error is not None:
+            assert result.returncode == 2
+            assert parse_error in result.stderr
+        logs = [
+            path.read_text(encoding="utf-8")
+            for path in (env.home / "logs").glob("*.jsonl")
+        ]
+        assert all(marker not in text for text in logs)
+        events = [json.loads(line) for text in logs for line in text.splitlines()]
+        [start] = [event for event in events if event["event"] == "command.start"]
+        assert start["argv"] == command_words
+        if parse_error is not None:
+            [end] = [event for event in events if event["event"] == "command.end"]
+            assert end["error"] == parse_error
 
 
 @pytest.mark.parametrize(
@@ -676,10 +762,10 @@ def test_import_usage_keeps_rejected_token_private(
     ],
 )
 def test_import_rejects_nonroot_json_before_reading_clipboard(
-    tmp_path: Path, auth_pair: tuple[CLI, CLI], args: CLI, alias: bool
+    tmp_path: Path, auth_privacy_pair: tuple[CLI, CLI], args: CLI, alias: bool
 ) -> None:
     results = []
-    python, rust = homes(tmp_path, auth_pair)
+    python, rust = homes(tmp_path, auth_privacy_pair)
     if alias:
         launcher = tmp_path / "sai-under-review"
         launcher.symlink_to(Path(rust.command[0]))
