@@ -49,7 +49,6 @@ class TradeReplay:
     fill_on_second_poll: bool = False
     phase: Phase = "absent"
     reserved_key: str | None = None
-    leverage_target: str | None = None
     arrived: threading.Event = field(default_factory=threading.Event, init=False)
     release: threading.Event = field(default_factory=threading.Event, init=False)
     _intents: dict[str, dict[str, Any]] = field(default_factory=dict, init=False)

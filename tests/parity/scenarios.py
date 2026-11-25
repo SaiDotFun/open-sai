@@ -412,6 +412,7 @@ def loopback(
     *,
     trade_replay: Callable[[WireRequest, str | None], dict[str, Any] | None]
     | None = None,
+    leverage_target: str | None = None,
     market_price: float | None = None,
     cancel_target: str | None = None,
     close_target: str | None = None,
@@ -784,12 +785,7 @@ def loopback(
             "action": {
                 "update_leverage": {
                     "trade_index": "UserTradeIndex(7)",
-                    "new_leverage": (
-                        trade_replay.leverage_target
-                        if trade_replay is not None
-                        and trade_replay.leverage_target is not None
-                        else "1.818181818181818182"
-                    ),
+                    "new_leverage": leverage_target or "1.818181818181818182",
                 }
             },
         },

@@ -325,14 +325,11 @@ class Action:
     outcome: str = "succeeded"
 
     def replay(self, **options: Any) -> TradeReplay:
-        leverage_target = self.args[-1] if self.args[0] == "leverage" else None
-        return TradeReplay(
-            self.kind,
-            self.entity,
-            self.change,
-            leverage_target=leverage_target,
-            **options,
-        )
+        return TradeReplay(self.kind, self.entity, self.change, **options)
+
+    @property
+    def leverage_target(self) -> str | None:
+        return self.args[-1] if self.args[0] == "leverage" else None
 
 
 ACTIONS = {
@@ -512,7 +509,9 @@ def test_lost_admission_blocks_until_reconciliation(
     retry = runtime(retry_runtime, request, python_reference)
     action = ACTIONS[action_name]
     replay = action.replay(lose_reply=True)
-    with loopback(action.server, trade_replay=replay) as endpoints:
+    with loopback(
+        action.server, trade_replay=replay, leverage_target=action.leverage_target
+    ) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, writer, action_name)
@@ -557,7 +556,9 @@ def test_trade_wait_replays_pending_then_receipt(
     writer = runtime(submitter, request, python_reference)
     action = ACTIONS[action_name]
     replay = action.replay(phase="pending", fill_on_second_poll=True)
-    with loopback(action.server, trade_replay=replay) as endpoints:
+    with loopback(
+        action.server, trade_replay=replay, leverage_target=action.leverage_target
+    ) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         required_wait = action_name in ("tpsl", "leverage", "margin", "partial-close")
@@ -877,7 +878,9 @@ def test_cli_and_mcp_overlap(
     action = ACTIONS[action_name]
     replay = action.replay(hold_admission=True)
     tool_name = f"trade_{mcp_action(action_name)}"
-    with loopback(action.server, trade_replay=replay) as endpoints:
+    with loopback(
+        action.server, trade_replay=replay, leverage_target=action.leverage_target
+    ) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, cli, action_name)
