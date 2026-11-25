@@ -439,6 +439,7 @@ session = load_session()
 assert session["token"] == "synthetic-legacy-session"
 assert session["evmAddress"] == sys.argv[1]
 assert session["endpoint"] == sys.argv[2]
+assert session["expiresAt"] == "2000-01-01T00:00:00+00:00"
 "#;
     write_cli_fixture(home.path(), read_session, &[ADDR, ENDPOINT]);
     let damaged_home = tempdir().unwrap();
@@ -458,13 +459,19 @@ assert session["endpoint"] == sys.argv[2]
         !result.status.success(),
         "Python accepted a damaged session"
     );
-    let status = parity(
-        home.path(),
-        &["--json", "--endpoint", ENDPOINT, "auth", "status"],
-        6,
-    );
-    let error: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
+    let mut python = uv(home.path());
+    python.arg("sai");
+    // The releases use different human-facing hints for the same expired session.
+    for mut command in [rust(home.path()), python] {
+        let status = command
+            .args(["--json", "--endpoint", ENDPOINT, "auth", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(status.status.code(), Some(6));
+        assert!(status.stderr.is_empty());
+        let error: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
+    }
     let output = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "list"],
