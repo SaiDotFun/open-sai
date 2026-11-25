@@ -625,7 +625,9 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
                 replace_if(source, "observedAt", timestamp)
     if command == "skill source" and isinstance(value, dict):
         replace_if(value, "cliVersion", is_version)
-        if isinstance(path := value.get("path"), str) and Path(path).is_absolute():
+        if isinstance(path := value.get("path"), str) and (
+            Path(path).is_absolute() or path.startswith("<HOME>/")
+        ):
             value["path"] = "<package-location>"
     if (
         command == "logs path"
