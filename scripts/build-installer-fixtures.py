@@ -56,10 +56,6 @@ MUTATION = """
         && args.get(1).is_some_and(|arg| arg == "mcp")
         && args.get(2).is_some_and(|arg| arg == "serve")
         && (Path::new(&args[0]).ends_with(".local/bin/sai")
-            || Path::new(&args[0])
-                .parent()
-                .is_some_and(|dir| !dir.file_name().unwrap_or_default().to_string_lossy().starts_with(".stage-")
-                    && dir.parent().is_some_and(|root| root.ends_with(".sai-native")))
             || env::var_os("SAI_NATIVE_UV_PREFIX")
                 .is_some_and(|prefix| Path::new(&prefix).ends_with("sai-cli")))
     {

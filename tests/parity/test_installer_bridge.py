@@ -496,7 +496,7 @@ def test_standalone_reinstall_keeps_public_inode_without_link_or_renameat2(
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
-@pytest.mark.parametrize("boundary", ["selector", "doctor"])
+@pytest.mark.parametrize("boundary", ["selector", "public-startup", "doctor"])
 def test_standalone_refuses_to_commit_a_same_version_replacement(
     install: Install, replay: Replay, boundary: str
 ) -> None:
@@ -513,6 +513,9 @@ script, launcher, competitor, selector, boundary, binary, *args = sys.argv[1:]
 def race(event, values):
     if boundary == 'selector' and event == 'os.rename' and values[1] == selector:
         os.replace(competitor, launcher)
+    if boundary == 'public-startup' and event == 'subprocess.Popen':
+        if [os.fsdecode(arg) for arg in values[1]] == [launcher, '--version']:
+            os.replace(competitor, launcher)
     if boundary == 'doctor' and event == 'subprocess.Popen' and 'doctor' in values[1]:
         os.replace(competitor, launcher)
         assert os.fsdecode(values[0]) == binary
@@ -628,7 +631,7 @@ def test_native_refuses_unsafe_destination(
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 @pytest.mark.parametrize("fresh", [True, False])
-def test_native_does_not_activate_a_binary_that_fails_installed_mcp(
+def test_native_rolls_back_a_binary_that_fails_only_through_the_public_launcher(
     install: Install, replay: Replay, fresh: bool
 ) -> None:
     artifact("MUTANT")
@@ -637,6 +640,7 @@ def test_native_does_not_activate_a_binary_that_fails_installed_mcp(
         version = native_artifact(replay)
         ok(install.install(replay, "--native"))
         old = install.launcher.resolve(strict=True)
+        entry = install.launcher.lstat()
         config, content = save_profile(install, replay)
     else:
         install.profile.mkdir(mode=0o700)
@@ -646,14 +650,15 @@ def test_native_does_not_activate_a_binary_that_fails_installed_mcp(
     version = native_artifact(replay, "MUTANT")
     result = install.install(replay, "--native", "--version", version)
     assert result.returncode == 1
-    assert (
-        "installed MCP startup mutation" in result.stderr
-        and "mcp serve" in result.stderr
-    )
+    assert "Rolled back the selection" in result.stderr
+    assert "installed MCP startup mutation" in result.stderr
+    assert "mcp serve" in result.stderr
+    assert "Installed sai" not in result.stdout
     if old is None:
-        assert not install.launcher.is_symlink()
+        assert install.launcher.is_symlink() and not install.launcher.exists()
     else:
         assert install.launcher.resolve(strict=True) == old
+        assert os.path.samestat(install.launcher.lstat(), entry)
     assert not pending(install).exists()
     assert config.read_bytes() == content
 

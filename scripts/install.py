@@ -878,14 +878,22 @@ def recover_native(
     return old
 
 
-def smoke_native(binary: Path, home: Path, version: str) -> None:
+def smoke_native(
+    executable: Path,
+    home: Path,
+    version: str,
+    *,
+    check_launcher: Callable[[], None] | None = None,
+) -> None:
     env = {**os.environ, "SAI_HOME": str(home), "SAI_LOG": "false", "CI": "1"}
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
         for args in (["--version"], ["config", "get", "update.auto"], ["mcp", "serve"]):
             label = f"sai {' '.join(args)}"
+            if check_launcher is not None:
+                check_launcher()
             try:
                 with subprocess.Popen(
-                    [binary, *args],
+                    [executable, *args],
                     cwd=home,
                     env=env,
                     stdin=subprocess.PIPE,
@@ -915,6 +923,8 @@ def smoke_native(binary: Path, home: Path, version: str) -> None:
             except subprocess.TimeoutExpired as error:
                 raise LookupFailed(f"`{label}` timed out") from error
             finally:
+                if check_launcher is not None:
+                    check_launcher()
                 for stream in (output, errors):
                     stream.seek(0)
                     stream.truncate()
@@ -1063,7 +1073,7 @@ def install_native(args: argparse.Namespace) -> int:
                 sync_dir(root)
             binary = native_binary(root, new)
             proved = binary.stat()
-            # Complete startup checks before making this binary public.
+            # Check the versioned executable before changing the public selection.
             smoke_native(binary, Path(profile), version)
             require_launcher(launcher, entry, binary)
             if entry is None:
@@ -1084,7 +1094,26 @@ def install_native(args: argparse.Namespace) -> int:
             )
             require_launcher(launcher, entry, binary)
             switch_selector(root, new)
-            require_launcher(launcher, entry, binary, proved)
+
+            def check_public_launcher() -> None:
+                require_launcher(launcher, entry, binary, proved)
+
+            try:
+                smoke_native(
+                    launcher,
+                    Path(profile),
+                    version,
+                    check_launcher=check_public_launcher,
+                )
+            except LauncherChanged:
+                raise
+            except (LookupFailed, OSError, KeyboardInterrupt) as error:
+                recover_native(root, launcher, entry)
+                if isinstance(error, KeyboardInterrupt):
+                    raise
+                raise LookupFailed(
+                    f"Startup through {launcher} failed. Rolled back the selection. {error}"
+                ) from error
             if old is not None:
                 repair_mcp(binary, profile)
             require_launcher(launcher, entry, binary, proved)
