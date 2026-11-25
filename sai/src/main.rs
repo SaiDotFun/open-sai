@@ -187,7 +187,8 @@ impl Cli {
 }
 
 fn main() -> process::ExitCode {
-    execute(env::args_os().collect(), &Environment::from_process())
+    let args: Vec<_> = env::args_os().collect();
+    execute(args, &Environment::from_process())
 }
 
 fn execute(
