@@ -123,6 +123,7 @@ class Case:
     admission: str = "accepted"
     alternate_rust_args: tuple[str, ...] = ()
     direct_update: bool = False
+    provisional: bool = False
 
 
 CASES = (
@@ -191,6 +192,24 @@ CASES = (
     ),
     Case("tpsl-rejected", TPSL, "UPDATE_TRADE", "tpsl_updated", "rejected", "rejected"),
     Case("leverage-failed", LEVERAGE, "UPDATE_TRADE", "leverage_updated", "failed"),
+    Case(
+        "tpsl-index-lag",
+        TPSL,
+        "UPDATE_TRADE",
+        "tpsl_updated",
+        "succeeded",
+        direct_update=True,
+        provisional=True,
+    ),
+    Case(
+        "leverage-index-lag",
+        LEVERAGE,
+        "UPDATE_TRADE",
+        "leverage_updated",
+        "succeeded",
+        direct_update=True,
+        provisional=True,
+    ),
 )
 
 
@@ -381,13 +400,14 @@ def test_trade_wait(
                     intent(name, intentKey=keys[0], kind=case.kind, body=body)
                 )
 
-            def indexed_outcome(request: Request) -> Reply:
+            def history_reply(request: Request, *, present: bool) -> Reply:
                 assert "authorization" not in request.headers
-                assert json.loads(request.body)["variables"] == {
-                    "trader": ADDR,
-                    "limit": 25,
-                    "offset": 0,
+                assert json.loads(request.body) == {
+                    "query": keeper.INTENT_HISTORY,
+                    "variables": {"trader": ADDR, "limit": 25, "offset": 0},
                 }
+                if not present:
+                    return response(history())
                 row = (
                     indexed_update(case.change, keys[0], case.args)
                     if case.direct_update
@@ -400,7 +420,17 @@ def test_trade_wait(
             if update:
                 queue_update_preflight(replies)
             replies.append(admit)
-            if case.admission != "rejected":
+            if case.provisional:
+                replies.extend(
+                    (
+                        lambda request: poll(request, "outcome_not_indexed"),
+                        lambda request: history_reply(request, present=False),
+                        lambda request: history_reply(request, present=False),
+                        lambda request: poll(request, "outcome_not_indexed"),
+                        lambda request: history_reply(request, present=True),
+                    )
+                )
+            elif case.admission != "rejected":
                 replies.append(lambda request: poll(request, "pending_exec"))
                 if case.outcome == "failed":
                     replies.append(
@@ -408,7 +438,10 @@ def test_trade_wait(
                     )
                 else:
                     replies.extend(
-                        (lambda request: poll(request, "filled"), indexed_outcome)
+                        (
+                            lambda request: poll(request, "filled"),
+                            lambda request: history_reply(request, present=True),
+                        )
                     )
             args = (
                 case.alternate_rust_args
@@ -460,7 +493,9 @@ def test_trade_wait(
                 assert document["referencePrice"] == "81000.50"
             if case.outcome != "rejected":
                 receipt = document["receipt"]
-                assert receipt["requestBlock"] == REQUEST_BLOCK
+                assert receipt["requestBlock"] == (
+                    None if case.provisional else REQUEST_BLOCK
+                )
                 assert receipt["requestTxHash"] == "a" * 64
                 if case.outcome != "failed":
                     assert receipt["execution"]["block"] == FILL_BLOCK
@@ -711,22 +746,31 @@ def test_position_trade_wait_times_out(
         requests: list[Request],
     ) -> dict[str, Any]:
         keys: list[str] = []
+        poll_times: list[float] = []
+        deadline_seconds = 30
 
         def admit(request: Request) -> Reply:
             key = submitted_key(request, "UPDATE_TRADE")
             keys.append(key)
             return accepted(key, "UPDATE_TRADE")
 
-        def poll(request: Request) -> Reply:
-            assert json.loads(request.body)["variables"] == {
+        def reconcile(request: Request) -> Reply:
+            assert "authorization" not in request.headers
+            wire = json.loads(request.body)
+            replies.append(reconcile)
+            if wire["query"] == keeper.INTENT_HISTORY:
+                assert wire["variables"] == {"trader": ADDR, "limit": 25, "offset": 0}
+                return response(history())
+            assert wire["query"] == keeper.WAIT_INTENTS
+            assert wire["variables"] == {
                 "user": ADDR,
                 "key": keys[0],
                 "includeAction": True,
             }
-            replies.append(poll)
+            poll_times.append(time.monotonic())
             return response(
                 intent(
-                    "pending_exec",
+                    "outcome_not_indexed",
                     intentKey=keys[0],
                     kind="UPDATE_TRADE",
                     body=UPDATES[args],
@@ -734,33 +778,37 @@ def test_position_trade_wait_times_out(
             )
 
         queue_update_preflight(replies)
-        replies.extend((admit, poll))
+        replies.extend((admit, reconcile))
+        command = (
+            "--endpoint",
+            endpoint,
+            "--lcd-endpoint",
+            endpoint.removesuffix("/query"),
+            "--json",
+            "trade",
+            *args,
+            "--wait",
+        )
         result = subprocess.run(
-            [
-                *cli,
-                "--endpoint",
-                endpoint,
-                "--lcd-endpoint",
-                endpoint.removesuffix("/query"),
-                "--json",
-                "trade",
-                *args,
-                "--wait",
-            ],
+            [*cli, *command],
             env=cli_environment(home),
             cwd=home.parent,
             capture_output=True,
             check=False,
-            timeout=45,
+            timeout=deadline_seconds + 15,
         )
+        ended = time.monotonic()
         assert (result.returncode, result.stderr) == (5, b"")
         document = json.loads(result.stdout)
         key = document["intentKey"]
         assert keys == [key]
-        assert len(requests) > 6
+        assert len(poll_times) >= 2
+        elapsed = ended - poll_times[0]
+        assert elapsed >= deadline_seconds - 1.5, elapsed
         assert document["outcome"] == document["status"] == "unknown"
         assert document["code"] == document["error"]["code"] == "OUTCOME_UNKNOWN"
-        assert document["receipt"]["requestBlock"] == REQUEST_BLOCK
+        assert document["receipt"]["requestBlock"] is None
+        assert document["receipt"]["requestTxHash"] == "a" * 64
         assert document["receipt"]["execution"] is None
         assert ledger_state(home) == [(key, "unknown", "pending")]
         waits = [
@@ -770,9 +818,24 @@ def test_position_trade_wait_times_out(
             and event["event"].startswith("intent.wait.")
         ]
         assert waits == [
-            ("intent.wait.start", 30_000, None),
+            ("intent.wait.start", deadline_seconds * 1000, None),
             ("intent.wait.end", None, "OUTCOME_UNKNOWN"),
         ]
+        replies.clear()
+        queue_update_preflight(replies)
+        again = invoke(cli, home, *command)
+        assert again.returncode == 1, again
+        assert json.loads(again.stdout)["error"]["intentKey"] == key
+        assert ledger_state(home) == [(key, "unknown", "pending")]
+        assert not replies
+        assert (
+            sum(
+                json.loads(item.body)["query"].startswith("mutation")
+                for item in requests
+                if item.body
+            )
+            == 1
+        )
         return normalized(document, key)
 
     # Both commands and runtimes exercise the real 30-second deadline concurrently.
