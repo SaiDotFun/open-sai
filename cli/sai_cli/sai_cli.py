@@ -1021,7 +1021,8 @@ def market_prices(ctx: click.Context) -> None:
 def account(ctx: click.Context) -> None:
     """Inspect positions and account activity."""
     if ctx.invoked_subcommand != "overview":
-        session_notice(ctx, ctx.obj["as_addr"])
+        if ctx.invoked_subcommand != "balances":
+            session_notice(ctx, ctx.obj["as_addr"])
         if auto_update_applies("account", ctx.obj["json"]):
             updater.tick(warn)
 
@@ -1077,8 +1078,13 @@ def history(ctx: click.Context, addr: str) -> None:
 @click.pass_context
 def balances(ctx: click.Context, addr: str, ws_endpoint: str | None) -> None:
     """Read one account balance snapshot from Keeper's subscription."""
-    ws = ws_url(ctx, ws_endpoint)
-    snapshot = overview.balance_snapshot(settings(ctx), ws, addr, notify=warn)
+    if ws_endpoint is not None:
+        ctx.obj["flags"]["keeper.ws_endpoint"] = ws_endpoint
+    session_notice(ctx, ctx.obj["as_addr"])
+    resolved = settings(ctx)
+    snapshot = overview.balance_snapshot(
+        resolved, resolved.ws_endpoint, addr, notify=warn
+    )
     if ctx.obj["json"]:
         emit(ctx, snapshot)
     else:

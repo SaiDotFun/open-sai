@@ -1228,3 +1228,25 @@ def test_balance_commands_report_fresh_and_stale_source_blocks(replay):
         finally:
             server.should_exit = True
             thread.join(timeout=10)
+
+
+def test_balance_subcommand_ws_flag_overrides_invalid_environment(replay, monkeypatch):
+    config = replay["config"]
+    monkeypatch.setenv("SAI_WS_ENDPOINT", "not-a-websocket-url")
+    result = CliRunner().invoke(
+        main,
+        [
+            "--json",
+            "--endpoint",
+            config.endpoint,
+            "account",
+            "balances",
+            ADDR,
+            "--ws-endpoint",
+            config.ws_endpoint,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    response = json.loads(result.stdout)
+    assert response["data"]["userBalances"]
+    assert (stream.BALANCES_WITH_BLOCK, {"user": ADDR}) in replay["calls"]
