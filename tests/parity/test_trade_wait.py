@@ -40,7 +40,6 @@ from test_intent_wait import (
     indexed,
     intent,
     ledger_state,
-    without_legacy_fill_placeholders,
 )
 from test_trade import rows
 from test_trade import run as run_trade
@@ -450,10 +449,6 @@ def test_position_size_wait_v012(
                 "waitUserIntents",
                 "intentTradeHistory",
             ]
-            if index == 0 and outcome == "filled":
-                fill = result["receipt"]["fill"]
-                assert fill.pop("price") is None
-                assert fill.pop("sizeCollateralBaseUnits") is None
             observations.append(normalized(result, key))
     assert observations[0] == observations[1]
 
@@ -653,12 +648,9 @@ def test_trade_wait(
                     submission = item["variables"]["input"]
                     stamp = submission["intent"].pop("tsIntentInit")
                     assert submission["lifecycle"].pop("tsLifecycleStep") == stamp
-            stdout = result.stdout
-            if index == 0 and case.outcome == "filled":
-                stdout = without_legacy_fill_placeholders(stdout)
             documents.append(
                 (
-                    stdout.replace(key.encode(), b"<intent>"),
+                    result.stdout.replace(key.encode(), b"<intent>"),
                     normalized([wire, ledger], key),
                 )
             )

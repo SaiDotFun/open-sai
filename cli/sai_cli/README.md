@@ -543,8 +543,8 @@ that filled it. When history is available, `execution.historyId` identifies
 the matching row. `positionNow` shows Keeper's latest state for that trade,
 and `positionFeesUsd` gives cumulative fees. The fill can include an oracle
 quote and the escrowed collateral in base units from the matching market
-order. Keeper's current position can change after execution, so it supplies
-`positionNow` and cannot establish the original fill price or size.
+order. Actual fill price and size remain null when Keeper exposes only the
+current position.
 
 ### Doctor
 

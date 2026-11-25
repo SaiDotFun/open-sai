@@ -130,6 +130,8 @@ impl<'a> Evidence<'a> {
         });
         let fill = (outcome == Outcome::Filled).then(|| {
             json!({
+                "price": null,
+                "sizeCollateralBaseUnits": null,
                 "oraclePrice": number(&order["execPrice"]),
                 "escrowedCollateralBaseUnits": number(&order["collateralAmount"]),
             })

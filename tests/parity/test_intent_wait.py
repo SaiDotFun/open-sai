@@ -282,14 +282,6 @@ def ledger_state(home: Path) -> list[tuple[str, str, str | None]]:
         ).fetchall()
 
 
-def without_legacy_fill_placeholders(stdout: bytes) -> bytes:
-    # The pinned Python reference predates the removal. Keep the remaining
-    # bytes intact, including the wire spelling of decimal numbers.
-    old = b'"fill": {"price": null, "sizeCollateralBaseUnits": null, '
-    assert old in stdout
-    return stdout.replace(old, b'"fill": {', 1)
-
-
 def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
     wait_cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -367,10 +359,7 @@ def test_intent_wait(
             assert result.returncode == case.exit, result
             assert result.stderr == b""
             assert OPAQUE.encode() not in result.stdout
-            stdout = result.stdout
-            if index == 0 and case.outcome == "filled":
-                stdout = without_legacy_fill_placeholders(stdout)
-            document = json.loads(stdout)
+            document = json.loads(result.stdout)
             assert document["intentKey"] == KEY
             assert document["addr"] == ADDR
             assert document["outcome"] == case.outcome
@@ -429,10 +418,12 @@ def test_intent_wait(
                 assert document["receipt"]["execution"]["block"] == FILL_BLOCK
                 assert document["receipt"]["positionNow"]["openPrice"] == 87_000
                 assert document["receipt"]["fill"] == {
+                    "price": None,
+                    "sizeCollateralBaseUnits": None,
                     "oraclePrice": "81000.50",
                     "escrowedCollateralBaseUnits": 4_000_000,
                 }
-            observed.append((stdout, wire, ledger))
+            observed.append((result.stdout, wire, ledger))
     assert observed[0] == observed[1]
 
 
@@ -484,12 +475,7 @@ def test_wait_account_first_matches_python(
             assert result.returncode == 0, result
             assert result.stderr == b""
             assert len(requests) == 2
-            document = json.loads(result.stdout)
-            if index == 0:
-                fill = document["receipt"]["fill"]
-                assert fill.pop("price") is None
-                assert fill.pop("sizeCollateralBaseUnits") is None
-            results.append(document)
+            results.append(json.loads(result.stdout))
     assert results[0] == results[1]
 
 

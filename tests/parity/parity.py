@@ -947,30 +947,6 @@ def expect_native_mcp_info(
     return ", ".join(reasons) or None
 
 
-def project_reference_mcp_fill_placeholders(output: list[dict[str, Any]]) -> str | None:
-    """Remove the retired fill fields from the pinned Python transcript."""
-    fields = ("price", "sizeCollateralBaseUnits")
-    old = '"fill": {"price": null, "sizeCollateralBaseUnits": null, '
-    for frame in output:
-        result = frame["result"]
-        value = result.get("structuredContent", {}).get("result")
-        if not isinstance(value, dict) or value.get("outcome") != "filled":
-            continue
-        fill = value["receipt"]["fill"]
-        if not all(key in fill and fill[key] is None for key in fields):
-            continue
-        text = result["_toolText"]
-        if old not in text:
-            raise ValueError("Unexpected whitespace or field order in the legacy fill")
-        result["_toolText"] = text.replace(old, '"fill": {', 1)
-        content_fill = result["content"][0]["text"]["receipt"]["fill"]
-        for key in fields:
-            del fill[key]
-            content_fill.pop(key, None)
-        return "The pinned Python receipt has two retired fill fields"
-    return None
-
-
 def project_reference_auth_status_errors(
     output: list[dict[str, Any]], endpoints: Endpoints
 ) -> str | None:
@@ -1269,16 +1245,9 @@ def run_case(
                 auth_status = project_reference_auth_status_errors(
                     left.output, endpoints
                 )
-            fill_fields = (
-                project_reference_mcp_fill_placeholders(left.output)
-                if case.mcp_profile == "wait-final"
-                else None
-            )
             expected = (
                 ", ".join(
-                    reason
-                    for reason in (expected, validation, auth_status, fill_fields)
-                    if reason
+                    reason for reason in (expected, validation, auth_status) if reason
                 )
                 or None
             )

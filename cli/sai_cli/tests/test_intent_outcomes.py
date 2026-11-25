@@ -1332,6 +1332,8 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert receipt["execution"]["historyId"] == 1007
     assert receipt["execution"]["marketOrderSequence"] == 49
     assert receipt["fill"] == {
+        "price": None,
+        "sizeCollateralBaseUnits": None,
         "oraclePrice": 81000.5,
         "escrowedCollateralBaseUnits": 4000000,
     }
@@ -1591,6 +1593,8 @@ def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
     receipt = result["receipt"]
     assert receipt["execution"]["historyId"] == 1007
     assert receipt["fill"] == {
+        "price": None,
+        "sizeCollateralBaseUnits": None,
         "oraclePrice": 81000.5,
         "escrowedCollateralBaseUnits": 4000000,
     }
@@ -1827,6 +1831,8 @@ def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, out
     assert local[0]["status"] == ("terminal" if outcome == "filled" else "rejected")
     if outcome == "filled":
         assert value["receipt"]["fill"] == {
+            "price": None,
+            "sizeCollateralBaseUnits": None,
             "oraclePrice": 81000.5,
             "escrowedCollateralBaseUnits": 4000000,
         }
