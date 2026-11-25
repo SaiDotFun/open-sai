@@ -13,7 +13,9 @@ import tempfile
 import time
 import unittest
 import urllib.request
-from contextlib import suppress
+from contextlib import redirect_stdout, suppress
+from http.client import RemoteDisconnected
+from io import StringIO
 from pathlib import Path
 from threading import Event
 from typing import Any
@@ -858,37 +860,75 @@ query($trader:String!) {
             data = self.query(base, query, trader=self.replay.addr)
         self.assertEqual(data, {"p": {"tradeHistory": [{"id": 1}]}})
 
-    def test_mutation_uses_the_bound_input_argument(self) -> None:
-        key = "20261124T080000000Z_ABCDEFGHJKMNPQRT"
+    def submit_open(self, base: str, key: str) -> dict[str, Any]:
         query = (
             "mutation($payload:RecordUserIntentInput!) {"
             " submitted: recordUserIntent(input:$payload) { intentKey } }"
         )
+        token = REHEARSAL["SYNTHETIC_TOKEN"]
+        request = urllib.request.Request(
+            f"{base}/query",
+            data=json.dumps(
+                {
+                    "query": query,
+                    "variables": {
+                        "payload": {
+                            "intentKey": key,
+                            "intent": {"kind": "OPEN_TRADE"},
+                        }
+                    },
+                }
+            ).encode(),
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {token}",
+            },
+        )
+        with urllib.request.urlopen(request, timeout=2) as response:
+            return json.load(response)["data"]
+
+    def test_mutation_uses_the_bound_input_argument(self) -> None:
+        key = "20261124T080000000Z_ABCDEFGHJKMNPQRT"
         with REHEARSAL["keeper_server"](self.replay.handler()) as base:
-            token = REHEARSAL["SYNTHETIC_TOKEN"]
-            request = urllib.request.Request(
-                f"{base}/query",
-                data=json.dumps(
-                    {
-                        "query": query,
-                        "variables": {
-                            "payload": {
-                                "intentKey": key,
-                                "intent": {"kind": "OPEN_TRADE"},
-                            }
-                        },
-                    }
-                ).encode(),
-                headers={
-                    "Content-Type": "application/json",
-                    "Authorization": f"Bearer {token}",
-                },
+            self.assertEqual(
+                self.submit_open(base, key), {"submitted": {"intentKey": key}}
             )
-            with urllib.request.urlopen(request, timeout=2) as response:
-                self.assertEqual(
-                    json.load(response)["data"], {"submitted": {"intentKey": key}}
-                )
         self.assertEqual(self.replay.submitted, [self.key, key])
+
+    def test_native_rehearsal_fails_if_reconciliation_submits_another_open(
+        self,
+    ) -> None:
+        self.replay.submitted.clear()
+        self.replay.lifecycle = "pending_exec"
+        second = "20261124T080000000Z_ABCDEFGHJKMNPQRT"
+        status = (
+            "query($user:String!, $key:String) {"
+            " userIntents(where:{user:$user,intentKey:$key}) { intentKey lifecycleStep } }"
+        )
+        with REHEARSAL["keeper_server"](self.replay.handler()) as base:
+            with self.assertRaises(RemoteDisconnected):
+                self.submit_open(base, self.key)
+            with redirect_stdout(StringIO()):
+                self.assertEqual(
+                    REHEARSAL["native_cutover_result"](self.replay, self.key, 0), 0
+                )
+
+            # A broken reconciliation sends a new open but still returns the
+            # pending status of the original intent.
+            self.assertEqual(
+                self.submit_open(base, second), {"submitted": {"intentKey": second}}
+            )
+            result = self.query(base, status, user=self.replay.addr, key=self.key)
+            self.assertEqual(
+                result["userIntents"],
+                [{"intentKey": self.key, "lifecycleStep": "pending_exec"}],
+            )
+
+        with redirect_stdout(StringIO()) as output:
+            self.assertEqual(
+                REHEARSAL["native_cutover_result"](self.replay, self.key, 0), 1
+            )
+        self.assertIn("recorded 2 submissions", output.getvalue())
 
     def test_projects_trade_history_with_variable_pagination_and_legacy_limit(
         self,

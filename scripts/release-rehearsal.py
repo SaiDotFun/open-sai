@@ -2145,6 +2145,19 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
             "Rollback update repoints or removes the stale Cursor alias",
             mcp.verify_cursor_alias,
         )
+    return native_cutover_result(replay, key, failures)
+
+
+def native_cutover_result(replay: Replay, key: str, failures: int) -> int:
+    if replay.submitted == [key]:
+        print("PASS Keeper recorded one open across cutover and rollback", flush=True)
+    else:
+        failures += 1
+        print(
+            "FAIL Keeper should record only the original open across cutover and rollback"
+            f" (recorded {len(replay.submitted)} submissions)",
+            flush=True,
+        )
     print(
         f"Native cutover rehearsal finished with {failures} failed checks.",
         flush=True,
