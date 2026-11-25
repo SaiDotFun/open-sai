@@ -37,7 +37,9 @@ fn uv(home: &Path) -> Command {
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
     let mut command = Command::new("uv");
-    command.args(["--quiet", "run", "--project"]).arg(root);
+    command
+        .args(["--quiet", "run", "--offline", "--no-sync", "--project"])
+        .arg(root);
     clean_env(&mut command, home);
     command
 }
@@ -414,7 +416,6 @@ Path(os.environ["SAI_HOME"], "clipboard-tools", "contents").write_bytes(
 }
 
 #[test]
-#[ignore = "requires uv and a Python reference checkout"]
 fn rust_saved_session_round_trips_in_python() {
     let home = tempdir().unwrap();
     Storage::new(home.path())
@@ -425,6 +426,30 @@ fn rust_saved_session_round_trips_in_python() {
             ENDPOINT.into(),
         ))
         .unwrap();
+    let read_session = r#"
+import sys
+from sai_cli.core.storage import load_session
+
+session = load_session()
+assert session["token"] == "synthetic-legacy-session"
+assert session["evmAddress"] == sys.argv[1]
+assert session["endpoint"] == sys.argv[2]
+"#;
+    write_cli_fixture(home.path(), read_session, &[ADDR, ENDPOINT]);
+    let damaged_home = tempdir().unwrap();
+    let damaged_trader = damaged_home.path().join("trader");
+    fs::create_dir(&damaged_trader).unwrap();
+    let envelope = home.path().join("trader/sessions.json");
+    let mut damaged: Value = serde_json::from_slice(&fs::read(envelope).unwrap()).unwrap();
+    damaged["ciphertext"] = Value::String("AAAA".into());
+    let damaged_envelope = damaged_trader.join("sessions.json");
+    fs::write(&damaged_envelope, serde_json::to_vec(&damaged).unwrap()).unwrap();
+    fs::set_permissions(damaged_envelope, fs::Permissions::from_mode(0o600)).unwrap();
+    let result = uv(damaged_home.path())
+        .args(["python", "-c", read_session, ADDR, ENDPOINT])
+        .output()
+        .unwrap();
+    assert!(!result.status.success(), "Python accepted a damaged session");
     let status = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "status"],

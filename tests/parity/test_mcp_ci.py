@@ -38,3 +38,26 @@ def test_cutover_ci_uses_one_release_for_focused_and_full_parity() -> None:
     assert "env: *release-parity" in manifest
     assert 'parity.py --reference "$SAI_PARITY_PYTHON" --cutover' in manifest
     assert "--case " not in manifest
+
+
+def test_ci_checks_shared_storage_with_both_releases() -> None:
+    root = Path(__file__).resolve().parents[2]
+    workflow = (root / ".github/workflows/ci.yml").read_text()
+    for version, checkout in [
+        ("v0.1.2", ".parity-python"),
+        ("v0.1.1", ".parity-python-v011"),
+    ]:
+        steps = workflow.split("\n      - name: ")
+        step = next(
+            item
+            for item in steps
+            if item.startswith("Compare C") and item.splitlines()[0].endswith(version)
+        )
+        assert f"/{checkout}\n" in step
+        assert "cargo test --locked -p sai --test storage_parity" in step
+        assert "rust_saved_session_round_trips_in_python" in step
+        assert "rust_reads_and_migrates_python_v2_session" in step
+        assert "python_and_rust_share_ledger_reservations_and_rows" in step
+    tests = (root / "sai/tests/storage_parity.rs").read_text()
+    attributes = tests.split("fn rust_saved_session_round_trips_in_python", 1)[0]
+    assert attributes.endswith("#[test]\n")
