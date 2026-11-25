@@ -38,6 +38,8 @@ pub enum StorageError {
     Session(#[from] SessionError),
     #[error("{0}")]
     SessionData(#[source] SessionError),
+    #[error("{}", crate::session::INVALID_EXPIRY)]
+    InvalidSessionExpiry,
 }
 
 #[derive(Debug, Error)]
@@ -60,6 +62,9 @@ impl From<StorageError> for SaiError {
     fn from(error: StorageError) -> Self {
         match error {
             StorageError::Session(error) | StorageError::SessionData(error) => error.into(),
+            StorageError::InvalidSessionExpiry => {
+                Self::new(Code::SessionUnavailable, crate::session::INVALID_EXPIRY)
+            }
             StorageError::RecentOpenPending { ref key, ref hint } => SaiError {
                 intent_key: Some(key.clone()),
                 hint: Some(hint.clone()),

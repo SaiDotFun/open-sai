@@ -59,6 +59,7 @@ pub(super) fn arguments<'a>(
                 Err(("Input should be a valid string", "string_type"))
             }
             Some("integer") => integer(value),
+            Some("number") => number(value),
             Some("boolean") => boolean(value),
             _ => Ok(None),
         };
@@ -93,6 +94,9 @@ impl Rejected<'_> {
     }
 
     pub(super) fn message(self, tool: &Tool) -> String {
+        if tool.name == "auth_use" {
+            return "Argument 'addr' must be a string.".into();
+        }
         if tool.name == "logs_intent" {
             return match self.0[0].field {
                 Some("key") => "Argument 'key' must be a string.",
@@ -213,6 +217,35 @@ fn integer_string(text: &str) -> Option<Value> {
     }
     let sign = if whole.starts_with('-') { "-" } else { "" };
     serde_json::from_str(&format!("{sign}{digits}")).ok()
+}
+
+fn number(value: &Value) -> Conversion {
+    if float_value(value).is_some() {
+        return Ok(None);
+    }
+    if value.is_string() {
+        return Err((
+            "Input should be a valid number, unable to parse string as a number",
+            "float_parsing",
+        ));
+    }
+    Err(("Input should be a valid number", "float_type"))
+}
+
+pub(super) fn float_value(value: &Value) -> Option<f64> {
+    match value {
+        Value::Bool(flag) => Some(f64::from(u8::from(*flag))),
+        Value::Number(number) if is_integer(value) => number.as_f64(),
+        Value::Number(number) => number.as_str().parse().ok(),
+        Value::String(text) => {
+            let text = text.trim();
+            if text.starts_with('_') || text.ends_with('_') || text.contains("__") {
+                return None;
+            }
+            text.replace('_', "").parse().ok()
+        }
+        _ => None,
+    }
 }
 
 fn boolean(value: &Value) -> Conversion {

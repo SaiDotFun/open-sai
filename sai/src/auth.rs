@@ -266,7 +266,7 @@ fn show_expiry_notice(notice: Option<&ExpiryNotice>, json: bool) {
 }
 
 // Python exposes account-store decoding failures as ValueError outside status.
-fn account_error(error: StorageError) -> SaiError {
+pub(crate) fn account_error(error: StorageError) -> SaiError {
     match error {
         StorageError::SessionData(error) => SaiError::new(Code::InvalidRequest, error.0.message),
         error => error.into(),
