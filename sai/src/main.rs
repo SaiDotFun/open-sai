@@ -604,7 +604,9 @@ fn print_parse_error(
             let _ = error.print();
             return (ExitCode::Ok, None);
         }
-        ErrorKind::MissingSubcommand if !command.is_empty() && operands.is_empty() => {
+        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand
+            if !command.is_empty() && operands.is_empty() =>
+        {
             let message = if command == "auth" {
                 Some("Invalid arguments to auth.".into())
             } else {
