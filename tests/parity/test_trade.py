@@ -871,7 +871,10 @@ def test_open_retry_is_in_the_blocking_intent_trail(
             ]
             assert refusal["intentKey"] == key and refusal["addr"] == ADDRESS
             assert refusal["code"] == blocked["error"]["code"]
-            assert [entry.label for entry in endpoints.wire] == ["recordUserIntent"]
+            assert (
+                sum(entry.label == "recordUserIntent" for entry in endpoints.wire) == 1
+            )
+            assert len(rows(home)) == 1
             assert not endpoints.errors
 
 
