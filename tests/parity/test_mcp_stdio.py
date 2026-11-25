@@ -1027,6 +1027,7 @@ def test_overview_queue_offsets_include_invalid_rows(
         ("overview-fill-check-malformed", 0, True, False),
         ("overview-lcd-fails", 2, False, True),
         ("overview-lcd-malformed", 2, False, True),
+        ("overview-lcd-market-height", 2, False, True),
         ("overview-fill-and-lcd-fail", 2, True, True),
     ],
 )

@@ -235,6 +235,12 @@ class OverviewReplay:
         served = RISK_BLOCK
         if name == "get_trade" and self.scenario == "overview-wrong-height":
             served -= 1
+        if (
+            name == "get_market"
+            and self.scenario == "overview-lcd-market-height"
+            and args["index"] == "MarketIndex(0)"
+        ):
+            served -= 1
         if name == "get_trade":
             data = self.state["contractTrades"][args["index"]]
             if self.scenario == "overview-lcd-malformed" and args["index"] == 0:

@@ -133,7 +133,7 @@ pub(super) async fn read(view: &Overview<'_>) -> TradeSections {
         if let Some(reads) = reads {
             if reads.deadline_expired() && rows.iter().any(|row| row["riskStatus"] != "verified") {
                 issues.push("An LCD deadline expired. Position risk is partial.");
-            } else if reads.trade_read_failed {
+            } else if reads.risk_read_failed {
                 issues.push("LCD position read failed. Position risk is partial.");
             }
         }
