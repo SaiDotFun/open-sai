@@ -467,8 +467,20 @@ def observe(
             after_config = config_text(after_config, key)
         if before_config != after_config:
             check_failed("config.toml changed text outside the edited value")
+    fixture_values = None
+    if cutover:
+        fixture_values = {
+            urlsplit(endpoints.http).netloc: "<fixture-http>",
+            urlsplit(endpoints.ws).netloc: "<fixture-ws>",
+            endpoints.near_expiry: "<fixture-near-expiry>",
+            endpoints.overview_expiry: "<fixture-overview-expiry>",
+        }
     normalize = Normalize(
-        home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
+        home,
+        concurrent=concurrent,
+        started_at=started_at,
+        ended_at=ended_at,
+        fixture_values=fixture_values,
     )
     if case.absent_log_text:
         for path in (home / "sai" / "logs").glob("*.jsonl"):
@@ -528,7 +540,13 @@ def observe(
     }
     if case.command == "account overview" and case.mode == "json":
         display = mask_overview_stdout(display, case.mode)
-    raw = (display.encode(), result.stderr.encode()) if exact else None
+    raw = None
+    if exact:
+        raw = (
+            (normalize.text(display).encode(), normalize.text(result.stderr).encode())
+            if cutover
+            else (display.encode(), result.stderr.encode())
+        )
     return Observation(result.returncode, output, stderr, files, raw, tuple(checks))
 
 

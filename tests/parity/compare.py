@@ -189,6 +189,7 @@ class Normalize:
         concurrent: bool = False,
         started_at: float | None = None,
         ended_at: float | None = None,
+        fixture_values: Mapping[str, str] | None = None,
     ):
         self.home = str(home)
         self.log_fields = load_log_field_rules(log_schema)
@@ -196,13 +197,17 @@ class Normalize:
         self.ids: dict[str, dict[int | str, str]] = {}
         self.started_at = started_at
         self.ended_at = ended_at
+        self.fixture_values = fixture_values or {}
 
     def identity(self, kind: str, value: int | str) -> str:
         existing = self.ids.setdefault(kind, {})
         return existing.setdefault(value, f"<{kind} {len(existing) + 1}>")
 
     def text(self, value: str) -> str:
-        return value.replace(self.home, "<HOME>")
+        value = value.replace(self.home, "<HOME>")
+        for fixture, label in self.fixture_values.items():
+            value = re.sub(re.escape(fixture) + r"(?!\d)", label, value)
+        return value
 
     def intent_refs(self, value: str) -> str:
         return INTENT_ID.sub(lambda match: self.identity("intentKey", match[0]), value)
