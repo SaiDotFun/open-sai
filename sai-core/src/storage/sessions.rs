@@ -39,8 +39,8 @@ pub struct Session {
     token: Zeroizing<String>,
     #[serde(rename = "evmAddress")]
     addr: String,
-    #[serde(rename = "expiresAt")]
-    expires_at: String,
+    #[serde(rename = "expiresAt", default, deserialize_with = "deserialize_expiry")]
+    expires_at: Option<String>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -63,7 +63,7 @@ impl Session {
         Self {
             token,
             addr,
-            expires_at,
+            expires_at: Some(expires_at),
             extra: BTreeMap::from([("endpoint".to_owned(), Value::String(endpoint))]),
         }
     }
@@ -77,11 +77,28 @@ impl Session {
     }
 
     pub fn expires_at(&self) -> &str {
-        &self.expires_at
+        self.expires_at
+            .as_deref()
+            .expect("stored expiry is checked on read")
     }
 
     pub fn endpoint(&self) -> Option<&str> {
         self.extra.get("endpoint").and_then(Value::as_str)
+    }
+
+    pub fn checked_endpoint(&self) -> Result<Option<&str>, SessionError> {
+        match self.extra.get("endpoint") {
+            None | Some(Value::Null) => Ok(None),
+            Some(Value::String(endpoint)) => Ok(Some(endpoint)),
+            _ => Err(session_error("Stored session has an invalid endpoint")),
+        }
+    }
+
+    pub fn checked_address(&self, key: &str) -> Result<&str, SessionError> {
+        if !crate::keeper::is_evm_address(self.addr()) || self.addr().to_ascii_lowercase() != key {
+            return Err(session_error("Stored session has an invalid address"));
+        }
+        Ok(self.addr())
     }
 
     pub fn key_name(&self) -> Option<&str> {
@@ -137,6 +154,16 @@ fn deserialize_token<'de, D: Deserializer<'de>>(
     String::deserialize(deserializer).map(Zeroizing::new)
 }
 
+// Decode the other fields before classifying a missing or non-string expiry.
+fn deserialize_expiry<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<String>, D::Error> {
+    match Value::deserialize(deserializer)? {
+        Value::String(expiry) => Ok(Some(expiry)),
+        _ => Ok(None),
+    }
+}
+
 #[derive(Deserialize, Serialize)]
 struct StoredSession(#[serde(with = "Session")] Session);
 
@@ -159,9 +186,17 @@ impl Accounts {
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&Session, bool)> {
-        self.sessions
-            .iter()
-            .map(|(addr, session)| (&session.0, Some(addr) == self.active.as_ref()))
+        self.entries().map(|(_, session, active)| (session, active))
+    }
+
+    pub fn entries(&self) -> impl Iterator<Item = (&str, &Session, bool)> {
+        self.sessions.iter().map(|(addr, session)| {
+            (
+                addr.as_str(),
+                &session.0,
+                Some(addr) == self.active.as_ref(),
+            )
+        })
     }
 
     fn find(&self, addr: &str, label: &str) -> Result<String, SessionError> {
@@ -248,7 +283,14 @@ fn load_v2(envelope: &Value) -> Result<Accounts, SessionError> {
 
 impl Storage<'_> {
     pub fn load_accounts(&self) -> Result<Accounts, StorageError> {
-        self.read_accounts().map_err(StorageError::SessionData)
+        let accounts = self.read_accounts().map_err(StorageError::SessionData)?;
+        if accounts
+            .iter()
+            .any(|(session, _)| session.expires_at.is_none())
+        {
+            return Err(StorageError::InvalidSessionExpiry);
+        }
+        Ok(accounts)
     }
 
     fn read_accounts(&self) -> Result<Accounts, SessionError> {
@@ -277,6 +319,12 @@ impl Storage<'_> {
     }
 
     fn save_accounts(&self, accounts: &Accounts) -> Result<(), StorageError> {
+        self.write_accounts(accounts)?;
+        remove_if_exists(&self.trader.join(LEGACY_SESSION))?;
+        Ok(())
+    }
+
+    fn write_accounts(&self, accounts: &Accounts) -> Result<(), StorageError> {
         let cannot_save = || SessionError::new("Cannot encrypt session");
         let mut nonce = [0; 12];
         OsRng
@@ -300,7 +348,6 @@ impl Storage<'_> {
         serde_json::to_writer(temp.as_file_mut(), &envelope).map_err(io::Error::other)?;
         temp.persist(self.trader.join(SESSIONS))
             .map_err(|error| error.error)?;
-        remove_if_exists(&self.trader.join(LEGACY_SESSION))?;
         Ok(())
     }
 
@@ -336,7 +383,9 @@ impl Storage<'_> {
     fn save_session_locked(&self, lock: fs::File, session: Session) -> Result<(), StorageError> {
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::SessionData(_)) => Accounts::default(),
+            Err(StorageError::SessionData(_) | StorageError::InvalidSessionExpiry) => {
+                Accounts::default()
+            }
             Err(error) => return Err(error),
         };
         let key = session.addr.to_lowercase();
@@ -440,18 +489,53 @@ impl Storage<'_> {
     }
 
     pub fn use_session(&self, addr: &str) -> Result<Session, StorageError> {
+        self.select_session(
+            addr,
+            REQUESTED_ACCOUNT,
+            |_, session, _| {
+                crate::session::session_expiry(session)?;
+                Ok(())
+            },
+            |accounts| self.save_accounts(accounts),
+        )
+        .map(|(session, ())| session)
+    }
+
+    /// Prepare an account-switch reply from the new selection before committing it.
+    pub fn use_session_prepared<T>(
+        &self,
+        addr: &str,
+        prepare: impl FnOnce(&str, &Session, &Accounts) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        self.select_session(addr, REQUESTED_ACCOUNT, prepare, |accounts| {
+            self.write_accounts(accounts)?;
+            if remove_if_exists(&self.trader.join(LEGACY_SESSION)).is_err() {
+                eprintln!("Could not remove legacy session file trader/session.json after saving accounts.");
+            }
+            Ok(())
+        })
+        .map(|(_, report)| report)
+    }
+
+    fn select_session<T>(
+        &self,
+        addr: &str,
+        label: &str,
+        prepare: impl FnOnce(&str, &Session, &Accounts) -> Result<T, StorageError>,
+        save: impl FnOnce(&Accounts) -> Result<(), StorageError>,
+    ) -> Result<(Session, T), StorageError> {
         let lock = self.lock_sessions()?;
         let mut accounts = self.load_accounts()?;
-        let key = accounts.find(addr, "Requested account")?;
-        crate::session::session_expiry(&accounts.sessions[&key].0)?;
+        let key = accounts.find(addr, label)?;
         accounts.active = Some(key.clone());
-        self.save_accounts(&accounts)?;
+        let report = prepare(&key, &accounts.sessions[&key].0, &accounts)?;
+        save(&accounts)?;
         drop(lock);
         let session = accounts.sessions.remove(&key).expect("connected account").0;
         self.emit(StorageEvent::SessionActive {
             addr: session.addr(),
         });
-        Ok(session)
+        Ok((session, report))
     }
 
     pub fn session_exists(&self) -> bool {
@@ -473,7 +557,9 @@ impl Storage<'_> {
         }
         let mut accounts = match self.load_accounts() {
             Ok(accounts) => accounts,
-            Err(StorageError::SessionData(_)) if addr.is_none() => {
+            Err(StorageError::SessionData(_) | StorageError::InvalidSessionExpiry)
+                if addr.is_none() =>
+            {
                 self.remove_session_files()?;
                 drop(lock);
                 self.emit(StorageEvent::UnreadableSessionRemoved);
