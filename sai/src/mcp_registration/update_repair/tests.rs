@@ -20,11 +20,19 @@ if [ "$3" != sai ]; then
     printf "Error: No MCP server named '%s' found.\n" "$3" >&2
     exit 1
 fi
-if grep -Fq "$HOME/.local/bin/sai" "$CODEX_HOME/config.toml"; then
-    [ ! -f "$HOME/reject-repair" ] || exit 9
+if [ "$5" = "-c" ]; then
+    case "$6" in
+        'mcp_servers.sai.command="'*"$HOME/.local/bin/sai"'"') ;;
+        *) exit 9 ;;
+    esac
+    launcher="$HOME/.local/bin/sai"
+elif grep -Fq "$HOME/.local/bin/sai" "$CODEX_HOME/config.toml"; then
     launcher="$HOME/.local/bin/sai"
 else
     launcher="$HOME/retired/sai"
+fi
+if [ "$launcher" = "$HOME/.local/bin/sai" ] && [ -f "$HOME/reject-repair" ]; then
+    exit 9
 fi
 printf '{"transport":{"type":"stdio","command":"%s","args":["mcp","serve"]}}\n' "$launcher"
 "#;
