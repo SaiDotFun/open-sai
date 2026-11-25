@@ -221,6 +221,17 @@ def call_mcp(mcp: FastMCP, tool: str, args: dict[str, Any]) -> dict[str, Any]:
     return json.loads(block.text)
 
 
+def open_mcp(endpoint: str) -> FastMCP:
+    return server.create_server(
+        settings.load(
+            flags={
+                "keeper.endpoint": endpoint,
+                "lcd.endpoint": endpoint.removesuffix("/query"),
+            }
+        )
+    )
+
+
 def reserve(endpoint: str, *, expired: bool = False) -> None:
     storage.pending(KEY, endpoint, ADDR, "OPEN_TRADE", "")
     if expired:
@@ -412,7 +423,7 @@ def test_unkeyed_cli_status_blocks_a_second_acknowledged_open(
 
     with storage.db() as connection:
         connection.execute("UPDATE intents SET created_at=0 WHERE id=?", (key,))
-    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    mcp = open_mcp(endpoint)
     replies.append(MARKET)
     preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
     args = {
@@ -454,7 +465,7 @@ def test_acknowledged_open_blocks_retry(connected_replay, submitted_keys, retry)
     assert first["status"] == status(endpoint) == "accepted"
     key = first["intentKey"]
     if retry == "mcp":
-        mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+        mcp = open_mcp(endpoint)
         replies.append(MARKET)
         preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
         args = {
@@ -528,7 +539,7 @@ def test_locked_ledger_reports_open_was_not_sent(
     lock: str,
 ) -> None:
     endpoint, replies = connected_replay
-    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    mcp = open_mcp(endpoint)
     if surface == "mcp":
         replies.append(MARKET)
         preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
@@ -570,7 +581,7 @@ def test_locked_ledger_reports_open_was_not_sent(
 def _open_with_mcp(
     endpoint: str, args: dict[str, Any], results: Queue[dict[str, Any]]
 ) -> None:
-    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    mcp = open_mcp(endpoint)
     results.put(call_mcp(mcp, "trade_open", args))
 
 
@@ -578,7 +589,7 @@ def test_mcp_open_reservation_rechecks_after_concurrent_ack(
     connected_replay, submitted_keys
 ):
     endpoint, replies = connected_replay
-    mcp = server.create_server(settings.load(flags={"keeper.endpoint": endpoint}))
+    mcp = open_mcp(endpoint)
     replies.append(MARKET)
     preview = call_mcp(mcp, "preview_open", OPEN_ARGS)
     args = {
