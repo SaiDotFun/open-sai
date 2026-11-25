@@ -67,6 +67,7 @@ def replay():
         "contractMarkets": {},
         "expiration": 300,
         "lcdDisconnected": threading.Event(),
+        "queuedRequestHash": "A" * 64,
     }
 
     class Handler(BaseHTTPRequestHandler):
@@ -484,7 +485,10 @@ def populate_trades(replay: dict[str, Any]):
                         "collateralAmount": 5_000_000,
                         "orderReqBlock": 41148706,
                         "orderReqBlockTs": BLOCK_TIME,
-                        "orderReqTxHash": "A" * 64,
+                        # Release parity reuses this helper with the original hash.
+                        "orderReqTxHash": replay.get(
+                            "queuedRequestHash", "SYNTHETIC_COSMOS_REQUEST"
+                        ),
                         "orderReqEvmTxHash": None,
                     },
                 ]
