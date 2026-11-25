@@ -1316,7 +1316,7 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         metadata = {key: value for key, value in result.items() if key != "message"}
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
         return
-    output = {"addr": account, **result}
+    output: dict[str, Any] = {"addr": account, **result}
     if confirmation.is_confirmable(output):
         output = confirmation.with_digest(output)
     if not ctx.obj["json"] and (collateral := output.get("collateral")):
