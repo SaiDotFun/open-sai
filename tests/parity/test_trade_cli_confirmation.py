@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Literal
@@ -9,6 +10,7 @@ from typing import Any, Literal
 import pytest
 from sai_cli.core.confirmation import preview_digest
 from scenarios import loopback, seed_home
+from test_mcp_stdio import server
 from test_trade import CLI, CLOSE, OPEN, rows, run
 from trade_replay import TradeReplay
 
@@ -66,6 +68,52 @@ def test_unconfirmed_trade_checks_execution_before_reserving(
                 error["details"]["preview"]["estimates"]["execution"]["code"]
                 == execution_code
             )
+
+
+def test_partial_close_with_unreadable_leverage_cannot_be_confirmed(
+    pair: tuple[CLI, CLI], tmp_path: Path
+) -> None:
+    python, rust = pair
+    scenario = "position-malformed-after-hours-cap"
+    with (
+        loopback(scenario) as endpoints,
+        server(
+            Path(python[0]), tmp_path / "python-preview", endpoints, seed="session"
+        ) as stdio,
+    ):
+        reply = stdio.call(2, "preview_partial_close", trade_id=7, percent=50)
+        expected = json.loads(reply["content"][0]["text"])
+        assert expected["quote"]["effectiveLeverage"] is None
+        assert "previewDigest" not in expected
+        assert not endpoints.errors
+
+    for index, cli in enumerate(pair):
+        replay = TradeReplay("DECREASE_POSITION_SIZE")
+        with loopback(scenario, trade_replay=replay) as endpoints:
+            home = tmp_path / f"submit-{index}"
+            seed_home(home, endpoints, "session")
+            code, result, stderr = run(cli, home, endpoints, PARTIAL, python=index == 0)
+            assert (code, result["error"]["code"], stderr) == (
+                4,
+                "PREVIEW_MISMATCH",
+                "",
+            )
+            assert "Cannot verify effective leverage" in result["error"]["message"]
+            assert not replay.attempts()
+            assert not rows(home)
+            assert not endpoints.errors
+
+    with loopback(scenario) as endpoints:
+        home = tmp_path / "rust-preview"
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            rust, home, endpoints, (*PARTIAL, "--dry-run"), python=False
+        )
+        assert (code, stderr) == (0, "")
+        assert preview["quote"] == expected["quote"]
+        assert "previewDigest" not in preview
+        assert not endpoints.errors
+        assert not rows(home)
 
 
 @pytest.mark.parametrize(

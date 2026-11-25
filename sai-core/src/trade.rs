@@ -118,7 +118,9 @@ impl TradePreview {
         if let Some(route) = &self.position_route {
             output["positionRoute"] = json!(route);
         }
-        output["previewDigest"] = json!(preview_digest(self, account));
+        if !self.has_unknown_partial_leverage() {
+            output["previewDigest"] = json!(preview_digest(self, account));
+        }
         output
     }
 
@@ -137,11 +139,20 @@ impl TradePreview {
                 && (!self.requires_market_price_refresh() || self.reference_price.is_some())
                 && !rejected
                 && !missing_oracle
+                && !self.has_unknown_partial_leverage()
             {
                 output["previewDigest"] = json!(preview_digest(self, account));
             }
         }
         output
+    }
+
+    fn has_unknown_partial_leverage(&self) -> bool {
+        self.intent.kind == "DECREASE_POSITION_SIZE"
+            && self
+                .quote
+                .as_ref()
+                .is_none_or(|quote| quote["effectiveLeverage"].is_null())
     }
 
     pub fn is_market_close(&self) -> bool {
