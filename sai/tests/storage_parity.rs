@@ -454,7 +454,10 @@ assert session["endpoint"] == sys.argv[2]
         .args(["python", "-c", read_session, ADDR, ENDPOINT])
         .output()
         .unwrap();
-    assert!(!result.status.success(), "Python accepted a damaged session");
+    assert!(
+        !result.status.success(),
+        "Python accepted a damaged session"
+    );
     let status = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "status"],
