@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-import click
+from case_inventory import cli_commands, require_manifest_case_ids
 from compare import (
     LEDGER,
     MIN_SQLITE_SCHEMA,
@@ -836,15 +836,32 @@ def run_case(
     return diffs, tools, expected
 
 
-def cli_commands(group: click.Group, prefix: str = "") -> set[str]:
-    result = set()
-    for name, command in group.commands.items():
-        full = f"{prefix} {name}".strip()
-        if isinstance(command, click.Group):
-            result.update(cli_commands(command, full))
-        else:
-            result.add(full)
-    return result
+def release_commands(reference: list[str]) -> set[str]:
+    interpreter = Path(reference[0]).with_name("python")
+    if not interpreter.is_file():
+        raise ValueError("The release launcher needs its installed Python interpreter")
+    with (
+        tempfile.TemporaryDirectory(prefix="sai-release-inventory-") as temp,
+        loopback("normal") as endpoints,
+    ):
+        home = Path(temp)
+        env = child_env(home, endpoints)
+        result = invoke(
+            [str(interpreter)], [str(HERE / "case_inventory.py")], home, env
+        )
+    if result.returncode:
+        raise ValueError(f"Release command inventory exited {result.returncode}")
+    try:
+        names = json.loads(result.stdout)
+    except ValueError:
+        raise ValueError("Invalid release command inventory") from None
+    if (
+        not isinstance(names, list)
+        or not names
+        or not all(isinstance(name, str) for name in names)
+    ):
+        raise ValueError("Invalid release command inventory")
+    return set(names)
 
 
 def row(command: str, status: str, detail: str = "") -> None:
@@ -899,9 +916,16 @@ def main() -> int:
         configured = tomllib.load(file)
     cases = [Case(**item) for item in configured["case"]]
     deferred: dict[str, str] = configured.get("deferred", {})
-    missing = cli_commands(python_cli) - (
-        {case.command for case in cases} | deferred.keys()
-    )
+    commands = cli_commands(python_cli)
+    if args.cutover:
+        try:
+            require_manifest_case_ids(
+                (case.name for case in cases), HERE / "release-case-ids.txt"
+            )
+            commands |= release_commands(reference)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            parser.error(str(exc))
+    missing = commands - ({case.command for case in cases} | deferred.keys())
     if missing:
         parser.error(
             f"Add cases or mark these commands deferred: {', '.join(sorted(missing))}"
