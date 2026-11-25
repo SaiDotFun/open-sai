@@ -183,7 +183,10 @@ def describe(exc: Exception) -> dict[str, Any]:
     if isinstance(exc, trading.PositionChanged):
         if exc.preview is None:
             return preview_mismatch(failure.message)
-        reason = estimates.rejection_reason(exc.preview.get("estimates", {}))
+        values = exc.preview.get("estimates", {})
+        reason = estimates.rejection_reason(values)
+        if estimates.close_oracle_time_unknown(values):
+            reason = values["execution"]["reason"]
         return preview_mismatch(
             reason
             or (
@@ -428,7 +431,7 @@ def market_list(settings: Settings) -> dict[str, Any]:
 
 
 def market_prices(settings: Settings) -> dict[str, Any]:
-    return keeper.request(settings.endpoint, keeper.PRICES)
+    return keeper.market_prices(settings.endpoint)
 
 
 def account_positions(settings: Settings, addr: str | None) -> dict[str, Any]:

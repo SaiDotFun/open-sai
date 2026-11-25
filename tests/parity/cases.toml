@@ -99,6 +99,12 @@ args = ["--json","market","prices"]
 wire = ["tokenPricesUsd"]
 
 [[case]]
+name = "market-prices-epoch-spellings"
+args = ["--json","market","prices"]
+server = "read-price-epoch-spellings"
+wire = ["tokenPricesUsd"]
+
+[[case]]
 name = "market-prices-text"
 args = ["market","prices"]
 mode = "text"
@@ -1446,8 +1452,8 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market",
-    "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
-    "is_after_hours_market", "get_market", "get_fees",
+    # The fixture has no oracle publication time, so the estimate stops here.
+    "get_collateral_price", "get_trade_raw", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
@@ -1458,11 +1464,9 @@ seed = "session"
 server = "concurrent-close"
 wire = [
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
     "recordUserIntent",
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

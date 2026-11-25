@@ -401,3 +401,9 @@ jobs:
           PROFILE
           fi
           uv run --locked python tests/parity/parity.py --case 'mcp-uninstall-*'
+
+      - name: Compare market price epoch spellings against the Rust CLI
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+        run: uv run --locked python tests/parity/parity.py --case market-prices-epoch-spellings
