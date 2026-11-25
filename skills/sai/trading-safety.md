@@ -153,10 +153,10 @@ is readable and request a fresh preview.
 `PRICE_MOVED` is the quote check from rule 3. Passing it does not cap the
 fill at the confirmed price plus the slippage.
 
-The partial-close digest covers the close percentage, starting collateral and
-leverage, and the contract inputs used to quote the requested slice. The quote
-uses the applicable after-hours leverage cap, collateral/USD oracle price, and
-Perp's rounding. A change to those inputs requires a new confirmation.
+The partial-close digest covers the close percentage, starting collateral,
+reduction amount, and leverage inputs, including the applicable after-hours
+cap. A tick in the collateral/USD price updates the USD estimate without
+requiring a new confirmation.
 [mcp.md](mcp.md#preview-confirm-then-trade) lists what each digest covers.
 
 ## Reading the Estimates
