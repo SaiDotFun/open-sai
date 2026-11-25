@@ -17,6 +17,11 @@ from . import keeper, log, storage
 from .errors import Code, ExitCode, SaiError
 
 IntentIdentity = tuple[str, str, str]  # Keeper endpoint, account, key
+TRADE_DECIMAL = re.compile(r"(0|[1-9][0-9]*)(\.[0-9]{1,18})?")
+
+
+def is_trade_integer(value: str) -> bool:
+    return value.isascii() and value.isdecimal()
 
 
 @dataclass
@@ -46,7 +51,7 @@ def now() -> str:
 
 def positive(value: str, name: str) -> Decimal:
     try:
-        if not re.fullmatch(r"(0|[1-9][0-9]*)(\.[0-9]{1,18})?", value):
+        if not TRADE_DECIMAL.fullmatch(value):
             raise ValueError
         result = Decimal(value)
         if not result.is_finite() or result <= 0 or result * 10**18 > 2**128 - 1:
@@ -86,7 +91,7 @@ def open_intent(
         valid_slippage = False
     if not valid_slippage:
         raise SaiError(
-            "Slippage must be greater than 0 and at most 100 percent,"
+            "Slippage (--slippage) must be greater than 0 and at most 100 percent,"
             " with at most 18 decimal places and only zeros after the 16th place",
             Code.INVALID_REQUEST,
             exit_code=ExitCode.USAGE,
