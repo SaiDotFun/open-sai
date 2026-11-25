@@ -648,9 +648,17 @@ def test_trade_wait_dry_run(
             assert documents[0] == documents[1]
 
 
-@pytest.mark.parametrize("phase", ["submit", "poll"])
 @pytest.mark.parametrize(
-    "args", [CLOSE, TPSL, LEVERAGE], ids=["close", "tpsl", "leverage"]
+    ("args", "phase"),
+    [
+        pytest.param(args, phase, id=f"{args[0]}-{phase}")
+        for args in (CLOSE, *POSITION_ACTIONS)
+        for phase in (
+            ("submit", "poll", "accepted", "pending")
+            if args in POSITION_ACTIONS
+            else ("submit", "poll")
+        )
+    ],
 )
 def test_trade_wait_interrupt_retains_reservation(
     request: pytest.FixtureRequest,
@@ -663,6 +671,9 @@ def test_trade_wait_interrupt_retains_reservation(
     update = args in UPDATES
     kind = "UPDATE_TRADE" if update else "CLOSE_POSITION"
     preflight_reads = 4 if update else 0
+    acknowledged = phase in ("accepted", "pending")
+    status = phase if acknowledged else "unknown"
+    ledger_status = ("unknown", "pending") if phase == "pending" else (status, None)
     with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
         endpoint,
         replies,
@@ -686,9 +697,26 @@ def test_trade_wait_interrupt_retains_reservation(
             )
             # A zero-length body completes as soon as the headers arrive.
             delayed = Reply(body=b"{}", body_delay=4.0)
-            replies.append(delayed if phase == "submit" else Reply(disconnect=True))
-            if phase == "poll":
-                replies.append(delayed)
+            if acknowledged:
+                replies.extend(
+                    (
+                        lambda request: accepted(submitted_key(request, kind), kind),
+                        lambda _: response(
+                            intent(
+                                "pending_exec" if phase == "pending" else "accepted",
+                                kind=kind,
+                                intentKey=submitted_key(
+                                    requests[preflight_reads], kind
+                                ),
+                                body=UPDATES[args],
+                            )
+                        ),
+                    )
+                )
+            elif phase == "poll":
+                replies.append(Reply(disconnect=True))
+            replies.append(delayed)
+            expected_requests = preflight_reads + 1 + (phase != "submit") + acknowledged
             with subprocess.Popen(
                 [*cli, *command],
                 env=cli_environment(home),
@@ -698,35 +726,35 @@ def test_trade_wait_interrupt_retains_reservation(
             ) as process:
                 try:
                     end = time.monotonic() + 5
-                    expected_requests = preflight_reads + (
-                        1 if phase == "submit" else 2
-                    )
                     while len(requests) < expected_requests and time.monotonic() < end:
                         time.sleep(0.01)
                     assert len(requests) == expected_requests
+                    key = submitted_key(requests[preflight_reads], kind)
+                    assert ledger_state(home) == [(key, *ledger_status)]
                     process.send_signal(signal.SIGINT)
                     stdout, stderr = process.communicate(timeout=2)
                 finally:
                     if process.poll() is None:
                         process.kill()
                 assert process.returncode == 5, (stdout, stderr)
-            key = submitted_key(requests[preflight_reads], kind)
             assert stderr == b""
             document = json.loads(stdout)
             assert document["intentKey"] == key
-            assert document["outcome"] == document["localStatus"] == "unknown"
+            assert document["outcome"] == "unknown"
+            assert document["localStatus"] == status
             assert document["interrupted"] is True
             assert document["code"] == "OUTCOME_UNKNOWN"
             assert document["receipt"] is None
-            assert ledger_state(home) == [(key, "unknown", None)]
-            if phase == "poll":
-                assert json.loads(requests[-1].body)["variables"]["key"] == key
+            assert ledger_state(home) == [(key, *ledger_status)]
+            for poll in requests[preflight_reads + 1 :]:
+                assert json.loads(poll.body)["variables"]["key"] == key
             if update:
                 queue_update_preflight(replies)
             again = invoke(cli, home, *command)
             assert again.returncode == 1, again
             assert json.loads(again.stdout)["error"]["intentKey"] == key
             assert len(requests) == expected_requests + preflight_reads
+            assert ledger_state(home) == [(key, *ledger_status)]
             assert not replies
             documents.append(normalized(document, key))
     assert documents[0] == documents[1]
@@ -924,17 +952,40 @@ def test_trade_wait_recovers_when_stdout_closes(
     assert documents[0] == documents[1]
 
 
+@pytest.mark.parametrize("args", [CLOSE, *POSITION_ACTIONS], ids=lambda args: args[0])
 def test_trade_wait_interrupts_a_full_stdout_pipe(
-    wait_cli_pair: tuple[CLI, CLI],
+    request: pytest.FixtureRequest,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    args: tuple[str, ...],
 ) -> None:
-    kind = "CLOSE_POSITION"
-    with replay() as (endpoint, replies, requests):
-        for index, cli in enumerate(wait_cli_pair):
+    update = args in UPDATES
+    kind = "UPDATE_TRADE" if update else "CLOSE_POSITION"
+    change = {TPSL: "tpsl_updated", LEVERAGE: "leverage_updated"}.get(
+        args, "position_closed_user"
+    )
+    preflight_reads = 4 if update else 0
+    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
+        endpoint,
+        replies,
+        requests,
+    ):
+        for index, cli in enumerate(trade_wait_pair(request, args)):
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
             requests.clear()
+            if update:
+                queue_update_preflight(replies)
+
+            def index_receipt(_: Request) -> Reply:
+                key = submitted_key(requests[preflight_reads], kind)
+                row = (
+                    indexed_update(change, key, args)
+                    if update
+                    else indexed(change, intentKey=key)
+                )
+                return response(history(row))
+
             replies.extend(
                 (
                     lambda request: accepted(submitted_key(request, kind), kind),
@@ -942,17 +993,11 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
                         intent(
                             "filled",
                             kind=kind,
-                            intentKey=submitted_key(requests[0], kind),
+                            intentKey=submitted_key(requests[preflight_reads], kind),
+                            body=UPDATES.get(args, {}),
                         )
                     ),
-                    lambda _: response(
-                        history(
-                            indexed(
-                                "position_closed_user",
-                                intentKey=submitted_key(requests[0], kind),
-                            )
-                        )
-                    ),
+                    index_receipt,
                 )
             )
             read_fd, write_fd = os.pipe()
@@ -964,7 +1009,17 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
                 os.set_blocking(write_fd, True)
             try:
                 with subprocess.Popen(
-                    [*cli, "--endpoint", endpoint, "--json", "trade", *CLOSE, "--wait"],
+                    [
+                        *cli,
+                        "--endpoint",
+                        endpoint,
+                        "--lcd-endpoint",
+                        endpoint.removesuffix("/query"),
+                        "--json",
+                        "trade",
+                        *args,
+                        "--wait",
+                    ],
                     env=cli_environment(home),
                     cwd=home.parent,
                     stdout=write_fd,
@@ -972,9 +1027,10 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
                 ) as process:
                     try:
                         end = time.monotonic() + 3
-                        while len(requests) < 3 and time.monotonic() < end:
+                        expected = preflight_reads + 3
+                        while len(requests) < expected and time.monotonic() < end:
                             time.sleep(0.01)
-                        assert len(requests) == 3
+                        assert len(requests) == expected
                         time.sleep(0.15)
                         assert process.poll() is None
                         assert os.get_blocking(write_fd), (
@@ -1000,8 +1056,10 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
             finally:
                 os.close(read_fd)
                 os.close(write_fd)
-            key = submitted_key(requests[0], kind)
+            key = submitted_key(requests[preflight_reads], kind)
             assert document["intentKey"] == key
             assert document["interrupted"] is True
             assert document["localStatus"] == document["outcome"] == "terminal"
+            assert document["receipt"] is None
             assert ledger_state(home) == [(key, "terminal", "terminal")]
+            assert not replies
