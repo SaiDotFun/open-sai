@@ -984,6 +984,7 @@ class Install:
         check: bool = True,
         timeout: float = 300,
         env: dict[str, str] | None = None,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             # File-backed input stays readable across communicate() timeouts.
@@ -992,7 +993,7 @@ class Install:
                 source.seek(0)
                 with owned_process(
                     command,
-                    self.cwd,
+                    cwd or self.cwd,
                     self.env if env is None else env,
                     stdin=source,
                 ) as process:
@@ -1019,8 +1020,8 @@ class Install:
                 log.write(f"\n[{step}] stdout\n".encode() + stdout)
                 log.write(f"\n[{step}] stderr\n".encode() + stderr)
 
-    def json(self, step: str, *args: str) -> Any:
-        return json.loads(self.run(step, self.sai, "--json", *args).stdout)
+    def json(self, step: str, *args: str, cwd: Path | None = None) -> Any:
+        return json.loads(self.run(step, self.sai, "--json", *args, cwd=cwd).stdout)
 
     def verify_version(self, version: str) -> None:
         result = self.run("Run the launcher", self.sai, "--version")
@@ -1792,7 +1793,9 @@ def verify_codex_mcp(tool: Install) -> None:
         )
 
 
-def cutover_update(tool: Install, base: str, version: str) -> dict[str, Any]:
+def cutover_update(
+    tool: Install, base: str, version: str, *, cwd: Path | None = None
+) -> dict[str, Any]:
     report = tool.json(
         f"Update to {version}",
         "update",
@@ -1802,6 +1805,7 @@ def cutover_update(tool: Install, base: str, version: str) -> dict[str, Any]:
         base,
         "--web-base",
         base,
+        cwd=cwd,
     )
     require(
         report.get("status") == "updated" and report.get("target") == version,
@@ -1810,9 +1814,9 @@ def cutover_update(tool: Install, base: str, version: str) -> dict[str, Any]:
     return report
 
 
-def cutover_doctor(tool: Install) -> dict[str, Any]:
+def cutover_doctor(tool: Install, label: str, *, cwd: Path) -> dict[str, Any]:
     result = tool.run(
-        "Run native doctor", tool.sai, "--json", "doctor", "--offline", check=False
+        label, tool.sai, "--json", "doctor", "--offline", check=False, cwd=cwd
     )
     report = json.loads(result.stdout)
     report = report.get("error", {}).get("details", report)
@@ -1949,9 +1953,20 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
 
         cutover_update(tool, base, bridge)
         tool.verify_version(bridge)
+
+        def python_doctor_from_home() -> None:
+            mcp.seed("cursor", stale=True)
+            doctors = cutover_doctor(tool, "Run Python doctor from HOME", cwd=tool.home)
+            require(
+                doctors.get("mcp.cursor", {}).get("status") == "fixed",
+                "Python doctor did not report a successful Cursor repair from HOME",
+            )
+            mcp.verify("cursor")
+
+        check("Python doctor repairs Cursor from HOME", python_doctor_from_home)
         for client in CUTOVER_CLIENTS:
             mcp.seed(client, stale=True)
-        update = cutover_update(tool, base, native)
+        update = cutover_update(tool, base, native, cwd=tool.home)
         tool.verify_version(native)
         digest = release_install.file_digest(assets.archive)
         binaries = list(tool.sai_home.glob(f"bin/*/{native}/*/{digest}/sai"))
@@ -2000,11 +2015,17 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
             "Bridge update reports a Claude Code repair and the native command applies it",
             repair_claude,
         )
-        for client in ("codex", "cursor"):
-            check(
-                f"Bridge update MCP {client}",
-                lambda client=client: mcp.verify(client),
+
+        def bridge_cursor() -> None:
+            cursor = [row for row in update.get("mcp", []) if row["client"] == "cursor"]
+            require(
+                len(cursor) == 1 and cursor[0]["status"] == "fixed",
+                "The bridge update did not report a successful Cursor repair from HOME",
             )
+            mcp.verify("cursor")
+
+        check("Bridge update MCP codex", lambda: mcp.verify("codex"))
+        check("Bridge update repairs Cursor from HOME", bridge_cursor)
 
         def profile() -> None:
             require(config.read_bytes() == config_bytes, "The config file changed")
@@ -2054,19 +2075,26 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
             for row in intent_log(tool, key)
             if row["version"] == native and row["event"] == "intent.keeper"
         ]
-        for client in ("codex", "cursor"):
-            mcp.seed(client, stale=True)
-        doctor = cutover_doctor(tool)
-        for client in CUTOVER_CLIENTS:
-            if client != "claude":
-                print(
-                    f"Native doctor MCP {client} status {doctor.get(f'mcp.{client}', {}).get('status', 'missing')}",
-                    flush=True,
-                )
-            check(
-                f"Native doctor MCP {client}",
-                lambda client=client: mcp.verify(client),
+
+        def verify_doctor_mcp(doctor: dict[str, Any], client: str) -> None:
+            expected = "pass" if client == "claude" else "fixed"
+            status = doctor.get(f"mcp.{client}", {}).get("status", "missing")
+            require(
+                status == expected, f"Doctor reported {status}, expected {expected}"
             )
+            mcp.verify(client)
+
+        for location, cwd in (("project", tool.cwd), ("HOME", tool.home)):
+            for client in ("codex", "cursor"):
+                mcp.seed(client, stale=True)
+            doctor = cutover_doctor(tool, f"Run native doctor from {location}", cwd=cwd)
+            for client in CUTOVER_CLIENTS:
+                check(
+                    f"Native doctor from {location} MCP {client}",
+                    lambda client=client, doctor=doctor: verify_doctor_mcp(
+                        doctor, client
+                    ),
+                )
 
         # Restore the good entries from before the doctor probe. Add a stale
         # Cursor alias to check repair and startup independently on rollback.
