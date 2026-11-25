@@ -13,18 +13,21 @@ import sqlite3
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
 from dataclasses import dataclass, replace
+from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from stat import S_IMODE
 from typing import Any
 
 import pytest
+from compare import is_version
 from sai_cli.core import keeper, log, reconcile, storage
 from sai_cli.tests.loopback import graphql_ws
 from websockets.http11 import Request as UpgradeRequest
@@ -450,14 +453,29 @@ def test_c11_first_write_restores_owner_directory_mode(
     assert profiles[0] == profiles[1]
 
 
-def read_events(home: Path, *, c4_reference: bool = False) -> list[dict[str, Any]]:
+@cache
+def cli_version(cli: CLI) -> str:
+    with tempfile.TemporaryDirectory(prefix="sai-parity-version-") as directory:
+        result = invoke(cli, Path(directory) / "sai", "--version")
+    assert result.returncode == 0, result.stderr
+    version = result.stdout.decode().split()[-1]
+    assert is_version(version)
+    return version
+
+
+def read_events(
+    home: Path, cli: CLI, *, c4_reference: bool = False
+) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
         for line in path.read_bytes().splitlines()
     ]
     groups: dict[str, list[int]] = {}
+    version = cli_version(cli)
     for event in events:
+        assert event["version"] == version
+        event["version"] = "<version>"
         if c4_reference:
             # The C4 pin predates the v2 envelope and keyed endpoint identity.
             for field in ("schema", "commandId", "endpointId"):
@@ -546,9 +564,11 @@ def public_intent_output(output: bytes, *, compact: bool) -> bytes:
     ).encode()
 
 
-def legacy_status_events(home: Path, *, reference: bool) -> list[dict[str, Any]]:
+def legacy_status_events(
+    home: Path, cli: CLI, *, reference: bool
+) -> list[dict[str, Any]]:
     """Compare event payloads across the two reference versions."""
-    events = read_events(home, c4_reference=True)
+    events = read_events(home, cli, c4_reference=True)
     for event in events:
         if event["event"] == "keeper.request":
             event.pop("intentKey", None)
@@ -647,7 +667,9 @@ def compare(
                         state,
                     )
                 )
-            observed.append((runs, legacy_status_events(home, reference=index == 0)))
+            observed.append(
+                (runs, legacy_status_events(home, cli, reference=index == 0))
+            )
         assert observed[0] == observed[1]
 
 
@@ -903,7 +925,8 @@ def test_c11_intent_status_skips_null_records(
             assert intent["lifecycleStep"] == "intent_start"
         else:
             assert document == {"userIntents": []}
-            assert all(event["event"] != "intent.keeper" for event in read_events(home))
+            events = read_events(home, cli)
+            assert all(event["event"] != "intent.keeper" for event in events)
         # Even an expired local reservation stays unknown when Keeper sent
         # a nonempty list with no usable record.
         assert read_state(home)[1:] == ledger
@@ -964,7 +987,7 @@ def test_intent_status_logs_only_public_graphql_codes(
                 assert document["outcome"] == "pending"
             [event] = [
                 event
-                for event in read_events(home)
+                for event in read_events(home, cli)
                 if event["event"] == "keeper.request"
                 and event["operation"] == operation
             ]
@@ -1002,7 +1025,7 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
             outputs.append(
-                (result.stdout, legacy_status_events(home, reference=index == 0))
+                (result.stdout, legacy_status_events(home, cli, reference=index == 0))
             )
         assert outputs[0] == outputs[1]
 
@@ -1135,7 +1158,7 @@ def test_expired_auth_status(
                 'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
             )
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        events = read_events(home)
+        events = read_events(home, cli)
         [start] = [event for event in events if event["event"] == "command.start"]
         command_words = ["auth", "status"]
         # The C4 reference predates auth argument privacy. Assert each form
@@ -1474,7 +1497,7 @@ def assert_watch_disconnect(
     )
     assert [
         (event["level"], event["code"], event["errorType"], event["endpoint"])
-        for event in read_events(home)
+        for event in read_events(home, cli)
         if event["event"] == "watch.disconnected"
     ] == [("warn", "STREAM_ERROR", error_type, ws.removesuffix("/query"))]
 
