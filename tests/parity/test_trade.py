@@ -839,6 +839,42 @@ def test_open_retry_preserves_first_reservation(
     assert observations[0] == observations[1]
 
 
+def test_open_retry_is_in_the_blocking_intent_trail(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The released Python reference predates scoped open-refusal events.
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    args = (*OPEN, "--type", "limit")
+    for index, cli in enumerate(clis):
+        with loopback("trade-accepted") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, first, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert (code, stderr) == (0, "")
+            key = first["intentKey"]
+            code, blocked, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert (code, stderr) == (1, "")
+            assert blocked["error"]["code"] == "RECENT_OPEN_PENDING"
+            code, trail, stderr = run(
+                cli,
+                home,
+                endpoints,
+                ("logs", "intent", key, "--offline"),
+                python=index == 0,
+            )
+            assert (code, stderr) == (0, "")
+            [refusal] = [
+                event
+                for event in trail["events"]
+                if event["event"] == "intent.open_blocked"
+            ]
+            assert refusal["intentKey"] == key and refusal["addr"] == ADDRESS
+            assert refusal["code"] == blocked["error"]["code"]
+            assert [entry.label for entry in endpoints.wire] == ["recordUserIntent"]
+            assert not endpoints.errors
+
+
 def test_connect_failure_releases_reservation(
     trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:

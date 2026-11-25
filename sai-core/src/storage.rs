@@ -88,8 +88,8 @@ pub struct Storage<'a> {
     events: Option<&'a (dyn Fn(StorageEvent<'_>) + Sync)>,
 }
 
-/// State changes to pass to the shared log writer. The event sink runs only
-/// after the operation has committed. Endpoints contain only the URL origin.
+/// Storage events for the shared log writer. State changes are emitted after
+/// commit. Endpoints contain only the URL origin.
 pub enum StorageEvent<'a> {
     SessionSaved {
         addr: &'a str,
@@ -114,6 +114,11 @@ pub enum StorageEvent<'a> {
         kind: &'a str,
         addr: &'a str,
         entity: &'a str,
+        endpoint: &'a str,
+    },
+    OpenBlocked {
+        key: &'a str,
+        addr: &'a str,
         endpoint: &'a str,
     },
     IntentStatus {

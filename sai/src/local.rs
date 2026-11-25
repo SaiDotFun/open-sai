@@ -363,6 +363,23 @@ pub(crate) fn storage_event_with_endpoint(
                 ],
             );
         }
+        StorageEvent::OpenBlocked {
+            key,
+            addr,
+            endpoint,
+        } => {
+            events.event(
+                "intent.open_blocked",
+                Level::Warn,
+                [
+                    ("intentKey", json!(key).into()),
+                    ("addr", json!(addr).into()),
+                    ("endpoint", Field::Endpoint(endpoint.into())),
+                    ("endpointId", endpoint_id()),
+                    ("code", json!(Code::RecentOpenPending).into()),
+                ],
+            );
+        }
         StorageEvent::IntentStatus {
             key,
             kind,
