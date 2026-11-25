@@ -384,7 +384,7 @@ def test_intent_wait(
             ]
             waits = [
                 event
-                for event in read_events(home)
+                for event in read_events(home, cli)
                 if event["event"].startswith("intent.wait.")
             ]
             assert [event["event"] for event in waits] == [

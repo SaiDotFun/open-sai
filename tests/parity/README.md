@@ -65,6 +65,24 @@ The `auth-use-missing` case checks the fixed diagnostic for an
 unregistered account. The auth privacy comparison checks that command logs
 contain only the command words.
 
+## Native Distribution
+
+The Native Distribution workflow installs the built shim wheel with uv on
+each native target and serves the matching archive over loopback. Build the
+loopback-only wheel with `python scripts/native-dist.py rehearsal-wheel DIR`.
+Set `SAI_NATIVE_WHEEL` and `SAI_NATIVE_ARCHIVE` to the rehearsal wheel and archive paths to run
+`uv run --locked pytest tests/parity/test_native_distribution.py`. If uv
+is exposed through a version manager, set `UV` to the uv executable itself.
+Set `SAI_NATIVE_RELEASE_WHEEL` to the official-source wheel to check that it
+ignores the loopback override. The CI bundle contains the official-source wheel.
+
+The Linux x86_64 job also tests upgrade and offline rollback against the
+published Python release `sai-cli/v0.1.1` at commit
+`9ee5a356fd41a22697483e467652d367035909bd`. To run that case locally, set
+`SAI_NATIVE_BASELINE` to a directory with the published wheel and
+`SHA256SUMS`, `scripts/install.py` from the pinned commit as `install.py`,
+and the commit SHA in a file named `commit`.
+
 ## Compare MCP Stdio
 
 Check out Python commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` in a
