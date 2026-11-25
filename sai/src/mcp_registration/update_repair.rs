@@ -73,7 +73,7 @@ pub(crate) fn repair_after_update(
         let target = verified_target(launcher, &home)?;
         Some((Clients { home, cwd }, target))
     }) {
-        for check in clients.check_all(Some(&target), true, false, Duration::from_secs(7)) {
+        for check in clients.check_all(Some(&target), true, None, Duration::from_secs(7)) {
             if !matches!(check.status, "fixed" | "fail") && !check.pinned && !check.legacy_name {
                 continue;
             }

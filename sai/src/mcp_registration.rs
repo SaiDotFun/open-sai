@@ -4,6 +4,7 @@ pub(crate) mod update_repair;
 
 use std::{
     env,
+    ffi::OsStr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -283,8 +284,14 @@ pub(crate) fn in_uv_cache(path: &Path, home: &Path) -> bool {
 }
 
 fn profile(home: &Path) -> Option<String> {
-    let value = env::var_os("SAI_HOME").filter(|v| !v.is_empty())?;
-    let path = Path::new(&value);
+    profile_value(home, &env::var_os("SAI_HOME")?)
+}
+
+fn profile_value(home: &Path, value: &OsStr) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let path = Path::new(value);
     let path = path
         .strip_prefix("~")
         .map_or_else(|_| path.to_owned(), |tail| home.join(tail));
@@ -664,10 +671,15 @@ impl RegistrationCheck {
 pub(crate) fn check_registrations(
     fix: bool,
     timeout: Duration,
+    profile_override: Option<&OsStr>,
 ) -> ClientResult<Vec<RegistrationCheck>> {
     let clients = Clients::open()?;
     let target = doctor_target(&clients.home);
-    Ok(clients.check_all(target.as_ref(), fix, true, timeout))
+    let expected_profile = match profile_override {
+        Some(value) => profile_value(&clients.home, value),
+        None => profile(&clients.home),
+    };
+    Ok(clients.check_all(target.as_ref(), fix, Some(&expected_profile), timeout))
 }
 
 impl Clients {
@@ -675,14 +687,14 @@ impl Clients {
         &self,
         target: Option<&Target>,
         fix: bool,
-        compare_profile: bool,
+        expected_profile: Option<&Option<String>>,
         timeout: Duration,
     ) -> Vec<RegistrationCheck> {
         let deadline = Instant::now() + timeout;
         CLIENTS
             .into_iter()
             .filter(|client| client.detected(&self.home).is_some())
-            .map(|client| self.check(client, target, fix, compare_profile, deadline))
+            .map(|client| self.check(client, target, expected_profile, fix, deadline))
             .collect()
     }
 
@@ -690,8 +702,8 @@ impl Clients {
         &self,
         client: Client,
         target: Option<&Target>,
+        expected_profile: Option<&Option<String>>,
         fix: bool,
-        compare_profile: bool,
         deadline: Instant,
     ) -> RegistrationCheck {
         let install = format!("Run `sai mcp install {}`", client.name());
@@ -734,12 +746,11 @@ impl Clients {
             result.legacy_name = legacy;
             return result;
         }
-        let different_profile = compare_profile && {
-            let expected_profile = profile(&self.home);
+        let different_profile = expected_profile.is_some_and(|expected_profile| {
             inspected
                 .iter()
-                .any(|(_, entry, _)| !entry.matches_profile(&expected_profile))
-        };
+                .any(|(_, entry, _)| !entry.matches_profile(expected_profile))
+        });
         let pinned = target.is_some_and(|target| {
             inspected.iter().any(|(_, entry, issue)| {
                 issue.is_none()
