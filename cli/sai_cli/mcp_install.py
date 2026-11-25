@@ -92,14 +92,13 @@ class Registration:
     def shown(self, target: Target | None) -> dict[str, Any]:
         """Show the expected argv when the saved command matches.
 
-        Saved directories and args can contain private values. An unmatched
-        entry shows only the command's file name.
+        Saved launcher names, directories, and args can contain private values.
         """
         if target is not None and self.matches_command(target):
             return {"command": target.argv}
         if not self.argv:
             return {"command": []}
-        out: dict[str, Any] = {"command": [Path(self.argv[0]).name]}
+        out: dict[str, Any] = {"command": [HIDDEN]}
         if len(self.argv) > 1:
             out["args"] = HIDDEN
         return out
@@ -114,12 +113,11 @@ class Registration:
         )
 
     def matches_command(self, target: Target) -> bool:
-        if self.argv == target.argv:
-            return True
         return bool(
             self.argv
             and target.argv
             and self.argv[1:] == target.argv[1:]
+            and not missing_absolute_launcher(self.argv[0])
             and normalize_launcher(self.argv[0]) == normalize_launcher(target.argv[0])
         )
 
@@ -182,6 +180,12 @@ class Result:
 
 class ClientError(Exception):
     """A client command or config file failed; the message is safe to print."""
+
+
+class CodexPreflightError(ClientError):
+    def __init__(self, message: str, fix: str) -> None:
+        super().__init__(message)
+        self.fix = fix
 
 
 @dataclass(frozen=True)
@@ -391,6 +395,10 @@ def normalize_launcher(command: str) -> str:
     return os.path.join(os.path.realpath(directory), name)
 
 
+def missing_absolute_launcher(command: str) -> bool:
+    return os.path.isabs(command) and shutil.which(command) is None
+
+
 def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
     return Target([launcher, "mcp", "serve"], server_env(environ))
 
@@ -442,12 +450,16 @@ def server_target(
 # --- helpers --------------------------------------------------------------
 
 
-def run(argv: list[str]) -> None:
+def run(
+    argv: list[str], *, cwd: Path | None = None, env: Mapping[str, str] | None = None
+) -> None:
     """Run a client command without relaying output that may contain config values."""
     command = " ".join([Path(argv[0]).name, *argv[1:3]])
     try:
         done = subprocess.run(
             argv,
+            cwd=cwd,
+            env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -558,12 +570,16 @@ def replace_if_unchanged(
 
 
 def replace_bytes(
-    path: Path, data: bytes, seen: bytes | None, *, destination: Path
+    path: Path,
+    data: bytes,
+    seen: bytes | None,
+    *,
+    destination: Path,
 ) -> bool:
     """Write data over path in one rename if path still holds `seen`.
 
-    Keeps the file mode (0600 for a new file). Returns False, writing
-    nothing, when another program changed the file since it was read.
+    Keeps the file mode (0600 for a new file). Returns False if another
+    program has changed the file.
     """
     # Replace the file, including when the configured path is a symlink.
     # Recheck the link before writing so a concurrent retarget is detectable.
@@ -867,15 +883,25 @@ class Codex(Client):
             return
         raise ClientError(STILL_ACTIVE)
 
-    def get(self, cwd: Path, scope: str, name: str = NAME) -> Registration | None:
+    def get(
+        self,
+        cwd: Path,
+        scope: str,
+        name: str = NAME,
+        *,
+        overrides: tuple[str, ...] = (),
+    ) -> Registration | None:
         """Run `codex mcp get` for one Sai server name; keep command and args."""
         exe = self.exe()
         if exe is None:
             return None
         command = f"codex mcp get {name} --json"
+        argv = [exe, "mcp", "get", name, "--json"]
+        for override in overrides:
+            argv.extend(("-c", override))
         try:
             done = subprocess.run(
-                [exe, "mcp", "get", name, "--json"],
+                argv,
                 cwd=cwd,
                 stdin=subprocess.DEVNULL,
                 capture_output=True,
@@ -1096,6 +1122,10 @@ def report_legacy_install(client: Client, reg: Registration, target: Target) -> 
 def install_one(client: Client, scope: str, target: Target, dry_run: bool) -> Result:
     result = Result(client.name, "failed", command=target.argv, scope=scope)
     try:
+        if missing_absolute_launcher(target.argv[0]):
+            raise ClientError(
+                "The requested server launcher is missing or not executable"
+            )
         if isinstance(client, Codex):
             client.check_scope(scope)
             client.require_exe()
@@ -1343,12 +1373,92 @@ def repair_entry(
     return original
 
 
+def codex_restore_hint(name: str, original: dict[str, Any]) -> str:
+    """Show the original invocation's shape without printing saved values."""
+    launcher = original["command"]
+    args = []
+    for arg in original.get("args", []):
+        flag, equals, _ = arg.partition("=")
+        if flag in ENDPOINT_FLAGS or flag == "--as":
+            args.append(f"{flag}=<original-value>" if equals else flag)
+        elif arg in {"mcp", "serve", "--", "--json"}:
+            args.append(arg)
+        else:
+            args.append("<original-argument>")
+    env_count = len(original.get("env", {}))
+    command = shlex.join(
+        [
+            "codex",
+            "mcp",
+            "add",
+            name,
+            *(["--env", "<NAME>=<value>"] * env_count),
+            "--",
+            launcher if launcher in SERVER_NAMES else "<original-launcher>",
+            *args,
+        ]
+    )
+    hint = (
+        "If you need to restore the entry, use the same Codex home. "
+        f"The saved entry has {env_count} environment assignment{'s' if env_count != 1 else ''}. "
+        f"Replace the placeholders with the original values in `{command}`."
+    )
+    if original.keys() - {"command", "args", "env"}:
+        hint += " Restore settings such as tool filters in Codex config.toml."
+    return hint
+
+
+def codex_entry_state(path: Path, name: str, original: dict[str, Any]) -> str:
+    try:
+        current = read_bytes(path)
+        servers = (
+            tomllib.loads(current.decode()).get("mcp_servers", {})
+            if current is not None
+            else {}
+        )
+        entry = servers.get(name) if isinstance(servers, dict) else None
+    except (OSError, ValueError):
+        return "Could not read the current Sai entry."
+    if entry == original:
+        return "The original Sai entry is unchanged."
+    if entry is None:
+        return "The Sai entry is missing."
+    return "The Sai entry was changed by another process."
+
+
+def validate_codex_repair(
+    client: Codex, path: Path, name: str, expected: Target, original: dict[str, Any]
+) -> None:
+    prefix = f"mcp_servers.{name}"
+    launcher = expected.argv[0]
+    overrides = (f"{prefix}.command={tomlkit.string(launcher).as_string()}",)
+    preview = expected
+    if original.get("args", []) != expected.argv[1:]:
+        # Codex treats args as opaque strings. Check the new legacy prefix
+        # without copying saved argument values into the subprocess argv.
+        # The rendered TOML retains the whole argument list.
+        overrides += (f'{prefix}.args=["mcp", "serve"]',)
+        preview = Target([launcher, "mcp", "serve"])
+    try:
+        actual = client.get(client.neutral_dir(), "user", name, overrides=overrides)
+        if actual is not None and actual.matches_command(preview):
+            return
+    except ClientError:
+        pass
+    state = codex_entry_state(path, name, original)
+    raise CodexPreflightError(
+        f"Codex rejected the proposed repair. {state}",
+        codex_restore_hint(name, original),
+    )
+
+
 def edit_codex_config(
     path: Path,
     target: Target | None,
     *,
     stale: StaleRegistration | None = None,
     name: str = NAME,
+    validate: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     """Change only Sai's table, publishing the complete config in one rename."""
     name = stale.name if stale else name
@@ -1367,7 +1477,11 @@ def edit_codex_config(
         except (ValueError, TOMLKitError, TypeError):
             raise ClientError("Could not edit Codex config.toml") from None
         data = rendered.encode()
-        if data == seen or replace_bytes(path, data, seen, destination=destination):
+        if data == seen:
+            return
+        if validate is not None:
+            validate(tomllib.loads(source)["mcp_servers"][name])
+        if replace_bytes(path, data, seen, destination=destination):
             return
     raise ClientError("Codex config.toml changed while Sai was writing it")
 
@@ -1507,10 +1621,14 @@ def replace_registration(
     if isinstance(client, Codex):
         expected = Target([normalize_launcher(target.argv[0]), *stale.args])
         path = client.config_path(scope)
-        edit_codex_config(path, expected, stale=stale)
-        actual = client.get(client.neutral_dir(), "user", name)
-        if actual is None or not actual.matches_command(expected):
-            raise ClientError("Codex did not load the repaired Sai registration")
+        edit_codex_config(
+            path,
+            expected,
+            stale=stale,
+            validate=lambda original: validate_codex_repair(
+                client, path, name, expected, original
+            ),
+        )
         return
     if not isinstance(client, Cursor):
         raise ClientError("Only Codex and Cursor support automatic repair")
@@ -1759,11 +1877,16 @@ def check_registration(
         else:
             try:
                 replace_registration(client, issue, target)
-            except (ClientError, OSError, ValueError, TOMLKitError, TypeError):
+            except (ClientError, OSError, ValueError, TOMLKitError, TypeError) as exc:
+                summary = f"{issue.reason}. Could not repair the {scope} registration"
+                if isinstance(exc, ClientError):
+                    summary += f". {exc}"
                 failures.append(
                     (
-                        f"{issue.reason}. Could not repair the {scope} registration",
-                        "Check this client's Sai registration and rerun `sai doctor`",
+                        summary,
+                        exc.fix
+                        if isinstance(exc, CodexPreflightError)
+                        else "Check this client's Sai registration and rerun `sai doctor`",
                     )
                 )
             else:
