@@ -115,10 +115,11 @@ for the token and never returns it.
 3. Call the `trade_*` tool with the same arguments, the same `addr`, and the
    preview's digest.
 
-A signed-out `preview_open` without `addr` can return `addr: null` and a
-`previewDigest`. Use it for estimates only. The digest changes when the
-preview names a connected account. After sign-in, preview again with that
-account's `addr` before asking for confirmation.
+A signed-out `preview_open` with no account returns estimates with
+`addr: null` and `confirmationStatus: "informational"`. The result omits
+`previewDigest`. When
+`recovery.action` is `connect_and_preview`, connect a Sai account, then call
+`preview_open` with that account's `addr` before asking for confirmation.
 
 Outputs use camelCase and inputs use snake_case:
 
@@ -180,16 +181,26 @@ the stored trigger after checking that the order can fill. The worst fill is
 A stop can miss its fill when a gap takes the price outside that bound.
 [trading-safety.md](trading-safety.md) rule 3 has the full rule.
 
-On `PREVIEW_MISMATCH` or `PRICE_MOVED`, nothing was submitted. Use the
-replacement `preview` only if Sai can verify the quote. For a partial
-close, check that `quote.collateralPriceUsd` has a value. A USDC estimate
-can still have a digest when that field is `null`.
+On `PREVIEW_MISMATCH` or `PRICE_MOVED`, the server refused submission.
+For `PREVIEW_MISMATCH`, the `quoteStatus` field tells you which
+`recovery.action` to follow.
 
-If the replacement is missing or lacks a verifiable quote, wait until Sai
-can verify the quote and call the matching `preview_*` tool again. Ask for
-confirmation only when the preview shows a verifiable quote, including the
-collateral price for a partial close. Discard the old digest and submit with
-the new `preview_digest` and, for a market open, the new `reference_price`.
+- `available` with `confirm_preview`. Show the replacement `preview` and
+  get confirmation before retrying with its `previewDigest` and, for a
+  market open, its `referencePrice`.
+- `unavailable` with `request_preview`. Check the reported cause and request
+  a fresh preview if the trade is still possible. A contract rejection can
+  include a diagnostic `preview` without a `previewDigest`.
+
+For `PRICE_MOVED`, check that the replacement `preview` has a
+`previewDigest`. Show it and get confirmation before retrying with its
+`previewDigest` and `referencePrice`. If the digest is absent, address the
+reported rejection and request a fresh preview before asking for confirmation.
+
+For a partial close, check that `quote.collateralPriceUsd` has a value
+before asking for confirmation. An estimated preview can carry a digest
+while that field is `null`. Wait for the collateral price and request a
+fresh preview in that case.
 
 To cancel a pending order, pass `cancel_order=true` to `preview_close` and
 `trade_close`. Both check that the order is pending. If it fills after the

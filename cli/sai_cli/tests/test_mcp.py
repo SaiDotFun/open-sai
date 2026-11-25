@@ -6,17 +6,21 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import select
+import signal
 import subprocess
 import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import Event
 from typing import Any, TextIO
 
 import pytest
 from click.testing import CliRunner
 from loopback_keeper import (
     POSITION_ROUTE,
+    KeeperHandler,
     PositionKeeperHandler,
     keeper_server,
     position_data,
@@ -201,6 +205,26 @@ def test_no_tool_accepts_a_token_or_passphrase(mcp):
             assert "token" not in field and "pass" not in field, tool.name
 
 
+def test_position_quote_trade_descriptions_explain_mismatch_recovery(mcp):
+    async def descriptions() -> dict[str, str | None]:
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            return {
+                tool.name: tool.description
+                for tool in (await client.list_tools()).tools
+            }
+
+    listed = asyncio.run(descriptions())
+    for name in ("trade_margin", "trade_partial_close"):
+        description = listed[name]
+        assert description is not None
+        assert "PREVIEW_MISMATCH" in description
+        assert "recovery.action" in description
+        assert "quoteStatus=available" in description
+        assert "quoteStatus=unavailable" in description
+
+
 def names(mcp: FastMCP) -> set[str]:
     return {tool.name for tool in mcp._tool_manager.list_tools()}
 
@@ -328,6 +352,59 @@ def test_signed_in_malformed_trade_still_gets_validation_errors(mcp):
     assert "trade_id" in text_of(called.content)
 
 
+@pytest.mark.parametrize(
+    ("name", "arguments", "field", "protocol_error"),
+    [
+        *(
+            (
+                "preview_open",
+                {
+                    "market_id": 3,
+                    "side": "long",
+                    "order_type": "limit",
+                    "amount": "20",
+                    "leverage": "2",
+                    "slippage": "1",
+                    "price": "100",
+                },
+                field,
+                field == "market_id",
+            )
+            for field in (
+                "market_id",
+                "amount",
+                "leverage",
+                "slippage",
+                "price",
+                "take_profit",
+                "stop_loss",
+            )
+        ),
+        ("preview_close", {"trade_id": 7}, "trade_id", True),
+        ("preview_partial_close", {"trade_id": 7, "percent": 50}, "percent", True),
+        ("trade_close", {"trade_id": 7, "preview_digest": "0" * 64}, "trade_id", True),
+    ],
+)
+def test_trade_tools_reject_non_ascii_digits(
+    mcp, name, arguments, field, protocol_error
+):
+    storage.save_session(stored_session())
+
+    async def call() -> Any:
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            return await client.call_tool(name, {**arguments, field: "3٣"})
+
+    called = asyncio.run(call())
+    assert called.isError is protocol_error
+    message = text_of(called.content)
+    if protocol_error:
+        assert field in message
+    else:
+        assert json.loads(message)["code"] == "INVALID_REQUEST"
+
+
 def test_signed_out_trade_close_over_the_client_returns_signed_out(mcp, monkeypatch):
     fake = FakeKeeper()
     monkeypatch.setattr(keeper, "request", fake)
@@ -355,12 +432,15 @@ def served_settings(monkeypatch, flags) -> settings.Settings:
         def run(self) -> None:
             pass
 
-    def build(resolved: settings.Settings | None = None) -> Idle:
+    def build(
+        resolved: settings.Settings | None = None, *, standalone_stdio: bool = False
+    ) -> Idle:
+        assert standalone_stdio
         seen.append(resolved)
         return Idle()
 
     monkeypatch.setattr(server, "create_server", build)
-    server.serve(flags)
+    server.serve(flags, standalone=True)
     assert len(seen) == 1 and seen[0] is not None
     return seen[0]
 
@@ -675,6 +755,72 @@ TRADES = (
 )
 
 
+@pytest.mark.parametrize("malformed", ["3_0", " 7 ", "+7", True, 7.0, -1])
+def test_trade_tool_integer_positions_reject_coercion(mcp, malformed):
+    storage.save_session(stored_session())
+
+    async def check() -> None:
+        async with create_connected_server_and_client_session(
+            mcp._mcp_server
+        ) as client:
+            for name, arguments in (*PREVIEWS, *TRADES):
+                if name.startswith("trade_"):
+                    arguments = {**arguments, "preview_digest": "0" * 64}
+                for field in arguments.keys() & {"market_id", "trade_id", "percent"}:
+                    called = await client.call_tool(
+                        name, {**arguments, field: malformed}
+                    )
+                    assert called.isError, (name, field, malformed)
+                    assert field in text_of(called.content)
+
+    asyncio.run(check())
+
+
+def test_trade_tool_accepts_a_plain_digit_string(monkeypatch):
+    class Keeper(PositionKeeperHandler):
+        def do_POST(self):
+            request = self.read_json()
+            if request["query"] == keeper.POSITION:
+                data = position_data(request["variables"])
+            elif request["query"] == keeper.ROUTE:
+                data = POSITION_ROUTE
+            else:
+                self.send_error(503)
+                return
+            self.reply({"data": data})
+
+    with keeper_server(Keeper) as base:
+        endpoint = f"{base}/query"
+        monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        monkeypatch.setenv("SAI_LCD_ENDPOINT", base)
+        storage.save_session(stored_session(endpoint=endpoint))
+        preview = invoke(server.create_server(), "preview_close", {"trade_id": "007"})
+    assert preview["intent"]["target"]["userTradeId"] == "7"
+
+
+@pytest.mark.parametrize("amount", ["٣", "3_0", " 30 ", "0.0000001", "0"])
+def test_preview_margin_validates_amount_before_keeper(monkeypatch, amount):
+    requests = []
+
+    class Keeper(KeeperHandler):
+        def do_POST(self):
+            requests.append(self.path)
+            self.send_error(503)
+
+    with keeper_server(Keeper) as base:
+        endpoint = f"{base}/query"
+        monkeypatch.setenv("SAI_ENDPOINT", endpoint)
+        storage.save_session(stored_session(endpoint=endpoint))
+        error = invoke(
+            server.create_server(),
+            "preview_margin",
+            {"trade_id": 7, "direction": "add", "amount": amount},
+        )
+    assert error["code"] == "INVALID_REQUEST"
+    assert "Margin amount" in error["error"]
+    assert requests == []
+
+
 @pytest.mark.parametrize(("name", "arguments"), PREVIEWS)
 def test_previews_never_submit(mcp, monkeypatch, name, arguments):
     storage.save_session(stored_session())
@@ -978,27 +1124,6 @@ def test_unknown_arguments_are_rejected(mcp, monkeypatch):
 MARKET_OPEN = {**OPEN_ARGS, "order_type": "market", "price": None}
 
 
-def test_preview_with_no_account_never_authorizes_a_trade(mcp, monkeypatch):
-    fake = FakeKeeper({keeper.MARKETS: markets()})
-    monkeypatch.setattr(keeper, "request", fake)
-    preview = invoke(mcp, "preview_open", MARKET_OPEN)
-    assert preview["addr"] is None
-    storage.save_session(stored_session())
-    error = invoke(
-        mcp,
-        "trade_open",
-        {
-            **MARKET_OPEN,
-            "preview_digest": preview["previewDigest"],
-            "reference_price": preview["referencePrice"],
-            "allow_concurrent_open": True,
-        },
-    )
-    assert error["code"] == "PREVIEW_MISMATCH"
-    assert error["preview"]["addr"] == ADDR
-    assert fake.submitted == []
-
-
 def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
     """A signed-out preview, then sign-in, then logout while the market
     price refreshes: the trade must not submit with the session it loaded
@@ -1020,7 +1145,7 @@ def test_logout_during_the_price_refresh_refuses_the_trade(mcp, monkeypatch):
         "trade_open",
         {
             **MARKET_OPEN,
-            "preview_digest": preview["previewDigest"],
+            "preview_digest": confirmation.preview_digest(preview),
             "reference_price": preview["referencePrice"],
             "allow_concurrent_open": True,
         },
@@ -1480,6 +1605,188 @@ def test_sai_mcp_serve_writes_only_protocol_to_stdout(tmp_path, global_flags):
         assert secret not in json.dumps(called) + stderr + logs
 
 
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
+@pytest.mark.parametrize("stop", [signal.SIGINT, signal.SIGTERM])
+def test_sai_mcp_serve_stops_while_stdin_is_open(tmp_path, stop):
+    initialize = {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    }
+    with subprocess.Popen(
+        [*sai_command(), "mcp", "serve"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"SAI_HOME": str(tmp_path), "PATH": os.defpath},
+        text=True,
+    ) as process:
+        assert process.stdin is not None and process.stdout is not None
+        assert process.stderr is not None
+        try:
+            process.stdin.write(rpc(1, "initialize", initialize))
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0], "MCP did not reply"
+            assert json.loads(process.stdout.readline())["id"] == 1
+
+            process.send_signal(stop)
+            code = process.wait(timeout=5)
+            assert code == 0, process.stderr.read()
+            assert process.stdout.read() == ""
+            assert process.stderr.read() == ""
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
+def test_mcp_serve_returns_to_its_in_process_caller_after_sigint(tmp_path):
+    script = """
+import time
+from sai_cli.mcp_server.stdio import SHUTDOWN_EXIT_TIMEOUT
+from sai_cli.sai_cli import main
+
+main.main(args=["mcp", "serve"], standalone_mode=False)
+time.sleep(SHUTDOWN_EXIT_TIMEOUT + 0.2)
+print("caller still running", flush=True)
+"""
+    initialize = {
+        "protocolVersion": "2025-06-18",
+        "capabilities": {},
+        "clientInfo": {"name": "test", "version": "0"},
+    }
+    with subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env={"SAI_HOME": str(tmp_path), "PATH": os.defpath},
+        text=True,
+    ) as process:
+        assert process.stdin is not None and process.stdout is not None
+        try:
+            process.stdin.write(rpc(1, "initialize", initialize))
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0]
+            assert json.loads(process.stdout.readline())["id"] == 1
+            process.send_signal(signal.SIGINT)
+            assert process.wait(timeout=5) == 0
+            assert process.stdout.read() == "caller still running\n"
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires POSIX signals and pipes")
+@pytest.mark.parametrize(
+    ("keeper_call", "close_stdin", "stop"),
+    [
+        ("finishes", False, signal.SIGINT),
+        ("blocks", False, signal.SIGINT),
+        ("client-cancelled", False, signal.SIGINT),
+        ("finishes", True, None),
+        ("blocks", True, None),
+        ("blocks", True, signal.SIGINT),
+        ("blocks", True, signal.SIGTERM),
+        ("client-cancelled", True, signal.SIGTERM),
+    ],
+)
+def test_sai_mcp_serve_replies_to_in_flight_request_on_shutdown(
+    tmp_path, keeper_call, close_stdin, stop
+):
+    started = Event()
+    release = Event()
+
+    class Keeper(KeeperHandler):
+        def do_POST(self):
+            started.set()
+            if release.wait(10):
+                try:
+                    self.reply({"data": {"perp": {"borrowings": []}}})
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+
+    with (
+        keeper_server(Keeper) as base,
+        subprocess.Popen(
+            [*sai_command(), "mcp", "serve", "--endpoint", f"{base}/query"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={"SAI_HOME": str(tmp_path), "PATH": os.defpath},
+            text=True,
+        ) as process,
+    ):
+        assert process.stdin is not None and process.stdout is not None
+        assert process.stderr is not None
+        try:
+            process.stdin.write(
+                rpc(
+                    1,
+                    "initialize",
+                    {
+                        "protocolVersion": "2025-06-18",
+                        "capabilities": {},
+                        "clientInfo": {"name": "test", "version": "0"},
+                    },
+                )
+            )
+            process.stdin.flush()
+            assert select.select([process.stdout], [], [], 10)[0], (
+                "MCP did not initialize"
+            )
+            assert json.loads(process.stdout.readline())["id"] == 1
+
+            process.stdin.write(rpc(None, "notifications/initialized", {}))
+            process.stdin.write(
+                rpc(2, "tools/call", {"name": "market_list", "arguments": {}})
+            )
+            process.stdin.flush()
+            assert started.wait(5), "MCP did not reach Keeper"
+
+            if keeper_call == "client-cancelled":
+                process.stdin.write(
+                    rpc(None, "notifications/cancelled", {"requestId": 2})
+                )
+                process.stdin.flush()
+                assert select.select([process.stdout], [], [], 5)[0]
+                cancelled = json.loads(process.stdout.readline())
+                assert (
+                    cancelled["id"] == 2
+                    and "cancelled" in cancelled["error"]["message"]
+                )
+
+            if close_stdin:
+                process.stdin.close()
+                if stop is not None:
+                    # Let the server reach EOF before the client escalates.
+                    with pytest.raises(subprocess.TimeoutExpired):
+                        process.wait(timeout=0.2)
+            if stop is not None:
+                process.send_signal(stop)
+            if keeper_call == "finishes":
+                release.set()
+            assert process.wait(timeout=4) == 0
+            replies = process.stdout.read().splitlines()
+            if keeper_call == "client-cancelled":
+                assert replies == []
+                return
+            (message,) = map(json.loads, replies)
+            assert message["id"] == 2
+            if keeper_call == "finishes":
+                assert message["result"]["isError"] is False
+                assert json.loads(message["result"]["content"][0]["text"]) == {
+                    "perp": {"borrowings": []}
+                }
+            else:
+                assert "shutting down" in message["error"]["message"]
+            assert process.stderr.read() == ""
+        finally:
+            if process.poll() is None:
+                process.kill()
+            release.set()
+
+
 def test_stdio_client_lists_every_tool_from_sai_mcp_serve(tmp_path):
     command, *args = sai_command()
 
@@ -1665,7 +1972,12 @@ def test_bare_sai_mcp_prints_help():
 def test_sai_mcp_serve_takes_the_root_endpoint(monkeypatch):
     """`sai --endpoint X mcp serve` serves X; serve's own flags win."""
     seen: list[dict[str, str | None] | None] = []
-    monkeypatch.setattr(server, "serve", seen.append)
+
+    def serve(flags, *, standalone):
+        assert standalone
+        seen.append(flags)
+
+    monkeypatch.setattr(server, "serve", serve)
     runner = CliRunner()
     url = "http://127.0.0.1:9/query"
     assert runner.invoke(main, ["--endpoint", url, "mcp", "serve"]).exit_code == 0

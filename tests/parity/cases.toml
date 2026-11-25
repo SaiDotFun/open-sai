@@ -742,6 +742,12 @@ seed = "accounts"
 state = { "trader/sessions.json#payload.active" = "0x1111111111111111111111111111111111111111", "trader/sessions.json#@mode" = 0o600 }
 
 [[case]]
+name = "auth-use-missing"
+args = ["--json","auth","use","{addr}"]
+expect = 1
+seed = "config-logs-disabled"
+
+[[case]]
 name = "auth-use-invalid-expiry-text"
 args = ["auth","use","{addr}"]
 mode = "text"
@@ -833,9 +839,56 @@ state = { "trader" = "<absent>" }
 [[case]]
 name = "doctor-network"
 args = ["--json","doctor","--no-fix"]
-accepted_divergence = "lcd-origin-only"
+exact_output = true
 seed = "session"
 wire = ["oneClickTrading","ws:init","node_info"]
+
+[[case]]
+name = "doctor-lcd-unknown-keeper-chain"
+args = ["--json", "doctor", "--no-fix"]
+server = "doctor-lcd-unknown-keeper-chain"
+exact_output = true
+seed = "session"
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
+name = "doctor-lcd-chain-mismatch"
+args = ["--json", "doctor", "--no-fix", "--lcd-endpoint", "{http}/fixture-chain-private"]
+server = "doctor-lcd-chain-mismatch"
+exact_output = true
+seed = "session"
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
+name = "doctor-lcd-chain-mismatch-text"
+args = ["doctor", "--lcd-endpoint", "{http}/fixture-chain-private"]
+mode = "text"
+server = "doctor-lcd-chain-mismatch"
+accepted_divergence = "doctor-keeper-log-context"
+exact_output = true
+seed = "session"
+wire = ["oneClickTrading", "ws:init", "node_info"]
+absent_log_text = ["fixture-chain-private"]
+state = { "logs/cli.jsonl#3.event" = "doctor.result", "logs/cli.jsonl#3.level" = "warn", "logs/cli.jsonl#3.checks.9.id" = "lcd", "logs/cli.jsonl#3.checks.9.status" = "warn" }
+
+[[case]]
+name = "doctor-lcd-invalid-chain"
+args = ["--json", "doctor", "--no-fix"]
+server = "doctor-lcd-invalid-chain"
+exact_output = true
+seed = "session"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
+name = "doctor-lcd-invalid-chain-text"
+args = ["doctor", "--no-fix"]
+mode = "text"
+server = "doctor-lcd-invalid-chain"
+exact_output = true
+seed = "session"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
 
 [[case]]
 name = "doctor-ws-no-subprotocol"
@@ -881,7 +934,16 @@ state = { "logs/cli.jsonl#2.event" = "keeper.request", "logs/cli.jsonl#2.keeperE
 [[case]]
 name = "doctor-lcd-unreachable"
 args = ["--json", "doctor", "--no-fix", "--lcd-endpoint", "{http}/private-fixture-credential"]
-accepted_divergence = "lcd-origin-only"
+exact_output = true
+server = "doctor-lcd-unreachable"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
+name = "doctor-lcd-unreachable-text"
+args = ["doctor", "--no-fix", "--lcd-endpoint", "{http}/private-fixture-credential"]
+mode = "text"
+exact_output = true
 server = "doctor-lcd-unreachable"
 expect = 1
 wire = ["oneClickTrading", "ws:init", "node_info"]
@@ -994,9 +1056,8 @@ state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json
 name = "doctor-mcp-verification-failure"
 args = ["--json", "doctor", "--offline"]
 client_seed = "partial"
-accepted_divergence = "codex-repair-rollback"
 expect = 1
-state = { "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
+state = { "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = true, "clients/.claude.json#changed" = false }
 
 [[case]]
 name = "doctor-mcp-codex-shadow"

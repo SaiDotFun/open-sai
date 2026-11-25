@@ -146,6 +146,26 @@ def _read_envelope(path: Path) -> dict[str, Any] | None:
     return envelope if isinstance(envelope, dict) else {}
 
 
+def is_session_envelope(name: str, value: object) -> bool:
+    """Recognize a supported session format without unlocking any tokens."""
+    if not isinstance(value, dict):
+        return False
+    version = value.get("version")
+    if type(version) is not int:
+        return False
+    if name == "session.json":
+        if version != 2 or value.get("backend") != "test":
+            return False
+    elif version != _VERSION:
+        return False
+    try:
+        nonce = base64.b64decode(value["nonce"], validate=True)
+        ciphertext = base64.b64decode(value["ciphertext"], validate=True)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return len(nonce) == 12 and len(ciphertext) > 16
+
+
 def _load_v2(fields: dict[str, Any]) -> dict[str, Any]:
     """Read a version 2 single-session file as a version 3 account set.
 
@@ -359,7 +379,13 @@ def use_session(
 
 def session_exists() -> bool:
     """Report whether any session file is stored, without reading it."""
-    return (home() / "sessions.json").is_file() or _v2_path().is_file()
+    # Sign-in writes the new file before unlinking the legacy file.
+    return _v2_path().is_file() or _sessions_path().is_file()
+
+
+def _logout_key(accounts: dict[str, Any], addr: str | None) -> str | None:
+    key = accounts["active"] if addr is None else addr.lower()
+    return key if key in accounts["sessions"] else None
 
 
 def delete_session(addr: str | None = None) -> str | None:
@@ -369,6 +395,17 @@ def delete_session(addr: str | None = None) -> str | None:
     Removing the active account leaves no account active. Without ADDR, a
     store that cannot be read is deleted and reported as removed.
     """
+    if not session_exists():
+        return None
+    if not (home() / "sessions.lock").exists():
+        # A legacy or copied store may have no lock yet. Leave it alone if
+        # this logout is a no-op, and re-read under the lock before writing.
+        try:
+            if _logout_key(load_accounts(), addr) is None:
+                return None
+        except ValueError:
+            if addr is not None:
+                raise
     with _locked():
         # Checked under the lock: a sign-in may be migrating the old file.
         if not session_exists():
@@ -386,14 +423,9 @@ def delete_session(addr: str | None = None) -> str | None:
                 reason="unreadable session file",
             )
             return UNREADABLE_REMOVED
-        if addr is None:
-            key = accounts["active"]
-            if key is None:
-                return None
-        else:
-            key = addr.lower()
-            if key not in accounts["sessions"]:
-                return None
+        key = _logout_key(accounts, addr)
+        if key is None:
+            return None
         removed = accounts["sessions"].pop(key)["evmAddress"]
         if accounts["active"] == key:
             accounts["active"] = None
@@ -444,6 +476,7 @@ def _migrate(connection: sqlite3.Connection) -> None:
 # Seconds a ledger write waits for another process's SQLite lock. A caller
 # with a deadline, such as `sai doctor`, lowers it with `busy_timeout`.
 _BUSY_TIMEOUT: ContextVar[float] = ContextVar("busy_timeout", default=10)
+_KEEP_MODES: ContextVar[bool] = ContextVar("keep_modes", default=False)
 
 
 @contextmanager
@@ -457,13 +490,26 @@ def busy_timeout(seconds: float) -> Generator[None]:
         _BUSY_TIMEOUT.reset(token)
 
 
+@contextmanager
+def keep_ledger_modes() -> Generator[None]:
+    """Use the existing ledger without changing its or its directory's mode."""
+    token = _KEEP_MODES.set(True)
+    try:
+        yield
+    finally:
+        _KEEP_MODES.reset(token)
+
+
 def db() -> sqlite3.Connection:
-    path = directory() / "intents.sqlite3"
-    connection = sqlite3.connect(path, timeout=_BUSY_TIMEOUT.get())
+    keep_modes = _KEEP_MODES.get()
+    path = (home() if keep_modes else directory()) / "intents.sqlite3"
+    target = f"{path.absolute().as_uri()}?mode=rw" if keep_modes else str(path)
+    connection = sqlite3.connect(target, uri=keep_modes, timeout=_BUSY_TIMEOUT.get())
     try:
         # Closing a separate file descriptor would release any POSIX locks
         # that another connection in this process holds on the ledger.
-        path.chmod(0o600)
+        if not keep_modes:
+            path.chmod(0o600)
         _migrate(connection)
     except BaseException:
         connection.close()

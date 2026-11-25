@@ -117,7 +117,7 @@ fn chmod(path: &Path, file: &File, info: &Metadata) -> io::Result<Option<String>
     if mode == new {
         return Ok(None);
     }
-    unix::fchmod(file, Mode::from_bits_truncate(new))?;
+    unix::fchmod(file, Mode::from_bits_truncate(new as _))?;
     Ok(Some(format!(
         "chmod {} {mode:o} -> {new:o}",
         path.display()
@@ -242,12 +242,14 @@ impl ProfileDir {
             if info.st_uid != uid {
                 return None;
             }
+            let mode: u32 = info.st_mode as _;
             match FileType::from_raw_mode(info.st_mode) {
-                FileType::Directory if info.st_mode & SHARED == 0 => {
+                FileType::Directory if mode & SHARED == 0 => {
                     let child = self.child(text)?;
                     let fd = File::from(unix::openat(dir, name, DIR_FLAGS, Mode::empty()).ok()?);
                     let opened = fd.metadata().ok()?;
-                    if info.st_dev != opened.dev() || info.st_ino != opened.ino() {
+                    let device: u64 = info.st_dev as _;
+                    if device != opened.dev() || info.st_ino != opened.ino() {
                         return None;
                     }
                     has_data |= child.has_data(&fd, uid)?;

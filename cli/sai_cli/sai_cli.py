@@ -13,6 +13,7 @@ import uuid
 from collections.abc import Callable, Generator, Mapping, Sequence
 from dataclasses import asdict
 from datetime import UTC, datetime
+from decimal import Decimal
 from functools import wraps
 from importlib import metadata
 from pathlib import Path
@@ -37,6 +38,7 @@ from .core import (
     updater,
     wait,
 )
+from .core import preview as estimates
 from .core import session as sessions
 from .core import settings as sai_settings
 from .core.errors import Code, ExitCode, McpStdioError, SaiError, SessionError, describe
@@ -300,6 +302,10 @@ class LoggedGroup(SaiGroup):
         names, audit_names, flag_keys = _command_parts(self, argv)
         private_args = auth_attempt(names, argv)
         quiet = unlogged(names, argv)
+        if names == ["doctor"] and not quiet:
+            from .doctor import can_log_to_profile
+
+            quiet = not can_log_to_profile()
         command = " ".join(names) or ("repl" if not argv else None)
         # Keep only command words for auth, even if a parent parser fails.
         logged_argv = names if private_args else audit_names
@@ -324,6 +330,9 @@ class LoggedGroup(SaiGroup):
             log.silenced()
             if quiet
             else log.bind(surface=surface, command=command, commandId=uuid.uuid4().hex),
+            log.keep_existing_modes()
+            if command == "doctor"
+            else contextlib.nullcontext(),
         ):
             if command == "doctor" and not quiet:
                 # Let doctor report directory creation before logging creates
@@ -331,6 +340,11 @@ class LoggedGroup(SaiGroup):
                 obj["doctor_log_start"] = log_start
             else:
                 log_start()
+            if command == "mcp serve":
+                extra["obj"] = {
+                    **(extra.get("obj") or {}),
+                    "mcp_standalone": standalone_mode,
+                }
             try:
                 result = super().main(
                     args,
@@ -1282,7 +1296,7 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
         return
     output = {"addr": account, **result}
-    if "positionRoute" in result:
+    if confirmation.is_confirmable(output):
         output = confirmation.with_digest(output)
     emit(ctx, output)
 
@@ -1314,8 +1328,78 @@ def warn(message: str) -> None:
     click.echo(message, err=True)
 
 
+def trade_submit_check(
+    load: PinnedSession,
+    digest: str | None,
+    *,
+    reference_price: str | None = None,
+    slippage: str | None = None,
+) -> trading.SubmitCheck | None:
+    if digest is None:
+        return None
+    reference = (
+        intents.positive(reference_price, "Reference price")
+        if reference_price is not None
+        else None
+    )
+
+    def check(preview: dict[str, Any]) -> None:
+        confirmed = {**preview, "addr": load.addr}
+        if reference is not None:
+            confirmed["referencePrice"] = format(reference, "f")
+        if digest != confirmation.preview_digest(confirmed):
+            raise trading.PositionChanged(
+                "The trade no longer matches the confirmed preview. Run with"
+                " --dry-run to review a new preview before submitting."
+            )
+        if reference is not None and slippage is not None:
+            current = Decimal(str(preview["referencePrice"]))
+            moved = estimates.market_price_move(reference, current, slippage)
+            if moved is not None:
+                raise SaiError(
+                    f"The market price moved {moved}% from the confirmed reference,"
+                    f" more than the {slippage}% slippage. Run with --dry-run to"
+                    " review a new preview before submitting.",
+                    Code.PRICE_MOVED,
+                )
+
+    return check
+
+
+preview_digest_option = click.option(
+    "--preview-digest", help="Submit only if the trade matches this dry-run digest."
+)
+
+
+class TradeInt(click.IntRange):
+    name = "integer"
+
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> int:
+        if isinstance(value, str) and not intents.is_trade_integer(value):
+            self.fail(f"{value!r} is not a valid integer.", param, ctx)
+        return super().convert(value, param, ctx)
+
+
+class TradeDecimal(click.types.StringParamType):
+    name = "decimal"
+
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> str:
+        value = super().convert(value, param, ctx)
+        if not intents.TRADE_DECIMAL.fullmatch(value):
+            self.fail(f"{value!r} is not a valid decimal.", param, ctx)
+        return value
+
+
+TRADE_INT = TradeInt()
+TRADE_DECIMAL = TradeDecimal()
+
+
 @trade.command("open")
-@click.option("--market", "market_id", type=int, required=True)
+@click.option("--market", "market_id", type=TRADE_INT, required=True)
 @click.option("--side", type=click.Choice(["long", "short"]), required=True)
 @click.option(
     "--type",
@@ -1323,19 +1407,21 @@ def warn(message: str) -> None:
     type=click.Choice(["market", "limit", "stop"]),
     required=True,
 )
-@click.option("--amount", required=True, help="USDC amount in USD.")
-@click.option("--leverage", required=True)
+@click.option("--amount", type=TRADE_DECIMAL, required=True, help="USDC amount in USD.")
+@click.option("--leverage", type=TRADE_DECIMAL, required=True)
 @click.option(
     "--price",
-    help="Required trigger for limit/stop; optional dry-run reference for market orders. Live market orders use a refreshed price.",
+    type=TRADE_DECIMAL,
+    help="Trigger for limit and stop orders. For market orders, pass the preview's"
+    " reference price when submitting with --preview-digest.",
 )
 @click.option(
     "--slippage",
     required=True,
     help="Maximum slippage percentage, greater than 0 and at most 100.",
 )
-@click.option("--take-profit")
-@click.option("--stop-loss")
+@click.option("--take-profit", type=TRADE_DECIMAL)
+@click.option("--stop-loss", type=TRADE_DECIMAL)
 @click.option(
     "--allow-concurrent-open",
     is_flag=True,
@@ -1344,6 +1430,7 @@ def warn(message: str) -> None:
     " including a late acknowledgement.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_open(
@@ -1359,9 +1446,17 @@ def trade_open(
     stop_loss: str | None,
     allow_concurrent_open: bool,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Open a market, limit, or stop trade."""
     try:
+        market_confirmation = (
+            order_type == "market" and not dry_run and preview_digest is not None
+        )
+        if market_confirmation and price is None:
+            raise ValueError(
+                "Pass the confirmed market preview's referencePrice via --price"
+            )
         emit_trade(
             ctx,
             trading.open_trade(
@@ -1380,6 +1475,19 @@ def trade_open(
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
                 notify=warn,
+                before_price_refresh=(
+                    trade_submit_check(
+                        loader(ctx), preview_digest, reference_price=price
+                    )
+                    if market_confirmation
+                    else None
+                ),
+                before_submit=trade_submit_check(
+                    loader(ctx),
+                    preview_digest,
+                    reference_price=price if market_confirmation else None,
+                    slippage=slippage if market_confirmation else None,
+                ),
             ),
         )
     except (ValueError, KeyError, keeper.KeeperError) as exc:
@@ -1387,17 +1495,22 @@ def trade_open(
 
 
 @trade.command("close")
-@click.argument("trade_id", type=int)
+@click.argument("trade_id", type=TRADE_INT)
 @click.option(
     "--cancel-order",
     is_flag=True,
     help="Cancel a pending order instead of closing a position.",
 )
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_close(
-    ctx: click.Context, trade_id: int, cancel_order: bool, dry_run: bool
+    ctx: click.Context,
+    trade_id: int,
+    cancel_order: bool,
+    dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Close a position or cancel a pending order."""
     try:
@@ -1410,6 +1523,7 @@ def trade_close(
                 cancel_order=cancel_order,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1417,12 +1531,13 @@ def trade_close(
 
 
 @trade.command("tpsl")
-@click.argument("trade_id", type=int)
-@click.option("--take-profit")
-@click.option("--stop-loss")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--take-profit", type=TRADE_DECIMAL)
+@click.option("--stop-loss", type=TRADE_DECIMAL)
 @click.option("--clear-take-profit", is_flag=True)
 @click.option("--clear-stop-loss", is_flag=True)
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_tpsl(
@@ -1433,6 +1548,7 @@ def trade_tpsl(
     clear_take_profit: bool,
     clear_stop_loss: bool,
     dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Set or clear take-profit and stop-loss prices."""
     try:
@@ -1448,6 +1564,7 @@ def trade_tpsl(
                 clear_stop_loss=clear_stop_loss,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
@@ -1455,13 +1572,23 @@ def trade_tpsl(
 
 
 @trade.command("leverage")
-@click.argument("trade_id", type=int)
-@click.option("--leverage", required=True, help="Target leverage as a decimal.")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option(
+    "--leverage",
+    type=TRADE_DECIMAL,
+    required=True,
+    help="Target leverage as a decimal.",
+)
 @click.option("--dry-run", is_flag=True)
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_leverage(
-    ctx: click.Context, trade_id: int, leverage: str, dry_run: bool
+    ctx: click.Context,
+    trade_id: int,
+    leverage: str,
+    dry_run: bool,
+    preview_digest: str | None,
 ) -> None:
     """Set target leverage without changing TP or SL."""
     try:
@@ -1474,31 +1601,11 @@ def trade_leverage(
                 leverage=leverage,
                 dry_run=dry_run,
                 lcd_endpoint=settings(ctx).lcd_endpoint,
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, keeper.KeeperError) as exc:
         trade_error(ctx, exc)
-
-
-def position_submit_check(
-    load: PinnedSession, digest: str | None
-) -> trading.SubmitCheck | None:
-    if digest is None:
-        return None
-
-    def check(preview: dict[str, Any]) -> None:
-        if digest != confirmation.preview_digest({**preview, "addr": load.addr}):
-            raise trading.PositionChanged(
-                "The trade no longer matches the confirmed preview. Run with"
-                " --dry-run to review a new preview before submitting."
-            )
-
-    return check
-
-
-position_digest_option = click.option(
-    "--preview-digest", help="Submit only if the trade matches this dry-run digest."
-)
 
 
 def lcd_trade_settings(
@@ -1512,10 +1619,11 @@ def lcd_trade_settings(
 
 
 @trade.command("margin")
-@click.argument("trade_id", type=int)
+@click.argument("trade_id", type=TRADE_INT)
 @click.option("--direction", type=click.Choice(["add", "remove"]), required=True)
 @click.option(
     "--amount",
+    type=TRADE_DECIMAL,
     required=True,
     help="USDC amount for a leverage quote, not an execution cap.",
 )
@@ -1525,7 +1633,7 @@ def lcd_trade_settings(
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
-@position_digest_option
+@preview_digest_option
 @wait_option
 @click.pass_context
 def trade_margin(
@@ -1553,7 +1661,7 @@ def trade_margin(
                 amount=amount,
                 lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
-                before_submit=position_submit_check(loader(ctx), preview_digest),
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1561,15 +1669,15 @@ def trade_margin(
 
 
 @trade.command("partial-close")
-@click.argument("trade_id", type=int)
-@click.option("--percent", type=click.IntRange(1, 99), required=True)
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--percent", type=TradeInt(1, 99), required=True)
 @click.option(
     "--lcd-endpoint",
     help="Nibiru REST endpoint for exact contract state. Defaults to the"
     " lcd.endpoint setting.",
 )
 @click.option("--dry-run", is_flag=True)
-@position_digest_option
+@preview_digest_option
 @wait_option
 @click.pass_context
 def partial_close(
@@ -1592,7 +1700,7 @@ def partial_close(
                 percent=percent,
                 lcd_endpoint=resolved.lcd_endpoint,
                 dry_run=dry_run,
-                before_submit=position_submit_check(loader(ctx), preview_digest),
+                before_submit=trade_submit_check(loader(ctx), preview_digest),
             ),
         )
     except (ValueError, KeyError, TypeError, keeper.KeeperError) as exc:
@@ -1946,7 +2054,7 @@ def mcp_serve(
     )
     if sys.stdin.isatty():
         click.echo(SERVE_TTY_NOTICE, err=True)
-    server.serve(flags)
+    server.serve(flags, standalone=ctx.obj.get("mcp_standalone", False))
 
 
 def serve_flags(
