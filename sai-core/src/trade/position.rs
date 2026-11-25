@@ -38,7 +38,28 @@ pub(super) struct Snapshot {
 
 pub(super) enum SnapshotError {
     Owner(&'static str),
+    IndexMismatch,
     Unavailable,
+}
+
+pub(super) enum ContractPositionError {
+    Owner,
+    Read(SaiError),
+}
+
+impl From<SaiError> for ContractPositionError {
+    fn from(error: SaiError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl From<ContractPositionError> for SaiError {
+    fn from(error: ContractPositionError) -> Self {
+        match error {
+            ContractPositionError::Owner => invalid(CONTRACT_OWNER),
+            ContractPositionError::Read(error) => error,
+        }
+    }
 }
 
 const KEEPER_OWNER: &str = "Keeper position belongs to a different account";
@@ -49,10 +70,6 @@ impl From<SaiError> for SnapshotError {
     fn from(_: SaiError) -> Self {
         Self::Unavailable
     }
-}
-
-pub(super) fn contract_owner_error() -> SaiError {
-    invalid(CONTRACT_OWNER)
 }
 
 impl PositionRoute {
@@ -113,32 +130,22 @@ impl Trading<'_> {
         Ok(route)
     }
 
-    async fn read_contract_target(
-        lcd: &Lcd<'_>,
-        addr: &str,
-        id: &Value,
-        route: &PositionRoute,
-    ) -> Result<Value, SaiError> {
-        let (raw, _) = lcd
-            .position(&route.contract_address, addr, id, Read::Fresh)
-            .await?;
-        if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
-            return Err(invalid(&format!("Unable to verify contract position {id}")));
-        }
-        Ok(raw)
-    }
-
     pub(super) async fn verify_contract_owner(
         lcd: &Lcd<'_>,
         addr: &str,
         id: &Value,
-        route: &PositionRoute,
-    ) -> Result<(), SaiError> {
-        let raw = Self::read_contract_target(lcd, addr, id, route).await?;
-        if !same_account(addr, raw.get("user")) {
-            return Err(contract_owner_error());
+        route: PositionRoute,
+    ) -> Result<(PositionRoute, Value), ContractPositionError> {
+        let (raw, _) = lcd
+            .position(&route.contract_address, addr, id, Read::Fresh)
+            .await?;
+        if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
+            return Err(invalid(&format!("Unable to verify contract position {id}")).into());
         }
-        Ok(())
+        if !same_account(addr, raw.get("user")) {
+            return Err(ContractPositionError::Owner);
+        }
+        Ok((route, raw))
     }
 
     pub(super) async fn verify_position_owner(
@@ -149,7 +156,7 @@ impl Trading<'_> {
         confirming: bool,
     ) -> Result<PositionRoute, SaiError> {
         let route = self.position_route(lcd, confirming).await?;
-        Self::verify_contract_owner(lcd, addr, id, &route).await?;
+        let (route, _) = Self::verify_contract_owner(lcd, addr, id, route).await?;
         Ok(route)
     }
 
@@ -256,8 +263,10 @@ impl Trading<'_> {
             if !same_account(addr, raw.get("user")) {
                 return Err(SnapshotError::Owner(CONTRACT_OWNER));
             }
-            if raw["user_trade_index"] != format!("UserTradeIndex({id})")
-                || raw["market_index"] != format!("MarketIndex({market_id})")
+            if raw["user_trade_index"] != format!("UserTradeIndex({id})") {
+                return Err(SnapshotError::IndexMismatch);
+            }
+            if raw["market_index"] != format!("MarketIndex({market_id})")
                 || raw["collateral_index"] != token
             {
                 return Err(SnapshotError::Unavailable);
@@ -342,8 +351,10 @@ impl Snapshot {
         if !same_account(trader, latest.get("user")) {
             return Err(SnapshotError::Owner(CONTRACT_OWNER));
         }
+        if latest["user_trade_index"] != format!("UserTradeIndex({id})") {
+            return Err(SnapshotError::IndexMismatch);
+        }
         if [
-            "user_trade_index",
             "market_index",
             "collateral_index",
             "collateral_amount",

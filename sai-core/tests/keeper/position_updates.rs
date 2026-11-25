@@ -8,9 +8,10 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sai_core::{
     errors::Code,
-    keeper::{MARKETS, POSITION, ROUTE, SUBMIT},
+    keeper::{MARKET, MARKETS, POSITION, ROUTE, SUBMIT},
     storage::{Session, Storage},
     trade::{
         Confirmation, OpenTrade, OrderType, PreviewMode, Side, SubmitOptions, TradePreview,
@@ -39,6 +40,7 @@ struct ReplyState {
     market_available: bool,
     trade_type: &'static str,
     indexed_position_missing: bool,
+    close_height_check_index: Option<u8>,
     target_missing: bool,
 }
 
@@ -66,6 +68,7 @@ impl PositionServer {
             market_available: true,
             trade_type: "trade",
             indexed_position_missing: false,
+            close_height_check_index: None,
             target_missing: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -136,10 +139,23 @@ impl ReplyState {
                     self.requests.push("position".into());
                     let position = if self.indexed_position_missing {
                         Value::Null
+                    } else if self.close_height_check_index.is_some() {
+                        json!({
+                            "id": 7, "trader": self.keeper_owner, "isOpen": true, "tradeType": "trade",
+                            "collateralAmount": 2_000_000, "leverage": "2",
+                            "perpBorrowing": {"marketId": 3, "collateralToken": {"id": 0, "symbol": "USDC"}}
+                        })
                     } else {
                         json!({"id": 7, "trader": self.keeper_owner})
                     };
                     json!({"perp": {"trade": position}})
+                }
+                MARKET => {
+                    assert_eq!(request["variables"], json!({"market": 3, "collateral": 0}));
+                    self.requests.push("borrowing".into());
+                    json!({"perp": {"borrowing": {
+                        "marketId": 3, "isOpen": true, "collateralToken": {"id": 0}
+                    }}})
                 }
                 MARKETS => {
                     self.requests.push("markets".into());
@@ -172,13 +188,47 @@ impl ReplyState {
             self.requests.push("node_info".into());
             return json!({"default_node_info": {"network": self.lcd_chain}});
         }
-        assert!(
-            request.starts_with(&format!(
+        let path = request
+            .strip_prefix(&format!(
                 "GET /cosmwasm/wasm/v1/contract/{}/smart/",
                 self.contract
-            )),
-            "{request}"
-        );
+            ))
+            .unwrap_or_else(|| panic!("Unexpected LCD request: {request}"));
+        if let Some(latest_index) = self.close_height_check_index {
+            let (path, _) = path.split_once(' ').unwrap();
+            let (encoded, _) = url::form_urlencoded::parse(path.as_bytes()).next().unwrap();
+            let message: Value =
+                serde_json::from_slice(&STANDARD.decode(encoded.as_bytes()).unwrap()).unwrap();
+            if message.get("get_exchange_balance").is_some() {
+                assert_eq!(
+                    message,
+                    json!({"get_exchange_balance": {"user": ACCOUNT, "collateral_index": "TokenIndex(0)"}})
+                );
+                self.requests.push("exchange_balance".into());
+                return json!({"data": {"collateral_index": "TokenIndex(0)"}});
+            }
+            assert_eq!(
+                message,
+                json!({"get_trade_raw": {"trader": ACCOUNT, "index": 7}})
+            );
+            let index = if self
+                .requests
+                .iter()
+                .any(|label| label == "exchange_balance")
+            {
+                self.requests.push("height_check".into());
+                latest_index
+            } else {
+                self.requests.push("contract_position".into());
+                7
+            };
+            return json!({"data": {
+                "user": self.contract_owner, "user_trade_index": format!("UserTradeIndex({index})"),
+                "market_index": "MarketIndex(3)", "collateral_index": "TokenIndex(0)",
+                "is_open": true, "trade_type": "trade", "collateral_amount": "2000000",
+                "leverage": "2", "long": true, "open_price": "100"
+            }});
+        }
         self.requests.push("contract_position".into());
         if self.target_missing {
             return json!({"data": null});
@@ -264,6 +314,50 @@ async fn close_preview_requires_verified_ownership_to_issue_a_digest() {
             requests.push("contract_position");
         }
         assert_eq!(server.requests(), requests);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
+}
+
+#[tokio::test]
+async fn close_preview_withholds_digest_when_the_height_check_returns_a_different_index() {
+    for (latest_index, verified) in [(8, false), (7, true)] {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        // Neither response serves a block height. Only a conflicting index
+        // invalidates the earlier ownership check.
+        server.state.lock().unwrap().close_height_check_index = Some(latest_index);
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+
+        let output = trading
+            .confirmed_trade_preview(&session, close_preview("7", false).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.requests(),
+            [
+                "position",
+                "route",
+                "node_info",
+                "contract_position",
+                "borrowing",
+                "exchange_balance",
+                "height_check"
+            ]
+        );
+        assert_eq!(output["estimates"]["fees"]["status"], "unavailable");
+        if verified {
+            assert!(output["previewDigest"].is_string());
+            assert_eq!(output["positionRoute"]["contractAddress"], CONTRACT);
+            assert!(output.get("positionOwnerVerified").is_none());
+        } else {
+            assert!(output.get("previewDigest").is_none());
+            assert!(output.get("positionRoute").is_none());
+            assert_eq!(output["positionOwnerVerified"], false);
+        }
         assert!(!home.path().join("trader/intents.sqlite3").exists());
     }
 }

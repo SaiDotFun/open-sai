@@ -290,7 +290,7 @@ impl<'a> Trading<'a> {
         } else {
             self.position_route(&lcd, false).await?
         };
-        Self::verify_contract_owner(&lcd, account, &id, &route).await?;
+        let (route, _) = Self::verify_contract_owner(&lcd, account, &id, route).await?;
         Ok(route)
     }
 
