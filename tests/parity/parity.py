@@ -467,10 +467,7 @@ def observe(
         if SECRET in result.stdout or SECRET in result.stderr:
             raise ValueError("Client config value escaped into CLI output")
         files.update(client_state(home, client_before, normalize))
-    state = dict(case.state or {})
-    if candidate and case.accepted_divergence == "codex-repair-rollback":
-        state["clients/.codex/config.toml#changed"] = False
-    check_state(state, files)
+    check_state(case.state or {}, files)
     display = result.stdout
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
@@ -662,6 +659,30 @@ def expect_native_mcp_info(
     return ", ".join(reasons) or None
 
 
+def expect_native_mcp_validation(
+    output: list[dict[str, Any]], profile: str
+) -> str | None:
+    """Project only the Python reference's declared validation errors."""
+    validation_detail = re.compile(
+        r"^([^\n]+)\n(  [^\n]+? \[type=(\w+)), input_value=[^\n]*, input_type=\w+\]$",
+        re.MULTILINE,
+    )
+
+    def strip_input(match: re.Match[str]) -> str:
+        field, detail, category = match.groups()
+        return detail + "]" if category == "extra_forbidden" else f"{field}\n{detail}]"
+
+    replies = {frame["id"]: frame["result"] for frame in output}
+    changed = False
+    for id_, call in enumerate(CALLS[profile], 3):
+        if call.expected == "invalid":
+            block = replies[id_]["content"][0]
+            expected = validation_detail.sub(strip_input, block["text"])
+            changed |= expected != block["text"]
+            block["text"] = expected
+    return "Native MCP validation omits rejected input" if changed else None
+
+
 def project_reference_lcd_origin(output: dict[str, Any]) -> None:
     """The pinned Python reference still displays the LCD URL path."""
     error = output.get("error")
@@ -747,14 +768,6 @@ def run_case(
             tools,
             None,
         )
-    if candidate != reference and case.accepted_divergence == "codex-repair-rollback":
-        # Both observations checked their expected change flag. Compare the
-        # saved file's existence and mode while allowing its contents to differ.
-        filename = "clients/.codex/config.toml"
-        for observation in (left, right):
-            observation.files[filename] = replace(
-                observation.files[filename], data=None
-            )
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
     if (
@@ -767,6 +780,10 @@ def run_case(
         expected = expect_native_mcp_info(
             left.output,
             allow_deferred_trade=case.mcp_deferred_trade_exception,
+        )
+        validation = expect_native_mcp_validation(left.output, case.mcp_profile)
+        expected = (
+            ", ".join(reason for reason in (expected, validation) if reason) or None
         )
     diffs = differences(left, right)
     if left.exit_code != case.expect:
