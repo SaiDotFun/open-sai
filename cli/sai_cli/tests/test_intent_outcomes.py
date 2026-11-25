@@ -1373,10 +1373,7 @@ def test_mcp_wait_caps_timeout_and_paginates_history(keeper_replay):
     assert result["addrSource"] == "ledger"
     assert result["outcome"] == "filled"
     assert result["receipt"]["execution"]["historyId"] == 1007
-    assert (
-        log.tail(1, name="intent.wait.start")[0]["timeoutMs"]
-        == wait.MCP_MAX_TIMEOUT * 1000
-    )
+    assert log.tail(1, name="intent.wait.start")[0]["timeoutMs"] == 10_000
 
 
 @pytest.mark.parametrize("surface", ["cli", "mcp"])
@@ -1747,5 +1744,6 @@ def test_trade_wait_uses_submission_key(keeper_replay, admission, exit_code, out
     assert [row["intentKey"] for row in local] == [value["intentKey"]]
     assert local[0]["status"] == ("terminal" if outcome == "filled" else "rejected")
     if outcome == "filled":
+        assert log.tail(1, name="intent.wait.start")[0]["timeoutMs"] == 60_000
         assert value["receipt"]["fill"]["price"] is None
         assert value["receipt"]["positionNow"]["isOpen"] is False
