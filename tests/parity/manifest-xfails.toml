@@ -302,10 +302,6 @@ signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
 owner = "#126"
 signature = "eb3616ea18827a78b76b245af4136b46e433c95369f30cafa29b314f36269d63"
 
-[gap."cli:mcp uninstall"]
-owner = "#193"
-signature = "b4ab34d65a9935a9283ad21ce76afe5160eb375f9ed239f6dce9bd7938502d78"
-
 [gap."cli:skill install"]
 owner = "#126"
 signature = "8caa35d02c69de313a00a6e21cf0b861dd1796702f1887716d0929af3584f53e"

@@ -385,6 +385,11 @@ the raw logs for the fixture path. It allows the existing difference in
 the Keeper probe event, where Python includes `command` and `commandId`
 and Rust omits both fields.
 
+The `mcp-uninstall-*` cases use the Python `sai-cli/v0.1.2` reference at
+`8557a7e13dceab0accc369191182c8e01423c91b`. Point `SAI_MCP_UNINSTALL_PYTHON`
+at that checkout's `.venv/bin/sai` and run the driver with
+`--case 'mcp-uninstall-*'`.
+
 The `client_seed` key supplies private Claude Code, Codex, and Cursor
 configs. The runner uses fixture programs for client subprocesses and
 compares their arguments, file modes, config values, Codex comments, and
@@ -395,6 +400,16 @@ In `doctor-mcp-verification-failure`, Rust restores the Codex config when
 verification rejects the repaired entry. The case checks that Rust keeps the
 original bytes and mode. The pinned Python reference leaves the replacement
 on disk.
+
+In `mcp-uninstall-codex-query-failure`, both CLIs report the failed Codex
+query. Rust restores the original configuration bytes and mode, so the
+result reports no change or reconnect. The Python reference leaves the
+entry deleted.
+
+The `mcp-uninstall-*-read-only` cases use mode-0444 Codex and Cursor files
+in writable directories. Python replaces the file with the Sai entry removed
+and preserves its mode. Rust returns `INTERNAL_ERROR` and leaves the bytes and
+mode intact. The cases also check that the unrelated server remains.
 
 The `lcd-origin-only` cases project the LCD endpoint in Python's report to
 its origin before comparing it with Rust. The byte-comparison cases use

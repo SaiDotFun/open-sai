@@ -265,6 +265,7 @@ jobs:
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_MCP_PARITY_PYTHON: ${{ github.workspace }}/.parity-mcp-python/.venv/bin/sai
+          SAI_MCP_UNINSTALL_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
         run: |
           if ! unshare -Urn ip link set lo up; then
             sudo apparmor_parser -r <<'PROFILE'
@@ -417,3 +418,21 @@ jobs:
           PROFILE
           fi
           uv run --locked python tests/parity/network.py -m parity_namespace tests/parity/test_trade_shared_state.py -rs
+
+      - name: Compare Rust MCP uninstall with Python v0.1.2
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_MCP_UNINSTALL_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
+        run: |
+          if ! unshare -Urn ip link set lo up; then
+            sudo apparmor_parser -r <<'PROFILE'
+          abi <abi/4.0>,
+          include <tunables/global>
+
+          /usr/bin/unshare flags=(unconfined) {
+            userns,
+          }
+          PROFILE
+          fi
+          uv run --locked python tests/parity/parity.py --case 'mcp-uninstall-*'

@@ -9,6 +9,7 @@ import socket
 import stat
 import subprocess
 import sys
+import tomllib
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
@@ -297,6 +298,91 @@ def test_doctor_respects_read_only_cursor_config(
     assert cursor["status"] == "fail"
     assert "read-only" in cursor["summary"]
     assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444
+
+
+@pytest.mark.parametrize(
+    ("client", "filename"),
+    [
+        ("claude", ".claude.json"),
+        ("codex", ".codex/config.toml"),
+        ("cursor", ".cursor/mcp.json"),
+    ],
+)
+def test_uninstall_does_not_replace_read_only_client_config(
+    candidate: str,
+    tmp_path: Path,
+    fixture_env: dict[str, str],
+    client: str,
+    filename: str,
+) -> None:
+    seed_clients(tmp_path, fixture_env, "current")
+    path = tmp_path / filename
+    path.chmod(0o444)
+    before = path.read_bytes()
+    result = invoke(candidate, tmp_path, fixture_env, "mcp", "uninstall", client)
+    assert result.returncode == 1
+    details = json.loads(result.stdout)["error"]["details"]
+    assert details["reconnectNeeded"] is False
+    (row,) = details["results"]
+    assert row["error"] == "The client config is read-only"
+    assert row["changed"] is False
+    assert path.read_bytes() == before and stat.S_IMODE(path.stat().st_mode) == 0o444
+
+
+def test_uninstall_restores_codex_config_when_verifier_disappears(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    seed_clients(tmp_path, fixture_env, "current")
+    (tmp_path / "drop-codex-after-discovery").touch()
+    config = tmp_path / ".codex/config.toml"
+    before = config.read_bytes()
+    result = invoke(candidate, tmp_path, fixture_env, "mcp", "uninstall", "codex")
+
+    assert not (tmp_path / "bin/codex").exists()
+    assert result.returncode == 1
+    error = json.loads(result.stdout)["error"]
+    assert error["code"] == "INTERNAL_ERROR"
+    report = error["details"]
+    (row,) = report["results"]
+    assert row["action"] == "failed"
+    assert row["error"] == "`codex` is not on PATH"
+    assert row["changed"] is False and report["reconnectNeeded"] is False
+    assert (
+        config.read_bytes() == before and stat.S_IMODE(config.stat().st_mode) == 0o640
+    )
+
+    # A new uninstall can still report absence when Codex is missing at discovery.
+    next_result = invoke(candidate, tmp_path, fixture_env, "mcp", "uninstall", "codex")
+    assert next_result.returncode == 0
+    assert json.loads(next_result.stdout)["results"] == [
+        {"client": "codex", "action": "absent"}
+    ]
+    assert config.read_bytes() == before
+
+
+def test_uninstall_keeps_removal_after_confirmed_codex_override(
+    candidate: str, tmp_path: Path, fixture_env: dict[str, str]
+) -> None:
+    seed_clients(tmp_path, fixture_env, "shadowed")
+    config = tmp_path / ".codex/config.toml"
+    user_entry = tomllib.loads(config.read_text())["mcp_servers"]["sai"]
+    (tmp_path / ".codex/project.json").write_text(json.dumps(user_entry))
+    (tmp_path / "fail-second-project-query").touch()
+    result = subprocess.run(
+        [candidate, "--json", "mcp", "uninstall", "codex", "--scope", "user"],
+        cwd=tmp_path,
+        env=fixture_env,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+    assert result.returncode == 1
+    details = json.loads(result.stdout)["error"]["details"]
+    (row,) = details["results"]
+    assert row["changed"] and details["reconnectNeeded"]
+    assert row["error"] == "a project .codex/config.toml entry is still active"
+    assert "sai" not in tomllib.loads(config.read_text())["mcp_servers"]
 
 
 def test_doctor_shows_only_origin_for_an_unreachable_lcd(
