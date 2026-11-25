@@ -21,6 +21,7 @@ from typing import Any
 import pytest
 from compare import Normalize, mask_overview_stdout, overview_clocks
 from mcp_cases import REJECTED_AUTH_ADDRESS, TRADE_TOOLS
+from overview_scenarios import HEX_MARKER, PRIVATE_URL, RELATIVE_URL, SESSION_MARKER
 from scenarios import (
     ADDRESS,
     INTENT,
@@ -888,6 +889,54 @@ def test_overview_v013_partial_response_and_session_reload(
             ]
             endpoints.wire.clear()
     assert transcripts[0] == transcripts[1]
+
+
+@pytest.mark.parametrize("source", ["argument", "session"])
+def test_overview_rejects_non_evm_address(
+    native: Path, tmp_path: Path, source: str
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("overview-full") as endpoints,
+        server(native, home, endpoints, receive_timeout=20) as stdio,
+    ):
+        if source == "session":
+            write_seed(
+                home,
+                endpoints,
+                [{**session_fixture(endpoints, "session"), "evmAddress": PRIVATE_URL}],
+            )
+        arguments = {"addr": PRIVATE_URL} if source == "argument" else {}
+        text = tool_text(stdio.call(2, "account_overview", **arguments))
+        assert not endpoints.wire, "overview sent an invalid address upstream"
+        assert PRIVATE_URL not in text
+        expected = "INVALID_REQUEST" if source == "argument" else "SESSION_UNAVAILABLE"
+        assert json.loads(text)["code"] == expected
+
+
+def test_overview_rejects_malformed_fields_and_scrubs_text(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("overview-tainted") as endpoints,
+        server(native, home, endpoints, receive_timeout=20) as stdio,
+    ):
+        write_seed(
+            home,
+            endpoints,
+            [{**session_fixture(endpoints, "session"), "token": SESSION_MARKER}],
+        )
+        text = tool_text(stdio.call(2, "account_overview"))
+        assert PRIVATE_URL not in text, "overview returned an upstream URL"
+        assert RELATIVE_URL not in text, "overview returned a scheme-relative URL"
+        assert SESSION_MARKER not in text, "overview returned a stored credential"
+        assert HEX_MARKER not in text, "overview returned a key-shaped display field"
+        report = json.loads(text)
+        assert report["balances"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert report["queuedMarketOrders"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert len(report["positions"]["data"]["items"]) == 2
+        assert not endpoints.errors
 
 
 def test_logs_intent_v013_offline_and_live(

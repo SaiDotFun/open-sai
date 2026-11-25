@@ -1,6 +1,7 @@
 use sai_core::{
     errors::{Code, SaiError},
-    log::{EventContext, Surface},
+    keeper,
+    log::{self, EventContext, Field, Surface},
     overview,
 };
 use serde_json::{Value, json};
@@ -13,6 +14,12 @@ impl SaiMcp {
         addr: Option<&str>,
         call_id: &str,
     ) -> Result<Value, SaiError> {
+        if addr.is_some_and(|addr| !keeper::is_evm_address(addr)) {
+            return Err(SaiError::new(
+                Code::InvalidRequest,
+                "Pass a 0x-prefixed EVM address.",
+            ));
+        }
         let settings = self.settings.clone();
         let home = self.env.home.clone();
         let writer = self.writer.clone();
@@ -41,9 +48,44 @@ impl SaiMcp {
                     }
                     error
                 })?;
-            Ok(release_response(value))
+            let mut report = release_response(value);
+            // The reported WebSocket origin comes from settings. All other
+            // overview sections can contain data controlled by Keeper.
+            let endpoint = report["balances"]["source"]["endpoint"].take();
+            let scrub = log::scrubber(&home);
+            for (name, section) in report.as_object_mut().expect("overview report") {
+                if name != "session" {
+                    redact_keeper_fields(section, &scrub);
+                }
+            }
+            report["balances"]["source"]["endpoint"] = endpoint;
+            Ok(scrub(report.into()))
         })
         .await
+    }
+}
+
+fn redact_keeper_fields(value: &mut Value, scrub: &impl Fn(Field) -> Value) {
+    match value {
+        Value::String(text) if text.contains("//") => *text = "[redacted url]".into(),
+        Value::Array(items) => {
+            for item in items {
+                redact_keeper_fields(item, scrub);
+            }
+        }
+        Value::Object(fields) => {
+            for (key, field) in fields {
+                redact_keeper_fields(field, scrub);
+                if matches!(
+                    key.as_str(),
+                    "market" | "collateralToken" | "quoteToken" | "token"
+                ) && let Some(text) = field.as_str()
+                {
+                    *field = scrub(Field::Untrusted(text.into()));
+                }
+            }
+        }
+        _ => (),
     }
 }
 

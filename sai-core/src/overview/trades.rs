@@ -18,7 +18,8 @@ use crate::{
 use super::{
     Object, Overview, PAGINATION_ERROR, Stamp,
     chain::{ContractReads, membership},
-    error_value, failed, incomplete, instant, invalid, iso, merge, now, number, success, variables,
+    error_value, failed, incomplete, instant, invalid, iso, merge, now, number, success,
+    valid_base_units, valid_block, variables,
 };
 
 const USD_TOKEN: u64 = 0;
@@ -201,24 +202,29 @@ fn parse_prices(data: &Object) -> Option<Prices> {
             continue;
         }
         let token = row.get("token")?;
+        let block = row.get("lastUpdatedBlock")?;
+        if !block.is_object() || !valid_block(&block["block"], &block["block_ts"]) {
+            return None;
+        }
         prices.insert(
             token["id"].as_u64()?,
             Price {
                 usd,
-                block: row.get("lastUpdatedBlock")?.clone(),
-                token: token_name(token)?.clone(),
+                block: block.clone(),
+                token: json!(token_name(token)?),
             },
         );
     }
     Some(prices)
 }
 
-fn token_name(token: &Value) -> Option<&Value> {
+fn token_name(token: &Value) -> Option<&str> {
     let symbol = token.get("symbol")?;
-    if keeper::truthy(symbol) {
-        Some(symbol)
-    } else {
-        token.get("name")
+    match symbol {
+        Value::Null => token["name"].as_str(),
+        Value::String(symbol) if symbol.is_empty() => token["name"].as_str(),
+        Value::String(symbol) => Some(symbol),
+        _ => None,
     }
 }
 
@@ -311,6 +317,9 @@ async fn read_rows(
         else {
             return failed(invalid());
         };
+        if !valid_block(&block["block"], &block["block_ts"]) {
+            return failed(invalid());
+        }
         let stamp = instant(&row["fetchedAt"]).expect("page time");
         item["fetchedAt"] = row["fetchedAt"].clone();
         merge(
@@ -329,7 +338,7 @@ fn trade_row(trade: &Object, prices: Option<&Prices>) -> Option<Value> {
     let quote = market.get("quoteToken")?;
     let collateral_id = collateral["id"].as_u64()?;
     let quote_id = quote["id"].as_u64()?;
-    let symbol = collateral.get("symbol")?;
+    let symbol = collateral["symbol"].as_str()?;
     let price = |id: u64| {
         if id == USD_TOKEN {
             Some(BigDecimal::from(1))
@@ -344,6 +353,9 @@ fn trade_row(trade: &Object, prices: Option<&Prices>) -> Option<Value> {
     } else {
         None
     };
+    if !valid_base_units(&trade["collateralAmount"]) {
+        return None;
+    }
     let amount = decimal(&trade["collateralAmount"])?;
     let leverage = decimal(&trade["leverage"])?;
     let quote_usd = price(quote_id);
@@ -352,9 +364,9 @@ fn trade_row(trade: &Object, prices: Option<&Prices>) -> Option<Value> {
     let sl = level(trade.get("sl")?)?;
     let mut row = json!({
         "id": trade["id"],
-        "marketId": market.get("marketId")?,
-        "market": market.get("baseToken")?.get("symbol")?,
-        "side": if keeper::truthy(trade.get("isLong")?) { "long" } else { "short" },
+        "marketId": market["marketId"].as_u64()?,
+        "market": market["baseToken"]["symbol"].as_str()?,
+        "side": if trade["isLong"].as_bool()? { "long" } else { "short" },
         "collateralToken": symbol,
         "collateralTokenId": collateral_id,
         "collateralBaseUnits": trade["collateralAmount"],

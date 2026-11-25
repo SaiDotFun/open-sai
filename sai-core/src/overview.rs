@@ -60,17 +60,22 @@ pub async fn read(
                     .iter()
                     .map(|(session, _)| session.token().to_owned()),
             );
-            let stored = accounts.selected(addr);
-            let addr = match addr {
-                Some(addr) => addr,
+            let (addr, stored) = match addr {
+                Some(addr) => (addr, accounts.selected(Some(addr))),
                 None => {
-                    let active = stored.ok_or_else(|| unavailable("No active Sai account"))?;
+                    let (key, active, _) = accounts
+                        .entries()
+                        .find(|(_, _, active)| *active)
+                        .ok_or_else(|| unavailable("No active Sai account"))?;
                     if active.endpoint() != Some(settings.endpoint()) {
                         return Err(unavailable(
                             "The active session belongs to another Keeper endpoint",
                         ));
                     }
-                    active.addr()
+                    let addr = active
+                        .checked_address(key)
+                        .map_err(|_| unavailable("Stored session has an invalid address"))?;
+                    (addr, Some(active))
                 }
             };
             (
@@ -364,7 +369,19 @@ impl Overview<'_> {
             else {
                 return failed(invalid());
             };
-            if !row.contains_key("orderReqBlock") || !row.contains_key("orderReqBlockTs") {
+            let optional_id = |value: &Value| value.is_null() || value.as_u64().is_some();
+            let valid_hash = |value: &Value| !keeper::request_hash(value).1;
+            if !row.contains_key("orderReqBlock")
+                || !row.contains_key("orderReqBlockTs")
+                || !optional_id(&row["tradeId"])
+                || row["perpMarketId"].as_u64().is_none()
+                || !matches!(row["side"].as_str(), Some("open" | "close"))
+                || row["status"] != "pending_exec"
+                || !valid_base_units(&row["collateralAmount"])
+                || !valid_hash(&row["orderReqTxHash"])
+                || !valid_hash(&row["orderReqEvmTxHash"])
+                || !valid_block(&row["orderReqBlock"], &row["orderReqBlockTs"])
+            {
                 return failed(invalid());
             }
             rows.push(Value::Object(mapped));
@@ -397,17 +414,18 @@ fn parse_balances(payload: Value) -> Result<Value, SaiError> {
         .ok_or_else(invalid)?
     {
         let token = &row["token_info"];
-        let kind = token.get("type").ok_or_else(invalid)?;
+        let kind = token["type"].as_str().ok_or_else(invalid)?;
         if kind != "sai" {
             continue;
         }
-        let name = token.get("name").ok_or_else(invalid)?;
+        let name = token["name"].as_str().ok_or_else(invalid)?;
         if let Some((_, key)) = BALANCE_KEYS.iter().find(|(label, _)| name == *label) {
             let usd = number(&row["usd_value"]).ok_or_else(invalid)?;
-            selected.insert(
-                (*key).to_owned(),
-                json!({"usd": usd, "block": row["lastUpdatedBlock"]}),
-            );
+            let height = &row["lastUpdatedBlock"];
+            if !valid_block(height, &Value::Null) {
+                return Err(invalid());
+            }
+            selected.insert((*key).to_owned(), json!({"usd": usd, "block": height}));
         }
     }
     Ok(Value::Object(selected))
@@ -482,6 +500,20 @@ fn merge(into: &mut Value, from: Value) {
 
 fn number(value: &Value) -> Option<f64> {
     value.as_f64().filter(|value| value.is_finite())
+}
+
+fn valid_base_units(value: &Value) -> bool {
+    value
+        .as_str()
+        .or_else(|| value.as_number().map(serde_json::Number::as_str))
+        .is_some_and(|text| {
+            text.bytes().all(|byte| byte.is_ascii_digit()) && text.parse::<u128>().is_ok()
+        })
+}
+
+fn valid_block(height: &Value, timestamp: &Value) -> bool {
+    (height.is_null() || height.as_u64().is_some())
+        && (timestamp.is_null() || timestamp.is_string())
 }
 
 fn now() -> Stamp {

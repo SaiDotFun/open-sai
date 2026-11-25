@@ -23,6 +23,10 @@ ORACLE = "nibi1oraclefixture"
 BLOCKS = "/cosmos/base/tendermint/v1beta1/blocks/"
 SMART = "/cosmwasm/wasm/v1/contract/"
 PAGINATED = {"overview-paginated", "overview-confirmation-fails"}
+PRIVATE_URL = "https://overview-fixture.invalid/private"
+RELATIVE_URL = "//overview-fixture.invalid/private?fixture=marker"
+SESSION_MARKER = "synthetic-overview-session-marker"
+HEX_MARKER = "D" * 64
 
 
 class OverviewReplay:
@@ -80,6 +84,16 @@ class OverviewReplay:
         )
         self.trades = self.state["http"][keeper.OVERVIEW_TRADES]
         self.orders = self.state["http"][keeper.PENDING_MARKET_ORDERS]
+        queued = self.orders["data"]["perp"]["marketOrders"][0]
+        queued["orderReqTxHash"] = "A" * 64
+        if scenario == "overview-tainted":
+            self.balances["data"]["userBalances"][-1]["lastUpdatedBlock"] = {
+                "nested": PRIVATE_URL
+            }
+            queued["orderReqTxHash"] = PRIVATE_URL
+            long["perpBorrowing"]["baseToken"]["symbol"] = SESSION_MARKER
+            long["perpBorrowing"]["quoteToken"]["name"] = HEX_MARKER
+            short["perpBorrowing"]["baseToken"]["symbol"] = RELATIVE_URL
 
         if self.scenario in PAGINATED:
             rows = self.trades["data"]["perp"]["trades"]
