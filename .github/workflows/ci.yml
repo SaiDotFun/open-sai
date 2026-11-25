@@ -221,8 +221,17 @@ jobs:
           path: .parity-position-owner
           persist-credentials: false
 
+      - name: Check out Python main for close and cancel parity
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: b777fe836d1ac57148606edb2c97177b66543b7a
+          path: .parity-trade-main
+          persist-credentials: false
+
       - run: |
           uv sync --locked --all-groups
+          uv sync --project .parity-trade-main --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
           uv sync --project .parity-overview-python --locked --all-groups --python 3.13
           uv sync --project .parity-mcp-python --python 3.12 --locked --all-groups
@@ -280,6 +289,7 @@ jobs:
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
+          SAI_PARITY_TRADE_MAIN_PYTHON: ${{ github.workspace }}/.parity-trade-main/.venv/bin/sai
           SAI_MCP_PARITY_PYTHON: ${{ github.workspace }}/.parity-mcp-python/.venv/bin/sai
           SAI_PARITY_C7_PYTHON: ${{ github.workspace }}/.parity-python-c7/.venv/bin/sai
           SAI_PARITY_WAIT_PYTHON: ${{ github.workspace }}/.parity-python-wait/.venv/bin/sai
