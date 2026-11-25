@@ -12,14 +12,13 @@ import socket
 import sqlite3
 import ssl
 import subprocess
-import sys
 import tempfile
 import threading
 import time
 from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager, suppress
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass
 from functools import cache
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -27,8 +26,9 @@ from stat import S_IMODE
 from typing import Any
 
 import pytest
-from compare import is_version
-from sai_cli.core import keeper, log, reconcile, storage
+from compare import Normalize, is_version, validate_log_endpoint_key
+from release_mismatch import assert_release_equal
+from sai_cli.core import keeper, log, storage
 from sai_cli.tests.loopback import graphql_ws
 from websockets.http11 import Request as UpgradeRequest
 from websockets.http11 import Response as UpgradeResponse
@@ -463,88 +463,59 @@ def cli_version(cli: CLI) -> str:
     return version
 
 
-def read_events(
-    home: Path, cli: CLI, *, c4_reference: bool = False, rust: bool = False
-) -> list[dict[str, Any]]:
+def read_events(home: Path, cli: CLI | None = None) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
         for path in sorted((home / "logs").glob("*.jsonl"))
         for line in path.read_bytes().splitlines()
     ]
     groups: dict[str, list[int]] = {}
-    version = cli_version(cli)
+    version = cli_version(cli) if cli is not None else None
     for event in events:
-        assert event["version"] == version
-        event["version"] = "<version>"
-        if isinstance(argv := event.get("argv"), list):
-            # These cases invoke intent status and auth status only. Compare
-            # the safe words and preserve argument count after projection.
-            safe = {"--json", "--endpoint", "intent", "auth", "status", "--key"}
-            if rust:
-                assert all(arg in safe or arg == "[redacted]" for arg in argv)
-            event["argv"] = [arg if arg in safe else "[redacted]" for arg in argv]
-        if "error" in event:
-            if rust:
-                assert event["error"] == "[redacted]"
-            event["error"] = "[redacted]"
-        if c4_reference:
-            # The C4 pin predates the v2 envelope and keyed endpoint identity.
-            for field in ("schema", "commandId", "endpointId"):
-                event.pop(field, None)
-        run = event["runId"]
-        event["runId"] = list(groups).index(run) if run in groups else len(groups)
-        seq = groups.setdefault(run, [])
-        seq.append(event["seq"])
-        for dynamic in ("ts", "pid", "durationMs"):
-            if dynamic in event:
-                assert isinstance(event[dynamic], str if dynamic == "ts" else int)
-                event[dynamic] = "<dynamic>"
-        # C4's Python reference wrote v1 rows. The C9b cases compare
-        # these v2 fields directly against the newer Python writer.
-        for field in ("schema", "commandId", "endpointId"):
-            event.pop(field, None)
-        if c4_reference and event["event"] == "keeper.request":
-            event.pop("intentKey", None)
-            if "keeperErrors" in event:
-                event.update(
-                    log.keeper_error_fields(
-                        event["keeperErrors"],
-                        retained=True,
-                        total=event.get("keeperErrorCount"),
-                    )
-                )
-        if c4_reference and event["event"] == "intent.keeper":
-            if not rust:
-                event["addr"] = keeper.canonical_account(event["addr"])
-            if (code := keeper.intent_error_code(event)) is not None:
-                event["errorCode"] = code
-            event.pop("errorMsg", None)
-            for field, allowed in (
-                ("kind", keeper.INTENT_KINDS),
-                ("lifecycleStep", keeper.INTENT_STEPS),
-                ("execActor", keeper.INTENT_ACTORS),
-            ):
-                if event.get(field) not in allowed:
-                    event.pop(field, None)
-            tx, invalid = keeper.request_hash(event.pop("txHash", None))
-            if tx is not None:
-                event["txHash"] = tx
-            if invalid:
-                event["txHashInvalid"] = True
+        if version is not None:
+            assert event["version"] == version
+        groups.setdefault(event["runId"], []).append(event["seq"])
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
     return events
 
 
+def normalized_events(home: Path, cli: CLI | None = None) -> list[dict[str, Any]]:
+    normalize = Normalize(home)
+    # The request and ledger assertions use this fixed fixture key.
+    normalize.identity("intentKey", KEY)
+    return normalize.log_records(read_events(home, cli))
+
+
+def test_log_events_detect_wrong_fixture_intent_key(tmp_path: Path) -> None:
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    path = logs / "cli-2026-11-20.jsonl"
+    event = {
+        "ts": "2026-11-20T15:43:31.123Z",
+        "runId": "a" * 32,
+        "seq": 1,
+        "event": "intent.keeper",
+        "intentKey": KEY,
+    }
+    path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+    assert read_events(tmp_path)[0]["intentKey"] == KEY
+    reference = normalized_events(tmp_path)
+
+    path.write_text(
+        json.dumps({**event, "intentKey": "20261120T154331123Z_" + "A" * 16}) + "\n",
+        encoding="utf-8",
+    )
+    assert normalized_events(tmp_path) != reference
+
+
 def read_state(home: Path) -> tuple[Any, ...]:
     files = {
-        str(path.relative_to(home)): path.stat().st_mode
-        for path in home.rglob("*")
-        if path.relative_to(home).as_posix()
-        not in {"logs/.endpoint-key", "logs/.endpoint-key.lock"}
+        str(path.relative_to(home)): path.stat().st_mode for path in home.rglob("*")
     }
-    for name in ("logs/.endpoint-key", "logs/.endpoint-key.lock"):
-        if name in files:
-            assert files.pop(name) & 0o777 == 0o600
+    if "logs/.endpoint-key" in files:
+        validate_log_endpoint_key(home / "logs/.endpoint-key")
+    if "logs/.endpoint-key.lock" in files:
+        assert files["logs/.endpoint-key.lock"] & 0o777 == 0o600
     db = home / "trader/intents.sqlite3"
     if not db.exists():
         return (files,)
@@ -554,6 +525,19 @@ def read_state(home: Path) -> tuple[Any, ...]:
         version = connection.execute("PRAGMA user_version").fetchone()
         rows = connection.execute("SELECT * FROM intents ORDER BY id")
         return files, schema.fetchall(), version, rows.fetchall()
+
+
+def test_read_state_rejects_short_endpoint_key(tmp_path: Path) -> None:
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    key = log_dir / ".endpoint-key"
+    key.write_bytes(b"x" * 32)
+    key.chmod(0o600)
+    read_state(tmp_path)
+
+    key.write_bytes(b"x")
+    with pytest.raises(ValueError, match="Expected a 32-byte log endpoint key"):
+        read_state(tmp_path)
 
 
 def seed(
@@ -602,14 +586,6 @@ class Step:
     json_output: bool = True
 
 
-def public_intent_output(output: bytes, *, compact: bool) -> bytes:
-    """Apply the published projection to the old CI reference's raw output."""
-    public = reconcile.status_report(json.loads(output))
-    return (
-        json.dumps(log.clean(public), indent=None if compact else 2) + "\n"
-    ).encode()
-
-
 def compare(
     cli_pair: tuple[CLI, CLI],
     root: Path,
@@ -637,19 +613,22 @@ def compare(
                 if step.key is not None:
                     args.extend(("--key", step.key))
                 result = invoke(cli, home, *args)
-                assert result.returncode == step.code, (result.stdout, result.stderr)
-                assert not replies
-                history = (
-                    wire(keeper.HISTORY, trader=step.addr)
-                    if index == 0
-                    else wire(
-                        keeper.INTENT_HISTORY, trader=step.addr, limit=25, offset=0
-                    )
+                first_request = wire(keeper.INTENTS, user=step.addr, key=step.key)
+                history_request = wire(
+                    keeper.INTENT_HISTORY, trader=step.addr, limit=25, offset=0
                 )
-                assert [request.body for request in requests] == [
-                    wire(keeper.INTENTS, user=step.addr, key=step.key),
-                    *[history] * (len(step.replies) - 1),
+                bodies = [request.body for request in requests]
+                expected = [
+                    first_request,
+                    *[history_request] * (len(step.replies) - 1),
                 ]
+                if index == 0:
+                    assert result.returncode == step.code, (
+                        result.stdout,
+                        result.stderr,
+                    )
+                assert not replies
+                assert bodies == expected
                 if step.json_output:
                     assert not result.stderr
                     assert len(result.stdout.splitlines()) == 1
@@ -667,58 +646,51 @@ def compare(
                     assert (
                         next(row for row in rows if row[0] == "foreign")[4] == "unknown"
                     )
-                stdout = result.stdout
-                if index == 0 and step.code == 0:
-                    stdout = public_intent_output(stdout, compact=step.json_output)
-                # The two wire formats have already been checked separately.
-                for req in requests:
-                    assert req.headers["content-length"] == str(len(req.body))
                 runs.append(
-                    (
-                        stdout,
-                        result.stderr,
-                        [
-                            replace(
-                                req,
-                                body=b"",
-                                headers={
-                                    name: value
-                                    for name, value in req.headers.items()
-                                    if name != "content-length"
-                                },
-                            )
-                            for req in requests
-                        ],
-                        state,
-                    )
+                    {
+                        "exit": result.returncode,
+                        "stdout": result.stdout,
+                        "stderr": result.stderr,
+                        "requests": [asdict(request) for request in requests],
+                        "unconsumed": len(replies),
+                        "files": state[0],
+                        "ledger": state[1:],
+                    }
                 )
-            observed.append(
-                (runs, read_events(home, cli, c4_reference=True, rust=index == 1))
-            )
-        assert observed[0] == observed[1]
+                replies.clear()
+            observed.append({"runs": runs, "logs": normalized_events(home, cli)})
+        assert_release_equal(*observed)
 
 
 @pytest.mark.parametrize(
     ("name", "local"),
     [
-        ("started", "unknown"),
-        ("jwt_failed", "unknown"),
-        ("user_rejected", "unknown"),
-        ("user_sign_failed", "unknown"),
-        ("user_submitted", "unknown"),
-        ("accepted", "accepted"),
-        ("submitted", "accepted"),
-        ("pending_exec", "pending"),
-        ("chain_execution_failed", "terminal"),
-        ("market_order_expired", "terminal"),
-        ("market_order_fill_failed", "terminal"),
-        ("market_order_trading_paused", "terminal"),
-        ("market_order_market_closed", "terminal"),
-        ("market_order_trade_not_open", "terminal"),
-        ("simulation_failed", "terminal"),
-        ("admission_expired", "terminal"),
-        ("broadcast_rejected", "terminal"),
-        ("absent", "absent"),
+        pytest.param("started", "unknown", id="started"),
+        pytest.param("jwt_failed", "unknown", id="jwt_failed"),
+        pytest.param("user_rejected", "unknown", id="user_rejected"),
+        pytest.param("user_sign_failed", "unknown", id="user_sign_failed"),
+        pytest.param("user_submitted", "unknown", id="user_submitted"),
+        pytest.param("accepted", "accepted", id="accepted"),
+        pytest.param("submitted", "accepted", id="submitted"),
+        pytest.param("pending_exec", "pending", id="pending_exec"),
+        pytest.param("chain_execution_failed", "terminal", id="chain_execution_failed"),
+        pytest.param("market_order_expired", "terminal", id="market_order_expired"),
+        pytest.param(
+            "market_order_fill_failed", "terminal", id="market_order_fill_failed"
+        ),
+        pytest.param(
+            "market_order_trading_paused", "terminal", id="market_order_trading_paused"
+        ),
+        pytest.param(
+            "market_order_market_closed", "terminal", id="market_order_market_closed"
+        ),
+        pytest.param(
+            "market_order_trade_not_open", "terminal", id="market_order_trade_not_open"
+        ),
+        pytest.param("simulation_failed", "terminal", id="simulation_failed"),
+        pytest.param("admission_expired", "terminal", id="admission_expired"),
+        pytest.param("broadcast_rejected", "terminal", id="broadcast_rejected"),
+        pytest.param("absent", "absent", id="absent"),
     ],
 )
 def test_lifecycle(
@@ -734,24 +706,56 @@ def test_lifecycle(
 @pytest.mark.parametrize(
     ("history", "local"),
     [
-        (("server_finality", "open_history"), "terminal"),
-        (("user_finality", "not_yet_in_history", "not_yet_in_history"), "pending"),
-        (("other_trade_finality", "other_trade_history"), "terminal"),
-        (("other_trade_executed", "other_trade_history"), "terminal"),
-        (("limit_placement_exec_pass", "limit_placement_history"), "terminal"),
-        (("filled", "not_yet_in_history", "not_yet_in_history"), "terminal"),
-        (("outcome_not_indexed", "not_yet_in_history", "filled_history"), "terminal"),
-        (
+        pytest.param(
+            ("server_finality", "open_history"), "terminal", id="server-finality"
+        ),
+        pytest.param(
+            ("user_finality", "not_yet_in_history", "not_yet_in_history"),
+            "pending",
+            id="user-finality-empty-history",
+        ),
+        pytest.param(
+            ("other_trade_finality", "other_trade_history"),
+            "terminal",
+            id="other-trade-finality",
+        ),
+        pytest.param(
+            ("other_trade_executed", "other_trade_history"),
+            "terminal",
+            id="other-trade-executed",
+        ),
+        pytest.param(
+            ("limit_placement_exec_pass", "limit_placement_history"),
+            "terminal",
+            id="limit-placement",
+        ),
+        pytest.param(
+            ("filled", "not_yet_in_history", "not_yet_in_history"),
+            "terminal",
+            id="filled-without-history",
+        ),
+        pytest.param(
+            ("outcome_not_indexed", "not_yet_in_history", "filled_history"),
+            "terminal",
+            id="late-fill",
+        ),
+        pytest.param(
             ("outcome_not_indexed", "not_yet_in_history", "not_yet_in_history"),
             "pending",
+            id="unresolved",
         ),
-        (("outcome_not_indexed", Reply(status=503)), "pending"),
-        (
+        pytest.param(
+            ("outcome_not_indexed", Reply(status=503)),
+            "pending",
+            id="service-unavailable",
+        ),
+        pytest.param(
             (
                 "outcome_not_indexed",
                 Reply(response("not_yet_in_history").body, body_delay=2.25),
             ),
             "pending",
+            id="body-timeout",
         ),
     ],
 )
@@ -779,7 +783,23 @@ def test_split_history_headers_keep_the_inactivity_timer_alive(
     )
 
 
-@pytest.mark.parametrize("key", [KEY, None])
+def test_malformed_history_page_stays_pending_without_retry(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty = {"data": {"perp": {"tradeHistory": {}}}}
+    compare(
+        cli_pair,
+        tmp_path,
+        monkeypatch,
+        (Step(("outcome_not_indexed", empty), "pending"),),
+    )
+
+
+@pytest.mark.parametrize(
+    "key", [pytest.param(KEY, id="keyed"), pytest.param(None, id="unkeyed")]
+)
 def test_late_admission_and_stale_results(
     cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
@@ -884,17 +904,45 @@ def test_absent_response_only_creates_ledger_for_valid_keyed_account(
 @pytest.mark.parametrize(
     ("replies", "local", "error"),
     [
-        (
+        pytest.param(
             (Reply(status=302, headers=(("Location", "/elsewhere"),)),),
             "unknown",
             "KEEPER_ERROR",
+            id="redirect",
         ),
-        ((Reply(status=401),), "unknown", "KEEPER_ERROR"),
-        ((Reply(status=500),), "unknown", "KEEPER_ERROR"),
-        ((Reply(disconnect=True),), "unknown", "KEEPER_ERROR"),
-        ((Reply(b"malformed"),), "unknown", "KEEPER_ERROR"),
-        ((Reply(b"[]"),), "unknown", "KEEPER_ERROR"),
-        ((Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR"),
+        pytest.param(
+            (Reply(status=401),), "unknown", "KEEPER_ERROR", id="unauthorized"
+        ),
+        pytest.param(
+            (Reply(status=500),), "unknown", "KEEPER_ERROR", id="server-error"
+        ),
+        pytest.param(
+            (Reply(disconnect=True),), "unknown", "KEEPER_ERROR", id="disconnect"
+        ),
+        pytest.param(
+            (Reply(b"malformed"),), "unknown", "KEEPER_ERROR", id="invalid-json"
+        ),
+        pytest.param(
+            (Reply(b"[]"),), "unknown", "KEEPER_ERROR", id="non-object-response"
+        ),
+        pytest.param(
+            (Reply(b'{"data":null}'),), "unknown", "KEEPER_ERROR", id="null-data"
+        ),
+        pytest.param(
+            ({"data": {"userIntents": 123}},), "unknown", None, id="non-list-intents"
+        ),
+        pytest.param(
+            ({"data": {"userIntents": [None]}},), "unknown", None, id="null-intent-row"
+        ),
+        pytest.param(
+            ("outcome_not_indexed", {"data": {}}), "pending", None, id="missing-history"
+        ),
+        pytest.param(
+            ("outcome_not_indexed", {"data": {"perp": {"tradeHistory": None}}}),
+            "pending",
+            None,
+            id="null-history",
+        ),
     ],
 )
 def test_request_and_data_failures(
@@ -903,11 +951,10 @@ def test_request_and_data_failures(
     monkeypatch: pytest.MonkeyPatch,
     replies: tuple[str | dict[str, Any] | Reply, ...],
     local: str,
-    error: str,
+    error: str | None,
 ) -> None:
-    compare(
-        cli_pair, tmp_path, monkeypatch, (Step(replies, local, code=1, error=error),)
-    )
+    step = Step(replies, local, code=1 if error else 0, error=error)
+    compare(cli_pair, tmp_path, monkeypatch, (step,))
 
 
 @pytest.mark.parametrize("with_record", [False, True], ids=["null-only", "mixed"])
@@ -973,20 +1020,17 @@ def test_intent_status_logs_only_public_graphql_codes(
             {"message": diagnostic, "extensions": {"code": "BAD_USER_INPUT"}},
         ],
     }
-    # The Python checkout has the current logging policy. C4's pinned CLI
-    # predates it and remains the reference for the other reconciliation tests.
-    candidate = cli_pair[1]
-    reference = (sys.executable, "-m", "sai_cli.sai_cli")
     with replay() as (endpoint, replies, requests):
-        for index, cli in enumerate((reference, candidate)):
+        for index, cli in enumerate(cli_pair):
             home = tmp_path / str(index)
             requests.clear()
             expected_requests = [wire(keeper.INTENTS, user=ADDR, key=KEY)]
             if operation == "history":
                 replies.append(response("outcome_not_indexed"))
-                expected_requests.append(
-                    wire(keeper.INTENT_HISTORY, trader=ADDR, limit=25, offset=0)
+                history_request = wire(
+                    keeper.INTENT_HISTORY, trader=ADDR, limit=25, offset=0
                 )
+                expected_requests.append(history_request)
             replies.append(response(failure))
             result = invoke(
                 cli,
@@ -1012,7 +1056,7 @@ def test_intent_status_logs_only_public_graphql_codes(
                 assert document["outcome"] == "pending"
             [event] = [
                 event
-                for event in read_events(home, cli)
+                for event in normalized_events(home, cli)
                 if event["event"] == "keeper.request"
                 and event["operation"] == operation
             ]
@@ -1050,28 +1094,41 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
             outputs.append(
-                (
-                    result.stdout,
-                    read_events(home, cli, c4_reference=True, rust=index == 1),
-                )
+                {"stdout": result.stdout, "logs": normalized_events(home, cli)}
             )
-        assert outputs[0] == outputs[1]
+        assert_release_equal(*outputs)
 
 
 @pytest.mark.parametrize(
     ("args", "exit_code", "code"),
     [
-        (("--json",), 2, "INVALID_REQUEST"),
-        (("--json", "config"), 2, "INVALID_REQUEST"),
-        (("--bad-option", "--json", "intent", "status", ADDR), 2, "INVALID_REQUEST"),
-        (("--json", "intent", "status"), 2, "INVALID_REQUEST"),
-        (
+        pytest.param(("--json",), 2, "INVALID_REQUEST", id="root-usage"),
+        pytest.param(
+            ("--json", "intent"), 2, "INVALID_REQUEST", id="intent-group-usage"
+        ),
+        pytest.param(("--json", "config"), 2, "INVALID_REQUEST", id="config-usage"),
+        pytest.param(
+            ("--bad-option", "--json", "intent", "status", ADDR),
+            2,
+            "INVALID_REQUEST",
+            id="unknown-option",
+        ),
+        pytest.param(
+            ("--json", "intent", "status"), 2, "INVALID_REQUEST", id="status-usage"
+        ),
+        pytest.param(
             ("--json", "intent", "status", ADDR, "--key"),
             2,
             "INVALID_REQUEST",
+            id="missing-key",
         ),
-        (("--json", "config", "get", "invalid"), 2, "INVALID_REQUEST"),
-        (
+        pytest.param(
+            ("--json", "config", "get", "invalid"),
+            2,
+            "INVALID_REQUEST",
+            id="invalid-config",
+        ),
+        pytest.param(
             (
                 "--json",
                 "--endpoint",
@@ -1082,8 +1139,9 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             ),
             1,
             "KEEPER_ERROR",
+            id="http-endpoint",
         ),
-        (
+        pytest.param(
             (
                 "--json",
                 "--endpoint",
@@ -1094,8 +1152,9 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             ),
             1,
             "KEEPER_ERROR",
+            id="userinfo-endpoint",
         ),
-        (("--json", "auth", "status"), 6, "SIGNED_OUT"),
+        pytest.param(("--json", "auth", "status"), 6, "SIGNED_OUT", id="signed-out"),
     ],
 )
 def test_cli_errors_share_one_envelope(
@@ -1114,12 +1173,8 @@ def test_cli_errors_share_one_envelope(
         payload = json.loads(result.stdout)
         assert payload["error"]["code"] == code
         if code == "SIGNED_OUT":
-            endpoint = keeper.MAINNET_HTTP
-            expected_hint = (
-                f"sai --endpoint {endpoint} auth login NAME"
-                if index == 0
-                else origin_login_hint(endpoint.removesuffix("/query"))
-            )
+            origin = None if index == 0 else keeper.MAINNET_HTTP.removesuffix("/query")
+            expected_hint = origin_login_hint(origin)
             assert payload["error"].pop("hint") == expected_hint
             outputs.append(payload)
         elif args[0] == "--bad-option":
@@ -1141,11 +1196,20 @@ def test_cli_errors_share_one_envelope(
     assert outputs[0] == outputs[1]
 
 
-def test_intent_help(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "command",
+    [
+        pytest.param(("intent",), id="group"),
+        pytest.param(("intent", "status"), id="status"),
+    ],
+)
+def test_intent_help(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, command: tuple[str, ...]
+) -> None:
     outputs = []
     for index, cli in enumerate(cli_pair):
         home = tmp_path / str(index)
-        result = invoke(cli, home, "intent", "status", "--help")
+        result = invoke(cli, home, *command, "--help")
         assert result.returncode == 0
         assert not result.stderr
         assert not home.exists()
@@ -1153,10 +1217,11 @@ def test_intent_help(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
     assert outputs[0] == outputs[1]
 
 
-def origin_login_hint(origin: str) -> str:
+def origin_login_hint(origin: str | None) -> str:
+    suffix = f" at {origin}" if origin else ""
     return (
         'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL at {origin}}}"'
+        f'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL{suffix}}}"'
         " auth login NAME"
     )
 
@@ -1190,30 +1255,10 @@ def test_expired_auth_status(
         assert result.stderr == b""
         payload = json.loads(result.stdout)
         assert payload["error"]["code"] == "SESSION_EXPIRED"
-        if index == 1:
-            login = origin_login_hint(origin)
-        elif path == "/query":
-            login = f"sai --endpoint {endpoint} auth login NAME"
-        else:
-            login = (
-                'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?'
-                'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
-            )
+        login = origin_login_hint(origin if index == 1 else None)
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        events = read_events(home, cli, rust=index == 1)
-        [start] = [event for event in events if event["event"] == "command.start"]
-        command_words = ["auth", "status"]
-        # The C4 reference predates auth argument privacy. Assert each form
-        # before comparing the remaining fields and expiry events.
-        expected_argv = (
-            ["--json", "--endpoint", "[redacted]", *command_words]
-            if index == 0
-            else command_words
-        )
-        assert start["argv"] == expected_argv
-        start["argv"] = command_words
-        observed.append((payload, events))
-    assert observed[0] == observed[1]
+        observed.append({"stdout": payload, "logs": normalized_events(home, cli)})
+    assert_release_equal(*observed)
 
 
 @pytest.mark.parametrize("json_output", [True, False])
@@ -1267,10 +1312,6 @@ def test_public_intent_status_scrubs_keeper_payload(
                 wire(keeper.INTENTS, user=ADDR, key=KEY)
             ]
             output = result.stdout
-            if index == 0:
-                # The pinned CLI returns raw rows. Compare the public
-                # projection and always check Rust stdout as emitted.
-                output = public_intent_output(output, compact=json_output)
             assert token.encode() not in output
             assert private.encode() not in output
             envelope = json.loads(output)
@@ -1379,9 +1420,6 @@ def test_public_history_preserves_liquidation_label(
             )
             assert result.returncode == 0, (result.stdout, result.stderr)
             [row] = json.loads(result.stdout)["matchedTradeHistory"]
-            if index == 0:
-                # The pinned Python CLI returns raw rows. Apply its public projection.
-                row = keeper.safe_intent_history(row)
             assert row.get("tradeChangeType") == projected
 
 
@@ -1649,12 +1687,7 @@ def test_keeper_tls_trust_matches_httpx(
             )
             if not trusted:
                 assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
-            stdout = (
-                public_intent_output(result.stdout, compact=True)
-                if index == 0 and trusted
-                else result.stdout
-            )
-            observed.append((stdout, list(requests)))
+            observed.append((result.stdout, list(requests)))
         assert observed[0] == observed[1]
 
 

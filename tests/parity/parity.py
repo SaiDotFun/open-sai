@@ -20,12 +20,12 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-import click
+from case_inventory import cli_commands, require_manifest_case_ids
 from compare import (
     LEDGER,
     MIN_SQLITE_SCHEMA,
@@ -43,10 +43,12 @@ from compare import (
     stderr_category,
     stdout,
 )
-from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, handshake
+from manifest_gaps import ManifestGaps
+from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, RELEASE_MCP_TOOL_NAMES, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
+from release_mismatch import differing_paths, value_fingerprint
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import (
@@ -59,6 +61,18 @@ from scenarios import (
     session_fixture,
     write_seed,
 )
+
+C2_CONFIG_CASE_IDS = {
+    "config-get-default",
+    "config-get-env",
+    "config-get-file",
+    "config-get-text",
+    "config-invalid-value",
+    "config-set",
+    "config-set-existing",
+    "config-unknown-key",
+    "config-unset",
+}
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,7 @@ class Case:
     client_seed: str | None = None
     accepted_divergence: str | None = None
     absent_log_text: list[str] | None = None
+    absent_output_text: list[str] | None = None
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
     overview_expected: dict[str, Any] | None = None
@@ -116,6 +131,7 @@ class Observation:
     stderr: tuple[str, ...]
     files: dict[str, Entry]
     raw: tuple[bytes, bytes] | None = None
+    checks: tuple[str, ...] = ()
 
 
 def invoke(
@@ -365,8 +381,9 @@ def check_deferred_trade_probe(result: dict[str, Any]) -> None:
     )
 
 
-def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
+def state_differences(state: dict[str, Any], files: dict[str, Entry]) -> list[str]:
     # A filename and optional dotted field path are separated with '#'.
+    differences = []
     for selector, expected in state.items():
         name, _, keys = selector.partition("#")
         actual: Any = ABSENT
@@ -374,10 +391,14 @@ def check_state(state: dict[str, Any], files: dict[str, Entry]) -> None:
             if keys == "@mode":
                 if entry.mode == expected:
                     continue
-                raise ValueError(f"Persisted mode differs from expectation at {name}")
+                differences.append(f"Persisted mode differs from expectation at {name}")
+                continue
             actual = entry.data if keys else entry.kind
         if not field_matches(actual, keys, expected):
-            raise ValueError(f"Persisted state differs from expectation at {selector}")
+            differences.append(
+                f"Persisted state differs from expectation at {selector}"
+            )
+    return differences
 
 
 def check_overview_fields(fields: dict[str, Any], output: Any) -> None:
@@ -408,7 +429,15 @@ def observe(
     endpoints: Endpoints,
     *,
     candidate: bool = False,
+    cutover: bool = False,
 ) -> Observation:
+    checks: list[str] = []
+
+    def check_failed(message: str) -> None:
+        if not cutover:
+            raise ValueError(message)
+        checks.append(message)
+
     started_at = time.time()
     seed_home(home, endpoints, case.seed)
     config = home / "sai" / "config.toml"
@@ -491,13 +520,18 @@ def observe(
                     f"Expected retry exit {case.retry_expect}, got {contender.returncode}"
                 )
     ended_at = time.time()
-    if endpoints.errors:
-        raise ValueError(endpoints.errors[0])
+    if candidate and any(
+        marker in result.stdout or marker in result.stderr
+        for marker in case.absent_output_text or ()
+    ):
+        raise ValueError("Fixture credential appeared in CLI output")
+    for error in endpoints.errors:
+        check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
     if case.command == "doctor":
         actual, expected = sorted(actual), sorted(expected)
     if actual != expected:
-        raise ValueError(f"Expected wire {expected}, got {actual}")
+        check_failed(f"Expected wire {expected}, got {actual}")
     if before_config is not None:
         if config.is_symlink() or not config.is_file():
             raise ValueError("The existing config.toml was replaced or removed")
@@ -507,9 +541,30 @@ def observe(
             before_config = config_text(before_config, key)
             after_config = config_text(after_config, key)
         if before_config != after_config:
-            raise ValueError("config.toml changed text outside the edited value")
+            check_failed("config.toml changed text outside the edited value")
+    fixture_values = None
+    if cutover:
+        fixture_values = {
+            urlsplit(endpoints.http).netloc: "<fixture-http>",
+            urlsplit(endpoints.ws).netloc: "<fixture-ws>",
+            urlsplit(endpoints.http).path: "<fixture-route>",
+            endpoints.near_expiry: "<fixture-near-expiry>",
+            endpoints.overview_expiry: "<fixture-overview-expiry>",
+        }
+    if fixture_values is not None and case.command == "doctor":
+        # Doctor reports both its own checkout and the launcher found on PATH.
+        # Match the known fixture paths before the enclosing checkout path.
+        fixture_values[str(Path(sys.executable).with_name("sai"))] = "<fixture-sai>"
+        checkout = Path(binary[0]).parent.parent.parent
+        if (checkout / ".git").exists():
+            fixture_values[str(checkout)] = "<checkout>"
+        fixture_values[str(ROOT)] = "<checkout>"
     normalize = Normalize(
-        home, concurrent=concurrent, started_at=started_at, ended_at=ended_at
+        home,
+        concurrent=concurrent,
+        started_at=started_at,
+        ended_at=ended_at,
+        fixture_values=fixture_values,
     )
     admission_key = endpoints.admission.key
     expected_id = (
@@ -519,7 +574,11 @@ def observe(
         for path in (home / "sai" / "logs").glob("*.jsonl"):
             text = path.read_text(encoding="utf-8")
             if any(value in text for value in case.absent_log_text):
-                raise ValueError("Fixture credential appeared in a log")
+                if candidate or not cutover:
+                    raise ValueError("Fixture credential appeared in a log")
+                # The immutable release may contain a marker from this
+                # synthetic fixture. Compare its fingerprint in the snapshot.
+                check_failed("Published reference logs a synthetic fixture marker")
     files = snapshot(
         home / "sai", normalize, raw_config=case.seed == "doctor-malformed-toml"
     )
@@ -542,9 +601,10 @@ def observe(
             state[f"{filename}#{entry}.args"] = ["mcp", "serve"]
         else:
             state[f"{filename}#{entry}"] = "<absent>"
-    check_state(state, files)
     if expected_id is not None:
-        check_state({f"{LEDGER}#tables.intents.rows.0.id": expected_id}, files)
+        state[f"{LEDGER}#tables.intents.rows.0.id"] = expected_id
+    for mismatch in state_differences(state, files):
+        check_failed(mismatch)
     display = result.stdout
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
@@ -567,11 +627,18 @@ def observe(
         ) from None
     for keys, expected in (case.output or {}).items():
         if not field_matches(output, keys, expected):
-            raise ValueError(f"Stdout differs from expectation at {keys}")
+            check_failed(f"Stdout differs from expectation at {keys}")
     if case.overview_expected:
-        check_overview_fields(case.overview_expected, output)
+        try:
+            check_overview_fields(case.overview_expected, output)
+        except ValueError as exc:
+            check_failed(str(exc))
     if case.mode == "mcp" and case.mcp_calls is None:
-        check_mcp_calls(output, case.mcp_profile)
+        mcp_tools(output)
+        try:
+            check_mcp_calls(output, case.mcp_profile)
+        except ValueError as exc:
+            check_failed(str(exc))
     stderr = stderr_category(result.stderr)
     if case.accepted_divergence == "uninstall-read-only":
         check_read_only_uninstall(case, result.returncode, output, stderr, candidate)
@@ -587,14 +654,33 @@ def observe(
     }
     if case.command == "account overview" and case.mode == "json":
         display = mask_overview_stdout(display, case.mode)
+    if cutover and endpoints.overview_times is not None:
+        risk_time, mark_time = endpoints.overview_times
+        clocks = Normalize(
+            home,
+            fixture_values={
+                risk_time: "<fixture-risk-time>",
+                mark_time: "<fixture-mark-time>",
+            },
+        )
+        # Validate the timestamps and their ages in stdout before replacing
+        # the two source times allocated by the overview fixture.
+        output = clocks.paths(output)
+        display = clocks.text(display)
     diagnostic = result.stderr
     if case.command == "doctor" and case.exact_output:
         if case.mode == "json":
-            display = mask_doctor_stream(display)
+            display = mask_doctor_stream(display, checkout=cutover)
         display = normalize.text(display)
         diagnostic = normalize.text(mask_doctor_stream(diagnostic))
-    raw = (display.encode(), diagnostic.encode()) if exact else None
-    return Observation(result.returncode, output, stderr, files, raw)
+    raw = None
+    if exact:
+        raw = (
+            (normalize.text(display).encode(), normalize.text(diagnostic).encode())
+            if cutover
+            else (display.encode(), diagnostic.encode())
+        )
+    return Observation(result.returncode, output, stderr, files, raw, tuple(checks))
 
 
 def read_only_uninstall_path(case: Case) -> tuple[str, str]:
@@ -637,6 +723,8 @@ def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
         inventory = {tool["name"]: tool for tool in tools}
         if not inventory or len(inventory) != len(tools):
             raise ValueError("MCP tools/list gave an empty or duplicate inventory")
+        if any(not isinstance(name, str) for name in inventory):
+            raise ValueError("MCP tools/list gave a non-string tool name")
         return inventory
     except (KeyError, TypeError):
         raise ValueError(
@@ -702,6 +790,67 @@ def differences(reference: Observation, candidate: Observation) -> list[str]:
     return diffs
 
 
+def cutover_differences(reference: Observation, candidate: Observation) -> list[str]:
+    left, right = asdict(reference), asdict(candidate)
+    checks = [
+        f"{side}: {mismatch}"
+        for side, observed in (("reference", left), ("candidate", right))
+        for mismatch in observed.pop("checks")
+    ]
+    # Preserve the exit codes in the signature. All other observations
+    # report paths and shape without emitting potentially private values.
+    for observed in (left, right):
+        observed["exit"] = observed.pop("exit_code")
+    return checks + differing_paths(left, right, "parity")
+
+
+def mcp_evidence(
+    case: Case,
+    reference: Observation | None,
+    candidate: Observation | None,
+    evidence: dict[str, list[str]],
+) -> None:
+    def record(tool: str, fields: list[str]) -> None:
+        if fields:
+            evidence.setdefault(tool, []).extend(fields)
+
+    prefix = case.name
+    left_tools = (
+        mcp_tools(reference.output) if reference and case.mcp_calls is None else {}
+    )
+    right_tools = (
+        mcp_tools(candidate.output) if candidate and case.mcp_calls is None else {}
+    )
+    for tool in left_tools.keys() | right_tools.keys():
+        record(
+            tool,
+            differing_paths(
+                left_tools.get(tool), right_tools.get(tool), f"{prefix}.tool"
+            ),
+        )
+    left_calls = (
+        {reply["id"]: reply["result"] for reply in reference.output}
+        if reference
+        else {}
+    )
+    right_calls = (
+        {reply["id"]: reply["result"] for reply in candidate.output}
+        if candidate
+        else {}
+    )
+    if case.mcp_calls is None:
+        names = enumerate((call.tool for call in CALLS[case.mcp_profile]), 3)
+    else:
+        names = enumerate((call["name"] for call in case.mcp_calls), 2)
+    for id_, name in names:
+        record(
+            name,
+            differing_paths(
+                left_calls.get(id_), right_calls.get(id_), f"{prefix}.call[{id_}]"
+            ),
+        )
+
+
 def matches_early_position_reads(
     reference: Observation, candidate: Observation, expected_reads: int
 ) -> bool:
@@ -738,6 +887,7 @@ def safe_observe(
     endpoints: Endpoints,
     *,
     candidate: bool = False,
+    cutover: bool = False,
 ) -> tuple[Observation | None, str]:
     endpoints.errors.clear()
     endpoints.interrupt_ready.clear()
@@ -749,7 +899,9 @@ def safe_observe(
     outbound = unroutable_packets()
     try:
         result: tuple[Observation | None, str] = (
-            observe(case, binary, home, endpoints, candidate=candidate),
+            observe(
+                case, binary, home, endpoints, candidate=candidate, cutover=cutover
+            ),
             "",
         )
     except subprocess.TimeoutExpired:
@@ -939,7 +1091,12 @@ def project_reference_doctor_keeper_log(left: Observation, right: Observation) -
 
 
 def run_case(
-    case: Case, reference: list[str], candidate: list[str]
+    case: Case,
+    reference: list[str],
+    candidate: list[str],
+    *,
+    cutover: bool = False,
+    tool_evidence: dict[str, list[str]] | None = None,
 ) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
     candidate_case = case.rust_case() if rust else case
@@ -948,7 +1105,7 @@ def run_case(
         loopback(case.server) as endpoints,
     ):
         left, left_error = safe_observe(
-            case, reference, Path(temp) / "reference", endpoints
+            case, reference, Path(temp) / "reference", endpoints, cutover=cutover
         )
         right, right_error = safe_observe(
             candidate_case,
@@ -956,7 +1113,10 @@ def run_case(
             Path(temp) / "candidate",
             endpoints,
             candidate=rust,
+            cutover=cutover,
         )
+    if case.mode == "mcp" and tool_evidence is not None:
+        mcp_evidence(case, left, right, tool_evidence)
     tools = {}
     inventory_case = case.mode == "mcp" and case.mcp_calls is None
     if inventory_case and left is not None:
@@ -989,7 +1149,7 @@ def run_case(
     reference_exit = left.exit_code
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
-    if candidate != reference:
+    if rust and not cutover:
         project_reference_log_privacy(left, right)
         if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
             left = project_reference_rejected_scope(left)
@@ -1046,44 +1206,52 @@ def run_case(
         left = replace(
             left, exit_code=right.exit_code, output=right.output, stderr=right.stderr
         )
-    if rust and case.position_case:
-        project_position_estimates(left.output)
-    if rust and case.accepted_difference and case.mode != "mcp":
-        diffs = []
-        if right.exit_code != candidate_case.expect:
-            diffs.append(
-                f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
-            )
-        if left.stderr != right.stderr:
-            diffs.append("stderr differs")
+    expected = None
+    if cutover:
+        diffs = cutover_differences(left, right)
     else:
-        diffs = differences(left, right)
-    expected = case.accepted_difference if rust else None
-    if (
-        rust
-        and diffs
-        and case.rust_early_position_reads
-        and matches_early_position_reads(left, right, case.rust_early_position_reads)
-    ):
-        diffs = []
-        expected = "Rust checks Keeper ownership before reading the LCD network."
-
-    if inventory_case and rust:
-        expected = expect_native_mcp_info(
-            left.output,
-            allow_deferred_trade=case.mcp_deferred_trade_exception,
-        )
-        validation = expect_native_mcp_validation(left.output, case.mcp_profile)
-        auth_status = None
-        if case.mcp_profile == "auth-status":
-            auth_status = project_reference_auth_status_errors(left.output, endpoints)
-        expected = (
-            ", ".join(
-                reason for reason in (expected, validation, auth_status) if reason
+        if rust and case.position_case:
+            project_position_estimates(left.output)
+        if rust and case.accepted_difference and case.mode != "mcp":
+            diffs = []
+            if right.exit_code != candidate_case.expect:
+                diffs.append(
+                    f"expected candidate exit {candidate_case.expect}, got {right.exit_code}"
+                )
+            if left.stderr != right.stderr:
+                diffs.append("stderr differs")
+        else:
+            diffs = differences(left, right)
+        expected = case.accepted_difference if rust else None
+        if (
+            rust
+            and diffs
+            and case.rust_early_position_reads
+            and matches_early_position_reads(
+                left, right, case.rust_early_position_reads
             )
-            or None
-        )
-        diffs = differences(left, right)
+        ):
+            diffs = []
+            expected = "Rust checks Keeper ownership before reading the LCD network."
+
+        if inventory_case and rust:
+            expected = expect_native_mcp_info(
+                left.output,
+                allow_deferred_trade=case.mcp_deferred_trade_exception,
+            )
+            validation = expect_native_mcp_validation(left.output, case.mcp_profile)
+            auth_status = None
+            if case.mcp_profile == "auth-status":
+                auth_status = project_reference_auth_status_errors(
+                    left.output, endpoints
+                )
+            expected = (
+                ", ".join(
+                    reason for reason in (expected, validation, auth_status) if reason
+                )
+                or None
+            )
+            diffs = differences(left, right)
     if reference_exit != case.expect:
         diffs.insert(0, f"expected reference exit {case.expect}, got {reference_exit}")
     if (case.mode in {"mcp", "jsonl"} or case.expect == 0) and left.output == "":
@@ -1093,6 +1261,34 @@ def run_case(
             if call.expected == "ok" and not diffs:
                 tools[call.tool] = "PASS"
     return diffs, tools, expected
+
+
+def release_commands(reference: list[str]) -> set[str]:
+    interpreter = Path(reference[0]).with_name("python")
+    if not interpreter.is_file():
+        raise ValueError("The release launcher needs its installed Python interpreter")
+    with (
+        tempfile.TemporaryDirectory(prefix="sai-release-inventory-") as temp,
+        loopback("normal") as endpoints,
+    ):
+        home = Path(temp)
+        env = child_env(home, endpoints)
+        result = invoke(
+            [str(interpreter)], [str(HERE / "case_inventory.py")], home, env
+        )
+    if result.returncode:
+        raise ValueError(f"Release command inventory exited {result.returncode}")
+    try:
+        names = json.loads(result.stdout)
+    except ValueError:
+        raise ValueError("Invalid release command inventory") from None
+    if (
+        not isinstance(names, list)
+        or not names
+        or not all(isinstance(name, str) for name in names)
+    ):
+        raise ValueError("Invalid release command inventory")
+    return set(names)
 
 
 def project_position_estimates(value: Any) -> None:
@@ -1107,17 +1303,6 @@ def project_position_estimates(value: Any) -> None:
             project_position_estimates(item)
 
 
-def cli_commands(group: click.Group, prefix: str = "") -> set[str]:
-    result = set()
-    for name, command in group.commands.items():
-        full = f"{prefix} {name}".strip()
-        if isinstance(command, click.Group):
-            result.update(cli_commands(command, full))
-        else:
-            result.add(full)
-    return result
-
-
 def row(command: str, status: str, detail: str = "") -> None:
     escaped = [
         item.replace("|", "\\|").replace("\n", " ")
@@ -1126,32 +1311,98 @@ def row(command: str, status: str, detail: str = "") -> None:
     print("| " + " | ".join(escaped) + " |", flush=True)
 
 
+def report_mcp_tools(
+    tools: dict[str, str], evidence: dict[str, list[str]], gaps: ManifestGaps | None
+) -> None:
+    print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
+    for name in sorted(tools.keys() | evidence.keys()):
+        status = tools.get(name, "MISSING")
+        label = (
+            name
+            if name in RELEASE_MCP_TOOL_NAMES
+            else f"unexpected-sha256:{value_fingerprint(name)}"
+        )
+        if gaps:
+            diffs = sorted(evidence.get(name, []))
+            if status != "PASS":
+                diffs.append(
+                    f"tools/list or tools/call: {status}; no passing transcript"
+                )
+            row(f"`{label}`", *gaps.result(f"mcp:{label}", diffs))
+        else:
+            row(
+                f"`{label}`", status, "tools/call" if status == "PASS" else "tools/list"
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--case", action="append", help="Run matching case IDs (glob, repeatable)"
     )
     parser.add_argument(
+        "--reference",
         "--python-reference",
-        type=Path,
-        metavar="SAI",
-        help="Use the sai entry point of an installed Python reference",
+        help="Use this Python sai executable for every selected case",
+    )
+    parser.add_argument(
+        "--cutover",
+        action="store_true",
+        help="Require each release row to pass or match its reviewed signature",
+    )
+    parser.add_argument(
+        "--c2-v011",
+        action="store_true",
+        help="Run the C2 config comparisons with their exact logging signatures",
     )
     args = parser.parse_args()
+    comparing_release = args.cutover or args.c2_v011
+    if comparing_release and (
+        args.case
+        or not args.reference
+        or not os.getenv("SAI_PARITY_BIN")
+        or (args.cutover and args.c2_v011)
+    ):
+        parser.error(
+            "Select one release suite with --reference and SAI_PARITY_BIN, without --case"
+        )
     if sqlite3.sqlite_version_info < MIN_SQLITE_SCHEMA:
         parser.error(SQLITE_SCHEMA_REQUIREMENT)
     try:
         enter_loopback()
-        uv = resolve_uv()
+        # Use the CLI subprocess umask when seeding fixtures.
+        os.umask(0o022)
+        configured_reference = args.reference or os.environ.get("SAI_PARITY_PYTHON")
+        if configured_reference is None:
+            reference = [
+                resolve_uv(),
+                "run",
+                "--project",
+                str(ROOT),
+                "--no-sync",
+                "--offline",
+                "sai",
+            ]
+        elif executable := shutil.which(configured_reference):
+            reference = [str(Path(executable).absolute())]
+        else:
+            parser.error("--reference must name an executable Python sai")
     except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         parser.error(str(exc))
     with (HERE / "cases.toml").open("rb") as file:
         configured = tomllib.load(file)
     cases = [Case(**item) for item in configured["case"]]
     deferred: dict[str, str] = configured.get("deferred", {})
-    missing = cli_commands(python_cli) - (
-        {case.command for case in cases} | deferred.keys()
-    )
+    commands = cli_commands(python_cli)
+    if args.cutover:
+        try:
+            require_manifest_case_ids(
+                (case.name for case in cases), HERE / "release-case-ids.txt"
+            )
+            commands |= release_commands(reference)
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            parser.error(str(exc))
+    missing = commands - ({case.command for case in cases} | deferred.keys())
     if missing:
         parser.error(
             f"Add cases or mark these commands deferred: {', '.join(sorted(missing))}"
@@ -1159,22 +1410,19 @@ def main() -> int:
     selected = [
         case
         for case in cases
-        if not args.case
-        or any(fnmatch.fnmatchcase(case.name, pattern) for pattern in args.case)
+        if (
+            case.name in C2_CONFIG_CASE_IDS
+            if args.c2_v011
+            else not args.case
+            or any(fnmatch.fnmatchcase(case.name, pattern) for pattern in args.case)
+        )
     ]
+    if args.c2_v011 and (
+        missing := C2_CONFIG_CASE_IDS - {case.name for case in selected}
+    ):
+        parser.error(f"Missing C2 config case IDs: {', '.join(sorted(missing))}")
     if not selected:
         parser.error("No parity cases matched")
-    reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
-    if args.python_reference is not None:
-        executable = shutil.which(str(args.python_reference.absolute()))
-        if executable is None:
-            parser.error("--python-reference must name an executable file")
-        reference = [executable]
-    elif configured_python := os.environ.get("SAI_PARITY_PYTHON"):
-        executable = shutil.which(configured_python)
-        if not executable:
-            parser.error("SAI_PARITY_PYTHON must name an executable file or command")
-        reference = [str(Path(executable).absolute())]
     candidate = reference
     checkout_python = str(Path(sys.executable).with_name("sai"))
     c9a_python = os.environ.get("SAI_C9A_PYTHON") or checkout_python
@@ -1185,7 +1433,7 @@ def main() -> int:
             parser.error("SAI_PARITY_BIN must name an executable file or command")
         candidate = [str(Path(executable).absolute())]
     mcp_reference = reference
-    if any(case.mode == "mcp" for case in selected):
+    if args.reference is None and any(case.mode == "mcp" for case in selected):
         if override := os.getenv("SAI_MCP_PARITY_PYTHON"):
             executable = shutil.which(override)
             if not executable:
@@ -1203,9 +1451,21 @@ def main() -> int:
     mismatches = 0
     expected_differences = 0
     tools: dict[str, str] = {}
+    evidence: dict[str, list[str]] = {}
+    gaps = None
+    if comparing_release:
+        gaps = ManifestGaps(
+            HERE / "manifest-xfails.toml",
+            case_ids={f"case:{name}" for name in C2_CONFIG_CASE_IDS}
+            if args.c2_v011
+            else None,
+            row_label="C2_V011_ROW" if args.c2_v011 else "CUTOVER_ROW",
+        )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
-        if overview_reference and (
+        if args.reference is not None:
+            oracle = reference
+        elif overview_reference and (
             case.name == "account-bare" or case.command == "account overview"
         ):
             oracle = [str(Path(overview_reference).absolute())]
@@ -1221,14 +1481,39 @@ def main() -> int:
         else:
             oracle = reference
         executable = oracle if candidate is reference else candidate
-        diffs, listed, expected = run_case(case, oracle, executable)
+        if comparing_release:
+            case = replace(
+                case,
+                accepted_divergence=None,
+                mcp_deferred_trade_exception=False,
+            )
+        diffs, listed, expected = run_case(
+            case,
+            oracle,
+            executable,
+            cutover=comparing_release,
+            tool_evidence=evidence if gaps else None,
+        )
         for tool, status in listed.items():
             if status != "LISTED" or tool not in tools:
                 tools[tool] = status
         mismatches += bool(diffs)
         expected_differences += bool(expected and not diffs)
+        shown_args = [
+            "<redacted>"
+            if any(marker in arg for marker in case.absent_output_text or ())
+            else arg
+            for arg in case.args
+        ]
+        command = f"`sai {shlex.join(shown_args)}` ({case.name})"
+        if gaps:
+            row(
+                command,
+                *gaps.result(f"case:{case.name}", diffs),
+            )
+            continue
         row(
-            f"`sai {shlex.join(case.args)}` ({case.name})",
+            command,
             "DIFF" if diffs else "EXPECTED DIFF" if expected else "PASS",
             ", ".join(diffs)
             if diffs
@@ -1239,17 +1524,26 @@ def main() -> int:
                 else ""
             ),
         )
-    if not args.case:
+    if not args.case and not args.c2_v011:
         for name, reason in sorted(deferred.items()):
-            row(f"`sai {name}`", "DEFERRED", reason)
+            if gaps:
+                row(
+                    f"`sai {name}`",
+                    *gaps.result(f"cli:{name}", [f"deferred: {reason}"]),
+                )
+            else:
+                row(f"`sai {name}`", "DEFERRED", reason)
     if tools:
-        print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
-        for name, status in tools.items():
-            row(f"`{name}`", status, "tools/call" if status == "PASS" else "tools/list")
+        report_mcp_tools(tools, evidence, gaps)
     passed = len(selected) - mismatches - expected_differences
     print(f"\n{passed}/{len(selected)} cases passed.")
     if expected_differences:
         print(f"Expected differences: {expected_differences}.")
+    if gaps:
+        if args.cutover and not tools:
+            print("Cutover could not verify an MCP inventory.")
+            return 1
+        return gaps.finish()
     return int(bool(mismatches))
 
 

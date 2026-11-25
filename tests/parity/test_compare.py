@@ -52,6 +52,17 @@ def test_doctor_stream_masks_clock_and_build_values_and_keeps_other_bytes() -> N
     )
 
 
+def test_release_doctor_stream_masks_each_checkouts_git_state() -> None:
+    sha = "a" * 40
+    raw = f'{{"git":{{"commit":"{sha}","dirty":false}},"summary":"other chain"}}'
+    other = raw.replace(sha, "b" * 40).replace("false", "true")
+    expected = '{"git":{"commit":"<commit>","dirty":"<dirty>"},"summary":"other chain"}'
+    assert mask_doctor_stream(raw) == raw
+    assert mask_doctor_stream(raw, checkout=True) == expected
+    assert mask_doctor_stream(other, checkout=True) == expected
+    assert mask_doctor_stream(raw.replace(sha, "invalid"), checkout=True) != expected
+
+
 def test_start_log_compares_command_and_argv_shape(tmp_path: Path) -> None:
     normalize = Normalize(tmp_path)
     start = {
@@ -68,6 +79,31 @@ def test_start_log_compares_command_and_argv_shape(tmp_path: Path) -> None:
     assert normalize.log_event({**names_only, "argv": [42]}) != expected
     end = {**names_only, "event": "command.end"}
     assert normalize.log_event(end)["argv"] == names_only["argv"]
+
+
+def test_log_schema_selects_volatile_fields(tmp_path: Path) -> None:
+    schema = tmp_path / "log-events.json"
+    schema.write_text(json.dumps({"volatileFields": ["ts", "durationMs"]}), "utf-8")
+    normalize = Normalize(tmp_path, log_schema=schema)
+    event = {"ts": "2026-11-24T01:00:00.000Z", "durationMs": 12, "pid": 99}
+
+    assert normalize.log_event(event) == {
+        "ts": "<ts>",
+        "durationMs": "<durationMs>",
+        "pid": 99,
+    }
+    assert normalize.log_event({**event, "durationMs": "12"})["durationMs"] == "12"
+    assert "durationMs" not in normalize.log_event({"ts": event["ts"]})
+
+
+def test_log_schema_requires_a_rule_for_each_volatile_field(tmp_path: Path) -> None:
+    schema = tmp_path / "log-events.json"
+    schema.write_text(json.dumps({"volatileFields": ["undocumentedId"]}), "utf-8")
+
+    with pytest.raises(
+        ValueError, match="Missing log normalization rule for undocumentedId"
+    ):
+        Normalize(tmp_path, log_schema=schema)
 
 
 @pytest.mark.parametrize(

@@ -37,7 +37,9 @@ fn uv(home: &Path) -> Command {
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join(".."));
     let mut command = Command::new("uv");
-    command.args(["--quiet", "run", "--project"]).arg(root);
+    command
+        .args(["--quiet", "run", "--offline", "--no-sync", "--project"])
+        .arg(root);
     clean_env(&mut command, home);
     command
 }
@@ -425,13 +427,63 @@ fn rust_saved_session_round_trips_in_python() {
             ENDPOINT.into(),
         ))
         .unwrap();
-    let status = parity(
-        home.path(),
-        &["--json", "--endpoint", ENDPOINT, "auth", "status"],
-        6,
+    let read_session = r#"
+import sys
+from sai_cli.core.storage import load_session
+
+session = load_session()
+assert session["token"] == "synthetic-legacy-session"
+assert session["evmAddress"] == sys.argv[1]
+assert session["endpoint"] == sys.argv[2]
+assert session["expiresAt"] == "2000-01-01T00:00:00+00:00"
+"#;
+    write_cli_fixture(home.path(), read_session, &[ADDR, ENDPOINT]);
+    let damaged_home = tempdir().unwrap();
+    let damaged_trader = damaged_home.path().join("trader");
+    fs::create_dir(&damaged_trader).unwrap();
+    fs::copy(
+        home.path().join("trader/sessions.json"),
+        damaged_trader.join("sessions.json"),
+    )
+    .unwrap();
+    write_cli_fixture(
+        damaged_home.path(),
+        r#"
+import base64
+import json
+from cryptography.exceptions import InvalidTag
+from sai_cli.core.storage import SIGN_IN_AGAIN, directory, load_session
+
+path = directory() / "sessions.json"
+envelope = json.loads(path.read_text())
+ciphertext = bytearray(base64.b64decode(envelope["ciphertext"], validate=True))
+ciphertext[-1] ^= 1
+envelope["ciphertext"] = base64.b64encode(ciphertext).decode()
+path.write_text(json.dumps(envelope))
+
+try:
+    load_session()
+except ValueError as exc:
+    assert str(exc) == f"Cannot unlock session; {SIGN_IN_AGAIN}"
+    assert isinstance(exc.__cause__, InvalidTag)
+else:
+    raise AssertionError("Python accepted a damaged session")
+"#,
+        &[],
     );
-    let error: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
+    let mut python = uv(home.path());
+    python.arg("sai");
+    // The releases use different human-facing hints for the same expired session.
+    for mut command in [rust(home.path()), python] {
+        let status = command
+            .args(["--json", "--endpoint", ENDPOINT, "auth", "status"])
+            .output()
+            .unwrap();
+        assert_eq!(status.status.code(), Some(6));
+        assert!(status.stderr.is_empty());
+        let error: Value = serde_json::from_slice(&status.stdout).unwrap();
+        assert_eq!(error["error"]["code"], "SESSION_EXPIRED");
+    }
     let output = parity(
         home.path(),
         &["--json", "--endpoint", ENDPOINT, "auth", "list"],

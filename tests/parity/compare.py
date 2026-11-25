@@ -28,6 +28,7 @@ LOG_FILE = re.compile(r"logs/(?P<surface>[a-z]+)-(?P<day>\d{4}-\d{2}-\d{2})\.jso
 LOG_TIMESTAMP = re.compile(
     r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
 )
+LOG_SCHEMA = Path(__file__).resolve().parents[2] / "docs" / "log-events.json"
 LEDGER = "trader/intents.sqlite3"
 MIN_SQLITE_SCHEMA = (3, 26, 0)
 SQLITE_SCHEMA_REQUIREMENT = (
@@ -39,6 +40,9 @@ DOCTOR_GENERATED_AT = re.compile(r'("generatedAt":)"([^"\\]+)"')
 DOCTOR_DURATION_MS = re.compile(r'(?<="durationMs":)(?:0|[1-9]\d*)(?=[,}])')
 DOCTOR_BUILD_VERSION = re.compile(rf'("(?:version|installed)":"){VERSION.pattern}(?=")')
 DOCTOR_DISPLAY_VERSION = re.compile(rf"(?<=sai ){VERSION.pattern}(?=[ ;]|$)")
+DOCTOR_CHECKOUT_GIT = re.compile(
+    r'("git":\{"commit":")[0-9a-f]{40}(","dirty":)(?:true|false)(?=\})'
+)
 INTENT_ID = re.compile(r"\b\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}\b")
 TOML_TABLE = re.compile(r"\s*\[([^\[\]]+)\]\s*(?:#.*)?")
 SQLITE_TRIVIA = r"[ \t\n\f\r]+|--[^\n]*|/\*[\s\S]*?(?:\*/|$)"
@@ -135,9 +139,8 @@ def config_text(text: str, edited_key: str) -> str:
     return "".join(lines)
 
 
-# The log schema lists volatile fields in docs/log-events.json. Intent keys
-# are also generated in parity cases and must join to the ledger and stdout.
-LOG_VOLATILE_FIELDS: Mapping[str, str] = {
+# Each rule validates the field before masking its value or mapping its ID.
+LOG_FIELD_RULES = {
     "ts": "timestamp",
     "durationMs": "duration",
     "version": "version",
@@ -146,8 +149,18 @@ LOG_VOLATILE_FIELDS: Mapping[str, str] = {
     "callId": "callId",
     "commandId": "commandId",
     "endpointId": "endpointId",
-    "intentKey": "intentKey",
 }
+
+
+@cache
+def load_log_field_rules(schema: Path) -> Mapping[str, str]:
+    fields = json.loads(schema.read_text(encoding="utf-8"))["volatileFields"]
+    if not isinstance(fields, list) or any(not isinstance(f, str) for f in fields):
+        raise ValueError(f"Expected a list of volatile field names in {schema}")
+    try:
+        return {field: LOG_FIELD_RULES[field] for field in fields}
+    except KeyError as exc:
+        raise ValueError(f"Missing log normalization rule for {exc.args[0]}") from exc
 
 
 def timestamp(value: object) -> bool:
@@ -178,25 +191,30 @@ class Normalize:
     def __init__(
         self,
         home: Path,
-        log_fields: Mapping[str, str] = LOG_VOLATILE_FIELDS,
         *,
+        log_schema: Path = LOG_SCHEMA,
         concurrent: bool = False,
         started_at: float | None = None,
         ended_at: float | None = None,
+        fixture_values: Mapping[str, str] | None = None,
     ):
         self.home = str(home)
-        self.log_fields = log_fields
+        self.log_fields = load_log_field_rules(log_schema)
         self.concurrent = concurrent
         self.ids: dict[str, dict[int | str, str]] = {}
         self.started_at = started_at
         self.ended_at = ended_at
+        self.fixture_values = fixture_values or {}
 
     def identity(self, kind: str, value: int | str) -> str:
         existing = self.ids.setdefault(kind, {})
         return existing.setdefault(value, f"<{kind} {len(existing) + 1}>")
 
     def text(self, value: str) -> str:
-        return value.replace(self.home, "<HOME>")
+        value = value.replace(self.home, "<HOME>")
+        for fixture, label in self.fixture_values.items():
+            value = re.sub(re.escape(fixture) + r"(?!\d)", label, value)
+        return value
 
     def intent_refs(self, value: str) -> str:
         return INTENT_ID.sub(lambda match: self.identity("intentKey", match[0]), value)
@@ -236,13 +254,10 @@ class Normalize:
             "callId": r"[0-9a-fA-F]{12}",
             "commandId": r"[0-9a-f]{32}",
             "endpointId": r"h1_[0-9a-f]{64}",
-            "intentKey": INTENT_ID,
         }
         for field, rule in self.log_fields.items():
             item = value.get(field)
-            if rule == "timestamp" and field in value:
-                if field != "ts":
-                    parse_log_timestamp(item)
+            if rule == "timestamp":
                 result[field] = f"<{field}>"
             elif rule in predicates:
                 replace_if(result, field, predicates[rule])
@@ -367,7 +382,7 @@ def doctor_report(value: dict[str, Any]) -> None:
             doctor_provenance(install)
 
 
-def mask_doctor_stream(raw: str) -> str:
+def mask_doctor_stream(raw: str, *, checkout: bool = False) -> str:
     """Mask clock and build values without changing serialization or layout."""
     raw = DOCTOR_GENERATED_AT.sub(
         lambda match: f'{match[1]}"<generatedAt>"' if timestamp(match[2]) else match[0],
@@ -376,6 +391,8 @@ def mask_doctor_stream(raw: str) -> str:
     raw = DOCTOR_DURATION_MS.sub('"<durationMs>"', raw)
     raw = DOCTOR_BUILD_VERSION.sub(r"\g<1><version>", raw)
     raw = DOCTOR_DISPLAY_VERSION.sub("<version>", raw)
+    if checkout:
+        raw = DOCTOR_CHECKOUT_GIT.sub(r'\g<1><commit>\g<2>"<dirty>"', raw)
     return DURATION.sub("<durationMs>", raw)
 
 
@@ -1190,10 +1207,14 @@ def content(path: Path, name: str, normalize: Normalize) -> Any:
         replace_if(value, "checkedAt", timestamp)
         return value
     if name == "logs/.endpoint-key":
-        if path.stat().st_size != 32:
-            raise ValueError("Expected a 32-byte log endpoint key")
+        validate_log_endpoint_key(path)
         return "<generated endpoint key>"
     return path.read_bytes()
+
+
+def validate_log_endpoint_key(path: Path) -> None:
+    if path.stat().st_size != 32:
+        raise ValueError("Expected a 32-byte log endpoint key")
 
 
 def read_log(path: Path, day: str) -> list[dict[str, Any]]:

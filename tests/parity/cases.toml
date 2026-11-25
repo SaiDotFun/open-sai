@@ -706,6 +706,8 @@ args = ["auth","import","synthetic-import-credential-marker"]
 mode = "text"
 expect = 2
 seed = "config-logs-disabled"
+exact_output = true
+absent_output_text = ["synthetic-import-credential-marker"]
 
 [[case]]
 name = "auth-import-rejected-operand-json"
