@@ -190,8 +190,8 @@ pub struct Open {
 }
 
 impl Open {
-    fn preview(&self) -> Result<TradePreview, SaiError> {
-        OpenTrade {
+    fn preview(&self, price: Option<&str>, confirmed: bool) -> Result<TradePreview, SaiError> {
+        let trade = OpenTrade {
             market: &self.market,
             side: match self.side {
                 Side::Long => trade::Side::Long,
@@ -204,12 +204,26 @@ impl Open {
             },
             amount: &self.amount,
             leverage: &self.leverage,
-            price: self.price.as_deref(),
+            price,
             slippage: &self.slippage,
             take_profit: self.take_profit.as_deref(),
             stop_loss: self.stop_loss.as_deref(),
+        };
+        if confirmed {
+            trade.confirmed_cli_preview()
+        } else {
+            trade.preview()
         }
-        .preview()
+    }
+
+    fn confirmation(&self) -> Result<Option<trade::Confirmation<'_>>, SaiError> {
+        let Some(digest) = self.preview_digest.as_deref().filter(|_| !self.dry_run) else {
+            return Ok(None);
+        };
+        if matches!(self.order_type, OrderType::Market) {
+            return trade::Confirmation::for_market_cli(digest, self.price.as_deref()).map(Some);
+        }
+        Ok(Some(trade::Confirmation::for_cli(digest)))
     }
 }
 
@@ -365,16 +379,25 @@ pub fn run(
                 ..
             }
     );
-    let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price, preview_digest) =
-        match command {
-            TradeCommand::Open(open) => (
-                open.preview()?,
-                open.dry_run,
-                open.wait,
-                open.allow_concurrent_open,
-                open.price.is_some(),
-                open.preview_digest,
-            ),
+    let (preview, dry_run, wait_for_trade, allow_concurrent_open, supplied_price, confirmation) =
+        match &command {
+            TradeCommand::Open(open) => {
+                let confirmation = open.confirmation()?;
+                let confirmed_market =
+                    confirmation.is_some() && matches!(open.order_type, OrderType::Market);
+                let supplied = open.price.as_deref();
+                (
+                    open.preview(
+                        if confirmed_market { None } else { supplied },
+                        open.dry_run || confirmation.is_some(),
+                    )?,
+                    open.dry_run,
+                    open.wait,
+                    open.allow_concurrent_open,
+                    supplied.is_some(),
+                    confirmation,
+                )
+            }
             TradeCommand::Close {
                 trade_id,
                 cancel_order,
@@ -382,21 +405,21 @@ pub fn run(
                 preview_digest,
                 wait,
             } => (
-                close_preview(&trade_id, cancel_order)?,
-                dry_run,
-                wait,
+                close_preview(trade_id, *cancel_order)?,
+                *dry_run,
+                *wait,
                 false,
                 false,
-                preview_digest,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
             ),
             TradeCommand::Cancel {
                 trade_id,
                 dry_run,
                 wait,
             } => (
-                close_preview(&trade_id, true)?,
-                dry_run,
-                wait,
+                close_preview(trade_id, true)?,
+                *dry_run,
+                *wait,
                 false,
                 false,
                 None,
@@ -412,7 +435,7 @@ pub fn run(
                     _ => {
                         return Err(SaiError::usage(format!(
                             "Invalid value for '--direction': {} is not one of 'add', 'remove'.",
-                            repr(&direction),
+                            repr(direction),
                         )));
                     }
                 };
@@ -420,10 +443,7 @@ pub fn run(
                     &trading,
                     &settings,
                     account,
-                    PositionAction::Margin {
-                        direction,
-                        amount: &amount,
-                    },
+                    PositionAction::Margin { direction, amount },
                     &waiting,
                 );
             }
@@ -433,7 +453,7 @@ pub fn run(
                     &settings,
                     account,
                     PositionAction::PartialClose {
-                        percent: trade::parse_partial_close_percent(&percent)?,
+                        percent: trade::parse_partial_close_percent(percent)?,
                     },
                     &waiting,
                 );
@@ -449,17 +469,17 @@ pub fn run(
                 wait,
             } => (
                 trade::tpsl_preview(
-                    &trade_id,
+                    trade_id,
                     take_profit.as_deref(),
                     stop_loss.as_deref(),
-                    clear_take_profit,
-                    clear_stop_loss,
+                    *clear_take_profit,
+                    *clear_stop_loss,
                 )?,
-                dry_run,
-                wait,
+                *dry_run,
+                *wait,
                 false,
                 false,
-                preview_digest,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
             ),
             TradeCommand::Leverage {
                 trade_id,
@@ -468,12 +488,12 @@ pub fn run(
                 preview_digest,
                 wait,
             } => (
-                trade::leverage_preview(&trade_id, &leverage)?,
-                dry_run,
-                wait,
+                trade::leverage_preview(trade_id, leverage)?,
+                *dry_run,
+                *wait,
                 false,
                 false,
-                preview_digest,
+                preview_digest.as_deref().map(trade::Confirmation::for_cli),
             ),
         };
     let session = match trading.load_session(account) {
@@ -509,13 +529,13 @@ pub fn run(
         return Ok(ExitCode::Ok);
     }
     let session = session.ok_or_else(SaiError::internal)?;
-    if preview.requires_market_price_refresh() && supplied_price {
+    if preview.requires_market_price_refresh() && supplied_price && confirmation.is_none() {
         eprintln!("{}", trade::MARKET_PRICE_NOTICE);
     }
     let track = |addr: &str, key: &str| waiting.track(addr, key);
     let options = SubmitOptions {
         allow_concurrent_open,
-        confirmation: preview_digest.as_deref().map(trade::Confirmation::for_cli),
+        confirmation,
         on_reserved: wait_for_trade.then_some(&track),
         ..SubmitOptions::default()
     };
@@ -655,7 +675,7 @@ pub fn missing_position_option(argument: &str) -> Option<SaiError> {
 
 impl Position {
     fn run(
-        self,
+        &self,
         trading: &Trading<'_>,
         settings: &Settings,
         account: Option<&str>,

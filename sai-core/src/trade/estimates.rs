@@ -28,6 +28,7 @@ const KEEPER_PRICE: &str = "Sai Keeper market price";
 #[derive(Clone, Copy)]
 pub enum PreviewMode {
     Cli,
+    CliSubmission,
     Mcp,
 }
 
@@ -96,7 +97,10 @@ impl Trading<'_> {
     ) -> Value {
         let market = preview.requires_market_price_refresh();
         let mcp_market = market && matches!(mode, PreviewMode::Mcp);
-        if market_row.is_none() && self.lcd_endpoint.is_some() {
+        if market_row.is_none()
+            && self.lcd_endpoint.is_some()
+            && !(market && matches!(mode, PreviewMode::CliSubmission))
+        {
             market_row = self.open_market_row(preview, QUOTE_TIMEOUT).await.ok();
         }
         if preview.position_route.is_none()
@@ -110,12 +114,12 @@ impl Trading<'_> {
             .as_ref()
             .and_then(|row| decimal_price(&row["price"]).ok())
             .filter(|price| positive_decimal(price, "Current price").is_ok());
-        let (price, source) = match (market, mcp_market, supplied) {
+        let (price, source) = match (market, mode, supplied) {
             (false, _, price) => (price, "Order trigger"),
-            (true, false, Some(price)) => (Some(price), "CLI --price"),
+            (true, PreviewMode::Cli, Some(price)) => (Some(price), "CLI --price"),
             _ => (keeper_price.as_deref(), KEEPER_PRICE),
         };
-        if market && !mcp_market {
+        if market && matches!(mode, PreviewMode::Cli) {
             preview.reference_price = price.map(str::to_owned);
         }
         let reference =

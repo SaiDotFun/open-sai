@@ -13,6 +13,7 @@ use super::{
 use crate::{
     errors::{Code, SaiError},
     keeper::TIMEOUT,
+    settings::repr,
     storage::Session,
 };
 
@@ -49,6 +50,23 @@ impl<'a> Confirmation<'a> {
             reference_price: None,
             cli: true,
         }
+    }
+
+    pub fn for_market_cli(digest: &'a str, price: Option<&'a str>) -> Result<Self, SaiError> {
+        let price = price.ok_or_else(|| {
+            invalid("Pass the confirmed market preview's referencePrice via --price")
+        })?;
+        if decimal_parts(price).is_none() {
+            return Err(SaiError::usage(format!(
+                "Invalid value for '--price': {} is not a valid decimal.",
+                repr(price)
+            )));
+        }
+        let units = reference_price_units(price, "Reference price")?;
+        Ok(Self {
+            reference_price: Some((price, units)),
+            ..Self::for_cli(digest)
+        })
     }
 
     pub(super) fn is_cli(&self) -> bool {
@@ -140,6 +158,14 @@ impl<'a> Confirmation<'a> {
             let moved = distance * 100u32;
             if &moved * SCALE > reference * allowed {
                 let moved = display_movement(moved, reference.clone());
+                if self.cli {
+                    return Err(SaiError::new(
+                        Code::PriceMoved,
+                        format!(
+                            "The market price moved {moved}% from the confirmed reference, more than the {slippage}% slippage. Run with --dry-run to review a new preview before submitting."
+                        ),
+                    ));
+                }
                 return Err(refusal(
                     preview,
                     account,
@@ -188,14 +214,28 @@ impl Trading<'_> {
         let addr = session.addr();
         match preview.intent.kind {
             "OPEN_TRADE" => {
-                self.estimate_preview(&mut prepared, Some(session), PreviewMode::Cli, None)
-                    .await?;
-                if self.position_route(&lcd, true).await? != route {
-                    return Err(SaiError::new(
-                        Code::PreviewMismatch,
-                        "The trading route changed while checking the open. Request a new preview before submitting.",
-                    ));
-                }
+                let market_row = if preview.requires_market_price_refresh() {
+                    Some(
+                        self.refresh_confirmed_cli_price(
+                            session,
+                            &mut prepared,
+                            confirmation,
+                            &lcd,
+                            &route,
+                        )
+                        .await?,
+                    )
+                } else {
+                    None
+                };
+                self.estimate_preview(
+                    &mut prepared,
+                    Some(session),
+                    PreviewMode::CliSubmission,
+                    market_row,
+                )
+                .await?;
+                self.recheck_open_route(&lcd, &route).await?;
             }
             "CANCEL_PENDING_TRADE" => {
                 let target = self
@@ -233,6 +273,57 @@ impl Trading<'_> {
             }
         }
         Ok(prepared)
+    }
+
+    async fn refresh_confirmed_cli_price(
+        &self,
+        session: &Session,
+        preview: &mut TradePreview,
+        confirmation: &Confirmation<'_>,
+        lcd: &Lcd<'_>,
+        route: &PositionRoute,
+    ) -> Result<serde_json::Value, SaiError> {
+        let mismatch = confirmation.verify_digest(preview, session.addr()).is_err();
+        let refreshed = async {
+            let row = self.refresh_market_quote(preview).await?;
+            let price = preview
+                .reference_price
+                .as_deref()
+                .ok_or_else(SaiError::internal)?;
+            reference_price_units(price, "Current price")?;
+            preview.intent.body["intentPrice"] = json!(price);
+            Ok(row)
+        }
+        .await;
+        match refreshed {
+            Ok(row) => Ok(row),
+            Err(_) if mismatch => Err(SaiError::new(
+                Code::PreviewMismatch,
+                "The market open no longer matches the confirmed preview. Request a new preview before submitting.",
+            )),
+            Err(error) => {
+                self.recheck_open_route(lcd, route).await?;
+                self.estimate_preview(preview, Some(session), PreviewMode::CliSubmission, None)
+                    .await?;
+                self.recheck_open_route(lcd, route).await?;
+                preview.check_cli_execution(session.addr())?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn recheck_open_route(
+        &self,
+        lcd: &Lcd<'_>,
+        route: &PositionRoute,
+    ) -> Result<(), SaiError> {
+        if &self.position_route(lcd, true).await? != route {
+            return Err(SaiError::new(
+                Code::PreviewMismatch,
+                "The trading route changed while checking the open. Request a new preview before submitting.",
+            ));
+        }
+        Ok(())
     }
 }
 
