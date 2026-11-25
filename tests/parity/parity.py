@@ -653,6 +653,30 @@ def expect_native_mcp_info(
     return ", ".join(reasons) or None
 
 
+def expect_native_mcp_validation(
+    output: list[dict[str, Any]], profile: str
+) -> str | None:
+    """Project only the Python reference's declared validation errors."""
+    validation_detail = re.compile(
+        r"^([^\n]+)\n(  [^\n]+? \[type=(\w+)), input_value=[^\n]*, input_type=\w+\]$",
+        re.MULTILINE,
+    )
+
+    def strip_input(match: re.Match[str]) -> str:
+        field, detail, category = match.groups()
+        return detail + "]" if category == "extra_forbidden" else f"{field}\n{detail}]"
+
+    replies = {frame["id"]: frame["result"] for frame in output}
+    changed = False
+    for id_, call in enumerate(CALLS[profile], 3):
+        if call.expected == "invalid":
+            block = replies[id_]["content"][0]
+            expected = validation_detail.sub(strip_input, block["text"])
+            changed |= expected != block["text"]
+            block["text"] = expected
+    return "Native MCP validation omits rejected input" if changed else None
+
+
 def project_reference_lcd_origin(output: dict[str, Any]) -> None:
     """The pinned Python reference still displays the LCD URL path."""
     error = output.get("error")
@@ -735,6 +759,10 @@ def run_case(
         expected = expect_native_mcp_info(
             left.output,
             allow_deferred_trade=case.mcp_deferred_trade_exception,
+        )
+        validation = expect_native_mcp_validation(left.output, case.mcp_profile)
+        expected = (
+            ", ".join(reason for reason in (expected, validation) if reason) or None
         )
     diffs = differences(left, right)
     if left.exit_code != case.expect:
