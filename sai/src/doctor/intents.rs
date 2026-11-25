@@ -112,45 +112,56 @@ fn copy_snapshot(root: &Path) -> Result<tempfile::TempDir, SnapshotError> {
     Err(SnapshotError::Changed)
 }
 
+fn matches_ledger_schema(db: &Connection, version: i64) -> rusqlite::Result<bool> {
+    let table: bool = db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents')",
+        [],
+        |row| row.get(0),
+    )?;
+    if !table {
+        return Ok(false);
+    }
+    if !matches!(version, 0 | SCHEMA_VERSION) {
+        return Ok(false);
+    }
+    let mut statement = db.prepare("PRAGMA table_info(intents)")?;
+    let columns = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?.to_ascii_uppercase(),
+            row.get::<_, i64>(3)?,
+            row.get::<_, i64>(5)?,
+        ))
+    })?;
+    let mut required = HashSet::new();
+    for column in columns {
+        let (name, kind, not_null, primary) = column?;
+        match (name.as_str(), kind.as_str(), not_null, primary) {
+            ("id", "TEXT", 0, 1)
+            | ("endpoint" | "account" | "kind" | "status" | "entity", "TEXT", 1, 0) => {
+                required.insert(name);
+            }
+            ("created_at", "REAL", 0, 0) if version == SCHEMA_VERSION => {
+                required.insert(name);
+            }
+            ("keeper_status", "TEXT", 0, 0) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(required.len() == if version == 0 { 6 } else { 7 })
+}
+
 pub(super) fn has_ledger_schema(root: &Path) -> bool {
-    let check = || -> Result<bool, SnapshotError> {
-        let private = copy_snapshot(root)?;
-        let run = || -> rusqlite::Result<bool> {
-            let db = Connection::open(private.path().join(FILES[0]))?;
-            db.busy_timeout(TIMEOUT)?;
-            let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
-            if !matches!(version, 0 | SCHEMA_VERSION) {
-                return Ok(false);
-            }
-            let mut statement = db.prepare("PRAGMA table_info(intents)")?;
-            let columns = statement.query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?.to_ascii_uppercase(),
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            })?;
-            let mut required = HashSet::new();
-            for column in columns {
-                let (name, kind, not_null, primary) = column?;
-                match (name.as_str(), kind.as_str(), not_null, primary) {
-                    ("id", "TEXT", 0, 1)
-                    | ("endpoint" | "account" | "kind" | "status" | "entity", "TEXT", 1, 0) => {
-                        required.insert(name);
-                    }
-                    ("created_at", "REAL", 0, 0) if version == SCHEMA_VERSION => {
-                        required.insert(name);
-                    }
-                    ("keeper_status", "TEXT", 0, 0) => {}
-                    _ => return Ok(false),
-                }
-            }
-            Ok(required.len() == if version == 0 { 6 } else { 7 })
-        };
-        run().map_err(|_| SnapshotError::Unreadable)
+    let has_schema = || {
+        let private = copy_snapshot(root).ok()?;
+        let db = Connection::open(private.path().join(FILES[0])).ok()?;
+        db.busy_timeout(TIMEOUT).ok()?;
+        let version = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .ok()?;
+        matches_ledger_schema(&db, version).ok()
     };
-    check().unwrap_or(false)
+    has_schema().unwrap_or(false)
 }
 
 fn read(root: &Path) -> Result<Snapshot, SnapshotError> {
@@ -160,12 +171,10 @@ fn read(root: &Path) -> Result<Snapshot, SnapshotError> {
         db.busy_timeout(TIMEOUT)?;
         let version = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
         let integrity: String = db.pragma_query_value(None, "quick_check", |row| row.get(0))?;
-        let table: bool = db.query_row(
-            "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type='table' AND name='intents')",
-            [],
-            |row| row.get(0),
-        )?;
-        let unknown = if table && integrity == "ok" {
+        let unknown = if integrity == "ok" && version <= SCHEMA_VERSION {
+            if !matches_ledger_schema(&db, version)? {
+                return Err(rusqlite::Error::InvalidQuery);
+            }
             let mut statement = db.prepare("SELECT id, endpoint, account FROM intents WHERE status='unknown' ORDER BY rowid DESC")?;
             statement
                 .query_map([], |row| {

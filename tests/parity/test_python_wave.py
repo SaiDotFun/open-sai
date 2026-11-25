@@ -192,9 +192,10 @@ def test_doctor_needs_trader_data_to_tighten_sai_home(
         config = sai_home / "config.toml"
         config.write_text('[unrelated]\nname = "fixture"\n')
         trader = sai_home / "trader"
+        ledger_file = trader / "intents.sqlite3"
         if profile != "config-only":
             trader.mkdir(mode=0o755)
-            with sqlite3.connect(trader / "intents.sqlite3") as ledger:
+            with sqlite3.connect(ledger_file) as ledger:
                 if profile == "dedicated":
                     ledger.execute(
                         "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL,"
@@ -203,6 +204,9 @@ def test_doctor_needs_trader_data_to_tighten_sai_home(
                     )
                 else:
                     ledger.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        if profile == "fake-ledger":
+            ledger_file.chmod(0o644)
+            original_ledger = ledger_file.read_bytes()
         result = run_cli(
             binary,
             home,
@@ -220,6 +224,11 @@ def test_doctor_needs_trader_data_to_tighten_sai_home(
         )
         [check] = [check for check in checks if check["id"] == "home"]
         assert config.read_text() == '[unrelated]\nname = "fixture"\n'
+        if profile == "fake-ledger":
+            assert ledger_file.read_bytes() == original_ledger
+            assert stat.S_IMODE(ledger_file.stat().st_mode) == 0o644
+            [intents] = [check for check in checks if check["id"] == "intents"]
+            assert intents["status"] == "fail"
         if profile == "dedicated" and not no_fix:
             assert stat.S_IMODE(sai_home.stat().st_mode) == 0o700
             assert stat.S_IMODE(trader.stat().st_mode) == 0o700
