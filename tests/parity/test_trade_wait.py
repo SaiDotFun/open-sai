@@ -9,15 +9,16 @@ import select
 import signal
 import sqlite3
 import subprocess
-import sys
 import time
 from collections import deque
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
-from threading import Event, Timer
+from threading import Event
 from typing import Any
+from unittest.mock import Mock
 from urllib.parse import unquote, urlsplit
 
 import pytest
@@ -979,10 +980,11 @@ def finish_trade_wait(
     *,
     startup_timeout: float,
     polling_timeout: float,
+    clock: Callable[[], float] = time.monotonic,
 ) -> tuple[bytes, bytes]:
-    startup_deadline = time.monotonic() + startup_timeout
+    startup_deadline = clock() + startup_timeout
     while not polling_started.is_set() and process.poll() is None:
-        remaining = startup_deadline - time.monotonic()
+        remaining = startup_deadline - clock()
         if remaining <= 0:
             pytest.fail(
                 f"Trade did not start polling within {startup_timeout:g} seconds"
@@ -992,33 +994,32 @@ def finish_trade_wait(
 
 
 def test_trade_wait_watchdog_starts_polling_budget_after_startup() -> None:
-    polling_started = Event()
-    with subprocess.Popen(
-        [sys.executable, "-c", "input(); print('receipt')"],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-    ) as process:
+    elapsed = 0.0
+    process = Mock(spec=subprocess.Popen)
+    process.poll.return_value = None
+    process.communicate.return_value = (b"receipt\n", b"")
+    polling_started = Mock(spec=Event)
+    polling_started.is_set.return_value = False
 
-        def complete_startup() -> None:
-            assert process.stdin is not None
-            process.stdin.write(b"\n")
-            process.stdin.flush()
-            polling_started.set()
+    def complete_startup(_timeout: float) -> bool:
+        nonlocal elapsed
+        process.communicate.assert_not_called()
+        # Startup uses more time than the polling watchdog allows.
+        elapsed = 5.0
+        polling_started.is_set.return_value = True
+        return True
 
-        # Startup alone uses more than the polling watchdog allows.
-        startup = Timer(1.25, complete_startup)
-        startup.start()
-        try:
-            assert finish_trade_wait(
-                process, polling_started, startup_timeout=10, polling_timeout=1
-            ) == (b"receipt\n", b"")
-            assert process.returncode == 0
-        finally:
-            startup.cancel()
-            startup.join()
-            if process.poll() is None:
-                process.kill()
+    polling_started.wait.side_effect = complete_startup
+    result = finish_trade_wait(
+        process,
+        polling_started,
+        startup_timeout=10,
+        polling_timeout=1,
+        clock=lambda: elapsed,
+    )
+    assert result == (b"receipt\n", b"")
+    polling_started.wait.assert_called_once()
+    process.communicate.assert_called_once_with(timeout=1)
 
 
 def test_position_trade_wait_deadlines(
