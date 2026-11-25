@@ -330,7 +330,7 @@ impl Overview<'_> {
         let ids = |scan: &Pages| {
             scan.rows
                 .iter()
-                .map(|row| row[id].as_u64())
+                .map(|row| row.get(id).and_then(Value::as_u64))
                 .collect::<Vec<_>>()
         };
         let mut previous_ids = ids(&first);
