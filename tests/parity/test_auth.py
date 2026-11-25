@@ -168,9 +168,14 @@ def test_auth_use_missing(
 
 @pytest.mark.parametrize("action", ["use", "logout"])
 @pytest.mark.parametrize(
-    ("umask", "existing_mode", "expected_mode"),
-    [(0o022, None, 0o644), (0o077, None, 0o600), (0o077, 0o640, 0o640)],
-    ids=["default-umask", "private-umask", "existing-lock"],
+    ("umask", "existing_mode", "expected_modes"),
+    [
+        (0o022, None, (0o644, 0o644)),
+        (0o077, None, (0o600, 0o600)),
+        (0o002, None, (0o664, 0o644)),
+        (0o077, 0o664, (0o664, 0o664)),
+    ],
+    ids=["default-umask", "private-umask", "permissive-umask", "existing-lock"],
 )
 def test_auth_session_lock_mode(
     tmp_path: Path,
@@ -178,10 +183,12 @@ def test_auth_session_lock_mode(
     action: str,
     umask: int,
     existing_mode: int | None,
-    expected_mode: int,
+    expected_modes: tuple[int, int],
 ) -> None:
     with loopback("normal") as endpoints:
-        for index, cli in enumerate(cli_pair):
+        for index, (cli, expected_mode) in enumerate(
+            zip(cli_pair, expected_modes, strict=True)
+        ):
             home = tmp_path / str(index)
             seed_home(home, endpoints, "accounts")
             lock = home / "sai" / "trader" / "sessions.lock"

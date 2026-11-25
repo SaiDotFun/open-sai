@@ -2,6 +2,7 @@ use std::{
     collections::BTreeMap,
     fs::{self, OpenOptions},
     io,
+    os::unix::fs::OpenOptionsExt,
     path::Path,
     time::Duration,
 };
@@ -355,12 +356,13 @@ impl Storage<'_> {
     }
 
     fn session_lock_file(&self) -> io::Result<fs::File> {
-        // Match Python's append open: honor the umask for a new lock and keep
-        // the mode of an existing lock. Session data lives in a separate file.
+        // Let the umask narrow 0644 for a new lock. The open preserves an
+        // existing lock's mode. Session data lives in a separate file.
         OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
+            .mode(0o644)
             .open(self.directory()?.join("sessions.lock"))
     }
 

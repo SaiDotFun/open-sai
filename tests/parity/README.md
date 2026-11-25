@@ -100,6 +100,11 @@ start, session event, and command end against the release. Rust records only
 the command words in `argv`, following Python main's auth privacy behavior.
 Python v0.1.2 records the address operand and flags.
 
+Rust applies the process umask to mode `0644` when creating
+`trader/sessions.lock`. Python applies it to mode `0666`, so a permissive
+umask can give Python's new lock group or other write permissions. Both
+CLIs preserve the mode of an existing lock.
+
 ## Native Distribution
 
 The Linux installer rehearsal installs the published Python v0.1.3 wheel
