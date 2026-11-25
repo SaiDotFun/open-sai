@@ -559,12 +559,13 @@ def test_trade_wait_replays_pending_then_receipt(
         assert receipt["execution"]["tradeChangeType"] == action.change
         assert receipt["execution"]["marketOrderSequence"] == 49
         if action.outcome == "filled":
-            assert receipt["fill"] == {
-                "price": None,
-                "sizeCollateralBaseUnits": None,
+            expected_fill: dict[str, Any] = {
                 "oraclePrice": "100.25",
                 "escrowedCollateralBaseUnits": "4000000",
             }
+            if not writer.rust and python_reference is not None:
+                expected_fill.update(price=None, sizeCollateralBaseUnits=None)
+            assert receipt["fill"] == expected_fill
         else:
             assert receipt["fill"] is None
         home.row(key, action.kind, action.entity, "terminal")

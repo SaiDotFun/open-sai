@@ -132,6 +132,16 @@ CASES = (
         (None, 0),
     ),
     Case(
+        "market-close",
+        (
+            intent("filled", kind="CLOSE_POSITION"),
+            history(indexed("position_closed_user")),
+        ),
+        "filled",
+        "terminal",
+        (None, 0),
+    ),
+    Case(
         "confirmed-failure",
         ("pending_exec", intent("market_order_fill_failed", errorMsg=OPAQUE)),
         "failed",
@@ -269,6 +279,14 @@ def ledger_state(home: Path) -> list[tuple[str, str, str | None]]:
         ).fetchall()
 
 
+def without_legacy_fill_placeholders(stdout: bytes) -> bytes:
+    # The pinned Python reference predates the removal. Keep the remaining
+    # bytes intact, including the wire spelling of decimal numbers.
+    old = b'"fill":{"price":null,"sizeCollateralBaseUnits":null,'
+    assert old in stdout
+    return stdout.replace(old, b'"fill":{', 1)
+
+
 def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
     wait_cli_pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -346,7 +364,10 @@ def test_intent_wait(
             assert result.returncode == case.exit, result
             assert result.stderr == b""
             assert OPAQUE.encode() not in result.stdout
-            document = json.loads(result.stdout)
+            stdout = result.stdout
+            if index == 0 and case.outcome == "filled":
+                stdout = without_legacy_fill_placeholders(stdout)
+            document = json.loads(stdout)
             assert document["intentKey"] == KEY
             assert document["addr"] == ADDR
             assert document["outcome"] == case.outcome
@@ -405,12 +426,10 @@ def test_intent_wait(
                 assert document["receipt"]["execution"]["block"] == FILL_BLOCK
                 assert document["receipt"]["positionNow"]["openPrice"] == 87_000
                 assert document["receipt"]["fill"] == {
-                    "price": None,
-                    "sizeCollateralBaseUnits": None,
                     "oraclePrice": "81000.50",
                     "escrowedCollateralBaseUnits": 4_000_000,
                 }
-            observed.append((result.stdout, wire, ledger))
+            observed.append((stdout, wire, ledger))
     assert observed[0] == observed[1]
 
 
@@ -462,7 +481,12 @@ def test_wait_account_first_matches_python(
             assert result.returncode == 0, result
             assert result.stderr == b""
             assert len(requests) == 2
-            results.append(json.loads(result.stdout))
+            stdout = (
+                without_legacy_fill_placeholders(result.stdout)
+                if index == 0
+                else result.stdout
+            )
+            results.append(json.loads(stdout))
     assert results[0] == results[1]
 
 
