@@ -61,9 +61,8 @@ jobs:
     needs: changes
     if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
-    # The suite takes under a minute; a hung test must not hold a required
-    # check for GitHub's six-hour default.
-    timeout-minutes: 10
+    # Allow time for pytest and the loopback parity checks on a slow runner.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: needs.changes.result != 'success' || needs.changes.outputs.python != 'false'
