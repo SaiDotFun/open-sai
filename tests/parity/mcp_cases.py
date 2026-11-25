@@ -42,6 +42,24 @@ TRADE_TOOLS = (
     "trade_partial_close",
 )
 
+# The public v0.1.2 inventory supplies the only readable tool labels in reports.
+RELEASE_MCP_TOOL_NAMES = frozenset(
+    {
+        *ACCOUNT_READS,
+        *TRADE_TOOLS,
+        *(f"preview_{tool.removeprefix('trade_')}" for tool in TRADE_TOOLS),
+        "account_overview",
+        "auth_list",
+        "auth_status",
+        "auth_use",
+        "intent_wait",
+        "logs_intent",
+        "market_list",
+        "market_prices",
+        "mcp_info",
+    }
+)
+
 
 @dataclass(frozen=True)
 class Call:

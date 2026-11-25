@@ -39,6 +39,7 @@ jobs:
             python:
               - 'cli/**'
               - 'tests/parity/**'
+              - 'docs/log-events.json'
               - 'skills/**'
               - 'scripts/**'
               - 'pyproject.toml'
@@ -148,14 +149,21 @@ jobs:
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo test --locked --workspace
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
-
-      # Use the C4 Python reference in sai/README.md on both PR and push runs.
+      # Use the published Python reference on both PR and push runs.
       - name: Check out the Python parity reference
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: 5b6e5fbf26975a837dfd0a0cad1d1fd40c5b2bdf
+          ref: refs/tags/sai-cli/v0.1.2
           path: .parity-python
+          persist-credentials: false
+
+      - name: Check out Python v0.1.1 for C2 and C3
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/sai-cli/v0.1.1
+          path: .parity-python-v011
           persist-credentials: false
 
       - name: Check out the Python account overview reference
@@ -197,14 +205,6 @@ jobs:
           # PR 152 changes how Python reports and logs rejected auth operands.
           ref: 3725b66446da215f3e84e65ad9fce36679b80c20
           path: .parity-auth-privacy-python
-          persist-credentials: false
-
-      - name: Check out Python v0.1.2 for intent status parity
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: 8557a7e13dceab0accc369191182c8e01423c91b # sai-cli/v0.1.2
-          path: .parity-intent-python
           persist-credentials: false
 
       - name: Install uv and Python for parity
@@ -257,13 +257,13 @@ jobs:
           uv sync --locked --all-groups
           uv sync --project .parity-trade-main --locked --all-groups
           uv sync --project .parity-python --locked --all-groups
+          uv sync --project .parity-python-v011 --locked
           uv sync --project .parity-overview-python --locked --all-groups --python 3.13
           uv sync --project .parity-mcp-python --python 3.12 --locked --all-groups
           uv sync --project .parity-python-c7 --locked --all-groups
           uv sync --project .parity-python-wait --locked --all-groups
           uv sync --project .parity-auth-python --locked --all-groups
           uv sync --project .parity-auth-privacy-python --locked --all-groups
-          uv sync --project .parity-intent-python --locked --all-groups
           uv sync --project .parity-position-v012 --locked --all-groups
           uv sync --project .parity-position-owner --locked --all-groups
           uv sync --project .parity-position-wait --locked --all-groups
@@ -289,21 +289,56 @@ jobs:
           fi
           test -x "$SAI_PARITY_BIN"
           test -x "$SAI_MCP_PARITY_PYTHON"
+          printf 'C8 Python reference '
+          git -C .parity-mcp-python rev-parse HEAD
           uv run --locked python tests/parity/parity.py --case 'mcp-*-*'
+      - name: Compare C3 shared storage against Python v0.1.2
+        if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false') }}
+        env:
+          SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-python
+        run: |
+          printf 'C3 Python v0.1.2 reference '
+          git -C "$SAI_PYTHON_REFERENCE" rev-parse HEAD
+          unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+            cargo test --locked -p sai --test storage_parity -- --include-ignored \
+              rust_saved_session_round_trips_in_python rust_reads_and_migrates_python_v2_session \
+              python_and_rust_share_ledger_reservations_and_rows python_and_rust_can_only_reserve_one_intent_at_a_time \
+              opening_a_second_rust_connection_keeps_the_reservation_locked
+      - name: Compare C2 and C3 against Python v0.1.1
+        if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false') }}
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-python-v011
+        run: |
+          printf 'C2/C3 Python v0.1.1 reference '
+          git -C "$SAI_PYTHON_REFERENCE" rev-parse HEAD
+          uv run --locked python tests/parity/parity.py \
+            --reference "$SAI_PYTHON_REFERENCE/.venv/bin/sai" --c2-v011
+          unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+            cargo test --locked -p sai --test storage_parity -- --include-ignored \
+              rust_saved_session_round_trips_in_python rust_reads_and_migrates_python_v2_session \
+              python_and_rust_share_ledger_reservations_and_rows python_and_rust_can_only_reserve_one_intent_at_a_time \
+              opening_a_second_rust_connection_keeps_the_reservation_locked
+      - name: Compare focused release parity cases
+        if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false') }}
+        env: &release-parity
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
+        run: |
+          uv run --locked pytest tests/parity/test_config_regressions.py \
+            tests/parity/test_intent_status.py tests/parity/test_intent_status_v012.py \
+            --release-xfails --verbose -rxX
+
+      - name: Compare the full Rust manifest against the released Python CLI
+        if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false') }}
+        env: *release-parity
+        run: uv run --locked python tests/parity/parity.py --reference "$SAI_PARITY_PYTHON" --cutover
+
       - name: Race the Rust and Python intent reservations
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         env:
           SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-python-c7
         run: cargo test --locked -p sai --test storage_parity -- --ignored python_and_rust_can_only_reserve_one_intent_at_a_time opening_a_second_rust_connection_keeps_the_reservation_locked
-      - name: Compare C11 and config regressions against Python v0.1.2
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
-        env:
-          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
-          SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
-        run: |
-          test "$("$SAI_PARITY_PYTHON" --version)" = 'sai, version 0.1.2'
-          uv run --locked pytest tests/parity/test_intent_status.py tests/parity/test_config_regressions.py \
-            -k 'c11 or watch_reports_rejected_upgrade or non_utf8_home_json or undecodable_environment'
       - name: Compare the Rust and Python CLIs
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         env:
@@ -319,17 +354,17 @@ jobs:
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
           SAI_PARITY_ESTIMATES_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_WAIT_PYTHON: ${{ github.workspace }}/.parity-position-wait/.venv/bin/sai
-        run: >-
-          uv run --locked pytest tests/parity
-          --ignore=tests/parity/test_intent_status_v012.py
-          --ignore=tests/parity/test_trade_shared_state.py
-
-      - name: Replay intent status against Python v0.1.2
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
-        env:
-          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
-          SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-intent-python/.venv/bin/sai
-        run: uv run --locked pytest tests/parity/test_intent_status_v012.py
+        run: |
+          printf 'Python release tag %s\n' 'sai-cli/v0.1.2'
+          for parity_checkout in .parity-python .parity-mcp-python .parity-python-c7 .parity-python-wait .parity-auth-python .parity-position-v012 .parity-position-owner; do
+            printf '%s ' "$parity_checkout"
+            git -C "$parity_checkout" rev-parse HEAD
+          done
+          uv run --locked pytest tests/parity --verbose -rxX \
+            --ignore=tests/parity/test_config_regressions.py \
+            --ignore=tests/parity/test_intent_status.py \
+            --ignore=tests/parity/test_intent_status_v012.py \
+            --ignore=tests/parity/test_trade_shared_state.py
 
       - name: Compare account overview and Doctor LCD in a loopback network namespace
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'

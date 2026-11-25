@@ -5,9 +5,82 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+from release_mismatch import ExpectedReleaseMismatch, ReleaseMismatch
+
+RELEASE_SIGNATURE = pytest.StashKey[str]()
+PENDING_RELEASE_RESULTS = pytest.StashKey[set[str]]()
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--release-xfails",
+        action="store_true",
+        help="Apply the strict expected failures for the v0.1.2 Rust CI comparison",
+    )
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(
+    config: pytest.Config, items: list[pytest.Item]
+) -> None:
+    if not config.getoption("--release-xfails"):
+        return
+    path = Path(__file__).with_name("release-xfails.toml")
+    with path.open("rb") as file:
+        registry = tomllib.load(file)
+    reasons: dict[str, tuple[str, str]] = {}
+    for table, endpoint in (("pull_request", "pull"), ("issue", "issues")):
+        for number, cases in registry.get(table, {}).items():
+            url = f"https://github.com/SaiDotFun/open-sai/{endpoint}/{number}"
+            for case, signature in cases.items():
+                nodeid = f"tests/parity/{case}"
+                if nodeid in reasons:
+                    raise pytest.UsageError(f"Multiple release owners for {nodeid}")
+                reasons[nodeid] = (url, signature)
+    config.stash[PENDING_RELEASE_RESULTS] = set(reasons)
+    for item in items:
+        if entry := reasons.pop(item.nodeid, None):
+            url, signature = entry
+            item.stash[RELEASE_SIGNATURE] = signature
+            item.add_marker(
+                pytest.mark.xfail(
+                    reason=url,
+                    strict=True,
+                    raises=ExpectedReleaseMismatch,
+                )
+            )
+    if reasons:
+        raise pytest.UsageError(
+            "Stale release expected-failure IDs: " + ", ".join(sorted(reasons))
+        )
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    try:
+        return (yield)
+    except ReleaseMismatch as error:
+        if error.signature == item.stash.get(RELEASE_SIGNATURE, None):
+            item.config.stash[PENDING_RELEASE_RESULTS].remove(item.nodeid)
+            raise ExpectedReleaseMismatch(error.differences) from None
+        raise
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if not (pending := session.config.stash.get(PENDING_RELEASE_RESULTS, None)):
+        return
+    if terminal := session.config.pluginmanager.get_plugin("terminalreporter"):
+        terminal.write_line(
+            "Required release comparisons did not report their expected mismatch:"
+        )
+        for nodeid in sorted(pending):
+            terminal.write_line(f"  {nodeid}")
+    if exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture

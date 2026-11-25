@@ -153,6 +153,7 @@ class Endpoints:
             datetime.now(UTC) + timedelta(hours=49, minutes=30)
         ).isoformat()
     )
+    overview_times: tuple[str, str] | None = None
 
     @property
     def keeper(self) -> str:
@@ -1677,4 +1678,7 @@ def loopback(
             interrupt_ready=interrupt_ready,
             interrupt_closed=interrupt_closed,
             keeper_path=keeper_path,
+            overview_times=(overview.state["riskTime"], overview.state["markTime"])
+            if overview is not None
+            else None,
         )

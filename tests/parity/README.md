@@ -57,6 +57,32 @@ means the MCP tool's schema and metadata matched in `tools/list`.
 `ACCEPTED` means each implementation met its recorded expectations for an
 intentional difference.
 
+## Release Cutover Results
+
+The required Rust job runs the full manifest and the focused comparisons
+against the same `sai-cli/v0.1.2` executable. Run the manifest locally with
+`parity.py --reference /absolute/path/to/released/sai --cutover` and set
+`SAI_PARITY_BIN` to the native executable.
+
+Each `CUTOVER_ROW` in the CI log carries a stable ID, a result, and the
+observed difference paths. Hashes bind the normalized values without exposing
+them in the job log. The full manifest must contain every case ID in
+[`release-case-ids.txt`](release-case-ids.txt). `case:` IDs use names in
+`cases.toml`, `cli:` IDs
+use deferred command names, and `mcp:` IDs use tool names. The MCP result
+includes tool metadata and requires a matching `tools/call` transcript.
+
+[`manifest-xfails.toml`](manifest-xfails.toml) records the owner and hash of
+each reviewed difference signature. An exact match reports `XFAIL`. A changed
+signature, unexpected pass, or unused entry fails the required job. Owners
+remove their entries in the same change that repairs the corresponding gaps.
+`M2-unassigned` entries include proposed issue titles for triage.
+
+CI records the C3 storage replays against v0.1.2 and a separate C2/C3 replay
+against v0.1.1. The nine C2 config cases share their exact log-schema
+signatures across both releases. Each v0.1.1 config result appears as a
+`C2_V011_ROW`.
+
 ## Auth Security Parity
 
 The namespace matrix compares rejected import operands and malformed stored
@@ -156,6 +182,24 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
 
+## Python References in Rust CI
+
+The Rust CI job sets `SAI_PARITY_PYTHON` to the `sai` executable built from
+the Python tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
+To compare every selected manifest case against that same executable, run
+`uv run --locked python tests/parity/parity.py --reference "$SAI_PARITY_PYTHON"`
+with `SAI_PARITY_BIN` set to the Rust binary. The explicit reference applies
+to the CLI cases and the MCP transcripts.
+
+The focused Rust CI comparison uses `--release-xfails`. The file
+`release-xfails.toml` maps exact failing pytest IDs to the open PR that owns
+each gap and the signature of its normalized field differences. The cases
+still run, and an unexpected pass fails CI so the fixing
+PR removes its marks in the same change. Keep a scenario's explicit pytest
+ID when changing its fixture. If a first fix exposes a second known gap,
+retain the scenario and update its expected failure with the next owner.
+Run without the option to see the raw failures.
+
 ## Auth Subprocess Cases
 
 Run `tests/parity/test_auth.py` with `SAI_PARITY_BIN` set to the Rust binary.
@@ -228,8 +272,8 @@ Set `SAI_PARITY_AUTH_PRIVACY_PYTHON` to the `.venv/bin/sai` from Python
 The C11 parity fixes use Python tag `sai-cli/v0.1.2` at commit
 `8557a7e13dceab0accc369191182c8e01423c91b`. Install that checkout with
 `uv sync --locked` and point `SAI_PARITY_PYTHON` at its `.venv/bin/sai`.
-The Rust CI job runs these cases in a focused step using the v0.1.2
-checkout. Its broader comparison still uses the legacy C4 reference.
+The focused CI step and the full release manifest use the same v0.1.2
+launcher.
 
 ```sh
 SAI_PARITY_PYTHON=/absolute/path/to/v0.1.2/.venv/bin/sai \
@@ -243,9 +287,8 @@ SAI_PARITY_BIN=/absolute/path/to/rust/sai \
 Run `tests/parity/test_intent_status_v012.py` with `SAI_PARITY_BIN` set to
 the Rust binary and `SAI_PARITY_PYTHON` set to the Python executable from
 tag `sai-cli/v0.1.2`, commit `8557a7e13dceab0accc369191182c8e01423c91b`.
-The Rust CI job runs this file separately because the existing intent
-status replay expects the older, unpaginated history request from its
-pre-release Python reference.
+The focused release CI step runs this file and the intent status replays
+against the same executable.
 
 ## Comparison Rules
 
@@ -294,14 +337,15 @@ checked on both sides.
 | Encrypted session envelopes | The nonce and ciphertext, after verifying the decrypted payload |
 | Intent ledger and outputs | Generated `intentKey` values and their ledger creation timestamps. The latter must be stored as REAL Unix seconds within the invocation window. |
 | Log file grouping | Dated files for each surface are merged in UTC date order. Each event requires a UTC timestamp in `YYYY-MM-DDTHH:MM:SS.sssZ` format that belongs to the file's date and falls within the invocation window. |
-| Log events | `ts`, `durationMs`, `pid`, `runId`, `callId`, `commandId`, `endpointId`, generated `intentKey`, and CLI version. The `doctor.result` and `update.check` events use the same rules as their stdout reports. |
+| Log events | Fields listed under `volatileFields` in `docs/log-events.json` and generated `intentKey` values. The `doctor.result` and `update.check` events use the same rules as their stdout reports. |
 | `logs/.endpoint-key` | The randomly generated contents. The file must contain 32 bytes, and its mode is compared. |
 
 Generated IDs use the same placeholder wherever the original ID reappears
 within a run. An event with the wrong call ID or an output with a different
 intent key can therefore differ even when both IDs have valid shapes.
-`LOG_VOLATILE_FIELDS` in `compare.py` assigns normalization rules to the
-volatile fields listed in `docs/log-events.json` and to generated intent keys.
+Each field listed under `volatileFields` needs a normalization rule in
+`compare.py` that checks the value's format. Intent keys use the same
+mapping in logs, the ledger, and command output.
 
 ## Account Overview Reference
 
@@ -325,8 +369,8 @@ reference for logs, skill management, and the REPL. It contains the logging
 v2 schema from PR #69 and the paging fixes from PR #93. In CI,
 `test_local_commands.py` uses the installed Python in the current checkout.
 To reproduce the pinned comparison, install Python from that commit and set
-`SAI_C9B_PARITY_PYTHON` to its `sai` launcher. The C4 tests still use
-`SAI_PARITY_PYTHON` for the older Keeper baseline.
+`SAI_C9B_PARITY_PYTHON` to its `sai` launcher. The C4 tests select the v0.1.2 launcher via
+`SAI_PARITY_PYTHON` in CI.
 
 The dense intent attribution test also matches Python `sai-cli/v0.1.2`
 at commit `8557a7e`. With 1,025 distinct anchors, Rust carries a compact
