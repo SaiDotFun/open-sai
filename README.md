@@ -384,29 +384,75 @@ scratch log. The script prints the log path and removes the temporary home.
 
 ### Rehearse the Native Cutover and Rollback
 
-On Linux, use the published Python 0.1.3 wheel and its `SHA256SUMS`, a
-full Python bridge wheel, and the native candidate archive for your
-architecture. Pair the archive with a shim built at the same version by
-`scripts/native-dist.py rehearsal-wheel`. That wheel can fetch only from the
-loopback release server. Keep the archive's source revision and digest with
-the results. The run also needs `cursor-agent` and a Codex build with
-`app-server` on `PATH`.
+Run this rehearsal manually on Linux before publishing a native candidate.
+It uses real Claude Code, Codex, and Cursor installations. The hosted
+Native Distribution jobs provision uv and Sai and run the automated archive
+smoke tests against Python 0.1.1. They do not provision the three clients
+needed for the populated 0.1.3 profile rehearsal.
+
+Use Python 3.11 or later and put `uv`, `claude`, `codex`, and
+`cursor-agent` on `PATH`. Codex must support `codex app-server`. The host
+must support the loopback-only network namespace described above.
+
+To reproduce the reported native 0.2.4 candidate, export its source revision
+into a scratch directory and set the test version in its package metadata.
+The commands below keep the version changes out of the checkout. Use the
+revision under review when rehearsing a different candidate.
+
+```bash
+cutover="$PWD/dist/cutover"
+native_src="$cutover/native-src"
+native_ref=ccffb46ab2b5a7084cc6ce41cc6a1be6c81900b6
+target="$(rustc -vV | sed -n 's/^host: //p')"
+mkdir -p "$native_src"
+git archive "$native_ref" | tar -x -C "$native_src"
+python3 - "$native_src" <<'PYTHON'
+from pathlib import Path
+import sys
+
+source = Path(sys.argv[1])
+for filename in ("Cargo.toml", "shim/pyproject.toml"):
+    path = source / filename
+    text = path.read_text()
+    old = 'version = "0.1.2"'
+    assert text.count(old) == 1
+    path.write_text(text.replace(old, 'version = "0.2.4"'))
+
+lock = source / "Cargo.lock"
+text = lock.read_text()
+for package in ("sai", "sai-core"):
+    old = f'name = "{package}"\nversion = "0.1.2"'
+    assert text.count(old) == 1
+    text = text.replace(old, f'name = "{package}"\nversion = "0.2.4"')
+lock.write_text(text)
+PYTHON
+cargo build --locked --bin sai --manifest-path "$native_src/Cargo.toml" \
+  --target-dir "$native_src/target"
+strip --strip-debug "$native_src/target/debug/sai"
+python3 "$native_src/scripts/native-dist.py" archive \
+  "$native_src/target/debug/sai" "$cutover/native" --target "$target"
+python3 "$native_src/scripts/native-dist.py" rehearsal-wheel "$cutover/native"
+sha256sum "$cutover/native/sai-0.2.4-$target.tar.gz"
+```
+
+The loopback shim must match the archive's version. Record the source
+revision and archive digest with the rehearsal output. Download the baseline
+wheel and build the full Python bridge from the checkout under review.
 
 ```bash
 gh release download sai-cli/v0.1.3 --repo SaiDotFun/open-sai \
-  --pattern '*.whl' --pattern SHA256SUMS --dir dist/published
-python3 scripts/build-bridge.py --version 0.1.4 --out-dir dist/bridge
+  --pattern '*.whl' --pattern SHA256SUMS --dir "$cutover/published"
+python3 scripts/build-bridge.py --version 0.1.4 --out-dir "$cutover/bridge"
 python3 scripts/release-rehearsal.py --verbose \
-  --published-assets dist/published \
-  --bridge-wheel dist/bridge/sai_cli-0.1.4-py3-none-any.whl \
-  --native-archive dist/sai-X.Y.Z-aarch64-unknown-linux-gnu.tar.gz \
-  dist/rehearsal-shim/sai_cli-X.Y.Z-py3-none-any.whl
+  --published-assets "$cutover/published" \
+  --bridge-wheel "$cutover/bridge/sai_cli-0.1.4-py3-none-any.whl" \
+  --native-archive "$cutover/native/sai-0.2.4-$target.tar.gz" \
+  "$cutover/native/sai_cli-0.2.4-py3-none-any.whl"
 ```
 
-Replace `X.Y.Z` and the archive architecture with the candidate values.
 The script prefetches Python dependencies before entering the required
-loopback-only namespace. All installs and all CLI and MCP checks run inside
-it. The script installs the published wheel with uv, updates to the bridge
+loopback-only namespace. CLI installs and MCP checks run inside it.
+The script installs the published wheel with uv, updates to the bridge
 and then to the native shim, and rolls back using the native updater.
 The same uv launcher and temporary profile are used throughout.
 
