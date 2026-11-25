@@ -3525,6 +3525,75 @@ def test_intent_cursor_replays_newer_rows_after_finding_older_anchor(
     assert seen_gaps == ([linked] if linked_event == "log.dropped" else [])
 
 
+@pytest.mark.parametrize("case", ["run", "scoped_run", "conflicting_invocation"])
+def test_intent_cursor_preserves_progress_when_reloading_many_anchors(home, case):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    row = {"ts": f"{day}T11:00:00.000Z", "surface": "cli"}
+    anchor = {
+        **row,
+        "event": "intent.keeper",
+        "runId": "target",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    gap = {**row, "event": "log.dropped", "runId": "target", "count": 1}
+    filler = log.encode({**row, "event": "command.start", "padding": "x" * 14000})
+    addresses = [ADDR if case == "run" else f"0x{seq:040x}" for seq in range(760)]
+    linked = (
+        {**gap, "event": "command.end", "commandId": "target"}
+        if case == "conflicting_invocation"
+        else gap
+    )
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.writelines(
+            log.encode(
+                {
+                    **anchor,
+                    "commandId": "target"
+                    if case == "conflicting_invocation"
+                    else f"command-{seq}",
+                    "addr": addr,
+                    "seq": seq,
+                    "padding": "x" * 14000,
+                }
+            )
+            for seq, addr in enumerate(addresses)
+        )
+        if case != "run":
+            stream.writelines(
+                log.encode(
+                    {**anchor, "addr": addr, "runId": "recent", "seq": 760 + seq}
+                )
+                for seq, addr in enumerate(addresses)
+            )
+        stream.write(filler * (18 * 1024 * 1024 // len(filler)))
+        stream.write(log.encode(linked))
+        stream.write(log.encode({**anchor, "runId": "recent", "seq": 1520}))
+
+    before = None
+    cursors = set()
+    events, gaps = [], []
+    while True:
+        page = log_queries.intent(
+            "KEY",
+            offline=True,
+            before=before,
+            addr=addresses[-1] if case != "run" else None,
+        )
+        events.extend(line["seq"] for line in page["events"])
+        gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 20
+        cursors.add(before)
+    assert gaps == ([] if case == "conflicting_invocation" else [gap])
+    assert sorted(events) == ([*range(760), 1520] if case == "run" else [759, 1519])
+
+
 def test_intent_cursor_keeps_anchors_from_each_scan_window(home):
     root = home / "logs"
     root.mkdir()

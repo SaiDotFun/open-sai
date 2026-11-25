@@ -288,6 +288,7 @@ MAX_CURSOR_FILE_BYTES = 1024 * 1024
 MAX_CURSOR_STATE_BYTES = 8 * 1024 * 1024
 LinkPositions = dict[str, set[log.RowPosition]]
 LINK_TAG = re.compile(r"[0-9a-f]{16}")
+LINK_REF = re.compile(r"[0-9a-f]{16}(?:[0-9a-f]{16})?")
 
 
 def _cursor_directories(
@@ -453,7 +454,7 @@ def _intent_cursor(
                 not isinstance(entry, list)
                 or len(entry) != 5
                 or not isinstance(entry[0], str)
-                or LINK_TAG.fullmatch(entry[0]) is None
+                or LINK_REF.fullmatch(entry[0]) is None
             ):
                 raise ValueError
             links[entry[0]].add(position(entry[1:]))
@@ -528,6 +529,10 @@ def _link_tag(kind: str, value: str | tuple[str, str, str]) -> str:
     return hashlib.blake2s(
         json.dumps((kind, value)).encode(), digest_size=8
     ).hexdigest()
+
+
+def _run_scope_tag(tag: str, scope: Scope) -> str:
+    return tag + _link_tag("scope", (*scope, ""))
 
 
 def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
@@ -722,8 +727,6 @@ def intent(
             )
             if (ts := _timestamp(line)) is not None
         ]
-        if not rows and scan.resume == cursor.position:
-            scan.resume = None
     complete_scan = not scan.truncated
     anchors = sorted((line for _, line in evidence.values()), key=log.event_order)
     identity = (log.endpoint_id(endpoint, root) or "") if endpoint else None
@@ -734,7 +737,7 @@ def intent(
         match
         for line in anchors
         if _scope(line) not in (None, scope)
-        and (match := _invocation(line)) in invocations
+        and (match := _invocation(line)) is not None
     }
     report: LogLine = {
         "intentKey": key if scope else None,
@@ -789,12 +792,51 @@ def intent(
     report["txHash"] = keeper.request_hash(log.clean(request_hash))[0]
     matched_runs = {_id(line, "runId") for line in direct} - {None}
 
-    def resolve_link(tag: str) -> bool:
+    def resolve_link(
+        tag: str,
+        *,
+        run: str | None = None,
+        invocation: tuple[str, str, str] | None = None,
+    ) -> bool:
         pending = links.get(tag, set()) - checked
-        previous, truncated = log.read_rows_at(root, list(pending), snapshot, budget)
+        if run and scope is not None:
+            pending.update(links.get(_run_scope_tag(tag, scope), set()) - checked)
+
+        def decisive(anchor: LogLine) -> bool:
+            if not is_anchor(anchor) or (anchor_scope := _scope(anchor)) is None:
+                return False
+            if run:
+                return anchor_scope == scope and _id(anchor, "runId") == run
+            return anchor_scope != scope and _invocation(anchor) == invocation
+
+        previous, truncated = log.read_rows_at(
+            root, list(pending), snapshot, budget, until=decisive
+        )
         if truncated:
+            # Keep unread references and one verified row for each distinct
+            # relationship. Duplicate proofs need no further reads on retry.
+            representatives = {}
+            visited = set()
+            for position, anchor in previous:
+                visited.add(position)
+                if is_anchor(anchor):
+                    if (
+                        run
+                        and (anchor_scope := _scope(anchor)) is not None
+                        and _id(anchor, "runId") == run
+                    ):
+                        links.setdefault(_run_scope_tag(tag, anchor_scope), set()).add(
+                            position
+                        )
+                        continue
+                    relation = (
+                        _scope(anchor),
+                        _id(anchor, "runId") if run else _invocation(anchor),
+                    )
+                    representatives.setdefault(relation, position)
+            links[tag] = links.get(tag, set()) - visited | set(representatives.values())
             return False
-        checked.update(pending)
+        checked.update(position for position, _ in previous)
         for position, anchor in previous:
             if not is_anchor(anchor):
                 continue
@@ -823,7 +865,7 @@ def intent(
                 scope is not None
                 and run_id
                 and run_id not in matched_runs
-                and not resolve_link(_link_tag("run", run_id))
+                and not resolve_link(_link_tag("run", run_id), run=run_id)
             ):
                 stop = position
                 break
@@ -851,15 +893,19 @@ def intent(
                 )
             )
         ):
-            if scope is not None and not resolve_link(_link_tag("invocation", match)):
+            if match in conflicting:
+                continue
+            if scope is not None and not resolve_link(
+                _link_tag("invocation", match), invocation=match
+            ):
                 stop = position
                 break
+            if match in conflicting:
+                continue
             if scope is None or match not in invocations:
                 if can_defer:
                     replay = position
                     break
-                continue
-            if match in conflicting:
                 continue
             field = "events"
         else:
@@ -875,10 +921,6 @@ def intent(
         scan.truncated |= any(
             not page.add("unattributedGaps", line) for line in unattributed[:8]
         )
-    if stop is not None and stop == cursor.position and last is None:
-        # The first unread row needs more context than this page can verify.
-        scan.truncated = True
-        scan.resume = stop = None
     keep_all_links = replay is not None
     if replay is not None and complete_scan:
         # The search has reached the end of the snapshot. Resume output at
@@ -909,7 +951,7 @@ def intent(
             # The entire unread range was visible. Drop links it cannot use.
             needed = {_link_tag("invocation", match) for match in related_invocations}
             needed.update(_link_tag("run", run) for run in related_runs if run)
-            links = {tag: refs for tag, refs in links.items() if tag in needed}
+            links = {tag: refs for tag, refs in links.items() if tag[:16] in needed}
         summaries: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
         for group, (position, line) in evidence.items():
             authority = (group[0], *group[3:])

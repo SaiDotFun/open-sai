@@ -1576,6 +1576,8 @@ def read_rows_at(
     positions: list[RowPosition],
     snapshot: FileSnapshot,
     budget: ScanBudget,
+    *,
+    until: Callable[[dict[str, Any]], bool] | None = None,
 ) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
     """Read the individual lines that supplied attribution on earlier pages."""
     rows: list[tuple[RowPosition, dict[str, Any]]] = []
@@ -1615,6 +1617,8 @@ def read_rows_at(
                             continue
                         if isinstance(line, dict):
                             rows.append((position, line))
+                            if until is not None and until(line):
+                                return rows, False
             except OSError:
                 raise SaiError(
                     "Could not read saved intent log evidence. "
