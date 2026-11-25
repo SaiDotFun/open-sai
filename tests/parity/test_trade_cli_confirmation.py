@@ -233,7 +233,7 @@ def test_position_execution_refuses_before_reserving(
     ],
     ids=["margin-pinned", "leverage-snapshot", "leverage-pinned"],
 )
-def test_confirmed_trade_refuses_funding_for_another_collateral(
+def test_confirmed_trade_handles_balance_for_another_collateral(
     pair: tuple[CLI, CLI],
     tmp_path: Path,
     command: CLI,
@@ -251,16 +251,13 @@ def test_confirmed_trade_refuses_funding_for_another_collateral(
         assert not endpoints.errors
 
     for index, cli in enumerate(pair):
-        # Python treats a failed standalone leverage estimate as advisory.
-        if index == 0 and command == LEVERAGE:
-            continue
         replay = TradeReplay("UPDATE_TRADE")
         with loopback(
             scenario, trade_replay=replay, wrong_balance_at=wrong_balance_at
         ) as endpoints:
             home = tmp_path / f"submit-{index}"
             seed_home(home, endpoints, "session")
-            refusal = run(
+            result = run(
                 cli,
                 home,
                 endpoints,
@@ -268,9 +265,20 @@ def test_confirmed_trade_refuses_funding_for_another_collateral(
                 python=index == 0,
             )
             assert not endpoints.errors
+            if command == LEVERAGE:
+                # A wrong-token balance leaves the standalone estimate unavailable.
+                code, _, stderr = result
+                assert (code, stderr) == (0, "")
+                (key,) = replay.admitted_keys()
+                assert replay.attempts() == {key: 1}
+                assert replay.intent(key)["body"] == preview["intent"]["body"]
+                assert [row[:6] for row in rows(home)] == [
+                    (key, "UPDATE_TRADE", "accepted", "7", preview["addr"], None)
+                ]
+                continue
             assert not replay.attempts()
-            assert not (home / "sai/trader/intents.sqlite3").exists()
-            assert refusal == (
+            assert not rows(home)
+            assert result == (
                 4,
                 {
                     "error": {
