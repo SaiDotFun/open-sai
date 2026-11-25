@@ -192,6 +192,7 @@ class ClaudeRepair:
     config_path: Path | None = None
     fields: tuple[str, ...] = ()
     launcher: str | None = None
+    launcher_args: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -236,6 +237,7 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
                     *profile,
                     "--",
                     entry.launcher,
+                    *entry.launcher_args,
                     "mcp",
                     "serve",
                 ]
@@ -278,10 +280,20 @@ def report_different_claude_entry(
     client: Claude, result: Result, existing: Registration, target: Target
 ) -> Result:
     launcher = target.argv[0]
+    launcher_args: tuple[str, ...] = ()
     if target.explicit_command:
         # An explicit override can contain private arguments or paths.
         default_launcher = shutil.which("sai", path=client.environ.get("PATH"))
-        launcher = os.path.abspath(default_launcher or sys.argv[0])
+        spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+        if (
+            default_launcher is None
+            and spec is not None
+            and spec.name == "sai_cli.__main__"
+        ):
+            launcher = os.path.abspath(sys.executable)
+            launcher_args = ("-m", "sai_cli")
+        else:
+            launcher = os.path.abspath(default_launcher or sys.argv[0])
     scope = existing.scope
     path = client.registration_path(scope)
     entry = ClaudeRepair(
@@ -292,6 +304,7 @@ def report_different_claude_entry(
         config_path=path,
         fields=claude_differing_fields(existing, target),
         launcher=launcher,
+        launcher_args=launcher_args,
     )
     hint = claude_repair_hint((entry,))
     if target.explicit_command:

@@ -2486,11 +2486,15 @@ def test_claude_install_reports_scoped_commands_without_credentials(
     assert not env.calls()
 
 
-def test_claude_custom_advice_uses_the_invoked_sai_without_sai_on_path(env: Env):
+@pytest.mark.parametrize("as_module", [False, True])
+def test_claude_custom_advice_uses_the_invoked_sai_without_sai_on_path(
+    env: Env, as_module: bool
+):
     env.sai.unlink()
     invoked = write_exe(
         env.root / "invoked sai", "from sai_cli.sai_cli import main\nmain()"
     )
+    invocation = [sys.executable, "-m", "sai_cli"] if as_module else [str(invoked)]
     custom = write_exe(env.root / f"custom-{SECRET}", "raise SystemExit(9)")
     config = env.home / ".claude.json"
     config.write_text(json.dumps({"mcpServers": {"sai": claude_entry(["old"])}}))
@@ -2498,7 +2502,7 @@ def test_claude_custom_advice_uses_the_invoked_sai_without_sai_on_path(env: Env)
 
     result = subprocess.run(
         [
-            str(invoked),
+            *invocation,
             "--json",
             "mcp",
             "install",
@@ -2525,10 +2529,13 @@ def test_claude_custom_advice_uses_the_invoked_sai_without_sai_on_path(env: Env)
         "user",
         "sai",
         "--",
-        str(invoked),
+        *invocation,
         "mcp",
         "serve",
     ]
+    executable = shlex.quote(invocation[0])
+    assert f"test -f {executable} && test -x {executable}" in row["fix"]
+    assert "__main__.py" not in row["fix"]
     assert "substitute your requested command after --" in row["fix"]
     assert SECRET not in result.stdout + result.stderr
     assert config.read_bytes() == before and not env.calls()
