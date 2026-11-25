@@ -514,11 +514,9 @@ def recheck_position(
     if check_collateral:
         prices = perp_prices(lcd, state, height)
         value = prices.get("collateral") if isinstance(prices, dict) else None
-        if (
-            value is None
-            or str(contract_decimal(value)) != quoted_inputs["collateralPriceUsd"]
-        ):
+        if value is None or quoted_inputs["collateralPriceUsd"] is None:
             return None
+        contract_decimal(value)
     return RecheckedPosition(height, effective_leverage, prices)
 
 

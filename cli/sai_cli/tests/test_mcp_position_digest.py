@@ -1319,6 +1319,38 @@ def test_partial_close_allows_remainder_below_fee_schedule_minimum(
     asyncio.run(scenario())
 
 
+def test_partial_close_accepts_confirmed_reduction_after_collateral_price_moves(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            position.collateral_price = "1.00119"
+            fresh = await call(client, "preview_partial_close", args)
+            assert fresh["quote"] == {
+                **preview["quote"],
+                "collateralPriceUsd": "1.00119",
+                "closedNotionalUsd": "4.00476",
+            }
+            assert fresh["intent"] == preview["intent"]
+            assert fresh["previewDigest"] == preview["previewDigest"]
+
+            position.prices_on_position_read.extend([None, "1.0012"])
+            accepted = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert accepted["status"] == "accepted", accepted
+            (submitted,) = position.submitted
+            assert submitted["body"] == preview["intent"]["body"]
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("collateral", "leverage", "closed_notional"),
     [(4_000_000, "2.5", "5"), (4_000_001, "2", "4")],
@@ -1639,31 +1671,20 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
                 "trade_partial_close",
                 {**args, "preview_digest": preview["previewDigest"]},
             )
-            assert result.get("code") == "PREVIEW_MISMATCH", result
-            assert position.submitted == []
-            assert position.price_query_heights == [None, None, None, None]
-            assert position.perp_price_query_heights == ["121", "121"]
-            assert result["quoteStatus"] == "available"
-            assert result["recovery"]["action"] == "confirm_preview"
-            fresh = result["preview"]
+            assert result["status"] == "accepted", result
+            (submitted,) = position.submitted
+            assert submitted["body"] == preview["intent"]["body"]
+            assert position.price_query_heights == [None, None, None]
+            assert position.perp_price_query_heights == ["121"]
+            fresh = await call(client, "preview_partial_close", args)
             assert fresh["quote"]["collateralPriceUsd"] == "0.98"
             assert fresh["quote"]["closedNotionalUsd"] == "245"
-            assert fresh["intent"] == preview["intent"]
-            assert fresh["previewDigest"] != preview["previewDigest"]
-            assert fresh == await call(client, "preview_partial_close", args)
-
-            accepted = await call(
-                client,
-                "trade_partial_close",
-                {**args, "preview_digest": fresh["previewDigest"]},
-            )
-            assert accepted["status"] == "accepted", accepted
-            assert len(position.submitted) == 1
+            assert fresh["previewDigest"] == preview["previewDigest"]
 
     asyncio.run(scenario())
 
 
-def test_partial_close_binds_collateral_from_the_publication_time_read(
+def test_partial_close_accepts_collateral_price_update_at_publication_time_read(
     position_service,
 ):
     position, base_url = position_service
@@ -1680,28 +1701,19 @@ def test_partial_close_binds_collateral_from_the_publication_time_read(
             position.reported_height = 121
             position.collateral_price_on_perp_read = "0.98"
 
-            refused = await call(
+            accepted = await call(
                 client,
                 "trade_partial_close",
                 {**args, "preview_digest": preview["previewDigest"]},
             )
-            assert refused["code"] == "PREVIEW_MISMATCH"
-            assert position.submitted == []
-            assert position.perp_price_query_heights == ["120", "121", "121"]
+            assert accepted["status"] == "accepted", accepted
+            (submitted,) = position.submitted
+            assert submitted["body"] == preview["intent"]["body"]
+            assert position.perp_price_query_heights == ["120", "121"]
             assert all(height is None for height in position.price_query_heights)
-            fresh = refused["preview"]
+            fresh = await call(client, "preview_partial_close", args)
             assert fresh["quote"]["closedNotionalUsd"] == "245"
-            assert fresh["intent"] == preview["intent"]
-            assert fresh["previewDigest"] != preview["previewDigest"]
-
-            accepted = await call(
-                client,
-                "trade_partial_close",
-                {**args, "preview_digest": fresh["previewDigest"]},
-            )
-            assert accepted["status"] == "accepted"
-            assert len(position.submitted) == 1
-            assert position.perp_price_query_heights == ["120", "121", "121", "121"]
+            assert fresh["previewDigest"] == preview["previewDigest"]
 
     asyncio.run(scenario())
 
@@ -1774,12 +1786,8 @@ def test_margin_refuses_when_the_guarded_leverage_cannot_size_a_change(
     asyncio.run(scenario())
 
 
-@pytest.mark.parametrize(
-    ("field", "changed", "fresh_usd"),
-    [("cap", "0", "0"), ("collateral_price", "1.000000000000000001", "250.000009")],
-)
-def test_partial_close_binds_cap_and_oracle_with_contract_rounding(
-    position_service: tuple[Position, str], field: str, changed: str, fresh_usd: str
+def test_partial_close_binds_cap_and_quotes_with_contract_rounding(
+    position_service: tuple[Position, str],
 ) -> None:
     position, base_url = position_service
     position.collateral = 100_000_002
@@ -1805,7 +1813,7 @@ def test_partial_close_binds_cap_and_oracle_with_contract_rounding(
                 == "250.000009"
             )
             assert quote["closedNotionalIsEstimate"] is False
-            setattr(position, field, changed)
+            position.cap = "0"
             result = await call(
                 client,
                 "trade_partial_close",
@@ -1814,7 +1822,7 @@ def test_partial_close_binds_cap_and_oracle_with_contract_rounding(
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
             assert result["preview"]["intent"] == preview["intent"]
-            assert result["preview"]["quote"]["closedNotionalUsd"] == fresh_usd
+            assert result["preview"]["quote"]["closedNotionalUsd"] == "0"
             assert result["preview"]["quote"]["closedNotionalIsEstimate"] is False
             assert result["preview"] == await call(
                 client, "preview_partial_close", args
@@ -1848,6 +1856,45 @@ def test_partial_close_marks_incomplete_quotes_as_estimates(
             assert quote["closedNotionalUsd"] == expected_usd
             assert quote["closedNotionalUsdc"] == ("20" if missing == "cap" else "10")
             assert quote["closedNotionalIsEstimate"] is True
+
+    asyncio.run(scenario())
+
+
+def test_partial_close_requires_fresh_confirmation_after_collateral_price_recovers(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral_price = None
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            outage = await call(client, "preview_partial_close", args)
+            assert outage["quote"]["effectiveLeverage"] == "2"
+            assert outage["quote"]["closedNotionalUsd"] is None
+            assert outage["quote"]["closedNotionalIsEstimate"] is True
+            position.collateral_price = "1.00119"
+            refused = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": outage["previewDigest"]},
+            )
+            assert refused.get("code") == "PREVIEW_MISMATCH", refused
+            assert position.submitted == []
+            fresh = refused["preview"]
+            assert fresh["quote"]["closedNotionalUsd"] == "4.00476"
+            assert fresh["quote"]["closedNotionalIsEstimate"] is False
+            assert fresh["intent"] == outage["intent"]
+            assert fresh["previewDigest"] != outage["previewDigest"]
+            accepted = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
+            assert accepted["status"] == "accepted", accepted
+            (submitted,) = position.submitted
+            assert submitted["body"] == fresh["intent"]["body"]
 
     asyncio.run(scenario())
 
