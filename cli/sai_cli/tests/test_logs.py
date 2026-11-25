@@ -3525,6 +3525,98 @@ def test_intent_cursor_replays_newer_rows_after_finding_older_anchor(
     assert seen_gaps == ([linked] if linked_event == "log.dropped" else [])
 
 
+def test_intent_cursor_discovers_only_links_needed_by_deferred_rows(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    before = f"{day}T11:00:00.000Z"
+    anchor = {
+        "ts": before,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    linked = {
+        "ts": f"{day}T10:00:00.000Z",
+        "event": "command.end",
+        "runId": "run-0",
+        "commandId": "command-0",
+    }
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.writelines(
+            log.encode({**anchor, "runId": f"run-{i}", "commandId": f"command-{i}"})
+            for i in range(70_000)
+        )
+        stream.write(log.encode(linked))
+        stream.write(log.encode({**linked, "runId": "unrelated"}))
+
+    events = []
+    cursors = set()
+    while True:
+        page = log_queries.intent("KEY", offline=True, before=before)
+        events.extend(page["events"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 12
+        cursors.add(before)
+    assert events == [linked]
+
+
+def test_intent_cursor_caches_run_proofs_only_for_requested_scope(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    before = f"{day}T11:00:00.000Z"
+    gap = {"ts": f"{day}T10:00:00.000Z", "event": "log.dropped", "runId": "run"}
+    anchor = {
+        **gap,
+        "ts": before,
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "endpointId": "h1_" + "a" * 64,
+    }
+    addresses = [f"0x{i:040x}" for i in range(log_queries.MAX_CURSOR_LINKS + 1)]
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.writelines(log.encode({**anchor, "addr": addr}) for addr in addresses)
+        stream.write(
+            log.encode({"event": "command.start", "ts": gap["ts"]}) * log.MAX_SCAN_ROWS
+        )
+        stream.write(log.encode(gap))
+
+    gaps = []
+    cursors = set()
+    while True:
+        page = log_queries.intent(
+            "KEY", offline=True, addr=addresses[-1], before=before
+        )
+        gaps.extend(page["gaps"])
+        before = page.get("nextBefore")
+        if before is None:
+            break
+        assert before not in cursors and len(cursors) < 10
+        cursors.add(before)
+    assert gaps == [gap]
+
+
+def test_intent_cursor_rejects_oversize_link_search_on_first_page(home):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    row = {"ts": f"{day}T11:00:00.000Z", "event": "command.end", "runId": "run"}
+    with log.file_path("cli", day, root).open("wb") as stream:
+        stream.write(log.encode(row) * log.MAX_SCAN_ROWS)
+        stream.writelines(
+            log.encode({**row, "commandId": f"command-{i}"})
+            for i in range(log_queries.MAX_CURSOR_LINKS + 1)
+        )
+
+    code, output = run_cli("--json", "logs", "intent", "KEY", "--offline")
+    assert code == 2 and "Start a narrower intent log query" in output
+    assert "nextBefore" not in json.loads(output)
+
+
 @pytest.mark.parametrize("case", ["run", "scoped_run", "conflicting_invocation"])
 def test_intent_cursor_preserves_progress_when_reloading_many_anchors(home, case):
     root = home / "logs"

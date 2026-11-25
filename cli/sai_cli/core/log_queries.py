@@ -200,8 +200,6 @@ def _trail_scan() -> log.PageScan:
 
 
 NO_CALL_PARENT = "-"
-# Intent cursors use the otherwise unused parent field after anchor discovery.
-INTENT_ATTRIBUTION_COMPLETE = "-"
 
 
 def _parse_position(day: str, parts: str) -> log.ScanPosition:
@@ -286,9 +284,26 @@ MAX_CURSOR_STATES = 128
 MAX_CURSOR_CACHE_BYTES = 16 * 1024 * 1024
 MAX_CURSOR_FILE_BYTES = 1024 * 1024
 MAX_CURSOR_STATE_BYTES = 8 * 1024 * 1024
+# Leave space in the cursor for the snapshot and attribution evidence.
+MAX_CURSOR_LINKS = MAX_CURSOR_FILE_BYTES // 128
 LinkPositions = dict[str, set[log.RowPosition]]
 LINK_TAG = re.compile(r"[0-9a-f]{16}")
 LINK_REF = re.compile(r"[0-9a-f]{16}(?:[0-9a-f]{16})?")
+
+
+@dataclass
+class _LinkSearch:
+    wanted: set[str]
+    settled: set[str]
+    forgotten: bool = False
+
+
+def _narrow_query() -> SaiError:
+    return SaiError(
+        "Intent log continuation exceeds the cache limit. Start a narrower intent log query with --before or --addr.",
+        Code.INVALID_REQUEST,
+        exit_code=ExitCode.USAGE,
+    )
 
 
 def _cursor_directories(
@@ -374,14 +389,10 @@ def _write_cursor_state(
     root: Path | None, raw: bytes, snapshot: log.FileSnapshot
 ) -> str:
     if len(raw) > MAX_CURSOR_STATE_BYTES:
-        raise SaiError(
-            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
-        )
+        raise _narrow_query()
     data = zlib.compress(raw)
     if len(data) > MAX_CURSOR_FILE_BYTES:
-        raise SaiError(
-            "Intent log continuation exceeds the cache limit.", Code.INTERNAL_ERROR
-        )
+        raise _narrow_query()
     name = f"{max(snapshot)[0].isoformat()}_{hashlib.sha256(data).hexdigest()}"
     for opened in _cursor_directories(root, create=True):
         with opened:
@@ -400,7 +411,9 @@ def _write_cursor_state(
 def _intent_cursor(
     value: str | None,
     root: Path | None,
-) -> tuple[_Cursor, list[log.RowPosition], log.FileSnapshot | None, LinkPositions]:
+) -> tuple[
+    _Cursor, list[log.RowPosition], log.FileSnapshot | None, LinkPositions, _LinkSearch
+]:
     base, separator, payload = (value or "").partition(CURSOR_STATE_SUFFIX)
     if not separator:
         if "~s~" in base or "~i~" in base:
@@ -408,14 +421,28 @@ def _intent_cursor(
         cursor = _Cursor.parse(value)
         if cursor.position is not None:
             raise log.stale_snapshot()
-        return cursor, [], None, {}
+        return cursor, [], None, {}, _LinkSearch(set(), set())
     cursor = _Cursor.parse(base)
     try:
         if cursor.position is None:
             raise ValueError
-        items, files, tagged = json.loads(_read_cursor_state(root, payload))
+        items, files, tagged, *extra = json.loads(_read_cursor_state(root, payload))
         if not all(isinstance(value, list) for value in (items, files, tagged)):
             raise TypeError
+        search = _LinkSearch(set(), set())
+        if extra:
+            (state,) = extra
+            wanted, settled, forgotten = state
+            if type(forgotten) is not bool or any(
+                not isinstance(tags, list)
+                or any(
+                    not isinstance(tag, str) or LINK_TAG.fullmatch(tag) is None
+                    for tag in tags
+                )
+                for tags in (wanted, settled)
+            ):
+                raise ValueError
+            search = _LinkSearch(set(wanted), set(settled), forgotten)
 
         def position(item: Any) -> log.RowPosition:
             if (
@@ -458,7 +485,7 @@ def _intent_cursor(
             ):
                 raise ValueError
             links[entry[0]].add(position(entry[1:]))
-        return cursor, positions, snapshot, links
+        return cursor, positions, snapshot, links, search
     except (TypeError, ValueError, OverflowError, RecursionError, zlib.error):
         raise SaiError(
             "Pass a log cursor or a UTC timestamp to --before.",
@@ -472,9 +499,16 @@ def _save_intent_cursor(
     positions: list[log.RowPosition],
     snapshot: log.FileSnapshot,
     links: LinkPositions,
+    search: _LinkSearch,
     root: Path | None,
 ) -> None:
     if base := report.get("nextBefore"):
+        if (
+            sum(ref.size for ref in positions) > log.MAX_SCAN_BYTES // 2
+            or len(positions) > log.MAX_SCAN_ROWS // 2
+            or len({(ref.day, ref.slot) for ref in positions}) > log.MAX_SCAN_FILES // 2
+        ):
+            raise _narrow_query()
 
         def fields(row: log.RowPosition) -> tuple[int, int, int, int]:
             return row.day.toordinal(), row.slot, row.offset, row.size
@@ -495,9 +529,10 @@ def _save_intent_cursor(
                 ],
                 [
                     (tag, *fields(row))
-                    for tag, refs in links.items()
+                    for tag, refs in sorted(links.items())
                     for row in sorted(refs)
                 ],
+                (sorted(search.wanted), sorted(search.settled), search.forgotten),
             ),
             separators=(",", ":"),
         ).encode()
@@ -533,6 +568,19 @@ def _link_tag(kind: str, value: str | tuple[str, str, str]) -> str:
 
 def _run_scope_tag(tag: str, scope: Scope) -> str:
     return tag + _link_tag("scope", (*scope, ""))
+
+
+def _candidate_tag(line: LogLine, key: str) -> str | None:
+    if line.get("event") == "log.dropped":
+        run = _id(line, "runId")
+        return _link_tag("run", run) if run else None
+    if (
+        (not _has_intent(line, key) or _scope(line) is None)
+        and (match := _invocation(line)) is not None
+        and line.get("intentKey") in (None, key)
+    ):
+        return _link_tag("invocation", match)
+    return None
 
 
 def _export(line: LogLine, tokens: tuple[str, ...]) -> LogLine:
@@ -647,7 +695,7 @@ def intent(
     if addr is not None and not keeper.is_address(addr):
         raise SaiError("Pass a 0x-prefixed EVM address.", Code.INVALID_REQUEST)
     chosen_addr = addr.lower() if addr else None
-    cursor, positions, snapshot, links = _intent_cursor(before, root)
+    cursor, positions, snapshot, links, search = _intent_cursor(before, root)
     log.flush(1.0)
     if snapshot is None:
         snapshot = log.snapshot_files(root)
@@ -855,10 +903,31 @@ def intent(
     last = None
     stop = None
     replay = cursor.replay
-    parent = cursor.parent
-    can_defer = scan.resume is not None and parent != INTENT_ATTRIBUTION_COMPLETE
+    search_from: log.ScanPosition | None = None
+    can_defer = scan.resume is not None or search.forgotten
+
+    def defer(position: log.ScanPosition, tag: str, index: int) -> bool:
+        nonlocal replay, search_from
+        if not can_defer or tag in search.settled:
+            return False
+        candidates = {
+            candidate
+            for _, _, row in rows[index:]
+            if (candidate := _candidate_tag(row, key)) is not None
+        } | {tag}
+        if len(candidates) > MAX_CURSOR_LINKS:
+            raise _narrow_query()
+        search.settled.intersection_update(candidates)
+        search.wanted = candidates - search.settled
+        replay = position
+        # Once speculative links were evicted, the anchor may be in a
+        # window already passed by the output cursor.
+        if search.forgotten:
+            search_from = log.ScanPosition(max(snapshot)[0])
+        return True
+
     unattributed = []
-    for position, ts, line in rows if replay is None else ():
+    for index, (position, ts, line) in enumerate(rows if replay is None else ()):
         if line.get("event") == "log.dropped":
             run_id = _id(line, "runId")
             if (
@@ -870,8 +939,7 @@ def intent(
                 stop = position
                 break
             if run_id not in matched_runs:
-                if run_id and can_defer:
-                    replay = position
+                if run_id and defer(position, _link_tag("run", run_id), index):
                     break
                 unattributed.append(line)
                 continue
@@ -903,8 +971,7 @@ def intent(
             if match in conflicting:
                 continue
             if scope is None or match not in invocations:
-                if can_defer:
-                    replay = position
+                if defer(position, _link_tag("invocation", match), index):
                     break
                 continue
             field = "events"
@@ -921,38 +988,40 @@ def intent(
         scan.truncated |= any(
             not page.add("unattributedGaps", line) for line in unattributed[:8]
         )
-    keep_all_links = replay is not None
-    if replay is not None and complete_scan:
+    searching = replay is not None
+    search_tags = search.wanted.copy()
+    if searching and complete_scan and search_from is None:
         # The search has reached the end of the snapshot. Resume output at
         # the first withheld row with the anchors found across all windows.
-        stop, replay, parent = replay, None, INTENT_ATTRIBUTION_COMPLETE
-    page.finish(scan, cursor, last, stop, parent, replay=replay)
+        stop, replay = replay, None
+        search.settled.update(search.wanted)
+        search.wanted.clear()
+    if search_from is not None:
+        stop = search_from
+    page.finish(scan, cursor, last, stop, replay=replay)
     if frontier := stop or scan.resume:
         # Scope evidence can be deeper than the next page's scan. Links to
         # unread anchors are only needed when the scan already saw related rows.
         remaining_rows = rows
-        if complete_scan and stop is not None and not keep_all_links:
+        if complete_scan and stop is not None and not searching:
             first_unread = next(
                 index for index, (position, _, _) in enumerate(rows) if position == stop
             )
             remaining_rows = rows[first_unread:]
-        related_invocations = {
-            match
+        needed = {
+            tag
             for _, _, line in remaining_rows
-            if (not _has_intent(line, key) or _scope(line) is None)
-            and (match := _invocation(line)) is not None
+            if (tag := _candidate_tag(line, key)) is not None
         }
-        related_runs = {
-            _id(line, "runId")
-            for _, _, line in remaining_rows
-            if line.get("event") == "log.dropped"
-        }
-        if complete_scan and not keep_all_links:
+        if complete_scan and not searching:
             # The entire unread range was visible. Drop links it cannot use.
-            needed = {_link_tag("invocation", match) for match in related_invocations}
-            needed.update(_link_tag("run", run) for run in related_runs if run)
-            links = {tag: refs for tag, refs in links.items() if tag[:16] in needed}
+            links = {
+                tag: refs
+                for tag, refs in links.items()
+                if tag[:16] in needed | search.settled
+            }
         summaries: dict[tuple[Any, ...], tuple[log.RowPosition, LogLine]] = {}
+        proofs: set[tuple[str, Scope]] = set()
         for group, (position, line) in evidence.items():
             authority = (group[0], *group[3:])
             previous = summaries.get(authority)
@@ -965,23 +1034,52 @@ def intent(
                     or position.offset < frontier.offsets[position.slot]
                 )
             )
-            if (match := _invocation(line)) and (
-                keep_all_links
-                or (not unread and (not complete_scan or match in related_invocations))
-                or (not complete_scan and match in related_invocations)
-            ):
-                links.setdefault(_link_tag("invocation", match), set()).add(position)
-            if (run_id := _id(line, "runId")) and (
-                keep_all_links
-                or (not unread and (not complete_scan or run_id in related_runs))
-                or (not complete_scan and run_id in related_runs)
-            ):
-                links.setdefault(_link_tag("run", run_id), set()).add(position)
+            if anchor_scope := _scope(line):
+                for kind, value in (
+                    ("invocation", _invocation(line)),
+                    ("run", _id(line, "runId")),
+                ):
+                    if value is None:
+                        continue
+                    if kind == "run" and (
+                        (chosen_addr is not None and anchor_scope[0] != chosen_addr)
+                        or (identity is not None and anchor_scope[1] != identity)
+                    ):
+                        continue
+                    tag = _link_tag(kind, value)
+                    proof = tag, anchor_scope
+                    if searching:
+                        retain = tag in search_tags or (
+                            cursor.replay is None
+                            and not search.forgotten
+                            and not unread
+                        )
+                    else:
+                        retain = (
+                            tag in needed and (not unread or not complete_scan)
+                        ) or (not complete_scan and not unread and not search.forgotten)
+                    if retain and proof not in proofs:
+                        proofs.add(proof)
+                        ref_tag = (
+                            _run_scope_tag(tag, anchor_scope) if kind == "run" else tag
+                        )
+                        links.setdefault(ref_tag, set()).add(position)
+        if sum(map(len, links.values())) > MAX_CURSOR_LINKS:
+            required_tags = (
+                search_tags | search.settled | (needed if not searching else set())
+            )
+            links = {
+                tag: refs for tag, refs in links.items() if tag[:16] in required_tags
+            }
+            search.forgotten = True
+            if sum(map(len, links.values())) > MAX_CURSOR_LINKS:
+                raise _narrow_query()
         _save_intent_cursor(
             report,
             [position for position, _ in summaries.values()],
             snapshot,
             links,
+            search,
             root,
         )
     if report.get("truncated") and "nextBefore" not in report:
