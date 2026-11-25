@@ -1091,9 +1091,18 @@ def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
-@pytest.mark.parametrize("legacy_record", [False, True])
+@pytest.mark.parametrize(
+    ("legacy_record", "leftover"),
+    [
+        (False, "none"),
+        (True, "none"),
+        (False, "empty"),
+        (False, "partial"),
+        (False, "foreign"),
+    ],
+)
 def test_uv_recovers_an_interrupted_in_place_bridge_install(
-    standalone: NativeInstall, tmp_path: Path, legacy_record: bool
+    standalone: NativeInstall, tmp_path: Path, legacy_record: bool, leftover: str
 ) -> None:
     install, initial = uv_install(standalone, tmp_path)
     prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
@@ -1107,31 +1116,67 @@ def test_uv_recovers_an_interrupted_in_place_bridge_install(
             installed_record.read_bytes()
         ).hexdigest()
     pending.write_text(json.dumps(record), encoding="utf-8")
+    if leftover == "foreign":
+        foreign_dir = tmp_path / "foreign"
+        foreign_dir.mkdir()
+        foreign = wheel(foreign_dir, install.installed, fail="installed")
+        replaced = subprocess.run(
+            [
+                install.launcher.with_name("uv"),
+                "tool",
+                "install",
+                "--force",
+                "--offline",
+                "--python",
+                sys.executable,
+                foreign,
+            ],
+            env=install.env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert replaced.returncode == 0, replaced.stderr
     receipt = prefix / "uv-receipt.toml"
     receipt_bytes = receipt.read_bytes()
     link = install.launcher.readlink()
-    removed = subprocess.run(
-        [
-            install.launcher.with_name("uv"),
-            "pip",
-            "uninstall",
-            "--python",
-            prefix / "bin/python",
-            "sai-cli",
-        ],
-        env=install.env,
-        capture_output=True,
-        text=True,
-        timeout=20,
-        check=False,
-    )
-    assert removed.returncode == 0, removed.stderr
+    if leftover == "none":
+        removed = subprocess.run(
+            [
+                install.launcher.with_name("uv"),
+                "pip",
+                "uninstall",
+                "--python",
+                prefix / "bin/python",
+                "sai-cli",
+            ],
+            env=install.env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        assert removed.returncode == 0, removed.stderr
+    else:
+        (prefix / "bin/sai").unlink()
+        (installed_record.parent / "METADATA").unlink()
+        if leftover == "empty":
+            for entry in installed_record.parent.iterdir():
+                entry.unlink()
+        assert installed_record.parent.is_dir()
     assert receipt.read_bytes() == receipt_bytes
     assert install.launcher.readlink() == link
     assert not install.launcher.exists()
-    assert not installed_record.exists()
+    assert installed_record.exists() is (leftover in {"partial", "foreign"})
 
     recovered = install.invoke("--json", "update", "--recover", exe=install.executable)
+    if leftover == "foreign":
+        assert recovered.returncode == 3, recovered.stdout + recovered.stderr
+        assert pending.exists()
+        assert not install.launcher.exists()
+        assert receipt.read_bytes() == receipt_bytes
+        return
     assert recovered.returncode == 0, recovered.stdout + recovered.stderr
     assert json.loads(recovered.stdout)["status"] == "recovered"
     assert install.launcher.readlink() == link

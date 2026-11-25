@@ -8,7 +8,7 @@ use semver::Version;
 use serde_json::{Value, json};
 use url::Url;
 
-use super::{Wheel, release, state};
+use super::{Pending, Wheel, release, state};
 use crate::update::install::{Result, io as io_error};
 
 const RELEASE_RECORD: &str = ".sai-cli-release.json";
@@ -71,6 +71,27 @@ pub(super) fn file_origin(prefix: &Path) -> Option<PathBuf> {
         .ok()?
         .to_file_path()
         .ok()
+}
+
+pub(super) fn matches_original_origin(prefix: &Path, pending: &Pending) -> bool {
+    let Some(fingerprint) = pending.original_record.as_deref() else {
+        return false;
+    };
+    let Some(parent) = prefix.parent() else {
+        return false;
+    };
+    let Some(record) = read_json(&parent.join(RELEASE_RECORD)) else {
+        return false;
+    };
+    record["schema"] == 1
+        && record["installed"].as_str() == Some(fingerprint)
+        && record["tag"]
+            .as_str()
+            .and_then(|tag| tag.strip_prefix("sai-cli/v"))
+            == Some(pending.wheel.version.as_str())
+        && record["wheel"]
+            .as_str()
+            .is_some_and(|wheel| file_origin(prefix).as_deref() == Some(Path::new(wheel)))
 }
 
 fn recorded_wheel(prefix: &Path, url: &Url) -> Option<()> {

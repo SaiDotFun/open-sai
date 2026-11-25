@@ -181,6 +181,13 @@ impl Uv {
             })
             && provenance::is_release(&self.prefix, &self.web_base);
         let expected = || std::iter::once(&record.wheel).chain(record.next.as_ref());
+        let file = provenance::file_origin(&self.prefix);
+        let matches_wheel_origin = |wheel: &Wheel| {
+            file.as_ref().is_some_and(|origin| {
+                self.wheel_path(wheel).is_ok_and(|path| path == *origin)
+                    && self.verify_wheel(wheel).is_ok()
+            })
+        };
         let matches_version = |wheel: &Wheel| {
             current
                 .as_ref()
@@ -202,7 +209,37 @@ impl Uv {
             .is_none_or(release::valid_digest)
             && registered.as_deref() == Some(self.launcher())
             && self.python().is_ok_and(|python| python == record.python)
-            && provenance::dist_info(&self.prefix).is_none()
+            && provenance::dist_info(&self.prefix).is_none_or(|info| {
+                // uv removes files before removing their dist-info directory.
+                // A directory for either recorded wheel may outlive METADATA.
+                let remaining_record = provenance::installed_digest(&self.prefix);
+                let owned = remaining_record
+                    .as_ref()
+                    .is_some_and(|digest| record.original_record.as_ref() == Some(digest))
+                    || expected().any(matches_wheel_origin)
+                    || (remaining_record.is_none()
+                        && (!provenance::has_origin(&self.prefix)
+                            || provenance::is_release(&self.prefix, &self.web_base)
+                            || provenance::matches_original_origin(&self.prefix, record)));
+                info.symlink_metadata().is_ok_and(|entry| entry.is_dir())
+                    && info
+                        .join("METADATA")
+                        .symlink_metadata()
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                    && expected().any(|wheel| {
+                        self.wheel_path(wheel).ok().is_some_and(|path| {
+                            let Some(stem) = path
+                                .file_name()
+                                .and_then(OsStr::to_str)
+                                .and_then(|name| name.strip_suffix("-py3-none-any.whl"))
+                            else {
+                                return false;
+                            };
+                            info.ends_with(format!("{stem}.dist-info"))
+                        })
+                    })
+                    && owned
+            })
             && self
                 .prefix
                 .join("bin/sai")
@@ -211,13 +248,7 @@ impl Uv {
         if original || incomplete || interrupted_in_place {
             return Ok(());
         }
-        let file = provenance::file_origin(&self.prefix);
-        if expected().any(|wheel| {
-            matches_version(wheel)
-                && self
-                    .verify_wheel(wheel)
-                    .is_ok_and(|path| Some(&path) == file.as_ref())
-        }) {
+        if expected().any(|wheel| matches_version(wheel) && matches_wheel_origin(wheel)) {
             return Ok(());
         }
         Err("A different package now occupies the pending uv installation.".into())
