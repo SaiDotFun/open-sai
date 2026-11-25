@@ -53,6 +53,8 @@ def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             "DECREASE_POSITION_SIZE",
             "OraclePriceStale",
         ),
+        (LEVERAGE, "quote-close-only", "UPDATE_TRADE", "MarketClosed"),
+        (LEVERAGE, "quote-stale", "UPDATE_TRADE", "OraclePriceStale"),
     ],
     ids=[
         "margin-close-only",
@@ -60,9 +62,11 @@ def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         "margin-liquidates-with-borrowing",
         "partial-no-oracle-time",
         "partial-stale",
+        "leverage-close-only",
+        "leverage-stale-before-liquidation",
     ],
 )
-def test_position_size_execution_refuses_before_reserving(
+def test_position_execution_refuses_before_reserving(
     pair: tuple[CLI, CLI],
     tmp_path: Path,
     command: CLI,
@@ -72,7 +76,8 @@ def test_position_size_execution_refuses_before_reserving(
 ) -> None:
     documents = []
     for index, cli in enumerate(pair):
-        with loopback("position-execution-ready") as endpoints:
+        ready = "quote-close" if command == LEVERAGE else "position-execution-ready"
+        with loopback(ready) as endpoints:
             home = tmp_path / f"preview-{index}"
             seed_home(home, endpoints, "session")
             code, preview, stderr = run(
@@ -82,16 +87,6 @@ def test_position_size_execution_refuses_before_reserving(
             digest = preview["previewDigest"]
             assert digest == preview_digest(preview)
             assert not endpoints.errors
-        with loopback(scenario) as endpoints:
-            home = tmp_path / f"blocked-preview-{index}"
-            seed_home(home, endpoints, "session")
-            code, blocked, stderr = run(
-                cli, home, endpoints, (*command, "--dry-run"), python=index == 0
-            )
-            assert (code, stderr) == (0, ""), blocked
-            assert not endpoints.errors
-            assert "previewDigest" not in blocked
-            assert blocked["estimates"]["execution"]["code"] == execution_code
         replay = TradeReplay(kind)
         with loopback(scenario, trade_replay=replay) as endpoints:
             home = tmp_path / f"submit-{index}"
@@ -114,6 +109,16 @@ def test_position_size_execution_refuses_before_reserving(
             )
             assert "previewDigest" not in error["details"]["preview"]
             documents.append(document)
+        with loopback(scenario) as endpoints:
+            home = tmp_path / f"blocked-preview-{index}"
+            seed_home(home, endpoints, "session")
+            code, blocked, stderr = run(
+                cli, home, endpoints, (*command, "--dry-run"), python=index == 0
+            )
+            assert (code, stderr) == (0, ""), blocked
+            assert not endpoints.errors
+            assert "previewDigest" not in blocked
+            assert blocked["estimates"]["execution"]["code"] == execution_code
     assert documents[0] == documents[1]
 
 

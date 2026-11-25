@@ -86,7 +86,7 @@ impl Trading<'_> {
         let mut result = unavailable_close(false);
         let quote = async {
             let state = self
-                .position_snapshot(lcd, account, id, route, indexed, Some(raw))
+                .position_snapshot(lcd, account, id, route, (indexed, Some(raw)), true)
                 .await?;
             if let Some(height) = state.verified_height(lcd, id).await? {
                 let quote_lcd = QuoteLcd::new(lcd.0, state.route.contract_address.clone());

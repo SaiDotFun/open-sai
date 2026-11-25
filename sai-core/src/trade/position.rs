@@ -222,8 +222,8 @@ impl Trading<'_> {
         addr: &str,
         id: &Value,
         route: PositionRoute,
-        mut indexed: Value,
-        verified_raw: Option<Value>,
+        (mut indexed, verified_raw): (Value, Option<Value>),
+        require_open_market: bool,
     ) -> Result<Snapshot, SnapshotError> {
         require_open(&indexed)?;
         let borrowing = field(&indexed, "perpBorrowing")?.clone();
@@ -248,7 +248,7 @@ impl Trading<'_> {
             )
             .await?;
         let market = field(response.get("perp").ok_or_else(malformed)?, "borrowing")?;
-        if !truthy(&market["isOpen"])
+        if (require_open_market && !truthy(&market["isOpen"]))
             || market["marketId"] != *market_id
             || market["collateralToken"]["id"] != *token_id
         {
