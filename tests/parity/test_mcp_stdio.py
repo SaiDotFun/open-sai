@@ -939,6 +939,70 @@ def test_overview_rejects_malformed_fields_and_scrubs_text(
         assert not endpoints.errors
 
 
+def write_intent_trail(home: Path, endpoints: Endpoints, count: int) -> dict[str, Any]:
+    stamp = "2026-11-19T12:00:00.000Z"
+    logs = home / "sai/logs"
+    logs.mkdir(mode=0o700, exist_ok=True)
+    key = bytes(32)
+    profile_key = logs / ".endpoint-key"
+    profile_key.write_bytes(key)
+    profile_key.chmod(0o600)
+    digest = hashlib.sha256(f"{endpoints.keeper}?".encode()).digest()
+    row = {
+        "schema": 2,
+        "ts": stamp,
+        "level": "info",
+        "event": "intent.status",
+        "runId": "fixture-run",
+        "seq": 1,
+        "surface": "cli",
+        "intentKey": INTENT,
+        "addr": ADDRESS,
+        "endpointId": "h1_" + hmac.digest(key, digest, "sha256").hex(),
+        "status": "pending",
+    }
+    trail = logs / f"cli-{stamp[:10]}.jsonl"
+    trail.write_text(
+        "".join(json.dumps({**row, "seq": seq}) + "\n" for seq in range(1, count + 1))
+    )
+    trail.chmod(0o600)
+    return row
+
+
+def test_logs_intent_v013_cursor_after_upgrade(
+    native: Path, python_v013: Path, tmp_path: Path
+) -> None:
+    python_home = tmp_path / "python"
+    rust_home = tmp_path / "rust"
+    with loopback("normal") as endpoints:
+        with server(python_v013, python_home, endpoints, receive_timeout=15) as python:
+            write_intent_trail(python_home, endpoints, 129)
+            result = json.loads(
+                tool_text(python.call(2, "logs_intent", key=INTENT, offline=True))
+            )
+            assert result["truncated"] is True
+            cursor = result["nextBefore"]
+            assert "~s2~" in cursor
+        with server(native, rust_home, endpoints) as rust:
+            shutil.copytree(
+                python_home / "sai/logs", rust_home / "sai/logs", dirs_exist_ok=True
+            )
+            result = json.loads(
+                tool_text(
+                    rust.call(2, "logs_intent", key=INTENT, offline=True, before=cursor)
+                )
+            )
+            assert result == {
+                "error": "This cursor was issued by Python Sai. Start a new intent log query without a cursor.",
+                "code": "INVALID_REQUEST",
+            }
+            restarted = json.loads(
+                tool_text(rust.call(3, "logs_intent", key=INTENT, offline=True))
+            )
+            assert restarted["events"]
+        assert not endpoints.wire
+
+
 def test_logs_intent_v013_offline_and_live(
     native: Path, python_v013: Path, tmp_path: Path
 ) -> None:
@@ -953,30 +1017,7 @@ def test_logs_intent_v013_offline_and_live(
                     for tool in stdio.receive()["result"]["tools"]
                     if tool["name"] == "logs_intent"
                 ]
-                stamp = "2026-11-19T12:00:00.000Z"
-                logs = home / "sai/logs"
-                logs.mkdir(mode=0o700, exist_ok=True)
-                key = bytes(32)
-                profile_key = logs / ".endpoint-key"
-                profile_key.write_bytes(key)
-                profile_key.chmod(0o600)
-                digest = hashlib.sha256(f"{endpoints.keeper}?".encode()).digest()
-                row = {
-                    "schema": 2,
-                    "ts": stamp,
-                    "level": "info",
-                    "event": "intent.status",
-                    "runId": "fixture-run",
-                    "seq": 1,
-                    "surface": "cli",
-                    "intentKey": INTENT,
-                    "addr": ADDRESS,
-                    "endpointId": "h1_" + hmac.digest(key, digest, "sha256").hex(),
-                    "status": "pending",
-                }
-                trail = logs / f"cli-{stamp[:10]}.jsonl"
-                trail.write_text(json.dumps(row) + "\n")
-                trail.chmod(0o600)
+                row = write_intent_trail(home, endpoints, 1)
 
                 offline = tool_text(
                     stdio.call(
