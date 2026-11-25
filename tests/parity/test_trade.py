@@ -911,6 +911,35 @@ def test_open_retry_preserves_first_reservation(
     assert observations[0] == observations[1]
 
 
+@pytest.mark.parametrize(
+    "args",
+    [
+        ("trade", "margin", "7", "--direction", "remove", "--amount", "1"),
+        ("trade", "partial-close", "7", "--percent", "50"),
+    ],
+    ids=["margin-remove", "partial-close"],
+)
+def test_stale_index_is_retryable_before_submission(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    args: CLI,
+) -> None:
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    for index, cli in enumerate(clis):
+        with loopback("position-index-lag") as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, result, stderr = run(cli, home, endpoints, args, python=index == 0)
+            assert (code, stderr) == (1, "")
+            assert result["error"]["code"] == "INVALID_REQUEST"
+            assert result["error"]["retryable"] is True, (cli, result["error"])
+            assert not rows(home)
+            assert "recordUserIntent" not in [entry.label for entry in endpoints.wire]
+            assert not endpoints.errors
+
+
 def test_open_retry_is_in_the_blocking_intent_trail(
     request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
