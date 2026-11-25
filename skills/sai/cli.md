@@ -333,7 +333,8 @@ If `sai skill` answers "No such command", the installed CLI predates it. Use
 
 `trade open`, `trade close`, `trade partial-close`, `trade tpsl`, `trade
 leverage`, and `trade margin` submit intents. Add `--wait` to a live trade
-to wait for its outcome, or run `sai intent wait KEY --timeout 30` with an
-existing key. The commands `intent local` and `intent status` show the
+to wait for its outcome. In text mode, the CLI prints one progress line to
+stderr when polling starts. For an existing key, run
+`sai intent wait KEY --timeout 30`. The commands `intent local` and `intent status` show the
 local ledger and Keeper's latest records. [Trading safety](trading-safety.md)
 has the approval, dry-run, and follow-up steps.

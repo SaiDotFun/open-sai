@@ -1284,6 +1284,12 @@ def emit_wait(ctx: click.Context, result: dict[str, Any]) -> None:
         ctx.exit(exit_code)
 
 
+def poll_trade(ctx: click.Context, account: str, key: str) -> dict[str, Any]:
+    if not ctx.obj["json"]:
+        warn(f"Waiting for intent {key} to confirm...")
+    return wait.for_intent(keeper_url(ctx), account, key)
+
+
 def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     """Print a trade result with the account it used or would use.
 
@@ -1305,7 +1311,7 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
         and account
         and result.get("status") == "accepted"
     ):
-        final = wait.for_intent(keeper_url(ctx), account, result["intentKey"])
+        final = poll_trade(ctx, account, result["intentKey"])
         # Keep trade quote metadata, but report the final outcome as the status.
         metadata = {key: value for key, value in result.items() if key != "message"}
         emit_wait(ctx, {**metadata, **final, "status": final["outcome"]})
@@ -1342,7 +1348,7 @@ def trade_error(ctx: click.Context, exc: Exception) -> None:
             final = (
                 wait.rejected_result(exc.intent_key, account, str(exc))
                 if isinstance(exc, keeper.AdmissionRejected)
-                else wait.for_intent(keeper_url(ctx), account, exc.intent_key)
+                else poll_trade(ctx, account, exc.intent_key)
             )
             emit_wait(ctx, {**final, "status": final["outcome"]})
             return

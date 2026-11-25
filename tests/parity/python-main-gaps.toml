@@ -15,3 +15,7 @@ difference = "Trade cancel and close --cancel-order share the dry run, digest co
 [gap.balance-source-age]
 owner = "#231"
 difference = "Account overview and account balances show the source block and age, mark ages over five minutes stale, and report an unknown age when block time cannot be verified."
+
+[gap.trade-wait-progress]
+owner = "#231"
+difference = "A text-mode trade --wait prints one stderr line before polling, then writes the receipt to stdout. JSON mode has no progress line."

@@ -9,6 +9,8 @@ import select
 import signal
 import sqlite3
 import subprocess
+import sys
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -1256,4 +1258,58 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
             assert document["localStatus"] == document["outcome"] == "terminal"
             assert document["receipt"] is None
             assert ledger_state(home) == [(key, "terminal", "terminal")]
+            assert not replies
+
+
+@pytest.mark.parametrize("json_output", [False, True], ids=["text", "json"])
+def test_current_cli_wait_progress_precedes_the_receipt(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, json_output: bool
+) -> None:
+    home = tmp_path / "sai"
+    python = str(Path(sys.executable).with_name("sai"))
+    first_poll = threading.Event()
+    release = threading.Event()
+    with replay(get=target_lcd) as (endpoint, replies, requests):
+        connect(home, endpoint, monkeypatch)
+        preflight = filled_close(replies, requests, rust=True)
+        filled = replies[-2]
+
+        def hold_poll(request: Request) -> Reply:
+            first_poll.set()
+            assert release.wait(10)
+            assert callable(filled)
+            return filled(request)
+
+        replies[-2] = hold_poll
+        args = tuple(
+            arg
+            for arg in trade_wait_args(endpoint, CLOSE)
+            if json_output or arg != "--json"
+        )
+        with subprocess.Popen(
+            [python, *args],
+            env=cli_environment(home),
+            cwd=tmp_path,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as process:
+            try:
+                assert first_poll.wait(10)
+                key = submitted_key(requests[preflight], "CLOSE_POSITION")
+                assert process.stdout is not None and process.stderr is not None
+                assert not select.select([process.stdout], [], [], 0)[0]
+                if not json_output:
+                    assert select.select([process.stderr], [], [], 1)[0]
+                    assert process.stderr.readline() == (
+                        f"Waiting for intent {key} to confirm...\n".encode()
+                    )
+                release.set()
+                stdout, stderr = process.communicate(timeout=10)
+            finally:
+                release.set()
+                if process.poll() is None:
+                    process.kill()
+            assert process.returncode == 0, (stdout, stderr)
+            assert stderr == b""
+            assert json.loads(stdout)["outcome"] == "filled"
             assert not replies

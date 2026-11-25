@@ -536,7 +536,8 @@ recorded for the key, then the active account on the configured Keeper
 endpoint. Pass `--addr ADDR` to look up an intent from another machine
 without signing in. The address can be EVM or Nibiru. If Sai cannot select
 an account, the command exits 1 with code `INVALID_REQUEST`. Add `--wait` to a live
-trade command to submit once and wait up to 30 seconds for that key. With
+trade command to submit once and wait up to 30 seconds for that key. In text
+mode, the CLI prints one progress line to stderr when polling starts. With
 MCP, call `intent_wait` after the trade returns its key. The tool caps each
 call at 10 seconds.
 
