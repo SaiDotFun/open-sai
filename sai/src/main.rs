@@ -559,7 +559,7 @@ fn auth_usage_error(error: &clap::Error, command: &str) -> SaiError {
     } else if option.is_some() {
         "No such option for auth."
     } else if error.kind() == ErrorKind::MissingRequiredArgument
-        && let Some(missing) = usage_error(error, command, &[])
+        && let Some(missing) = usage_error(error, command)
     {
         return missing;
     } else {
@@ -568,7 +568,7 @@ fn auth_usage_error(error: &clap::Error, command: &str) -> SaiError {
     SaiError::usage(message)
 }
 
-fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Option<SaiError> {
+fn usage_error(error: &clap::Error, command: &str) -> Option<SaiError> {
     let arg = context_text(error, ContextKind::InvalidArg);
     let message = match error.kind() {
         ErrorKind::InvalidSubcommand => "No such command.".into(),
@@ -731,7 +731,7 @@ fn print_parse_error(
             home,
         );
     }
-    if let Some(usage) = usage_error(error, usage_command, operands) {
+    if let Some(usage) = usage_error(error, usage_command) {
         if !json && error.kind() == ErrorKind::InvalidValue && usage.message.starts_with("Option ")
         {
             eprintln!("Error: {}", usage.message);

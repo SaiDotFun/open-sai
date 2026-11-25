@@ -284,11 +284,6 @@ fn invalid_settings_match_python_for_local_commands() {
         ("[update]\nauto = 'off'\n", 1),
         ("[keeper]\nws_endpoint = 'http://localhost'\n", 2),
     ] {
-        let code = if invalid.starts_with("[update]") {
-            1
-        } else {
-            2
-        };
         fs::write(&config, invalid).unwrap();
         parity(home.path(), &["--json", "auth", "list"], code);
         parity(home.path(), &["--json", "auth", "status"], code);
