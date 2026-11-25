@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 import pytest
 from compare import INTENT_ID, timestamp
 from keeper_wire import same_variables
+from sai_cli.core.confirmation import preview_digest
 from scenarios import (
     ADDRESS,
     OTHER_ADDRESS,
@@ -75,6 +76,73 @@ def current_trade_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             "Install the pinned Python main reference and set SAI_PARITY_TRADE_MAIN_PYTHON"
         )
     return (reference,), candidate
+
+
+@pytest.mark.parametrize(
+    ("args", "scenario", "confirmable"),
+    [
+        (OPEN, "quote-market", True),
+        (OPEN[:-2], "quote-market", True),
+        ((*OPEN, "--type", "limit"), "quote-trigger-fee", True),
+        ((*OPEN, "--type", "stop"), "quote-trigger-fee", True),
+        (OPEN, "quote-close-only", False),
+        (CLOSE, "quote-queued", True),
+        (CLOSE, "quote-no-publication", False),
+        ((*CLOSE, "--cancel-order"), "pending-order", True),
+        (("trade", "tpsl", "7", "--take-profit", "110"), "quote-close", True),
+        (
+            ("trade", "leverage", "7", "--leverage", "1.818181818181818182"),
+            "quote-close",
+            True,
+        ),
+        (
+            ("trade", "margin", "7", "--direction", "add", "--amount", "1"),
+            "position-default",
+            True,
+        ),
+        (("trade", "partial-close", "7", "--percent", "50"), "partial-preview", True),
+    ],
+    ids=[
+        "market-explicit",
+        "market-keeper",
+        "limit",
+        "stop",
+        "rejected-open",
+        "close",
+        "close-unknown-oracle",
+        "pending-cancel",
+        "tpsl",
+        "leverage",
+        "margin",
+        "partial-close",
+    ],
+)
+def test_cli_dry_run_digest_matches_python_main(
+    cli_pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    args: CLI,
+    scenario: str,
+    confirmable: bool,
+) -> None:
+    reference = str(Path(sys.executable).with_name("sai"))
+    confirmations = []
+    for index, cli in enumerate(((reference,), cli_pair[1])):
+        with loopback(scenario) as endpoints:
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "session")
+            code, preview, stderr = run(
+                cli, home, endpoints, (*args, "--dry-run"), python=index == 0
+            )
+            assert (code, stderr) == (0, ""), preview
+            digest = preview.get("previewDigest")
+            if confirmable:
+                assert digest == preview_digest(preview)
+            else:
+                assert digest is None
+            confirmations.append((preview["positionRoute"], digest))
+            assert not endpoints.errors
+            assert not rows(home)
+    assert confirmations[0] == confirmations[1]
 
 
 def run(
@@ -428,9 +496,13 @@ def test_cancel_dry_run_checks_pending_order(
         with loopback("trade-accepted", cancel_target="pending") as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
-            assert run(
+            code, preview, stderr = run(
                 cli, home, endpoints, (*args, "--dry-run"), python=index == 0
-            ) == (
+            )
+            if index == 1:
+                assert preview.pop("previewDigest") == preview_digest(preview)
+                assert preview.pop("positionRoute")["chainId"]
+            assert (code, preview, stderr) == (
                 0,
                 {
                     "addr": ADDRESS,
