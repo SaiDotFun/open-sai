@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from compare import Normalize
 from sai_cli.core import keeper, storage
 from sai_cli.tests.test_auth_connect import (
     ADDR,
@@ -37,6 +38,7 @@ from sai_cli.tests.test_auth_connect import (
     typed_data,
 )
 from sai_cli.tests.test_auth_connect import keeper_auth as keeper_auth  # noqa: PLC0414
+from scenarios import ADDRESS, child_env, loopback, seed_home
 
 CLI = tuple[str, ...]
 
@@ -162,6 +164,96 @@ def test_auth_use_missing(
     assert "Requested account is not connected" in expected[1] + expected[2]
     assert marker not in expected[1] + expected[2]
     assert observed(rust.run(*flags, "auth", "use", marker)) == expected
+
+
+@pytest.mark.parametrize("action", ["use", "logout"])
+@pytest.mark.parametrize(
+    ("umask", "existing_mode", "expected_modes"),
+    [
+        (0o022, None, (0o644, 0o644)),
+        (0o077, None, (0o600, 0o600)),
+        (0o002, None, (0o664, 0o644)),
+        (0o077, 0o664, (0o664, 0o664)),
+    ],
+    ids=["default-umask", "private-umask", "permissive-umask", "existing-lock"],
+)
+def test_auth_session_lock_mode(
+    tmp_path: Path,
+    cli_pair: tuple[CLI, CLI],
+    action: str,
+    umask: int,
+    existing_mode: int | None,
+    expected_modes: tuple[int, int],
+) -> None:
+    with loopback("normal") as endpoints:
+        for index, (cli, expected_mode) in enumerate(
+            zip(cli_pair, expected_modes, strict=True)
+        ):
+            home = tmp_path / str(index)
+            seed_home(home, endpoints, "accounts")
+            lock = home / "sai" / "trader" / "sessions.lock"
+            if existing_mode is None:
+                lock.unlink()
+            else:
+                lock.chmod(existing_mode)
+            result = subprocess.run(
+                [*cli, "--json", "auth", action, ADDRESS],
+                env=child_env(home, endpoints),
+                capture_output=True,
+                timeout=10,
+                umask=umask,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr
+            assert lock.stat().st_mode & 0o777 == expected_mode
+            assert lock.read_bytes() == b""
+        assert not endpoints.wire
+
+
+@pytest.mark.parametrize(
+    ("action", "session_event"),
+    [("use", "session.active"), ("logout", "session.removed")],
+)
+def test_auth_mutation_log_fields(
+    tmp_path: Path, cli_pair: tuple[CLI, CLI], action: str, session_event: str
+) -> None:
+    command_words = ["auth", action]
+    command = " ".join(command_words)
+    args = ["--json", *command_words, ADDRESS]
+    normalized = []
+    with loopback("normal") as endpoints:
+        for runtime, cli in zip(("python", "rust"), cli_pair, strict=True):
+            home = tmp_path / runtime
+            seed_home(home, endpoints, "accounts")
+            result = subprocess.run(
+                [*cli, *args],
+                env={**child_env(home, endpoints), "SAI_LOG": "1"},
+                capture_output=True,
+                timeout=10,
+                check=False,
+            )
+            assert result.returncode == 0, result.stderr
+            logs = [
+                event
+                for path in (home / "sai" / "logs").glob("cli-*.jsonl")
+                for line in path.read_text().splitlines()
+                if (event := json.loads(line)).get("command") == command
+            ]
+            assert [event["event"] for event in logs] == [
+                "command.start",
+                session_event,
+                "command.end",
+            ]
+            start, session, end = logs
+            assert start["commandId"] == session["commandId"] == end["commandId"]
+            if runtime == "python":
+                # The release records the address, while Python main omits it.
+                assert start["argv"] in (args, command_words)
+            else:
+                assert start["argv"] == command_words
+            normalized.append(Normalize(home).log_records(logs))
+
+    assert normalized[0] == normalized[1]
 
 
 @pytest.mark.parametrize(
