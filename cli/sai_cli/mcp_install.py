@@ -47,6 +47,7 @@ SUBPROCESS_TIMEOUT = 60
 INSTALL_URL = "git+https://github.com/SaiDotFun/open-sai"
 ENDPOINT_FLAGS = {spec.flag: spec.key for spec in settings.SETTINGS if spec.flag}
 CLAUDE_ARG_PLACEHOLDER = "<original-argument>"
+CLAUDE_HOME_PLACEHOLDER = "<original-SAI_HOME>"
 
 
 class InstallError(Exception):
@@ -251,8 +252,10 @@ def claude_repair_hint(entries: tuple[ClaudeRepair, ...]) -> str:
             )
             launcher = shlex.quote(entry.launcher)
             check = f"test -f {launcher} && test -x {launcher}"
-            if entry.extra_env or any(
-                CLAUDE_ARG_PLACEHOLDER in arg for arg in entry.server_args
+            if (
+                entry.sai_home == CLAUDE_HOME_PLACEHOLDER
+                or entry.extra_env
+                or any(CLAUDE_ARG_PLACEHOLDER in arg for arg in entry.server_args)
             ):
                 hint += (
                     "\nFill in the placeholders from the existing config before removing the entry."
@@ -290,6 +293,18 @@ def claude_differing_fields(existing: Registration, target: Target) -> tuple[str
     return (*fields, *existing.extra_settings)
 
 
+def claude_advice_home(
+    reg: Registration, requested: str | None, *, show_saved: bool = False
+) -> str | None:
+    if reg.invalid_sai_home:
+        return None
+    if reg.sai_home is None:
+        return requested
+    if show_saved or reg.sai_home == requested:
+        return reg.sai_home
+    return CLAUDE_HOME_PLACEHOLDER
+
+
 def report_different_claude_entry(
     client: Claude, result: Result, existing: Registration, target: Target
 ) -> Result:
@@ -314,9 +329,7 @@ def report_different_claude_entry(
         scope,
         NAME,
         replace_entry=True,
-        sai_home=existing.sai_home
-        if existing.sai_home is not None or existing.invalid_sai_home
-        else target.env.get("SAI_HOME"),
+        sai_home=claude_advice_home(existing, target.env.get("SAI_HOME")),
         config_path=path,
         fields=claude_differing_fields(existing, target),
         launcher=launcher,
@@ -1636,15 +1649,14 @@ def check_claude_differences(
             if expected is None:
                 manual.append("Install a stable Sai launcher on PATH.")
             else:
-                home = profile
-                if reg.sai_home is not None or reg.invalid_sai_home:
-                    home = reg.sai_home
                 repairs.append(
                     ClaudeRepair(
                         reg.scope,
                         name,
                         replace_entry=True,
-                        sai_home=home,
+                        sai_home=claude_advice_home(
+                            reg, profile, show_saved=not compare_profile
+                        ),
                         config_path=client.registration_path(reg.scope),
                         fields=fields or ("command",),
                         launcher=expected.argv[0],

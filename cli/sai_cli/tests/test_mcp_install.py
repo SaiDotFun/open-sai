@@ -595,8 +595,10 @@ def test_doctor_compares_sai_home_without_printing_or_rewriting_it(
     assert ("SAI_HOME" in check["summary"]) == (status == "warn")
     assert profiles["different"] not in result.output
     assert profiles["current"] not in check["summary"]
-    if expected == "current" and status == "warn":
+    if expected == "current" and actual is None:
         assert f"--env=SAI_HOME={profiles['current']}" in check["fix"]
+    if status == "warn" and isinstance(actual, str):
+        assert "--env=SAI_HOME=<original-SAI_HOME>" in check["fix"]
     assert path.read_text() == original
 
 
@@ -1636,6 +1638,9 @@ def test_claude_replacement_advice_preserves_saved_server_options(
     assert all(
         value not in diagnostic for value in (SECRET, private_key, "private.example")
     )
+    redacted_profile = profile if surface == "background" else "<original-SAI_HOME>"
+    if surface != "background":
+        assert profile not in diagnostic
     assert (
         fix.index("Fill in the placeholders")
         < fix.index("Continue only if it succeeds")
@@ -1653,7 +1658,7 @@ def test_claude_replacement_advice_preserves_saved_server_options(
         "--scope",
         "user",
         "sai",
-        f"--env=SAI_HOME={profile}",
+        f"--env=SAI_HOME={redacted_profile}",
         "--env=<NAME>=<value>",
         "--",
         *serve(env),
@@ -1662,6 +1667,7 @@ def test_claude_replacement_advice_preserves_saved_server_options(
         "--ws-endpoint=<original-argument>",
     ]
     replacements = {
+        "--env=SAI_HOME=<original-SAI_HOME>": f"--env=SAI_HOME={profile}",
         "--env=<NAME>=<value>": f"--env={private_key}={SECRET}",
         "<original-argument>": endpoint,
         "--ws-endpoint=<original-argument>": f"--ws-endpoint={ws_endpoint}",
