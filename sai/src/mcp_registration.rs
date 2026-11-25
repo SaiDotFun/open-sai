@@ -696,10 +696,25 @@ impl Clients {
         timeout: Duration,
     ) -> Vec<RegistrationCheck> {
         let deadline = Instant::now() + timeout;
+        let user_only = Self {
+            home: self.home.clone(),
+            cwd: None,
+        };
         CLIENTS
             .into_iter()
             .filter(|client| client.detected(&self.home).is_some())
-            .map(|client| self.check(client, target, expected_profile, fix, deadline))
+            .map(|client| {
+                let clients = match (client, self.cwd.as_deref()) {
+                    (Client::Cursor, Some(cwd))
+                        if resolved(&client.path(Scope::Project, &self.home, cwd))
+                            == resolved(&client.path(Scope::User, &self.home, cwd)) =>
+                    {
+                        &user_only
+                    }
+                    _ => self,
+                };
+                clients.check(client, target, expected_profile, fix, deadline)
+            })
             .collect()
     }
 

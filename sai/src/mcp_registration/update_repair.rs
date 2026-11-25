@@ -18,13 +18,11 @@ const FAILED: (&str, &str) = (
     "Could not check MCP registrations. Run `sai doctor` for details.",
 );
 
-#[allow(dead_code, reason = "Consumed by the updater when PR #121 integrates")]
 pub(crate) struct UpdateRepair {
     reports: Vec<Value>,
     notes: Vec<(&'static str, &'static str)>,
 }
 
-#[allow(dead_code, reason = "Consumed by the updater when PR #121 integrates")]
 impl UpdateRepair {
     pub(crate) fn json_fields(&self) -> Map<String, Value> {
         self.fields(|(_, text)| text)
@@ -55,7 +53,6 @@ impl UpdateRepair {
 /// Check registrations after the installer has verified and committed the
 /// new install. Use the installer's stable launcher, since the old binary may
 /// still be running. Add the repair fields to the successful outcome and state.
-#[allow(dead_code, reason = "Called by the updater when PR #121 integrates")]
 pub(crate) fn repair_after_update(
     launcher: &Path,
     background: bool,
