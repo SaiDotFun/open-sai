@@ -350,10 +350,14 @@ async fn exchange(
         .handshake(io)
         .await
         .map_err(|_| request_failed())?;
-    let driver = tokio::spawn(connection);
-    let result = receive(&mut sender, request).await;
-    driver.abort();
-    result
+    let response = receive(&mut sender, request);
+    tokio::pin!(response);
+    // Keep the driver in this future so cancellation also drops the socket.
+    tokio::select! {
+        biased;
+        result = &mut response => result,
+        _ = connection => response.await,
+    }
 }
 
 async fn receive(

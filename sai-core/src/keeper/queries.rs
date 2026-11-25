@@ -37,6 +37,8 @@ pub(super) fn operation(query: &str) -> &'static str {
         MARKETS => "markets",
         POSITION => "position",
         POSITIONS => "positions",
+        OVERVIEW_TRADES => "overview_trades",
+        PENDING_MARKET_ORDERS => "pending_market_orders",
         PRICES => "prices",
         ROUTE => "route",
         SESSION => "session",
@@ -44,3 +46,29 @@ pub(super) fn operation(query: &str) -> &'static str {
         _ => "custom",
     }
 }
+
+pub(crate) const OVERVIEW_TRADES: &str = "
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    trades(where:{trader:$trader,isOpen:true}, order_by:sequence, order_desc:false, limit:$limit, offset:$offset) {
+      id trader isLong tradeType collateralAmount leverage openPrice tp sl
+      state { liquidationPrice }
+      perpBorrowing {
+        marketId baseToken { id symbol } quoteToken { id symbol name } collateralToken { id symbol }
+      }
+      lastUpdatedBlock { block block_ts }
+    }
+  }
+}
+";
+
+pub(crate) const PENDING_MARKET_ORDERS: &str = "
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    marketOrders(where:{trader:$trader,status:pending_exec}, limit:$limit, offset:$offset) {
+      sequence tradeId side perpMarketId status collateralAmount orderReqBlock orderReqBlockTs
+      orderReqTxHash orderReqEvmTxHash
+    }
+  }
+}
+";

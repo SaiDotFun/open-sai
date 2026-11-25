@@ -428,6 +428,96 @@ def normalize_mcp_result(result: dict[str, Any]) -> None:
         result["structuredContent"]["result"] = value
 
 
+OVERVIEW_AGE = re.compile(r"(?<=\()-?[\d.,]+(?:e[+-]\d+)?(?= s\))")
+OVERVIEW_TABLE = re.compile(
+    r"(?m)^  [^\n]* │ [^\n]*\n  ─+\n(?:  [^\n]* │ [^\n]*\n(?!  ─+\n))+"
+)
+
+
+def normalize_overview_table(match: re.Match[str]) -> str:
+    """Reflow only columns that contain a rendered source age."""
+    header, divider, *body = match[0].splitlines()
+    rows = [line[2:].split(" │ ") for line in (header, *body)]
+    widths = [len(cell) for cell in rows[0]]
+    # Keep malformed layout visible to the byte comparison.
+    if len(divider) != 2 + sum(widths) + 3 * (len(widths) - 1) or any(
+        [len(cell) for cell in row] != widths for row in rows
+    ):
+        return match[0]
+    for column, cells in enumerate(zip(*rows, strict=True)):
+        if any(OVERVIEW_AGE.search(cell) for cell in cells):
+            masked = [
+                OVERVIEW_AGE.sub("<sourceAgeSeconds>", cell.rstrip()) for cell in cells
+            ]
+            widths[column] = max(map(len, masked))
+            for row, cell in zip(rows, masked, strict=True):
+                row[column] = cell.ljust(widths[column])
+    lines = [" │ ".join(row) for row in rows]
+    lines.insert(1, "───".join("─" * width for width in widths))
+    return "".join(f"  {line}\n" for line in lines)
+
+
+def mask_overview_stdout(raw: str, mode: str) -> str:
+    """Mask clock values in place so serialization and table layout stay comparable."""
+    if mode == "json":
+        raw = re.sub(r'(?<!\\)("fetchedAt"\s*:\s*)"[^"]+"', r'\1"<fetchedAt>"', raw)
+        return re.sub(
+            r'(?<!\\)("sourceAgeSeconds"\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
+            r'\1"<sourceAgeSeconds>"',
+            raw,
+        )
+    raw = re.sub(
+        r"(?i)(fetched at )\d{4}-\d\d-\d\dT[\d:.]+\+00:00",
+        r"\1<fetchedAt>",
+        raw,
+    )
+    raw = OVERVIEW_TABLE.sub(normalize_overview_table, raw)
+    return OVERVIEW_AGE.sub("<sourceAgeSeconds>", raw)
+
+
+def overview_clocks(
+    value: Any, normalize: Normalize, fetched: datetime | None = None
+) -> None:
+    """Check age against the matching fetch before normalizing either value."""
+    if isinstance(value, list):
+        for item in value:
+            overview_clocks(item, normalize, fetched)
+        return
+    if not isinstance(value, dict):
+        return
+    if "fetchedAt" in value:
+        stamp = value["fetchedAt"]
+        if stamp is None:
+            fetched = None
+        else:
+            if not timestamp(stamp):
+                raise ValueError("Invalid overview fetch timestamp")
+            fetched = datetime.fromisoformat(stamp)
+            if (
+                normalize.started_at is None
+                or normalize.ended_at is None
+                or not normalize.started_at <= fetched.timestamp() <= normalize.ended_at
+            ):
+                raise ValueError("Overview fetch timestamp is outside the invocation")
+            value["fetchedAt"] = "<fetchedAt>"
+    if "sourceAgeSeconds" in value:
+        source, age = value["sourceAt"], value["sourceAgeSeconds"]
+        if source is None:
+            if age is not None:
+                raise ValueError("Overview reported an age without a source timestamp")
+        else:
+            if not timestamp(source) or type(age) is not float or fetched is None:
+                raise ValueError("Invalid overview source timestamp or age")
+            elapsed = (fetched - datetime.fromisoformat(source)).total_seconds()
+            if not abs(age - elapsed) <= 0.00051:
+                raise ValueError(
+                    "Overview age disagrees with its fetch and source times"
+                )
+            value["sourceAgeSeconds"] = "<sourceAgeSeconds>"
+    for item in value.values():
+        overview_clocks(item, normalize, fetched)
+
+
 def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
     if raw == "":
         return ""
@@ -458,6 +548,8 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         for field in ("message", "hint"):
             if isinstance(error.get(field), str):
                 error[field] = normalize.intent_refs(error[field])
+    if command == "account overview":
+        overview_clocks(value, normalize)
     if command == "doctor" and isinstance(value, dict):
         if isinstance(error := value.get("error"), dict):
             if isinstance(report := error.get("details"), dict):
