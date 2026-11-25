@@ -139,12 +139,14 @@ impl TradePreview {
     }
 }
 
+type ReservationCallback<'a> = dyn Fn(&str, &str) + Sync + 'a;
+
 #[derive(Default)]
 pub struct SubmitOptions<'a> {
     pub allow_concurrent_open: bool,
     pub confirmation: Option<Confirmation<'a>>,
     /// Receive the pinned account and committed key before dispatch to Keeper.
-    pub on_reserved: Option<&'a (dyn Fn(&str, &str) + Sync)>,
+    pub on_reserved: Option<&'a ReservationCallback<'a>>,
 }
 
 #[derive(Serialize)]
