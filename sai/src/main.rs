@@ -642,6 +642,7 @@ fn print_parse_error(
             .or_else(|| local::intent_help(command))
             .or_else(|| auth::help(command))
             .or_else(|| reads::help(command))
+            .or_else(|| trade::help(command))
     };
     match error.kind() {
         ErrorKind::DisplayHelp => {

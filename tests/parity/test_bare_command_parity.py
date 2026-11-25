@@ -20,7 +20,7 @@ with Path(__file__).with_name("cases.toml").open("rb") as manifest:
     ]
 
 
-def invoke(binary: str, home: Path, *args: str) -> subprocess.CompletedProcess[str]:
+def invoke(binary: str, home: Path, *args: str) -> subprocess.CompletedProcess[bytes]:
     home.mkdir(exist_ok=True)
     return subprocess.run(
         [binary, *args],
@@ -39,7 +39,6 @@ def invoke(binary: str, home: Path, *args: str) -> subprocess.CompletedProcess[s
         },
         stdin=subprocess.DEVNULL,
         capture_output=True,
-        text=True,
         check=False,
         timeout=10,
     )
@@ -58,24 +57,31 @@ def test_manifest_covers_every_required_python_command() -> None:
 def test_bare_leaf_prints_full_help_and_json_usage(
     binaries: tuple[str, str], tmp_path: Path, args: tuple[str, ...]
 ) -> None:
+    python, rust = binaries
+    expected = invoke(python, tmp_path / "python", *args, "--help")
+    assert expected.returncode == 0
+    assert expected.stderr == b""
+    assert expected.stdout.startswith(b"Usage:") and b"--help" in expected.stdout
+
     errors = []
-    for label, binary in zip(("python", "rust"), binaries, strict=True):
+    for label, binary in (("python", python), ("rust", rust)):
         home = tmp_path / label
-        help_result = invoke(binary, home, *args, "--help")
         bare = invoke(binary, home, *args)
         machine = invoke(binary, home, "--json", *args)
 
-        assert help_result.returncode == 0
-        assert not help_result.stderr
-        assert "Usage:" in help_result.stdout and "--help" in help_result.stdout
         assert bare.returncode == machine.returncode == 2
-        assert bare.stdout == machine.stderr == ""
-        assert bare.stderr == help_result.stdout
+        assert bare.stdout == machine.stderr == b""
+        assert bare.stderr == expected.stdout
         error = json.loads(machine.stdout)["error"]
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith("Missing ")
         errors.append(error)
     assert errors[0] == errors[1]
+
+    help_result = invoke(rust, tmp_path / "rust", *args, "--help")
+    assert help_result.returncode == 0
+    assert help_result.stderr == b""
+    assert help_result.stdout == expected.stdout
 
 
 @pytest.mark.parametrize(
@@ -98,18 +104,19 @@ def test_bare_group(binaries: tuple[str, str], tmp_path: Path, group: str) -> No
         home = tmp_path / label
         help_result = invoke(binary, home, group, "--help")
         assert help_result.returncode == 0
-        assert help_result.stderr == "" and f"Usage: sai {group}" in help_result.stdout
+        assert help_result.stderr == b""
+        assert f"Usage: sai {group}".encode() in help_result.stdout
 
         bare = invoke(binary, home, group)
         if group == "mcp":
             assert bare.returncode == 0
-            assert bare.stderr == "" and "Usage: sai mcp" in bare.stdout
+            assert bare.stderr == b"" and b"Usage: sai mcp" in bare.stdout
         else:
             assert bare.returncode == 2
-            assert bare.stdout == ""
-            assert bare.stderr.startswith(f"Usage: sai {group} ")
-            assert f"Try 'sai {group} --help' for help." in bare.stderr
-            expected = "Invalid arguments to auth." if group == "auth" else "Options:"
+            assert bare.stdout == b""
+            assert bare.stderr.startswith(f"Usage: sai {group} ".encode())
+            assert f"Try 'sai {group} --help' for help.".encode() in bare.stderr
+            expected = b"Invalid arguments to auth." if group == "auth" else b"Options:"
             assert expected in bare.stderr
 
 
@@ -118,11 +125,11 @@ def test_root_help_and_json_usage(binaries: tuple[str, str], tmp_path: Path) -> 
         home = tmp_path / label
         help_result = invoke(binary, home, "--help")
         assert help_result.returncode == 0
-        assert help_result.stderr == "" and "Usage: sai " in help_result.stdout
+        assert help_result.stderr == b"" and b"Usage: sai " in help_result.stdout
 
         machine = invoke(binary, home, "--json")
         assert machine.returncode == 2
-        assert machine.stderr == ""
+        assert machine.stderr == b""
         assert json.loads(machine.stdout) == {
             "error": {
                 "code": "INVALID_REQUEST",
@@ -137,8 +144,8 @@ def test_bare_root_starts_repl(binaries: tuple[str, str], tmp_path: Path) -> Non
         home = tmp_path / label
         bare = invoke(binary, home)
         assert bare.returncode == 0
-        assert bare.stderr == ""
-        assert "Enter a command, 'help', or 'exit'." in bare.stdout
+        assert bare.stderr == b""
+        assert b"Enter a command, 'help', or 'exit'." in bare.stdout
 
 
 @pytest.mark.parametrize(
@@ -154,6 +161,6 @@ def test_partial_input_reports_the_missing_parameter(
     for label, binary in zip(("python", "rust"), binaries, strict=True):
         partial = invoke(binary, tmp_path / label, *args)
         assert partial.returncode == 2
-        assert partial.stdout == ""
-        assert message in partial.stderr
-        assert "Options:" not in partial.stderr
+        assert partial.stdout == b""
+        assert message.encode() in partial.stderr
+        assert b"Options:" not in partial.stderr

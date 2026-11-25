@@ -1235,36 +1235,42 @@ name = "bare-help-trade-close"
 args = ["trade", "close"]
 mode = "text"
 expect = 2
+exact_output = true
 
 [[case]]
 name = "bare-help-trade-leverage"
 args = ["trade", "leverage"]
 mode = "text"
 expect = 2
+exact_output = true
 
 [[case]]
 name = "bare-help-trade-margin"
 args = ["trade", "margin"]
 mode = "text"
 expect = 2
+exact_output = true
 
 [[case]]
 name = "bare-help-trade-open"
 args = ["trade", "open"]
 mode = "text"
 expect = 2
+exact_output = true
 
 [[case]]
 name = "bare-help-trade-partial-close"
 args = ["trade", "partial-close"]
 mode = "text"
 expect = 2
+exact_output = true
 
 [[case]]
 name = "bare-help-trade-tpsl"
 args = ["trade", "tpsl"]
 mode = "text"
 expect = 2
+exact_output = true
 
 [[case]]
 name = "bare-help-watch-balances"

@@ -180,6 +180,102 @@ impl Open {
     }
 }
 
+// Render Click's help for the trade commands shared with Python.
+pub fn help(command: &str) -> Option<String> {
+    let body = match command {
+        "trade close" => {
+            r#"  Close a position or cancel a pending order.
+
+Options:
+  --cancel-order         Cancel a pending order instead of closing a position.
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        "trade leverage" => {
+            r#"  Set target leverage without changing TP or SL.
+
+Options:
+  --leverage DECIMAL     Target leverage as a decimal.  [required]
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        "trade margin" => {
+            r#"  Add or remove margin through a target-leverage intent.
+
+  The amount is a quote, not a cap: collateral can change before execution.
+
+Options:
+  --direction [add|remove]  [required]
+  --amount DECIMAL          USDC amount for a leverage quote, not an execution
+                            cap.  [required]
+  --lcd-endpoint TEXT       Nibiru REST endpoint for exact contract state.
+                            Defaults to the lcd.endpoint setting.
+  --dry-run
+  --preview-digest TEXT     Submit only if the trade matches this dry-run
+                            digest.
+  --wait                    Wait up to 30 seconds for the intent outcome.
+  --help                    Show this message and exit."#
+        }
+        "trade open" => {
+            r#"  Open a market, limit, or stop trade.
+
+Options:
+  --market INTEGER            [x<=None; required]
+  --side [long|short]         [required]
+  --type [market|limit|stop]  [required]
+  --amount DECIMAL            USDC amount in USD.  [required]
+  --leverage DECIMAL          [required]
+  --price DECIMAL             Trigger for limit and stop orders. For market
+                              orders, pass the preview's reference price when
+                              submitting with --preview-digest.
+  --slippage TEXT             Maximum slippage percentage, greater than 0 and
+                              at most 100.  [required]
+  --take-profit DECIMAL
+  --stop-loss DECIMAL
+  --allow-concurrent-open     Allow another open while an earlier open is
+                              unknown or accepted. Any locally pending open on
+                              the same account and Keeper still blocks,
+                              including a late acknowledgement.
+  --dry-run
+  --preview-digest TEXT       Submit only if the trade matches this dry-run
+                              digest.
+  --wait                      Wait up to 30 seconds for the intent outcome.
+  --help                      Show this message and exit."#
+        }
+        "trade partial-close" => {
+            r#"  Reduce an open USDC position by a whole percentage.
+
+Options:
+  --percent INTEGER      [1<=x<=99; required]
+  --lcd-endpoint TEXT    Nibiru REST endpoint for exact contract state.
+                         Defaults to the lcd.endpoint setting.
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        "trade tpsl" => {
+            r#"  Set or clear take-profit and stop-loss prices.
+
+Options:
+  --take-profit DECIMAL
+  --stop-loss DECIMAL
+  --clear-take-profit
+  --clear-stop-loss
+  --dry-run
+  --preview-digest TEXT  Submit only if the trade matches this dry-run digest.
+  --wait                 Wait up to 30 seconds for the intent outcome.
+  --help                 Show this message and exit."#
+        }
+        _ => return None,
+    };
+    Some(format!("{}\n\n{body}", crate::usage(command)))
+}
+
 pub fn run(
     command: TradeCommand,
     account: Option<&str>,
