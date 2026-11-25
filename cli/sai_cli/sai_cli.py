@@ -994,7 +994,7 @@ def market_list(ctx: click.Context) -> None:
     if ctx.obj["json"]:
         emit(ctx, data)
         return
-    rows = data["perp"]["borrowings"]
+    rows = trading.usdc_markets(data["perp"]["borrowings"])
     ReplSkin("sai").table(
         ["Symbol", "ID", "Collateral", "Price"],
         [
@@ -1449,7 +1449,7 @@ def resolve_market(endpoint: str, market: int | str) -> int:
     matches = sorted(
         {
             row["marketId"]
-            for row in rows
+            for row in trading.usdc_markets(rows)
             if row["baseToken"]["symbol"].casefold() == market.casefold()
         }
     )

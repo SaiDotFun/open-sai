@@ -3574,8 +3574,9 @@ def test_cli_market_symbol_and_compact_market_list(position_service):
     list_args = ["--endpoint", f"{base_url}/query", "market", "list"]
     market_list = cli.invoke(main, list_args)
     assert market_list.exit_code == 0, market_list.output
-    assert list(market_list.stdout.split()).count("BTC") == 2
-    for column in ("Symbol", "ID", "Collateral", "Price", "USDC", "100.5", "NIBI"):
+    assert market_list.stdout.split().count("BTC") == 1
+    assert "NIBI" not in market_list.stdout
+    for column in ("Symbol", "ID", "Collateral", "Price", "USDC", "100.5"):
         assert column in market_list.stdout
     machine = cli.invoke(main, ["--json", *list_args])
     assert machine.exit_code == 0, machine.output
@@ -3585,6 +3586,14 @@ def test_cli_market_symbol_and_compact_market_list(position_service):
     )
 
     position.extra_market_rows[0]["marketId"] = 3
+    still_unique = cli.invoke(main, args)
+    assert still_unique.exit_code == 0, still_unique.output
+    assert (
+        json.loads(still_unique.stdout)["intent"]
+        == json.loads(numeric.stdout)["intent"]
+    )
+
+    position.extra_market_rows[0]["collateralToken"] = {"id": 1, "symbol": "USDC"}
     ambiguous = cli.invoke(main, args)
     assert ambiguous.exit_code == 1, ambiguous.output
     assert "Ambiguous market symbol 'bTc'. Pass a market ID: 0, 3." in ambiguous.stdout

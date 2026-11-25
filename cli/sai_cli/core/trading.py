@@ -152,6 +152,11 @@ def _check_unavailable_target(
         raise
 
 
+def usdc_markets(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return borrowing rows for the collateral Keeper uses to open trades."""
+    return [row for row in rows if row["collateralToken"]["symbol"] == "USDC"]
+
+
 def open_usdc_market(
     endpoint: str, market_id: int, *, timeout: float = 20, require_open: bool = True
 ) -> dict[str, Any]:
@@ -161,10 +166,8 @@ def open_usdc_market(
     ]
     candidates = [
         item
-        for item in markets
-        if item["marketId"] == market_id
-        and item["collateralToken"]["symbol"] == "USDC"
-        and (not require_open or item["isOpen"])
+        for item in usdc_markets(markets)
+        if item["marketId"] == market_id and (not require_open or item["isOpen"])
     ]
     if len(candidates) != 1:
         raise ValueError("Current open USDC market data is unavailable")
