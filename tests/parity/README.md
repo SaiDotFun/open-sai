@@ -138,8 +138,19 @@ Auth cases check expiry, strict arguments, and active account changes
 from both MCP and a separate CLI process. They also check credential
 redaction and verify that an invalid account summary leaves selection intact.
 The wait transcript verifies exact Keeper request counts and the ledger for
-filled and still-pending intents. The inventory and validation cases cover
-overview and logs while their cores are pending.
+filled and still-pending intents.
+
+Run the overview and log-query transcripts against the published
+`sai-cli/v0.1.3` reference. The overview transcript checks clock values
+before masking them for the byte comparison. The log-query transcript
+checks the retained events and counts Keeper requests in each mode.
+
+```sh
+SAI_MCP_PARITY_V013_PYTHON=/absolute/path/to/python-v013/.venv/bin/sai \
+SAI_PARITY_BIN=/absolute/path/to/rust/sai \
+  unshare -Urn sh -c 'ip link set lo up && exec "$@"' sh \
+  uv run --locked pytest tests/parity/test_mcp_stdio.py -k v013
+```
 
 Native validation replies report the validation category and schema-defined
 field names. They omit submitted values and unknown field names. Until the
