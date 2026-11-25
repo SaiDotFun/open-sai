@@ -12,6 +12,7 @@ use thiserror::Error;
 use crate::{
     errors::{Code, SaiError},
     paths,
+    settings::MAINNET_HTTP,
 };
 
 mod ledger;
@@ -232,16 +233,19 @@ impl<'a> Storage<'a> {
     }
 
     pub(crate) fn keeper_hint_flag(&self, endpoint: &str) -> String {
-        if endpoint_origin(endpoint) == endpoint
-            && self
-                .trader
-                .parent()
-                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
-        {
+        if self.keeper_hint_uses_url(endpoint, Some(&endpoint_origin(endpoint))) {
             crate::session::shell_quote(endpoint)
         } else {
             crate::session::ORIGINAL_KEEPER_HINT.into()
         }
+    }
+
+    pub(crate) fn keeper_hint_uses_url(&self, endpoint: &str, origin: Option<&str>) -> bool {
+        (endpoint == MAINNET_HTTP || origin == Some(endpoint))
+            && self
+                .trader
+                .parent()
+                .is_some_and(|home| crate::log::redact(home, endpoint) == endpoint)
     }
 
     pub(crate) fn emit(&self, event: StorageEvent<'_>) {

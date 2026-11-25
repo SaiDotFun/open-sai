@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from sai_cli.core import storage
+from sai_cli.core import keeper, storage
 from test_intent_status import (
     ADDR,
     CLI,
@@ -535,6 +535,56 @@ def test_wait_bounds_account_lookup_when_ledger_is_locked(
             ]
             observed.append(document)
     assert observed[0] == observed[1]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "public"),
+    [
+        (keeper.MAINNET_HTTP, True),
+        (keeper.MAINNET_HTTP + "?key=private-fixture", False),
+    ],
+    ids=["public-keeper", "private-query"],
+)
+def test_wait_recovery_for_the_public_keeper_route(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+    endpoint: str,
+    public: bool,
+) -> None:
+    # These recovery hints compare against the current Python CLI.
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    for index, cli in enumerate(clis):
+        home = tmp_path / str(index) / "sai"
+        seed(home, endpoint, monkeypatch, "unknown")
+        # The account lookup exhausts the deadline before any Keeper request.
+        with closing(sqlite3.connect(home / "trader/intents.sqlite3")) as db:
+            db.execute("BEGIN EXCLUSIVE")
+            result = invoke(
+                cli,
+                home,
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "wait",
+                KEY,
+                "--timeout",
+                "0.05",
+            )
+        assert result.returncode == 5 and not result.stderr, result
+        document = json.loads(result.stdout)
+        assert document["addr"] is None
+        expected = (
+            endpoint
+            if public
+            else (
+                '"${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
+            )
+        )
+        assert document["hint"] == f"sai --endpoint {expected} intent wait {KEY}"
+        assert document["error"]["hint"] == document["hint"]
 
 
 def test_wait_interrupts_locked_account_lookup(
