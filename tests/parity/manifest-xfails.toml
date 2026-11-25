@@ -109,12 +109,12 @@ signature = "2f9cc8eb3151672f0ecfc3ea6e8d18ab1d8264a77ed527efad6214069b7eafc3"
 
 [gap."case:doctor-keeper-error-codes"]
 owner = "M2-unassigned"
-signature = "0a9d1d5e4d2458bd68f59fe4dbb1e49155a7aec634745d9a21ddf4e369738287"
+signature = "9fcc8a08b042cd138371fefe3b24994fd00c7e330201f8b1cdb5f5ea4431e8f1"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-lcd-unreachable"]
 owner = "M2-unassigned"
-signature = "d44d2129607d3ce6252613acb3a1a36daf26cc76fa9468679fa38875e05499f1"
+signature = "ba22a760e735d939b6f5e596ec10f30171f7462b0d02cd7ff15d8a0819ce2ec4"
 title = "Track the intentional redaction in Doctor LCD diagnostics"
 
 [gap."case:doctor-mcp-verification-failure"]
@@ -129,27 +129,27 @@ title = "Match the Doctor guidance for near-expiry sessions"
 
 [gap."case:doctor-network"]
 owner = "M2-unassigned"
-signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
+signature = "309e25b99b8efb63627781ba4aeda25b2244a5d14a27a38ef1ab5b98ff81dc21"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-network-with-logging"]
 owner = "M2-unassigned"
-signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
+signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-reconcile-absent-intent"]
 owner = "M2-unassigned"
-signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
+signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-ws-no-subprotocol"]
 owner = "M2-unassigned"
-signature = "dcb63e9db52ba958b18cf8fda14fa07243940d531eb9873e358e883c7f41b47f"
+signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-ws-timeout"]
 owner = "M2-unassigned"
-signature = "0a9d1d5e4d2458bd68f59fe4dbb1e49155a7aec634745d9a21ddf4e369738287"
+signature = "69ef87aee2da5b8600241b502f63a8a50c0cbf6e09525e66fb6ab65da7feb7ab"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:help"]
@@ -271,7 +271,7 @@ signature = "e3637d2978439a9ab0fd714b281f1dc5722875bc737a7042918e41e369f69f5f"
 
 [gap."case:version"]
 owner = "M2-unassigned"
-signature = "243e24cb23798f54e7fa6f68e68524a0d963d6d1983343e8551d39d8803b616e"
+signature = "d1a087013957a4980439a4e5a774af1a6843531593dbb0cf17ba98d2869d2007"
 title = "Match the released sai --version output"
 
 [gap."cli:auth import"]
@@ -410,3 +410,48 @@ signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
 [gap."mcp:trade_tpsl"]
 owner = "#176"
 signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
+
+[gap."case:doctor-lcd-unknown-keeper-chain"]
+owner = "M2-unassigned"
+signature = "34cff04d762f5759ce8f6f6ea4b1f75b640abcf228d0d74766cd8d19a0ff7a33"
+title = "Track Doctor LCD chain reporting against v0.1.2"
+
+[gap."case:doctor-lcd-chain-mismatch"]
+owner = "M2-unassigned"
+signature = "3d20a8c55dfb34687a1f9e6eb642b9a1033c53b60552f1308e0f46d0759f07b3"
+title = "Track Doctor LCD chain mismatch diagnostics against v0.1.2"
+
+[gap."case:doctor-lcd-chain-mismatch-text"]
+owner = "M2-unassigned"
+signature = "d0edb2e8739762316f314268f9113fc765717d8f2490afca0ccbd83a91739890"
+title = "Track Doctor LCD chain text and reference-only log redaction"
+
+[gap."case:doctor-lcd-invalid-chain"]
+owner = "M2-unassigned"
+signature = "1f6a1f9dd9621746f6f02f408c591251ffe96cb199918a93cee03956e53e6ae7"
+title = "Track Doctor invalid LCD chain exit behavior against v0.1.2"
+
+[gap."case:doctor-lcd-invalid-chain-text"]
+owner = "M2-unassigned"
+signature = "8730227c776c687551a6c518192d0ed1741c95c80bed827b6c5ebab29bef01e6"
+title = "Track Doctor invalid LCD chain text diagnostics against v0.1.2"
+
+[gap."case:doctor-lcd-unreachable-text"]
+owner = "M2-unassigned"
+signature = "9f6b55b65915b3ffcfcf1538b1cadc9b00b174866fd5e418a639ecb071e117a6"
+title = "Track Doctor unreachable LCD stderr against v0.1.2"
+
+[gap."case:mcp-uninstall-codex-query-failure"]
+owner = "M2-unassigned"
+signature = "13f6b69a1dbb69d06b5448f0772bde57b46747a52ddf3353db45b89a6dfdef4c"
+title = "Track safe Codex uninstall rollback against v0.1.2"
+
+[gap."case:mcp-uninstall-codex-read-only"]
+owner = "M2-unassigned"
+signature = "20333939a0768fa58998b5196db6693d1f8b81907f62a8e474a542eaee6539ba"
+title = "Track Codex read-only uninstall behavior against v0.1.2"
+
+[gap."case:mcp-uninstall-cursor-read-only"]
+owner = "M2-unassigned"
+signature = "d54ebf40d72168dc7f625be654d4231314fc1388b3c43b1462799602f3d4f607"
+title = "Track Cursor read-only uninstall behavior against v0.1.2"
