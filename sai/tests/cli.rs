@@ -521,12 +521,7 @@ fn invalid_environment_settings_never_echo_values_to_stderr() {
             "a URL starting with https:// or http://",
             2,
         ),
-        (
-            "SAI_UPDATE_AUTO",
-            "update.auto",
-            "true, false, yes, no, on, off, 1, or 0",
-            1,
-        ),
+        ("SAI_UPDATE_AUTO", "update.auto", "true or false", 2),
         (
             "SAI_LOG",
             "logs.enabled",

@@ -80,12 +80,9 @@ impl ServeArgs {
             );
         }
         let settings = crate::load_settings(&flags, env).map_err(|error| {
-            let message = format!("sai mcp serve: {error}");
-            if error.is_invalid_endpoint() {
-                SaiError::usage(message)
-            } else {
-                SaiError::new(Code::InvalidRequest, message)
-            }
+            let mut error = SaiError::from(error);
+            error.message = format!("sai mcp serve: {}", error.message);
+            error
         })?;
         let server = SaiMcp {
             settings,

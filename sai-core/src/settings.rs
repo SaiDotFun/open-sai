@@ -181,6 +181,7 @@ impl Key {
             Kind::Url([secure, plain]) => {
                 self.expected(&format!("a URL starting with {secure}:// or {plain}://"))
             }
+            Kind::Bool if self == Self::UpdateAuto => self.expected("true or false"),
             Kind::Bool => self.expected("true, false, yes, no, on, off, 1, or 0"),
             Kind::Days => self.expected("a whole number, 1 or more"),
         }
@@ -310,6 +311,7 @@ pub struct SettingsError {
     message: String,
     uneditable: bool,
     invalid_endpoint: bool,
+    invalid_override: bool,
     malformed_toml: bool,
 }
 
@@ -319,6 +321,7 @@ impl SettingsError {
             message,
             uneditable: false,
             invalid_endpoint: false,
+            invalid_override: false,
             malformed_toml: false,
         }
     }
@@ -336,6 +339,10 @@ impl SettingsError {
 
     pub fn is_invalid_endpoint(&self) -> bool {
         self.invalid_endpoint
+    }
+
+    pub fn is_invalid_setting(&self) -> bool {
+        self.invalid_endpoint || self.invalid_override
     }
 
     pub fn is_malformed_toml(&self) -> bool {
@@ -360,7 +367,7 @@ impl From<SettingsError> for crate::errors::SaiError {
     fn from(error: SettingsError) -> Self {
         if error.is_uneditable() {
             Self::usage(error.to_string())
-        } else if error.invalid_endpoint {
+        } else if error.is_invalid_setting() {
             Self {
                 show_usage: false,
                 ..Self::usage(error.to_string())
@@ -530,12 +537,13 @@ impl Settings {
                     }
                     (key.default_value(), source)
                 }
-                Err(error) => {
+                Err(mut error) => {
                     let origin = if source == Source::Flag {
                         key.spec().flag.unwrap_or(key.spec().name)
                     } else {
                         key.spec().env
                     };
+                    error.invalid_override = matches!(source, Source::Flag | Source::Env);
                     return Err(error.with_context(origin));
                 }
             };

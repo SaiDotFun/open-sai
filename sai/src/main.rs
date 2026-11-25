@@ -286,12 +286,11 @@ fn execute(
                 });
             match result {
                 Ok(code) => (code, None),
-                Err(error) => complete(
-                    Err(error),
-                    usage_command,
-                    json && command != "mcp serve",
-                    home,
-                ),
+                Err(error) => {
+                    let json =
+                        json && (command != "mcp serve" || error.exit_code == ExitCode::Usage);
+                    complete(Err(error), usage_command, json, home)
+                }
             }
         }
         Err(error) => print_parse_error(
