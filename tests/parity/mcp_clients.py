@@ -112,7 +112,7 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
     saved = stable
     args = ["mcp", "serve"]
     home_setting = str(home / "sai")
-    if scenario in {"retired", "partial", "shadowed"}:
+    if scenario in {"retired", "legacy-retired", "partial", "shadowed"}:
         saved = programs / ("sai" + "-mcp")
         args = ["--endpoint", "https://fixture.invalid/api?token=private"]
         if scenario == "partial":
@@ -125,7 +125,7 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
         shutil.copy2(stable, saved)
     elif scenario == "legacy":
         home_setting = str(home / "pinned-profile")
-    name = "sai" + "-mcp" if scenario == "legacy" else "sai"
+    name = "sai" + "-mcp" if scenario in {"legacy", "legacy-retired"} else "sai"
     entry = {"command": str(saved), "args": args, "env": {"SAI_HOME": home_setting}}
     extra = scenario != "current"
     if extra:
