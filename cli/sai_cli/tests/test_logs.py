@@ -3725,6 +3725,53 @@ def test_intent_cursor_rejects_truncation_during_terminal_page(
     assert "events" not in json.loads(output)
 
 
+@pytest.mark.parametrize("change", ["delete", "replace"])
+def test_intent_query_rechecks_file_name_after_read(home, monkeypatch, change):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    row = {
+        "ts": f"{day}T00:00:00.000Z",
+        "event": "intent.keeper",
+        "intentKey": "KEY",
+        "addr": ADDR,
+        "endpointId": "h1_" + "a" * 64,
+    }
+    path = log.file_path("cli", day, root)
+    path.write_bytes(log.encode(row))
+    replacement = root / "replacement"
+    replacement.write_bytes(log.encode({**row, "addr": OTHER}))
+    read = os.read
+    expected = path.stat()
+    changed = False
+
+    def change_during_read(fd, size):
+        nonlocal changed
+        data = read(fd, size)
+        info = os.fstat(fd)
+        if (
+            not changed
+            and size > 1
+            and (info.st_dev, info.st_ino)
+            == (
+                expected.st_dev,
+                expected.st_ino,
+            )
+        ):
+            if change == "delete":
+                path.unlink()
+            else:
+                replacement.replace(path)
+            changed = True
+        return data
+
+    monkeypatch.setattr(os, "read", change_during_read)
+    code, output = run_cli("--json", "logs", "intent", "KEY", "--offline")
+    assert changed
+    assert code == 2 and "Start a new intent log query" in output
+    assert "events" not in json.loads(output)
+
+
 def test_intent_cursor_cache_evicts_old_states_and_refuses_oversize_reads(home):
     root = home / "logs"
     root.mkdir()

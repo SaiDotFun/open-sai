@@ -863,8 +863,13 @@ class LogDir:
                 yield fd, size
             finally:
                 info = os.fstat(fd)
-                if info.st_size < size or (
-                    extent is not None and not extent.matches(info)
+                named = self.file_info(name)
+                if (
+                    named is None
+                    or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
+                    or named.st_size < info.st_size
+                    or info.st_size < size
+                    or (extent is not None and not extent.matches(named))
                 ):
                     raise stale_snapshot(intent=extent is not None)
         finally:
