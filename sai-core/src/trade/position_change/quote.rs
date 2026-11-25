@@ -386,11 +386,11 @@ mod tests {
         assert_eq!(initial["intent"], changed["intent"]);
         assert_eq!(
             initial["previewDigest"],
-            "8f1c017ea7f28a2eb445bf1531681ad7ad2e2342eef9d2ff25389828df28b4d3"
+            "170311e0406ac3f36a1554bf10f00bbafc0ad77d97954de5232d24e6763ed50d"
         );
         assert_eq!(
             changed["previewDigest"],
-            "65e315784c6c12a5e076391804e5b07e7c8c279f1f8ff6f8d8eed8ed0fcf68a6"
+            "85736d694c171b44ad83f99ac0f806c02433ea47104e1acff5324eb2b6d32ddd"
         );
     }
 }
