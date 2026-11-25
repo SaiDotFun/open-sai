@@ -73,6 +73,10 @@ signature = "1f5512d71e5092ae928423c842c3202dd2647e74f2be994482bd90d9b66d4811"
 owner = "#211"
 signature = "b9cd24acfe95b5081aa533032dcf6d737785a5b3a3137f1f7646a9464a5d7765"
 
+[gap."case:auth-import-rejected-operand-text"]
+owner = "#211"
+signature = "daa6bb6c28c5e4088d2b9ede7a99c4b8086fd9b4c28dc6defba571e677319b8f"
+
 [gap."case:auth-logout"]
 owner = "#213"
 signature = "3d90c0ac924b0ee4ede71e61d34a078f89ded1255e95ac382ed214eb83ca5276"

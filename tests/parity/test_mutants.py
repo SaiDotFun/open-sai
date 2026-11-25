@@ -8,10 +8,16 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import tomllib
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
 from compare import MIN_SQLITE_SCHEMA, SQLITE_SCHEMA_REQUIREMENT
+from manifest_gaps import ManifestGaps
+from network import require_loopback
+from parity import Case, run_case
+from release_mismatch import difference_signature
 
 HERE = Path(__file__).parent
 ROOT = HERE.parents[1]
@@ -113,6 +119,48 @@ def test_wrong_candidate_fails(
     assert run.returncode == 1, run.stdout + run.stderr
     assert "| DIFF |" in run.stdout
     assert message in run.stdout
+
+
+@pytest.mark.parametrize(
+    ("mutation", "detail", "status"),
+    [
+        (
+            "auth-import-stderr-echo",
+            "Fixture credential appeared in CLI output",
+            "DIFF",
+        ),
+        ("auth-import-stderr-drift", "parity.raw[1] [sha256:", "XFAIL"),
+    ],
+)
+def test_release_auth_import_rejects_wrong_diagnostic(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    mutation: str,
+    detail: str,
+    status: str,
+) -> None:
+    require_loopback()
+    case_id = "auth-import-rejected-operand-text"
+    cases = tomllib.loads((HERE / "cases.toml").read_text())["case"]
+    case = Case(**next(item for item in cases if item["name"] == case_id))
+    reference = [str(Path(sys.executable).with_name("sai"))]
+    candidate = [str(write_mutant(tmp_path, mutation))]
+    category_only = replace(case, exact_output=False, absent_output_text=None)
+    old_differences, _, _ = run_case(category_only, reference, candidate, cutover=True)
+    assert old_differences == []
+    differences, _, _ = run_case(case, reference, candidate, cutover=True)
+    assert any(detail in diff for diff in differences)
+
+    row = f"case:{case_id}"
+    release_gaps = ManifestGaps(HERE / "manifest-xfails.toml")
+    assert release_gaps.result(row, differences)[0] == "DIFF"
+    # Even registering the leaked diagnostic cannot turn it into an expected failure.
+    registry = tmp_path / "manifest-xfails.toml"
+    registry.write_text(
+        f'[gap."{row}"]\nowner = "#211"\nsignature = "{difference_signature(differences)}"\n'
+    )
+    assert ManifestGaps(registry).result(row, differences)[0] == status
+    assert case.args[-1] not in capsys.readouterr().out
 
 
 def test_driver_invokes_the_explicit_python_reference(tmp_path: Path) -> None:

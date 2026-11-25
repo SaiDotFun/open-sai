@@ -100,6 +100,7 @@ class Case:
     client_seed: str | None = None
     accepted_divergence: str | None = None
     absent_log_text: list[str] | None = None
+    absent_output_text: list[str] | None = None
     interrupt_after: int | None = None
     interrupt_on_request: bool = False
     overview_expected: dict[str, Any] | None = None
@@ -519,6 +520,11 @@ def observe(
                     f"Expected retry exit {case.retry_expect}, got {contender.returncode}"
                 )
     ended_at = time.time()
+    if candidate and any(
+        marker in result.stdout or marker in result.stderr
+        for marker in case.absent_output_text or ()
+    ):
+        raise ValueError("Fixture credential appeared in CLI output")
     for error in endpoints.errors:
         check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
@@ -1493,14 +1499,21 @@ def main() -> int:
                 tools[tool] = status
         mismatches += bool(diffs)
         expected_differences += bool(expected and not diffs)
+        shown_args = [
+            "<redacted>"
+            if any(marker in arg for marker in case.absent_output_text or ())
+            else arg
+            for arg in case.args
+        ]
+        command = f"`sai {shlex.join(shown_args)}` ({case.name})"
         if gaps:
             row(
-                f"`sai {shlex.join(case.args)}` ({case.name})",
+                command,
                 *gaps.result(f"case:{case.name}", diffs),
             )
             continue
         row(
-            f"`sai {shlex.join(case.args)}` ({case.name})",
+            command,
             "DIFF" if diffs else "EXPECTED DIFF" if expected else "PASS",
             ", ".join(diffs)
             if diffs
