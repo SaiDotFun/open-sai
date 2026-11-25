@@ -8,13 +8,14 @@ use std::{
     time::Duration,
 };
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use sai_core::{
     errors::Code,
-    keeper::{POSITION, ROUTE, SUBMIT},
+    keeper::{MARKET, MARKETS, POSITION, ROUTE, SUBMIT},
     storage::{Session, Storage},
     trade::{
-        Confirmation, PreviewMode, SubmitOptions, TradePreview, Trading, close_preview,
-        leverage_preview, preview_digest, tpsl_preview,
+        Confirmation, OpenTrade, OrderType, PreviewMode, Side, SubmitOptions, TradePreview,
+        Trading, close_preview, leverage_preview, preview_digest, tpsl_preview,
     },
 };
 use serde_json::{Value, json};
@@ -35,6 +36,12 @@ struct ReplyState {
     contract: &'static str,
     contract_available: bool,
     requests: Vec<String>,
+    price: &'static str,
+    market_available: bool,
+    trade_type: &'static str,
+    indexed_position_missing: bool,
+    close_height_check_index: Option<u8>,
+    target_missing: bool,
 }
 
 struct PositionServer {
@@ -57,6 +64,12 @@ impl PositionServer {
             contract: CONTRACT,
             contract_available: true,
             requests: Vec::new(),
+            price: "100",
+            market_available: true,
+            trade_type: "trade",
+            indexed_position_missing: false,
+            close_height_check_index: None,
+            target_missing: false,
         }));
         let stop = Arc::new(AtomicBool::new(false));
         let replies = Arc::clone(&state);
@@ -124,7 +137,34 @@ impl ReplyState {
                 POSITION => {
                     assert_eq!(request["variables"], json!({"trader": ACCOUNT, "id": 7}));
                     self.requests.push("position".into());
-                    json!({"perp": {"trade": {"id": 7, "trader": self.keeper_owner}}})
+                    let position = if self.indexed_position_missing {
+                        Value::Null
+                    } else if self.close_height_check_index.is_some() {
+                        json!({
+                            "id": 7, "trader": self.keeper_owner, "isOpen": true, "tradeType": "trade",
+                            "collateralAmount": 2_000_000, "leverage": "2",
+                            "perpBorrowing": {"marketId": 3, "collateralToken": {"id": 0, "symbol": "USDC"}}
+                        })
+                    } else {
+                        json!({"id": 7, "trader": self.keeper_owner})
+                    };
+                    json!({"perp": {"trade": position}})
+                }
+                MARKET => {
+                    assert_eq!(request["variables"], json!({"market": 3, "collateral": 0}));
+                    self.requests.push("borrowing".into());
+                    json!({"perp": {"borrowing": {
+                        "marketId": 3, "isOpen": true, "collateralToken": {"id": 0}
+                    }}})
+                }
+                MARKETS => {
+                    self.requests.push("markets".into());
+                    let borrowings = if self.market_available {
+                        json!([{"marketId": 3, "price": self.price, "isOpen": true, "collateralToken": {"symbol": "USDC"}}])
+                    } else {
+                        json!([])
+                    };
+                    json!({"perp": {"borrowings": borrowings}})
                 }
                 ROUTE => {
                     self.requests.push("route".into());
@@ -148,15 +188,56 @@ impl ReplyState {
             self.requests.push("node_info".into());
             return json!({"default_node_info": {"network": self.lcd_chain}});
         }
-        assert!(
-            request.starts_with(&format!(
+        let path = request
+            .strip_prefix(&format!(
                 "GET /cosmwasm/wasm/v1/contract/{}/smart/",
                 self.contract
-            )),
-            "{request}"
-        );
+            ))
+            .unwrap_or_else(|| panic!("Unexpected LCD request: {request}"));
+        if let Some(latest_index) = self.close_height_check_index {
+            let (target, _) = path.split_once(' ').unwrap();
+            let path = target.split('?').next().unwrap();
+            let (encoded, _) = url::form_urlencoded::parse(path.as_bytes()).next().unwrap();
+            let message: Value =
+                serde_json::from_slice(&STANDARD.decode(encoded.as_bytes()).unwrap()).unwrap();
+            if message.get("get_exchange_balance").is_some() {
+                assert_eq!(
+                    message,
+                    json!({"get_exchange_balance": {"user": ACCOUNT, "collateral_index": "TokenIndex(0)"}})
+                );
+                self.requests.push("exchange_balance".into());
+                return json!({"data": {"collateral_index": "TokenIndex(0)"}});
+            }
+            assert_eq!(
+                message,
+                json!({"get_trade_raw": {"trader": ACCOUNT, "index": 7}})
+            );
+            let index = if self
+                .requests
+                .iter()
+                .any(|label| label == "exchange_balance")
+            {
+                self.requests.push("height_check".into());
+                latest_index
+            } else {
+                self.requests.push("contract_position".into());
+                7
+            };
+            return json!({"data": {
+                "user": self.contract_owner, "user_trade_index": format!("UserTradeIndex({index})"),
+                "market_index": "MarketIndex(3)", "collateral_index": "TokenIndex(0)",
+                "is_open": true, "trade_type": "trade", "collateral_amount": "2000000",
+                "leverage": "2", "long": true, "open_price": "100"
+            }});
+        }
         self.requests.push("contract_position".into());
-        json!({"data": {"user_trade_index": "UserTradeIndex(7)", "user": self.contract_owner}})
+        if self.target_missing {
+            return json!({"data": null});
+        }
+        json!({"data": {
+            "user_trade_index": "UserTradeIndex(7)", "user": self.contract_owner,
+            "trade_type": self.trade_type, "is_open": true,
+        }})
     }
 }
 
@@ -234,6 +315,50 @@ async fn close_preview_requires_verified_ownership_to_issue_a_digest() {
             requests.push("contract_position");
         }
         assert_eq!(server.requests(), requests);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
+}
+
+#[tokio::test]
+async fn close_preview_withholds_digest_when_the_height_check_returns_a_different_index() {
+    for (latest_index, verified) in [(8, false), (7, true)] {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        // Neither response serves a block height. Only a conflicting index
+        // invalidates the earlier ownership check.
+        server.state.lock().unwrap().close_height_check_index = Some(latest_index);
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+
+        let output = trading
+            .confirmed_trade_preview(&session, close_preview("7", false).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            server.requests(),
+            [
+                "position",
+                "route",
+                "node_info",
+                "contract_position",
+                "borrowing",
+                "exchange_balance",
+                "height_check"
+            ]
+        );
+        assert_eq!(output["estimates"]["fees"]["status"], "unavailable");
+        if verified {
+            assert!(output["previewDigest"].is_string());
+            assert_eq!(output["positionRoute"]["contractAddress"], CONTRACT);
+            assert!(output.get("positionOwnerVerified").is_none());
+        } else {
+            assert!(output.get("previewDigest").is_none());
+            assert!(output.get("positionRoute").is_none());
+            assert_eq!(output["positionOwnerVerified"], false);
+        }
         assert!(!home.path().join("trader/intents.sqlite3").exists());
     }
 }
@@ -409,4 +534,376 @@ async fn confirmed_position_submit_reports_lcd_only_chain_drift() {
         assert_eq!(server.requests(), ["position", "route", "node_info"]);
         assert!(!home.path().join("trader/intents.sqlite3").exists());
     }
+}
+
+fn market_open() -> TradePreview {
+    OpenTrade {
+        market: "3",
+        side: Side::Long,
+        order_type: OrderType::Market,
+        amount: "20",
+        leverage: "2",
+        price: None,
+        slippage: "1",
+        take_profit: None,
+        stop_loss: None,
+    }
+    .preview()
+    .unwrap()
+}
+
+#[tokio::test]
+async fn shared_market_submit_refreshes_before_reserving() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = market_open();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    assert_eq!(issued["referencePrice"], "100");
+    assert_eq!(issued["estimates"]["worstCaseFill"]["price"], "102.01");
+    server.state.lock().unwrap().price = "102";
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(
+                    Confirmation::new(issued["previewDigest"].as_str().unwrap(), Some("100"))
+                        .unwrap(),
+                ),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PriceMoved);
+    let details = error.details.unwrap();
+    let replacement = &details["preview"];
+    assert_eq!(replacement["referencePrice"], "102");
+    let fill = &replacement["estimates"]["worstCaseFill"];
+    assert_eq!(fill["status"], "bound");
+    assert_eq!(fill["price"], "104.0502");
+    assert_eq!(fill["reference"]["price"], "102");
+    assert_ne!(replacement["previewDigest"], issued["previewDigest"]);
+    assert_eq!(replacement["positionRoute"], issued["positionRoute"]);
+    assert_eq!(
+        server.requests(),
+        [
+            "route",
+            "node_info",
+            "markets",
+            "route",
+            "node_info",
+            "markets"
+        ]
+    );
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn basic_trade_confirmation_checks_live_chain_and_contract() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../tests/parity/route_trade_digest.json"
+    ))
+    .unwrap();
+    for (index, preview) in [
+        market_open(),
+        close_preview("7", false).unwrap(),
+        close_preview("7", true).unwrap(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        if index == 2 {
+            server.state.lock().unwrap().trade_type = "limit";
+        }
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+        let issued = trading
+            .confirmed_trade_preview(&session, preview.clone())
+            .await
+            .unwrap();
+        let case = &fixture["cases"][index];
+        let digest = issued["previewDigest"].as_str().unwrap();
+        assert_eq!(digest, case["original"]);
+        assert_eq!(
+            issued["positionRoute"],
+            json!({"chainId": NETWORK, "contractAddress": CONTRACT})
+        );
+        for (change, chain, contract) in [
+            ("chain", "fixture-chain-2", CONTRACT),
+            ("contract", NETWORK, "nibi1differentcontract"),
+        ] {
+            {
+                let mut state = server.state.lock().unwrap();
+                state.keeper_chain = chain;
+                state.lcd_chain = chain;
+                state.contract = contract;
+            }
+            let error = trading
+                .submit(
+                    &session,
+                    &preview,
+                    SubmitOptions {
+                        confirmation: Some(
+                            Confirmation::new(digest, (index == 0).then_some("100")).unwrap(),
+                        ),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .err()
+                .unwrap();
+            assert_eq!(error.code, Code::PreviewMismatch);
+            assert!(error.details.is_none());
+            let refreshed = trading
+                .confirmed_trade_preview(&session, preview.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                refreshed["positionRoute"],
+                json!({"chainId": chain, "contractAddress": contract})
+            );
+            assert_eq!(refreshed["previewDigest"], case[change]);
+            assert!(!home.path().join("trader/intents.sqlite3").exists());
+            assert!(
+                !server
+                    .requests()
+                    .iter()
+                    .any(|request| request == "admission")
+            );
+        }
+        let accepted = trading
+            .confirmed_trade_preview(&session, preview.clone())
+            .await
+            .unwrap();
+        assert!(
+            trading
+                .submit(
+                    &session,
+                    &preview,
+                    SubmitOptions {
+                        confirmation: Some(
+                            Confirmation::new(
+                                accepted["previewDigest"].as_str().unwrap(),
+                                (index == 0).then_some("100")
+                            )
+                            .unwrap()
+                        ),
+                        ..Default::default()
+                    }
+                )
+                .await
+                .is_ok()
+        );
+        assert_eq!(server.requests().last().unwrap(), "admission");
+    }
+}
+
+#[tokio::test]
+async fn basic_confirmation_reports_keeper_only_chain_drift() {
+    for (preview, reference, preflight) in [
+        (market_open(), Some("100"), &["route", "node_info"][..]),
+        (close_preview("7", false).unwrap(), None, &["route"][..]),
+        (
+            close_preview("7", true).unwrap(),
+            None,
+            &["route", "node_info"][..],
+        ),
+    ] {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        server.state.lock().unwrap().trade_type = "limit";
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+        let issued = trading
+            .confirmed_trade_preview(&session, preview.clone())
+            .await
+            .unwrap();
+        let digest = issued["previewDigest"].as_str().unwrap();
+        {
+            let mut state = server.state.lock().unwrap();
+            state.keeper_chain = "fixture-chain-2";
+            state.requests.clear();
+        }
+        let error = trading
+            .submit(
+                &session,
+                &preview,
+                SubmitOptions {
+                    confirmation: Some(Confirmation::new(digest, reference).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, Code::PreviewMismatch);
+        assert_eq!(server.requests(), preflight);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
+}
+
+#[tokio::test]
+async fn market_confirmation_reports_contract_drift_before_reading_missing_market() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = market_open();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    let digest = issued["previewDigest"].as_str().unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.contract = "nibi1differentcontract";
+        state.market_available = false;
+        state.requests.clear();
+    }
+
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(digest, Some("100")).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert!(error.details.is_none());
+    assert!(error.message.contains("Request a fresh preview"));
+    assert_eq!(server.requests(), ["route", "node_info"]);
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn close_confirmation_checks_route_before_reading_the_indexed_position() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = close_preview("7", false).unwrap();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    let digest = issued["previewDigest"].as_str().unwrap();
+
+    for (contract, missing, owner, code, message, requests) in [
+        (
+            "nibi1differentcontract",
+            true,
+            ACCOUNT,
+            Code::PreviewMismatch,
+            "Request a fresh preview",
+            &["route"][..],
+        ),
+        (
+            CONTRACT,
+            true,
+            ACCOUNT,
+            Code::InvalidRequest,
+            "Position not found for this account",
+            &["route", "position"][..],
+        ),
+        (
+            CONTRACT,
+            false,
+            OTHER_ACCOUNT,
+            Code::InvalidRequest,
+            "Keeper position belongs to a different account",
+            &["route", "position"][..],
+        ),
+    ] {
+        {
+            let mut state = server.state.lock().unwrap();
+            state.contract = contract;
+            state.indexed_position_missing = missing;
+            state.keeper_owner = owner;
+            state.requests.clear();
+        }
+
+        let error = trading
+            .submit(
+                &session,
+                &preview,
+                SubmitOptions {
+                    confirmation: Some(Confirmation::new(digest, None).unwrap()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .err()
+            .unwrap();
+
+        assert_eq!(error.code, code);
+        assert!(error.message.contains(message));
+        assert!(error.details.is_none());
+        assert_eq!(server.requests(), requests);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
+}
+
+#[tokio::test]
+async fn cancel_confirmation_checks_route_before_reading_replacement_contract() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    server.state.lock().unwrap().trade_type = "limit";
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = close_preview("7", true).unwrap();
+    let issued = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    let digest = issued["previewDigest"].as_str().unwrap();
+    {
+        let mut state = server.state.lock().unwrap();
+        state.contract = "nibi1differentcontract";
+        state.target_missing = true;
+        state.requests.clear();
+    }
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(digest, None).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert!(error.details.is_none());
+    assert!(error.message.contains("Request a fresh preview"));
+    assert_eq!(server.requests(), ["route", "node_info"]);
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
 }

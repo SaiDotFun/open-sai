@@ -258,7 +258,7 @@ def submitted_key(request: Request, kind: str) -> str:
     return submission["intentKey"]
 
 
-def cancel_lcd(request: Request, *, trade_type: str = "limit") -> Reply:
+def target_lcd(request: Request, *, trade_type: str = "trade") -> Reply:
     assert "authorization" not in request.headers
     if request.path == NODE_INFO:
         return response({"default_node_info": {"network": ROUTE["chainId"]}})
@@ -278,7 +278,7 @@ def cancel_lcd(request: Request, *, trade_type: str = "limit") -> Reply:
     )
 
 
-def queue_update_preflight(replies: deque[ReplayReply]) -> None:
+def queue_update_preflight(replies: deque[ReplayReply]) -> int:
     def get_position(request: Request) -> Reply:
         assert "authorization" not in request.headers
         assert json.loads(request.body) == {
@@ -293,6 +293,25 @@ def queue_update_preflight(replies: deque[ReplayReply]) -> None:
         return response({"data": {"oneClickTrading": ROUTE}})
 
     replies.extend((get_position, get_route))
+    return 4  # Indexed position, route, LCD chain ID and contract position.
+
+
+def close_preflight(replies: deque[ReplayReply], rust: bool) -> int:
+    # The pinned wait reference predates the market-close owner check.
+    return queue_update_preflight(replies) if rust else 0
+
+
+def trade_wait_args(endpoint: str, args: CLI) -> CLI:
+    return (
+        "--endpoint",
+        endpoint,
+        "--lcd-endpoint",
+        endpoint.removesuffix("/query"),
+        "--json",
+        "trade",
+        *args,
+        "--wait",
+    )
 
 
 def accepted(key: str, kind: str) -> Reply:
@@ -309,6 +328,27 @@ def accepted(key: str, kind: str) -> Reply:
             }
         }
     )
+
+
+def filled_close(
+    replies: deque[ReplayReply], requests: list[Request], rust: bool
+) -> int:
+    preflight = close_preflight(replies, rust)
+    kind = "CLOSE_POSITION"
+
+    def key() -> str:
+        return submitted_key(requests[preflight], kind)
+
+    replies.extend(
+        (
+            lambda request: accepted(submitted_key(request, kind), kind),
+            lambda _: response(intent("filled", kind=kind, intentKey=key())),
+            lambda _: response(
+                history(indexed("position_closed_user", intentKey=key()))
+            ),
+        )
+    )
+    return preflight
 
 
 def normalized(document: Any, key: str) -> Any:
@@ -341,11 +381,12 @@ def test_trade_wait(
     documents = []
     keys: list[str] = []
     update = case.args in UPDATES
-    with replay(
-        get=lambda request: cancel_lcd(
-            request, trade_type="trade" if update else "limit"
-        )
-    ) as (endpoint, replies, requests):
+    trade_type = "limit" if case.kind == "CANCEL_PENDING_TRADE" else "trade"
+    with replay(get=lambda request: target_lcd(request, trade_type=trade_type)) as (
+        endpoint,
+        replies,
+        requests,
+    ):
         for index, cli in enumerate(trade_wait_pair(request, case.args)):
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
@@ -416,7 +457,10 @@ def test_trade_wait(
                 )
                 return response(history(row))
 
-            if case.args == OPEN:
+            preflight = 0
+            if case.kind == "CLOSE_POSITION":
+                preflight = close_preflight(replies, rust=index == 1)
+            elif case.args == OPEN:
                 replies.append(response(MARKETS))
             if update:
                 queue_update_preflight(replies)
@@ -449,18 +493,7 @@ def test_trade_wait(
                 if index and case.alternate_rust_args
                 else case.args
             )
-            result = invoke(
-                cli,
-                home,
-                "--endpoint",
-                endpoint,
-                "--lcd-endpoint",
-                endpoint.removesuffix("/query"),
-                "--json",
-                "trade",
-                *args,
-                "--wait",
-            )
+            result = invoke(cli, home, *trade_wait_args(endpoint, args))
             expected_exit = {"rejected": 4, "failed": 1}.get(case.outcome, 0)
             assert result.returncode == expected_exit, result
             assert result.stderr == b""
@@ -472,7 +505,7 @@ def test_trade_wait(
                 json.loads(request.body)
                 if request.body
                 else {"path": urlsplit(request.path).path}
-                for request in requests
+                for request in requests[preflight:]
             ]
             if case.kind == "CANCEL_PENDING_TRADE":
                 assert wire[0]["query"] == keeper.ROUTE
@@ -484,7 +517,10 @@ def test_trade_wait(
                 assert requests[2].path == NODE_INFO
                 assert requests[3].path.startswith(SMART_QUERY)
             else:
-                assert all(request.body for request in requests)
+                if preflight:
+                    assert requests[2].path == NODE_INFO
+                    assert requests[3].path.startswith(SMART_QUERY)
+                assert all(request.body for request in requests[preflight:])
             assert (
                 sum(item.get("query", "").startswith("mutation") for item in wire) == 1
             )
@@ -556,11 +592,7 @@ def test_trade_cancel_refuses_a_filled_target_before_mutation(
         assert wire == {"query": keeper.ROUTE, "variables": {}}
         return response({"data": {"oneClickTrading": ROUTE}})
 
-    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
-        endpoint,
-        replies,
-        requests,
-    ):
+    with replay(get=target_lcd) as (endpoint, replies, requests):
         for index, cli in enumerate(wait_cli_pair):
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
@@ -600,24 +632,21 @@ def test_trade_wait_dry_run(
     args: tuple[str, ...],
 ) -> None:
     update = args in UPDATES
-    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
-        endpoint,
-        replies,
-        requests,
-    ):
+    with replay(get=target_lcd) as (endpoint, replies, requests):
         for index, cli in enumerate(trade_wait_pair(request, args)):
             home = tmp_path / str(index) / "sai"
-            if update:
+            if update or index == 1:
                 connect(home, endpoint, monkeypatch)
             else:
                 home.mkdir(parents=True)
-            requests.clear()
             documents = []
-            counts = []
             for wait in ((), ("--wait",)):
-                if update:
+                requests.clear()
+                preflight = (
                     queue_update_preflight(replies)
-                start = len(requests)
+                    if update
+                    else close_preflight(replies, rust=index == 1)
+                )
                 result = invoke(
                     cli,
                     home,
@@ -636,15 +665,14 @@ def test_trade_wait_dry_run(
                 document = json.loads(result.stdout)
                 assert document["dryRun"] is True
                 assert "receipt" not in document
+                assert len(requests) == preflight
+                assert not replies
+                assert all(
+                    not request.body
+                    or not json.loads(request.body)["query"].startswith("mutation")
+                    for request in requests
+                )
                 documents.append(document)
-                counts.append(len(requests) - start)
-            assert counts[0] == counts[1]
-            assert all(
-                not request.body
-                or not json.loads(request.body)["query"].startswith("mutation")
-                for request in requests
-            )
-            assert not replies
             assert not (home / "trader/intents.sqlite3").exists()
             assert documents[0] == documents[1]
 
@@ -658,11 +686,7 @@ def test_position_update_submits_same_request_with_wait(
 ) -> None:
     kind = "UPDATE_TRADE"
     change = "tpsl_updated" if args == TPSL else "leverage_updated"
-    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
-        endpoint,
-        replies,
-        requests,
-    ):
+    with replay(get=target_lcd) as (endpoint, replies, requests):
 
         def dispatch(cli: CLI, home: Path, wait_flag: tuple[str, ...]) -> Any:
             connect(home, endpoint, monkeypatch)
@@ -778,38 +802,27 @@ def test_trade_wait_interrupt_retains_reservation(
     documents = []
     update = args in UPDATES
     kind = "UPDATE_TRADE" if update else "CLOSE_POSITION"
-    preflight_reads = 4 if update else 0
     acknowledged = phase in ("accepted", "pending")
     status = phase if acknowledged else "unknown"
     ledger_status = ("unknown", "pending") if phase == "pending" else (status, None)
-    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
-        endpoint,
-        replies,
-        requests,
-    ):
+    with replay(get=target_lcd) as (endpoint, replies, requests):
         for index, cli in enumerate(trade_wait_pair(request, args)):
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
             requests.clear()
-            if update:
+            preflight_reads = (
                 queue_update_preflight(replies)
-            command = (
-                "--endpoint",
-                endpoint,
-                "--lcd-endpoint",
-                endpoint.removesuffix("/query"),
-                "--json",
-                "trade",
-                *args,
-                "--wait",
+                if update
+                else close_preflight(replies, rust=index == 1)
             )
+            command = trade_wait_args(endpoint, args)
             # A zero-length body completes as soon as the headers arrive.
             delayed = Reply(body=b"{}", body_delay=4.0)
             if acknowledged:
                 replies.extend(
                     (
                         lambda request: accepted(submitted_key(request, kind), kind),
-                        lambda _: response(
+                        lambda _, preflight_reads=preflight_reads: response(
                             intent(
                                 "pending_exec" if phase == "pending" else "accepted",
                                 kind=kind,
@@ -856,12 +869,15 @@ def test_trade_wait_interrupt_retains_reservation(
             assert ledger_state(home) == [(key, *ledger_status)]
             for poll in requests[preflight_reads + 1 :]:
                 assert json.loads(poll.body)["variables"]["key"] == key
-            if update:
+            retry_preflight = (
                 queue_update_preflight(replies)
+                if update
+                else close_preflight(replies, rust=index == 1)
+            )
             again = invoke(cli, home, *command)
             assert again.returncode == 1, again
             assert json.loads(again.stdout)["error"]["intentKey"] == key
-            assert len(requests) == expected_requests + preflight_reads
+            assert len(requests) == expected_requests + retry_preflight
             assert ledger_state(home) == [(key, *ledger_status)]
             assert not replies
             documents.append(normalized(document, key))
@@ -981,7 +997,7 @@ def test_position_trade_wait_times_out(
             pending = []
             for index, cli in enumerate(position_wait_cli_pair):
                 endpoint, replies, requests = servers.enter_context(
-                    replay(get=lambda request: cancel_lcd(request, trade_type="trade"))
+                    replay(get=target_lcd)
                 )
                 home = tmp_path / args[0] / str(index) / "sai"
                 connect(home, endpoint, monkeypatch)
@@ -1002,36 +1018,17 @@ def test_trade_wait_recovers_when_stdout_closes(
 ) -> None:
     documents = []
     kind = "CLOSE_POSITION"
-    with replay() as (endpoint, replies, requests):
+    with replay(get=target_lcd) as (endpoint, replies, requests):
         for index, cli in enumerate(wait_cli_pair):
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
             requests.clear()
-            replies.extend(
-                (
-                    lambda request: accepted(submitted_key(request, kind), kind),
-                    lambda _: response(
-                        intent(
-                            "filled",
-                            kind=kind,
-                            intentKey=submitted_key(requests[0], kind),
-                        )
-                    ),
-                    lambda _: response(
-                        history(
-                            indexed(
-                                "position_closed_user",
-                                intentKey=submitted_key(requests[0], kind),
-                            )
-                        )
-                    ),
-                )
-            )
+            preflight = filled_close(replies, requests, rust=index == 1)
             read, write = os.pipe()
             os.close(read)
             try:
                 result = subprocess.run(
-                    [*cli, "--endpoint", endpoint, "--json", "trade", *CLOSE, "--wait"],
+                    [*cli, *trade_wait_args(endpoint, CLOSE)],
                     env=cli_environment(home),
                     cwd=home.parent,
                     stdout=write,
@@ -1048,8 +1045,8 @@ def test_trade_wait_recovers_when_stdout_closes(
                 assert b"BrokenPipeError" in flush_error
             else:
                 assert result.returncode == 1, result
-            assert len(requests) == 3
-            key = submitted_key(requests[0], kind)
+            assert len(requests) == preflight + 3
+            key = submitted_key(requests[preflight], kind)
             document = json.loads(stderr)
             assert document["intentKey"] == key
             assert document["localStatus"] == document["outcome"] == "terminal"
@@ -1072,42 +1069,38 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
     change = {TPSL: "tpsl_updated", LEVERAGE: "leverage_updated"}.get(
         args, "position_closed_user"
     )
-    preflight_reads = 4 if update else 0
-    with replay(get=lambda request: cancel_lcd(request, trade_type="trade")) as (
-        endpoint,
-        replies,
-        requests,
-    ):
+    with replay(get=target_lcd) as (endpoint, replies, requests):
         for index, cli in enumerate(trade_wait_pair(request, args)):
             home = tmp_path / str(index) / "sai"
             connect(home, endpoint, monkeypatch)
             requests.clear()
             if update:
-                queue_update_preflight(replies)
+                preflight_reads = queue_update_preflight(replies)
 
-            def index_receipt(_: Request) -> Reply:
-                key = submitted_key(requests[preflight_reads], kind)
-                row = (
-                    indexed_update(change, key, args)
-                    if update
-                    else indexed(change, intentKey=key)
-                )
-                return response(history(row))
+                def index_receipt(
+                    _: Request, preflight_reads: int = preflight_reads
+                ) -> Reply:
+                    key = submitted_key(requests[preflight_reads], kind)
+                    return response(history(indexed_update(change, key, args)))
 
-            replies.extend(
-                (
-                    lambda request: accepted(submitted_key(request, kind), kind),
-                    lambda _: response(
-                        intent(
-                            "filled",
-                            kind=kind,
-                            intentKey=submitted_key(requests[preflight_reads], kind),
-                            body=UPDATES.get(args, {}),
-                        )
-                    ),
-                    index_receipt,
+                replies.extend(
+                    (
+                        lambda request: accepted(submitted_key(request, kind), kind),
+                        lambda _, preflight_reads=preflight_reads: response(
+                            intent(
+                                "filled",
+                                kind=kind,
+                                intentKey=submitted_key(
+                                    requests[preflight_reads], kind
+                                ),
+                                body=UPDATES[args],
+                            )
+                        ),
+                        index_receipt,
+                    )
                 )
-            )
+            else:
+                preflight_reads = filled_close(replies, requests, rust=index == 1)
             read_fd, write_fd = os.pipe()
             os.set_blocking(write_fd, False)
             try:
@@ -1117,17 +1110,7 @@ def test_trade_wait_interrupts_a_full_stdout_pipe(
                 os.set_blocking(write_fd, True)
             try:
                 with subprocess.Popen(
-                    [
-                        *cli,
-                        "--endpoint",
-                        endpoint,
-                        "--lcd-endpoint",
-                        endpoint.removesuffix("/query"),
-                        "--json",
-                        "trade",
-                        *args,
-                        "--wait",
-                    ],
+                    [*cli, *trade_wait_args(endpoint, args)],
                     env=cli_environment(home),
                     cwd=home.parent,
                     stdout=write_fd,
