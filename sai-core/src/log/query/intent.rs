@@ -382,11 +382,10 @@ pub async fn intent(
             .map(|(account, _)| account.clone())
             .or(addr)
             .or_else(|| {
-                Storage::new(home)
-                    .load_session(None)
-                    .ok()
-                    .filter(|session| session.endpoint() == Some(endpoint))
-                    .map(|session| session.addr().to_ascii_lowercase())
+                let accounts = Storage::new(home).load_accounts().ok()?;
+                let (key, session) = accounts.selected(None)?;
+                let addr = session.checked_address(key).ok()?;
+                (session.endpoint() == Some(endpoint)).then(|| addr.to_ascii_lowercase())
             });
         if let Some(account) = account.filter(|_| !ambiguous) {
             match lookup(endpoint, key, &account).await {

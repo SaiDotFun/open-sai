@@ -60,12 +60,23 @@ pub async fn read(
                     .iter()
                     .map(|(session, _)| session.token().to_owned()),
             );
-            let (addr, stored) = match addr {
-                Some(addr) => (addr, accounts.selected(Some(addr))),
+            let (addr, section) = match addr {
+                Some(addr) => {
+                    let section = match accounts.selected(Some(addr)) {
+                        Some((key, stored)) if stored.checked_address(key).is_err() => {
+                            failed(incomplete("Stored session has an invalid address"))
+                        }
+                        selected => session_section(
+                            selected.map(|(_, stored)| stored),
+                            settings.endpoint(),
+                            &storage,
+                        ),
+                    };
+                    (addr, section)
+                }
                 None => {
-                    let (key, active, _) = accounts
-                        .entries()
-                        .find(|(_, _, active)| *active)
+                    let (key, active) = accounts
+                        .selected(None)
                         .ok_or_else(|| unavailable("No active Sai account"))?;
                     if active.endpoint() != Some(settings.endpoint()) {
                         return Err(unavailable(
@@ -75,13 +86,13 @@ pub async fn read(
                     let addr = active
                         .checked_address(key)
                         .map_err(|_| unavailable("Stored session has an invalid address"))?;
-                    (addr, Some(active))
+                    (
+                        addr,
+                        session_section(Some(active), settings.endpoint(), &storage),
+                    )
                 }
             };
-            (
-                addr.to_owned(),
-                session_section(stored, settings.endpoint(), &storage),
-            )
+            (addr.to_owned(), section)
         }
         Err(error) => {
             let addr = addr.ok_or_else(|| unavailable(&error.to_string()))?;

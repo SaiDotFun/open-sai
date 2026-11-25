@@ -1087,6 +1087,56 @@ def write_intent_trail(home: Path, endpoints: Endpoints, count: int) -> dict[str
     return row
 
 
+@pytest.mark.parametrize(
+    "embedded_address", [PRIVATE_URL, OTHER_ADDRESS], ids=["malformed", "wrong-account"]
+)
+def test_logs_intent_rejects_invalid_active_identity(
+    native: Path, tmp_path: Path, embedded_address: str
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints) as stdio,
+    ):
+        write_seed(
+            home,
+            endpoints,
+            [session_fixture(endpoints, "session")],
+            embedded_address=embedded_address,
+        )
+        text = tool_text(stdio.call(2, "logs_intent", key=INTENT))
+        assert not endpoints.wire, "an invalid active identity reached Keeper"
+        assert embedded_address not in text
+        assert json.loads(text)["keeperError"]["code"] == "INVALID_REQUEST"
+        explicit = json.loads(
+            tool_text(stdio.call(3, "logs_intent", key=INTENT, addr=ADDRESS))
+        )
+        assert explicit["keeper"]["evmAddress"] == ADDRESS
+        assert [request.label for request in endpoints.wire] == ["userIntents"]
+
+
+def test_overview_rejects_mismatched_session_metadata(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    with (
+        loopback("overview-full") as endpoints,
+        server(native, home, endpoints, receive_timeout=20) as stdio,
+    ):
+        write_seed(
+            home,
+            endpoints,
+            [session_fixture(endpoints, "expired")],
+            embedded_address=OTHER_ADDRESS,
+        )
+        result = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        assert result["addr"] == ADDRESS
+        assert result["positions"]["data"]["items"]
+        assert result["session"]["error"]["code"] == "INCOMPLETE_DATA"
+        assert "data" not in result["session"]
+        assert not endpoints.errors
+
+
 def test_logs_intent_v013_cursor_after_upgrade(
     native: Path, python_v013: Path, tmp_path: Path
 ) -> None:

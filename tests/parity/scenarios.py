@@ -112,6 +112,10 @@ if malformed_expiry := data["malformed_expiry"]:
     else:
         session["expiresAt"] = 123
     storage._save_accounts(accounts)
+if embedded_address := data["embedded_address"]:
+    accounts = storage.load_accounts()
+    accounts["sessions"][data["address"]]["evmAddress"] = embedded_address
+    storage._save_accounts(accounts)
 if data["ledger"]:
     if data.get("accepted_blockers"):
         for key, kind, entity in (
@@ -379,6 +383,7 @@ def write_seed(
     accepted_blockers: bool = False,
     disable_logs: bool = False,
     malformed_expiry: str | None = None,
+    embedded_address: str | None = None,
 ) -> None:
     env = child_env(home, endpoints)
     if disable_logs:
@@ -389,6 +394,7 @@ def write_seed(
             {
                 "sessions": sessions,
                 "malformed_expiry": malformed_expiry,
+                "embedded_address": embedded_address,
                 "ledger": ledger,
                 "accepted_blockers": accepted_blockers,
                 "key": INTENT,
