@@ -176,6 +176,25 @@ reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
 
+## Installer and Python Bridge Cases
+
+Run `uv run pytest tests/parity/test_installer_bridge.py`. The archive and
+ownership refusal cases run without build artifacts. Set the following paths
+to run the release replay:
+
+| Variable | Local artifact |
+| --- | --- |
+| `SAI_C10B_RUST` | Rust binary built for the runner with the same version as the shim. |
+| `SAI_C10B_SHIM` | Shim wheel or a directory containing it. Build it from PR #116 or its merged source. For loopback downloads, substitute the fixture release source from `tests/parity/native_release_source.py` before building. |
+| `SAI_C10B_BRIDGE` | Full Python wheel or a directory containing it. Build it from the branch under test at a lower version than the shim. |
+| `SAI_C10B_PRE_BRIDGE` | Directory with the Python wheel and `install.py` from the pinned pre-bridge commit `8557a7e13dceab0accc369191182c8e01423c91b`, and that commit SHA in a file named `commit`. |
+| `SAI_C10B_MUTANT` | A build of the same Rust source that fails `mcp serve` only when invoked from an installed standalone version directory or the persistent uv tool environment. |
+
+The fixture builder derives rehearsal versions from `pyproject.toml`. Both
+workflows build the wheels locally and run the compatibility checks with
+real uv launchers. Native MCP startup is an
+expected failure when a build from before PR #120 reports a missing command.
+
 ## Auth Argument Privacy Reference
 
 Set `SAI_PARITY_AUTH_PRIVACY_PYTHON` to the `.venv/bin/sai` from Python

@@ -1,0 +1,51 @@
+name: Installer Rehearsal (Linux)
+
+on:
+  pull_request:
+    paths:
+      - 'cli/sai_cli/core/**'
+      - 'sai/**'
+      - 'sai-core/**'
+      - 'shim/**'
+      - 'scripts/*bridge*.py'
+      - 'scripts/*installer*.py'
+      - 'pyproject.toml'
+      - 'scripts/check_release.py'
+      - 'scripts/install.py'
+      - 'tests/parity/test_installer_bridge.py'
+      - '.github/workflows/installer-linux.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  installer-replay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+      - name: Fetch pinned fixture sources
+        run: |
+          git fetch --depth=1 --no-tags origin \
+            8557a7e13dceab0accc369191182c8e01423c91b \
+            df224a3477c1151636cd2ac90fece7d38e4b4c07 \
+            b2aeb3be1d2660ec67e1ddc257c83224d68b9ac1 \
+            4bd968eb956c154f0a0ab53ccc288ceb78dd8713
+      - name: Build the release fixture artifacts
+        run: uv run --locked python scripts/build-installer-fixtures.py "$RUNNER_TEMP/sai-installer"
+      - name: Run the installer, recovery, and rollback replays
+        env:
+          SAI_C10B_REQUIRED: "1"
+          SAI_C10B_RUST: ${{ runner.temp }}/sai-installer/sai
+          SAI_C10B_RECOVERY_RUST: ${{ runner.temp }}/sai-installer/sai
+          SAI_C10B_MUTANT: ${{ runner.temp }}/sai-installer/sai-mutant
+          SAI_C10B_BRIDGE: ${{ runner.temp }}/sai-installer/bridge
+          SAI_C10B_SHIM: ${{ runner.temp }}/sai-installer/shim
+          SAI_C10B_PRE_BRIDGE: ${{ runner.temp }}/sai-installer/pre-bridge
+        run: uv run --locked pytest -q tests/parity/test_installer_bridge.py -k 'not windows'
