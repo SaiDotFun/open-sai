@@ -8,7 +8,7 @@ import json
 from decimal import Decimal
 from typing import Any
 
-from .preview import rejection_reason
+from .preview import close_oracle_time_unknown, rejection_reason
 
 
 def canonical_price(value: object) -> str:
@@ -64,6 +64,7 @@ def is_confirmable(preview: dict[str, Any]) -> bool:
 
 
 def with_digest(preview: dict[str, Any]) -> dict[str, Any]:
-    if rejection_reason(preview.get("estimates", {})) is not None:
+    values = preview.get("estimates", {})
+    if rejection_reason(values) is not None or close_oracle_time_unknown(values):
         return {key: value for key, value in preview.items() if key != "previewDigest"}
     return {**preview, "previewDigest": preview_digest(preview)}
