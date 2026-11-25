@@ -4,7 +4,6 @@
 "auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
 "auth renew" = "Compared with Python main in test_auth.py."
 "intent wait" = "Covered by the pinned, stateful replays in test_intent_wait.py."
-"mcp uninstall" = "Requires a client registration fixture."
 "logs intent" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
 "logs run" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
 "logs stats" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
@@ -97,6 +96,12 @@ wire = ["borrowings"]
 [[case]]
 name = "market-prices"
 args = ["--json","market","prices"]
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "market-prices-epoch-spellings"
+args = ["--json","market","prices"]
+server = "read-price-epoch-spellings"
 wire = ["tokenPricesUsd"]
 
 [[case]]
@@ -1214,6 +1219,91 @@ client_seed = "legacy-retired"
 state = { "clients/.claude.json#changed" = true, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false, "clients/argv.jsonl" = "<absent>" }
 
 [[case]]
+name = "mcp-uninstall-all"
+args = ["--json", "mcp", "uninstall", "--all"]
+client_seed = "current"
+state = { "clients/.claude.json#data.mcpServers.sai" = "<absent>", "clients/.codex/config.toml#data.settings.mcp_servers.sai" = "<absent>", "clients/.cursor/mcp.json#data.mcpServers.sai" = "<absent>", "clients/.claude.json#@mode" = 416, "clients/.codex/config.toml#@mode" = 416, "clients/.cursor/mcp.json#@mode" = 416 }
+
+[[case]]
+name = "mcp-uninstall-absent"
+args = ["--json", "mcp", "uninstall", "--all"]
+client_seed = "empty"
+state = { "clients/.claude.json" = "<absent>", "clients/.codex/config.toml" = "<absent>", "clients/.cursor/mcp.json" = "<absent>" }
+
+[[case]]
+name = "mcp-uninstall-legacy"
+args = ["--json", "mcp", "uninstall", "--all"]
+client_seed = "legacy"
+state = { "clients/.claude.json#changed" = true, "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true }
+
+[[case]]
+name = "mcp-uninstall-dry-run"
+args = ["--json", "mcp", "uninstall", "--all", "--dry-run"]
+client_seed = "uninstall-scopes"
+state = { "clients/.mcp.json#changed" = false, "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-local"
+args = ["--json", "mcp", "uninstall", "claude-code", "--scope", "local"]
+client_seed = "uninstall-scopes"
+state = { "clients/.claude.json#changed" = true, "clients/.claude.json#data.mcpServers.sai.args" = ["mcp", "serve"], "clients/.mcp.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-project"
+args = ["--json", "mcp", "uninstall", "claude", "--scope", "project"]
+client_seed = "uninstall-scopes"
+state = { "clients/.mcp.json#data.mcpServers.sai" = "<absent>", "clients/.claude.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-codex-project"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "project"]
+client_seed = "shadowed"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = false, "clients/.codex/project.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-codex-user-shadowed"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "shadowed"
+expect = 1
+state = { "clients/.codex/config.toml#data.settings.mcp_servers.sai" = "<absent>", "clients/.codex/project.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-codex-query-failure"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "uninstall-query-failure"
+accepted_divergence = "codex-uninstall-rollback"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = true, "clients/.codex/config.toml#data.settings.mcp_servers.sai" = "<absent>", "clients/.codex/config.toml#@mode" = 416 }
+
+[[case]]
+name = "mcp-uninstall-codex-crlf"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "uninstall-crlf"
+state = { "clients/.codex/config.toml#data.source" = "# Keep this comment\r\nmodel = \"before\"\r\n\r\n\r\n# Other server\r\n[mcp_servers.other-server]\r\nurl = \"https://fixture.invalid/mcp\"\r\n\r\n[profiles.demo]\r\nmodel =    \"after\"\r\n", "clients/.codex/config.toml#@mode" = 416 }
+
+[[case]]
+name = "mcp-uninstall-codex-read-only"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "uninstall-codex-read-only"
+accepted_divergence = "uninstall-read-only"
+state = { "clients/.codex/config.toml#@mode" = 292, "clients/.codex/config.toml#data.settings.mcp_servers.other-server.url" = "https://fixture.invalid/mcp" }
+
+[[case]]
+name = "mcp-uninstall-cursor-read-only"
+args = ["--json", "mcp", "uninstall", "cursor", "--scope", "user"]
+client_seed = "uninstall-cursor-read-only"
+accepted_divergence = "uninstall-read-only"
+state = { "clients/.cursor/mcp.json#@mode" = 292, "clients/.cursor/mcp.json#data.mcpServers.other-server.url" = "https://fixture.invalid/mcp" }
+
+[[case]]
+name = "mcp-uninstall-no-client"
+args = ["--json", "mcp", "uninstall"]
+client_seed = "current"
+expect = 2
+state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
+
+[[case]]
 name = "mcp-tool-inventory"
 args = ["mcp","serve"]
 mode = "mcp"
@@ -1354,18 +1444,649 @@ wire = [
     "get_pair_custom_max_leverage", "get_fees", "quote_trade", "get_exchange_balance",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market"] }
 
 [[case]]
 name = "trade-partial-close"
 args = ["--json","trade","partial-close","7","--percent","50","--dry-run"]
 seed = "session"
+server = "partial-preview"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market",
-    "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
-    "is_after_hours_market", "get_market", "get_fees",
+    "get_collateral_price", "get_trade_raw", "get_perp_prices", "market_order_config",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
+
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price"] }
+output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212" }
+
+# C7b position cases use the Python ownership and confirmation contracts from PRs 148 and 150.
+[[case]]
+name = "trade-margin-foreign-trader"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1", "--dry-run"]
+seed = "session"
+server = "position-foreign-trader"
+expect = 1
+wire = ["oneClickTrading", "node_info", "trade"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Keeper position belongs to a different account" }
+rust = { wire = ["oneClickTrading", "trade"] }
+
+[[case]]
+name = "trade-margin-foreign-trader-submit"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "position-foreign-trader"
+expect = 1
+wire = ["oneClickTrading", "node_info", "trade"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Keeper position belongs to a different account" }
+rust = { wire = ["oneClickTrading", "trade"] }
+
+[[case]]
+name = "trade-margin-wrong-index"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "position-wrong-index"
+expect = 1
+wire = ["oneClickTrading", "node_info", "trade"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Keeper returned a different position index" }
+rust = { wire = ["oneClickTrading", "trade"] }
+
+[[case]]
+name = "trade-margin-foreign-contract-owner"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "position-foreign-contract-owner"
+expect = 1
+wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Contract position belongs to a different account" }
+
+[[case]]
+name = "trade-margin-wrong-contract-index"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "position-wrong-contract-index"
+expect = 4
+wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH", "error.message" = "Position changed. Review the margin change again." }
+
+[[case]]
+name = "trade-margin-equivalent-owner"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "position-equivalent-owner"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote.requestedLeverage" = "1.818181818181818182", "txHash" = "<absent>" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "recordUserIntent",
+]
+
+[[case]]
+name = "trade-margin-invalid-direction"
+args = ["--json", "trade", "margin", "7", "--direction", "up", "--amount", "1"]
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.message" = "Invalid value for '--direction': 'up' is not one of 'add', 'remove'." }
+
+[[case]]
+name = "trade-margin-amount-required"
+args = ["--json", "trade", "margin", "7", "--direction", "add"]
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.message" = "Missing option '--amount'." }
+
+[[case]]
+name = "trade-partial-close-invalid-percent"
+args = ["--json", "trade", "partial-close", "7", "--percent", "100"]
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.message" = "Invalid value for '--percent': 100 is not in the range 1<=x<=99." }
+
+[[case]]
+name = "trade-partial-close-malformed-percent"
+args = ["--json", "trade", "partial-close", "7", "--percent", "5__0", "--dry-run"]
+seed = "session"
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer." }
+accepted_difference = "Python PR #194 changed the invalid percent diagnostic."
+rust = { output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '5__0' is not a valid integer range." } }
+
+[[case]]
+name = "trade-partial-close-unicode-percent"
+args = ["--json", "trade", "partial-close", "7", "--percent", "٥_٠", "--dry-run"]
+seed = "session"
+server = "position-default"
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--percent': '٥_٠' is not a valid integer." }
+accepted_difference = "Python PR #194 rejects non-ASCII percent digits. Rust accepts the pinned Python syntax."
+
+[case.rust]
+expect = 0
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+]
+output = { "quote.percent" = 50 }
+
+[[case]]
+name = "trade-partial-close-invalid-id"
+args = ["--json", "trade", "partial-close", "invalid", "--percent", "50"]
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.message" = "Invalid value for 'TRADE_ID': 'invalid' is not a valid integer." }
+
+[[case]]
+name = "trade-margin-add-rounding"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1.000001", "--lcd-endpoint", "{http}", "--dry-run"]
+seed = "session"
+server = "position-precision"
+unset = ["SAI_LCD_ENDPOINT"]
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_group", "get_pair_custom_max_leverage", "get_fees",
+]
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market"] }
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "quote.requestedLeverage" = "1.930415139893933113", "quote.actualDeltaUsdc" = "1000000" }
+
+[[case]]
+name = "trade-margin-remove-rounding"
+args = ["--json", "trade", "margin", "7", "--direction", "remove", "--amount", "1.000001", "--dry-run"]
+seed = "session"
+server = "position-precision"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_group", "get_pair_custom_max_leverage", "get_fees",
+]
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market"] }
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "quote.requestedLeverage" = "2.359396615744510258", "quote.actualDeltaUsdc" = "1000001" }
+
+[[case]]
+name = "trade-margin-after-hours"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1", "--dry-run"]
+seed = "session"
+server = "position-after-hours"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_market", "get_trade_infos", "get_after_hours_leverage",
+]
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage"] }
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.actualDeltaUsdc" = "999999", "quote.marginChangeIsEstimate" = true, "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
+
+[[case]]
+name = "trade-margin-signed-out-before-amount"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "invalid", "--dry-run"]
+seed = "empty"
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--amount': 'invalid' is not a valid decimal." }
+accepted_difference = "Python PR #194 validates the amount before loading the session. Rust checks the session first."
+rust = { expect = 6, output = { "error.code" = "SIGNED_OUT" } }
+
+[[case]]
+name = "trade-margin-chain-before-amount"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "invalid", "--dry-run"]
+seed = "session"
+server = "position-wrong-chain"
+expect = 2
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Invalid value for '--amount': 'invalid' is not a valid decimal." }
+accepted_difference = "Python PR #194 validates the amount before reading the route. Rust checks the chain first."
+rust = { expect = 1, wire = ["oneClickTrading", "trade", "node_info"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Keeper trading route and LCD network do not match" } }
+
+[[case]]
+name = "trade-margin-recheck-height"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "position-wrong-height"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH" }
+
+[[case]]
+name = "trade-margin-accepted"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "margin-accepted"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote.requestedLeverage" = "1.818181818181818182", "txHash" = "<absent>" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "recordUserIntent",
+]
+
+[[case]]
+name = "trade-margin-rejected"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "margin-rejected"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "rejected", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+output = { "error.code" = "ADMISSION_REJECTED" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "recordUserIntent",
+]
+
+[[case]]
+name = "trade-margin-unknown-blocks-retry"
+args = ["--json", "trade", "margin", "7", "--direction", "add", "--amount", "1"]
+seed = "session"
+server = "margin-unknown"
+expect = 5
+retry_expect = 1
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_group", "get_pair_custom_max_leverage", "get_fees",
+    "recordUserIntent", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_group", "get_pair_custom_max_leverage", "get_fees",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "UPDATE_TRADE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<intentKey 1>", "retry.error.code" = "INVALID_REQUEST", "retry.error.intentKey" = "<intentKey 1>" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_trade_raw",
+    "is_after_hours_market", "recordUserIntent", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_trade_raw", "is_after_hours_market",
+]
+
+[[case]]
+name = "trade-partial-close-scientific-reduction"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--dry-run"]
+seed = "session"
+server = "position-scientific-reduction"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "intent.body.collateral.amountUsdc" = "50000000000000000000000000000" }
+
+accepted_difference = "Python uses Perp's integer sizing rules from PR #167. Rust still follows the pinned Python reference."
+
+[case.rust]
+expect = 1
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings",
+]
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "invalid literal for int() with base 10: '5.0000000000000000000000000E+28'" }
+
+[[case]]
+name = "trade-partial-close-rounding"
+args = ["--json", "trade", "partial-close", "7", "--percent", "33", "--dry-run"]
+seed = "session"
+server = "position-precision"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "intent.body.collateral.amountUsdc" = "3300000", "quote.closedNotionalUsdc" = "7.007407", "quote.closedNotionalUsd" = "6.920895" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+]
+
+[[case]]
+name = "trade-partial-close-after-hours"
+args = ["--json", "trade", "partial-close", "7", "--percent", "33", "--dry-run"]
+seed = "session"
+server = "position-after-hours"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos",
+    "get_after_hours_leverage", "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.closedNotionalUsdc" = "4.074074", "quote.closedNotionalUsd" = "4.023776" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_market", "get_trade_infos",
+    "get_after_hours_leverage", "get_collateral_price",
+]
+
+[[case]]
+name = "trade-partial-close-no-oracle"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--dry-run"]
+seed = "session"
+server = "position-no-oracle"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "quote.closedNotionalIsEstimate" = true }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+]
+
+[[case]]
+name = "trade-partial-close-index-lag-before-minimum"
+args = ["--json", "trade", "partial-close", "7", "--percent", "99", "--dry-run"]
+seed = "session"
+server = "position-index-lag"
+expect = 1
+wire = ["oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw", "trade", "get_trade_raw", "trade", "get_trade_raw"]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state. Retry after Keeper synchronizes. No intent was submitted." }
+accepted_difference = "Python retries stale Keeper index reads. Rust refuses the stale snapshot immediately."
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance"], output = { "error.code" = "INVALID_REQUEST", "error.message" = "Indexed position differs from contract state; wait for synchronization and retry" } }
+
+[[case]]
+name = "trade-partial-close-market-minimum"
+args = ["--json", "trade", "partial-close", "7", "--percent", "99", "--dry-run"]
+seed = "session"
+server = "position-default"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "intent.body.collateral.amountUsdc" = "9900000" }
+
+accepted_difference = "Python uses Perp's integer sizing rules from PR #167. Rust still follows the pinned Python reference."
+
+[case.rust]
+expect = 1
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings",
+]
+output = { "error.message" = "Reduction is too small or leaves less than the market minimum" }
+
+[[case]]
+name = "trade-partial-close-live-leverage-change"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50"]
+seed = "session"
+server = "partial-preview-changed"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
+    "get_trade_raw", "is_after_hours_market", "get_perp_prices",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.message" = "Position changed; review the reduction again" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+]
+
+[[case]]
+name = "trade-partial-close-confirm-current-route"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "partial-accepted"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted" }
+output = { "status" = "accepted" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price", "recordUserIntent",
+]
+
+[[case]]
+name = "trade-partial-close-refuse-stale-chain"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "position-chain-changed"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price",
+]
+
+[[case]]
+name = "trade-partial-close-refuse-stale-contract"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "position-contract-changed"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "The trade no longer matches the confirmed preview. Run with --dry-run to review a new preview before submitting." }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price",
+]
+
+[[case]]
+name = "trade-partial-close-refuse-wrong-lcd-on-confirm"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212"]
+seed = "session"
+server = "position-wrong-chain"
+expect = 4
+wire = [
+    "oneClickTrading", "node_info", "oneClickTrading", "node_info",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "error.message" = "Keeper trading route and LCD network do not match. Use an LCD on Keeper's chain and request a new preview." }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "oneClickTrading", "trade", "node_info"] }
+rust_early_position_reads = 2
+
+[[case]]
+name = "trade-partial-close-accepted"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50"]
+seed = "session"
+server = "partial-accepted"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "DECREASE_POSITION_SIZE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote" = "<absent>", "txHash" = "<absent>" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price", "recordUserIntent",
+]
+
+[[case]]
+name = "trade-partial-close-unknown-blocks-retry"
+args = ["--json", "trade", "partial-close", "7", "--percent", "50"]
+seed = "session"
+server = "partial-unknown"
+expect = 5
+retry_expect = 1
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent", "oneClickTrading", "node_info", "trade",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market",
+    "get_collateral_price", "oneClickTrading", "node_info", "trade", "borrowing",
+    "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
+    "get_trade_raw", "is_after_hours_market", "get_perp_prices",
+]
+state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "unknown", "trader/intents.sqlite3#tables.intents.rows.0.kind" = "DECREASE_POSITION_SIZE", "trader/intents.sqlite3#tables.intents.rows.0.entity" = "7", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
+output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<intentKey 1>", "retry.error.code" = "INVALID_REQUEST", "retry.error.intentKey" = "<intentKey 1>" }
+
+[case.rust]
+wire = [
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_collateral_price", "recordUserIntent", "oneClickTrading", "trade", "node_info",
+    "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market",
+    "get_collateral_price", "oneClickTrading", "trade", "node_info", "borrowing",
+    "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+]
+
+[[case]]
+name = "trade-margin-mcp-preview"
+args = ["mcp", "serve"]
+mode = "mcp"
+mcp_calls = [
+    { name = "preview_margin", arguments = { trade_id = 7, direction = "add", amount = "1" } },
+]
+seed = "session"
+server = "position-after-hours"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos", "get_after_hours_leverage",
+    "get_trade_raw", "get_market", "market_order_config", "get_perp_prices", "is_after_hours_market",
+    "get_market", "get_trade_infos", "get_after_hours_leverage",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "1.result.content.0.text.previewDigest" = "6b4bcdb1cd79c56ff6f90e944a90c3c890f9fadd51569eb2b9875acd100824d4" }
+
+[[case]]
+name = "trade-partial-close-mcp-changed-leverage"
+args = ["mcp", "serve"]
+mode = "mcp"
+mcp_calls = [
+    { name = "preview_partial_close", arguments = { trade_id = 7, percent = 50 } },
+    { name = "trade_partial_close", arguments = { trade_id = 7, percent = 50, preview_digest = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212" } },
+]
+seed = "session"
+server = "partial-preview-changed"
+wire = [
+    "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "node_info", "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "oneClickTrading", "node_info",
+    "trade", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market", "get_perp_prices",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+output = { "1.result.content.0.text.previewDigest" = "fc78193a03ed172d039c5d4921de5ce92b9386c50bd0858e51c305909e3f1212", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "9d1e0a934de703d77be13e9a3fe7f2586b7db77c848e7bac3af1858810d50fe7" }
 
 [[case]]
 name = "trade-concurrent-close"
@@ -1374,11 +2095,9 @@ seed = "session"
 server = "concurrent-close"
 wire = [
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
     "recordUserIntent",
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }

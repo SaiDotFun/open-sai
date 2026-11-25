@@ -5,6 +5,7 @@ mod cancel;
 mod confirmation;
 mod estimates;
 mod position;
+mod position_change;
 mod update;
 
 use std::future::{Future, pending};
@@ -24,6 +25,9 @@ use crate::{
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
 pub use estimates::PreviewMode;
+pub use position_change::{
+    MarginDirection, PositionAction, PositionMode, parse_partial_close_percent,
+};
 pub use update::{leverage_preview, tpsl_preview};
 
 #[derive(Clone, Debug, Serialize)]
@@ -63,6 +67,7 @@ pub struct TradePreview {
     position_route: Option<position::PositionRoute>,
     position_owner_verified: Option<bool>,
     estimates: Option<Value>,
+    margin_change: bool,
 }
 
 impl TradePreview {
@@ -75,6 +80,7 @@ impl TradePreview {
             position_route: None,
             position_owner_verified: None,
             estimates: None,
+            margin_change: false,
         }
     }
 

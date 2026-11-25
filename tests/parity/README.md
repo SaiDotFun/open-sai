@@ -26,9 +26,11 @@ namespace-dependent candidate tests with
 loopback prerequisites.
 
 The default run compares Python with Python. Set `SAI_PARITY_BIN` to an
-executable path or a command on `PATH` to compare a port. Arguments belong in
-`cases.toml`. The runner prints a Markdown report to stdout and exits 1 if
-any selected case differs or fails its expectations.
+executable path or a command on `PATH` to compare a port. Set
+`SAI_PARITY_PYTHON` to the `sai` executable installed from a pinned Python
+checkout to override the reference. Arguments belong in `cases.toml`. The
+runner prints a Markdown report to stdout and exits 1 if any selected case
+differs or fails its expectations.
 
 The intent wait and trade `--wait` replays use Python commit
 `bdc11da6c9938aa0371835d921f27d45daa77c36`, the main merge of PR #70. Set the
@@ -52,6 +54,8 @@ uv run pytest tests/parity/test_intent_wait.py tests/parity/test_trade_wait.py
 `PASS` means the selected invocation or MCP tool call matched. `LISTED`
 means the MCP tool's schema and metadata matched in `tools/list`.
 `DEFERRED` marks a CLI command awaiting a fixture or a native implementation.
+`ACCEPTED` means each implementation met its recorded expectations for an
+intentional difference.
 
 ## Auth Security Parity
 
@@ -134,6 +138,10 @@ Each `[[case]]` table has a unique `name` and a list of CLI arguments in
   form `file#object.key.0.field`, with zero-based list indexes. Use
   `file#@mode` to assert a mode, or `"<absent>"` to assert that a file or
   field is missing.
+- The `output` table pins normalized stdout fields using dotted paths.
+  `mcp_calls` sends specific tool calls after initialization. If a case sets
+  `retry_expect`, the runner invokes the same command again in the same
+  home and checks both outputs under `first` and `retry`.
 - Keep the coverage inventory current. The runner checks that each leaf
   command in Python's Click command tree has a case or a `[deferred]` entry.
   The MCP table comes from the actual stdio `tools/list` response.
@@ -155,6 +163,29 @@ contains one `unknown` row tied to the actual request before releasing the
 reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
+
+## Position Trade Reference
+
+The margin and partial-close cases use Python commit
+`275df9c60af376ba7d884863fb00b011cd07ae02`, including the ownership check
+from [PR 148](https://github.com/SaiDotFun/open-sai/pull/148) and route
+binding from [PR 150](https://github.com/SaiDotFun/open-sai/pull/150).
+The cases compare canonical ownership, the requested index, quote decimals,
+and preview digests. Rust checks the Keeper trader and index before contacting
+the LCD. Foreign-owner and stale-digest cases require zero reservations and
+submissions.
+
+The standalone runner projects out Python-only estimates when comparing to
+Rust. It checks Python's estimate reads and Rust's quote reads separately.
+The stale-index case records Python's retries and Rust's immediate refusal.
+The wrong-chain cases account for the indexed reads Rust logs before the LCD
+network check. They still compare the rest of each log.
+
+```sh
+SAI_PARITY_PYTHON=/path/to/pinned/.venv/bin/sai \
+  SAI_PARITY_BIN=/path/to/rust/sai \
+  uv run python tests/parity/parity.py --case 'trade-margin*' --case 'trade-partial-close*'
+```
 
 ## Installer and Python Bridge Cases
 
@@ -347,6 +378,11 @@ the raw logs for the fixture path. It allows the existing difference in
 the Keeper probe event, where Python includes `command` and `commandId`
 and Rust omits both fields.
 
+The `mcp-uninstall-*` cases use the Python `sai-cli/v0.1.2` reference at
+`8557a7e13dceab0accc369191182c8e01423c91b`. Point `SAI_MCP_UNINSTALL_PYTHON`
+at that checkout's `.venv/bin/sai` and run the driver with
+`--case 'mcp-uninstall-*'`.
+
 The `client_seed` key supplies private Claude Code, Codex, and Cursor
 configs. The runner uses fixture programs for client subprocesses and
 compares their arguments, file modes, config values, Codex comments, and
@@ -357,6 +393,16 @@ In `doctor-mcp-verification-failure`, Rust restores the Codex config when
 verification rejects the repaired entry. The case checks that Rust keeps the
 original bytes and mode. The pinned Python reference leaves the replacement
 on disk.
+
+In `mcp-uninstall-codex-query-failure`, both CLIs report the failed Codex
+query. Rust restores the original configuration bytes and mode, so the
+result reports no change or reconnect. The Python reference leaves the
+entry deleted.
+
+The `mcp-uninstall-*-read-only` cases use mode-0444 Codex and Cursor files
+in writable directories. Python replaces the file with the Sai entry removed
+and preserves its mode. Rust returns `INTERNAL_ERROR` and leaves the bytes and
+mode intact. The cases also check that the unrelated server remains.
 
 The `lcd-origin-only` cases project the LCD endpoint in Python's report to
 its origin before comparing it with Rust. The byte-comparison cases use

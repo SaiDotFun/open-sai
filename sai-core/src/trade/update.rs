@@ -80,7 +80,8 @@ pub(super) struct PositionUpdate {
 
 impl TradePreview {
     pub fn is_standalone_position_update(&self) -> bool {
-        self.intent.kind == "UPDATE_TRADE"
+        // Margin has already quoted and rechecked its own position.
+        self.intent.kind == "UPDATE_TRADE" && !self.margin_change
     }
 
     fn update_id(&self) -> Result<Value, SaiError> {

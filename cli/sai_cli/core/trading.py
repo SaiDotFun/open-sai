@@ -62,9 +62,16 @@ class ExecutionRejected(SaiError, ValueError):
 
 
 def _reject_execution(
-    preview: dict[str, Any], values: dict[str, Any], addr: str
+    preview: dict[str, Any],
+    values: dict[str, Any],
+    addr: str,
+    *,
+    require_oracle_time: bool = False,
 ) -> None:
-    if reason := estimates.rejection_reason(values):
+    reason = estimates.rejection_reason(values)
+    if require_oracle_time and estimates.close_oracle_time_unknown(values):
+        reason = values["execution"]["reason"]
+    if reason:
         fresh = {**preview, "addr": addr}
         _attach_estimates(fresh, values)
         raise ExecutionRejected(reason, fresh)
@@ -89,13 +96,17 @@ def _checked(
             )
         raise
     if values is not None:
-        _reject_execution(preview, values, addr)
+        _reject_execution(
+            preview, values, addr, require_oracle_time=before_submit is not None
+        )
 
 
 def _attach_estimates(preview: dict[str, Any], values: dict[str, Any]) -> None:
     preview["estimates"] = values
-    if estimates.rejection_reason(values) is not None:
+    rejected = estimates.rejection_reason(values) is not None
+    if rejected:
         preview.pop("quote", None)
+    if rejected or estimates.close_oracle_time_unknown(values):
         preview.pop("previewDigest", None)
 
 
@@ -538,19 +549,26 @@ def _position_preview(
     before_submit: SubmitCheck | None,
     changed_message: str,
     estimate: Callable[
-        [margin.PositionSnapshot, dict[str, Any], dict[str, Any]], dict[str, Any]
+        [
+            margin.PositionSnapshot,
+            dict[str, Any],
+            dict[str, Any],
+            margin.RecheckedPosition | None,
+        ],
+        dict[str, Any],
     ],
 ) -> dict[str, Any]:
     def verify_replacement(
         state: margin.PositionSnapshot, inputs: dict[str, Any]
-    ) -> None:
+    ) -> margin.RecheckedPosition:
         try:
-            if margin.position_unchanged(lcd_endpoint, state, trade_id, inputs):
-                return
+            checked = margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
         except estimates.READ_ERRORS as exc:
             raise PositionChanged(
                 f"Could not verify the replacement position quote. {exc}"
             ) from exc
+        if checked is not None:
+            return checked
         raise PositionChanged(
             "The position quote changed again during verification. Request a new preview."
         )
@@ -563,15 +581,17 @@ def _position_preview(
                 raise
             try:
                 state, inputs, fresh = build()
-                _attach_estimates(fresh, estimate(state, inputs, fresh))
+                checked = verify_replacement(state, inputs)
+                _attach_estimates(fresh, estimate(state, inputs, fresh, checked))
             except margin.TradingNetworkMismatch:
                 raise _network_mismatch(exc) from exc
+            except PositionChanged:
+                raise
             except estimates.READ_ERRORS as refresh_error:
                 raise PositionChanged(
                     "Could not refresh the position preview after an LCD network mismatch."
                     " Request a new preview before submitting."
                 ) from refresh_error
-            verify_replacement(state, inputs)
             raise PositionChanged(
                 "Keeper trading route and LCD network differed during confirmation."
                 " Review the replacement preview before submitting.",
@@ -580,7 +600,7 @@ def _position_preview(
 
     state, inputs, preview = read_quote()
     if dry_run:
-        _attach_estimates(preview, estimate(state, inputs, preview))
+        _attach_estimates(preview, estimate(state, inputs, preview, None))
         return preview
 
     try:
@@ -591,7 +611,8 @@ def _position_preview(
         margin.MarketUnavailable,
     ) as exc:
         raise PositionChanged(f"{changed_message}. {exc}") from exc
-    changed = not margin.position_unchanged(lcd_endpoint, state, trade_id, inputs)
+    rechecked = margin.recheck_position(lcd_endpoint, state, trade_id, inputs)
+    changed = rechecked is None
     if changed:
         try:
             state, inputs, fresh = read_quote()
@@ -601,14 +622,14 @@ def _position_preview(
             raise PositionChanged(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
-        verify_replacement(state, inputs)
+        rechecked = verify_replacement(state, inputs)
     if changed or fresh != preview:
-        _attach_estimates(fresh, estimate(state, inputs, fresh))
+        _attach_estimates(fresh, estimate(state, inputs, fresh, rechecked))
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
     _checked(
         before_submit,
         fresh,
-        lambda _: estimate(state, inputs, fresh),
+        lambda _: estimate(state, inputs, fresh, rechecked),
         addr=addr,
     )
     return fresh
@@ -673,7 +694,7 @@ def change_margin(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the margin change again",
-        estimate=lambda state, inputs, fresh: estimates.position_estimates(
+        estimate=lambda state, inputs, fresh, _: estimates.position_estimates(
             lcd_endpoint,
             state,
             trade_id,
@@ -743,12 +764,13 @@ def partial_close(
         dry_run=dry_run,
         before_submit=before_submit,
         changed_message="Position changed; review the reduction again",
-        estimate=lambda state, inputs, fresh: estimates.close_estimates(
+        estimate=lambda state, inputs, fresh, rechecked: estimates.close_estimates(
             lcd_endpoint,
             state,
             trade_id,
             int(fresh["intent"]["body"]["collateral"]["amountUsdc"]),
             require_unchanged=not dry_run,
+            rechecked=rechecked,
         ),
     )
     if dry_run:

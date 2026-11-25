@@ -19,8 +19,7 @@ use super::{
     actions::{incomplete, invalid},
     positive_decimal,
 };
-use lcd::height_error;
-pub(super) use lcd::{Lcd, Read};
+pub(super) use lcd::{Lcd, Read, height_error};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

@@ -997,7 +997,7 @@ def market_list(ctx: click.Context) -> None:
 @click.pass_context
 def market_prices(ctx: click.Context) -> None:
     """List current indexed prices."""
-    perform_query(ctx, keeper.PRICES)
+    emit(ctx, keeper.market_prices(keeper_url(ctx)))
 
 
 @main.group()
