@@ -77,11 +77,12 @@ class Position:
     quoted_liquidation_threshold: str | None = None
     quote_error_height: int | None = None
     block_timestamp: int = 2_000_000_000
-    oracle_base_age: int | None = None
+    oracle_base_age: int | None = 0
     null_market_price: bool = False
     oracle_quote_age: int | None = None
     oracle_ttl: int = 300
     fill_at_next_oracle_price: bool = False
+    market_order_config_fails: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
     position_read_states: deque[bool] = field(default_factory=deque)
     snapshot_traders: deque[str] = field(default_factory=deque)
@@ -109,6 +110,8 @@ class Position:
     switch_contract_on_perp_market_read: str | None = None
     prices_on_position_read: deque[str | None] = field(default_factory=deque)
     price_query_heights: list[str | None] = field(default_factory=list)
+    perp_price_query_heights: list[str | None] = field(default_factory=list)
+    collateral_price_on_perp_read: str | None = None
     oracle_position_updates: deque[tuple[int, str] | None] = field(
         default_factory=deque
     )
@@ -307,31 +310,36 @@ def position_service() -> Iterator[tuple[Position, str]]:
                 assert self.headers.get("x-cosmos-block-height") == str(
                     position.reported_height
                 )
-                data = (
-                    {
-                        "market": None
-                        if position.null_market_price
-                        else {
-                            "base_per_quote": str(position.price),
-                            "base_last_update_time": position.block_timestamp
-                            - position.oracle_base_age
-                            if position.oracle_base_age is not None
-                            else None,
-                            "quote_last_update_time": position.block_timestamp
-                            - position.oracle_quote_age
-                            if position.oracle_quote_age is not None
-                            else None,
-                        },
-                        "collateral": position.collateral_price,
-                    }
-                    if position.collateral_price is not None
-                    else None
+                position.perp_price_query_heights.append(
+                    self.headers.get("x-cosmos-block-height")
                 )
+                if position.collateral_price_on_perp_read is not None:
+                    position.collateral_price = position.collateral_price_on_perp_read
+                    position.collateral_price_on_perp_read = None
+                data = {
+                    "market": None
+                    if position.null_market_price
+                    else {
+                        "base_per_quote": str(position.price),
+                        "base_last_update_time": position.block_timestamp
+                        - position.oracle_base_age
+                        if position.oracle_base_age is not None
+                        else None,
+                        "quote_last_update_time": position.block_timestamp
+                        - position.oracle_quote_age
+                        if position.oracle_quote_age is not None
+                        else None,
+                    },
+                    "collateral": position.collateral_price,
+                }
             elif "market_order_config" in message:
                 assert message["market_order_config"] == {}
                 assert self.headers.get("x-cosmos-block-height") == str(
                     position.reported_height
                 )
+                if position.market_order_config_fails:
+                    self.reply({}, status=503)
+                    return
                 data = {"fill_at_next_oracle_price": position.fill_at_next_oracle_price}
             elif "get_liquidation_price" in message:
                 assert message["get_liquidation_price"] == {
@@ -1633,14 +1641,10 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             )
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
-            assert position.price_query_heights == [
-                None,
-                None,
-                None,
-                "121",
-                None,
-                "121",
-            ]
+            assert position.price_query_heights == [None, None, None, None]
+            assert position.perp_price_query_heights == ["121", "121"]
+            assert result["quoteStatus"] == "available"
+            assert result["recovery"]["action"] == "confirm_preview"
             fresh = result["preview"]
             assert fresh["quote"]["collateralPriceUsd"] == "0.98"
             assert fresh["quote"]["closedNotionalUsd"] == "245"
@@ -1655,6 +1659,49 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             )
             assert accepted["status"] == "accepted", accepted
             assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+def test_partial_close_binds_collateral_from_the_publication_time_read(
+    position_service,
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral = 100_000_000
+    position.leverage = "10"
+    position.after_hours = True
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            assert preview["quote"]["closedNotionalUsd"] == "250"
+            position.reported_height = 121
+            position.collateral_price_on_perp_read = "0.98"
+
+            refused = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert position.submitted == []
+            assert position.perp_price_query_heights == ["120", "121", "121"]
+            assert all(height is None for height in position.price_query_heights)
+            fresh = refused["preview"]
+            assert fresh["quote"]["closedNotionalUsd"] == "245"
+            assert fresh["intent"] == preview["intent"]
+            assert fresh["previewDigest"] != preview["previewDigest"]
+
+            accepted = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
+            assert accepted["status"] == "accepted"
+            assert len(position.submitted) == 1
+            assert position.perp_price_query_heights == ["120", "121", "121", "121"]
 
     asyncio.run(scenario())
 
@@ -2700,6 +2747,159 @@ def test_null_market_price_preserves_close_preview_and_refusal(position_service)
             )
             assert result["code"] == "PREVIEW_MISMATCH"
             assert result["preview"] == preview
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_close_previews_withhold_estimates_and_digests_without_oracle_time(
+    position_service,
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.price = "95"
+    position.liquidation_threshold = "96"
+    position.oracle_base_age = None
+
+    def assert_unavailable(preview):
+        execution = preview["estimates"]["execution"]
+        assert execution["status"] == "unavailable"
+        assert execution["code"] == "OraclePublicationTimeUnknown"
+        assert preview["estimates"]["fees"]["status"] == "unavailable"
+        assert "previewDigest" not in preview
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            for action, options in (("close", {}), ("partial_close", {"percent": 10})):
+                args = {"trade_id": 7, **options}
+                assert_unavailable(await call(client, f"preview_{action}", args))
+                refused = await call(
+                    client, f"trade_{action}", {**args, "preview_digest": "wrong"}
+                )
+                assert refused["code"] == "PREVIEW_MISMATCH"
+                assert_unavailable(refused["preview"])
+            result = CliRunner().invoke(
+                main,
+                [
+                    "--endpoint",
+                    f"{base_url}/query",
+                    "--lcd-endpoint",
+                    base_url,
+                    "--json",
+                    "trade",
+                    "partial-close",
+                    "7",
+                    "--percent",
+                    "10",
+                    "--dry-run",
+                ],
+            )
+            assert result.exit_code == 0, result.output
+            assert_unavailable(json.loads(result.stdout))
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize(
+    ("action", "options"), [("close", {}), ("partial_close", {"percent": 10})]
+)
+def test_close_digest_is_refused_when_oracle_time_disappears(
+    position_service, action, options
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+
+    async def scenario():
+        args = {"trade_id": 7, **options}
+        async with connected_client(base_url) as client:
+            preview = await call(client, f"preview_{action}", args)
+            digest = preview["previewDigest"]
+            position.oracle_base_age = None
+
+            refusal = await call(
+                client, f"trade_{action}", {**args, "preview_digest": digest}
+            )
+            assert refusal["code"] == "PREVIEW_MISMATCH"
+            assert "publication time is unknown" in refusal["error"]
+            assert refusal["quoteStatus"] == "unavailable"
+            assert refusal["recovery"]["action"] == "request_preview"
+            assert refusal["preview"] == await call(client, f"preview_{action}", args)
+            assert "previewDigest" not in refusal["preview"]
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize(
+    ("action", "options"), [("close", {}), ("partial_close", {"percent": 10})]
+)
+def test_close_digest_is_refused_when_market_price_disappears(
+    position_service, action, options, queued
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.fill_at_next_oracle_price = queued
+
+    async def scenario():
+        args = {"trade_id": 7, **options}
+        async with connected_client(base_url) as client:
+            dated = await call(client, f"preview_{action}", args)
+            position.null_market_price = True
+            position.market_order_config_fails = queued
+            refused = await call(
+                client,
+                f"trade_{action}",
+                {**args, "preview_digest": dated["previewDigest"]},
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["preview"] == await call(client, f"preview_{action}", args)
+            assert refused["quoteStatus"] == "unavailable"
+            assert refused["recovery"]["action"] == "request_preview"
+            assert "previewDigest" not in refused["preview"]
+            assert refused["preview"]["estimates"]["execution"]["code"] == (
+                "OraclePublicationTimeUnknown"
+            )
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
+def test_full_close_digest_is_refused_when_lcd_height_disappears(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    args = {"trade_id": 7}
+
+    async def scenario():
+        async with connected_client(base_url) as client:
+            dated = await call(client, "preview_close", args)
+            digest = dated["previewDigest"]
+            position.reported_height = None
+
+            refused = await call(
+                client, "trade_close", {**args, "preview_digest": digest}
+            )
+            assert position.submitted == []
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["quoteStatus"] == "unavailable"
+            assert refused["recovery"]["action"] == "request_preview"
+            replacement = refused["preview"]
+            assert "previewDigest" not in replacement
+            assert replacement == await call(client, "preview_close", args)
+
+            cli_refusal = CliRunner().invoke(
+                main,
+                [
+                    *position_cli_args(base_url, ["close", "7"]),
+                    "--preview-digest",
+                    digest,
+                ],
+            )
+            assert cli_refusal.exit_code == ExitCode.REJECTED, cli_refusal.output
+            cli_error = json.loads(cli_refusal.stdout)["error"]
+            assert cli_error["code"] == "PREVIEW_MISMATCH"
+            assert cli_error["details"]["preview"] == replacement
             assert position.submitted == []
 
     asyncio.run(scenario())

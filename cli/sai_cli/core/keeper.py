@@ -10,7 +10,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -201,6 +201,39 @@ def _block_time(value: object) -> str | None:
         else:
             return value
     return None
+
+
+def _zero_price_timestamp(value: object) -> bool:
+    if type(value) in (int, float):
+        return value == 0
+    if not isinstance(value, str):
+        return False
+    if value == "0":
+        return True
+    # Match Chrono's separators. Drop all-zero fractions before parsing so a
+    # nonzero digit below datetime's resolution cannot turn into the epoch.
+    timestamp = value.upper().replace(" ", "T", 1).replace("−", "-")
+    timestamp = re.sub(r"\.0+(?=[Z+-])", "", timestamp)
+    if "." in timestamp or not BLOCK_TIMESTAMP.fullmatch(timestamp):
+        return False
+    try:
+        return datetime.fromisoformat(timestamp) == datetime(1970, 1, 1, tzinfo=UTC)
+    except ValueError:
+        return False
+
+
+def market_prices(endpoint: str) -> dict[str, Any]:
+    data = request(endpoint, PRICES)
+    oracle = data.get("oracle")
+    rows = oracle.get("tokenPricesUsd") if isinstance(oracle, dict) else None
+    if isinstance(rows, list):
+        for row in rows:
+            block = row.get("lastUpdatedBlock") if isinstance(row, dict) else None
+            if isinstance(block, dict):
+                timestamp = block.get("block_ts")
+                if timestamp is None or _zero_price_timestamp(timestamp):
+                    block["block_ts"] = None
+    return data
 
 
 def _row_id(value: object) -> str | int | None:

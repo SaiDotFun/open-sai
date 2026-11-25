@@ -271,7 +271,16 @@ class Normalize:
         if result.get("event") == "command.end" and isinstance(
             result.get("error"), str
         ):
-            result["error"] = self.intent_refs(result["error"])
+            error = result["error"]
+            # A command hint can be clipped by logging midway through a
+            # fixture path, before the full home can be normalized.
+            message, separator, omitted = error.rpartition("... [")
+            if separator and re.fullmatch(r"[0-9]+ more characters\]", omitted):
+                parent = f"{Path(self.home).parent}/"
+                index = message.rfind(parent)
+                if index >= 0 and self.home.startswith(message[index:]):
+                    error = f"{message[:index]}<HOME>{separator}{omitted}"
+            result["error"] = self.intent_refs(error)
         return result
 
     def log_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -476,7 +485,16 @@ def normalize_overview_table(match: re.Match[str]) -> str:
 def mask_overview_stdout(raw: str, mode: str) -> str:
     """Mask clock values in place so serialization and table layout stay comparable."""
     if mode == "json":
-        raw = re.sub(r'(?<!\\)("fetchedAt"\s*:\s*)"[^"]+"', r'\1"<fetchedAt>"', raw)
+        fetch_pattern = r'(?<!\\)("fetchedAt"\s*:\s*)"([^"]+)"'
+        fetched = {stamp for _, stamp in re.findall(fetch_pattern, raw)}
+        raw = re.sub(fetch_pattern, r'\1"<fetchedAt>"', raw)
+        raw = re.sub(
+            r'(?<!\\)("sourceAt"\s*:\s*)"([^"]+)"',
+            lambda match: (
+                f'{match[1]}"<fetchedAt>"' if match[2] in fetched else match[0]
+            ),
+            raw,
+        )
         return re.sub(
             r'(?<!\\)("sourceAgeSeconds"\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
             r'\1"<sourceAgeSeconds>"',
@@ -516,9 +534,24 @@ def overview_clocks(
             ):
                 raise ValueError("Overview fetch timestamp is outside the invocation")
             value["fetchedAt"] = "<fetchedAt>"
+            if "sourceAt" in value and "sourceAgeSeconds" not in value:
+                if value["sourceAt"] != stamp:
+                    raise ValueError(
+                        "Overview section source time differs from its fetch"
+                    )
+                value["sourceAt"] = "<fetchedAt>"
     if "sourceAgeSeconds" in value:
         source, age = value["sourceAt"], value["sourceAgeSeconds"]
-        if source is None:
+        if value.get("sourceAtBasis") == "fetchedAt":
+            if (
+                age is not None
+                or fetched is None
+                or not timestamp(source)
+                or datetime.fromisoformat(source) != fetched
+            ):
+                raise ValueError("Invalid overview fetch-time source")
+            value["sourceAt"] = "<fetchedAt>"
+        elif source is None:
             if age is not None:
                 raise ValueError("Overview reported an age without a source timestamp")
         else:

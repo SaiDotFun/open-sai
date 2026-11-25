@@ -43,8 +43,18 @@ if program == "codex":
     entry = servers.get(name)
     project = Path(os.environ["CODEX_HOME"]) / "project.json"
     if Path.cwd() == home and name == "sai" and project.exists():
+        if entry is None and (home / "fail-second-project-query").exists():
+            observed = home / "first-project-query"
+            if observed.exists():
+                sys.exit(9)
+            observed.touch()
         entry = json.loads(project.read_text())
     if entry is None:
+        if (name == "sai" + "-mcp" and Path.cwd() != config.parent
+                and (home / "drop-codex-after-discovery").exists()):
+            Path(sys.argv[0]).unlink()
+        if name == "sai" and (home / "fail-uninstall-verification").exists():
+            sys.exit(9)
         sys.exit(f"Error: No MCP server named '{name}' found.")
     for index in range(4, len(argv), 2):
         assert argv[index] == "-c"
@@ -60,18 +70,20 @@ if program == "codex":
             reply[key] = transport[key]
     print(json.dumps(reply))
 elif program == "claude":
-    path = home / ".claude.json"
+    assert argv[0] == "mcp" and argv[2] == "--scope"
+    scope, name = argv[3:5]
+    path = Path.cwd() / ".mcp.json" if scope == "project" else home / ".claude.json"
     data = json.loads(path.read_text()) if path.is_file() else {}
-    entries = data.setdefault("mcpServers", {})
-    assert argv[0] == "mcp" and argv[2:5] == ["--scope", "user", "sai"]
+    holder = data["projects"][str(Path.cwd())] if scope == "local" else data
+    entries = holder.setdefault("mcpServers", {})
     if argv[1] == "remove":
-        del entries["sai"]
+        del entries[name]
     else:
         assert argv[1] == "add"
         divider = argv.index("--")
         launcher, *args = argv[divider + 1 :]
         variables = dict(item.removeprefix("--env=").split("=", 1) for item in argv[5:divider])
-        entries["sai"] = {"type": "stdio", "command": launcher, "args": args, "env": variables}
+        entries[name] = {"type": "stdio", "command": launcher, "args": args, "env": variables}
     path.write_text(json.dumps(data))
 else:
     raise AssertionError("A registered launcher was invoked")
@@ -94,11 +106,13 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
     if scenario == "empty":
         (home / ".cursor").mkdir()
         return {}
+    if scenario == "uninstall-query-failure":
+        (home / "fail-uninstall-verification").touch()
     stable = programs / "sai"
     saved = stable
     args = ["mcp", "serve"]
     home_setting = str(home / "sai")
-    if scenario in {"retired", "partial", "shadowed"}:
+    if scenario in {"retired", "legacy-retired", "partial", "shadowed"}:
         saved = programs / ("sai" + "-mcp")
         args = ["--endpoint", "https://fixture.invalid/api?token=private"]
         if scenario == "partial":
@@ -111,7 +125,7 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
         shutil.copy2(stable, saved)
     elif scenario == "legacy":
         home_setting = str(home / "pinned-profile")
-    name = "sai" + "-mcp" if scenario == "legacy" else "sai"
+    name = "sai" + "-mcp" if scenario in {"legacy", "legacy-retired"} else "sai"
     entry = {"command": str(saved), "args": args, "env": {"SAI_HOME": home_setting}}
     extra = scenario != "current"
     if extra:
@@ -120,9 +134,12 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
         "url": "https://fixture.invalid/mcp",
         "headers": {"Authorization": SECRET},
     }
-    document = json.dumps({"mcpServers": {name: entry, "other-server": unrelated}})
-    write(home / ".claude.json", document, 0o640)
-    write(home / ".cursor/mcp.json", document, 0o640)
+    document = {"mcpServers": {name: entry, "other-server": unrelated}}
+    write(home / ".cursor/mcp.json", json.dumps(document), 0o640)
+    if scenario == "uninstall-scopes":
+        write(home / ".mcp.json", json.dumps(document), 0o640)
+        document["projects"] = {str(home): {"mcpServers": {name: entry}}}
+    write(home / ".claude.json", json.dumps(document), 0o640)
     if scenario == "shadowed":
         write(home / ".codex/project.json", json.dumps(entry))
     lines = [
@@ -149,7 +166,23 @@ def seed_clients(home: Path, env: dict[str, str], scenario: str) -> dict[str, by
         f"url = {json.dumps(unrelated['url'])}",
         f"headers = {{ Authorization = {json.dumps(SECRET)} }}",
     ]
-    write(home / ".codex/config.toml", "\n".join(lines) + "\n", 0o640)
+    config = "\n".join(lines) + "\n"
+    if scenario == "uninstall-crlf":
+        config = (
+            '# Keep this comment\r\nmodel = "before"\r\n\r\n'
+            "[mcp_servers.sai]\r\n"
+            f"command = {json.dumps(str(saved))}\r\n"
+            'args = ["mcp", "serve"]\r\n\r\n'
+            '# Other server\r\n[mcp_servers.other-server]\r\nurl = "https://fixture.invalid/mcp"\r\n\r\n'
+            '[profiles.demo]\r\nmodel =    "after"\r\n'
+        )
+    write(home / ".codex/config.toml", config, 0o640)
+    read_only = {
+        "uninstall-codex-read-only": ".codex/config.toml",
+        "uninstall-cursor-read-only": ".cursor/mcp.json",
+    }.get(scenario)
+    if read_only:
+        (home / read_only).chmod(0o444)
     return {
         relative: (home / relative).read_bytes()
         for relative in CLIENT_CONFIGS
@@ -178,8 +211,15 @@ def client_state(
                     if "#" in line
                 ],
             }
+            if b"\r\n" in previous.get(relative, b""):
+                data["source"] = source
         else:
             data = json.loads(raw)
+            if relative == ".claude.json" and isinstance(data.get("projects"), dict):
+                data["projects"] = {
+                    normalize.text(project): entry
+                    for project, entry in data["projects"].items()
+                }
         mode = stat.S_IMODE(path.stat().st_mode)
         files[f"clients/{relative}"] = Entry(
             "file",

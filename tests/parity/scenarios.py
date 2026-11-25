@@ -324,6 +324,16 @@ def loopback(
     )
     markets = fixture("mainnet_markets_http.json")
     prices = fixture("mainnet_prices_http.json")
+    if scenario == "read-price-epoch-spellings":
+        rows = prices["data"]["oracle"]["tokenPricesUsd"]
+        stamps = (
+            "1970-01-01t00:00:00z",
+            "1970-01-01 01:00:00.0000000000+01:00",
+            "1969-12-31T23:00:00−01:00",
+            "1970-01-01t00:00:00.0000000001z",
+        )
+        for row, stamp in zip(rows[: len(stamps)], stamps, strict=True):
+            row["lastUpdatedBlock"]["block_ts"] = stamp
     position = PROTOCOL["account_positions_response"]["data"]["perp"]["trades"][0]
     borrowing = position["perpBorrowing"]
     recorded_markets = markets["data"]["perp"]["borrowings"]

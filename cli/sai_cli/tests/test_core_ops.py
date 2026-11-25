@@ -402,6 +402,8 @@ def snapshots(monkeypatch, *collaterals: str) -> Iterator[margin.PositionSnapsho
         if "get_trade_raw" in query:
             assert current is not None
             return current.raw
+        if "get_perp_prices" in query:
+            return {"collateral": "1"}
         return "1" if "get_collateral_price" in query else False
 
     monkeypatch.setattr(margin, "snapshot", snapshot)

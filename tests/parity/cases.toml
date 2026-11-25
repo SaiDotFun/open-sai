@@ -4,7 +4,6 @@
 "auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
 "auth renew" = "Compared with Python main in test_auth.py."
 "intent wait" = "Covered by the pinned, stateful replays in test_intent_wait.py."
-"mcp uninstall" = "Requires a client registration fixture."
 "logs intent" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
 "logs run" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
 "logs stats" = "Rust ports log queries in lane C9 (issue 49); its cases land with it."
@@ -97,6 +96,12 @@ wire = ["borrowings"]
 [[case]]
 name = "market-prices"
 args = ["--json","market","prices"]
+wire = ["tokenPricesUsd"]
+
+[[case]]
+name = "market-prices-epoch-spellings"
+args = ["--json","market","prices"]
+server = "read-price-epoch-spellings"
 wire = ["tokenPricesUsd"]
 
 [[case]]
@@ -1207,10 +1212,96 @@ client_seed = "empty"
 state = { "clients/.cursor/mcp.json" = "<absent>", "clients/argv.jsonl" = "<absent>" }
 
 [[case]]
-name = "mcp-install-claude-repair"
-args = ["--json", "mcp", "install", "--client", "claude", "--repair-existing", "sai"]
-client_seed = "retired"
+name = "mcp-install-claude-repair-legacy"
+# The escaped name is the legacy alias accepted on both CLIs.
+args = ["--json", "mcp", "install", "--client", "claude", "--repair-existing", "sai\u002dmcp"]
+client_seed = "legacy-retired"
 state = { "clients/.claude.json#changed" = true, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false, "clients/argv.jsonl" = "<absent>" }
+
+[[case]]
+name = "mcp-uninstall-all"
+args = ["--json", "mcp", "uninstall", "--all"]
+client_seed = "current"
+state = { "clients/.claude.json#data.mcpServers.sai" = "<absent>", "clients/.codex/config.toml#data.settings.mcp_servers.sai" = "<absent>", "clients/.cursor/mcp.json#data.mcpServers.sai" = "<absent>", "clients/.claude.json#@mode" = 416, "clients/.codex/config.toml#@mode" = 416, "clients/.cursor/mcp.json#@mode" = 416 }
+
+[[case]]
+name = "mcp-uninstall-absent"
+args = ["--json", "mcp", "uninstall", "--all"]
+client_seed = "empty"
+state = { "clients/.claude.json" = "<absent>", "clients/.codex/config.toml" = "<absent>", "clients/.cursor/mcp.json" = "<absent>" }
+
+[[case]]
+name = "mcp-uninstall-legacy"
+args = ["--json", "mcp", "uninstall", "--all"]
+client_seed = "legacy"
+state = { "clients/.claude.json#changed" = true, "clients/.codex/config.toml#changed" = true, "clients/.cursor/mcp.json#changed" = true }
+
+[[case]]
+name = "mcp-uninstall-dry-run"
+args = ["--json", "mcp", "uninstall", "--all", "--dry-run"]
+client_seed = "uninstall-scopes"
+state = { "clients/.mcp.json#changed" = false, "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-local"
+args = ["--json", "mcp", "uninstall", "claude-code", "--scope", "local"]
+client_seed = "uninstall-scopes"
+state = { "clients/.claude.json#changed" = true, "clients/.claude.json#data.mcpServers.sai.args" = ["mcp", "serve"], "clients/.mcp.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-project"
+args = ["--json", "mcp", "uninstall", "claude", "--scope", "project"]
+client_seed = "uninstall-scopes"
+state = { "clients/.mcp.json#data.mcpServers.sai" = "<absent>", "clients/.claude.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-codex-project"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "project"]
+client_seed = "shadowed"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = false, "clients/.codex/project.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-codex-user-shadowed"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "shadowed"
+expect = 1
+state = { "clients/.codex/config.toml#data.settings.mcp_servers.sai" = "<absent>", "clients/.codex/project.json#changed" = false }
+
+[[case]]
+name = "mcp-uninstall-codex-query-failure"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "uninstall-query-failure"
+accepted_divergence = "codex-uninstall-rollback"
+expect = 1
+state = { "clients/.codex/config.toml#changed" = true, "clients/.codex/config.toml#data.settings.mcp_servers.sai" = "<absent>", "clients/.codex/config.toml#@mode" = 416 }
+
+[[case]]
+name = "mcp-uninstall-codex-crlf"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "uninstall-crlf"
+state = { "clients/.codex/config.toml#data.source" = "# Keep this comment\r\nmodel = \"before\"\r\n\r\n\r\n# Other server\r\n[mcp_servers.other-server]\r\nurl = \"https://fixture.invalid/mcp\"\r\n\r\n[profiles.demo]\r\nmodel =    \"after\"\r\n", "clients/.codex/config.toml#@mode" = 416 }
+
+[[case]]
+name = "mcp-uninstall-codex-read-only"
+args = ["--json", "mcp", "uninstall", "codex", "--scope", "user"]
+client_seed = "uninstall-codex-read-only"
+accepted_divergence = "uninstall-read-only"
+state = { "clients/.codex/config.toml#@mode" = 292, "clients/.codex/config.toml#data.settings.mcp_servers.other-server.url" = "https://fixture.invalid/mcp" }
+
+[[case]]
+name = "mcp-uninstall-cursor-read-only"
+args = ["--json", "mcp", "uninstall", "cursor", "--scope", "user"]
+client_seed = "uninstall-cursor-read-only"
+accepted_divergence = "uninstall-read-only"
+state = { "clients/.cursor/mcp.json#@mode" = 292, "clients/.cursor/mcp.json#data.mcpServers.other-server.url" = "https://fixture.invalid/mcp" }
+
+[[case]]
+name = "mcp-uninstall-no-client"
+args = ["--json", "mcp", "uninstall"]
+client_seed = "current"
+expect = 2
+state = { "clients/.claude.json#changed" = false, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false }
 
 [[case]]
 name = "mcp-tool-inventory"
@@ -1361,8 +1452,8 @@ seed = "session"
 wire = [
     "oneClickTrading", "node_info", "trade", "borrowing", "get_trade_raw",
     "get_exchange_balance", "is_after_hours_market",
-    "get_collateral_price", "get_trade_raw", "market_order_config", "get_perp_prices", "get_liquidation_price",
-    "is_after_hours_market", "get_market", "get_fees",
+    # The fixture has no oracle publication time, so the estimate stops here.
+    "get_collateral_price", "get_trade_raw", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
@@ -1373,11 +1464,9 @@ seed = "session"
 server = "concurrent-close"
 wire = [
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
     "recordUserIntent",
     "trade", "oneClickTrading", "node_info", "get_trade_raw", "borrowing",
-    "get_exchange_balance", "get_trade_raw", "market_order_config", "get_perp_prices",
-    "get_liquidation_price", "is_after_hours_market", "get_market", "get_fees",
+    "get_exchange_balance", "get_trade_raw", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3#tables.intents.rows.0.status" = "accepted", "trader/intents.sqlite3#tables.intents.rows.1" = "<absent>" }
