@@ -141,8 +141,11 @@ impl Lcd<'_> {
         let height = headers
             .get(SERVED_HEIGHT)
             .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned());
+        // The LCD can omit height metadata from Perp's missing storage key
+        // error. That specific miss means the group cap applies.
         if let Read::At(requested) = read
             && height.as_deref() != Some(requested)
+            && !(missing_cap && height.is_none())
         {
             return Err(height_error(
                 "LCD did not serve the requested contract query height.",
