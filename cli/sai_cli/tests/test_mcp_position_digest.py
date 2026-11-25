@@ -24,7 +24,7 @@ from click.testing import CliRunner
 from mcp import ClientSession
 from mcp.shared.memory import create_connected_server_and_client_session
 from mcp.types import TextContent
-from sai_cli.core import keeper, margin, settings, storage
+from sai_cli.core import confirmation, keeper, margin, settings, storage
 from sai_cli.core.errors import ExitCode
 from sai_cli.mcp_server.server import create_server
 from sai_cli.sai_cli import main
@@ -83,6 +83,7 @@ class Position:
     oracle_ttl: int = 300
     fill_at_next_oracle_price: bool = False
     snapshot_leverages: deque[str] = field(default_factory=deque)
+    position_read_states: deque[bool] = field(default_factory=deque)
     snapshot_traders: deque[str] = field(default_factory=deque)
     indexed_collaterals: deque[int] = field(default_factory=deque)
     after_hours: bool = False
@@ -128,6 +129,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
         def do_POST(self) -> None:
             assert self.path == "/query"
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            position_open = True
             if request["query"] == keeper.MARKETS:
                 position.market_reads += 1
             indexed_collateral = position.collateral
@@ -138,6 +140,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     position.switch_and_logout_on_keeper_read = None
                 if position.snapshot_leverages:
                     position.leverage = position.snapshot_leverages.popleft()
+                if position.position_read_states:
+                    position_open = position.position_read_states.popleft()
                 if position.snapshot_traders:
                     position.trader = position.snapshot_traders.popleft()
                 if position.indexed_collaterals:
@@ -187,6 +191,8 @@ def position_service() -> Iterator[tuple[Position, str]]:
                                 "leverage": float(position.leverage),
                                 "perpBorrowing": market,
                             }
+                            if position_open
+                            else None
                         }
                     },
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
@@ -1011,6 +1017,8 @@ def test_partial_close_requires_confirmation_when_position_changes(
 
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
+            assert result["quoteStatus"] == "available"
+            assert result["recovery"]["action"] == "confirm_preview"
             fresh = result["preview"]
             assert fresh["previewDigest"] != preview["previewDigest"]
             assert fresh["intent"] == preview["intent"]
@@ -1029,6 +1037,31 @@ def test_partial_close_requires_confirmation_when_position_changes(
             assert {key: submitted[key] for key in preview["intent"]} == preview[
                 "intent"
             ]
+
+    asyncio.run(scenario())
+
+
+def test_position_disappears_during_confirmation(position_service):
+    position, base_url = position_service
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            position.position_read_states.extend([True, False])
+            result = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert result["code"] == "PREVIEW_MISMATCH"
+            assert "Position not found for this account" in result["error"]
+            assert result["quoteStatus"] == "unavailable"
+            assert result["recovery"]["action"] == "request_preview"
+            assert "confirmation" in result["recovery"]["message"]
+            assert "preview" not in result
+            assert position.submitted == []
+            assert not (storage.home() / "intents.sqlite3").exists()
 
     asyncio.run(scenario())
 
@@ -1149,11 +1182,23 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
                 None,
                 "121" if reported_height is not None else None,
                 None,
+                "121" if reported_height is not None else None,
             ]
             if tool == "margin" and reported_height is not None:
                 expected_heights.append("121")
             assert position.cap_query_heights == expected_heights
-            fresh = result["preview"]
+            if reported_height is None:
+                assert result["quoteStatus"] == "unavailable"
+                assert result["recovery"]["action"] == "request_preview"
+                assert "reports the contract query height" in result["error"]
+                assert "preview" not in result
+                assert "previewDigest" not in result
+                position.reported_height = 121
+                fresh = await call(client, f"preview_{tool}", args)
+            else:
+                assert result["quoteStatus"] == "available"
+                assert result["recovery"]["action"] == "confirm_preview"
+                fresh = result["preview"]
             assert fresh["previewDigest"] != preview["previewDigest"]
             assert (
                 fresh["quote"]["effectiveLeverage"]
@@ -1173,13 +1218,44 @@ def test_trade_rechecks_cap_after_reading_unchanged_position(
                 f"trade_{tool}",
                 {**args, "preview_digest": fresh["previewDigest"]},
             )
-            if reported_height is None:
-                assert accepted.get("code") == "INVALID_REQUEST", accepted
-                assert "same block" in accepted["error"]
-                assert position.submitted == []
-            else:
-                assert accepted["status"] == "accepted"
-                assert len(position.submitted) == 1
+            assert accepted["status"] == "accepted"
+            assert len(position.submitted) == 1
+
+    asyncio.run(scenario())
+
+
+def test_partial_close_refuses_replacement_when_pinned_cap_is_malformed(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.leverage = "10"
+    position.after_hours = True
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            preview = await call(client, "preview_partial_close", args)
+            assert preview["quote"]["closedNotionalUsd"] == "10"
+            # The cap becomes unreadable at the final pinned position read.
+            position.caps_on_position_read.extend([None, None, "malformed"])
+            refused = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": preview["previewDigest"]},
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["quoteStatus"] == "unavailable"
+            assert refused["recovery"]["action"] == "request_preview"
+            assert "effective leverage" in refused["error"]
+            assert "preview" not in refused
+            assert "previewDigest" not in refused
+            assert position.cap_query_heights.count("121") == 2
+            assert position.submitted == []
+
+            estimate = await call(client, "preview_partial_close", args)
+            assert estimate["quote"]["effectiveLeverage"] is None
+            assert estimate["quote"]["closedNotionalUsd"] == "20"
+            assert estimate["quote"]["closedNotionalIsEstimate"] is True
 
     asyncio.run(scenario())
 
@@ -1205,6 +1281,9 @@ def test_trade_confirms_through_lcd_cache_and_refuses_unverified_heights(
             rejected = await call(client, f"trade_{tool}", trade)
             assert rejected.get("code") == "PREVIEW_MISMATCH", rejected
             assert "Retry" in rejected["error"]
+            assert rejected["quoteStatus"] == "unavailable"
+            assert rejected["recovery"]["action"] == "request_preview"
+            assert "preview" not in rejected
             assert position.submitted == []
 
             position.drop_pinned_height = False
@@ -1237,7 +1316,14 @@ def test_partial_close_rechecks_oracle_at_the_final_position_height(
             )
             assert result.get("code") == "PREVIEW_MISMATCH", result
             assert position.submitted == []
-            assert position.price_query_heights == [None, None, None, "121", None]
+            assert position.price_query_heights == [
+                None,
+                None,
+                None,
+                "121",
+                None,
+                "121",
+            ]
             fresh = result["preview"]
             assert fresh["quote"]["collateralPriceUsd"] == "0.98"
             assert fresh["quote"]["closedNotionalUsd"] == "245"
@@ -1402,6 +1488,35 @@ def test_partial_close_marks_incomplete_quotes_as_estimates(
     asyncio.run(scenario())
 
 
+def test_partial_close_preview_omits_digest_until_effective_leverage_is_readable(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.leverage = "10"
+    position.after_hours = True
+    position.cap = "malformed"
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            estimate = await call(client, "preview_partial_close", args)
+            assert estimate["addr"] == ADDR
+            assert estimate["quote"]["effectiveLeverage"] is None
+            assert estimate["quote"]["collateralPriceUsd"] == "1"
+            assert estimate["quote"]["closedNotionalUsd"] == "20"
+            assert estimate["quote"]["closedNotionalIsEstimate"] is True
+            assert "previewDigest" not in estimate
+
+            position.cap = "5"
+            fresh = await call(client, "preview_partial_close", args)
+            assert fresh["quote"]["effectiveLeverage"] == "5"
+            assert fresh["quote"]["closedNotionalUsd"] == "10"
+            assert len(fresh["previewDigest"]) == 64
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
 def test_partial_close_keeps_leverage_for_risk_updated_position(
     position_service: tuple[Position, str],
 ) -> None:
@@ -1511,6 +1626,65 @@ def test_cli_preview_text_and_json_use_the_order_trigger(
         Decimal(".0001")
     ) == Decimal(60)
     assert position.submitted == []
+
+
+def test_signed_out_market_open_requires_an_account_preview(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            session = storage.load_session(ADDR)
+            assert storage.delete_session(ADDR) == ADDR
+            preview = await call(client, "preview_open", args)
+            assert preview["addr"] is None
+            assert preview["confirmationStatus"] == "informational"
+            assert preview["recovery"]["action"] == "connect_and_preview"
+            assert "preview_open" in preview["recovery"]["message"]
+            assert "previewDigest" not in preview
+            assert preview["referencePrice"] == "100.5"
+            assert preview["estimates"]["worstCaseFill"]["status"] == "bound"
+            assert position.submitted == []
+
+            # Older versions emitted this digest for the same accountless quote.
+            legacy_digest = confirmation.preview_digest(preview)
+            storage.save_session(session)
+            trade = {**args, "reference_price": preview["referencePrice"]}
+            refused = await call(
+                client, "trade_open", {**trade, "preview_digest": legacy_digest}
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["preview"]["addr"] == ADDR
+            assert position.submitted == []
+
+            fresh = await call(client, "preview_open", {**args, "addr": ADDR})
+            assert fresh["addr"] == ADDR
+            assert fresh["previewDigest"] != legacy_digest
+            result = await call(
+                client,
+                "trade_open",
+                {**trade, "addr": ADDR, "preview_digest": fresh["previewDigest"]},
+            )
+            assert result["status"] == "accepted"
+            assert result["addr"] == ADDR
+            (submitted,) = position.submitted
+            assert submitted["kind"] == fresh["intent"]["kind"]
+            assert submitted["body"] == {
+                **fresh["intent"]["body"],
+                "intentPrice": fresh["referencePrice"],
+            }
+
+    asyncio.run(scenario())
 
 
 @pytest.mark.parametrize(
@@ -2328,6 +2502,34 @@ def test_open_previews_follow_perp_market_state(position_service, order_type):
     asyncio.run(scenario())
 
 
+def test_signed_out_open_reports_rejection_without_connect_action(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.market_trading_state = "close_only"
+    args = {
+        "market_id": 0,
+        "side": "long",
+        "order_type": "market",
+        "amount": "10",
+        "leverage": "2",
+        "slippage": "1",
+    }
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            assert storage.delete_session(ADDR) == ADDR
+            preview = await call(client, "preview_open", args)
+            assert preview["addr"] is None
+            assert preview["confirmationStatus"] == "informational"
+            assert_rejected_preview(preview, "MarketClosed", "close-only")
+            assert "recovery" not in preview
+            assert position.submitted == []
+
+    asyncio.run(scenario())
+
+
 def assert_rejected_preview(quote: dict[str, Any], code: str, reason: str) -> None:
     assert "quote" not in quote
     assert "previewDigest" not in quote
@@ -2556,6 +2758,8 @@ def test_leverage_submit_rechecks_balance_after_confirmation(
                 },
             )
             assert refused["code"] == "PREVIEW_MISMATCH"
+            assert refused["quoteStatus"] == "unavailable"
+            assert refused["recovery"]["action"] == "request_preview"
             assert_rejected_preview(
                 refused["preview"],
                 "InsufficientDepositBalance",
