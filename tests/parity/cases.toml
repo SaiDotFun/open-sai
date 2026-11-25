@@ -869,6 +869,17 @@ state = { "logs/cli.jsonl#3.event" = "doctor.result", "logs/cli.jsonl#3.level" =
 name = "doctor-lcd-invalid-chain"
 args = ["--json", "doctor", "--no-fix"]
 server = "doctor-lcd-invalid-chain"
+exact_output = true
+seed = "session"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
+name = "doctor-lcd-invalid-chain-text"
+args = ["doctor", "--no-fix"]
+mode = "text"
+server = "doctor-lcd-invalid-chain"
+exact_output = true
 seed = "session"
 expect = 1
 wire = ["oneClickTrading", "ws:init", "node_info"]

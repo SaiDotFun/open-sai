@@ -267,6 +267,11 @@ LCD, and malformed chain IDs. The driver compares the CLI streams byte
 for byte after masking the temporary home path, report timestamp, and
 probe and check durations.
 
+The invalid-chain cases pin exit 1 in both modes when `node_info` returns
+a nonempty malformed chain ID. Earlier Rust reported a warning and exited
+0 in this fixture. Current Rust treats it as a failed LCD check, matching
+Python.
+
 The logging-enabled mismatch case checks the LCD warning event and scans
 the raw logs for the fixture path. It allows the existing difference in
 the Keeper probe event, where Python includes `command` and `commandId`
