@@ -2,15 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import sys
 from pathlib import Path
 from typing import Any, Literal
 
 import pytest
 from sai_cli.core.confirmation import preview_digest
-from scenarios import loopback, seed_home
-from test_mcp_stdio import server
+from sai_cli.core.settings import load as load_settings
+from sai_cli.mcp_server.tools import partial_close as mcp_partial_close
+from scenarios import child_env, loopback, seed_home
 from test_trade import CLI, CLOSE, OPEN, rows, run
 from trade_replay import TradeReplay
 
@@ -71,37 +71,41 @@ def test_unconfirmed_trade_checks_execution_before_reserving(
 
 
 def test_partial_close_with_unreadable_leverage_cannot_be_confirmed(
-    pair: tuple[CLI, CLI], tmp_path: Path
+    pair: tuple[CLI, CLI], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    python, rust = pair
+    _, rust = pair
     scenario = "position-malformed-after-hours-cap"
-    with (
-        loopback(scenario) as endpoints,
-        server(
-            Path(python[0]), tmp_path / "python-preview", endpoints, seed="session"
-        ) as stdio,
-    ):
-        reply = stdio.call(2, "preview_partial_close", trade_id=7, percent=50)
-        expected = json.loads(reply["content"][0]["text"])
+    with loopback(scenario) as endpoints, monkeypatch.context() as env:
+        home = tmp_path / "python-preview"
+        seed_home(home, endpoints, "session")
+        variables = child_env(home, endpoints)
+        for key in ("SAI_HOME", "NO_PROXY", "no_proxy"):
+            env.setenv(key, variables[key])
+        expected = mcp_partial_close(
+            load_settings(env=variables), dry_run=True, trade_id=7, percent=50
+        )
         assert expected["quote"]["effectiveLeverage"] is None
         assert "previewDigest" not in expected
         assert not endpoints.errors
 
-    for index, cli in enumerate(pair):
-        replay = TradeReplay("DECREASE_POSITION_SIZE")
-        with loopback(scenario, trade_replay=replay) as endpoints:
-            home = tmp_path / f"submit-{index}"
-            seed_home(home, endpoints, "session")
-            code, result, stderr = run(cli, home, endpoints, PARTIAL, python=index == 0)
-            assert (code, result["error"]["code"], stderr) == (
-                4,
-                "PREVIEW_MISMATCH",
-                "",
-            )
-            assert "Cannot verify effective leverage" in result["error"]["message"]
-            assert not replay.attempts()
-            assert not rows(home)
-            assert not endpoints.errors
+    for args in (PARTIAL, (*PARTIAL, "--preview-digest", preview_digest(expected))):
+        for index, cli in enumerate(pair):
+            replay = TradeReplay("DECREASE_POSITION_SIZE")
+            with loopback(scenario, trade_replay=replay) as endpoints:
+                home = tmp_path / f"submit-{len(args)}-{index}"
+                seed_home(home, endpoints, "session")
+                code, result, stderr = run(
+                    cli, home, endpoints, args, python=index == 0
+                )
+                assert (code, result["error"]["code"], stderr) == (
+                    4,
+                    "PREVIEW_MISMATCH",
+                    "",
+                )
+                assert "Cannot verify effective leverage" in result["error"]["message"]
+                assert not replay.attempts()
+                assert not rows(home)
+                assert not endpoints.errors
 
     with loopback(scenario) as endpoints:
         home = tmp_path / "rust-preview"
