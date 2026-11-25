@@ -527,6 +527,56 @@ def test_mcp_install_dry_run_redacts_endpoint_query(
     assert entry["args"] == list(command[1:])
 
 
+def test_mcp_install_redacts_custom_launcher_credentials(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    _, rust = wave_clis
+    overrides = {"PATH": os.defpath}
+    seed_clients(tmp_path, overrides, "empty")
+    prefix = ("--json", "mcp", "install", "claude")
+    args = [
+        "--token=synthetic-token-value",
+        "--CLIENT_SECRET",
+        "synthetic-client-secret",
+        "--api-key",
+        "-synthetic-key-value",
+        "--bearer-token=https://fixture.invalid/synthetic-private",
+        "--header=Authorization: Bearer synthetic-header-value",
+        "--refreshToken",
+        "synthetic-refresh-token",
+        "--label",
+        "public-label",
+    ]
+    command = (str(tmp_path / "bin/sai"), "mcp", "serve", *args)
+    for flags in (("--dry-run",), ()):
+        run = run_cli(
+            rust, tmp_path, *prefix, *flags, "--", *command, overrides=overrides
+        )
+        assert run.returncode == 0
+        assert "synthetic-" not in run.stdout + run.stderr
+        [result] = json.loads(run.stdout)["results"]
+        public = [
+            "--token=[redacted]",
+            "--CLIENT_SECRET",
+            "[redacted]",
+            "--api-key",
+            "[redacted]",
+            "--bearer-token=[redacted]",
+            "--header=[redacted]",
+            "--refreshToken",
+            "[redacted]",
+            "--label",
+            "public-label",
+        ]
+        assert result["command"][3:] == public
+        assert result["argv"][0][-len(public) :] == public
+        if flags:
+            assert not (tmp_path / ".claude.json").exists()
+
+    entry = json.loads((tmp_path / ".claude.json").read_text())["mcpServers"]["sai"]
+    assert entry["args"] == list(command[1:])
+
+
 @pytest.mark.parametrize("kind", ["cwd", "remote"])
 def test_mcp_install_reports_claude_extra_fields(
     wave_clis: tuple[str, str], tmp_path: Path, kind: str

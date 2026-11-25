@@ -132,12 +132,46 @@ impl Target {
 }
 
 fn reported_argv(args: &[String]) -> Vec<String> {
+    let mut redact_next = false;
     args.iter()
         .map(|arg| {
             let (flag, value) = arg
                 .split_once('=')
                 .filter(|(flag, _)| flag.starts_with('-'))
                 .map_or((None, arg.as_str()), |(flag, value)| (Some(flag), value));
+            let name = flag.unwrap_or(arg);
+            let credential = name.starts_with('-')
+                && name.split(['-', '_', '.']).any(|part| {
+                    let part = part.to_ascii_lowercase();
+                    matches!(
+                        part.as_str(),
+                        "auth"
+                            | "authorization"
+                            | "bearer"
+                            | "cookie"
+                            | "cookies"
+                            | "credential"
+                            | "credentials"
+                            | "creds"
+                            | "header"
+                            | "headers"
+                            | "key"
+                            | "passphrase"
+                            | "passwd"
+                            | "apikey"
+                            | "accesskey"
+                            | "privatekey"
+                            | "sessionkey"
+                    ) || ["password", "secret", "token"]
+                        .iter()
+                        .any(|suffix| part.ends_with(suffix))
+                });
+            if std::mem::replace(&mut redact_next, credential && flag.is_none()) {
+                return "[redacted]".into();
+            }
+            if credential && let Some(flag) = flag {
+                return format!("{flag}=[redacted]");
+            }
             if ["http://", "https://", "ws://", "wss://"]
                 .iter()
                 .any(|scheme| {
