@@ -1564,7 +1564,7 @@ def check_claude_differences(
     disabled = False
     profile = target.env.get("SAI_HOME") if target is not None else None
     for name, reg in found:
-        if reg.disabled:
+        if name == NAME and reg.disabled:
             disabled = True
             differences.append(
                 f"{reg.scope} {name}: Claude Code has disabled this registration"

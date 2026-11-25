@@ -294,9 +294,9 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
         assert claude["status"] == "fail" and claude["changes"] == []
         repair_entry = {"scope": scope, "name": name}
         if legacy:
-            assert claude["disabled"] is True
-            assert "manualRepairs" not in claude
-            commands = []
+            commands = [
+                f"sai mcp install --client claude --scope {scope} --repair-existing {name}"
+            ]
         else:
             repair_entry["replaceEntry"] = True
             repair_entry["launcher"] = str(tool.sai)
@@ -309,19 +309,15 @@ def test_update_repairs_mcp_after_verification(uv_dirs, monkeypatch, mode):
                     f" --env=SAI_HOME={uv_dirs / 'sai-home'} -- {tool.sai} mcp serve"
                 ),
             ]
-            assert claude["manualRepairs"] == [repair_entry]
-            assert all(command in claude["fix"] for command in commands)
+        assert claude["manualRepairs"] == [repair_entry]
+        assert all(command in claude["fix"] for command in commands)
         assert state["result"]["mcp"] == repair[0]["clients"]
         if legacy:
             clients = {client["client"]: client for client in repair[0]["clients"]}
             assert set(clients) == {"claude", "codex", "cursor"}
             assert all(client["legacyName"] == name for client in clients.values())
             assert f"kept the existing {name} name" in result.stdout
-        message = (
-            "Claude Code has disabled a Sai MCP registration."
-            if legacy
-            else "Claude Code MCP registrations need manual repair."
-        )
+        message = "Claude Code MCP registrations need manual repair."
         if background:
             assert result.output == ""
             notices: list[str] = []
