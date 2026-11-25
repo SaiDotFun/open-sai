@@ -207,6 +207,7 @@ def update_loopback(mode: str) -> Generator[Endpoints]:
                     "stale": "85",
                     "liquidation": "85",
                     "cap-missing-height": "85",
+                    "cap-wrong-height": "85",
                     "short-liquidation": "110",
                 }.get(mode, "99"),
                 "base_last_update_time": 995,
@@ -577,30 +578,10 @@ def test_position_update_dry_run(
     assert outputs[0] == outputs[1]
 
 
-def test_pair_cap_fallback_requires_the_pinned_height(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path
-) -> None:
-    # Keep rejecting a response that names a different block.
-    _, rust = cli_pair
-    with update_loopback("cap-wrong-height") as endpoints:
-        seed_home(tmp_path / "rust", endpoints, "session")
-        code, output, stderr = run(
-            rust, tmp_path / "rust", endpoints, (*LEVERAGE, "--dry-run"), python=False
-        )
-        assert (code, stderr) == (0, "")
-        assert output["estimates"] == dict.fromkeys(
-            estimates({}), unavailable(UNKNOWN_LEVERAGE)
-        )
-        assert [request.label for request in endpoints.wire] == QUOTE_WIRE[
-            :-1
-        ] + LEVERAGE_WIRE
-        assert not endpoints.errors
-        assert not (tmp_path / "rust/sai/trader/intents.sqlite3").exists()
-
-
+@pytest.mark.parametrize("mode", ["cap-missing-height", "cap-wrong-height"])
 @pytest.mark.parametrize("confirmed", [False, True], ids=["direct", "confirmed"])
-def test_missing_pair_cap_without_height_still_checks_liquidation(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path, confirmed: bool
+def test_missing_pair_cap_still_checks_liquidation(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, confirmed: bool, mode: str
 ) -> None:
     args = LEVERAGE
     python = (str(Path(sys.executable).with_name("sai")),)
@@ -615,12 +596,12 @@ def test_missing_pair_cap_without_height_still_checks_liquidation(
             args = (*args, "--preview-digest", preview["previewDigest"])
     for index, cli in enumerate((python, cli_pair[1])):
         home = tmp_path / str(index)
-        with update_loopback("cap-missing-height") as endpoints:
+        with update_loopback(mode) as endpoints:
             seed_home(home, endpoints, "session")
             code, result, stderr = run(cli, home, endpoints, args, python=index == 0)
             assert not endpoints.errors
             assert all(entry.label != "recordUserIntent" for entry in endpoints.wire)
-            assert not (home / "sai/trader/intents.sqlite3").exists()
+            assert not rows(home)
             assert (code, stderr) == (4, "")
             error = result["error"]
             assert error["code"] == "PREVIEW_MISMATCH"
