@@ -25,7 +25,7 @@ use crate::settings::{self, Environment};
 
 use files::LogDir;
 use privacy::{Budget, EVENT_CHARS, prefix};
-pub use privacy::{Field, origin};
+pub use privacy::{Field, REDACTED, origin};
 use session_tokens::{FileStamp, Tokens, stamp};
 
 const QUEUE_SIZE: usize = 2048;
@@ -105,6 +105,19 @@ pub fn redact(home: &std::path::Path, text: &str) -> String {
     Tokens::default().refresh(home);
     let known = KNOWN.lock().unwrap_or_else(|error| error.into_inner());
     privacy::replace_tokens(text, &known)
+}
+
+/// Hide a whole display field if it contains a session token.
+pub fn session_field_redactor(home: &std::path::Path) -> impl Fn(&str) -> String {
+    Tokens::default().refresh(home);
+    let known = Arc::clone(&KNOWN.lock().unwrap_or_else(|error| error.into_inner()));
+    move |value| {
+        if known.iter().any(|secret| value.contains(secret.as_str())) {
+            REDACTED.into()
+        } else {
+            value.to_owned()
+        }
+    }
 }
 
 pub fn enabled(env: &Environment) -> bool {

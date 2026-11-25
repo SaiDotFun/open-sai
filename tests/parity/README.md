@@ -113,9 +113,13 @@ published Python release `sai-cli/v0.1.1` at commit
 `SHA256SUMS`, `scripts/install.py` from the pinned commit as `install.py`,
 and the commit SHA in a file named `commit`.
 
+Native MCP `auth_status` uses "Requested account" for disconnected addresses
+so an accidental URL in `addr` cannot reach the client transcript. The parity
+case rewrites that address in the pinned Python reference only.
+
 ## Compare MCP Stdio
 
-Check out Python commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` in a
+Check out Python commit `1c671b231b0fc968a44ec8dd520e67ea28e25b7f` in a
 separate directory. Use CPython 3.12, which preserves the tool description
 indentation recorded in the Rust inventory.
 
@@ -130,6 +134,12 @@ The transcript checks server initialization, ordered tool metadata,
 strict argument errors, and the JSON string in each successful response's
 `content` and `structuredContent`. It also replaces a fixture session
 between calls to check the trade refusal before argument validation.
+Auth cases check expiry, strict arguments, and active account changes
+from both MCP and a separate CLI process. They also check credential
+redaction and verify that an invalid account summary leaves selection intact.
+The wait transcript verifies exact Keeper request counts and the ledger for
+filled and still-pending intents. The inventory and validation cases cover
+overview and logs while their cores are pending.
 
 Native validation replies report the validation category and schema-defined
 field names. They omit submitted values and unknown field names. Until the

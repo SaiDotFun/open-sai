@@ -85,7 +85,6 @@ class Case:
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
     mcp_deferred_trade_exception: bool = False
-    mcp_checkout_wire: list[str] | None = None
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -254,7 +253,8 @@ def mcp_exchange(
             deadline = time.monotonic() + 20
             try:
                 requests = [
-                    (request, None, False) for request in handshake(case.mcp_protocol)
+                    (request, None, None, False)
+                    for request in handshake(case.mcp_protocol)
                 ]
                 if case.mcp_calls is None:
                     calls = CALLS[case.mcp_profile]
@@ -263,11 +263,17 @@ def mcp_exchange(
                             (
                                 DEFERRED_TRADE_PROBE.request(3 + len(calls), endpoints),
                                 None,
+                                None,
                                 True,
                             )
                         )
                     requests.extend(
-                        (call.request(id_, endpoints), call.session, False)
+                        (
+                            call.request(id_, endpoints),
+                            call.session,
+                            call.switch_active,
+                            False,
+                        )
                         for id_, call in enumerate(calls, 3)
                     )
                 else:
@@ -277,15 +283,25 @@ def mcp_exchange(
                         (
                             {"id": id_, "method": "tools/call", "params": call},
                             None,
+                            None,
                             False,
                         )
                         for id_, call in enumerate(case.mcp_calls, 2)
                     )
-                for request, session, probe in requests:
+                for request, session, switch_active, probe in requests:
                     if session is not None:
                         write_seed(
                             home, endpoints, [session_fixture(endpoints, session)]
                         )
+                    if switch_active is not None:
+                        result = invoke(
+                            binary,
+                            ["auth", "use", endpoints.expand(switch_active)],
+                            home,
+                            env,
+                        )
+                        if result.returncode != 0:
+                            raise ValueError("External fixture account switch failed")
                     wire = json.dumps({"jsonrpc": "2.0", **request}) + "\n"
                     proc.stdin.write(wire.encode())
                     proc.stdin.flush()
@@ -733,6 +749,8 @@ def check_mcp_calls(output: Any, profile: str) -> None:
             None if call.expected == "ok" else call.expected
         ):
             raise ValueError(f"{call.tool} expected MCP result {call.expected}")
+        if call.outcome is not None and text.get("outcome") != call.outcome:
+            raise ValueError(f"{call.tool} expected intent outcome {call.outcome}")
 
 
 def differences(reference: Observation, candidate: Observation) -> list[str]:
@@ -903,15 +921,6 @@ def expect_native_mcp_info(
         if not isinstance(value, dict) or value.get("name") != "sai":
             continue
         updates = {}
-        lcd = urlsplit(value["endpoints"]["lcd"])
-        # All replay URLs contain a per-run path. The explicit privacy case
-        # appends a synthetic credential to that path.
-        if re.fullmatch(r"/parity/[0-9a-f]{32}(?:/fixture-lcd-private)?", lcd.path):
-            updates["endpoints"] = {
-                **value["endpoints"],
-                "lcd": f"{lcd.scheme}://{lcd.netloc}",
-            }
-            reasons["Native MCP reports the LCD origin without the private path"] = None
         trading = value["trading"]
         if (
             allow_deferred_trade
@@ -930,6 +939,32 @@ def expect_native_mcp_info(
         result["content"][0]["text"].update(updates)
         result["_toolText"] = rewrite_mcp_fields(result["_toolText"], updates)
     return ", ".join(reasons) or None
+
+
+def project_reference_auth_status_errors(
+    output: list[dict[str, Any]], endpoints: Endpoints
+) -> str | None:
+    """Replace the rejected address that the pinned Python reply quotes."""
+    calls = CALLS["auth-status"]
+    replies = {frame["id"]: frame["result"] for frame in output}
+    changed = False
+    for id_, call in enumerate(calls, 3):
+        addr = call.args.get("addr")
+        if isinstance(addr, str) and call.expected == "SESSION_UNAVAILABLE":
+            result = replies[id_]
+            body = result["content"][0]["text"]
+            prefix = endpoints.expand(addr) + " is not connected;"
+            if body["error"].startswith(prefix):
+                error = (
+                    "Requested account is not connected;" + body["error"][len(prefix) :]
+                )
+                body["error"] = error
+                result["structuredContent"]["result"]["error"] = error
+                result["_toolText"] = rewrite_mcp_fields(
+                    result["_toolText"], {"error": error}
+                )
+                changed = True
+    return "Native MCP auth status omits disconnected addresses" if changed else None
 
 
 def expect_native_mcp_validation(
@@ -1066,8 +1101,6 @@ def run_case(
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints, cutover=cutover
         )
-        if rust and case.mcp_checkout_wire is not None:
-            candidate_case = replace(candidate_case, wire=case.mcp_checkout_wire)
         right, right_error = safe_observe(
             candidate_case,
             candidate,
@@ -1201,8 +1234,16 @@ def run_case(
                 allow_deferred_trade=case.mcp_deferred_trade_exception,
             )
             validation = expect_native_mcp_validation(left.output, case.mcp_profile)
+            auth_status = None
+            if case.mcp_profile == "auth-status":
+                auth_status = project_reference_auth_status_errors(
+                    left.output, endpoints
+                )
             expected = (
-                ", ".join(reason for reason in (expected, validation) if reason) or None
+                ", ".join(
+                    reason for reason in (expected, validation, auth_status) if reason
+                )
+                or None
             )
             diffs = differences(left, right)
     if reference_exit != case.expect:
@@ -1433,10 +1474,6 @@ def main() -> int:
             oracle = [c9a_python]
         else:
             oracle = reference
-        if (
-            args.cutover or (candidate is reference and oracle is reference)
-        ) and case.mcp_checkout_wire is not None:
-            case = replace(case, wire=case.mcp_checkout_wire)
         executable = oracle if candidate is reference else candidate
         if comparing_release:
             case = replace(

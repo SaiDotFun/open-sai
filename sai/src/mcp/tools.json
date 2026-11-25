@@ -149,7 +149,7 @@
   },
   {
     "name": "preview_open",
-    "description": "Preview opening a market, limit, or stop trade without submitting.\n\n    Show the user the result and get confirmation; trade_open then needs its\n    previewDigest. A market order preview sets requiresMarketPriceRefresh\n    and reports Keeper's current price as referencePrice: the submit uses\n    the price current at that time, and trade_open needs referencePrice too.\n\n    Args:\n        market_id: Market id from market_list.\n        side: long or short.\n        order_type: market, limit, or stop.\n        amount: Collateral in USD as a decimal string, at most 6 decimals.\n        leverage: Leverage as a decimal string, such as \"5\".\n        slippage: Maximum slippage percentage as a decimal string.\n        price: Trigger price, required for limit and stop. A market order\n            submits Keeper's current price instead.\n        take_profit: Optional take-profit price.\n        stop_loss: Optional stop-loss price.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "description": "Preview opening a market, limit, or stop trade without submitting.\n\n    Show the user the result and get confirmation; trade_open then needs its\n    previewDigest. Use estimates for execution fees, liquidation price, and\n    the worst-case fill. A market order reports Keeper's current price as\n    referencePrice. Submit refreshes the price and checks it against the\n    referencePrice from the preview.\n\n    Args:\n        market_id: Market id from market_list.\n        side: long or short.\n        order_type: market, limit, or stop.\n        amount: Collateral in USD as a decimal string, at most 6 decimals.\n        leverage: Leverage as a decimal string, such as \"5\".\n        slippage: Maximum slippage percentage as a decimal string. Must be\n            greater than 0 and at most 100. Use at most 18 decimal places.\n            Any digits after the 16th decimal place must be zero.\n        price: Trigger price, required for limit and stop. A market order\n            submits Keeper's current price instead.\n        take_profit: Optional take-profit price.\n        stop_loss: Optional stop-loss price.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
     "inputSchema": {
       "properties": {
         "market_id": {"title": "Market Id", "type": "integer"},
@@ -279,8 +279,39 @@
     "annotations": {"title": "Intent Log Trail", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
   },
   {
+    "name": "account_overview",
+    "description": "Read Sai funds, position risk, pending and queued orders, local blockers,\n    and session expiry. Check each section for its fetch time and any error.\n\n    Args:\n        addr: EVM addr (0x...). Defaults to the active account for this endpoint.\n    ",
+    "inputSchema": {
+      "properties": {
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"}
+      },
+      "title": "account_overviewArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "account_overviewOutput", "type": "object"},
+    "annotations": {"title": "Account Overview", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
+    "name": "intent_wait",
+    "description": "Wait up to 10 seconds for a final outcome and return an intent receipt.\n\n    If the outcome is unknown, call this tool again with the same key and\n    address. Keep using the original key for follow-up.\n\n    Args:\n        key: Intent key from a trade result or an OUTCOME_UNKNOWN error.\n        addr: EVM or Nibiru address. Defaults to the local intent account, then the active account.\n        timeout: Wait in seconds, capped at 10.\n    ",
+    "inputSchema": {
+      "properties": {
+        "key": {"title": "Key", "type": "string"},
+        "addr": {"anyOf": [{"type": "string"}, {"type": "null"}], "default": null, "title": "Addr"},
+        "timeout": {"default": 10.0, "title": "Timeout", "type": "number"}
+      },
+      "required": ["key"],
+      "title": "intent_waitArguments",
+      "type": "object",
+      "additionalProperties": false
+    },
+    "outputSchema": {"properties": {"result": {"title": "Result", "type": "string"}}, "required": ["result"], "title": "intent_waitOutput", "type": "object"},
+    "annotations": {"title": "Wait for Intent", "readOnlyHint": true, "destructiveHint": false, "idempotentHint": true, "openWorldHint": true}
+  },
+  {
     "name": "trade_open",
-    "description": "Submit an open-trade intent. Call preview_open with the same\n    arguments, show the user the preview, and get their explicit\n    confirmation first. `accepted` means Keeper admitted the intent, not\n    that it executed.\n\n    Refuses without submitting: PREVIEW_MISMATCH when the intent differs\n    from the confirmed preview, and, for a market order, PRICE_MOVED when\n    Keeper's current price moved from reference_price by more than the\n    slippage percent. Both return a new preview to show the user. Also\n    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or\n    pending. Check its key with intent_status before retrying.\n\n    Args:\n        market_id: Market id from market_list.\n        side: long or short.\n        order_type: market, limit, or stop.\n        amount: Collateral in USD as a decimal string, at most 6 decimals.\n        leverage: Leverage as a decimal string, such as \"5\".\n        slippage: Maximum slippage percentage as a decimal string.\n        price: Trigger price, required for limit and stop. A market order\n            submits Keeper's current price instead.\n        take_profit: Optional take-profit price.\n        stop_loss: Optional stop-loss price.\n        preview_digest: previewDigest from the confirmed preview_open.\n        reference_price: referencePrice from the confirmed preview_open;\n            required for market orders only.\n        allow_concurrent_open: True to submit while an earlier open is unknown\n            or accepted, after checking its status and getting confirmation for\n            another position. Any locally pending open on the same account and\n            Keeper still blocks submission, including a late acknowledgement\n            or an outcome that is still waiting to be indexed.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
+    "description": "Submit an open-trade intent. Call preview_open with the same\n    arguments, show the user the preview, and get their explicit\n    confirmation first. `accepted` means Keeper admitted the intent, not\n    that it executed.\n\n    Refuses without submitting: PREVIEW_MISMATCH when the intent differs\n    from the confirmed preview, and, for a market order, PRICE_MOVED when\n    Keeper's current price moved from reference_price by more than the\n    slippage percent. Both return a new preview to show the user. Also\n    RECENT_OPEN_PENDING when an earlier open is still unknown, accepted, or\n    pending. Check its key with intent_status before retrying.\n\n    Args:\n        market_id: Market id from market_list.\n        side: long or short.\n        order_type: market, limit, or stop.\n        amount: Collateral in USD as a decimal string, at most 6 decimals.\n        leverage: Leverage as a decimal string, such as \"5\".\n        slippage: Maximum slippage percentage as a decimal string. Must be\n            greater than 0 and at most 100. Use at most 18 decimal places.\n            Any digits after the 16th decimal place must be zero.\n        price: Trigger price, required for limit and stop. A market order\n            submits Keeper's current price instead.\n        take_profit: Optional take-profit price.\n        stop_loss: Optional stop-loss price.\n        preview_digest: previewDigest from the confirmed preview_open.\n        reference_price: referencePrice from the confirmed preview_open;\n            required for market orders only.\n        allow_concurrent_open: True to submit while an earlier open is unknown\n            or accepted, after checking its status and getting confirmation for\n            another position. Any locally pending open on the same account and\n            Keeper still blocks submission, including a late acknowledgement\n            or an outcome that is still waiting to be indexed.\n        addr: Connected account to act as (0x...). Defaults to the\n            active account.\n    ",
     "inputSchema": {
       "properties": {
         "market_id": {"title": "Market Id", "type": "integer"},

@@ -7,7 +7,7 @@ use url::Host;
 
 use crate::endpoint::Endpoint;
 
-const REDACTED: &str = "[redacted session token]";
+pub const REDACTED: &str = "[redacted session token]";
 const REDACTED_HEX: &str = "[redacted hex]";
 const REDACTED_URL: &str = "[redacted url]";
 pub(super) const REDACTED_INPUT: &str = "[redacted]";
