@@ -57,9 +57,10 @@ def python_v013() -> Path:
 class Stdio:
     initialize_result: dict[str, Any]
 
-    def __init__(self, proc: subprocess.Popen[bytes]):
+    def __init__(self, proc: subprocess.Popen[bytes], receive_timeout: float):
         self.proc = proc
         self.pending = bytearray()
+        self.receive_timeout = receive_timeout
 
     def write(self, raw: bytes) -> None:
         assert self.proc.stdin is not None
@@ -74,9 +75,11 @@ class Stdio:
             request["params"] = params
         self.write(json.dumps(request).encode())
 
-    def receive(self, timeout: float = 3) -> dict[str, Any]:
+    def receive(self, timeout: float | None = None) -> dict[str, Any]:
         assert self.proc.stdout is not None
-        deadline = time.monotonic() + timeout
+        deadline = time.monotonic() + (
+            self.receive_timeout if timeout is None else timeout
+        )
         while b"\n" not in self.pending:
             ready, _, _ = select.select(
                 [self.proc.stdout], [], [], max(0, deadline - time.monotonic())
@@ -106,6 +109,7 @@ def server(
     *,
     seed: str = "empty",
     logs: bool = False,
+    receive_timeout: float = 3,
 ) -> Iterator[Stdio]:
     seed_home(home, endpoints, seed)
     env = {**child_env(home, endpoints), "SAI_LOG": "1" if logs else "0"}
@@ -118,7 +122,7 @@ def server(
         stderr=subprocess.PIPE,
     ) as child:
         try:
-            stdio = Stdio(child)
+            stdio = Stdio(child, receive_timeout)
             stdio.send(
                 "initialize",
                 id_=1,
@@ -814,10 +818,10 @@ def test_overview_v013_partial_response_and_session_reload(
     native: Path, python_v013: Path, tmp_path: Path
 ) -> None:
     transcripts = []
-    with loopback("overview-partial") as endpoints:
-        for index, executable in enumerate((python_v013, native)):
+    with loopback("overview-partial", overview_delay=3.2) as endpoints:
+        for index, executable in enumerate((native, python_v013)):
             home = tmp_path / str(index)
-            with server(executable, home, endpoints) as stdio:
+            with server(executable, home, endpoints, receive_timeout=20) as stdio:
                 initialize = stdio.initialize_result
                 assert initialize["serverInfo"].pop("version")
                 stdio.send("tools/list", id_=2)

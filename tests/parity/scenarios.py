@@ -415,6 +415,7 @@ def loopback(
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
+    overview_delay: float = 0,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -1000,6 +1001,8 @@ def loopback(
                             interrupt_ready.set()
                             interrupt_closed.wait(8)
                         else:
+                            if name == "overviewTrades" and overview_delay:
+                                time.sleep(overview_delay)
                             self.reply(response)
                         return
                 if name == "recordUserIntent" and scenario.startswith("trade-"):
