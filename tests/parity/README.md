@@ -73,10 +73,9 @@ expiry in text and JSON against the native auth implementation from
 disable logging. The auth regression tests check output and log redaction
 directly, including Python MCP stdio responses.
 
-The matrix omits `auth-use-missing` while the native diagnostic quotes the
-unregistered operand. Python returns a fixed diagnostic and omits argument
-values from auth command logs. Native auth logging also differs from Python
-when the command includes an argument value.
+The `auth-use-missing` case checks the fixed diagnostic for an
+unregistered account. The auth privacy comparison checks that command logs
+contain only the command words.
 
 ## Compare MCP Stdio
 
@@ -162,6 +161,28 @@ contains one `unknown` row tied to the actual request before releasing the
 reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
+
+## Auth Argument Privacy Reference
+
+Set `SAI_PARITY_AUTH_PRIVACY_PYTHON` to the `.venv/bin/sai` from Python
+[PR #152](https://github.com/SaiDotFun/open-sai/pull/152) at commit
+`3725b66446da215f3e84e65ad9fce36679b80c20`. The CLI tests check the
+`auth use` diagnostic and the `command.start` arguments against that build.
+
+## C11 Python Reference
+
+The C11 parity fixes use Python tag `sai-cli/v0.1.2` at commit
+`8557a7e13dceab0accc369191182c8e01423c91b`. Install that checkout with
+`uv sync --locked` and point `SAI_PARITY_PYTHON` at its `.venv/bin/sai`.
+The Rust CI job runs these cases in a focused step using the v0.1.2
+checkout. Its broader comparison still uses the legacy C4 reference.
+
+```sh
+SAI_PARITY_PYTHON=/absolute/path/to/v0.1.2/.venv/bin/sai \
+SAI_PARITY_BIN=/absolute/path/to/rust/sai \
+  uv run --locked pytest tests/parity/test_intent_status.py \
+    -k 'c11 or watch_reports_rejected_upgrade'
+```
 
 ## Released Intent Status Cases
 

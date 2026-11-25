@@ -8,7 +8,21 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from release_mismatch import assert_release_equal
+
+
+@pytest.fixture
+def v012_reference(
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+) -> bool:
+    version = subprocess.run(
+        [*cli_pair[0], "--version"],
+        env={"HOME": str(tmp_path), "SAI_HOME": str(tmp_path / "version-home")},
+        cwd=tmp_path,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    return version.stdout.strip() == b"sai, version 0.1.2"
 
 
 def invoke(
@@ -77,7 +91,9 @@ def test_explicit_table_with_dotted_assignment(
 
 @pytest.mark.skipif(os.name != "posix", reason="requires Unix filesystem bytes")
 def test_non_utf8_home_json(
-    cli_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    v012_reference: bool,
 ) -> None:
     replies = []
     for index, cli in enumerate(cli_pair):
@@ -92,8 +108,8 @@ def test_non_utf8_home_json(
         ):
             result = invoke(cli, home, *args)
             data = reply(result, home)
-            if args == ("list",):
-                # The pinned Python reference predates origin-only endpoint output.
+            if args == ("list",) and not v012_reference:
+                # The legacy reference predates origin-only endpoint output.
                 settings = data["settings"]
                 assert isinstance(settings, dict)
                 data = {"settings": {"update.auto": settings["update.auto"]}}
@@ -107,7 +123,10 @@ def test_non_utf8_home_json(
 @pytest.mark.skipif(os.name != "posix", reason="requires Unix environment bytes")
 @pytest.mark.parametrize("setting", ["SAI_ENDPOINT", "SAI_LOG"])
 def test_undecodable_environment(
-    cli_pair: tuple[tuple[str, ...], tuple[str, ...]], tmp_path: Path, setting: str
+    cli_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    v012_reference: bool,
+    setting: str,
 ) -> None:
     observed = []
     for index, cli in enumerate(cli_pair):
@@ -124,20 +143,21 @@ def test_undecodable_environment(
         observed.append((result.returncode, result.stdout, result.stderr))
         assert not (home / "logs").exists()
     if setting == "SAI_ENDPOINT":
-        assert observed[0][0] == 2
-        assert observed[0][2] == observed[1][2] == b""
-        assert observed[0][1] == observed[1][1]
-        error = json.loads(observed[0][1])["error"]
+        python, rust = observed
+        # v0.1.2 classifies malformed endpoints as usage errors.
+        assert python[0] == (2 if v012_reference else 1)
+        assert rust[0] == 2
+        assert python[1:] == rust[1:]
+        assert rust[2] == b""
+        error = json.loads(rust[1])["error"]
         assert error["code"] == "INVALID_REQUEST"
         assert error["message"].startswith(
             "SAI_ENDPOINT: Invalid value for keeper.endpoint"
         )
-        assert_release_equal({"exit": observed[0][0]}, {"exit": observed[1][0]})
     else:
-        assert observed[0][:2] == observed[1][:2]
-        assert observed[0][2].startswith(b"SAI_LOG: invalid value for logs.enabled;")
-        assert observed[1][2].startswith(
-            b"SAI_LOG: Invalid value for logs.enabled: expected true, false,"
+        assert observed[0] == observed[1]
+        assert observed[0][2] == (
+            b"SAI_LOG: invalid value for logs.enabled; logging is off until it is fixed\n"
         )
         assert observed[0][0] == 0
         assert json.loads(observed[0][1]) == {
