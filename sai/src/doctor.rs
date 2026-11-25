@@ -586,7 +586,7 @@ fn session_recovery(mut check: Check, command: Option<String>, guidance: Option<
     check
 }
 
-fn shell_quote(arg: &str) -> String {
+pub(crate) fn shell_quote(arg: &str) -> String {
     if !arg.is_empty()
         && arg
             .bytes()

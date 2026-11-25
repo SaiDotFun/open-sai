@@ -18,6 +18,8 @@ use sai_core::{
 };
 use serde_json::{Value, json};
 
+use crate::doctor::shell_quote;
+
 use client::{CodexLookup, Result as ClientResult, absolute, basename, resolved, which};
 
 const RETIRED_NAME: &str = "sai-mcp";
@@ -929,6 +931,30 @@ fn claude_check(issues: &[(&str, &Registration, &Stale)]) -> RegistrationCheck {
     result
 }
 
+fn private_server_args(args: &[String], placeholder: &str) -> Vec<String> {
+    let mut expects_value = false;
+    args.iter()
+        .map(|arg| {
+            if std::mem::take(&mut expects_value) {
+                return placeholder.to_owned();
+            }
+            let flag = arg.split_once('=').map_or(arg.as_str(), |(flag, _)| flag);
+            if matches!(flag, "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as") {
+                if flag.len() == arg.len() {
+                    expects_value = true;
+                    arg.clone()
+                } else {
+                    format!("{flag}={placeholder}")
+                }
+            } else if matches!(arg.as_str(), "mcp" | "serve" | "--json" | "--") {
+                arg.clone()
+            } else {
+                placeholder.to_owned()
+            }
+        })
+        .collect()
+}
+
 impl McpArgs {
     pub(crate) fn run(
         self,
@@ -1227,6 +1253,7 @@ impl Clients {
             return Ok(());
         }
         if client == Client::Claude && existing.is_some_and(|entry| entry.disabled) {
+            result.report.as_object_mut().expect("result object").remove("command");
             return Err(format!(
                 "Claude Code has disabled the {} sai registration. Review MCP approvals and settings in the client.",
                 scope.name()
@@ -1245,13 +1272,17 @@ impl Clients {
             result.report["action"] = json!("unchanged");
             return Ok(());
         }
+        if client == Client::Claude && let Some(entry) = existing {
+            self.report_different_claude(entry, target, result);
+            return Ok(());
+        }
         let action = if existing.is_some() {
             "replaced"
         } else {
             "added"
         };
         let mut step = None;
-        if client == Client::Claude && existing.is_none() {
+        if client == Client::Claude {
             let exe = client
                 .executable()
                 .ok_or("`claude` is not on PATH")?
@@ -1281,8 +1312,6 @@ impl Clients {
         }
         if let Some(step) = step {
             client::run_step(&step, self.cwd(), deadline)?;
-        } else if let Some(old) = existing.filter(|_| client == Client::Claude) {
-            client.replace_claude(&self.home, self.cwd(), NAMES[0], target, old, deadline)?;
         } else {
             client.write(
                 scope,
@@ -1298,6 +1327,90 @@ impl Clients {
         self.verify(client, scope, NAMES[0], target, deadline)?;
         result.report["action"] = json!(action);
         Ok(())
+    }
+
+    fn report_different_claude(
+        &self,
+        entry: &Registration,
+        target: &Target,
+        result: &mut RegistrationResult,
+    ) {
+        const ARG: &str = "<original-argument>";
+        const PROFILE: &str = "<original-SAI_HOME>";
+        let scope = entry.scope.name();
+        let path = absolute(&Client::Claude.path(entry.scope, &self.home, self.cwd()));
+        let mut fields = Vec::new();
+        if entry.argv.first().is_none_or(|command| {
+            normalize_launcher(command) != normalize_launcher(&target.argv[0])
+        }) {
+            fields.push("command");
+        }
+        let args = entry.argv.get(1..).unwrap_or_default();
+        if args != &target.argv[1..] {
+            fields.push("args");
+        }
+        if !entry.stale_env.is_empty() || !entry.matches_profile(&target.profile) {
+            fields.push("env");
+        }
+        fields.extend(&entry.extra);
+        let label = format!("{scope} sai entry");
+        let mut fix = format!("The {label} in {} differs", path.display());
+        if !fields.is_empty() {
+            fix.push_str(&format!(" in {}", fields.join(", ")));
+        }
+        fix.push('.');
+
+        let launcher = if target.explicit {
+            which("sai").map(|path| absolute(&path)).or_else(|| env::current_exe().ok())
+        } else {
+            Some(PathBuf::from(&target.argv[0]))
+        };
+        if let Some(launcher) = launcher.filter(|path| path.is_absolute()) {
+            let launcher = launcher.to_string_lossy();
+            let profile = if entry.invalid_profile {
+                None
+            } else if entry.profile.is_none() || entry.profile == target.profile {
+                target.profile.as_deref()
+            } else {
+                Some(PROFILE)
+            };
+            let prefixed = prepend_serve(args);
+            let args = if !serves_mcp(args) && serves_mcp(&prefixed) {
+                &prefixed
+            } else {
+                args
+            };
+            let args = private_server_args(args, ARG);
+            let extra_env = entry.stale_env.len() + usize::from(entry.invalid_profile);
+            if profile == Some(PROFILE) || extra_env != 0 || args.iter().any(|arg| arg.contains(ARG)) {
+                fix.push_str("\nFill in the placeholders from the existing config before removing the entry. You can edit just the launcher in the config to keep those settings in place.");
+            }
+            let add = ["claude", "mcp", "add", "--scope", scope, NAMES[0]]
+                .into_iter()
+                .map(str::to_owned)
+                .chain(profile.map(|profile| format!("--env=SAI_HOME={profile}")))
+                .chain(std::iter::repeat_n("--env=<NAME>=<value>".to_owned(), extra_env))
+                .chain(["--".to_owned(), launcher.to_string()])
+                .chain(args)
+                .map(|arg| shell_quote(&arg))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let launcher = shell_quote(&launcher);
+            fix.push_str(&format!(
+                "\nRun `test -f {launcher} && test -x {launcher}` before removing the entry. Continue only if it succeeds.\nRemove the existing {label} in Claude from the project directory you normally use, then run `{add}`."
+            ));
+        } else {
+            fix.push_str(" Run `sai doctor` for current replacement instructions.");
+        }
+        if target.explicit {
+            fix.push_str(" For a custom launcher, substitute your requested command after -- and use its executable in the check.");
+        }
+        result.report.as_object_mut().expect("result object").remove("command");
+        result.report["path"] = json!(path);
+        result.report["fix"] = json!(fix);
+        result.failed(format!(
+            "The existing {scope} Claude Code sai registration differs from the requested settings"
+        ));
     }
 
     fn legacy_install(
@@ -1366,7 +1479,19 @@ fn finish(results: Vec<RegistrationResult>, json_output: bool) -> Result<(), Sai
         }
         lines.join("\n")
     } else {
-        serde_json::to_string_pretty(&summary).expect("JSON value")
+        let mut text_summary = summary.clone();
+        let mut hints = Vec::new();
+        for row in text_summary["results"].as_array_mut().expect("JSON results") {
+            if let Some(Value::String(fix)) = row.as_object_mut().expect("result object").remove("fix") {
+                hints.push(fix);
+            }
+        }
+        let mut text = serde_json::to_string_pretty(&text_summary).expect("JSON value");
+        for fix in hints {
+            text.push('\n');
+            text.push_str(&fix);
+        }
+        text
     };
     for (row, result) in summary["results"]
         .as_array_mut()

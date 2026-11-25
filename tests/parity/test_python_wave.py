@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from mcp_clients import SECRET, seed_clients
 
 
 @pytest.fixture
@@ -70,3 +71,39 @@ def test_invalid_update_environment_exits_2(
         else:
             assert not result.stdout
             assert message in result.stderr
+
+
+@pytest.mark.parametrize("dry_run", [(), ("--dry-run",)], ids=["apply", "dry-run"])
+def test_install_reports_differing_claude_entry(
+    wave_clis: tuple[str, str], tmp_path: Path, dry_run: tuple[str, ...]
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        home.mkdir()
+        overrides = {"PATH": os.defpath}
+        original = seed_clients(home, overrides, "retired")
+        result = run_cli(
+            binary,
+            home,
+            "--json",
+            "mcp",
+            "install",
+            "claude",
+            *dry_run,
+            overrides=overrides,
+        )
+        assert (home / ".claude.json").read_bytes() == original[".claude.json"]
+        assert not (home / "argv.jsonl").exists()
+        assert result.returncode == 1
+        assert SECRET not in result.stdout + result.stderr
+        assert "token=private" not in result.stdout + result.stderr
+        details = json.loads(result.stdout)["error"]["details"]
+        assert details["reconnectNeeded"] is False
+        [report] = details["results"]
+        assert report["action"] == "failed"
+        assert report["changed"] is False
+        assert report["scope"] == "user"
+        assert report["path"] == str(home / ".claude.json")
+        assert "differs in command, args, env." in report["fix"]
+        assert "test -f" in report["fix"]
+        assert "claude mcp add --scope user sai" in report["fix"]

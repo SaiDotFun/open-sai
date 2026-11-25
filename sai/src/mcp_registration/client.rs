@@ -26,7 +26,7 @@ pub(super) enum CodexLookup {
 }
 
 enum JsonUpdate<'a> {
-    Install(Option<&'a Registration>),
+    Install,
     Repair(&'a Registration),
 }
 
@@ -151,7 +151,7 @@ impl Client {
             })
             .map(|_| ());
         }
-        let update = old.map_or(JsonUpdate::Install(None), JsonUpdate::Repair);
+        let update = old.map_or(JsonUpdate::Install, JsonUpdate::Repair);
         self.write_json(&path, cwd, scope, name, target, update, deadline)
             .map(|_| ())
     }
@@ -269,29 +269,6 @@ impl Client {
         })
     }
 
-    pub(super) fn replace_claude(
-        self,
-        home: &Path,
-        cwd: &Path,
-        name: &str,
-        target: &Target,
-        old: &Registration,
-        deadline: Instant,
-    ) -> Result<()> {
-        let scope = old.scope;
-        let path = self.path(scope, home, cwd);
-        self.write_json(
-            &path,
-            cwd,
-            scope,
-            name,
-            target,
-            JsonUpdate::Install(Some(old)),
-            deadline,
-        )
-        .map(|_| ())
-    }
-
     #[allow(clippy::too_many_arguments)]
     fn write_json(
         self,
@@ -304,7 +281,7 @@ impl Client {
         deadline: Instant,
     ) -> Result<Option<PublishedConfig>> {
         let existing = match update {
-            JsonUpdate::Install(old) => old,
+            JsonUpdate::Install => None,
             JsonUpdate::Repair(old) => Some(old),
         };
         edit(path, existing.is_none(), deadline, |source| {
@@ -348,7 +325,7 @@ impl Client {
                     entry.insert("command".into(), Value::from(target.argv[0].clone()));
                     entry.insert("args".into(), serde_json::json!(target.argv[1..]));
                 }
-                JsonUpdate::Install(_) => {
+                JsonUpdate::Install => {
                     let mut entry =
                         serde_json::json!({"command": target.argv[0], "args": target.argv[1..]});
                     if self == Self::Claude {
