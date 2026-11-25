@@ -449,13 +449,11 @@ impl<'a> Trading<'a> {
             if let Some(update) = update {
                 return Err(self.update_refusal(account, update, error).await);
             }
-            if confirmed_preview.is_none()
+            if !mcp_confirmation
                 && let Some(fresh) = error
                     .details
                     .as_deref_mut()
                     .and_then(|details| details.get_mut("preview"))
-                && !preview.margin_change
-                && preview.intent.kind != "DECREASE_POSITION_SIZE"
             {
                 let mut replacement = preview.clone();
                 self.estimate_preview(
