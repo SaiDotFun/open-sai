@@ -1489,6 +1489,13 @@ def main() -> int:
             else None,
             row_label="C2_V011_ROW" if args.c2_v011 else "CUTOVER_ROW",
         )
+    current_gaps = None
+    if python_main and candidate is not reference:
+        current_gaps = ManifestGaps(
+            HERE / "python-main-gaps.toml",
+            case_ids={f"case:{case.name}" for case in selected} if args.case else None,
+            row_label="CURRENT_PYTHON_ROW",
+        )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
         if args.reference is not None:
@@ -1515,19 +1522,23 @@ def main() -> int:
                 accepted_divergence=None,
                 mcp_deferred_trade_exception=False,
             )
+        case_id = f"case:{case.name}"
+        current_gap = (
+            current_gaps is not None
+            and oracle is reference
+            and case_id in current_gaps.gaps
+        )
         diffs, listed, expected = run_case(
             case,
             oracle,
             executable,
-            cutover=comparing_release,
+            cutover=comparing_release or current_gap,
             python_main=python_main and oracle is reference,
             tool_evidence=evidence if gaps else None,
         )
         for tool, status in listed.items():
             if status != "LISTED" or tool not in tools:
                 tools[tool] = status
-        mismatches += bool(diffs)
-        expected_differences += bool(expected and not diffs)
         shown_args = [
             "<redacted>"
             if any(marker in arg for marker in case.absent_output_text or ())
@@ -1535,6 +1546,14 @@ def main() -> int:
             for arg in case.args
         ]
         command = f"`sai {shlex.join(shown_args)}` ({case.name})"
+        if current_gap and current_gaps is not None:
+            status, detail = current_gaps.result(case_id, diffs)
+            mismatches += status in {"DIFF", "XPASS"}
+            expected_differences += status == "XFAIL"
+            row(command, status, detail)
+            continue
+        mismatches += bool(diffs)
+        expected_differences += bool(expected and not diffs)
         if gaps:
             row(
                 command,
@@ -1573,7 +1592,8 @@ def main() -> int:
             print("Cutover could not verify an MCP inventory.")
             return 1
         return gaps.finish()
-    return int(bool(mismatches))
+    current_status = current_gaps.finish() if current_gaps is not None else 0
+    return int(bool(mismatches or current_status))
 
 
 if __name__ == "__main__":

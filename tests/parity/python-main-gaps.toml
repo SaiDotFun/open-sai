@@ -1,21 +1,38 @@
-# Python main behavior for the Rust port. The release manifest compares v0.1.2.
+# Reviewed Python main vs Rust comparisons for issue 231.
+# Leverage collateral and digest differences also run in test_position_update.py.
+# The text-only wait progress test runs in test_trade_wait.py.
 
-[gap.collateral-previews]
+[gap."case:account-balances"]
 owner = "#231"
-difference = "Leverage and margin dry runs show before and after collateral in USDC and oracle-valued USD in text and JSON. Margin adds can size the quote with --max-collateral-usd."
+title = "Python includes source block, age, and stale fields in balance snapshots."
+signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 
-[gap.market-symbol-and-table]
+[gap."case:account-balances-derived-endpoint"]
 owner = "#231"
-difference = "Trade open accepts case-insensitive market symbols and reports ambiguous IDs. Market list prints a symbol, ID, collateral, and price table in text mode."
+title = "Python includes balance freshness when the WebSocket endpoint is derived."
+signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 
-[gap.cancel-command]
+[gap."case:account-balances-no-subprotocol"]
 owner = "#231"
-difference = "Trade cancel and close --cancel-order share the dry run, digest confirmation, pending-order check, and wait path. Rust cancel already exists and still needs --preview-digest and matching help."
+title = "Python includes balance freshness when Keeper omits its WebSocket subprotocol."
+signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 
-[gap.balance-source-age]
+[gap."case:account-balances-redirect"]
 owner = "#231"
-difference = "Account overview and account balances show the source block and age, mark ages over five minutes stale, and report an unknown age when block time cannot be verified."
+title = "Python includes balance freshness after a WebSocket redirect."
+signature = "0c6c09717aa97c5866132f1e0020d745530d9da7f38155739014b3c2479aa160"
 
-[gap.trade-wait-progress]
+[gap."case:bare-help-trade-cancel"]
 owner = "#231"
-difference = "A text-mode trade --wait prints one stderr line before polling, then writes the receipt to stdout. JSON mode has no progress line."
+title = "Python cancel help includes digest confirmation."
+signature = "d96ba5f5a978b8e04e5593cf29e0e0c62b0bba07b17f7cc5b768f5037e390e68"
+
+[gap."case:trade-open-market-symbol"]
+owner = "#231"
+title = "Python resolves case-insensitive symbols using Keeper's USDC borrowing rows."
+signature = "b64337407377e1113dc12c29f0ef467a3b4f5c288cb62de3bd33a4f4313afc1c"
+
+[gap."case:trade-margin-capped-add"]
+owner = "#231"
+title = "Python sizes margin adds with --max-collateral-usd and shows the result."
+signature = "05e696687974b12350d127d3b85050843d23e824bb515f1a7ddf2a48e233a85c"

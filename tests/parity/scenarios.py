@@ -455,6 +455,9 @@ def loopback(
         market["price"] = market_price
     if scenario == "quote-null-price":
         market["price"] = None
+    if scenario == "market-symbol":
+        # Keep a single USDC market for BTC and retain its other collateral rows.
+        del recorded_markets[0]
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trader = {
