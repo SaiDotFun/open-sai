@@ -1,4 +1,4 @@
-"""Compare C7d dry runs with Python v0.1.2 at 8557a7e13dceab0accc369191182c8e01423c91b."""
+"""Compare trade estimates with Python main and the released signed-out preview."""
 
 from __future__ import annotations
 
@@ -18,12 +18,11 @@ OPEN_READS = (
     "borrowings oneClickTrading node_info get_market get_group "
     "get_pair_custom_max_leverage get_fees get_collateral_price"
 )
-POSITION_READS = (
-    "oneClickTrading node_info trade borrowing get_trade_raw get_exchange_balance "
-    "get_trade_raw get_perp_prices"
-)
-CLOSE_READS = POSITION_READS + " get_liquidation_price is_after_hours_market"
-STALE_READS = POSITION_READS + " get_market get_group block market_order_config"
+OWNER_READS = "trade oneClickTrading node_info get_trade_raw borrowing"
+POSITION_READS = OWNER_READS + " get_exchange_balance get_trade_raw get_perp_prices"
+FRESH_READS = POSITION_READS + " market_order_config get_market get_group"
+CLOSE_READS = FRESH_READS + " get_liquidation_price is_after_hours_market"
+STALE_READS = FRESH_READS + " block"
 
 
 @pytest.fixture
@@ -38,7 +37,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     ("args", "seed", "scenario", "wire", "status_field", "status"),
     [
         (OPEN, "empty", "quote-market", OPEN_READS, "fees", "estimate"),
-        (OPEN[:-2], "empty", "quote-market", OPEN_READS, "worstCaseFill", "estimate"),
+        (OPEN[:-2], "empty", "quote-market", OPEN_READS, "worstCaseFill", "bound"),
         (
             (*OPEN, "--type", "limit"),
             "empty",
@@ -81,12 +80,19 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             "fees",
             "unavailable",
         ),
-        (OPEN, "empty", "keeper-error", "borrowings", "worstCaseFill", "estimate"),
+        (
+            OPEN,
+            "empty",
+            "keeper-error",
+            "borrowings oneClickTrading",
+            "worstCaseFill",
+            "estimate",
+        ),
         (
             OPEN[:-2],
             "empty",
             "keeper-error",
-            "borrowings",
+            "borrowings oneClickTrading",
             "worstCaseFill",
             "unavailable",
         ),
@@ -97,7 +103,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             CLOSE,
             "session",
             "quote-close",
-            CLOSE_READS + " get_market get_fees",
+            CLOSE_READS + " get_fees",
             "execution",
             "voluntary_close",
         ),
@@ -105,7 +111,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             CLOSE,
             "session",
             "quote-close-fee-cap",
-            CLOSE_READS + " get_market get_fees",
+            CLOSE_READS + " get_fees",
             "fees",
             "estimate",
         ),
@@ -113,7 +119,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             CLOSE,
             "session",
             "quote-fee-read-error",
-            CLOSE_READS + " get_market get_fees",
+            CLOSE_READS + " get_fees",
             "fees",
             "unavailable",
         ),
@@ -121,7 +127,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             CLOSE,
             "session",
             "quote-liquidation",
-            POSITION_READS + " get_liquidation_price",
+            FRESH_READS + " get_liquidation_price",
             "execution",
             "would_liquidate",
         ),
@@ -137,7 +143,7 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             CLOSE,
             "session",
             "quote-after-hours",
-            CLOSE_READS + " get_market get_after_hours_leverage get_market get_fees",
+            CLOSE_READS + " get_market get_after_hours_leverage get_fees",
             "fees",
             "estimate",
         ),
@@ -149,7 +155,14 @@ def estimate_pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
             "execution",
             "would_be_rejected",
         ),
-        (CLOSE, "session", "quote-queued", STALE_READS, "execution", "unavailable"),
+        (
+            CLOSE,
+            "session",
+            "quote-queued",
+            POSITION_READS + " market_order_config",
+            "execution",
+            "unavailable",
+        ),
         (
             CANCEL,
             "session",
@@ -204,6 +217,8 @@ def test_dry_run_estimates(
     status_field: str,
     status: str,
 ) -> None:
+    if args != CLOSE or seed != "empty":
+        estimate_pair = (str(Path(sys.executable).with_name("sai")),), estimate_pair[1]
     outputs = []
     for index, cli in enumerate(estimate_pair):
         cli_args = (*CLOSE, "--cancel-order") if index == 0 and args == CANCEL else args
@@ -222,20 +237,12 @@ def test_dry_run_estimates(
             assert (completed.returncode, completed.stderr) == (0, b"")
             preview = json.loads(completed.stdout)
             assert preview["estimates"][status_field]["status"] == status
-            expected_wire = wire.split()
-            if index == 1 and wire.startswith(POSITION_READS):
-                # PR 148 validates both owners before reading market inputs.
-                expected_wire = [
-                    "trade",
-                    *expected_wire[:2],
-                    "get_trade_raw",
-                    "borrowing",
-                    *expected_wire[5:],
-                ]
-            assert [request.label for request in endpoints.wire] == expected_wire
+            assert [request.label for request in endpoints.wire] == wire.split()
             assert not endpoints.errors
             assert not rows(home)
-            outputs.append(OBSERVED_AT.sub(b'"observedAt": "<time>"', completed.stdout))
+            outputs.append(
+                json.loads(OBSERVED_AT.sub(b'"observedAt": "<time>"', completed.stdout))
+            )
     assert outputs[0] == outputs[1]
 
 
