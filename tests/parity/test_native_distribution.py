@@ -27,7 +27,6 @@ ROOT = Path(__file__).resolve().parents[2]
 BASELINE = "0.1.1"
 # Published full Python release, which predates the handoff to native Sai.
 BASELINE_COMMIT = "9ee5a356fd41a22697483e467652d367035909bd"
-MCP_PENDING = "Native MCP startup requires C8 (PR #120)"
 
 
 @pytest.fixture
@@ -43,9 +42,11 @@ def distribution(tmp_path: Path) -> SimpleNamespace:
         Path(archive_env).resolve(strict=True),
         Path(wheel_env).resolve(strict=True),
     )
-    match = re.fullmatch(r"sai_cli-(\d+\.\d+\.\d+)-py3-none-any\.whl", wheel.name)
-    assert match, "expected a stable sai-cli shim wheel"
-    version = match[1]
+    match = re.fullmatch(
+        r"sai_cli-(\d+\.\d+\.\d+)(?:rc(\d+))?-py3-none-any\.whl", wheel.name
+    )
+    assert match, "expected a sai-cli shim wheel"
+    version = f"{match[1]}-rc.{match[2]}" if match[2] else match[1]
     assert archive.name.startswith(f"sai-{version}-")
     uv = os.environ.get("UV") or shutil.which("uv")
     assert uv, "a real uv executable is required"
@@ -59,6 +60,7 @@ def distribution(tmp_path: Path) -> SimpleNamespace:
         archive=archive,
         wheel=wheel,
         version=version,
+        wheel_version=match[1] + (f"rc{match[2]}" if match[2] else ""),
         tool=tool,
         replay=replay,
         rehearsal=rehearsal,
@@ -84,23 +86,10 @@ def verify_mcp_startup(distribution: SimpleNamespace) -> None:
     d = distribution
     command = (d.tool.sai, "mcp", "serve")
     initialize = {"jsonrpc": "2.0", **d.rehearsal.MCP_REQUESTS[0]}
-    try:
-        with d.tool.stdio("Initialize native MCP", *command) as (send, receive):
-            send.write((json.dumps(initialize) + "\n").encode())
-            send.flush()
-            reply = json.loads(receive.line("MCP initialize"))
-    except (d.rehearsal.RehearsalError, BrokenPipeError):
-        # MCP registration is available before C8 adds the serve subcommand.
-        # Once the server module lands, a missing subcommand fails this test.
-        if not (ROOT / "sai" / "src" / "mcp.rs").is_file():
-            probe = d.tool.run("Check missing MCP command", *command, check=False)
-            if (
-                probe.returncode == 2
-                and not probe.stdout
-                and "No such command 'serve'." in probe.stderr
-            ):
-                pytest.xfail(MCP_PENDING)
-        raise
+    with d.tool.stdio("Initialize native MCP", *command) as (send, receive):
+        send.write((json.dumps(initialize) + "\n").encode())
+        send.flush()
+        reply = json.loads(receive.line("MCP initialize"))
     assert reply["jsonrpc"] == "2.0" and reply["id"] == initialize["id"]
     assert reply["result"]["protocolVersion"]
     assert reply["result"]["serverInfo"]["name"]
@@ -159,7 +148,7 @@ def test_shim_passes_the_launching_uv_prefix(
                 "--find-links",
                 d.wheel.parent,
                 "--from",
-                f"sai-cli=={d.version}",
+                f"sai-cli=={d.wheel_version}",
                 "sai",
             )
             probe = (
@@ -433,7 +422,7 @@ def test_native_shim_selects_exact_asset_and_reuses_it_offline(
                     "--find-links",
                     d.wheel.parent,
                     "--from",
-                    f"sai-cli=={d.version}",
+                    f"sai-cli=={d.wheel_version}",
                     "sai",
                     "--version",
                     env={**tool.env, "SAI_HOME": str(uvx_home)},
@@ -590,6 +579,8 @@ def test_published_python_updater_can_skip_bridge(
     distribution: SimpleNamespace,
     check: str,
 ) -> None:
+    if "-rc." in distribution.version:
+        pytest.skip("the published Python updater discovers stable releases")
     baseline_dir = os.environ.get("SAI_NATIVE_BASELINE")
     if not baseline_dir:
         pytest.skip(
