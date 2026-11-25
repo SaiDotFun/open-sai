@@ -260,12 +260,39 @@ def test_trade_integer_coercion(
         assert not endpoints.wire
 
 
+def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
+    label = "validation error" if len(issues) == 1 else "validation errors"
+    lines = [f"Error executing tool {tool}: {len(issues)} {label} for {tool}Arguments"]
+    for field, detail, category in issues:
+        if field is not None:
+            lines.append(field)
+        lines.extend(
+            (
+                f"  {detail} [type={category}]",
+                f"    For further information visit https://errors.pydantic.dev/2.14/v/{category}",
+            )
+        )
+    return "\n".join(lines)
+
+
 @pytest.mark.parametrize(
-    ("market_id", "code"),
-    [(1.5, "int_from_float"), ("3e0", "int_parsing"), ([], "int_type")],
+    ("market_id", "detail", "code"),
+    [
+        (
+            1.5,
+            "Input should be a valid integer, got a number with a fractional part",
+            "int_from_float",
+        ),
+        (
+            "3e0",
+            "Input should be a valid integer, unable to parse string as an integer",
+            "int_parsing",
+        ),
+        ([], "Input should be a valid integer", "int_type"),
+    ],
 )
 def test_trade_integer_rejections(
-    native: Path, tmp_path: Path, market_id: object, code: str
+    native: Path, tmp_path: Path, market_id: object, detail: str, code: str
 ) -> None:
     with (
         loopback("normal") as endpoints,
@@ -283,7 +310,14 @@ def test_trade_integer_rejections(
             preview_digest="fixture",
         )
         assert result["isError"] is True
-        assert f"[type={code}]" in result["content"][0]["text"]
+        assert result["content"] == [
+            {
+                "type": "text",
+                "text": validation_text("trade_open", ("market_id", detail, code)),
+            }
+        ]
+        assert "structuredContent" not in result
+        assert not endpoints.wire
 
 
 @pytest.mark.parametrize("offline", ["true", "YES", 1.0])
@@ -333,23 +367,53 @@ REJECTED_MARKER = "fixture-mcp-key"
 REJECTED_URL = f"//127.0.0.1:9/?api_key={REJECTED_MARKER}"
 
 
+EXTRA_ARGUMENT = (None, "Extra inputs are not permitted", "extra_forbidden")
+INVALID_ADDRESS = ("addr", "Input should be a valid string", "string_type")
+
+
 @pytest.mark.parametrize(
-    ("tool", "arguments", "field", "category"),
+    ("tool", "arguments", "issues"),
     [
-        ("account_positions", {REJECTED_URL: True}, None, "extra_forbidden"),
-        ("account_positions", {"extra": REJECTED_URL}, None, "extra_forbidden"),
-        ("account_positions", {"addr": [REJECTED_URL]}, "addr", "string_type"),
-        ("preview_close", {"extra": REJECTED_URL}, "trade_id", "missing"),
+        ("account_positions", {REJECTED_URL: True}, (EXTRA_ARGUMENT,)),
+        ("account_positions", {"extra": REJECTED_URL}, (EXTRA_ARGUMENT,)),
+        ("account_positions", {"addr": [REJECTED_URL]}, (INVALID_ADDRESS,)),
+        (
+            "account_positions",
+            {"addr": {"nested": [{"value": REJECTED_URL}]}},
+            (INVALID_ADDRESS,),
+        ),
+        (
+            "preview_close",
+            {"extra": REJECTED_URL},
+            (("trade_id", "Field required", "missing"), EXTRA_ARGUMENT),
+        ),
+        (
+            "preview_close",
+            {"trade_id": f"{REJECTED_MARKER}-" + "z" * 1024},
+            (
+                (
+                    "trade_id",
+                    "Input should be a valid integer, unable to parse string as an integer",
+                    "int_parsing",
+                ),
+            ),
+        ),
     ],
-    ids=["extra-name", "extra-value", "wrong-type-array", "missing-required"],
+    ids=[
+        "extra-name",
+        "extra-value",
+        "wrong-type-array",
+        "nested-object",
+        "missing-required",
+        "long-string",
+    ],
 )
 def test_validation_omits_rejected_input(
     native: Path,
     tmp_path: Path,
     tool: str,
     arguments: dict[str, Any],
-    field: str | None,
-    category: str,
+    issues: tuple[tuple[str | None, str, str], ...],
 ) -> None:
     with (
         loopback("normal") as endpoints,
@@ -358,14 +422,9 @@ def test_validation_omits_rejected_input(
         result = stdio.call(2, tool, **arguments)
         assert result["isError"] is True
         assert "structuredContent" not in result
-        assert len(result["content"]) == 1
-        text = result["content"][0]["text"]
-        assert f"[type={category}]" in text
-        if field is not None:
-            assert f"\n{field}\n" in text
-        assert REJECTED_MARKER not in json.dumps(result)
-        assert "input_value=" not in text
-        assert "input_type=" not in text
+        assert result["content"] == [
+            {"type": "text", "text": validation_text(tool, *issues)}
+        ]
         assert not endpoints.wire
 
 
