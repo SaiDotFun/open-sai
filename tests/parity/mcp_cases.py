@@ -114,12 +114,14 @@ CALLS = {
     ),
     "auth-list": (
         Call("auth_list"),
-        Call("auth_list", {"addr": "{addr}"}, "invalid"),
+        Call("auth_list", {"unexpected": REJECTED_AUTH_ADDRESS}, "invalid"),
         Call("auth_list", session="expired"),
     ),
     "auth-status": (
         Call("auth_status"),
         Call("auth_status", {"addr": False}, "invalid"),
+        Call("auth_status", {"addr": [REJECTED_AUTH_ADDRESS]}, "invalid"),
+        Call("auth_status", {"address": REJECTED_AUTH_ADDRESS}, "invalid"),
         Call("auth_status", {"addr": "{other_addr}"}, "SESSION_UNAVAILABLE"),
         Call("auth_status", {"addr": REJECTED_AUTH_ADDRESS}, "SESSION_UNAVAILABLE"),
         Call("auth_status", expected="SESSION_EXPIRED", session="expired"),
@@ -175,6 +177,8 @@ CALLS = {
     ),
     "refusals": (
         Call("auth_status", {"addr": False}, "invalid"),
+        Call("auth_status", {"addr": [REJECTED_AUTH_ADDRESS]}, "invalid"),
+        Call("auth_status", {"address": REJECTED_AUTH_ADDRESS}, "invalid"),
         Call("auth_status", expected="SIGNED_OUT"),
         Call("auth_list"),
         *(Call(tool, {"addr": None}, "SESSION_UNAVAILABLE") for tool in ACCOUNT_READS),
