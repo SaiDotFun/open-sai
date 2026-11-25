@@ -114,7 +114,7 @@ title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-lcd-unreachable"]
 owner = "M2-unassigned"
-signature = "ba22a760e735d939b6f5e596ec10f30171f7462b0d02cd7ff15d8a0819ce2ec4"
+signature = "fc7938ec16bf354bf498f3a83a4a6f01cbbde8030cc086dbcba3ca9e2441eebf"
 title = "Track the intentional redaction in Doctor LCD diagnostics"
 
 [gap."case:doctor-mcp-verification-failure"]
@@ -129,7 +129,7 @@ title = "Match the Doctor guidance for near-expiry sessions"
 
 [gap."case:doctor-network"]
 owner = "M2-unassigned"
-signature = "309e25b99b8efb63627781ba4aeda25b2244a5d14a27a38ef1ab5b98ff81dc21"
+signature = "dd6f5e283f17191e5a4eaa03e019aed598670f0aafdf3e675a2b2efa044218db"
 title = "Match v0.1.2 Doctor LCD endpoint display"
 
 [gap."case:doctor-network-with-logging"]
@@ -413,12 +413,12 @@ signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
 
 [gap."case:doctor-lcd-unknown-keeper-chain"]
 owner = "M2-unassigned"
-signature = "34cff04d762f5759ce8f6f6ea4b1f75b640abcf228d0d74766cd8d19a0ff7a33"
+signature = "e6ec97d71f6cee2c527fe20c3e7a9f80b5ead05caa31ddbb261a4f79b89af9fe"
 title = "Track Doctor LCD chain reporting against v0.1.2"
 
 [gap."case:doctor-lcd-chain-mismatch"]
 owner = "M2-unassigned"
-signature = "3d20a8c55dfb34687a1f9e6eb642b9a1033c53b60552f1308e0f46d0759f07b3"
+signature = "23569edde7d3daaf9624f14164a94c9fd13a75fe33ad763e067510bdb691db88"
 title = "Track Doctor LCD chain mismatch diagnostics against v0.1.2"
 
 [gap."case:doctor-lcd-chain-mismatch-text"]
@@ -428,7 +428,7 @@ title = "Track Doctor LCD chain text and reference-only log redaction"
 
 [gap."case:doctor-lcd-invalid-chain"]
 owner = "M2-unassigned"
-signature = "1f6a1f9dd9621746f6f02f408c591251ffe96cb199918a93cee03956e53e6ae7"
+signature = "09c419b5e0ffc64d07453c4583cd1bb617359f1922eecb8a0a1f82d789c38d7d"
 title = "Track Doctor invalid LCD chain exit behavior against v0.1.2"
 
 [gap."case:doctor-lcd-invalid-chain-text"]
