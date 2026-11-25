@@ -732,6 +732,43 @@ async fn confirmed_core_close_checks_oracle_age_before_reserving() {
 }
 
 #[tokio::test]
+async fn confirmed_core_leverage_checks_execution_before_reserving() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let preview = leverage_preview("7", "10").unwrap();
+    let digest = confirmed_digest(&trading, &session, &preview).await;
+    {
+        let mut state = server.state.lock().unwrap();
+        state.close_height_check_index = Some(7);
+        state.stale_oracle = true;
+    }
+
+    let error = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(&digest, None).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(error.code, Code::PreviewMismatch);
+    assert_eq!(
+        error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
+        "OraclePriceStale"
+    );
+    assert!(!server.requests().iter().any(|label| label == "admission"));
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
 async fn basic_trade_confirmation_checks_live_chain_and_contract() {
     let fixture: Value = serde_json::from_str(include_str!(
         "../../../tests/parity/route_trade_digest.json"

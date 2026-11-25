@@ -639,13 +639,18 @@ def test_position_update_submission(
     status: str,
 ) -> None:
     for implementation, cli in runners(cli_pair):
+        reads = (
+            QUOTE_WIRE[:-1] + LEVERAGE_WIRE + ["get_fees", "quote_trade"]
+            if command == LEVERAGE and implementation == "rust"
+            else UPDATE_WIRE
+        )
         home = tmp_path / implementation
         with update_loopback(mode) as endpoints:
             seed_home(home, endpoints, "session")
             actual, output, stderr = run(cli, home, endpoints, command, python=False)
             assert (actual, stderr) == (code, "")
             assert [entry.label for entry in endpoints.wire] == [
-                *UPDATE_WIRE,
+                *reads,
                 "recordUserIntent",
             ]
             request = endpoints.wire[-1].variables["input"]
@@ -676,18 +681,20 @@ def test_position_update_submission(
                 assert failure["error"]["code"] == "INVALID_REQUEST"
                 assert failure["error"]["intentKey"] == key
                 assert [entry.label for entry in endpoints.wire] == [
-                    *UPDATE_WIRE,
+                    *reads,
                     "recordUserIntent",
-                    *UPDATE_WIRE,
+                    *reads,
                 ]
                 assert len(rows(home)) == 1
                 reconcile = ("intent", "status", ADDRESS, "--key", key)
                 assert run(cli, home, endpoints, reconcile, python=False)[0] == 0
                 assert rows(home)[0][2:6] == ("terminal", "7", ADDRESS, "terminal")
                 assert run(cli, home, endpoints, command, python=False)[0] == 0
-                assert [entry.label for entry in endpoints.wire][-6:] == [
+                assert [entry.label for entry in endpoints.wire][
+                    -(len(reads) + 2) :
+                ] == [
                     "userIntents",
-                    *UPDATE_WIRE,
+                    *reads,
                     "recordUserIntent",
                 ]
                 assert [row[2] for row in rows(home)] == ["terminal", "accepted"]

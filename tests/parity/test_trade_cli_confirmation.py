@@ -31,8 +31,16 @@ def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         (OPEN, "quote-close-only", "OPEN_TRADE", "MarketClosed"),
         (LIMIT, "quote-close-only", "OPEN_TRADE", "MarketClosed"),
         (CLOSE, "quote-stale", "CLOSE_POSITION", "OraclePriceStale"),
+        (LEVERAGE, "quote-close-only", "UPDATE_TRADE", "MarketClosed"),
+        (LEVERAGE, "quote-stale", "UPDATE_TRADE", "OraclePriceStale"),
     ],
-    ids=["market-open", "limit-open", "full-close"],
+    ids=[
+        "market-open",
+        "limit-open",
+        "full-close",
+        "leverage-closed",
+        "leverage-stale",
+    ],
 )
 def test_unconfirmed_trade_checks_execution_before_reserving(
     pair: tuple[CLI, CLI],
