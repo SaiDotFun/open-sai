@@ -37,7 +37,6 @@ pub enum IntentCommand {
     /// List locally recorded intents for an account.
     Local { addr: String },
     /// Wait for an intent's final outcome and print its receipt.
-    #[command(arg_required_else_help = true)]
     Wait {
         #[arg(value_name = "KEY")]
         identity: String,

@@ -101,6 +101,30 @@ signature = "5219af5b19ddc2160975b3fdcad6f0369df5e397ce7c2b0d57bf68c5bb2e0264"
 owner = "#213"
 signature = "8fb1bd41d5d04c4e0773494c2ea1869c4bb8571f0c104785980e21412bde8b3b"
 
+[gap."case:bare-help-trade-close"]
+owner = "#172"
+signature = "4b5085fa692a60a3d657a2fbe43f9f05c1b57aee0e8b1b19fc0ae6b5762f6f09"
+
+[gap."case:bare-help-trade-leverage"]
+owner = "#172"
+signature = "14b94ef61ce07885cb7bd946f245ec9427eae58e6b35727ffdda7f61a2a8b46d"
+
+[gap."case:bare-help-trade-margin"]
+owner = "#172"
+signature = "cadaa68f93d602352a378bbfb2b30156db37b996d601e19895009fcd347ed557"
+
+[gap."case:bare-help-trade-open"]
+owner = "#172"
+signature = "506a4e0bdba44f16fb1acd77c043bdde7e84a10b9ea69d1a721585dd171e339a"
+
+[gap."case:bare-help-trade-partial-close"]
+owner = "#172"
+signature = "f353be375acdf87c430295b4baafd75cfc482fe318c1d2d1f0ce60356b8cf8a8"
+
+[gap."case:bare-help-trade-tpsl"]
+owner = "#172"
+signature = "b9f13a9e1fd1299b854d4a2d5f7e45cbea8951ebfb8064082cd4b922fea88f4e"
+
 [gap."case:config-invalid-value"]
 owner = "#211"
 signature = "8befeae2a987aa65a2566829ebf28e05ced3259ecdf79325204688e38b155385"
@@ -381,6 +405,18 @@ signature = "5ae8c49462c0c2a01cfe44d95295174f5bdfb9bfc2899af7198e98a42bd0de7d"
 owner = "#211"
 signature = "3befa3b1161431863c4ffc26972227acd032cca0133deaf4d7cc7861cb6d602a"
 
+[gap."case:trade-bare-group-json"]
+owner = "#172"
+signature = "756245c4c1189ce9cd300c9696329612a7c0a909d12bb8238e26a978feef6ee9"
+
+[gap."case:trade-bare-group-text"]
+owner = "#172"
+signature = "756245c4c1189ce9cd300c9696329612a7c0a909d12bb8238e26a978feef6ee9"
+
+[gap."case:trade-cancel"]
+owner = "#174"
+signature = "bbf14e7b57b265de818ea4686add9670147fe363ac3a314cc2a4ee2f3bbc79f0"
+
 [gap."case:trade-close"]
 owner = "#174"
 signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
@@ -395,19 +431,19 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-margin"]
 owner = "#140"
-signature = "8294c7f86e82cbcbb42c8e362365fc0d1442e05ca647eedb013e22e39a25a844"
+signature = "fb4d62d5792ed67060ceba1f880eb718999d9f65fb00857ddd6addfe3a86a325"
 
 [gap."case:trade-margin-accepted"]
 owner = "#174"
-signature = "4ab251d170a7e87927641906c6cc0c45eb9aa1053518667bc28ab53ce4ea5a82"
+signature = "a3060825112094e10969fa43db75eb358edbf8a4f997f16ed9aecff91e92849a"
 
 [gap."case:trade-margin-add-rounding"]
 owner = "#211"
-signature = "df345eb7e1f9755d4d85b34470500d4eddf5cc5805a1fbf6d5f36d13d63f1771"
+signature = "fe269d7a92bd28208a7cf6ed8286b6a7b19b13eb8985e813af87eb6c43fe5d3c"
 
 [gap."case:trade-margin-after-hours"]
 owner = "#211"
-signature = "88f9e0a83f9424ba2a6b2b246d4b52dc88ba495f1c4649e6b9892b39a967e16e"
+signature = "265de923e5b28619b0245af75dec82d1126d057443f5e7665ccdd25f6dec0795"
 
 [gap."case:trade-margin-amount-required"]
 owner = "#211"
@@ -419,7 +455,7 @@ signature = "3e39c6cc4d1f37a135e532a47b5a1e0dde6d6d73fd2e67e53b0933f340a0634b"
 
 [gap."case:trade-margin-equivalent-owner"]
 owner = "#211"
-signature = "8241e7099dfd739715e2ea40e61d384c36d69868945fa24c8bb3a89f0229083f"
+signature = "6b842ebc30bada8cd41aa9045ba28aebf0ff35b8677dc6f9befd9f8962264ac6"
 
 [gap."case:trade-margin-foreign-contract-owner"]
 owner = "#211"
@@ -447,11 +483,11 @@ signature = "c31c076f2a5480bc0a961f1f557b80545ac070b45ca9e508b916596bdb894d46"
 
 [gap."case:trade-margin-rejected"]
 owner = "#174"
-signature = "354b01df462b5334e96b2b9f26475f07efbc9747407c66b25a84dfd9f6599e91"
+signature = "1d33714dd23a06abaa909bb5e5d76016d764ffe619e576a4812ffdd953cb72a0"
 
 [gap."case:trade-margin-remove-rounding"]
 owner = "#211"
-signature = "56a7c585499ab97e6365204648fa80365b2b6476f83c34a501e96a94df4eefd4"
+signature = "8d39feef7fd3b14b135c18f3e19cb53cbf7cf56bb1e51b1387db300022397a44"
 
 [gap."case:trade-margin-signed-out-before-amount"]
 owner = "#211"
@@ -459,7 +495,7 @@ signature = "3290d000c84dce5128ae890bde3c57928de183ecd2c6dfdc33b37bbab775b414"
 
 [gap."case:trade-margin-unknown-blocks-retry"]
 owner = "#174"
-signature = "5ac8bce2374294aa9ab2db1bfe74393269132ae725a99c14277e709b99fd8cf2"
+signature = "51827945d31a077108bd9083d38ccfae47712825be2ae9009cd8191168826080"
 
 [gap."case:trade-margin-wrong-contract-index"]
 owner = "#211"
@@ -469,21 +505,41 @@ signature = "c806214752d145fb6c9b43b04de398c43e43446990e0f4fb334d84d0e736be0d"
 owner = "#211"
 signature = "6f14fe32d261f14c6bb0ff659fcdefe89f62840b9caf2a83fd2e383c8bb4ff7b"
 
+[gap."case:trade-open-market"]
+owner = "#174"
+signature = "3c5f48337554226c928feab80fac67ea1a5df8fd22a4c0bf7639bb5cb9339446"
+
+[gap."case:trade-open-missing-side-json"]
+owner = "#172"
+signature = "0e66dad3062babe8a8659d563845cbcf617f44ae3c1eb1e81b0feb55bc45a88c"
+
+[gap."case:trade-open-missing-side-text"]
+owner = "#172"
+signature = "0e66dad3062babe8a8659d563845cbcf617f44ae3c1eb1e81b0feb55bc45a88c"
+
+[gap."case:trade-open-missing-type-json"]
+owner = "#172"
+signature = "61313b81f4af139bb27ef9b7f77355143aa3fd54393c87e47eec75ed0258536c"
+
+[gap."case:trade-open-missing-type-text"]
+owner = "#172"
+signature = "61313b81f4af139bb27ef9b7f77355143aa3fd54393c87e47eec75ed0258536c"
+
 [gap."case:trade-partial-close"]
 owner = "#140"
-signature = "8846cf6a8cc6b2ab5cbbba0434f926ba97ce76424e5ea9f01bef1a9a8f966914"
+signature = "716a220eccf345288b43aa4a1008aa455f32662b5f0d11b772bb90ebfac86d9d"
 
 [gap."case:trade-partial-close-accepted"]
 owner = "#174"
-signature = "cb77e2fbc5bd9195220b15ef6c2f14b90d0412d4d5661cbc81949fe7655d9dd0"
+signature = "fbdac4583b85e25c5ac1d4e92838acfc076b0da3906038a5e8a606e4870dd038"
 
 [gap."case:trade-partial-close-after-hours"]
 owner = "#211"
-signature = "4d68faa24f7065e3c1e5b27895cf68725cb8b97668a9285e9acde48c79923b48"
+signature = "458428592069ed23461d9c0f18b074a9d87a44596f55a425f5444b3a4fbcf1b1"
 
 [gap."case:trade-partial-close-confirm-current-route"]
 owner = "#174"
-signature = "067a82ae290f31271f8dbfe31073e179f55e94bdf15c8915de9a118adf6fe327"
+signature = "f56030577aefb046dcae35899fac71e1e9b4b6c574846fd290114ef290eb453e"
 
 [gap."case:trade-partial-close-index-lag-before-minimum"]
 owner = "#211"
@@ -499,7 +555,7 @@ signature = "56a6650730701052d1895a5c7b06591a0faed6885b30a4a64b3f4e8d146e8c43"
 
 [gap."case:trade-partial-close-live-leverage-change"]
 owner = "#211"
-signature = "49704fbc7d31b9c09228d13bcac5c24e2ca0b4772e159ebd4be0af7241743af7"
+signature = "2dfce535971a46428d16a7917dc67eb38b82481903132023119a6faee87aaa67"
 
 [gap."case:trade-partial-close-malformed-percent"]
 owner = "#211"
@@ -515,15 +571,15 @@ signature = "2955e89e66e2dd56302bc826c0771aed6626d6f0d108208acf20a77f33c8d0ff"
 
 [gap."case:trade-partial-close-no-oracle"]
 owner = "#211"
-signature = "4a91f3c8408d0b7dc85726265590ab38700b9c4312b99041c7c4f584b773d479"
+signature = "09671abccf1e9fdfb2e0d4c1034d3e33d2449a9f3b803cb2afd35adaf3c39acb"
 
 [gap."case:trade-partial-close-refuse-stale-chain"]
 owner = "#174"
-signature = "fc1b9e4943c32866e288fe37dec81cf9a1e52f06fee0f421ba022eb641c2fe34"
+signature = "0213fc5df53fc85e0b6c1b7c8fb7b9eb2f927f3428751a2e9dd5e306c7e30e6c"
 
 [gap."case:trade-partial-close-refuse-stale-contract"]
 owner = "#174"
-signature = "fc1b9e4943c32866e288fe37dec81cf9a1e52f06fee0f421ba022eb641c2fe34"
+signature = "0213fc5df53fc85e0b6c1b7c8fb7b9eb2f927f3428751a2e9dd5e306c7e30e6c"
 
 [gap."case:trade-partial-close-refuse-wrong-lcd-on-confirm"]
 owner = "#174"
@@ -531,7 +587,7 @@ signature = "15b880ff6d30e09b3dd13222889d760bc53304aeb57e00436331a1a06acc73a3"
 
 [gap."case:trade-partial-close-rounding"]
 owner = "#211"
-signature = "212188d533aca5af8f2ae1f0b3eb491dcd77ebd2c16309aed841ffef5b60b004"
+signature = "9d9ebed968ac38cde5b621013ea2dc5c740b4234180268afbe5d7bf23de9284a"
 
 [gap."case:trade-partial-close-scientific-reduction"]
 owner = "#211"
@@ -539,11 +595,11 @@ signature = "239f76a3be30caf98fa3d5ed7716a23e0f36dcc0934cb4b833f4f5f4f0b6841d"
 
 [gap."case:trade-partial-close-unicode-percent"]
 owner = "#139"
-signature = "9f36eef91e3854f0af7e15fc8b1f8985fa0032949f19bbfcc5c3ae83db9c5480"
+signature = "ffaba9f1d2410e69746974d2d655c7d53671af6a9ae4836609cfc08d0dd2b9b3"
 
 [gap."case:trade-partial-close-unknown-blocks-retry"]
 owner = "#174"
-signature = "598ffbd09db6e607369d857e7ba4161c3481f7d97dac95f4591b652641a0f16d"
+signature = "76fea6c435428d0b2a503ed0d48d51dfeb42a66331202a4ec6dd34f278df275d"
 
 [gap."case:trade-tpsl"]
 owner = "#174"

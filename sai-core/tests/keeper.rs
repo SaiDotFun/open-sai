@@ -15,7 +15,7 @@ use sai_core::{
     keeper::{INTENTS, Keeper, MARKET, MARKETS, POSITION, ROUTE, SUBMIT},
     log::{EventContext, Surface},
     storage::{Session, Storage},
-    trade::{Confirmation, PositionAction, PositionMode, Trading},
+    trade::{Confirmation, PositionAction, PositionMode, SubmitOptions, Trading},
 };
 use serde_json::{Map, Value, json};
 use zeroize::Zeroizing;
@@ -301,6 +301,7 @@ async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
                         "get_exchange_balance" => json!({"collateral_index": "TokenIndex(1)"}),
                         "is_after_hours_market" => json!(false),
                         "get_collateral_price" => json!("1"),
+                        "get_perp_prices" => json!({"collateral": "1"}),
                         other => panic!("Unexpected LCD query: {other}"),
                     };
                     json!({"data": result})
@@ -337,7 +338,10 @@ async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
             &http,
             "7",
             action,
-            PositionMode::Submit(Some(confirmation)),
+            PositionMode::Submit(SubmitOptions {
+                confirmation: Some(confirmation),
+                ..SubmitOptions::default()
+            }),
         )
         .await;
     TcpStream::connect(socket)
