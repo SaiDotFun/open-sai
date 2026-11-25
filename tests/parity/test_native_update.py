@@ -66,7 +66,7 @@ def run():
     if args == ["--version"]:
         if FAIL == "replace-launcher" and in_stable:
             public.with_name("competitor").replace(public)
-        print(f"sai {VERSION}")
+        print(VERSION_OUTPUT)
     elif args == ["config", "get", "update.auto"]:
         print("true")
     elif args == ["mcp", "serve"]:
@@ -111,8 +111,18 @@ def main():
 """
 
 
-def executable(version: str, *, fail: str = "", forward: bool = False) -> str:
-    return f"VERSION = {version!r}\nFAIL = {fail!r}\nFORWARD = {forward!r}\n{MCP}"
+def executable(
+    version: str,
+    *,
+    fail: str = "",
+    forward: bool = False,
+    version_output: str | None = None,
+) -> str:
+    output = version_output if version_output is not None else f"sai {version}"
+    return (
+        f"VERSION = {version!r}\nVERSION_OUTPUT = {output!r}\n"
+        f"FAIL = {fail!r}\nFORWARD = {forward!r}\n{MCP}"
+    )
 
 
 def archive(version: str = NEW, *, fail: str = "", bad_entry: str = "") -> bytes:
@@ -140,11 +150,14 @@ def wheel(
     fail: str = "",
     forward: bool = False,
     cached: bool = False,
+    version_output: str | None = None,
 ) -> Path:
     wheel_version = version.replace("-rc.", "rc")
     filename = f"sai_cli-{wheel_version}-py3-none-any.whl"
     name = f"sai_cli-{wheel_version}.dist-info"
-    script = executable(version, fail=fail, forward=forward)
+    script = executable(
+        version, fail=fail, forward=forward, version_output=version_output
+    )
     entry = "run"
     if cached:
         entry = "main"
@@ -1047,6 +1060,35 @@ def cached_shim_release(
         **wheel_assets,
         **native_assets,
     }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize(
+    ("reported", "matches"), [("0.2.0rc1", True), ("0.2.0rc2", False)]
+)
+def test_uv_trial_checks_python_release_candidate_version(
+    standalone: NativeInstall, tmp_path: Path, reported: str, matches: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    target = "0.2.0-rc.1"
+    output = f"sai, version {reported}"
+    candidate = wheel(tmp_path, target, version_output=output)
+    local_assets = {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **assets(target, candidate.name, candidate.read_bytes()),
+    }
+    with releases(local_assets, tags=(target,)) as server:
+        result = install.update(server, "--to", target)
+    if matches:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert json.loads(result.stdout)["target"] == target
+        assert install.invoke("--version").stdout.strip() == output
+    else:
+        assert result.returncode == 1, result.stdout
+        assert (
+            f"did not report {target}" in json.loads(result.stdout)["error"]["message"]
+        )
+        assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")

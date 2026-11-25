@@ -31,6 +31,17 @@ pub(super) fn version(text: &str) -> Option<Version> {
         .filter(|version| version.build.is_empty())
 }
 
+pub(super) fn python_version(text: &str) -> Option<Version> {
+    version(text).or_else(|| {
+        let (base, rc) = text.split_once("rc")?;
+        let base = stable(base)?;
+        if rc.is_empty() || !rc.bytes().all(|digit| digit.is_ascii_digit()) {
+            return None;
+        }
+        version(&format!("{base}-rc.{rc}"))
+    })
+}
+
 pub(super) fn tag(version: &Version) -> String {
     format!("{TAG_PREFIX}{version}")
 }
