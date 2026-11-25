@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp_cases import TRADE_TOOLS
 from scenarios import ADDRESS, INTENT, Endpoints, child_env, loopback, seed_home
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
@@ -479,6 +480,46 @@ def test_rejected_arguments_are_logged_as_metadata(
     assert calls[0]["unknownArgumentMetadata"] == [{"type": "object", "length": 1}]
     assert calls[1]["arguments"] == {"trade_id": {"type": "number", "length": 1}}
     assert calls[2]["arguments"] == {"trade_id": string_metadata}
+
+
+def test_session_lookup_refusals_omit_submitted_addresses(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    credential = "fixture-opaque-session-lookup-credential"
+    error = (
+        "Requested account is not connected; run `sai auth list` to see connected "
+        "accounts, or sign in with `sai auth login NAME` or `sai auth import`, in a terminal."
+    )
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="session", logs=True) as stdio,
+    ):
+        for id_, tool in enumerate(TRADE_TOOLS, 2):
+            result = stdio.call(id_, tool, addr=credential)
+            assert result["isError"] is False
+            assert credential not in json.dumps(result)
+            assert json.loads(result["content"][0]["text"]) == {
+                "error": error,
+                "code": "SESSION_UNAVAILABLE",
+            }
+        assert not endpoints.wire
+
+        assert stdio.proc.stdin is not None
+        stdio.proc.stdin.close()
+        assert stdio.proc.wait(timeout=3) == 0
+        assert stdio.proc.stderr is not None
+        assert credential.encode() not in stdio.proc.stderr.read()
+
+    logs = (home / "sai" / "logs").glob("*.jsonl")
+    log_lines = [line for log in logs for line in log.read_text().splitlines()]
+    assert all(credential not in line for line in log_lines)
+    events = [json.loads(line) for line in log_lines]
+    results = [event for event in events if event["event"] == "mcp.tool_result"]
+    assert len(results) == len(TRADE_TOOLS)
+    assert {result["tool"] for result in results} == set(TRADE_TOOLS)
+    assert all(result["error"] == error for result in results)
+    assert all(result["code"] == "SESSION_UNAVAILABLE" for result in results)
 
 
 def test_local_ledger_read_while_keeper_reconciliation_is_busy(

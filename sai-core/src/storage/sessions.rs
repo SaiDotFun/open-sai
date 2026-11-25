@@ -25,6 +25,7 @@ const VERSION: u64 = 3;
 const AAD: &[u8] = b"sai-sessions-v3";
 const V2_AAD: &[u8] = b"sai-session-v2-test";
 const SIGN_IN_AGAIN: &str = "run `sai auth import` or `sai auth login NAME` again";
+const REQUESTED_ACCOUNT: &str = "Requested account";
 const NO_SESSION: &str = "No Sai session; run `sai auth import` or `sai auth login NAME`";
 
 /// A stored account session. Call `summary` to display it without the token.
@@ -164,6 +165,10 @@ impl Accounts {
     }
 
     fn find(&self, addr: &str) -> Result<String, SessionError> {
+        self.find_with_label(addr, addr)
+    }
+
+    fn find_with_label(&self, addr: &str, label: &str) -> Result<String, SessionError> {
         let key = addr.to_lowercase();
         if self.sessions.contains_key(&key) {
             Ok(key)
@@ -171,7 +176,7 @@ impl Accounts {
             Err(SessionError(SaiError::new(
                 Code::InvalidRequest,
                 format!(
-                    "{addr} is not connected; run `sai auth list` to see connected \
+                    "{label} is not connected; run `sai auth list` to see connected \
                  accounts, or sign in with `sai auth login NAME` or `sai auth import`"
                 ),
             )))
@@ -396,10 +401,23 @@ impl Storage<'_> {
     }
 
     pub fn load_session(&self, addr: Option<&str>) -> Result<Session, StorageError> {
+        self.load_session_with_label(addr, addr)
+    }
+
+    /// Read a session for an MCP tool without quoting its untrusted address argument.
+    pub fn load_session_for_mcp(&self, addr: Option<&str>) -> Result<Session, StorageError> {
+        self.load_session_with_label(addr, Some(REQUESTED_ACCOUNT))
+    }
+
+    fn load_session_with_label(
+        &self,
+        addr: Option<&str>,
+        label: Option<&str>,
+    ) -> Result<Session, StorageError> {
         let mut accounts = self.load_accounts()?;
         let key = if let Some(addr) = addr {
             accounts
-                .find(addr)
+                .find_with_label(addr, label.unwrap_or(addr))
                 .map_err(|error| SessionError(SaiError::new(Code::SignedOut, error.0.message)))?
         } else {
             accounts.active.take().ok_or_else(|| {
