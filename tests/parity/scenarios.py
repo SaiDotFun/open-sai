@@ -1560,6 +1560,16 @@ def loopback(
                 connection.recv(timeout=8)
                 errors.append("Balance read continued the subscription after SIGINT")
                 return
+            if scenario == "overview-balance-pings":
+                # Withhold the balance payload while keeping GraphQL traffic
+                # flowing. The client should close at its snapshot deadline.
+                while True:
+                    connection.send(json.dumps({"type": "ping"}))
+                    if json.loads(connection.recv(timeout=5)) != {"type": "pong"}:
+                        errors.append("Expected GraphQL pong")
+                        return
+                    wire.append(WireRequest("ws:pong"))
+                    time.sleep(1)
             payload = queue_payloads[name]
             if scenario == "ws-partial":
                 connection.send(json.dumps({"type": "ping"}))

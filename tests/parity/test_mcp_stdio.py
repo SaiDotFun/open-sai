@@ -939,6 +939,20 @@ def test_overview_rejects_malformed_fields_and_scrubs_text(
         assert not endpoints.errors
 
 
+def test_overview_balance_snapshot_deadline_survives_pings(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("overview-balance-pings") as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=26) as stdio,
+    ):
+        report = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        assert report["balances"]["error"]["code"] == "STREAM_ERROR"
+        assert report["positions"]["data"]["items"]
+        assert sum(request.label == "ws:pong" for request in endpoints.wire) >= 2
+        assert not endpoints.errors
+
+
 def write_intent_trail(home: Path, endpoints: Endpoints, count: int) -> dict[str, Any]:
     stamp = "2026-11-19T12:00:00.000Z"
     logs = home / "sai/logs"
