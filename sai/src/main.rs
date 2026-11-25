@@ -601,6 +601,11 @@ fn usage_error(error: &clap::Error, command: &str) -> Option<SaiError> {
                     return Some(error);
                 }
                 let option = first.split_whitespace().next()?;
+                if command == "trade open"
+                    && let Some(error) = trade::missing_open_option(option)
+                {
+                    return Some(error);
+                }
                 format!("Missing option {}.", repr(option))
             }
         }

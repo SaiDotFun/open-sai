@@ -1272,6 +1272,32 @@ expect = 2
 exact_output = true
 
 [[case]]
+name = "trade-open-missing-side-text"
+args = ["trade", "open", "--market", "1"]
+mode = "text"
+expect = 2
+exact_output = true
+
+[[case]]
+name = "trade-open-missing-side-json"
+args = ["--json", "trade", "open", "--market", "1"]
+expect = 2
+exact_output = true
+
+[[case]]
+name = "trade-open-missing-type-text"
+args = ["trade", "open", "--market", "1", "--side", "long"]
+mode = "text"
+expect = 2
+exact_output = true
+
+[[case]]
+name = "trade-open-missing-type-json"
+args = ["--json", "trade", "open", "--market", "1", "--side", "long"]
+expect = 2
+exact_output = true
+
+[[case]]
 name = "bare-help-trade-partial-close"
 args = ["trade", "partial-close"]
 mode = "text"

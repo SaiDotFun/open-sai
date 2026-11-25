@@ -123,6 +123,27 @@ enum OrderType {
     Stop,
 }
 
+pub fn missing_open_option(option: &str) -> Option<SaiError> {
+    match option {
+        "--side" => Some(missing_enum_option::<Side>(option)),
+        "--type" => Some(missing_enum_option::<OrderType>(option)),
+        _ => None,
+    }
+}
+
+fn missing_enum_option<T: ValueEnum>(option: &str) -> SaiError {
+    let choices = T::value_variants()
+        .iter()
+        .filter_map(ValueEnum::to_possible_value)
+        .map(|value| value.get_name().to_owned())
+        .collect::<Vec<_>>()
+        .join(",\n\t");
+    SaiError::usage(format!(
+        "Missing option {}. Choose from:\n\t{choices}",
+        repr(option)
+    ))
+}
+
 #[derive(Args)]
 pub struct Open {
     #[arg(long, allow_negative_numbers = true)]

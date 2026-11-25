@@ -186,3 +186,20 @@ def test_partial_input_reports_the_missing_parameter(
         assert partial.stdout == b""
         assert message.encode() in partial.stderr
         assert b"Options:" not in partial.stderr
+
+
+@pytest.mark.parametrize("options", [(), ("--side", "long")], ids=["side", "type"])
+@pytest.mark.parametrize("prefix", [(), ("--json",)], ids=["text", "json"])
+def test_trade_open_missing_choices_match_python(
+    binaries: tuple[str, str],
+    tmp_path: Path,
+    options: tuple[str, ...],
+    prefix: tuple[str, ...],
+) -> None:
+    python, rust = binaries
+    args = (*prefix, "trade", "open", "--market", "1", *options)
+    expected = invoke(python, tmp_path / "python", *args)
+    actual = invoke(rust, tmp_path / "rust", *args)
+    assert actual.returncode == expected.returncode == 2
+    assert actual.stdout == expected.stdout
+    assert actual.stderr == expected.stderr

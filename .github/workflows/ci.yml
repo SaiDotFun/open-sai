@@ -357,7 +357,8 @@ jobs:
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
         run: |
-          uv run --locked python tests/parity/parity.py --case 'bare-help-trade-*' --case 'trade-bare-group-*'
+          uv run --locked python tests/parity/parity.py \
+            --case 'bare-help-trade-*' --case 'trade-bare-group-*' --case 'trade-open-missing-*'
           uv run --locked pytest tests/parity/test_bare_command_parity.py
 
       - name: Check out the shared-state Python reference
