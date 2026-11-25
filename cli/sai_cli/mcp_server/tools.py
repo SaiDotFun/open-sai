@@ -661,7 +661,11 @@ def open_trade(
         return finish(load, dry_run, result)
     preview = {**result, "addr": load.account()}
     if preview["addr"] is not None:
-        return confirmation.with_digest(preview)
+        return (
+            confirmation.with_digest(preview)
+            if confirmation.is_confirmable(preview)
+            else preview
+        )
     preview["confirmationStatus"] = "informational"
     if estimates.rejection_reason(result.get("estimates", {})) is None:
         preview["recovery"] = {
