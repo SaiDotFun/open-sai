@@ -122,6 +122,23 @@ impl TradePreview {
         output
     }
 
+    /// Include only confirmations that the CLI can use to submit.
+    pub fn cli_preview_output(&self, account: Option<&str>) -> Value {
+        let mut output = self.output(account);
+        if let Some(route) = &self.position_route {
+            output["positionRoute"] = json!(route);
+            let execution = &output["estimates"]["execution"];
+            if self.position_owner_verified != Some(false)
+                && (!self.requires_market_price_refresh() || self.reference_price.is_some())
+                && execution["status"] != "would_be_rejected"
+                && execution["code"] != "OraclePublicationTimeUnknown"
+            {
+                output["previewDigest"] = json!(preview_digest(self, account));
+            }
+        }
+        output
+    }
+
     pub fn is_market_close(&self) -> bool {
         self.intent.kind == "CLOSE_POSITION"
     }

@@ -138,7 +138,7 @@ impl Trading<'_> {
         Ok(if confirmed {
             preview.confirmed_output(Some(addr))
         } else {
-            preview.output(Some(addr))
+            preview.cli_preview_output(Some(addr))
         })
     }
 

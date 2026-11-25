@@ -18,6 +18,7 @@ use super::{
 
 const UNKNOWN: &str = "Cannot verify the position and Perp liquidation inputs at one block.";
 const GUARDED: &str = "The after-hours guard can change or close this position.";
+const UNKNOWN_ORACLE_TIME: &str = "The oracle price publication time is unknown.";
 
 impl Trading<'_> {
     pub(super) async fn close_estimates(
@@ -60,6 +61,8 @@ impl Trading<'_> {
             if let Some(height) = state.verified_height(&lcd, &id).await? {
                 let quote_lcd = QuoteLcd::new(endpoint, state.route.contract_address.clone());
                 Self::quote_close(&quote_lcd, &lcd, &state, &id, &height, &mut result).await;
+            } else {
+                unknown_oracle_time(&mut result);
             }
             Ok(())
         };
@@ -96,46 +99,41 @@ impl Trading<'_> {
                 }}),
                 height,
             )
+            .await;
+        let prices = match prices {
+            Ok(prices) => prices,
+            Err(_) => return unknown_oracle_time(result),
+        };
+        let oracle = &prices["market"];
+        let Some(published_at) = publication_time(oracle) else {
+            return unknown_oracle_time(result);
+        };
+        let config = lcd
+            .smart(json!({"market_order_config": {}}), height)
             .await
             .ok()?;
-        let oracle = prices["market"].as_object()?;
-        let mut published_at = None;
-        for key in ["base_last_update_time", "quote_last_update_time"] {
-            if let Some(value) = oracle.get(key).filter(|value| !value.is_null()) {
-                let time = value.as_u64()?;
-                published_at = Some(published_at.map_or(time, |prior: u64| prior.min(time)));
+        if config["fill_at_next_oracle_price"].as_bool()? {
+            let queued = unavailable("Queued closes settle on a fresh oracle update.");
+            for value in result.as_object_mut()?.values_mut() {
+                *value = queued.clone();
             }
+            return Some(());
         }
-        let mut pair = None;
-        if let Some(time) = published_at {
-            let market = lcd.market(&raw["market_index"], height).await?;
-            let group = lcd.group(&market, height).await?;
-            let ttl = group["stale_price_expiration_secs"].as_u64()?;
-            if ttl > 0
-                && i128::from(lcd.block_timestamp(height?).await?) - i128::from(time)
-                    > i128::from(ttl)
-            {
-                let config = lcd
-                    .smart(json!({"market_order_config": {}}), height)
-                    .await
-                    .ok()?;
-                if config["fill_at_next_oracle_price"].as_bool()? {
-                    let queued = unavailable("Queued closes settle on a fresh oracle update.");
-                    for value in result.as_object_mut()?.values_mut() {
-                        *value = queued.clone();
-                    }
-                } else {
-                    let reason = "Perp rejects the close at the observed stale oracle price.";
-                    for value in result.as_object_mut()?.values_mut() {
-                        *value = unavailable(reason);
-                    }
-                    result["execution"] = json!({
-                        "status": "would_be_rejected", "code": "OraclePriceStale", "reason": reason,
-                    });
-                }
-                return Some(());
+        let pair = lcd.market(&raw["market_index"], height).await?;
+        let group = lcd.group(&pair, height).await?;
+        let ttl = group["stale_price_expiration_secs"].as_u64()?;
+        if ttl > 0
+            && i128::from(lcd.block_timestamp(height?).await?) - i128::from(published_at)
+                > i128::from(ttl)
+        {
+            let reason = "Perp rejects the close at the observed stale oracle price.";
+            for value in result.as_object_mut()?.values_mut() {
+                *value = unavailable(reason);
             }
-            pair = Some(market);
+            result["execution"] = json!({
+                "status": "would_be_rejected", "code": "OraclePriceStale", "reason": reason,
+            });
+            return Some(());
         }
 
         let threshold = lcd
@@ -191,14 +189,26 @@ impl Trading<'_> {
             COLLATERAL_ORACLE,
             Some(observed_at),
         )?;
-        let pair = match pair {
-            Some(pair) => pair,
-            None => lcd.market(&raw["market_index"], height).await?,
-        };
         let schedule = lcd.fees(&pair, height).await?;
         let notional = &collateral * effective / SCALE;
         let (_, fees) = base_fees(&schedule, &price, notional, false, false, Some(&collateral))?;
         result["fees"] = fees;
         Some(())
     }
+}
+
+fn publication_time(oracle: &Value) -> Option<u64> {
+    let times = ["base_last_update_time", "quote_last_update_time"]
+        .into_iter()
+        .filter_map(|key| oracle.get(key).filter(|value| !value.is_null()))
+        .map(Value::as_u64);
+    times.collect::<Option<Vec<_>>>()?.into_iter().min()
+}
+
+fn unknown_oracle_time(result: &mut Value) -> Option<()> {
+    for field in result.as_object_mut()?.values_mut() {
+        *field = unavailable(UNKNOWN_ORACLE_TIME);
+    }
+    result["execution"]["code"] = json!("OraclePublicationTimeUnknown");
+    Some(())
 }

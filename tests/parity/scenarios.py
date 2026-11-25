@@ -707,6 +707,15 @@ def loopback(
         contracts["get_fees"]["trigger_order_fee_p"] = "0.0007"
     if scenario == "quote-liquidation":
         contracts["get_liquidation_price"]["liquidation_price"] = "100"
+    if scenario in {
+        "quote-close",
+        "quote-close-fee-cap",
+        "quote-fee-read-error",
+        "quote-liquidation",
+        "quote-after-hours",
+    }:
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["get_group"]["stale_price_expiration_secs"] = 0
     if scenario in {"quote-stale", "quote-queued"}:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["get_group"]["stale_price_expiration_secs"] = 30

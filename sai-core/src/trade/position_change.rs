@@ -155,7 +155,7 @@ impl Trading<'_> {
             .await?;
         let PositionMode::Submit(options) = mode else {
             return Ok(match mode {
-                PositionMode::Preview => first.preview.confirmed_output(Some(addr)),
+                PositionMode::Preview => first.preview.cli_preview_output(Some(addr)),
                 _ => first.preview.output(Some(addr)),
             });
         };

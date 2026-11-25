@@ -479,7 +479,10 @@ pub fn run(
             session.as_ref(),
             PreviewMode::Cli,
         ))?;
-        local::emit(&preview.output(session.as_ref().map(Session::addr)), json)?;
+        local::emit(
+            &preview.cli_preview_output(session.as_ref().map(Session::addr)),
+            json,
+        )?;
         return Ok(ExitCode::Ok);
     }
     let session = session.ok_or_else(SaiError::internal)?;

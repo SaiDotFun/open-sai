@@ -99,6 +99,11 @@ impl Trading<'_> {
         if market_row.is_none() && self.lcd_endpoint.is_some() {
             market_row = self.open_market_row(preview, QUOTE_TIMEOUT).await.ok();
         }
+        if preview.position_route.is_none()
+            && let Some(endpoint) = self.lcd_endpoint
+        {
+            preview.position_route = self.position_route(&Lcd(endpoint), false).await.ok();
+        }
         let body = &preview.intent.body;
         let supplied = body["intentPrice"].as_str();
         let keeper_price = market_row
@@ -117,15 +122,25 @@ impl Trading<'_> {
             price.and_then(|price| Price::new(price, source, (source == KEEPER_PRICE).then(now)));
         let long = body["side"] == "long";
         let slippage = decimal(&body["maxSlippagePct"]).expect("validated slippage");
-        let fill = worst_case_fill(reference.as_ref(), long, slippage, market, mcp_market);
+        let market_bound = market && (mcp_market || preview.position_route.is_some());
+        let mut fill = worst_case_fill(reference.as_ref(), long, slippage, market, market_bound);
+        if market_bound && !mcp_market && fill["status"] == "bound" {
+            fill["assumption"] = json!("Submit with --preview-digest and the quoted --price.");
+        }
         let mut result = json!({
             "fees": unavailable(FEE_UNAVAILABLE),
             "liquidationPrice": unavailable("An entry price and opening fee estimate are required."),
             "worstCaseFill": fill,
         });
-        if let (Some(endpoint), Some(row)) = (self.lcd_endpoint, market_row.as_ref()) {
-            self.quote_open(endpoint, preview, row, reference.as_ref(), &mut result)
-                .await;
+        if let Some(endpoint) = self.lcd_endpoint {
+            self.quote_open(
+                endpoint,
+                preview,
+                market_row.as_ref(),
+                reference.as_ref(),
+                &mut result,
+            )
+            .await;
         }
         result
     }
@@ -134,29 +149,24 @@ impl Trading<'_> {
         &self,
         endpoint: &str,
         preview: &TradePreview,
-        row: &Value,
+        row: Option<&Value>,
         reference: Option<&Price>,
         result: &mut Value,
     ) -> Option<()> {
-        let token = json_index(row.get("collateralToken")?.get("id")?)?;
-        let contract = match &preview.position_route {
-            Some(route) => route.contract_address.clone(),
-            None => {
-                self.position_route(&Lcd(endpoint), false)
-                    .await
-                    .ok()?
-                    .contract_address
-            }
-        };
+        let contract = preview.position_route.as_ref()?.contract_address.clone();
         let lcd = lcd::QuoteLcd::new(endpoint, contract);
         let body = &preview.intent.body;
         let market = body["market"].get("marketIndex")?;
         let pair = lcd.market(market, None).await?;
         let pending = body["orderType"] != "market";
-        if pending && pair["market_trading_state"] == "close_only" {
-            *result = all_unavailable("Perp rejects pending opens while the market is close-only.");
+        if let Some(reason) = market_rejection(&pair, !pending) {
+            *result = all_unavailable(reason);
+            result["execution"] =
+                json!({"status": "would_be_rejected", "code": "MarketClosed", "reason": reason});
             return Some(());
         }
+        let row = row?;
+        let token = json_index(row.get("collateralToken")?.get("id")?)?;
         let group = lcd.group(&pair, None).await?;
         let minimum = decimal(&group["min_leverage"])?;
         let mut maximum = decimal(&group["max_leverage"])?;
@@ -258,19 +268,27 @@ fn all_unavailable(reason: &str) -> Value {
     json!({"fees": field, "liquidationPrice": field, "worstCaseFill": field})
 }
 
+fn market_rejection(pair: &Value, market: bool) -> Option<&'static str> {
+    match pair["market_trading_state"].as_str()? {
+        "close_only" => Some("Perp rejects this request in a close-only market."),
+        "closed" if market => Some("Perp rejects this request in a closed market."),
+        _ => None,
+    }
+}
+
 fn worst_case_fill(
     reference: Option<&Price>,
     long: bool,
     slippage: u128,
     market: bool,
-    mcp_market: bool,
+    market_bound: bool,
 ) -> Value {
     let Some(reference) = reference else {
         return unavailable("Keeper market price is unavailable.");
     };
     let mut price = BigUint::from(reference.units);
-    // MCP allows one move between preview and submission and one at execution.
-    for _ in 0..if mcp_market { 2 } else { 1 } {
+    // A confirmed market order allows a move before submission and at execution.
+    for _ in 0..if market_bound { 2 } else { 1 } {
         let distance = &price * slippage / (100 * SCALE);
         if long {
             price += distance;
@@ -279,7 +297,7 @@ fn worst_case_fill(
         }
     }
     json!({
-        "status": if market && !mcp_market { "estimate" } else { "bound" },
+        "status": if market && !market_bound { "estimate" } else { "bound" },
         "price": fixed(&price, 18),
         "side": if long { "maximum" } else { "minimum" },
         "reference": reference.output,

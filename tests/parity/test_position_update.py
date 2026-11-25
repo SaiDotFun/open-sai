@@ -396,14 +396,17 @@ def dry_run_bytes(cli: CLI, home: Path, endpoints: Endpoints, command: CLI) -> b
         check=False,
     )
     assert (result.returncode, result.stderr) == (0, b"")
-    liq = json.loads(result.stdout)["estimates"]["liquidationPrice"]
+    preview = json.loads(result.stdout)
+    # The older estimates reference predates CLI confirmations.
+    preview.pop("previewDigest", None)
+    preview.pop("positionRoute", None)
+    serialized = (json.dumps(preview) + "\n").encode()
+    liq = preview["estimates"]["liquidationPrice"]
     if entry := liq.get("entry"):
         observed_at = entry["observedAt"]
         assert timestamp(observed_at)
-        return result.stdout.replace(
-            json.dumps(observed_at).encode(), b'"<timestamp>"', 1
-        )
-    return result.stdout
+        return serialized.replace(json.dumps(observed_at).encode(), b'"<timestamp>"', 1)
+    return serialized
 
 
 @pytest.mark.parametrize(
