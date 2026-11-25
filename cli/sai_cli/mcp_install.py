@@ -347,12 +347,7 @@ def launcher_target(launcher: str, environ: Mapping[str, str]) -> Target:
 
 def server_env(environ: Mapping[str, str]) -> dict[str, str]:
     home = environ.get("SAI_HOME")
-    return {"SAI_HOME": absolute_sai_home(home)} if home else {}
-
-
-def absolute_sai_home(home: str, directory: Path | None = None) -> str:
-    path = Path(os.path.expanduser(home))
-    return os.path.abspath(path if directory is None else directory / path)
+    return {"SAI_HOME": os.path.abspath(os.path.expanduser(home))} if home else {}
 
 
 def server_target(
@@ -1548,6 +1543,7 @@ def check_claude_differences(
     differences = []
     manual = []
     disabled = False
+    profile = target.env.get("SAI_HOME") if target is not None else None
     for name, reg in found:
         if reg.disabled:
             disabled = True
@@ -1569,11 +1565,11 @@ def check_claude_differences(
             if expected is None:
                 manual.append("Install a stable Sai launcher on PATH.")
             else:
-                home = expected.env.get("SAI_HOME")
-                if home is not None and "${" not in home and not os.path.isabs(home):
-                    home = absolute_sai_home(
-                        home, client.scope_directory(reg.scope) or client.cwd
-                    )
+                home = profile
+                if not compare_profile and (
+                    reg.sai_home is not None or reg.invalid_sai_home
+                ):
+                    home = reg.sai_home
                 repairs.append(
                     ClaudeRepair(
                         reg.scope,

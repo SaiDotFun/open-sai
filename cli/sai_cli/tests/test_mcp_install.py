@@ -1536,13 +1536,22 @@ def test_update_commands_keep_the_profile_of_a_stale_claude_entry(env: Env):
 
 @pytest.mark.parametrize(
     "profile",
-    ["${HOME}/fixture profile", "${SAI_PROFILE:-fixture-profile}", "relative profile"],
+    [
+        "${HOME}/fixture profile",
+        "${SAI_PROFILE:-fixture-profile}",
+        "relative profile",
+        "",
+        None,
+    ],
 )
-def test_update_preserves_claude_profile_expressions(env: Env, profile: str):
+def test_update_keeps_the_saved_claude_profile(
+    env: Env, monkeypatch: pytest.MonkeyPatch, profile: str | None
+):
     config = env.project / ".mcp.json"
-    original = {
-        "mcpServers": {"sai": claude_entry(["missing-wrapper"], {"SAI_HOME": profile})}
-    }
+    fallback = env.root / "active profile"
+    monkeypatch.setenv("SAI_HOME", str(fallback))
+    saved_env = {"SAI_HOME": profile} if profile is not None else {}
+    original = {"mcpServers": {"sai": claude_entry(["missing-wrapper"], saved_env)}}
     config.write_text(json.dumps(original))
     before = config.read_bytes()
 
@@ -1551,7 +1560,7 @@ def test_update_preserves_claude_profile_expressions(env: Env, profile: str):
     )
     notice = updater.mcp_notice(updated.mcp_results(), updated.mcp_notes)
     [command] = notice.split("`")[1::2]
-    expected = profile if profile.startswith("${") else str(env.project / profile)
+    expected = profile if profile is not None else str(fallback)
     assert shlex.split(command) == [
         "claude",
         "mcp",

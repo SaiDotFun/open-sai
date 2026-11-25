@@ -1121,7 +1121,11 @@ def repair_after_update(outcome: Outcome, launcher: Path, background: bool) -> O
             notes.append("cwd-missing")
     checks: list[mcp_install.RegistrationCheck] = []
     try:
-        target = mcp_install.launcher_target(str(launcher), {})
+        try:
+            target = mcp_install.launcher_target(str(launcher), os.environ)
+        except FileNotFoundError:
+            # A relative SAI_HOME cannot be resolved after the cwd disappears.
+            target = mcp_install.launcher_target(str(launcher), {})
         checks = mcp_install.check_registrations(target, fix=True, cwd=cwd)
     except Exception:  # noqa: BLE001 - the installation has already succeeded
         notes.append("failed")
