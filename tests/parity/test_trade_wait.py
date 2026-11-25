@@ -9,12 +9,14 @@ import select
 import signal
 import sqlite3
 import subprocess
+import sys
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, closing, suppress
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Event, Timer
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
@@ -970,6 +972,54 @@ def test_trade_wait_interrupt_retains_reservation(
     assert documents[0] == documents[1]
 
 
+def finish_trade_wait(
+    process: subprocess.Popen[bytes],
+    polling_started: Event,
+    *,
+    startup_timeout: float,
+    polling_timeout: float,
+) -> tuple[bytes, bytes]:
+    startup_deadline = time.monotonic() + startup_timeout
+    while not polling_started.is_set() and process.poll() is None:
+        remaining = startup_deadline - time.monotonic()
+        if remaining <= 0:
+            pytest.fail(
+                f"Trade did not start polling within {startup_timeout:g} seconds"
+            )
+        polling_started.wait(min(remaining, 0.1))
+    return process.communicate(timeout=polling_timeout)
+
+
+def test_trade_wait_watchdog_starts_polling_budget_after_startup() -> None:
+    polling_started = Event()
+    with subprocess.Popen(
+        [sys.executable, "-c", "input(); print('receipt')"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    ) as process:
+
+        def complete_startup() -> None:
+            assert process.stdin is not None
+            process.stdin.write(b"\n")
+            process.stdin.flush()
+            polling_started.set()
+
+        # Startup alone uses more than the polling watchdog allows.
+        startup = Timer(1.25, complete_startup)
+        startup.start()
+        try:
+            assert finish_trade_wait(
+                process, polling_started, startup_timeout=10, polling_timeout=1
+            ) == (b"receipt\n", b"")
+            assert process.returncode == 0
+        finally:
+            startup.cancel()
+            startup.join()
+            if process.poll() is None:
+                process.kill()
+
+
 def test_position_trade_wait_deadlines(
     position_wait_cli_pair: tuple[CLI, CLI],
     tmp_path: Path,
@@ -987,6 +1037,7 @@ def test_position_trade_wait_deadlines(
     ) -> dict[str, Any]:
         keys: list[str] = []
         poll_times: list[float] = []
+        polling_started = Event()
         deadline_seconds = 60 if native else 30
         late_success = native and args == LEVERAGE
         execution_reported = False
@@ -1014,6 +1065,7 @@ def test_position_trade_wait_deadlines(
                 "includeAction": True,
             }
             poll_times.append(time.monotonic())
+            polling_started.set()
             execution_reported = late_success and poll_times[-1] - poll_times[0] >= 33
             replies.append(reconcile)
             return response(
@@ -1037,18 +1089,27 @@ def test_position_trade_wait_deadlines(
             *args,
             "--wait",
         )
-        result = subprocess.run(
+        with subprocess.Popen(
             [*cli, *command],
             env=cli_environment(home),
             cwd=home.parent,
-            capture_output=True,
-            check=False,
-            timeout=deadline_seconds + 15,
-        )
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as process:
+            try:
+                stdout, stderr = finish_trade_wait(
+                    process,
+                    polling_started,
+                    startup_timeout=120,
+                    polling_timeout=deadline_seconds + 15,
+                )
+            finally:
+                if process.poll() is None:
+                    process.kill()
         ended = time.monotonic()
         expected_exit = 0 if late_success else 5
-        assert (result.returncode, result.stderr) == (expected_exit, b""), result
-        document = json.loads(result.stdout)
+        assert (process.returncode, stderr) == (expected_exit, b""), stdout
+        document = json.loads(stdout)
         key = document["intentKey"]
         assert keys == [key]
         assert len(poll_times) >= 2
