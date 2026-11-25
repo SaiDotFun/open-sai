@@ -15,6 +15,11 @@ sai --json account overview --as 0x0000000000000000000000000000000000000001
 a connected account. Account reads can use a public address without a session.
 Supply a command when invoking Sai from an agent. A bare `sai` opens a shell.
 
+Use `sai market list` to see the symbol, market ID, collateral token, and
+price. The `trade open --market` option accepts a case-insensitive symbol
+such as `BTC` or a numeric ID. If a symbol matches multiple market IDs,
+choose the ID from the table.
+
 ## Read Markets and Accounts
 
 ```bash

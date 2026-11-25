@@ -461,6 +461,11 @@ On `main`, Sai refuses a position preview or submission if the position
 belongs to another account. A dry run with `positionOwnerVerified: false`
 is informational. Get a verified preview before submitting.
 
+Use `sai market list` to see the symbol, market ID, collateral token, and
+price. The `trade open --market` option accepts a case-insensitive symbol
+such as `BTC` or a numeric ID. If a symbol matches multiple market IDs,
+choose the ID from the table.
+
 For a live market order, the CLI refreshes the price before admission and
 reports that reference price after acceptance. A dry run marks the price as
 requiring refresh and may include an optional supplied reference. A partial

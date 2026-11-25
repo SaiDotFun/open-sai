@@ -101,6 +101,7 @@ class Position:
     minimum_position_microusd: str = "1"
     keeper_minimum_position_microusd: int = 1
     market_reads: int = 0
+    extra_market_rows: list[dict[str, Any]] = field(default_factory=list)
     preview_inputs: bool = False
     malformed_node_info: bool = False
     deny_lcd: bool = False
@@ -124,6 +125,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
     cached_replies: dict[str, Any] = {}
     market = {
         "marketId": 0,
+        "baseToken": {"symbol": "BTC"},
         "isOpen": True,
         "minLeverage": 1,
         "maxLeverage": 100,
@@ -206,7 +208,7 @@ def position_service() -> Iterator[tuple[Position, str]]:
                     keeper.MARKET: {"perp": {"borrowing": market_row}},
                     keeper.MARKETS: {
                         "perp": {
-                            "borrowings": [market_row]
+                            "borrowings": [market_row, *position.extra_market_rows]
                             if position.keeper_market_visible
                             else []
                         }
@@ -3544,3 +3546,50 @@ def test_cli_capped_margin_requotes_when_oracle_moves(position_service):
     assert result.exit_code == 0, result.output
     (submitted,) = position.submitted
     assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]
+
+
+def test_cli_market_symbol_and_compact_market_list(position_service):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.extra_market_rows.append(
+        {
+            "marketId": 0,
+            "baseToken": {"symbol": "BTC"},
+            "collateralToken": {"id": 2, "symbol": "NIBI"},
+            "price": None,
+        }
+    )
+    args = position_cli_args(base_url, [*OPEN_COMMAND, "--type", "market", "--dry-run"])
+    market_index = args.index("--market") + 1
+    cli = CliRunner()
+
+    numeric = cli.invoke(main, args)
+    args[market_index] = "bTc"
+    by_symbol = cli.invoke(main, args)
+    assert numeric.exit_code == by_symbol.exit_code == 0, by_symbol.output
+    assert (
+        json.loads(numeric.stdout)["intent"] == json.loads(by_symbol.stdout)["intent"]
+    )
+
+    list_args = ["--endpoint", f"{base_url}/query", "market", "list"]
+    market_list = cli.invoke(main, list_args)
+    assert market_list.exit_code == 0, market_list.output
+    assert list(market_list.stdout.split()).count("BTC") == 2
+    for column in ("Symbol", "ID", "Collateral", "Price", "USDC", "100.5", "NIBI"):
+        assert column in market_list.stdout
+    machine = cli.invoke(main, ["--json", *list_args])
+    assert machine.exit_code == 0, machine.output
+    assert (
+        json.loads(machine.stdout)["perp"]["borrowings"][1]
+        == position.extra_market_rows[0]
+    )
+
+    position.extra_market_rows[0]["marketId"] = 3
+    ambiguous = cli.invoke(main, args)
+    assert ambiguous.exit_code == 1, ambiguous.output
+    assert "Ambiguous market symbol 'bTc'. Pass a market ID: 0, 3." in ambiguous.stdout
+    args[market_index] = "ETH"
+    unknown = cli.invoke(main, args)
+    assert unknown.exit_code == 1, unknown.output
+    assert "Unknown market symbol 'ETH'. Run sai market list." in unknown.stdout
+    assert not position.submitted

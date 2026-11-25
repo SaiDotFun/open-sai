@@ -990,7 +990,23 @@ def market() -> None:
 @click.pass_context
 def market_list(ctx: click.Context) -> None:
     """List Keeper borrowing markets."""
-    perform_query(ctx, keeper.MARKETS)
+    data = keeper.request(keeper_url(ctx), keeper.MARKETS)
+    if ctx.obj["json"]:
+        emit(ctx, data)
+        return
+    rows = data["perp"]["borrowings"]
+    ReplSkin("sai").table(
+        ["Symbol", "ID", "Collateral", "Price"],
+        [
+            [
+                row["baseToken"]["symbol"],
+                str(row["marketId"]),
+                row["collateralToken"]["symbol"],
+                str(row["price"]) if row["price"] is not None else "-",
+            ]
+            for row in rows
+        ],
+    )
 
 
 @market.command("prices")
@@ -1408,8 +1424,49 @@ TRADE_INT = TradeInt()
 TRADE_DECIMAL = TradeDecimal()
 
 
+class TradeMarket(click.ParamType):
+    def convert(
+        self, value: Any, param: click.Parameter | None, ctx: click.Context | None
+    ) -> int | str:
+        if (
+            isinstance(value, str)
+            and value.isascii()
+            and any(c.isalpha() for c in value)
+        ):
+            return value
+        return TRADE_INT.convert(value, param, ctx)
+
+
+def resolve_market(endpoint: str, market: int | str) -> int:
+    if isinstance(market, int):
+        return market
+    rows = keeper.request(endpoint, keeper.MARKETS)["perp"]["borrowings"]
+    matches = sorted(
+        {
+            row["marketId"]
+            for row in rows
+            if row["baseToken"]["symbol"].casefold() == market.casefold()
+        }
+    )
+    if not matches:
+        raise ValueError(f"Unknown market symbol {market!r}. Run sai market list.")
+    if len(matches) > 1:
+        ids = ", ".join(map(str, matches))
+        raise ValueError(
+            f"Ambiguous market symbol {market!r}. Pass a market ID: {ids}."
+        )
+    return matches[0]
+
+
 @trade.command("open")
-@click.option("--market", "market_id", type=TRADE_INT, required=True)
+@click.option(
+    "--market",
+    "market_id",
+    type=TradeMarket(),
+    metavar="MARKET",
+    required=True,
+    help="Market ID or symbol, such as BTC.",
+)
 @click.option("--side", type=click.Choice(["long", "short"]), required=True)
 @click.option(
     "--type",
@@ -1445,7 +1502,7 @@ TRADE_DECIMAL = TradeDecimal()
 @click.pass_context
 def trade_open(
     ctx: click.Context,
-    market_id: int,
+    market_id: int | str,
     side: str,
     order_type: str,
     amount: str,
@@ -1472,7 +1529,7 @@ def trade_open(
             trading.open_trade(
                 keeper_url(ctx),
                 loader(ctx),
-                market_id=market_id,
+                market_id=resolve_market(keeper_url(ctx), market_id),
                 side=side,
                 order_type=order_type,
                 amount=amount,

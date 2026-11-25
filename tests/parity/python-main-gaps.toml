@@ -3,3 +3,7 @@
 [gap.collateral-previews]
 owner = "#231"
 difference = "Leverage and margin dry runs show before and after collateral in USDC and oracle-valued USD in text and JSON. Margin adds can size the quote with --max-collateral-usd."
+
+[gap.market-symbol-and-table]
+owner = "#231"
+difference = "Trade open accepts case-insensitive market symbols and reports ambiguous IDs. Market list prints a symbol, ID, collateral, and price table in text mode."

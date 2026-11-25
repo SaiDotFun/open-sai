@@ -1268,6 +1268,7 @@ exact_output = true
 
 [[case]]
 name = "bare-help-trade-open"
+accepted_difference = "Issue #231 adds market-symbol help to Python main."
 args = ["trade", "open"]
 mode = "text"
 expect = 2
