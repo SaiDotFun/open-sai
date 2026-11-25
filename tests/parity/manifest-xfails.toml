@@ -351,7 +351,7 @@ signature = "d1b18d5a59bc4cd183ee0da04238c0d565185b31f7dce0fea50b9c5e8b454505"
 
 [gap."case:mcp-session-reloads"]
 owner = "#175"
-signature = "83a17b11d3bc954a858c7e9a3143d2728957e3215190dd64d9d2900aa567f563"
+signature = "941d3d05a55ca36b031a9ec651e3e01a0b3b6d9748d26491cb69389d27ddc3f7"
 
 [gap."case:mcp-stream-error"]
 owner = "#175"
@@ -443,7 +443,7 @@ signature = "fe269d7a92bd28208a7cf6ed8286b6a7b19b13eb8985e813af87eb6c43fe5d3c"
 
 [gap."case:trade-margin-after-hours"]
 owner = "#211"
-signature = "265de923e5b28619b0245af75dec82d1126d057443f5e7665ccdd25f6dec0795"
+signature = "c2d60a315f968a68536938b87d1aca7d7f1994a62f393d965661527b571323d9"
 
 [gap."case:trade-margin-amount-required"]
 owner = "#211"
@@ -472,10 +472,6 @@ signature = "7b81720a53ac636c9a0291354d41fc1155316f1249c721d5933d8d629c84a46d"
 [gap."case:trade-margin-invalid-direction"]
 owner = "#211"
 signature = "63c1b71ea7a5b78339abd9aa0f91c01290e3a702c02277745bc11fd75d23126e"
-
-[gap."case:trade-margin-mcp-preview"]
-owner = "#176"
-signature = "420506bfd9eed5868d9f1013daa8835b1bffe5ddbbaa42ac3ccf1a48d76124b4"
 
 [gap."case:trade-margin-recheck-height"]
 owner = "#211"
@@ -564,10 +560,6 @@ signature = "b7afb4548020da4f7e90e54b7112aba5f4fc6619e9240175678b314728547d69"
 [gap."case:trade-partial-close-market-minimum"]
 owner = "#211"
 signature = "401f4a84ef91b32b7973457e0e7de9373cadedc726a7be1f38646920a93cab90"
-
-[gap."case:trade-partial-close-mcp-changed-leverage"]
-owner = "#176"
-signature = "2955e89e66e2dd56302bc826c0771aed6626d6f0d108208acf20a77f33c8d0ff"
 
 [gap."case:trade-partial-close-no-oracle"]
 owner = "#211"
@@ -735,52 +727,14 @@ signature = "e9d90a01fe5de7ff68ee44469cdd73ddee16d7f0aae1da13c03d208619b158ab"
 
 [gap."mcp:mcp_info"]
 owner = "#211"
-signature = "0027c146f87cb0b3c12d82924e22a2ec0fb9165a034d8f3b16701932354efaa8"
+signature = "3b2844b011b77ddc9648577a2755b9ce4f8530631367c8ac630453f50d73dec4"
 
-[gap."mcp:preview_close"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:preview_leverage"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:preview_margin"]
-owner = "#176"
-signature = "102700cec2d54d76c686586b5789561a3ba16085026c38bd9227897573aa4cf9"
-
+# The v0.1.2 inventory has a different open-tool description.
 [gap."mcp:preview_open"]
-owner = "#176"
+owner = "#49"
 signature = "82489300a9b00d596a66c573969c7a44bbe6560d7f3cfaad661a0bcb3d8b3745"
 
-[gap."mcp:preview_partial_close"]
-owner = "#176"
-signature = "ee5eb7493ec4a64ec60f98b4754a490c0e7419ed08bda154b9f7602d95c35f1b"
-
-[gap."mcp:preview_tpsl"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:trade_close"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:trade_leverage"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
-[gap."mcp:trade_margin"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"
-
+# The v0.1.2 inventory has a different open-tool description.
 [gap."mcp:trade_open"]
-owner = "#176"
+owner = "#49"
 signature = "0adb73da98a9099253ec61090e17065d597f2f2558c3a663c1c7036e2eaebd5f"
-
-[gap."mcp:trade_partial_close"]
-owner = "#176"
-signature = "99ec1ed744ec3efb8af06e07d84f87d4c0a3d3ccf8f610e4a4f708924863ce56"
-
-[gap."mcp:trade_tpsl"]
-owner = "#176"
-signature = "caf6e0b32b7852f948cfa75511d22c8249555f5cd68d7205dab6ce43bc64f9f3"

@@ -284,6 +284,7 @@ jobs:
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_MCP_PARITY_PYTHON: ${{ github.workspace }}/.parity-mcp-python/.venv/bin/sai
+          SAI_PARITY_MCP_TRADE_PYTHON: ${{ github.workspace }}/.parity-mcp-trade-python/.venv/bin/sai
           SAI_MCP_UNINSTALL_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
         run: |
           if ! unshare -Urn ip link set lo up; then
@@ -333,6 +334,7 @@ jobs:
         env: &release-parity
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
+          SAI_PARITY_MCP_TRADE_PYTHON: ${{ github.workspace }}/.parity-mcp-trade-python/.venv/bin/sai
         run: |
           uv run --locked pytest tests/parity/test_config_regressions.py \
             tests/parity/test_intent_status.py tests/parity/test_intent_status_v012.py \

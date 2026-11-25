@@ -42,6 +42,7 @@ from compare import (
     snapshot,
     stderr_category,
     stdout,
+    trade_estimate_clocks,
 )
 from manifest_gaps import ManifestGaps
 from mcp_cases import CALLS, RELEASE_MCP_TOOL_NAMES, handshake
@@ -84,6 +85,7 @@ class Case:
     mcp_profile: str = ""
     mcp_protocol: str = "2025-11-25"
     mcp_logs: bool = False
+    mcp_trade: bool = False
     seed: str = "empty"
     server: str = "normal"
     setup: list[str] | None = None
@@ -116,7 +118,10 @@ class Case:
             for index in range(len(wire) - 2):
                 if wire[index : index + 3] == ["oneClickTrading", "node_info", "trade"]:
                     wire[index + 1 : index + 3] = ["trade", "node_info"]
-        return replace(self, **{"wire": wire, **(self.rust or {})})
+        return replace(
+            self,
+            **{"wire": wire if self.wire is not None else None, **(self.rust or {})},
+        )
 
     @property
     def position_case(self) -> bool:
@@ -491,6 +496,8 @@ def observe(
     for error in endpoints.errors:
         check_failed(error)
     actual, expected = [request.label for request in endpoints.wire], case.wire or []
+    if case.mcp_trade and case.wire is None:
+        actual = [label for label in actual if label == "recordUserIntent"]
     if case.command == "doctor":
         actual, expected = sorted(actual), sorted(expected)
     if actual != expected:
@@ -602,6 +609,19 @@ def observe(
             check_mcp_calls(output, case.mcp_profile)
         except ValueError as exc:
             check_failed(str(exc))
+    if case.mcp_trade:
+        for frame in output[1:]:
+            result_fields = frame["result"]
+            # stdout() already checked that both MCP representations carry
+            # the same text. Compare the JSON members independent of order.
+            result_fields.pop("_toolText", None)
+            for payload in (
+                result_fields["content"][0]["text"],
+                result_fields.get("structuredContent", {}).get("result"),
+            ):
+                trade_estimate_clocks(payload)
+                if isinstance(payload, dict):
+                    trade_estimate_clocks(payload.get("preview"))
     stderr = stderr_category(result.stderr)
     if case.accepted_divergence == "uninstall-read-only":
         check_read_only_uninstall(case, result.returncode, output, stderr, candidate)
@@ -1143,7 +1163,7 @@ def run_case(
     if cutover:
         diffs = cutover_differences(left, right)
     else:
-        if rust and case.position_case:
+        if rust and case.position_case and not case.mcp_trade:
             project_position_estimates(left.output)
         if rust and case.accepted_difference and case.mode != "mcp":
             diffs = []
@@ -1187,6 +1207,8 @@ def run_case(
         for call in CALLS[case.mcp_profile]:
             if call.expected == "ok" and not diffs:
                 tools[call.tool] = "PASS"
+    elif case.mcp_trade and not diffs:
+        tools.update({call["name"]: "PASS" for call in case.mcp_calls or ()})
     return diffs, tools, expected
 
 
@@ -1360,6 +1382,14 @@ def main() -> int:
             parser.error("SAI_PARITY_BIN must name an executable file or command")
         candidate = [str(Path(executable).absolute())]
     mcp_reference = reference
+    mcp_trade_reference = None
+    if override := os.getenv("SAI_PARITY_MCP_TRADE_PYTHON"):
+        executable = shutil.which(override)
+        if not executable:
+            parser.error(
+                "SAI_PARITY_MCP_TRADE_PYTHON must name an executable Python sai"
+            )
+        mcp_trade_reference = [str(Path(executable).absolute())]
     if args.reference is None and any(case.mode == "mcp" for case in selected):
         if override := os.getenv("SAI_MCP_PARITY_PYTHON"):
             executable = shutil.which(override)
@@ -1390,7 +1420,9 @@ def main() -> int:
         )
     overview_reference = os.environ.get("SAI_PARITY_OVERVIEW_PYTHON")
     for case in selected:
-        if args.reference is not None:
+        if case.mcp_trade and mcp_trade_reference:
+            oracle = mcp_trade_reference
+        elif args.reference is not None:
             oracle = reference
         elif overview_reference and (
             case.name == "account-bare" or case.command == "account overview"

@@ -59,10 +59,11 @@ intentional difference.
 
 ## Release Cutover Results
 
-The required Rust job runs the full manifest and the focused comparisons
-against the same `sai-cli/v0.1.2` executable. Run the manifest locally with
-`parity.py --reference /absolute/path/to/released/sai --cutover` and set
-`SAI_PARITY_BIN` to the native executable.
+The required Rust job uses `sai-cli/v0.1.2` as the release reference and
+`sai-cli/v0.1.3` for the signed-in MCP trade transcripts. Run the manifest
+locally with `parity.py --reference /absolute/path/to/v0.1.2/sai --cutover`.
+Set `SAI_PARITY_BIN` to the native executable and
+`SAI_PARITY_MCP_TRADE_PYTHON` to the v0.1.3 executable.
 
 Each `CUTOVER_ROW` in the CI log carries a stable ID, a result, and the
 observed difference paths. Hashes bind the normalized values without exposing
