@@ -170,13 +170,20 @@ def test_auth_use_missing(
         (("--json", "--as", "{private}", "auth", "list"), ["auth", "list"], None),
         (("auth", "use", "{private}"), ["auth", "use"], None),
         (("{private}", "auth", "import"), [], "Invalid arguments to auth."),
+        (("--", "--as", "{private}", "auth", "use"), [], "Invalid arguments to auth."),
         (
             ("auth", "use", "--{private}"),
             ["auth", "use"],
             "No such option for auth.",
         ),
     ],
-    ids=["root-value", "leaf-value", "unrecognized-root-operand", "unknown-option"],
+    ids=[
+        "root-value",
+        "leaf-value",
+        "unrecognized-root-operand",
+        "root-end-of-options",
+        "unknown-option",
+    ],
 )
 def test_auth_logs_omit_argument_values(
     tmp_path: Path,

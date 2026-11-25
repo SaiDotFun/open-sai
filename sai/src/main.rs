@@ -501,14 +501,18 @@ fn finish(
 // Recover the command name even when clap rejects its arguments.
 fn command_path(args: &[String]) -> (String, &[String]) {
     let mut skip = false;
+    let mut options = true;
     for (index, arg) in args.iter().enumerate() {
         if skip {
             skip = false;
             continue;
         }
         match arg.as_str() {
-            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" => skip = true,
-            _ if arg.starts_with('-') => {}
+            "--" if options => options = false,
+            "--endpoint" | "--ws-endpoint" | "--lcd-endpoint" | "--as" if options => {
+                skip = true;
+            }
+            _ if options && arg.starts_with('-') => {}
             _ => {
                 let tree = Cli::command();
                 let Some(mut node) = tree.find_subcommand(arg) else {
