@@ -838,6 +838,22 @@ seed = "session"
 wire = ["oneClickTrading","ws:init","node_info"]
 
 [[case]]
+name = "doctor-lcd-chain-mismatch"
+args = ["--json", "doctor", "--lcd-endpoint", "{http}/fixture-chain-private"]
+server = "doctor-lcd-chain-mismatch"
+seed = "session"
+wire = ["oneClickTrading", "ws:init", "node_info"]
+absent_log_text = ["fixture-chain-private"]
+
+[[case]]
+name = "doctor-lcd-invalid-chain"
+args = ["--json", "doctor", "--no-fix"]
+server = "doctor-lcd-invalid-chain"
+seed = "session"
+expect = 1
+wire = ["oneClickTrading", "ws:init", "node_info"]
+
+[[case]]
 name = "doctor-ws-no-subprotocol"
 args = ["--json", "doctor", "--no-fix"]
 accepted_divergence = "lcd-origin-only"

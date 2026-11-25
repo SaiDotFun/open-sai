@@ -258,6 +258,11 @@ The C9a cases compare against Python main at
 `SAI_PARITY_BIN` to the Rust binary. With `SAI_C9A_PYTHON` unset, the
 driver uses the Python entry point from its own environment.
 
+Doctor cases that query `node_info` use the checkout's Python entry point.
+The LCD comparison contract comes from Python main at
+`59a694fc3bebcf18954de864d9aa8e009a8ac558`. The fixtures cover matching
+chains, a chain mismatch with a reflected endpoint path, and malformed chain IDs.
+
 The `client_seed` key supplies private Claude Code, Codex, and Cursor
 configs. The runner uses fixture programs for client subprocesses and
 compares their arguments, file modes, config values, Codex comments, and

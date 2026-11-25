@@ -801,9 +801,8 @@ def main() -> int:
         parser.error("No parity cases matched")
     reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
     candidate = reference
-    c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
-        Path(sys.executable).with_name("sai")
-    )
+    checkout_python = str(Path(sys.executable).with_name("sai"))
+    c9a_python = os.environ.get("SAI_C9A_PYTHON") or checkout_python
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -836,6 +835,8 @@ def main() -> int:
             oracle = [str(Path(overview_reference).absolute())]
         elif case.mode == "mcp":
             oracle = mcp_reference
+        elif case.command == "doctor" and "node_info" in (case.wire or []):
+            oracle = [checkout_python]
         elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
             # Launch directly so uv cannot shadow the fixture launcher on PATH.
             oracle = [c9a_python]

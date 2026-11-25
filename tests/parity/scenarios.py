@@ -936,13 +936,23 @@ def loopback(
                     wire.append(WireRequest("node_info"))
                     self.reply({}, 503)
                     return
+                if scenario == "doctor-lcd-chain-mismatch":
+                    prefix, separator, _ = path.partition(NODE_INFO)
+                    if separator:
+                        wire.append(WireRequest("node_info"))
+                        self.reply({"default_node_info": {"network": prefix[1:]}})
+                        return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
                     self.reply(
                         {
                             "default_node_info": {}
                             if chain is None
-                            else {"network": chain}
+                            else {
+                                "network": "invalid chain ID"
+                                if scenario == "doctor-lcd-invalid-chain"
+                                else chain
+                            }
                         }
                     )
                     return

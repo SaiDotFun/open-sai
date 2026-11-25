@@ -9,12 +9,14 @@ import socket
 import stat
 import subprocess
 import sys
+import tomllib
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
 from typing import Any
 
 import pytest
 from mcp_clients import seed_clients, write
+from parity import Case, run_case
 from sai_cli.tests.loopback import http_server
 
 
@@ -56,6 +58,21 @@ def checks(result: subprocess.CompletedProcess[str]) -> dict[str, dict[str, Any]
     body = json.loads(result.stdout)
     report = body["error"]["details"] if "error" in body else body
     return {check["id"]: check for check in report["checks"]}
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["doctor-network", "doctor-lcd-chain-mismatch", "doctor-lcd-invalid-chain"],
+)
+def test_doctor_lcd_matches_checkout_python(candidate: str, name: str) -> None:
+    with Path(__file__).with_name("cases.toml").open("rb") as manifest:
+        cases = tomllib.load(manifest)["case"]
+    case = next(Case(**entry) for entry in cases if entry["name"] == name)
+    python = Path(sys.executable).with_name("sai")
+
+    differences, _, _ = run_case(case, [str(python)], [candidate])
+
+    assert differences == []
 
 
 def test_claude_install_keeps_entry_until_replaced(

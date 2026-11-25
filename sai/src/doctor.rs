@@ -57,6 +57,8 @@ struct Check {
     changes: Vec<String>,
     details: Value,
     duration_ms: u64,
+    #[serde(skip)]
+    lcd_chain_id: Option<String>,
 }
 
 impl Check {
@@ -69,6 +71,7 @@ impl Check {
             changes: Vec::new(),
             details: json!({}),
             duration_ms: 0,
+            lcd_chain_id: None,
         }
     }
 
@@ -664,14 +667,22 @@ fn network_checks(settings: &Settings, events: EventContext<'_>) -> [Check; 3] {
     });
     rt.shutdown_background();
     let [keeper, _, lcd] = &mut checks;
-    if lcd.status == "pass"
-        && let Some(chain) = keeper.details["chainId"].as_str()
-        && !chain.is_empty()
-        && lcd.details["network"] != chain
+    if let Some(chain) = keeper.details["chainId"]
+        .as_str()
+        .filter(|id| !id.is_empty())
+        && let Some(network) = &lcd.lcd_chain_id
     {
-        lcd.status = "warn";
-        lcd.summary.push_str(&format!("; Keeper trades on {chain}"));
-        lcd.fix = Some("Pass the --lcd-endpoint for Keeper's chain".into());
+        let matches = chain == network;
+        lcd.details["matchesKeeperChain"] = json!(matches);
+        if matches {
+            lcd.summary
+                .push_str(&format!(" (matches Keeper chain {chain})"));
+        } else {
+            lcd.status = "warn";
+            lcd.summary
+                .push_str(&format!("; LCD network differs from Keeper chain {chain}"));
+            lcd.fix = Some("Pass the --lcd-endpoint for Keeper's chain".into());
+        }
     }
     checks
 }
@@ -763,28 +774,35 @@ async fn lcd_check(settings: &Settings) -> Check {
     let start = Instant::now();
     let endpoint = settings.lcd_endpoint();
     let display = log::origin(endpoint);
-    let mut details = json!({"endpoint": display});
     let check = match keeper::lcd_network(endpoint, TIMEOUT).await {
-        Ok(Some(network)) => {
-            let check = Check::new(
+        Ok(Some(network)) if valid_lcd_chain_id(&network) => {
+            let mut check = Check::new(
                 "lcd",
                 "pass",
-                format!(
-                    "{display} answered in {} ms (network {network})",
-                    elapsed_ms(start)
-                ),
+                format!("{display} answered in {} ms", elapsed_ms(start)),
             );
-            details["network"] = json!(network);
+            check.lcd_chain_id = Some(network);
             check
         }
-        Ok(None) => Check::new(
+        Ok(_) => Check::new(
             "lcd",
             "fail",
-            format!("{display} answered without a chain network in node_info"),
+            format!("{display} returned a missing or invalid chain ID in node_info network"),
         )
         .fix("Check --lcd-endpoint points at a Nibiru REST (LCD) service"),
         Err(reason) => Check::new("lcd", "fail", format!("{display} did not answer: {reason}"))
             .fix("Check the network and --lcd-endpoint"),
     };
-    check.details(details)
+    check.details(json!({"endpoint": display}))
+}
+
+fn valid_lcd_chain_id(network: &str) -> bool {
+    network.len() <= 50
+        && network
+            .as_bytes()
+            .first()
+            .is_some_and(u8::is_ascii_alphanumeric)
+        && network
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
 }
