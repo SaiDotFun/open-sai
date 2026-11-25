@@ -14,7 +14,7 @@ import time
 import uuid
 from collections.abc import Callable, Generator
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
@@ -415,6 +415,7 @@ def loopback(
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
+    balance_block_reads: bool = False,
     wrong_balance_at: Literal["snapshot", "pinned"] | None = None,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
@@ -607,6 +608,8 @@ def loopback(
     }
     if overview is not None:
         queue_payloads["userBalancesWithBlock"] = overview.balances
+    elif balance_block_reads:
+        queue_payloads["userBalancesWithBlock"] = queue_payloads["userBalances"]
     market_index = f"MarketIndex({borrowing['marketId']})"
     token_index = f"TokenIndex({collateral['id']})"
     cancel_trader = OTHER_ADDRESS if cancel_target == "other-account" else ADDRESS
@@ -1597,8 +1600,11 @@ def loopback(
             request_id = subscription["id"]
             try:
                 request = graphql_request(subscription["payload"], websocket=True)
-                wire.append(request)
                 name = request.label.removeprefix("ws:")
+                # Both registered query shapes read the same balance snapshot.
+                if balance_block_reads and name == "userBalancesWithBlock":
+                    request = replace(request, label="ws:userBalances")
+                wire.append(request)
                 expected = {"id": 3} if name == "tokenPricesUsd" else {"user": ADDRESS}
                 if not same_variables(request.variables, expected):
                     raise ValueError(f"Wrong WebSocket variables for {name}")

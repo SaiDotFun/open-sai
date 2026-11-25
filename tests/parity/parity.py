@@ -1101,9 +1101,10 @@ def run_case(
 ) -> tuple[list[str], dict[str, str], str | None]:
     rust = candidate is not reference
     candidate_case = case.rust_case() if rust else case
+    account_balances = case.command == "account balances"
     with (
         tempfile.TemporaryDirectory(prefix="sai-parity-") as temp,
-        loopback(case.server) as endpoints,
+        loopback(case.server, balance_block_reads=account_balances) as endpoints,
     ):
         left, left_error = safe_observe(
             case, reference, Path(temp) / "reference", endpoints, cutover=cutover
