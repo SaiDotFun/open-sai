@@ -1185,6 +1185,42 @@ def test_uv_recovers_an_interrupted_in_place_bridge_install(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize(
+    "removed_files",
+    [("METADATA",), ("METADATA", "RECORD"), ("RECORD",)],
+)
+def test_uv_recovers_after_retiring_the_receipt(
+    standalone: NativeInstall, tmp_path: Path, removed_files: tuple[str, ...]
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
+    pending = interrupted_uv_install(install, initial)
+    journal = json.loads(pending.read_text(encoding="utf-8"))
+    (info,) = prefix.glob("lib/python*/site-packages/sai_cli-*.dist-info")
+    journal["original_record"] = hashlib.sha256(
+        (info / "RECORD").read_bytes()
+    ).hexdigest()
+    journal["cwd"] = str(tmp_path)
+    pending.write_text(json.dumps(journal), encoding="utf-8")
+    receipt = prefix / "uv-receipt.toml"
+    receipt.unlink()
+    for name in removed_files:
+        (info / name).unlink()
+    assert (info / "direct_url.json").is_file()
+    assert install.launcher.exists()
+    public_inode = install.launcher.lstat().st_ino
+
+    recovered = install.invoke("--json", "update", "--recover", exe=install.executable)
+
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert json.loads(recovered.stdout)["status"] == "recovered"
+    assert install.launcher.lstat().st_ino == public_inode
+    assert receipt.is_file()
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+    assert not pending.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
 def test_uv_tool_upgrade_keeps_the_rolled_back_wheel(
     standalone: NativeInstall, tmp_path: Path
 ) -> None:

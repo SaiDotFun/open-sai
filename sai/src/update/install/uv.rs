@@ -172,6 +172,21 @@ impl Uv {
     }
 
     fn check_recoverable_package(&self, record: &Pending) -> Result<()> {
+        let registered = registered_launcher(&self.prefix);
+        let staged = recovery_bin(self.tools()).join("sai");
+        // Private staging retires the public receipt before uv replaces the
+        // environment. Until a public receipt is back, the validated pending
+        // record identifies the install. uv can leave any subset of its files
+        // behind. restore verifies the launcher and rollback wheel before writing.
+        if self
+            .prefix
+            .join(RECEIPT)
+            .symlink_metadata()
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            || registered.as_ref() == Some(&staged)
+        {
+            return Ok(());
+        }
         let current = provenance::installed_version(&self.prefix);
         let original = current
             .as_ref()
@@ -193,14 +208,6 @@ impl Uv {
                 .as_ref()
                 .is_some_and(|version| version.to_string() == wheel.version)
         };
-        // Recovery may itself stop after uv writes a receipt for the
-        // private staging bin, before we bind the public launcher.
-        let registered = registered_launcher(&self.prefix);
-        let staged = recovery_bin(self.tools()).join("sai");
-        let incomplete = (!self.prefix.join(RECEIPT).is_file()
-            || registered.as_ref() == Some(&staged))
-            && !provenance::has_origin(&self.prefix)
-            && (current.is_none() || expected().any(matches_version));
         // The Python bridge replaces the package in place and leaves uv's
         // receipt and public symlink intact even if uninstall was interrupted.
         let interrupted_in_place = record
@@ -245,7 +252,7 @@ impl Uv {
                 .join("bin/sai")
                 .symlink_metadata()
                 .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
-        if original || incomplete || interrupted_in_place {
+        if original || interrupted_in_place {
             return Ok(());
         }
         if expected().any(|wheel| matches_version(wheel) && matches_wheel_origin(wheel)) {
