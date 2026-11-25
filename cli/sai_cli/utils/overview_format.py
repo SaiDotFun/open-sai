@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 from ..core.session import expiry_notice_text
@@ -34,15 +35,36 @@ def _balance_source(row: dict[str, Any]) -> str:
     return f"{source} ({elapsed} old{' · stale' if row['stale'] else ''})"
 
 
+def _token_quantity(row: dict[str, Any]) -> str:
+    token = row["token_info"]
+    amount = str(row.get("amount"))
+    decimals = token.get("decimals")
+    symbol = token.get("symbol")
+    if not (
+        amount.isascii()
+        and amount.isdecimal()
+        and type(decimals) is int
+        and 0 <= decimals <= 255
+        and isinstance(symbol, str)
+        and symbol
+    ):
+        return UNKNOWN
+    quantity = format(Decimal(f"{amount}e-{decimals}"), "f")
+    if "." in quantity:
+        quantity = quantity.rstrip("0").rstrip(".")
+    return f"{quantity} {symbol}"
+
+
 def show_balances(rows: list[dict[str, Any]]) -> None:
     if not rows:
         print("No balance rows returned.")
         return
     ReplSkin("sai").table(
-        ["Balance", "USD", "Source (Age)"],
+        ["Balance", "Quantity", "USD", "Source (Age)"],
         [
             [
                 row["token_info"]["name"],
+                _token_quantity(row),
                 _value(row["usd_value"]),
                 _balance_source(row),
             ]

@@ -1250,3 +1250,28 @@ def test_balance_subcommand_ws_flag_overrides_invalid_environment(replay, monkey
     response = json.loads(result.stdout)
     assert response["data"]["userBalances"]
     assert (stream.BALANCES_WITH_BLOCK, {"user": ADDR}) in replay["calls"]
+
+
+def test_text_balances_show_unpriced_token_quantities(replay):
+    replay["ws"] = {
+        "data": {
+            "userBalances": [
+                {
+                    "amount": "123456789012345678901234567891",
+                    "usd_value": 0,
+                    "lastUpdatedBlock": RISK_BLOCK,
+                    "token_info": {
+                        "name": "Unpriced token",
+                        "symbol": "UP",
+                        "decimals": 18,
+                        "type": "erc20",
+                    },
+                }
+            ]
+        }
+    }
+    result = cli(replay, "account", "balances", ADDR)
+    assert result.exit_code == 0, result.output
+    assert "Quantity" in result.stdout
+    assert "123456789012.345678901234567891 UP" in result.stdout
+    assert f"block {RISK_BLOCK}" in result.stdout
