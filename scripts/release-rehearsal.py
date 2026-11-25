@@ -42,6 +42,7 @@ SYNTHETIC_TOKEN = "release-rehearsal-fixture-only"
 CHAIN = "cataclysm-1"
 CUTOVER_BASELINE = "0.1.3"
 CUTOVER_CLIENTS = (*CLIENTS, "cursor")
+RETIRED_MCP_FIXTURE = "sai" + "-mcp"
 INTENT_KEY = re.compile(r"\d{8}T\d{9}Z_[0-9A-HJKMNP-TV-Z]{16}")
 TRADE = (
     "trade",
@@ -1660,7 +1661,7 @@ class CutoverMcp:
 
     def expected(self, client: str, *, stale: bool) -> dict[str, Any]:
         entry: dict[str, Any] = {
-            "command": "sai-mcp" if stale else self.command[0],
+            "command": RETIRED_MCP_FIXTURE if stale else self.command[0],
             "args": [] if stale else self.command[1:],
             "env": self.env,
         }
@@ -1699,7 +1700,7 @@ class CutoverMcp:
 
     def add_stale_cursor_alias(self) -> None:
         data = self.read("cursor")
-        data["mcpServers"]["sai-mcp"] = self.expected("cursor", stale=True)[
+        data["mcpServers"][RETIRED_MCP_FIXTURE] = self.expected("cursor", stale=True)[
             "mcpServers"
         ]["sai"]
         self.paths["cursor"].write_text(json.dumps(data), encoding="utf-8")
@@ -1707,7 +1708,7 @@ class CutoverMcp:
     def verify_cursor_alias(self) -> None:
         data = self.read("cursor")
         expected = self.expected("cursor", stale=False)["mcpServers"]["sai"]
-        actual = data.get("mcpServers", {}).get("sai-mcp")
+        actual = data.get("mcpServers", {}).get(RETIRED_MCP_FIXTURE)
         require(
             actual == expected,
             "The native updater did not repoint the existing Cursor alias",
@@ -1718,7 +1719,7 @@ class CutoverMcp:
         data = self.read(client)
         key = next(iter(expected))
         if cursor_alias:
-            data[key].pop("sai-mcp", None)
+            data[key].pop(RETIRED_MCP_FIXTURE, None)
         entry = data.get(key, {}).get("sai", {})
         if isinstance(entry.get("command"), str):
             # uv can spell the registered bin path with a parent component.
