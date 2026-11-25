@@ -1616,7 +1616,11 @@ def read_rows_at(
                         if isinstance(line, dict):
                             rows.append((position, line))
             except OSError:
-                continue
+                raise SaiError(
+                    "Could not read saved intent log evidence. "
+                    "Retry this page or start a new intent log query.",
+                    Code.INCOMPLETE_DATA,
+                ) from None
     return rows, False
 
 

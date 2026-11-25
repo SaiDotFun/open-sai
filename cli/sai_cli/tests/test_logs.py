@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import os
 import stat
@@ -3770,6 +3771,57 @@ def test_intent_query_rechecks_file_name_after_read(home, monkeypatch, change):
     assert changed
     assert code == 2 and "Start a new intent log query" in output
     assert "events" not in json.loads(output)
+
+
+def test_intent_cursor_reports_saved_anchor_read_failure(home, monkeypatch):
+    root = home / "logs"
+    root.mkdir()
+    day = date(2026, 11, 24)
+    linked = {
+        "ts": f"{day}T00:00:00.000Z",
+        "event": "command.end",
+        "runId": "process",
+        "commandId": "command",
+    }
+    anchor = log.encode(
+        {
+            **linked,
+            "event": "intent.keeper",
+            "intentKey": "KEY",
+            "addr": ADDR,
+            "endpointId": "h1_" + "a" * 64,
+        }
+    )
+    path = log.file_path("cli", day, root)
+    path.write_bytes(log.encode(linked) * log_queries.MAX_REPORT_ROWS + anchor)
+    args = ("--json", "logs", "intent", "KEY", "--offline")
+    code, output = run_cli(*args)
+    assert code == 0
+    continuation = ("--before", json.loads(output)["nextBefore"])
+    assert json.loads(run_cli(*args, *continuation)[1])["events"] == [linked]
+
+    read = os.read
+    expected = path.stat()
+    failed = False
+
+    def fail_anchor_read(fd, size):
+        nonlocal failed
+        info = os.fstat(fd)
+        if not failed and (info.st_dev, info.st_ino, size) == (
+            expected.st_dev,
+            expected.st_ino,
+            len(anchor),
+        ):
+            failed = True
+            raise OSError(errno.EIO, "anchor read failed")
+        return read(fd, size)
+
+    monkeypatch.setattr(os, "read", fail_anchor_read)
+    code, output = run_cli(*args, *continuation)
+    assert failed
+    assert code != 0 and "Retry this page" in output
+    assert "events" not in json.loads(output)
+    assert json.loads(run_cli(*args, *continuation)[1])["events"] == [linked]
 
 
 def test_intent_cursor_cache_evicts_old_states_and_refuses_oversize_reads(home):
