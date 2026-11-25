@@ -219,6 +219,17 @@ def releases(
 ) -> Generator[ReleaseFixture]:
     reads: list[str] = []
 
+    def release(version: str) -> dict[str, object]:
+        folder = asset_key(version, "")
+        return {
+            "tag_name": f"sai-cli/v{version}",
+            "assets": [
+                {"name": path[len(folder) :], "state": "uploaded"}
+                for path in files
+                if path.startswith(folder)
+            ],
+        }
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             path = urlsplit(self.path).path
@@ -229,9 +240,7 @@ def releases(
                     self.send_error(503)
                     return
             if path == f"/repos{REPO}/releases":
-                data = json.dumps(
-                    [{"tag_name": f"sai-cli/v{tag}"} for tag in tags]
-                ).encode()
+                data = json.dumps([release(tag) for tag in tags]).encode()
             elif path in files:
                 data = files[path]
             else:
@@ -347,12 +356,16 @@ def test_standalone_update_keeps_the_public_launcher(
         checked = standalone.update(server, "--check")
         assert checked.returncode == 0, checked.stderr
         assert json.loads(checked.stdout)["install"]["kind"] == "standalone"
-        assert server.reads == [f"/repos{REPO}/releases"]
+        assert server.reads == [f"/repos{REPO}/releases", asset_key(NEW, "SHA256SUMS")]
         assert standalone.launcher.readlink() == initial
         result = standalone.update(server)
         assert result.returncode == 0, result.stderr
         assert json.loads(result.stdout)["status"] == "updated"
-        assert server.reads[2:] == list(reversed(asset))
+        assert server.reads[2:] == [
+            f"/repos{REPO}/releases",
+            asset_key(NEW, "SHA256SUMS"),
+            *reversed(asset),
+        ]
     assert standalone.launcher.is_symlink()
     assert standalone.launcher.readlink() == initial
     assert os.path.samestat(standalone.launcher.lstat(), public)
@@ -360,6 +373,52 @@ def test_standalone_update_keeps_the_public_launcher(
     assert standalone.invoke("--version").stdout.strip() == f"sai {NEW}"
     assert standalone.executable.is_file()
     assert ledger.read_bytes() == b"existing Sai state"
+
+
+def test_standalone_update_selects_the_latest_platform_archive(
+    standalone: NativeInstall,
+) -> None:
+    unlisted, other_platform, python = "9999.0.1", "9999.0.2", "9999.0.3"
+    unavailable, malformed = "9999.0.4", "9999.0.5"
+    versioned = {
+        **assets(NEW, archive_name(), archive()),
+        **assets(unlisted, archive_name(unlisted), archive(unlisted)),
+        **assets(
+            other_platform, f"sai-{other_platform}-other.tar.gz", b"other platform"
+        ),
+        **assets(python, f"sai_cli-{python}-py3-none-any.whl", b"full Python"),
+        **assets(unavailable, archive_name(unavailable), archive(unavailable)),
+        **assets(malformed, archive_name(malformed), archive(malformed)),
+        asset_key(unlisted, "SHA256SUMS"): b"",
+        asset_key(unavailable, "SHA256SUMS"): Redirect("/missing-checksum"),
+        asset_key(malformed, "SHA256SUMS"): b"\xff",
+    }
+    with releases(
+        versioned, tags=(other_platform, NEW, python, unlisted, malformed, unavailable)
+    ) as server:
+        checked = standalone.update(server, "--check")
+        assert checked.returncode == 0, checked.stdout
+        assert json.loads(checked.stdout)["latest"] == NEW
+        assert server.reads == [
+            f"/repos{REPO}/releases",
+            asset_key(malformed, "SHA256SUMS"),
+            asset_key(unavailable, "SHA256SUMS"),
+            "/missing-checksum",
+            asset_key(unlisted, "SHA256SUMS"),
+            asset_key(NEW, "SHA256SUMS"),
+        ]
+
+        server.reads.clear()
+        pinned = standalone.update(server, "--to", python)
+        assert pinned.returncode == 1, pinned.stdout
+        assert archive_name(python) in json.loads(pinned.stdout)["error"]["message"]
+        assert server.reads == [asset_key(python, "SHA256SUMS")]
+        assert standalone.launcher.resolve() == standalone.executable
+
+        updated = standalone.update(server)
+        assert updated.returncode == 0, updated.stdout
+        assert json.loads(updated.stdout)["target"] == NEW
+    assert standalone.invoke("--version").stdout.strip() == f"sai {NEW}"
 
 
 @pytest.mark.parametrize(
@@ -379,7 +438,8 @@ def test_invalid_assets_keep_the_working_launcher(
     with releases(
         assets(NEW, archive_name(), archive(bad_entry=bad_entry), manifest=manifest)
     ) as server:
-        result = standalone.update(server)
+        target = ("--to", NEW) if manifest == "duplicate" else ()
+        result = standalone.update(server, *target)
     assert result.returncode == 1
     assert "is unchanged" in json.loads(result.stdout)["error"]["message"]
     assert standalone.launcher.readlink() == initial
@@ -494,7 +554,11 @@ def test_check_leaves_interrupted_install_for_next_mutating_update(
         ),
         encoding="utf-8",
     )
-    with releases({}, tags=(standalone.installed,)) as server:
+    installed = standalone.installed
+    with releases(
+        assets(installed, archive_name(installed), b"installed archive"),
+        tags=(installed,),
+    ) as server:
         checked = standalone.update(server, "--check")
         assert checked.returncode == 0, checked.stdout
         assert standalone.launcher.resolve() == staged
@@ -673,9 +737,9 @@ def test_background_optout_keeps_pending_standalone_recovery(
     record = root / "pending.json"
     content = json.dumps({"old": standalone.executable.parent.name, "new": interrupted})
     record.write_text(content, encoding="utf-8")
-    with releases({}) as server:
+    with releases(assets(NEW, archive_name(), archive())) as server:
         result = standalone.update(server, "--background", SAI_UPDATE_AUTO="false")
-        assert server.reads == [f"/repos{REPO}/releases"]
+        assert server.reads == [f"/repos{REPO}/releases", asset_key(NEW, "SHA256SUMS")]
     assert result.returncode == 0 and result.stdout == ""
     assert standalone.launcher.resolve() == staged
     assert record.read_text(encoding="utf-8") == content
@@ -693,7 +757,10 @@ def test_only_explicit_targets_can_downgrade_or_select_prereleases(
         current = standalone.update(server)
         assert current.returncode == 0, current.stdout
         assert json.loads(current.stdout)["status"] == "current"
-        assert server.reads == [f"/repos{REPO}/releases"]
+        assert server.reads == [
+            f"/repos{REPO}/releases",
+            asset_key(previous, "SHA256SUMS"),
+        ]
         result = standalone.update(server, "--to", prerelease)
         assert result.returncode == 0, result.stdout
         assert json.loads(result.stdout)["target"] == prerelease
@@ -747,7 +814,10 @@ def test_background_optout_rechecked_before_install(
             assert process.communicate(timeout=15) == (b"", b"")
             assert process.returncode == 0
         if not pause:
-            assert server.reads == [f"/repos{REPO}/releases"]
+            assert server.reads == [
+                f"/repos{REPO}/releases",
+                asset_key(NEW, "SHA256SUMS"),
+            ]
         assert standalone.state()["result"]["status"] == "available"
         assert standalone.launcher.resolve() == standalone.executable
         # An explicit update still installs while update.auto is false.

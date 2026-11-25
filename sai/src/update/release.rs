@@ -153,13 +153,13 @@ impl Releases {
             .expect("validated base URL and release filename")
     }
 
-    pub(super) async fn latest(&self) -> Result<Option<Version>> {
-        tokio::time::timeout(CHECK_TIMEOUT, self.latest_within_budget())
+    pub(super) async fn latest(&self, native: bool) -> Result<Option<Version>> {
+        tokio::time::timeout(CHECK_TIMEOUT, self.latest_within_budget(native))
             .await
             .map_err(|_| error(TIMED_OUT))?
     }
 
-    async fn latest_within_budget(&self) -> Result<Option<Version>> {
+    async fn latest_within_budget(&self, native: bool) -> Result<Option<Version>> {
         let http = self
             .client()
             .redirect(Policy::none())
@@ -169,7 +169,7 @@ impl Releases {
             .api
             .join(&format!("repos/{REPO}/releases"))
             .expect("release list URL");
-        let mut latest = None;
+        let mut candidates = Vec::new();
         for page in 1..=MAX_PAGES {
             let response = http
                 .get(url.clone())
@@ -197,19 +197,55 @@ impl Releases {
             let data = bytes(response, MAX_PAGE, "GitHub API answer is too large").await?;
             let releases: Vec<Value> = serde_json::from_slice(&data)
                 .map_err(|_| error("GitHub API answered with malformed JSON"))?;
-            let best = releases
+            let versions = releases
                 .iter()
                 .filter(|item| !truthy(&item["draft"]) && !truthy(&item["prerelease"]))
-                .filter_map(|item| stable(item["tag_name"].as_str()?.strip_prefix(TAG_PREFIX)?))
-                .max();
-            latest = latest.max(best);
+                .filter_map(|item| {
+                    let version = stable(item["tag_name"].as_str()?.strip_prefix(TAG_PREFIX)?)?;
+                    if native {
+                        let name = archive_name(&version)?;
+                        if !has_uploaded_asset(item, &name)
+                            || !has_uploaded_asset(item, "SHA256SUMS")
+                        {
+                            return None;
+                        }
+                    }
+                    Some(version)
+                });
+            candidates.extend(versions);
             if !more {
-                return Ok(latest);
+                return if native {
+                    self.latest_native(candidates).await
+                } else {
+                    Ok(candidates.into_iter().max())
+                };
             }
         }
         Err(error(format!(
             "the release list is longer than {MAX_PAGES} pages; the lookup is incomplete"
         )))
+    }
+
+    async fn latest_native(&self, mut candidates: Vec<Version>) -> Result<Option<Version>> {
+        if candidates.is_empty() {
+            return Ok(None);
+        }
+        let http = self.asset_client()?;
+        candidates.sort_unstable();
+        for version in candidates.into_iter().rev() {
+            let name = archive_name(&version).expect("candidate has a platform archive");
+            let response = self.get_asset(&http, &version, "SHA256SUMS").await?;
+            if matches!(response.status().as_u16(), 404 | 410) {
+                continue;
+            }
+            let manifest = read_asset(response, MAX_SUMS, "SHA256SUMS").await?;
+            if let Ok(manifest) = std::str::from_utf8(&manifest)
+                && expected_digest(manifest, &name).is_ok()
+            {
+                return Ok(Some(version));
+            }
+        }
+        Ok(None)
     }
 
     async fn redirect(&self, http: &Client) -> Result<Option<Version>> {
@@ -256,10 +292,9 @@ impl Releases {
             .map_err(|_| error("timed out downloading the release"))?
     }
 
-    async fn download_pair(&self, version: &Version, name: &str) -> Result<(Vec<u8>, String)> {
+    fn asset_client(&self) -> Result<Client> {
         let web = self.web.clone();
-        let http = self
-            .client()
+        self.client()
             .redirect(Policy::custom(move |attempt| {
                 let url = attempt.url();
                 let allowed = if loopback(&web) {
@@ -287,14 +322,18 @@ impl Releases {
                 }
             }))
             .build()
-            .map_err(request_error)?;
-        let manifest = self
-            .download(&http, version, "SHA256SUMS", MAX_SUMS)
-            .await?;
+            .map_err(request_error)
+    }
+
+    async fn download_pair(&self, version: &Version, name: &str) -> Result<(Vec<u8>, String)> {
+        let http = self.asset_client()?;
+        let manifest = self.get_asset(&http, version, "SHA256SUMS").await?;
+        let manifest = read_asset(manifest, MAX_SUMS, "SHA256SUMS").await?;
         let manifest =
             std::str::from_utf8(&manifest).map_err(|_| error("SHA256SUMS is not UTF-8"))?;
         let expected = expected_digest(manifest, name)?;
-        let asset = self.download(&http, version, name, MAX_ASSET).await?;
+        let response = self.get_asset(&http, version, name).await?;
+        let asset = read_asset(response, MAX_ASSET, name).await?;
         let digest = sha256(&asset);
         if digest != expected {
             return Err(error(format!("{name} does not match its SHA256SUMS entry")));
@@ -302,15 +341,8 @@ impl Releases {
         Ok((asset, digest))
     }
 
-    async fn download(
-        &self,
-        http: &Client,
-        version: &Version,
-        name: &str,
-        limit: usize,
-    ) -> Result<Vec<u8>> {
-        let response = http
-            .get(self.asset(version, name))
+    async fn get_asset(&self, http: &Client, version: &Version, name: &str) -> Result<Response> {
+        http.get(self.asset(version, name))
             .send()
             .await
             .map_err(|exc| {
@@ -319,15 +351,26 @@ impl Releases {
                 } else {
                     error(format!("could not download {name}"))
                 }
-            })?;
-        if response.status().as_u16() != 200 {
-            return Err(error(format!(
-                "download of {name} answered HTTP {}",
-                response.status().as_u16()
-            )));
-        }
-        bytes(response, limit, &format!("{name} is too large")).await
+            })
     }
+}
+
+async fn read_asset(response: Response, limit: usize, name: &str) -> Result<Vec<u8>> {
+    if response.status().as_u16() != 200 {
+        return Err(error(format!(
+            "download of {name} answered HTTP {}",
+            response.status().as_u16()
+        )));
+    }
+    bytes(response, limit, &format!("{name} is too large")).await
+}
+
+fn has_uploaded_asset(release: &Value, name: &str) -> bool {
+    release["assets"].as_array().is_some_and(|assets| {
+        assets.iter().any(|asset| {
+            asset["name"].as_str() == Some(name) && asset["state"].as_str() == Some("uploaded")
+        })
+    })
 }
 
 fn expected_digest(manifest: &str, name: &str) -> Result<String> {
