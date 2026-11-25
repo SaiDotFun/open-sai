@@ -467,10 +467,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn load(flags: &Flags, env: &Environment) -> Result<Self, SettingsError> {
-        let overridden = |key| flags.value(key).is_some() || env.raw(key).is_some();
-        let file = FileSettings::read_effective(&env.path(), |key| {
-            overridden(key) || key == Key::KeeperWsEndpoint && overridden(Key::KeeperEndpoint)
-        })?;
+        let file = FileSettings::read(&env.path(), env.raw(Key::UpdateAuto).is_some())?;
         Self::resolve(flags, env, file)
     }
 
@@ -623,7 +620,7 @@ struct FileSettings {
 
 impl FileSettings {
     fn read_for_diagnostics(path: &Path) -> Result<Self, SettingsError> {
-        let file = Self::read(path)?;
+        let file = Self::read(path, false)?;
         for key in KEYS {
             if let Some(Ok(value)) = &file.entries[key as usize]
                 && let Some(url) = value.as_str()
@@ -635,14 +632,7 @@ impl FileSettings {
         Ok(file)
     }
 
-    fn read(path: &Path) -> Result<Self, SettingsError> {
-        Self::read_effective(path, |_| false)
-    }
-
-    fn read_effective(
-        path: &Path,
-        overridden: impl Fn(Key) -> bool,
-    ) -> Result<Self, SettingsError> {
+    fn read(path: &Path, update_overridden: bool) -> Result<Self, SettingsError> {
         let Some(text) = read_text(path)? else {
             return Ok(Self::default());
         };
@@ -659,7 +649,7 @@ impl FileSettings {
                             .push(format!("{path}: ignoring unknown setting {}", repr(&name)));
                         continue;
                     };
-                    if overridden(key) {
+                    if key == Key::UpdateAuto && update_overridden {
                         continue;
                     }
                     let entry = key.read_value(item, &parsed);
@@ -672,32 +662,25 @@ impl FileSettings {
                     }
                     file.entries[key as usize] = Some(entry);
                 }
-            } else {
-                let in_section = |key: &Key| key.section_and_name().0 == section;
-                if !KEYS.iter().any(in_section) {
-                    file.warnings.push(format!(
-                        "{path}: ignoring unknown setting {}",
-                        repr(section)
-                    ));
-                    continue;
-                }
-                let mut active = KEYS
-                    .into_iter()
-                    .filter(in_section)
-                    .filter(|key| !overridden(*key))
-                    .peekable();
-                if active.peek().is_none() {
-                    continue;
-                }
+            } else if section == "logs" {
                 let message = table_error(section);
-                if section != "logs" {
-                    return Err(SettingsError::invalid(format!("{path}: {message}")));
-                }
-                for key in active {
+                for key in [Key::LogsEnabled, Key::LogsKeepDays] {
                     file.entries[key as usize] = Some(Err(SettingsError::invalid(message.clone())));
                 }
                 file.warnings.push(format!(
                     "{path}: {message}; logging is off until it is fixed"
+                ));
+            } else if section == "update" && update_overridden {
+                continue;
+            } else if KEYS.iter().any(|key| key.section_and_name().0 == section) {
+                return Err(SettingsError::invalid(format!(
+                    "{path}: {}",
+                    table_error(section)
+                )));
+            } else {
+                file.warnings.push(format!(
+                    "{path}: ignoring unknown setting {}",
+                    repr(section)
                 ));
             }
         }
@@ -739,7 +722,7 @@ pub(crate) fn log_keep_days(env: &Environment) -> Option<u64> {
 }
 
 pub(crate) fn log_keep_value(env: &Environment) -> Option<Value> {
-    let file = FileSettings::read(&env.path()).ok()?;
+    let file = FileSettings::read(&env.path(), false).ok()?;
     let flags = Flags::default();
     let value = |key: Key| {
         pick(key, &flags, env, file.entries[key as usize].as_ref())

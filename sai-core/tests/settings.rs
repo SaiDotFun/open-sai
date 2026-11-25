@@ -47,7 +47,7 @@ fn resolves_all_layers_and_uses_websocket_from_the_same_or_higher_layer() {
 }
 
 #[test]
-fn file_type_errors_are_skipped_for_overrides_and_reported_for_diagnostics() {
+fn file_type_errors_are_reported_before_overrides_except_for_logging() {
     let home = tempdir().unwrap();
     let env = fixture(
         home.path(),
@@ -57,10 +57,7 @@ fn file_type_errors_are_skipped_for_overrides_and_reported_for_diagnostics() {
         ],
     );
     fs::write(env.path(), "[keeper]\nendpoint = 42\n").unwrap();
-    let resolved = Settings::load(&Flags::default(), &env).unwrap();
-    assert_eq!(resolved.endpoint(), "https://env.example");
-    assert_eq!(resolved.source(Key::KeeperEndpoint), Source::Env);
-    let error = Settings::for_doctor(&Flags::default(), &env).unwrap_err();
+    let error = Settings::load(&Flags::default(), &env).unwrap_err();
     assert_eq!(
         error.to_string(),
         format!(
@@ -85,6 +82,29 @@ fn file_type_errors_are_skipped_for_overrides_and_reported_for_diagnostics() {
             "SAI_LOG_KEEP_DAYS: Invalid value for logs.keep_days: expected a whole number, 1 or more; logging is off until it is fixed"
                 .to_owned(),
         ]
+    );
+}
+
+#[test]
+fn update_override_wins_for_runtime_but_doctor_checks_the_stored_value() {
+    let home = tempdir().unwrap();
+    let env = fixture(home.path(), &[("SAI_UPDATE_AUTO", "invalid")]);
+    fs::write(env.path(), "[update]\nauto = \"invalid\"\n").unwrap();
+
+    let effective = Settings::load(&Flags::default(), &env).unwrap_err();
+    assert!(effective.is_invalid_setting());
+    assert_eq!(
+        effective.to_string(),
+        "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
+    );
+
+    let stored = Settings::for_doctor(&Flags::default(), &env).unwrap_err();
+    assert_eq!(
+        stored.to_string(),
+        format!(
+            "{}: Invalid value for update.auto: expected true or false",
+            env.path().display()
+        )
     );
 }
 
