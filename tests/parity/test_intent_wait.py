@@ -33,6 +33,9 @@ from test_intent_status import (
 REQUEST_BLOCK = 50109595
 FILL_BLOCK = 50109596
 OPAQUE = "fixture-upstream-private-text"
+PRIVATE_KEEPER_HINT = (
+    '"${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
+)
 
 
 def intent(name: str, **fields: object) -> dict[str, Any]:
@@ -517,6 +520,15 @@ def test_wait_usage(
         observed.append(
             result.stdout if "--help" in args else json.loads(result.stdout)
         )
+    if code == 5:
+        # The pinned CLI treated its own /query route as private.
+        reference = observed[0]
+        old = f"sai --endpoint {PRIVATE_KEEPER_HINT} "
+        for item in (reference, reference["error"]):
+            assert item["hint"].startswith(old)
+            item["hint"] = f"sai --endpoint {keeper.MAINNET_HTTP} " + item[
+                "hint"
+            ].removeprefix(old)
     assert observed[0] == observed[1]
 
 
@@ -600,13 +612,7 @@ def test_wait_recovery_for_the_public_keeper_route(
         assert result.returncode == 5 and not result.stderr, result
         document = json.loads(result.stdout)
         assert document["addr"] is None
-        expected = (
-            endpoint
-            if public
-            else (
-                '"${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}"'
-            )
-        )
+        expected = endpoint if public else PRIVATE_KEEPER_HINT
         assert document["hint"] == f"sai --endpoint {expected} intent wait {KEY}"
         assert document["error"]["hint"] == document["hint"]
 
