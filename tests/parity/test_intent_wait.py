@@ -282,9 +282,9 @@ def ledger_state(home: Path) -> list[tuple[str, str, str | None]]:
 def without_legacy_fill_placeholders(stdout: bytes) -> bytes:
     # The pinned Python reference predates the removal. Keep the remaining
     # bytes intact, including the wire spelling of decimal numbers.
-    old = b'"fill":{"price":null,"sizeCollateralBaseUnits":null,'
+    old = b'"fill": {"price": null, "sizeCollateralBaseUnits": null, '
     assert old in stdout
-    return stdout.replace(old, b'"fill":{', 1)
+    return stdout.replace(old, b'"fill": {', 1)
 
 
 def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
@@ -481,12 +481,12 @@ def test_wait_account_first_matches_python(
             assert result.returncode == 0, result
             assert result.stderr == b""
             assert len(requests) == 2
-            stdout = (
-                without_legacy_fill_placeholders(result.stdout)
-                if index == 0
-                else result.stdout
-            )
-            results.append(json.loads(stdout))
+            document = json.loads(result.stdout)
+            if index == 0:
+                fill = document["receipt"]["fill"]
+                assert fill.pop("price") is None
+                assert fill.pop("sizeCollateralBaseUnits") is None
+            results.append(document)
     assert results[0] == results[1]
 
 
