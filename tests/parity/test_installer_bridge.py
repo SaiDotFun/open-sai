@@ -724,8 +724,9 @@ def test_standalone_recovers_an_interrupted_first_switch(
 ) -> None:
     native_artifact(replay)
     interrupt_install(install, replay, boundary)
-    assert pending(install).exists() == (boundary != "record")
-    assert install.launcher.is_symlink() == (boundary in ("published", "commit"))
+    assert pending(install).exists() == (boundary == "commit")
+    assert install.launcher.is_symlink() == (boundary != "link")
+    assert install.launcher.exists() == (boundary == "commit")
     replay.redirects[f"/repos{REPO}/releases"] = "/unavailable"
     result = install.install(replay, "--native")
     assert result.returncode == 1 and "HTTP 302" in result.stderr
@@ -738,9 +739,11 @@ def test_native_updater_recovers_an_interrupted_first_install(
     install: Install, replay: Replay
 ) -> None:
     native_artifact(replay, "RECOVERY_RUST")
-    interrupt_install(install, replay, "published")
-    assert json.loads(pending(install).read_text())["old"] is None
+    interrupt_install(install, replay, "commit")
     public = install.launcher.lstat()
+    record = json.loads(pending(install).read_text())
+    assert record["old"] is None
+    assert record["launcher"] == [public.st_dev, public.st_ino]
     result = install.run(
         install.launcher, "update", "--api-base", replay.base, "--web-base", replay.base
     )
@@ -748,6 +751,33 @@ def test_native_updater_recovers_an_interrupted_first_install(
     assert not install.launcher.exists()
     assert os.path.samestat(install.launcher.lstat(), public)
     assert not pending(install).exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+@pytest.mark.parametrize("runtime", ["installer", "rust"])
+def test_pending_recovery_preserves_a_replaced_same_version_launcher(
+    install: Install, replay: Replay, runtime: str
+) -> None:
+    native_artifact(replay, "RECOVERY_RUST")
+    interrupt_install(install, replay, "commit")
+    record = pending(install).read_bytes()
+    target = install.launcher.resolve(strict=True)
+    competitor = install.launcher.with_name("competitor")
+    competitor.symlink_to(install.launcher.readlink())
+    entry = competitor.lstat()
+    competitor.replace(install.launcher)
+
+    result = (
+        install.install(replay, "--native")
+        if runtime == "installer"
+        else install.update(replay)
+    )
+
+    assert result.returncode == 1, (result.stdout, result.stderr)
+    assert "launcher changed" in (result.stdout + result.stderr).lower()
+    assert os.path.samestat(install.launcher.lstat(), entry)
+    assert install.launcher.resolve(strict=True) == target
+    assert pending(install).read_bytes() == record
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")

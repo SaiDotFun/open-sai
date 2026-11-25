@@ -819,7 +819,10 @@ def read_native_pending(root: Path) -> dict[str, Any] | None:
         raise LookupFailed("could not read the pending Sai install record") from error
     if (
         not isinstance(record, dict)
-        or set(record) != {"old", "new"}
+        or set(record) != {"old", "new", "launcher"}
+        or not isinstance(record["launcher"], list)
+        or len(record["launcher"]) != 2
+        or any(type(part) is not int or part < 0 for part in record["launcher"])
         or not isinstance(record["new"], str)
         or (record["old"] is not None and not isinstance(record["old"], str))
     ):
@@ -840,7 +843,9 @@ def switch_selector(root: Path, directory: str | None) -> None:
     sync_dir(root)
 
 
-def recover_native(root: Path) -> str | None:
+def recover_native(
+    root: Path, launcher: Path, entry: tuple[int, int, str | None] | None
+) -> str | None:
     legacy = root / ".launcher-switch"
     if os.path.lexists(legacy):
         raise LookupFailed(
@@ -852,15 +857,22 @@ def recover_native(root: Path) -> str | None:
     if record is None:
         return active
     old, new = record["old"], record["new"]
-    native_binary(root, new)
+    binary = native_binary(root, new)
+    if entry is None or list(entry[:2]) != record["launcher"]:
+        raise LauncherChanged(
+            f"The Sai launcher changed at {launcher} during an interrupted install."
+            f" The pending install selected {binary}."
+        )
     if old is not None:
         native_binary(root, old)
+    require_launcher(launcher, entry, binary)
     if active == new and old != new:
         switch_selector(root, old)
     elif active != old:
         raise LookupFailed(
             f"{root / NATIVE_SELECTOR} changed during an interrupted Sai install"
         )
+    require_launcher(launcher, entry, binary)
     (root / NATIVE_PENDING).unlink()
     sync_dir(root)
     return old
@@ -1030,7 +1042,7 @@ def install_native(args: argparse.Namespace) -> int:
         check_path(launcher)
         entry = standalone_launcher(launcher, root)
         checked_directory(root, private=True)
-        old = recover_native(root)
+        old = recover_native(root, launcher, entry)
         tag, version, asset = native_release(args)
         with (
             tempfile.TemporaryDirectory(dir=root, prefix=".stage-") as scratch,
@@ -1053,27 +1065,29 @@ def install_native(args: argparse.Namespace) -> int:
             proved = binary.stat()
             # Complete startup checks before making this binary public.
             smoke_native(binary, Path(profile), version)
-            pending = root / NATIVE_PENDING
-            write_native_pending(root, {"old": old, "new": new})
-            try:
-                require_launcher(launcher, entry, binary)
-                switch_selector(root, new)
-                if entry is None:
+            require_launcher(launcher, entry, binary)
+            if entry is None:
+                try:
                     entry = publish_launcher(launcher, root)
-                require_launcher(launcher, entry, binary, proved)
-                if old is not None:
-                    repair_mcp(binary, profile)
-                require_launcher(launcher, entry, binary, proved)
-            except FileExistsError as error:
-                recover_native(root)
-                actual = launcher_destination(launcher, launcher_entry(launcher))
-                raise LookupFailed(
-                    f"{launcher} was created by another installer at {actual}"
-                    f" while selecting {binary}"
-                ) from error
-            except LauncherChanged:
-                recover_native(root)
-                raise
+                except FileExistsError as error:
+                    actual = launcher_destination(launcher, launcher_entry(launcher))
+                    raise LauncherChanged(
+                        f"{launcher} was created by another installer at {actual}"
+                        f" while selecting {binary}"
+                    ) from error
+            require_launcher(launcher, entry, binary)
+            pending = root / NATIVE_PENDING
+            # The stable link can exist before selection. Journal its inode
+            # before activating the already-verified executable.
+            write_native_pending(
+                root, {"old": old, "new": new, "launcher": list(entry[:2])}
+            )
+            require_launcher(launcher, entry, binary)
+            switch_selector(root, new)
+            require_launcher(launcher, entry, binary, proved)
+            if old is not None:
+                repair_mcp(binary, profile)
+            require_launcher(launcher, entry, binary, proved)
             pending.unlink()
             sync_dir(root)
             require_launcher(launcher, entry, binary, proved)
