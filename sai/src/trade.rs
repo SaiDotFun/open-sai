@@ -1,4 +1,5 @@
 use std::{
+    future::{Future, pending},
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -15,7 +16,7 @@ use sai_core::{
     },
     wait,
 };
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 use crate::{load_settings, local};
 
@@ -105,6 +106,9 @@ pub struct Position {
     lcd_endpoint: Option<String>,
     #[arg(long)]
     dry_run: bool,
+    /// Wait up to 30 seconds for the intent outcome.
+    #[arg(long)]
+    wait: bool,
     /// Confirm the digest printed by --dry-run.
     #[arg(long)]
     preview_digest: Option<String>,
@@ -337,6 +341,14 @@ pub fn run(
     let storage = Storage::new(&env.home).with_event_sink(&log_storage);
     let trading = Trading::new(settings.endpoint(), &storage, events)
         .with_lcd_endpoint(settings.lcd_endpoint());
+    let waiting = WaitTrade {
+        endpoint: settings.endpoint(),
+        storage: &storage,
+        events,
+        env,
+        json,
+        reservation: OnceLock::new(),
+    };
     let cancelling = matches!(
         command,
         TradeCommand::Cancel { .. }
@@ -393,7 +405,7 @@ pub fn run(
                     direction,
                     amount: &amount,
                 },
-                json,
+                &waiting,
             );
         }
         TradeCommand::PartialClose { position, percent } => {
@@ -404,7 +416,7 @@ pub fn run(
                 PositionAction::PartialClose {
                     percent: trade::parse_partial_close_percent(&percent)?,
                 },
-                json,
+                &waiting,
             );
         }
         TradeCommand::Tpsl {
@@ -471,114 +483,135 @@ pub fn run(
         return Ok(ExitCode::Ok);
     }
     let session = session.ok_or_else(SaiError::internal)?;
-    let endpoint = settings.endpoint();
-    let addr = session.addr();
-    let reservation = OnceLock::<String>::new();
-    let track = |key: &str| {
-        let _ = reservation.set(key.to_owned());
-    };
     if preview.requires_market_price_refresh() && supplied_price {
         eprintln!("{}", trade::MARKET_PRICE_NOTICE);
     }
+    let track = |addr: &str, key: &str| waiting.track(addr, key);
     let options = SubmitOptions {
         allow_concurrent_open,
-        on_reserved: wait_for_trade.then_some(&track as &(dyn Fn(&str) + Sync)),
+        on_reserved: wait_for_trade.then_some(&track),
         ..SubmitOptions::default()
     };
+    let submit = async {
+        let (result, reference_price) = trading
+            .submit_with_reference_price(
+                &session,
+                &preview,
+                options,
+                trade_interrupt(wait_for_trade),
+            )
+            .await?;
+        let mut output = json!({
+            "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
+            "message": result.message,
+        });
+        if let Some(price) = reference_price {
+            output["referencePrice"] = json!(price);
+        }
+        Ok(output)
+    };
     if wait_for_trade {
+        return runtime.block_on(waiting.finish(submit));
+    }
+    local::emit(&runtime.block_on(submit)?, json)?;
+    Ok(ExitCode::Ok)
+}
+
+struct WaitTrade<'a> {
+    endpoint: &'a str,
+    storage: &'a Storage<'a>,
+    events: EventContext<'a>,
+    env: &'a Environment,
+    json: bool,
+    reservation: OnceLock<(String, String)>,
+}
+
+impl WaitTrade<'_> {
+    fn track(&self, addr: &str, key: &str) {
+        let _ = self.reservation.set((addr.into(), key.into()));
+    }
+
+    async fn finish(
+        &self,
+        submit: impl Future<Output = Result<Value, SaiError>>,
+    ) -> Result<ExitCode, SaiError> {
         let recover = |interrupted, error: SaiError| {
-            let Some(key) = reservation.get() else {
+            let Some((addr, key)) = self.reservation.get() else {
                 return Err(error);
             };
             let confirmed = (error.code == Code::NotSent).then_some(wait::Outcome::NotSent);
             Ok((
-                wait::recovery_result(&storage, endpoint, addr, key, interrupted, confirmed),
+                wait::recovery_result(
+                    self.storage,
+                    self.endpoint,
+                    addr,
+                    key,
+                    interrupted,
+                    confirmed,
+                ),
                 None,
                 true,
             ))
         };
-        return runtime.block_on(async {
-            let mut signal = local::wait_signal()?;
-            let waited = async {
-                let submission = trading
-                    .submit_with_reference_price(
-                        &session,
-                        &preview,
-                        options,
-                        std::future::pending(),
-                    )
-                    .await;
-                let (key, metadata) = match submission {
-                    Ok((accepted, price)) => {
-                        let mut metadata = Map::from_iter([
-                            ("intentKey".into(), json!(accepted.intent_key)),
-                            ("status".into(), json!(accepted.status)),
-                        ]);
-                        if let Some(price) = price {
-                            metadata.insert("referencePrice".into(), json!(price));
-                        }
-                        (accepted.intent_key, Some(metadata))
-                    }
-                    Err(error) if error.code == Code::AdmissionRejected => {
-                        let Some(key) = reservation.get() else {
-                            return Err(error);
-                        };
-                        return Ok((
-                            wait::rejected_result(key, addr, &error.message),
-                            None,
-                            false,
-                        ));
-                    }
-                    Err(error) if error.code == Code::OutcomeUnknown => {
-                        (reservation.get().ok_or(error)?.clone(), None)
-                    }
-                    Err(error) => return Err(error),
-                };
-                let receipt = wait::for_intent(
-                    endpoint,
-                    addr,
-                    &key,
-                    Duration::from_secs_f64(wait::DEFAULT_TIMEOUT),
-                    Instant::now(),
-                    &storage,
-                    events,
-                )
-                .await?;
-                Ok((receipt, metadata, false))
+        let mut signal = local::wait_signal()?;
+        let waited = async {
+            let result = submit.await;
+            let Some((addr, key)) = self.reservation.get() else {
+                return result.and_then(|_| Err(SaiError::internal()));
             };
-            let (mut receipt, metadata, recovered) = tokio::select! {
-                biased;
-                _ = signal.recv() => recover(true, local::wait_aborted()),
-                result = waited => result.or_else(|error| recover(false, error)),
-            }?;
-            if let Some(mut metadata) = metadata {
-                let Value::Object(body) = receipt.body else {
-                    return Err(SaiError::internal());
-                };
-                metadata.extend(body);
-                receipt.body = Value::Object(metadata);
-            }
-            if !recovered {
-                receipt.body["status"] = json!(receipt.outcome);
-            }
-            local::emit_wait(receipt, endpoint, env, json, recovered, &mut signal).await
-        });
+            let metadata = match result {
+                Ok(Value::Object(mut metadata)) => {
+                    metadata.remove("message");
+                    Some(metadata)
+                }
+                Ok(_) => return Err(SaiError::internal()),
+                Err(error) if error.code == Code::AdmissionRejected => {
+                    return Ok((
+                        wait::rejected_result(key, addr, &error.message),
+                        None,
+                        false,
+                    ));
+                }
+                Err(error) if error.code == Code::OutcomeUnknown => None,
+                Err(error) => return Err(error),
+            };
+            let receipt = wait::for_intent(
+                self.endpoint,
+                addr,
+                key,
+                Duration::from_secs_f64(wait::DEFAULT_TIMEOUT),
+                Instant::now(),
+                self.storage,
+                self.events,
+            )
+            .await?;
+            Ok((receipt, metadata, false))
+        };
+        let (mut receipt, metadata, recovered) = tokio::select! {
+            biased;
+            _ = signal.recv() => recover(true, local::wait_aborted()),
+            result = waited => result.or_else(|error| recover(false, error)),
+        }?;
+        if let Some(mut metadata) = metadata {
+            let Value::Object(body) = receipt.body else {
+                return Err(SaiError::internal());
+            };
+            metadata.extend(body);
+            receipt.body = Value::Object(metadata);
+        }
+        if !recovered {
+            receipt.body["status"] = json!(receipt.outcome);
+        }
+        local::emit_wait(
+            receipt,
+            self.endpoint,
+            self.env,
+            self.json,
+            recovered,
+            &mut signal,
+        )
+        .await
     }
-    let (result, reference_price) = runtime.block_on(trading.submit_with_reference_price(
-        &session,
-        &preview,
-        options,
-        trade_interrupt(),
-    ))?;
-    let mut output = json!({
-        "addr": session.addr(), "intentKey": result.intent_key, "status": result.status,
-        "message": result.message,
-    });
-    if let Some(price) = reference_price {
-        output["referencePrice"] = json!(price);
-    }
-    local::emit(&output, json)?;
-    Ok(ExitCode::Ok)
 }
 
 pub fn missing_position_option(argument: &str) -> Option<SaiError> {
@@ -598,7 +631,7 @@ impl Position {
         settings: &Settings,
         account: Option<&str>,
         action: PositionAction<'_>,
-        json: bool,
+        waiting: &WaitTrade<'_>,
     ) -> Result<ExitCode, SaiError> {
         if let Some(endpoint) = &self.lcd_endpoint {
             Key::LcdEndpoint.parse_value(endpoint)?;
@@ -607,44 +640,58 @@ impl Position {
             .lcd_endpoint
             .as_deref()
             .unwrap_or_else(|| settings.lcd_endpoint());
+        let wait_for_trade = self.wait && !self.dry_run;
+        let track = |addr: &str, key: &str| waiting.track(addr, key);
         let mode = if self.dry_run {
             PositionMode::Preview
         } else {
-            PositionMode::Submit(
-                self.preview_digest
+            PositionMode::Submit(SubmitOptions {
+                confirmation: self
+                    .preview_digest
                     .as_deref()
                     .map(trade::Confirmation::for_position_cli),
-            )
+                on_reserved: wait_for_trade.then_some(&track),
+                ..SubmitOptions::default()
+            })
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .map_err(|_| SaiError::internal())?;
-        let result = runtime
-            .block_on(trading.position_trade_with_interrupt(
-                account,
-                lcd_endpoint,
-                &self.trade_id,
-                action,
-                mode,
-                trade_interrupt(),
-            ))
-            .map_err(|mut error| {
-                if !json && error.code == Code::PreviewMismatch && error.details.is_some() {
+        let submit = async {
+            trading
+                .position_trade_with_interrupt(
+                    account,
+                    lcd_endpoint,
+                    &self.trade_id,
+                    action,
+                    mode,
+                    trade_interrupt(wait_for_trade),
+                )
+                .await
+                .map_err(|mut error| {
+                    if !waiting.json
+                        && error.code == Code::PreviewMismatch
+                        && error.details.is_some()
+                    {
+                        error
+                            .message
+                            .push_str(" Run with --dry-run to review a fresh preview.");
+                    }
                     error
-                        .message
-                        .push_str(" Run with --dry-run to review a fresh preview.");
-                }
-                error
-            })?;
-        local::emit(&result, json)?;
+                })
+        };
+        if wait_for_trade {
+            return runtime.block_on(waiting.finish(submit));
+        }
+        local::emit(&runtime.block_on(submit)?, waiting.json)?;
         Ok(ExitCode::Ok)
     }
 }
 
-async fn trade_interrupt() {
-    if tokio::signal::ctrl_c().await.is_err() {
-        std::future::pending().await
+async fn trade_interrupt(waiting_handles_interrupt: bool) {
+    if waiting_handles_interrupt || tokio::signal::ctrl_c().await.is_err() {
+        pending().await
     }
 }
 

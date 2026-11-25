@@ -41,7 +41,7 @@ pub enum PositionAction<'a> {
 pub enum PositionMode<'a> {
     DryRun,
     Preview,
-    Submit(Option<Confirmation<'a>>),
+    Submit(SubmitOptions<'a>),
 }
 
 pub fn parse_partial_close_percent(input: &str) -> Result<u8, SaiError> {
@@ -148,18 +148,20 @@ impl Trading<'_> {
         let session = self.load_session(account)?;
         let addr = session.addr();
         let lcd = Lcd(lcd_endpoint);
-        let confirming = matches!(&mode, PositionMode::Submit(Some(_)));
+        let confirming =
+            matches!(&mode, PositionMode::Submit(options) if options.confirmation.is_some());
         let first = self
             .quote_for_position(&lcd, addr, &id, action, confirming)
             .await?;
-        let PositionMode::Submit(confirmation) = mode else {
+        let PositionMode::Submit(options) = mode else {
             return Ok(match mode {
                 PositionMode::Preview => first.preview.confirmed_output(Some(addr)),
                 _ => first.preview.output(Some(addr)),
             });
         };
 
-        let cli = confirmation
+        let cli = options
+            .confirmation
             .as_ref()
             .is_none_or(Confirmation::is_position_cli);
         let current = self
@@ -179,15 +181,7 @@ impl Trading<'_> {
             return Err(position_changed(action, addr, latest, cli));
         }
         let (accepted, _) = self
-            .submit_with_reference_price(
-                &session,
-                &current.preview,
-                SubmitOptions {
-                    confirmation,
-                    ..SubmitOptions::default()
-                },
-                interrupted,
-            )
+            .submit_with_reference_price(&session, &current.preview, options, interrupted)
             .await?;
         let mut output = json!({
             "addr": addr,

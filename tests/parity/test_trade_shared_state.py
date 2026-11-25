@@ -553,7 +553,7 @@ def test_trade_wait_replays_pending_then_receipt(
     with loopback(action.server, trade_replay=replay) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
-        required_wait = action_name in ("tpsl", "leverage")
+        required_wait = action_name in ("tpsl", "leverage", "margin", "partial-close")
         if not required_wait:
             trade_help(home, writer, action_name)
         if not supports_trade_wait(home, writer, action.args[0]):
