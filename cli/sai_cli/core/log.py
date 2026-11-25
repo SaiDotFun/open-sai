@@ -855,7 +855,7 @@ class LogDir:
     @contextmanager
     def scan_file(
         self, name: str, extent: FileExtent | None
-    ) -> Iterator[tuple[int, int]]:
+    ) -> Generator[tuple[int, int]]:
         fd = self.read_fd(name, extent)
         try:
             size = extent.size if extent is not None else os.fstat(fd).st_size
