@@ -466,10 +466,7 @@ def observe(
         if SECRET in result.stdout or SECRET in result.stderr:
             raise ValueError("Client config value escaped into CLI output")
         files.update(client_state(home, client_before, normalize))
-    state = dict(case.state or {})
-    if candidate and case.accepted_divergence == "codex-repair-rollback":
-        state["clients/.codex/config.toml#changed"] = False
-    check_state(state, files)
+    check_state(case.state or {}, files)
     display = result.stdout
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
@@ -744,14 +741,6 @@ def run_case(
             tools,
             None,
         )
-    if candidate != reference and case.accepted_divergence == "codex-repair-rollback":
-        # Both observations checked their expected change flag. Compare the
-        # saved file's existence and mode while allowing its contents to differ.
-        filename = "clients/.codex/config.toml"
-        for observation in (left, right):
-            observation.files[filename] = replace(
-                observation.files[filename], data=None
-            )
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
     expected = None
