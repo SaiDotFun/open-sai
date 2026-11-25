@@ -13,8 +13,8 @@ use sai_core::{
     keeper::{POSITION, ROUTE, SUBMIT},
     storage::{Session, Storage},
     trade::{
-        Confirmation, SubmitOptions, TradePreview, Trading, leverage_preview, preview_digest,
-        tpsl_preview,
+        Confirmation, PreviewMode, SubmitOptions, TradePreview, Trading, close_preview,
+        leverage_preview, preview_digest, tpsl_preview,
     },
 };
 use serde_json::{Value, json};
@@ -33,6 +33,7 @@ struct ReplyState {
     keeper_chain: &'static str,
     lcd_chain: &'static str,
     contract: &'static str,
+    contract_available: bool,
     requests: Vec<String>,
 }
 
@@ -54,6 +55,7 @@ impl PositionServer {
             keeper_chain: NETWORK,
             lcd_chain: NETWORK,
             contract: CONTRACT,
+            contract_available: true,
             requests: Vec::new(),
         }));
         let stop = Arc::new(AtomicBool::new(false));
@@ -70,14 +72,22 @@ impl PositionServer {
                     Err(error) => panic!("loopback listener: {error}"),
                 };
                 let (headers, bytes) = read_request(&mut stream);
-                let response = replies
-                    .lock()
-                    .unwrap()
-                    .response(&headers[0], &bytes)
-                    .to_string();
+                let mut replies = replies.lock().unwrap();
+                let response = replies.response(&headers[0], &bytes).to_string();
+                let status = if !replies.contract_available
+                    && replies
+                        .requests
+                        .last()
+                        .is_some_and(|label| label == "contract_position")
+                {
+                    "503 Service Unavailable"
+                } else {
+                    "200 OK"
+                };
+                drop(replies);
                 write!(
                     stream,
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}",
                     response.len(),
                 )
                 .unwrap();
@@ -161,6 +171,71 @@ fn fixture_storage<'a>(home: &'a TempDir, endpoint: &str) -> Storage<'a> {
         ))
         .unwrap();
     storage
+}
+
+#[tokio::test]
+async fn cancel_preview_rejects_a_close_before_network_reads() {
+    let server = PositionServer::start(ACCOUNT, ACCOUNT);
+    let endpoint = format!("{}/query", server.url);
+    let home = tempfile::tempdir().unwrap();
+    let storage = fixture_storage(&home, &endpoint);
+    let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+    let session = trading.load_session(None).unwrap();
+    let close = close_preview("7", false).unwrap();
+
+    let error = trading.cancel_preview(&session, &close).await.unwrap_err();
+    assert_eq!(error.code, Code::InternalError);
+    assert!(server.requests().is_empty());
+    assert!(!home.path().join("trader/intents.sqlite3").exists());
+}
+
+#[tokio::test]
+async fn close_preview_requires_verified_ownership_to_issue_a_digest() {
+    for (chain, available, verified) in [
+        (NETWORK, false, false),
+        ("other-chain", true, false),
+        (NETWORK, true, true),
+    ] {
+        let server = PositionServer::start(ACCOUNT, ACCOUNT);
+        {
+            let mut state = server.state.lock().unwrap();
+            state.lcd_chain = chain;
+            state.contract_available = available;
+        }
+        let endpoint = format!("{}/query", server.url);
+        let home = tempfile::tempdir().unwrap();
+        let storage = fixture_storage(&home, &endpoint);
+        let trading = Trading::new(&endpoint, &storage, EVENTS).with_lcd_endpoint(&server.url);
+        let session = trading.load_session(None).unwrap();
+        let preview = trading
+            .prepare_preview(
+                close_preview("7", false).unwrap(),
+                Some(&session),
+                PreviewMode::Mcp,
+            )
+            .await
+            .unwrap();
+
+        let output = preview.confirmed_output(Some(session.addr()));
+        // The fixture has no borrowing data. Ownership can still be confirmed.
+        assert_eq!(output["estimates"]["fees"]["status"], "unavailable");
+        if verified {
+            assert!(output.get("positionOwnerVerified").is_none());
+            assert_eq!(
+                output["previewDigest"],
+                preview_digest(&preview, Some(session.addr()))
+            );
+        } else {
+            assert!(output.get("previewDigest").is_none());
+            assert_eq!(output["positionOwnerVerified"], false);
+        }
+        let mut requests = vec!["position", "route", "node_info"];
+        if chain == NETWORK {
+            requests.push("contract_position");
+        }
+        assert_eq!(server.requests(), requests);
+        assert!(!home.path().join("trader/intents.sqlite3").exists());
+    }
 }
 
 #[tokio::test]

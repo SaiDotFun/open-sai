@@ -40,7 +40,7 @@ impl Trading<'_> {
             let target = preview.intent.body["requestedLeverage"].as_str();
             let quote = async {
                 let snapshot = self
-                    .position_snapshot(&lcd, addr, id, route, indexed)
+                    .position_snapshot(&lcd, addr, id, route, indexed, None)
                     .await?;
                 let Some(height) = snapshot.verified_height(&lcd, id).await? else {
                     return Ok(None);

@@ -1,6 +1,5 @@
 # List uncovered commands explicitly so adding a command requires a decision.
 [deferred]
-"account overview" = "Requires pinned LCD and trade replay fixtures."
 "auth import" = "Successful imports are compared with a fixture clipboard and PTY in test_auth.py."
 "auth login" = "Compared with fixture signing programs and loopback Keeper in test_auth.py."
 "auth renew" = "Compared with Python main in test_auth.py."
@@ -155,7 +154,430 @@ name = "account-bare"
 args = ["account"]
 mode = "text"
 expect = 2
-expected_overview_help = "Remove when the Rust account overview follow-up lands (PR #104 rev-5)."
+
+[[case]]
+name = "account-overview-interrupt-http"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+server = "overview-interrupt-http"
+interrupt_on_request = true
+expect = 1
+wire = ["ws:init", "ws:userBalancesWithBlock", "overviewTrades"]
+[case.state]
+"logs/cli.jsonl#1.event" = "keeper.request"
+"logs/cli.jsonl#1.operation" = "overview_trades"
+"logs/cli.jsonl#1.status" = "error"
+"logs/cli.jsonl#1.code" = "INTERNAL_ERROR"
+
+[[case]]
+name = "account-overview-help"
+args = ["account", "overview", "--help"]
+mode = "text"
+
+[[case]]
+name = "account-overview-signed-out"
+args = ["--json", "account", "overview"]
+expect = 1
+
+[[case]]
+name = "account-overview-signed-out-leaf-json"
+args = ["account", "overview", "--json"]
+mode = "text"
+expect = 1
+
+[[case]]
+name = "account-overview-signed-in"
+args = ["account", "overview", "--json"]
+seed = "overview-session"
+server = "overview-full"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "account-overview-paginated"
+args = ["account", "overview", "--json"]
+seed = "overview-blockers"
+server = "overview-paginated"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+[case.overview_expected]
+"positions.data.items.@len" = 2
+"positions.data.unrealizedPnlUsd" = 7.0
+"pendingOrders.data.@len" = 99
+"pendingOrders.data.98.id" = 100
+"blockingIntents.data.@len" = 3
+"blockingIntents.data.0.scope" = "allTrades"
+"blockingIntents.data.1.scope" = "openTrades"
+"blockingIntents.data.1.tradeId" = "<null>"
+"blockingIntents.data.2.scope" = "sameTrade"
+"blockingIntents.data.2.tradeId" = "1"
+
+[[case]]
+name = "account-overview-confirmation-fails"
+args = ["account", "overview", "--json"]
+seed = "overview-session"
+server = "overview-confirmation-fails"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+[case.overview_expected]
+"positions.data.items.@len" = 2
+"positions.data.unrealizedPnlUsd" = "<null>"
+"positions.error.code" = "INCOMPLETE_DATA"
+"pendingOrders.error.code" = "INCOMPLETE_DATA"
+"pendingOrders.data.@len" = 99
+"pendingOrders.data.98.id" = 100
+
+[[case]]
+name = "account-overview-pnl-total"
+args = ["account", "overview", "--json"]
+seed = "overview-session"
+server = "overview-pnl-total"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "get_trade",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "account-overview-liquidation-json"
+args = ["account", "overview", "--json"]
+seed = "overview-session"
+server = "overview-liquidation"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_exchange_rate_stamped",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "account-overview-liquidation-text"
+args = ["account", "overview"]
+mode = "text"
+seed = "overview-session"
+server = "overview-liquidation"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_exchange_rate_stamped",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3#@mode" = 0o600, "trader/sessions.json#@mode" = 0o600 }
+
+[[case]]
+name = "account-overview-public"
+args = ["--json", "--as", "{other_addr}", "account", "overview", "--as", "{addr}"]
+seed = "empty"
+server = "overview-full"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "account-overview-partial"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+seed = "empty"
+server = "overview-partial"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "account-overview-expiry"
+args = ["account", "overview", "--json"]
+seed = "overview-expiry"
+server = "overview-full"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+[case.overview_expected]
+"session.data.renewalCommand" = 'sai --endpoint "${SAI_RECONCILE_ENDPOINT:?Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth import --addr 0x1111111111111111111111111111111111111111'
+
+[[case]]
+name = "account-overview-expiry-text"
+args = ["account", "overview"]
+mode = "text"
+seed = "overview-expiry"
+server = "overview-full"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "account-overview-wrong-height"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+seed = "empty"
+server = "overview-wrong-height"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_trade",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "account-overview-conflicting-height"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+seed = "empty"
+server = "overview-conflicting-height"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_trade",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "account-overview-deadline"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+seed = "empty"
+server = "overview-deadline"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
+
+[[case]]
+name = "account-overview-stale-mark"
+args = ["--json", "account", "overview", "--as", "{addr}"]
+seed = "empty"
+server = "overview-stale"
+wire = [
+    "ws:init",
+    "ws:userBalancesWithBlock",
+    "overviewTrades",
+    "userIntents",
+    "tokenPricesUsd",
+    "oneClickTrading",
+    "lcd:latest",
+    "get_base_size_seed_status",
+    "live_trades_by_user",
+    "get_trade",
+    "get_market",
+    "get_oracle_address",
+    "get_exchange_rate_stamped",
+    "get_group",
+    "get_trade",
+    "get_market",
+    "get_exchange_rate_stamped",
+    "pendingMarketOrders",
+]
+state = { "trader/intents.sqlite3" = "<absent>" }
 
 [[case]]
 name = "account-positions"
@@ -468,6 +890,7 @@ wire = ["oneClickTrading", "ws:init", "node_info"]
 name = "doctor-invalid-endpoint"
 args = ["--json", "doctor", "--no-fix"]
 seed = "doctor-invalid-endpoint"
+unset = ["SAI_ENDPOINT"]
 expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 
@@ -476,6 +899,7 @@ name = "doctor-invalid-endpoint-text"
 args = ["doctor", "--offline", "--no-fix"]
 mode = "text"
 seed = "doctor-invalid-endpoint"
+unset = ["SAI_ENDPOINT"]
 expect = 2
 state = { "trader" = "<absent>", "logs" = "<absent>" }
 
@@ -773,7 +1197,7 @@ mcp_profile = "reads"
 seed = "ledger"
 server = "mcp-reads"
 wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "tradeHistory", "userIntents"]
-# The current Python checkout uses the narrower history query during reconciliation.
+# Python v0.1.2 and Rust use paginated history during reconciliation.
 mcp_checkout_wire = ["trades", "tradeHistory", "ws:init", "ws:userBalances", "userIntents", "intentTradeHistory", "userIntents"]
 
 [[case]]

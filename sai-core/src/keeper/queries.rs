@@ -7,8 +7,6 @@ pub const POSITIONS: &str = "query($trader:String!) { perp { trades(where:{trade
 pub const POSITION: &str = "query($trader:String!, $id:Int!) { perp { trade(trader:$trader,id:$id) { id trader isOpen tradeType collateralAmount leverage perpBorrowing { marketId collateralToken { id symbol } } } } }";
 pub const ROUTE: &str = "query { oneClickTrading { enabled chainId contractAddress } }";
 pub const HISTORY: &str = "query($trader:String!) { perp { tradeHistory(where:{trader:$trader}, limit:50, order_desc:true) { id intentKey tradeChangeType txHash evmTxHash block { block block_ts } trade { id trader } } } }";
-pub const INTENTS: &str = "query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
-pub const WAIT_INTENTS: &str = "query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
 pub const INTENT_HISTORY: &str = "query($trader:String!, $limit:Int!, $offset:Int!) {
   perp {
     tradeHistory(where:{trader:$trader}, order_by:sequence, order_desc:true,
@@ -24,6 +22,8 @@ pub const INTENT_HISTORY: &str = "query($trader:String!, $limit:Int!, $offset:In
     }
   }
 }";
+pub const INTENTS: &str = "query($user:String!, $key:String) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
+pub const WAIT_INTENTS: &str = "query($user:String!, $key:String, $includeAction:Boolean! = false) { userIntents(where:{user:$user, intentKey:$key}, limit:50) { intentKey kind body @include(if:$includeAction) lifecycleStep execActor evmAddress nibiAddress txHash execBlock execBlockTs errorCode errorMsg } }";
 pub const CHALLENGE: &str = "mutation($address:String!) { createUserIntentAuthChallenge(evmAddress:$address) { nonce evmAddress expiresAt chainId typedData } }";
 pub const SESSION: &str = "mutation($signature:String!, $challenge:String!) { createUserIntentSession(signature:$signature, challenge:$challenge) { token evmAddress expiresAt } }";
 pub const SUBMIT: &str = "mutation($input:RecordUserIntentInput!) { recordUserIntent(input:$input) { intentKey kind lifecycleStep execActor evmAddress txHash errorCode errorMsg } }";
@@ -37,6 +37,8 @@ pub(super) fn operation(query: &str) -> &'static str {
         MARKETS => "markets",
         POSITION => "position",
         POSITIONS => "positions",
+        OVERVIEW_TRADES => "overview_trades",
+        PENDING_MARKET_ORDERS => "pending_market_orders",
         PRICES => "prices",
         ROUTE => "route",
         SESSION => "session",
@@ -44,3 +46,29 @@ pub(super) fn operation(query: &str) -> &'static str {
         _ => "custom",
     }
 }
+
+pub(crate) const OVERVIEW_TRADES: &str = "
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    trades(where:{trader:$trader,isOpen:true}, order_by:sequence, order_desc:false, limit:$limit, offset:$offset) {
+      id trader isLong tradeType collateralAmount leverage openPrice tp sl
+      state { liquidationPrice }
+      perpBorrowing {
+        marketId baseToken { id symbol } quoteToken { id symbol name } collateralToken { id symbol }
+      }
+      lastUpdatedBlock { block block_ts }
+    }
+  }
+}
+";
+
+pub(crate) const PENDING_MARKET_ORDERS: &str = "
+query($trader:String!, $limit:Int!, $offset:Int!) {
+  perp {
+    marketOrders(where:{trader:$trader,status:pending_exec}, limit:$limit, offset:$offset) {
+      sequence tradeId side perpMarketId status collateralAmount orderReqBlock orderReqBlockTs
+      orderReqTxHash orderReqEvmTxHash
+    }
+  }
+}
+";
