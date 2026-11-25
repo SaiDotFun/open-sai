@@ -1320,6 +1320,8 @@ def emit_trade(ctx: click.Context, result: dict[str, Any]) -> None:
     if confirmation.is_confirmable(output):
         output = confirmation.with_digest(output)
     if not ctx.obj["json"] and (collateral := output.get("collateral")):
+        if reason := estimates.rejection_reason(output.get("estimates", {})):
+            raise trading.ExecutionRejected(reason, output)
 
         def value(side: str) -> str:
             usd = collateral[f"{side}Usd"]

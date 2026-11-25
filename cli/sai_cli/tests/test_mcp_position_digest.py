@@ -3671,3 +3671,27 @@ def test_cli_leverage_confirmation_binds_only_collateral_quantities(
         assert fresh["previewDigest"] == original["previewDigest"]
         assert result.exit_code == 0, result.output
         assert len(position.submitted) == 1
+
+
+def test_cli_margin_preview_reports_insufficient_funds_before_any_projection(
+    position_service,
+):
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.available_balance = 500_000
+    save_session(f"{base_url}/query")
+    args = position_cli_args(
+        base_url, ["margin", "7", "--direction", "add", "--amount", "1", "--dry-run"]
+    )
+    cli = CliRunner()
+    machine = cli.invoke(main, args)
+    assert machine.exit_code == 0, machine.output
+    execution = json.loads(machine.stdout)["estimates"]["execution"]
+    assert execution["code"] == "InsufficientDepositBalance"
+
+    text = cli.invoke(main, args[1:])
+    assert text.exit_code == ExitCode.REJECTED, text.output
+    assert text.stdout == ""
+    assert "Perp requires 1.000000 USDC of additional margin" in text.stderr
+    assert "The observed available balance is 0.500000 USDC" in text.stderr
+    assert not position.submitted
