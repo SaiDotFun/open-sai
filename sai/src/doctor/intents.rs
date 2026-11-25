@@ -112,6 +112,47 @@ fn copy_snapshot(root: &Path) -> Result<tempfile::TempDir, SnapshotError> {
     Err(SnapshotError::Changed)
 }
 
+pub(super) fn has_ledger_schema(root: &Path) -> bool {
+    let check = || -> Result<bool, SnapshotError> {
+        let private = copy_snapshot(root)?;
+        let run = || -> rusqlite::Result<bool> {
+            let db = Connection::open(private.path().join(FILES[0]))?;
+            db.busy_timeout(TIMEOUT)?;
+            let version: i64 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+            if !matches!(version, 0 | SCHEMA_VERSION) {
+                return Ok(false);
+            }
+            let mut statement = db.prepare("PRAGMA table_info(intents)")?;
+            let columns = statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?.to_ascii_uppercase(),
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            let mut required = HashSet::new();
+            for column in columns {
+                let (name, kind, not_null, primary) = column?;
+                match (name.as_str(), kind.as_str(), not_null, primary) {
+                    ("id", "TEXT", 0, 1)
+                    | ("endpoint" | "account" | "kind" | "status" | "entity", "TEXT", 1, 0) => {
+                        required.insert(name);
+                    }
+                    ("created_at", "REAL", 0, 0) if version == SCHEMA_VERSION => {
+                        required.insert(name);
+                    }
+                    ("keeper_status", "TEXT", 0, 0) => {}
+                    _ => return Ok(false),
+                }
+            }
+            Ok(required.len() == if version == 0 { 6 } else { 7 })
+        };
+        run().map_err(|_| SnapshotError::Unreadable)
+    };
+    check().unwrap_or(false)
+}
+
 fn read(root: &Path) -> Result<Snapshot, SnapshotError> {
     let private = copy_snapshot(root)?;
     let run = || -> rusqlite::Result<Snapshot> {

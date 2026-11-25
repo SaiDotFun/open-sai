@@ -18,7 +18,7 @@ mod ledger;
 mod sessions;
 
 pub use ledger::{IntentRow, IntentStatus, StatusUpdateOptions};
-pub use sessions::{Accounts, RemovedSession, Session, SessionSummary};
+pub use sessions::{Accounts, RemovedSession, Session, SessionSummary, is_session_envelope};
 
 #[derive(Debug, Error)]
 pub enum StorageError {

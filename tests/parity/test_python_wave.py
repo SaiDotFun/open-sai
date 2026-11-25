@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -148,3 +150,57 @@ def test_doctor_validates_codex_repair_before_writing(
         )
         assert "codex mcp add sai" in codex["fix"]
         assert "<original-launcher>" in codex["fix"]
+
+
+@pytest.mark.parametrize("profile", ["config-only", "fake-ledger", "dedicated"])
+@pytest.mark.parametrize("no_fix", [(), ("--no-fix",)], ids=["apply", "no-fix"])
+def test_doctor_needs_trader_data_to_tighten_sai_home(
+    wave_clis: tuple[str, str], tmp_path: Path, profile: str, no_fix: tuple[str, ...]
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        sai_home = home / "sai directory"
+        sai_home.mkdir(parents=True, mode=0o755)
+        config = sai_home / "config.toml"
+        config.write_text('[unrelated]\nname = "fixture"\n')
+        trader = sai_home / "trader"
+        if profile != "config-only":
+            trader.mkdir(mode=0o755)
+            with sqlite3.connect(trader / "intents.sqlite3") as ledger:
+                if profile == "dedicated":
+                    ledger.execute(
+                        "CREATE TABLE intents (id TEXT PRIMARY KEY, endpoint TEXT NOT NULL,"
+                        " account TEXT NOT NULL, kind TEXT NOT NULL, status TEXT NOT NULL,"
+                        " entity TEXT NOT NULL)"
+                    )
+                else:
+                    ledger.execute("CREATE TABLE unrelated (id INTEGER PRIMARY KEY)")
+        result = run_cli(
+            binary,
+            home,
+            "--json",
+            "doctor",
+            "--offline",
+            *no_fix,
+            overrides={"SAI_HOME": str(sai_home)},
+        )
+        report = json.loads(result.stdout)
+        checks = (
+            report["error"]["details"]["checks"]
+            if result.returncode
+            else report["checks"]
+        )
+        [check] = [check for check in checks if check["id"] == "home"]
+        assert config.read_text() == '[unrelated]\nname = "fixture"\n'
+        if profile == "dedicated" and not no_fix:
+            assert stat.S_IMODE(sai_home.stat().st_mode) == 0o700
+            assert stat.S_IMODE(trader.stat().st_mode) == 0o700
+            assert check["status"] == "fixed"
+        else:
+            assert stat.S_IMODE(sai_home.stat().st_mode) == 0o755
+            assert check["status"] == "warn"
+            if profile == "dedicated":
+                assert check["fix"].startswith(f"chmod go-rwx '{sai_home}'; ")
+                assert stat.S_IMODE(trader.stat().st_mode) == 0o755
+            else:
+                assert "moving the profile to a dedicated directory" in check["fix"]

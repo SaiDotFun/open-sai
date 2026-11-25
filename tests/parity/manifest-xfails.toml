@@ -181,6 +181,10 @@ signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 owner = "#211"
 signature = "4ea3cbfaad69b7b9dae31a0c825539628fed3d656eb2034dc5b7d94e20d752fa"
 
+[gap."case:doctor-report-loose-modes"]
+owner = "#211"
+signature = "2a4c3a0ee24ee4e28df03a3594ce7d9278ab86e309394245d0abb2de8ac27119"
+
 [gap."case:doctor-unknown-option"]
 owner = "#211"
 signature = "f5e9c854936c6bec43a24cc5b88ee5404754b6995971e1d760e5eaa6c7a47dd2"
