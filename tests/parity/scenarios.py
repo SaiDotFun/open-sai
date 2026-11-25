@@ -723,6 +723,9 @@ def loopback(
         "quote-fee-read-error",
         "quote-liquidation",
         "quote-after-hours",
+        "confirmation-account-change",
+        "shared-confirmable-position",
+        "shared-confirmable-leverage",
     }:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["get_group"]["stale_price_expiration_secs"] = 0
@@ -779,7 +782,11 @@ def loopback(
             "action": {
                 "update_leverage": {
                     "trade_index": "UserTradeIndex(7)",
-                    "new_leverage": "1.818181818181818182",
+                    "new_leverage": (
+                        "5"
+                        if scenario == "shared-confirmable-leverage"
+                        else "1.818181818181818182"
+                    ),
                 }
             },
         },

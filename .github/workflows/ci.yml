@@ -428,6 +428,7 @@ jobs:
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         env:
           SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_MCP_TRADE_PYTHON: ${{ github.workspace }}/.parity-mcp-trade-python/.venv/bin/sai
           SAI_PARITY_MAIN_BIN: ${{ github.workspace }}/target/parity-main/debug/sai
           SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-trade-python
         shell: bash

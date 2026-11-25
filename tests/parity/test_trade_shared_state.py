@@ -820,6 +820,17 @@ def mcp_action(action_name: str) -> str:
     return "close" if action_name == "cancel" else action_name.replace("-", "_")
 
 
+def mcp_trade_runtime(
+    name: str, request: pytest.FixtureRequest, python_reference: Path | None
+) -> Runtime:
+    if name == "python":
+        executable = os.environ.get(
+            "SAI_PARITY_MCP_TRADE_PYTHON", str(Path(sys.executable).with_name("sai"))
+        )
+        return Runtime(name, (executable,))
+    return runtime(name, request, python_reference)
+
+
 async def mcp_preview(
     session: ClientSession,
     home: Home,
@@ -863,14 +874,19 @@ def test_cli_and_mcp_overlap(
     python_reference: Path | None,
 ) -> None:
     cli = runtime(cli_name, request, python_reference)
-    mcp = runtime(mcp_name, request, python_reference)
+    mcp = mcp_trade_runtime(mcp_name, request, python_reference)
     reconciler = runtime(
         "rust" if python_reference is not None else "python", request, python_reference
     )
     action = ACTIONS[action_name]
     replay = action.replay(hold_admission=True)
     tool_name = f"trade_{mcp_action(action_name)}"
-    with loopback(action.server, trade_replay=replay) as endpoints:
+    scenario = {
+        "close": "shared-confirmable-position",
+        "partial-close": "shared-confirmable-position",
+        "leverage": "shared-confirmable-leverage",
+    }.get(action_name, action.server)
+    with loopback(scenario, trade_replay=replay) as endpoints:
         home = Home(tmp_path / "home", endpoints)
         seed_home(home.path, endpoints, "session")
         trade_help(home, cli, action_name)
@@ -988,7 +1004,7 @@ def test_mcp_confirmation_rechecks_active_account(
     tmp_path: Path,
     python_reference: Path | None,
 ) -> None:
-    mcp = runtime(mcp_name, request, python_reference)
+    mcp = mcp_trade_runtime(mcp_name, request, python_reference)
     cli = runtime(switcher, request, python_reference)
     replay = TradeReplay()
     with loopback("confirmation-account-change", trade_replay=replay) as endpoints:
@@ -1015,8 +1031,9 @@ def test_mcp_confirmation_rechecks_active_account(
                 if rust_mcp_stub(mcp, "trade_close", refused):
                     return False
                 assert refused["code"] == "PREVIEW_MISMATCH"
-                assert refused["preview"]["addr"] == OTHER_ADDRESS
-                assert refused["preview"]["previewDigest"] != preview["previewDigest"]
+                assert refused["quoteStatus"] == "unavailable"
+                assert refused["recovery"]["action"] == "request_preview"
+                assert "preview" not in refused
                 return True
 
         confirmed = asyncio.run(confirm())
