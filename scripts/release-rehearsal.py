@@ -2112,9 +2112,16 @@ def rehearse_native_staged(tool: Install, assets: NativeAssets) -> int:
             flush=True,
         )
         check("Rolled-back Python reads the same config, session, and ledger", profile)
+
+        def verify_rollback_logs() -> None:
+            require(
+                bool(native_events), "Native Sai did not log the pending Keeper result"
+            )
+            verify_intent_logs(tool, key, [*python_events, *native_events])
+
         check(
             "Rolled-back Python reads intent logs from both runtimes",
-            lambda: verify_intent_logs(tool, key, [*python_events, *native_events]),
+            verify_rollback_logs,
         )
         check(
             "Rolled-back Python blocks the pending open",
