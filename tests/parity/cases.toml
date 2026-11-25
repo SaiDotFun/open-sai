@@ -1857,7 +1857,7 @@ wire = [
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
 
-rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price"] }
+rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "get_perp_prices", "market_order_config"] }
 output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8" }
 
 # C7b position cases use the Python ownership and confirmation contracts from PRs 148 and 150.
@@ -1984,7 +1984,7 @@ accepted_difference = "Python PR #194 rejects non-ASCII percent digits. Rust acc
 expect = 0
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
 output = { "quote.percent" = 50 }
 
@@ -2175,15 +2175,11 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "intent.body.collateral.amountUsdc" = "50000000000000000000000000000" }
 
-accepted_difference = "Python uses Perp's integer sizing rules from PR #167. Rust still follows the pinned Python reference."
-
 [case.rust]
-expect = 1
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
-output = { "error.code" = "INVALID_REQUEST", "error.message" = "invalid literal for int() with base 10: '5.0000000000000000000000000E+28'" }
 
 [[case]]
 name = "trade-partial-close-rounding"
@@ -2200,7 +2196,7 @@ output = { "intent.body.collateral.amountUsdc" = "3300000", "quote.closedNotiona
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
 
 [[case]]
@@ -2219,8 +2215,8 @@ output = { "quote.effectiveLeverage" = "1.234567890123456789", "quote.closedNoti
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_market", "get_trade_infos",
-    "get_after_hours_leverage", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_market", "get_trade_infos",
+    "get_after_hours_leverage", "get_collateral_price", "get_trade_raw",
 ]
 
 [[case]]
@@ -2238,7 +2234,7 @@ output = { "quote.closedNotionalIsEstimate" = true }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
 
 [[case]]
@@ -2266,15 +2262,11 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "intent.body.collateral.amountUsdc" = "9900000" }
 
-accepted_difference = "Python uses Perp's integer sizing rules from PR #167. Rust still follows the pinned Python reference."
-
 [case.rust]
-expect = 1
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
 ]
-output = { "error.message" = "Reduction is too small or leaves less than the market minimum" }
 
 [[case]]
 name = "trade-partial-close-live-leverage-change"
@@ -2295,10 +2287,10 @@ output = { "error.message" = "Position changed; review the reduction again" }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
 ]
 
 [[case]]
@@ -2319,10 +2311,10 @@ output = { "status" = "accepted" }
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent",
 ]
 
 [[case]]
@@ -2344,10 +2336,10 @@ output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "err
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
 ]
 
 [[case]]
@@ -2369,10 +2361,10 @@ output = { "error.code" = "PREVIEW_MISMATCH", "error.details" = "<absent>", "err
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices",
 ]
 
 [[case]]
@@ -2407,10 +2399,10 @@ output = { "status" = "accepted", "intentKey" = "<intentKey 1>", "quote" = "<abs
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent",
 ]
 
 [[case]]
@@ -2437,14 +2429,14 @@ output = { "first.error.code" = "OUTCOME_UNKNOWN", "first.error.intentKey" = "<i
 [case.rust]
 wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "oneClickTrading",
     "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance",
-    "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
-    "get_collateral_price", "recordUserIntent", "oneClickTrading", "trade", "node_info",
-    "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market",
-    "get_collateral_price", "oneClickTrading", "trade", "node_info", "borrowing",
-    "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
-    "get_trade_raw", "is_after_hours_market", "get_collateral_price",
+    "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market",
+    "get_perp_prices", "recordUserIntent", "oneClickTrading", "trade", "node_info", "borrowing",
+    "get_trade_raw", "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
+    "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
+    "is_after_hours_market", "get_perp_prices",
 ]
 
 [[case]]
@@ -2489,11 +2481,11 @@ state = { "trader/intents.sqlite3" = "<absent>" }
 output = { "1.result.content.0.text.previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "31871b2aa39eb00c7d14021f2af5fb65ed5795a7125cc2f1d7ac924ae8a20176" }
 rust = { wire = [
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price", "get_trade_raw",
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
     "oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw",
-    "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price",
+    "get_exchange_balance", "is_after_hours_market", "get_collateral_price",
     "get_trade_raw", "is_after_hours_market", "get_perp_prices",
 ] }
 

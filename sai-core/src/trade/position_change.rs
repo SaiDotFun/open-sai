@@ -13,7 +13,7 @@ use serde_json::{Map, Value, json};
 
 use crate::{
     errors::{Code, SaiError},
-    keeper::{MARKET, MARKETS, POSITION, ROUTE, TIMEOUT, truthy},
+    keeper::{MARKET, POSITION, ROUTE, TIMEOUT, truthy},
     settings::repr,
 };
 
@@ -266,20 +266,7 @@ impl Trading<'_> {
             )
             .await?;
         let delta = if let PositionAction::PartialClose { percent } = action {
-            let markets = self.position_request(MARKETS, Map::new()).await?;
-            let markets = field(field(&markets, "perp")?, "borrowings")?
-                .as_array()
-                .ok_or_else(malformed)?;
-            let mut matches = markets.iter().filter(|market| {
-                market["marketId"] == snapshot.market["marketId"]
-                    && market["collateralToken"]["symbol"] == "USDC"
-            });
-            let market = matches
-                .next()
-                .filter(|market| matches.next().is_none() && truthy(&market["isOpen"]))
-                .ok_or_else(|| invalid("Open market data not available"))?;
-            let minimum = field(market, "minPositionSizeUSD")?;
-            Some(quote::reduction(&snapshot.raw, percent, minimum)?)
+            Some(quote::reduction(&snapshot.raw, percent)?)
         } else {
             None
         };

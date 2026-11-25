@@ -258,6 +258,37 @@ def test_mcp_refuses_changed_execution(
     assert replacements[0] == replacements[1]
 
 
+def test_mcp_partial_close_previews_remainder_below_market_minimum(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    previews = []
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        with (
+            loopback("partial-preview") as endpoints,
+            server(
+                executable, home, endpoints, seed="session", call_timeout=15
+            ) as stdio,
+        ):
+            args = {**POSITION, "percent": "99"}
+            preview = result(stdio.call(2, "preview_partial_close", **args))
+            assert preview["intent"]["body"]["collateral"] == {
+                "amountUsdc": "9900000",
+                "amountUsd": "9.9",
+            }
+            assert preview["previewDigest"]
+            refused = result(
+                stdio.call(3, "trade_partial_close", **args, preview_digest="wrong")
+            )
+            assert refused["code"] == "PREVIEW_MISMATCH"
+            assert binding(refused["preview"]) == binding(preview)
+            assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
+            assert not rows(home)
+            assert not endpoints.errors
+            previews.append(binding(preview))
+    assert previews[0] == previews[1]
+
+
 def test_mcp_open_binds_the_selected_account(
     mcp_pair: tuple[Path, Path], tmp_path: Path
 ) -> None:
