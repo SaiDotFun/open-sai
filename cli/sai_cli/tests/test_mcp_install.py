@@ -889,21 +889,20 @@ def test_doctor_does_not_write_a_rejected_codex_repair(env: Env, writer: str):
 
 @pytest.mark.parametrize("has_policy", [False, True])
 def test_doctor_prints_redacted_codex_restore_command(env: Env, has_policy: bool):
-    valid_keys = ("PRIVATE", "_", "A9" + "B" * 62)
-    private_keys = (
+    saved_keys = (
+        "ROUND4_MOCK_PRIVATE_KEYNAME",
+        "SAI_RESTORE_FIXTURE",
         "sk-fixture-token-used-as-a-key",
-        "fixturelowercasekey",
-        "9PRIVATE",
-        "B" * 65,
     )
     original = {
         "command": str(env.root / SECRET / OLD_COMMAND),
         "args": [f"--endpoint=https://fixture.invalid/{SECRET}"],
-        "env": dict.fromkeys((*valid_keys, *private_keys), SECRET),
+        "env": dict.fromkeys(saved_keys, SECRET),
     }
     if has_policy:
         original.update(enabled=False, enabled_tools=[])
     env.write_codex({"sai": original})
+    before = env.codex_path().read_bytes()
     reject = f"""
     if entry["command"] == {str(env.sai)!r}:
         sys.stderr.write({SECRET!r})
@@ -927,19 +926,22 @@ def test_doctor_prints_redacted_codex_restore_command(env: Env, has_policy: bool
         "mcp",
         "add",
         "sai",
-        *(f"--env={key}=<original-value>" for key in valid_keys),
-        *("--env=<original-key>=<original-value>" for _ in private_keys),
+        *(["--env", "<NAME>=<value>"] * len(saved_keys)),
         "--",
         "<original-launcher>",
         "--endpoint=<original-value>",
     ]
     assert ("Codex config.toml" in check["fix"]) is has_policy
+    count = f"The saved entry has {len(saved_keys)} environment assignments."
+    assert count in check["fix"]
     text_result = CliRunner().invoke(main, ["doctor", "--offline"])
     assert text_result.exit_code == 1
-    assert "--env=<original-key>=<original-value>" in text_result.output
+    assert count in text_result.output
+    assert text_result.output.count("--env '<NAME>=<value>'") == len(saved_keys)
     logs = "".join(path.read_text() for path in log.directory().glob("*.jsonl"))
     outputs = result.output + text_result.output + logs + env.log.read_text()
-    assert all(private not in outputs for private in (SECRET, *private_keys))
+    assert all(private not in outputs for private in (SECRET, *saved_keys))
+    assert env.codex_path().read_bytes() == before
     assert list(env.codex_home.iterdir()) == [env.codex_path()]
 
 
