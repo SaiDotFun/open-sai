@@ -68,23 +68,40 @@ def slippage_price(price: Decimal, slippage: Decimal, long: bool) -> Decimal:
         return price + distance if long else price - distance
 
 
+def market_price_move(
+    reference: Decimal, current: Decimal, slippage: str
+) -> str | None:
+    """Return the percentage moved if the refreshed price exceeds the quote tolerance."""
+    fraction = Decimal(slippage).scaleb(-2)
+    lower = slippage_price(reference, fraction, False)
+    upper = slippage_price(reference, fraction, True)
+    if lower <= current <= upper:
+        return None
+    with localcontext() as context:
+        context.prec = 90
+        moved = abs(current - reference) / reference * 100
+        return format(moved.quantize(Decimal("0.0001")), "f")
+
+
 def fill_range(
     order_type: str,
     long: bool,
     slippage: Decimal,
     reference: dict[str, Any] | None,
     *,
-    mcp_market: bool,
+    market_bound: bool,
 ) -> dict[str, Any]:
     if reference is None:
         return unavailable("Keeper market price is unavailable.")
     price = Decimal(reference["price"])
-    steps = 2 if order_type == "market" and mcp_market else 1
+    steps = 2 if order_type == "market" and market_bound else 1
     for _ in range(steps):
         price = slippage_price(price, slippage, long)
     price_text = format(price, "f")
     return {
-        "status": "estimate" if order_type == "market" and not mcp_market else "bound",
+        "status": "estimate"
+        if order_type == "market" and not market_bound
+        else "bound",
         "price": price_text.rstrip("0").rstrip(".")
         if "." in price_text
         else price_text,
@@ -249,33 +266,30 @@ def _notional(collateral: int, leverage: Decimal) -> int:
 
 
 def open_estimates(
-    endpoint: str,
     lcd: str | None,
+    contract: str | None,
     body: dict[str, Any],
     row: dict[str, Any] | None,
     market_reference: dict[str, Any] | None,
     *,
-    mcp_market: bool,
+    market_bound: bool,
 ) -> dict[str, Any]:
     order_type, long = body["orderType"], body["side"] == "long"
     reference = market_reference
     if order_type != "market":
         reference = price_input(Decimal(body["intentPrice"]), "Order trigger", None)
-    elif not mcp_market and "intentPrice" in body:
-        reference = price_input(Decimal(body["intentPrice"]), "CLI --price", None)
 
     fill = fill_range(
         order_type,
         long,
         Decimal(body["maxSlippagePct"]).scaleb(-2),
         reference,
-        mcp_market=mcp_market,
+        market_bound=market_bound,
     )
     fees = unavailable("Perp fee schedule or collateral oracle price is unavailable.")
     liq = unavailable("An entry price and opening fee estimate are required.")
-    if lcd:
+    if lcd and contract:
         try:
-            contract = margin.trading_contract(endpoint, lcd)
             pair = contract_market(lcd, contract, body["market"]["marketIndex"])
             if refusal := market_open_rejection(
                 pair, market_order=order_type == "market"

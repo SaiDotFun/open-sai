@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from mcp_cases import TRADE_TOOLS
 from scenarios import ADDRESS, INTENT, Endpoints, child_env, loopback, seed_home
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
@@ -260,12 +261,39 @@ def test_trade_integer_coercion(
         assert not endpoints.wire
 
 
+def validation_text(tool: str, *issues: tuple[str | None, str, str]) -> str:
+    label = "validation error" if len(issues) == 1 else "validation errors"
+    lines = [f"Error executing tool {tool}: {len(issues)} {label} for {tool}Arguments"]
+    for field, detail, category in issues:
+        if field is not None:
+            lines.append(field)
+        lines.extend(
+            (
+                f"  {detail} [type={category}]",
+                f"    For further information visit https://errors.pydantic.dev/2.14/v/{category}",
+            )
+        )
+    return "\n".join(lines)
+
+
 @pytest.mark.parametrize(
-    ("market_id", "code"),
-    [(1.5, "int_from_float"), ("3e0", "int_parsing"), ([], "int_type")],
+    ("market_id", "detail", "code"),
+    [
+        (
+            1.5,
+            "Input should be a valid integer, got a number with a fractional part",
+            "int_from_float",
+        ),
+        (
+            "3e0",
+            "Input should be a valid integer, unable to parse string as an integer",
+            "int_parsing",
+        ),
+        ([], "Input should be a valid integer", "int_type"),
+    ],
 )
 def test_trade_integer_rejections(
-    native: Path, tmp_path: Path, market_id: object, code: str
+    native: Path, tmp_path: Path, market_id: object, detail: str, code: str
 ) -> None:
     with (
         loopback("normal") as endpoints,
@@ -283,7 +311,14 @@ def test_trade_integer_rejections(
             preview_digest="fixture",
         )
         assert result["isError"] is True
-        assert f"type={code}," in result["content"][0]["text"]
+        assert result["content"] == [
+            {
+                "type": "text",
+                "text": validation_text("trade_open", ("market_id", detail, code)),
+            }
+        ]
+        assert "structuredContent" not in result
+        assert not endpoints.wire
 
 
 @pytest.mark.parametrize("offline", ["true", "YES", 1.0])
@@ -329,28 +364,162 @@ def test_info_observes_launcher_replacement(
         assert after["restartNeeded"] is True
 
 
+REJECTED_MARKER = "fixture-mcp-key"
+REJECTED_URL = f"//127.0.0.1:9/?api_key={REJECTED_MARKER}"
+
+
+EXTRA_ARGUMENT = (None, "Extra inputs are not permitted", "extra_forbidden")
+INVALID_ADDRESS = ("addr", "Input should be a valid string", "string_type")
+
+
 @pytest.mark.parametrize(
-    ("literal", "rendered"), [(b"1e2", "100.0"), (b"1e-7", "1e-07"), (b"-0.0", "-0.0")]
+    ("tool", "arguments", "issues"),
+    [
+        ("account_positions", {REJECTED_URL: True}, (EXTRA_ARGUMENT,)),
+        ("account_positions", {"extra": REJECTED_URL}, (EXTRA_ARGUMENT,)),
+        ("account_positions", {"addr": [REJECTED_URL]}, (INVALID_ADDRESS,)),
+        (
+            "account_positions",
+            {"addr": {"nested": [{"value": REJECTED_URL}]}},
+            (INVALID_ADDRESS,),
+        ),
+        (
+            "preview_close",
+            {"extra": REJECTED_URL},
+            (("trade_id", "Field required", "missing"), EXTRA_ARGUMENT),
+        ),
+        (
+            "preview_close",
+            {"trade_id": f"{REJECTED_MARKER}-" + "z" * 1024},
+            (
+                (
+                    "trade_id",
+                    "Input should be a valid integer, unable to parse string as an integer",
+                    "int_parsing",
+                ),
+            ),
+        ),
+    ],
+    ids=[
+        "extra-name",
+        "extra-value",
+        "wrong-type-array",
+        "nested-object",
+        "missing-required",
+        "long-string",
+    ],
 )
-def test_extra_float_uses_python_spelling(
-    native: Path, tmp_path: Path, literal: bytes, rendered: str
+def test_validation_omits_rejected_input(
+    native: Path,
+    tmp_path: Path,
+    tool: str,
+    arguments: dict[str, Any],
+    issues: tuple[tuple[str | None, str, str], ...],
 ) -> None:
     with (
         loopback("normal") as endpoints,
         server(native, tmp_path / "home", endpoints) as stdio,
     ):
-        stdio.write(
-            b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"mcp_info","arguments":{"extra":'
-            + literal
-            + b"}}}"
+        result = stdio.call(2, tool, **arguments)
+        assert result["isError"] is True
+        assert "structuredContent" not in result
+        assert result["content"] == [
+            {"type": "text", "text": validation_text(tool, *issues)}
+        ]
+        assert not endpoints.wire
+
+
+def test_rejected_arguments_are_logged_as_metadata(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    credential = "fixture-opaque-preview-credential"
+    numeric = 21873.625
+    unknown_name = "fixture-private-field-name"
+    unknown_value = "fixture-unknown-argument-value"
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, logs=True) as stdio,
+    ):
+        first = stdio.call(
+            2,
+            "preview_close",
+            trade_id=credential,
+            addr=ADDRESS,
+            **{unknown_name: {"nested": [unknown_value]}},
         )
-        response = stdio.receive()
-        assert response["id"] == 2
-        assert response["result"]["isError"] is True
-        assert (
-            f"input_value={rendered}, input_type=float"
-            in response["result"]["content"][0]["text"]
-        )
+        assert first["isError"] is True
+        refused = stdio.call(3, "preview_close", trade_id=numeric)
+        assert refused["isError"] is True
+        signed_out = stdio.call(4, "trade_close", trade_id=credential)
+        assert signed_out["isError"] is False
+        assert json.loads(signed_out["content"][0]["text"])["code"] == "SIGNED_OUT"
+        assert not endpoints.wire
+
+        assert stdio.proc.stdin is not None
+        stdio.proc.stdin.close()
+        assert stdio.proc.wait(timeout=3) == 0
+        assert stdio.proc.stderr is not None
+        stderr = stdio.proc.stderr.read().decode()
+
+    logs = (home / "sai" / "logs").glob("*.jsonl")
+    log_lines = [line for log in logs for line in log.read_text().splitlines()]
+    for rejected in (credential, str(numeric), unknown_name, unknown_value):
+        assert rejected not in stderr
+        assert all(rejected not in line for line in log_lines)
+    events = [json.loads(line) for line in log_lines]
+    calls = [event for event in events if event["event"] == "mcp.tool_call"]
+    assert [call["tool"] for call in calls] == [
+        "preview_close",
+        "preview_close",
+        "trade_close",
+    ]
+    string_metadata = {"type": "string", "length": len(credential)}
+    assert calls[0]["arguments"] == {"trade_id": string_metadata, "addr": "[redacted]"}
+    assert calls[0]["unknownArguments"] == 1
+    assert calls[0]["unknownArgumentMetadata"] == [{"type": "object", "length": 1}]
+    assert calls[1]["arguments"] == {"trade_id": {"type": "number", "length": 1}}
+    assert calls[2]["arguments"] == {"trade_id": string_metadata}
+
+
+def test_session_lookup_refusals_omit_submitted_addresses(
+    native: Path, tmp_path: Path
+) -> None:
+    home = tmp_path / "home"
+    credential = "fixture-opaque-session-lookup-credential"
+    error = (
+        "Requested account is not connected; run `sai auth list` to see connected "
+        "accounts, or sign in with `sai auth login NAME` or `sai auth import`, in a terminal."
+    )
+    with (
+        loopback("normal") as endpoints,
+        server(native, home, endpoints, seed="session", logs=True) as stdio,
+    ):
+        for id_, tool in enumerate(TRADE_TOOLS, 2):
+            result = stdio.call(id_, tool, addr=credential)
+            assert result["isError"] is False
+            assert credential not in json.dumps(result)
+            assert json.loads(result["content"][0]["text"]) == {
+                "error": error,
+                "code": "SESSION_UNAVAILABLE",
+            }
+        assert not endpoints.wire
+
+        assert stdio.proc.stdin is not None
+        stdio.proc.stdin.close()
+        assert stdio.proc.wait(timeout=3) == 0
+        assert stdio.proc.stderr is not None
+        assert credential.encode() not in stdio.proc.stderr.read()
+
+    logs = (home / "sai" / "logs").glob("*.jsonl")
+    log_lines = [line for log in logs for line in log.read_text().splitlines()]
+    assert all(credential not in line for line in log_lines)
+    events = [json.loads(line) for line in log_lines]
+    results = [event for event in events if event["event"] == "mcp.tool_result"]
+    assert len(results) == len(TRADE_TOOLS)
+    assert {result["tool"] for result in results} == set(TRADE_TOOLS)
+    assert all(result["error"] == "[redacted]" for result in results)
+    assert all(result["code"] == "SESSION_UNAVAILABLE" for result in results)
 
 
 def test_local_ledger_read_while_keeper_reconciliation_is_busy(

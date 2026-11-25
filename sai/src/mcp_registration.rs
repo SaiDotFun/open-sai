@@ -2,6 +2,7 @@ mod client;
 
 use std::{
     env,
+    ffi::OsStr,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -277,8 +278,14 @@ pub(crate) fn in_uv_cache(path: &Path, home: &Path) -> bool {
 }
 
 fn profile(home: &Path) -> Option<String> {
-    let value = env::var_os("SAI_HOME").filter(|v| !v.is_empty())?;
-    let path = Path::new(&value);
+    profile_value(home, &env::var_os("SAI_HOME")?)
+}
+
+fn profile_value(home: &Path, value: &OsStr) -> Option<String> {
+    if value.is_empty() {
+        return None;
+    }
+    let path = Path::new(value);
     let path = path
         .strip_prefix("~")
         .map_or_else(|_| path.to_owned(), |tail| home.join(tail));
@@ -626,14 +633,19 @@ impl RegistrationCheck {
 pub(crate) fn check_registrations(
     fix: bool,
     timeout: Duration,
+    profile_override: Option<&OsStr>,
 ) -> ClientResult<Vec<RegistrationCheck>> {
     let clients = Clients::open()?;
     let target = doctor_target(&clients.home);
+    let expected_profile = match profile_override {
+        Some(value) => profile_value(&clients.home, value),
+        None => profile(&clients.home),
+    };
     let deadline = Instant::now() + timeout;
     Ok(CLIENTS
         .into_iter()
         .filter(|client| client.detected(&clients.home).is_some())
-        .map(|client| clients.check(client, target.as_ref(), fix, deadline))
+        .map(|client| clients.check(client, target.as_ref(), &expected_profile, fix, deadline))
         .collect())
 }
 
@@ -642,6 +654,7 @@ impl Clients {
         &self,
         client: Client,
         target: Option<&Target>,
+        expected_profile: &Option<String>,
         fix: bool,
         deadline: Instant,
     ) -> RegistrationCheck {
@@ -683,10 +696,9 @@ impl Clients {
         if client == Client::Claude && !issues.is_empty() {
             return claude_check(&issues);
         }
-        let expected_profile = profile(&self.home);
         let different_profile = inspected
             .iter()
-            .any(|(_, entry, _)| !entry.matches_profile(&expected_profile));
+            .any(|(_, entry, _)| !entry.matches_profile(expected_profile));
         let pinned = target.is_some_and(|target| {
             inspected.iter().any(|(_, entry, issue)| {
                 issue.is_none()

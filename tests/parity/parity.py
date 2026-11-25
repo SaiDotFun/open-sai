@@ -36,6 +36,7 @@ from compare import (
     config_text,
     first_difference,
     ledger,
+    mask_doctor_stream,
     mask_overview_stdout,
     rewrite_mcp_fields,
     snapshot,
@@ -466,13 +467,12 @@ def observe(
         if SECRET in result.stdout or SECRET in result.stderr:
             raise ValueError("Client config value escaped into CLI output")
         files.update(client_state(home, client_before, normalize))
-    state = dict(case.state or {})
-    if candidate and case.accepted_divergence == "codex-repair-rollback":
-        state["clients/.codex/config.toml#changed"] = False
-    check_state(state, files)
+    check_state(case.state or {}, files)
     display = result.stdout
     if case.command == "account overview" and case.mode == "text":
         display = mask_overview_stdout(display, case.mode)
+    if case.command == "doctor" and case.exact_output and case.mode == "text":
+        display = mask_doctor_stream(display)
     try:
         output = stdout(display, case.mode, case.command, normalize)
         if contender:
@@ -504,7 +504,13 @@ def observe(
     }
     if case.command == "account overview" and case.mode == "json":
         display = mask_overview_stdout(display, case.mode)
-    raw = (display.encode(), result.stderr.encode()) if exact else None
+    diagnostic = result.stderr
+    if case.command == "doctor" and case.exact_output:
+        if case.mode == "json":
+            display = mask_doctor_stream(display)
+        display = normalize.text(display)
+        diagnostic = normalize.text(mask_doctor_stream(diagnostic))
+    raw = (display.encode(), diagnostic.encode()) if exact else None
     return Observation(result.returncode, output, stderr, files, raw)
 
 
@@ -653,6 +659,30 @@ def expect_native_mcp_info(
     return ", ".join(reasons) or None
 
 
+def expect_native_mcp_validation(
+    output: list[dict[str, Any]], profile: str
+) -> str | None:
+    """Project only the Python reference's declared validation errors."""
+    validation_detail = re.compile(
+        r"^([^\n]+)\n(  [^\n]+? \[type=(\w+)), input_value=[^\n]*, input_type=\w+\]$",
+        re.MULTILINE,
+    )
+
+    def strip_input(match: re.Match[str]) -> str:
+        field, detail, category = match.groups()
+        return detail + "]" if category == "extra_forbidden" else f"{field}\n{detail}]"
+
+    replies = {frame["id"]: frame["result"] for frame in output}
+    changed = False
+    for id_, call in enumerate(CALLS[profile], 3):
+        if call.expected == "invalid":
+            block = replies[id_]["content"][0]
+            expected = validation_detail.sub(strip_input, block["text"])
+            changed |= expected != block["text"]
+            block["text"] = expected
+    return "Native MCP validation omits rejected input" if changed else None
+
+
 def project_reference_lcd_origin(output: dict[str, Any]) -> None:
     """The pinned Python reference still displays the LCD URL path."""
     error = output.get("error")
@@ -728,6 +758,24 @@ def project_reference_rejected_scope(reference: Observation) -> Observation:
     return replace(reference, raw=(stdout_bytes, stderr))
 
 
+def project_reference_doctor_keeper_log(left: Observation, right: Observation) -> None:
+    """Allow the existing omission of command context on Rust's Keeper probe."""
+    name = "logs/cli.jsonl"
+    if (reference := left.files.get(name)) is None or (
+        native := right.files.get(name)
+    ) is None:
+        return
+    for expected, actual in zip(reference.data, native.data, strict=False):
+        if (
+            expected.get("event") == actual.get("event") == "keeper.request"
+            and expected.get("command") == "doctor"
+            and "command" not in actual
+            and "commandId" not in actual
+        ):
+            del expected["command"]
+            expected.pop("commandId", None)
+
+
 def run_case(
     case: Case, reference: list[str], candidate: list[str]
 ) -> tuple[list[str], dict[str, str], str | None]:
@@ -778,25 +826,26 @@ def run_case(
             tools,
             None,
         )
-    if candidate != reference and case.accepted_divergence == "codex-repair-rollback":
-        # Both observations checked their expected change flag. Compare the
-        # saved file's existence and mode while allowing its contents to differ.
-        filename = "clients/.codex/config.toml"
-        for observation in (left, right):
-            observation.files[filename] = replace(
-                observation.files[filename], data=None
-            )
     if candidate != reference and case.accepted_divergence == "lcd-origin-only":
         project_reference_lcd_origin(left.output)
     if candidate != reference:
         project_reference_log_privacy(left, right)
         if case.name in {"mcp-install-invalid-scope", "mcp-install-empty-scope"}:
             left = project_reference_rejected_scope(left)
+    if (
+        candidate != reference
+        and case.accepted_divergence == "doctor-keeper-log-context"
+    ):
+        project_reference_doctor_keeper_log(left, right)
     expected = None
     if case.mode == "mcp" and reference != candidate:
         expected = expect_native_mcp_info(
             left.output,
             allow_deferred_trade=case.mcp_deferred_trade_exception,
+        )
+        validation = expect_native_mcp_validation(left.output, case.mcp_profile)
+        expected = (
+            ", ".join(reason for reason in (expected, validation) if reason) or None
         )
     diffs = differences(left, right)
     if left.exit_code != case.expect:
@@ -863,9 +912,8 @@ def main() -> int:
         parser.error("No parity cases matched")
     reference = [uv, "run", "--project", str(ROOT), "--no-sync", "--offline", "sai"]
     candidate = reference
-    c9a_python = os.environ.get("SAI_C9A_PYTHON") or str(
-        Path(sys.executable).with_name("sai")
-    )
+    checkout_python = str(Path(sys.executable).with_name("sai"))
+    c9a_python = os.environ.get("SAI_C9A_PYTHON") or checkout_python
     if "SAI_PARITY_BIN" in os.environ:
         executable = shutil.which(os.environ["SAI_PARITY_BIN"])
         if not executable:
@@ -898,6 +946,8 @@ def main() -> int:
             oracle = [str(Path(overview_reference).absolute())]
         elif case.mode == "mcp":
             oracle = mcp_reference
+        elif case.command == "doctor" and "node_info" in (case.wire or []):
+            oracle = [checkout_python]
         elif case.client_seed or case.command in {"doctor", "mcp install", "mcp list"}:
             # Launch directly so uv cannot shadow the fixture launcher on PATH.
             oracle = [c9a_python]

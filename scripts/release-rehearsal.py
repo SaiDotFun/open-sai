@@ -686,17 +686,20 @@ class Replay:
         ]
         self.assets: dict[str, tuple[bytes, str]] = {}
         self.add_release(wheel, version)
+        self.get_requests: list[str] = []
         self.latest = version
         self.submitted: list[str] = []
         self.lifecycle = "outcome_not_indexed"
         self.history: list[dict[str, Any]] = []
 
-    def add_release(self, wheel: Path, version: str) -> None:
-        payload = wheel.read_bytes()
-        sums = f"{hashlib.sha256(payload).hexdigest()}  {wheel.name}\n".encode()
+    def add_release(self, wheel: Path, version: str, *native_assets: Path) -> None:
+        sums = []
         path = f"/{REPO}/releases/download/sai-cli/v{version}"
-        self.assets[f"{path}/{wheel.name}"] = payload, "application/octet-stream"
-        self.assets[f"{path}/SHA256SUMS"] = sums, "text/plain"
+        for asset in (wheel, *native_assets):
+            payload = asset.read_bytes()
+            sums.append(f"{hashlib.sha256(payload).hexdigest()}  {asset.name}\n")
+            self.assets[f"{path}/{asset.name}"] = payload, "application/octet-stream"
+        self.assets[f"{path}/SHA256SUMS"] = "".join(sums).encode("ascii"), "text/plain"
 
     def intent_rows(self, where: Any) -> list[dict[str, Any]]:
         if not isinstance(where, dict) or where.keys() != {"user", "intentKey"}:
@@ -734,6 +737,10 @@ class Replay:
 
         class Handler(KeeperHandler):
             def do_GET(self) -> None:
+                if self.path.startswith(
+                    (f"/repos/{REPO}/releases", f"/{REPO}/releases/")
+                ):
+                    replay.get_requests.append(self.path)
                 if self.path.startswith(f"/repos/{REPO}/releases?"):
                     self.reply([{"tag_name": f"sai-cli/v{replay.latest}"}])
                 elif asset := replay.assets.get(self.path):
@@ -907,7 +914,13 @@ def launcher_interpreter(name: str, launcher: Path) -> Path | None:
 
 class Install:
     def __init__(
-        self, root: Path, diagnostics: Path | None = None, *, prepared: bool = False
+        self,
+        root: Path,
+        diagnostics: Path | None = None,
+        *,
+        prepared: bool = False,
+        clients: tuple[str, ...] = CLIENTS,
+        uv: Path | None = None,
     ) -> None:
         self.diagnostics = diagnostics
         self.home = root / "home"
@@ -924,8 +937,8 @@ class Install:
         (self.home / ".codex").mkdir(mode=0o700)
         bin_dir.mkdir(parents=True)
         runtime_dirs = []
-        for name in ("uv", *CLIENTS):
-            tool = shutil.which(name)
+        for name in ("uv", *clients):
+            tool = str(uv) if name == "uv" and uv is not None else shutil.which(name)
             if tool is None:
                 raise RehearsalError(f"{name} is required on PATH")
             launcher = Path(tool).resolve()

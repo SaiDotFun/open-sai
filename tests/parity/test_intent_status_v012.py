@@ -282,7 +282,7 @@ def test_status_projects_public_fields_and_correlates_events(
                 wire(keeper.INTENTS, user=NIBI, key=KEY)
             ]
             assert not replies
-            events = read_events(home)
+            events = read_events(home, cli)
             [request] = [
                 event for event in events if event["event"] == "keeper.request"
             ]
