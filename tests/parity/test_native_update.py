@@ -34,6 +34,7 @@ pty = pytest.importorskip("pty")
 
 REPO = "/SaiDotFun/open-sai"
 NEW = "9999.0.0"
+RETIRED = "sai" + "-mcp"
 PLATFORM = {
     ("Linux", "x86_64"): "x86_64-unknown-linux-gnu",
     ("Linux", "aarch64"): "aarch64-unknown-linux-gnu",
@@ -950,6 +951,42 @@ def cached_shim_release(
         **wheel_assets,
         **native_assets,
     }
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("owner", ["standalone", "uv"])
+def test_doctor_repairs_cursor_through_its_managed_launcher(
+    standalone: NativeInstall, tmp_path: Path, owner: str
+) -> None:
+    install = uv_install(standalone, tmp_path)[0] if owner == "uv" else standalone
+    config = tmp_path / ".cursor" / "mcp.json"
+    config.parent.mkdir()
+    data = {
+        "mcpServers": {
+            "sai": {
+                "command": RETIRED,
+                "args": [],
+                "env": {"SAI_HOME": str(install.home)},
+            },
+            "other": {"url": "http://127.0.0.1:8765/mcp"},
+        }
+    }
+    config.write_text(json.dumps(data), encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = install.invoke(
+        "--json", "doctor", "--offline", cwd=project, PATH=os.defpath
+    )
+
+    out = json.loads(result.stdout)
+    checks = out.get("error", {}).get("details", out)["checks"]
+    [report] = [row for row in checks if row["id"] == "mcp.cursor"]
+    assert report["status"] == "fixed", report
+    data["mcpServers"]["sai"].update(
+        command=str(install.launcher), args=["mcp", "serve"]
+    )
+    assert json.loads(config.read_text(encoding="utf-8")) == data
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")

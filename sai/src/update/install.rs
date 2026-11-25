@@ -36,6 +36,18 @@ pub(super) enum Change {
     Failed { reason: String, rolled_back: bool },
 }
 
+pub(crate) fn mcp_repair_launcher(
+    executable: &Path,
+    profile: &Path,
+    runs_executable: impl Fn(&Path) -> bool,
+) -> Option<PathBuf> {
+    if let Some(install) = standalone::Standalone::discover(executable) {
+        install.owner().ok()?;
+        return runs_executable(install.launcher()).then(|| install.launcher().to_owned());
+    }
+    uv::Uv::shim_launcher(executable, profile)
+}
+
 impl Change {
     fn unchanged(reason: impl Into<String>, installed: &Version) -> Self {
         Self::Failed {

@@ -24,6 +24,8 @@ use sai_core::{
 use semver::Version;
 use serde_json::{Map, Value, json};
 
+pub(crate) use install::mcp_repair_launcher;
+
 const RUNNING: &str = env!("CARGO_PKG_VERSION");
 const LOCK_WAIT: Duration = Duration::from_secs(300);
 const NO_RELEASE: &str = "No sai-cli release is published yet; nothing to update to.";
