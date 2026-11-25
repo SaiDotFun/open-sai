@@ -266,12 +266,6 @@ impl<'a> Trading<'a> {
     ) -> Result<Option<position::PositionRoute>, SaiError> {
         let account = session.addr();
         let no_lcd = match preview.intent.kind {
-            "CLOSE_POSITION" => {
-                return self
-                    .close_submit_route(session, preview, confirmation)
-                    .await
-                    .map(Some);
-            }
             "CANCEL_PENDING_TRADE" => "Cannot verify the pending order without an LCD",
             "OPEN_TRADE" if bind_open => "Cannot verify the trade route without an LCD",
             _ => return Ok(None),
@@ -293,12 +287,12 @@ impl<'a> Trading<'a> {
         Ok(Some(route))
     }
 
-    async fn close_submit_route(
+    async fn prepare_close_submission(
         &self,
         session: &Session,
         preview: &TradePreview,
         confirmation: Option<&Confirmation<'_>>,
-    ) -> Result<position::PositionRoute, SaiError> {
+    ) -> Result<TradePreview, SaiError> {
         let account = session.addr();
         let id = preview.position_id()?;
         let confirmed_route = if let Some(confirmation) = confirmation {
@@ -309,7 +303,7 @@ impl<'a> Trading<'a> {
         } else {
             None
         };
-        self.indexed_position(account, &id, keeper::TIMEOUT).await?;
+        let indexed = self.indexed_position(account, &id, keeper::TIMEOUT).await?;
         let lcd = self
             .lcd_endpoint
             .map(position::Lcd)
@@ -320,8 +314,15 @@ impl<'a> Trading<'a> {
         } else {
             self.position_route(&lcd, false).await?
         };
-        let (route, _) = Self::verify_contract_owner(&lcd, account, &id, route).await?;
-        Ok(route)
+        let verified = Self::verify_contract_owner(&lcd, account, &id, route.clone()).await?;
+        let (owner_verified, estimates) = self
+            .estimate_verified_close(&lcd, account, &id, indexed, verified)
+            .await?;
+        let mut prepared = preview.clone();
+        prepared.position_route = Some(route);
+        prepared.position_owner_verified = Some(owner_verified);
+        prepared.estimates = Some(estimates);
+        Ok(prepared)
     }
 
     /// Verify a confirmed preview, commit the reservation, then send once.
@@ -364,13 +365,21 @@ impl<'a> Trading<'a> {
         } else {
             None
         };
-        let route = if cli_preview.is_none() {
+        let close = if cli_preview.is_none() && preview.is_market_close() {
+            Some(
+                self.prepare_close_submission(session, preview, options.confirmation.as_ref())
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let route = if cli_preview.is_none() && close.is_none() {
             self.basic_trade_route(session, preview, confirming, options.confirmation.as_ref())
                 .await?
         } else {
             None
         };
-        let checked_route = route.is_some() || cli_preview.is_some();
+        let checked_route = route.is_some() || cli_preview.is_some() || close.is_some();
         let open = preview.intent.kind == "OPEN_TRADE";
         let update = if cli_preview.is_none() && preview.is_standalone_position_update() {
             Some(
@@ -381,7 +390,7 @@ impl<'a> Trading<'a> {
             None
         };
         let mut prepared;
-        let preview = if let Some(preview) = &cli_preview {
+        let preview = if let Some(preview) = cli_preview.as_ref().or(close.as_ref()) {
             preview
         } else if open || confirming && checked_route {
             prepared = preview.clone();

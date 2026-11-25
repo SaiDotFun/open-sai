@@ -1368,7 +1368,10 @@ def loopback(
                             and query == {name: {"trader": ADDRESS, "index": 7}}
                         )
                         if name == "get_trade_raw":
-                            if scenario == "concurrent-close":
+                            if (
+                                scenario == "concurrent-close"
+                                or close_target == "verified"
+                            ):
                                 allowed.append(
                                     {name: {"trader": position["trader"], "index": 7}}
                                 )

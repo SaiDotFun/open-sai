@@ -423,7 +423,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-concurrent-close"]
 owner = "#174"
-signature = "4fa163afadfadfd6db677f4d84c8a7c582fdd04081b820357492e66965056d15"
+signature = "128757aa7c8cd1da9b691ce38413eac6610dee99bf0b5ef1b234bb2bb4b357bd"
 
 [gap."case:trade-leverage"]
 owner = "#174"

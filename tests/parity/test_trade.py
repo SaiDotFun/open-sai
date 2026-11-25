@@ -53,6 +53,12 @@ CLOSE = ("trade", "close", "7")
 CANCEL = ("trade", "cancel", "7")
 CANCEL_READS = ["oneClickTrading", "node_info", "get_trade_raw"]
 CLOSE_READS = ["trade", *CANCEL_READS]
+CLOSE_ESTIMATE_READS = [
+    "borrowing",
+    "get_exchange_balance",
+    "get_trade_raw",
+    "get_perp_prices",
+]
 OPEN_ESTIMATE_READS = [
     "oneClickTrading",
     "node_info",
@@ -256,6 +262,7 @@ def test_python_reads_rust_trade_events_offline(
         assert report["txHash"] == TRADE_REQUEST_HASH.lower()
         assert [request.label for request in endpoints.wire] == [
             *CLOSE_READS,
+            *CLOSE_ESTIMATE_READS,
             "recordUserIntent",
         ]
         events = {event["event"]: event for event in report["events"]}
@@ -298,6 +305,7 @@ def test_python_reads_rust_reconciliation_evidence_offline(
         }
         assert [request.label for request in endpoints.wire] == [
             *CLOSE_READS,
+            *CLOSE_ESTIMATE_READS,
             "recordUserIntent",
             "userIntents",
         ]
@@ -488,6 +496,7 @@ def test_position_trade_preserves_lcd_query(
             assert (code, output.get("status"), stderr) == (0, "accepted", "")
             assert [request.label for request in endpoints.wire] == [
                 *(CANCEL_READS if cancel else CLOSE_READS),
+                *(CLOSE_ESTIMATE_READS if not cancel and index == 1 else []),
                 "recordUserIntent",
             ]
             assert not endpoints.errors
@@ -800,6 +809,8 @@ def test_trade_submission(
             assert not endpoints.errors
             if markets:
                 reads = ["borrowings", *([] if index == 0 else OPEN_ESTIMATE_READS)]
+            elif close and index == 1:
+                reads = CLOSE_READS + CLOSE_ESTIMATE_READS
             else:
                 reads = CANCEL_READS if cancel else CLOSE_READS
             assert [request.label for request in endpoints.wire] == [
@@ -857,7 +868,8 @@ def test_trade_submission(
                 assert output["error"]["intentKey"] == key
                 assert output["error"]["code"] == code
             keeper_reads = sum(
-                label in {"borrowings", "oneClickTrading", "trade"} for label in reads
+                label in {"borrowing", "borrowings", "oneClickTrading", "trade"}
+                for label in reads
             )
             expected_events = [("keeper.request", "ok")] * keeper_reads
             expected_events.extend(
@@ -1030,6 +1042,7 @@ def test_concurrent_close_sends_once(
     current_trade_pair: tuple[CLI, CLI], tmp_path: Path
 ) -> None:
     for index, cli in enumerate(current_trade_pair):
+        reads = CLOSE_READS + (CLOSE_ESTIMATE_READS if index == 1 else [])
         with loopback("concurrent-close") as endpoints, ThreadPoolExecutor() as tasks:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
@@ -1053,9 +1066,9 @@ def test_concurrent_close_sends_once(
                     "",
                 )
                 assert [entry.label for entry in endpoints.wire] == [
-                    *CLOSE_READS,
+                    *reads,
                     "recordUserIntent",
-                    *CLOSE_READS,
+                    *reads,
                 ]
             finally:
                 endpoints.admission.release.set()
@@ -1067,9 +1080,9 @@ def test_concurrent_close_sends_once(
                 "",
             )
             assert [entry.label for entry in endpoints.wire] == [
-                *CLOSE_READS,
+                *reads,
                 "recordUserIntent",
-                *CLOSE_READS,
+                *reads,
             ]
             assert [row[2] for row in rows(home)] == ["accepted"]
             assert not endpoints.errors
@@ -1140,10 +1153,11 @@ def test_interrupt_after_dispatch_reports_reserved_key(
             ) == 1
             assert not endpoints.errors
             if scenario == "concurrent-close":
+                reads = CLOSE_READS + (CLOSE_ESTIMATE_READS if index == 1 else [])
                 assert [entry.label for entry in endpoints.wire] == [
-                    *CLOSE_READS,
+                    *reads,
                     "recordUserIntent",
-                    *CLOSE_READS,
+                    *reads,
                 ]
 
 
