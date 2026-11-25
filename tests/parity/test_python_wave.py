@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 from mcp_clients import SECRET, seed_clients
+from scenarios import loopback
 
 
 @pytest.fixture
@@ -204,3 +205,34 @@ def test_doctor_needs_trader_data_to_tighten_sai_home(
                 assert stat.S_IMODE(trader.stat().st_mode) == 0o755
             else:
                 assert "moving the profile to a dedicated directory" in check["fix"]
+
+
+def test_doctor_lcd_keeps_the_query_after_the_node_info_path(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        home.mkdir()
+        with loopback("normal", lcd_query=True) as endpoints:
+            result = run_cli(
+                binary,
+                home,
+                "--json",
+                "doctor",
+                "--no-fix",
+                overrides={
+                    "SAI_ENDPOINT": endpoints.keeper,
+                    "SAI_WS_ENDPOINT": endpoints.ws,
+                    "SAI_LCD_ENDPOINT": endpoints.http + "/?project=fixture",
+                },
+            )
+            assert result.returncode == 0, result.stdout
+            [lcd] = [
+                check
+                for check in json.loads(result.stdout)["checks"]
+                if check["id"] == "lcd"
+            ]
+            assert lcd["status"] == "pass"
+            assert sum(request.label == "node_info" for request in endpoints.wire) == 1
+            assert not endpoints.errors
+            assert "project=fixture" not in result.stdout + result.stderr
