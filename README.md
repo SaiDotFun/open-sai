@@ -10,18 +10,60 @@ and trading intents. It uses Sai Keeper's mainnet endpoint by default. Fund the
 Sai account through Sai Web before trading; depositing and bridging funds are
 outside the CLI.
 
-Install [uv](https://docs.astral.sh/uv/), then install the newest release of
-`sai` on your `PATH`:
+On Linux or macOS (x86-64 and ARM64), use Python 3.10 or later to run the
+standalone installer. It verifies the release archive against `SHA256SUMS`,
+checks that Sai and its MCP server start, and installs the launcher at
+`~/.local/bin/sai`. Add `~/.local/bin` to your `PATH` to run the command. The
+installed binary runs on its own. Until a native release is available, use the
+pinned Python installer below.
 
 ```bash
-uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py
+curl -fsSL https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py | python3 - --native
 sai --help
 ```
 
-The [install script](scripts/install.py) downloads the latest stable
-`sai-cli` release wheel, checks it against the release's `SHA256SUMS`,
-and installs it with `uv tool install`. It caches the wheel under
-`$SAI_HOME/cache/wheels`.
+If you installed Sai from a release wheel with [uv](https://docs.astral.sh/uv/),
+find the full Python bridge version in the release notes. Install it explicitly
+before running the native update. The bridge is published after the first
+native release, whose version is higher, so an unpinned update can skip the
+bridge.
+
+```bash
+sai update --to BRIDGE_VERSION
+sai update
+```
+
+Replace `BRIDGE_VERSION` with the version in the release notes. The second
+command selects the native release by its tag, verifies the matching shim,
+and keeps your uv launcher.
+
+On Windows, use the latest full Python release listed in the release notes.
+Replace `PYTHON_VERSION` with that release version. The installer verifies the
+wheel against `SHA256SUMS` and caches it under `$SAI_HOME/cache/wheels`.
+
+```powershell
+uv run https://raw.githubusercontent.com/SaiDotFun/open-sai/main/scripts/install.py --version PYTHON_VERSION
+```
+
+For maintainers, ship the next regular Python release, then publish the
+native archives and matching shim. Cut the bridge afterward as the last full
+Python release in the existing series. Choose its version at cut time and set
+it in `pyproject.toml` for the ordinary Python release build. It must be newer
+than the earlier full Python releases and lower than the first native
+release. To rehearse a proposed version before bumping the package metadata,
+run `uv run python scripts/build-bridge.py --version BRIDGE_VERSION --out-dir dist`.
+
+If uv installed Sai from Git, run `uv tool uninstall sai-cli` and use the
+pinned installer above with the published full-Python bridge version. Then
+run `sai update`. The bridge keeps a verified Python wheel for offline
+recovery. Your Sai profile stays in place when you replace the uv tool.
+
+If the uv switch is interrupted, run the saved recovery binary with the same
+uv settings:
+
+```bash
+"$(uv tool dir)/.sai-cli-recover" update --recover
+```
 
 To build from source instead, install from Git:
 
@@ -32,7 +74,8 @@ uv tool install git+https://github.com/SaiDotFun/open-sai
 To try the CLI without installing it:
 
 ```bash
-uvx --from https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v0.1.2/sai_cli-0.1.2-py3-none-any.whl sai --json market prices
+PYTHON_VERSION=X.Y.Z
+uvx --from "https://github.com/SaiDotFun/open-sai/releases/download/sai-cli/v${PYTHON_VERSION}/sai_cli-${PYTHON_VERSION}-py3-none-any.whl" sai --json market prices
 ```
 
 The Git install builds `main`. Run `sai --version` to check your installed version.
@@ -150,7 +193,7 @@ and keeps available data when another read fails. Check the section's
 
 `sai mcp serve` runs an MCP server that gives agent clients such as Claude
 Code the same reads, previews, and trades as the CLI. Install `sai` on your
-`PATH` with `uv tool install` first, then register it:
+`PATH`, then register it:
 
 ```bash
 sai mcp install claude          # or codex, cursor, or several at once
@@ -212,7 +255,8 @@ nothing. Use the returned `preview` for confirmation if it has a
 `previewDigest`. Otherwise, check the reported cause and request a fresh
 preview before asking for confirmation.
 
-- Every trade: the signed-in account and the trade's arguments.
+- Every trade digest binds the signed-in account, the trade's arguments,
+  the verified chain ID, and the Perp contract address.
 - `trade_margin` also binds the margin quote, including the position's
   starting collateral and leverage.
 - `trade_partial_close` also binds the close percentage, starting collateral
@@ -221,12 +265,9 @@ preview before asking for confirmation.
 - `trade_open` for a market order also takes the preview's `referencePrice`
   as `reference_price`. A move beyond the allowed slippage requires a fresh
   preview and confirmation.
-- `trade_close`, `trade_tpsl`, and `trade_leverage`: nothing beyond the
-  account and arguments.
 
 On `main`, Sai refuses trades on positions owned by a different account.
 A preview with `positionOwnerVerified: false` has no confirmation digest.
-Margin and partial-close digests also bind the chain ID and Perp contract.
 
 Ask the agent to call `mcp_info` to see the version, endpoints, and active
 account. Its `trading` field reports the active account's session readiness.
@@ -306,7 +347,8 @@ GitHub Release. The install script and `sai update` look for the highest
 ### Rehearse an Upgrade and Downgrade
 
 After the version bump lands on `main`, build the candidate and run the
-rehearsal with `--strict` before tagging. The release gate requires a Linux
+rehearsal with `--strict` before tagging. Replace `X.Y.Z` with the version in
+`pyproject.toml`. The release gate requires a Linux
 host that can create a loopback-only network namespace with `unshare` and
 `ip`. The script also needs Python 3.11 or later, `uv`, `claude`, and
 `codex` on `PATH`, and network access to GitHub and the Python package
@@ -314,7 +356,7 @@ index. Use executables that can run with a fresh home directory.
 
 ```bash
 uv build --wheel --out-dir dist
-python3 scripts/release-rehearsal.py --strict dist/sai_cli-0.1.2-py3-none-any.whl
+python3 scripts/release-rehearsal.py --strict dist/sai_cli-X.Y.Z-py3-none-any.whl
 ```
 
 The script installs the latest published `sai-cli` wheel in a temporary home

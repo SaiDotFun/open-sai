@@ -59,6 +59,24 @@ The `auth-use-missing` case checks the fixed diagnostic for an
 unregistered account. The auth privacy comparison checks that command logs
 contain only the command words.
 
+## Native Distribution
+
+The Native Distribution workflow installs the built shim wheel with uv on
+each native target and serves the matching archive over loopback. Build the
+loopback-only wheel with `python scripts/native-dist.py rehearsal-wheel DIR`.
+Set `SAI_NATIVE_WHEEL` and `SAI_NATIVE_ARCHIVE` to the rehearsal wheel and archive paths to run
+`uv run --locked pytest tests/parity/test_native_distribution.py`. If uv
+is exposed through a version manager, set `UV` to the uv executable itself.
+Set `SAI_NATIVE_RELEASE_WHEEL` to the official-source wheel to check that it
+ignores the loopback override. The CI bundle contains the official-source wheel.
+
+The Linux x86_64 job also tests upgrade and offline rollback against the
+published Python release `sai-cli/v0.1.1` at commit
+`9ee5a356fd41a22697483e467652d367035909bd`. To run that case locally, set
+`SAI_NATIVE_BASELINE` to a directory with the published wheel and
+`SHA256SUMS`, `scripts/install.py` from the pinned commit as `install.py`,
+and the commit SHA in a file named `commit`.
+
 ## Compare MCP Stdio
 
 Check out Python commit `ea09f0d417a53a71079bb8c5e426005fa29051a4` in a
@@ -131,6 +149,25 @@ contains one `unknown` row tied to the actual request before releasing the
 reply. The unsubmitted-intent case starts with a committed reservation and
 replays recovery when Keeper has no record. This case models the state left
 by an exit before submission.
+
+## Installer and Python Bridge Cases
+
+Run `uv run pytest tests/parity/test_installer_bridge.py`. The archive and
+ownership refusal cases run without build artifacts. Set the following paths
+to run the release replay:
+
+| Variable | Local artifact |
+| --- | --- |
+| `SAI_C10B_RUST` | Rust binary built for the runner with the same version as the shim. |
+| `SAI_C10B_SHIM` | Shim wheel or a directory containing it. Build it from PR #116 or its merged source. For loopback downloads, substitute the fixture release source from `tests/parity/native_release_source.py` before building. |
+| `SAI_C10B_BRIDGE` | Full Python wheel or a directory containing it. Build it from the branch under test at a lower version than the shim. |
+| `SAI_C10B_PRE_BRIDGE` | Directory with the Python wheel and `install.py` from the pinned pre-bridge commit `8557a7e13dceab0accc369191182c8e01423c91b`, and that commit SHA in a file named `commit`. |
+| `SAI_C10B_MUTANT` | A build of the same Rust source that fails `mcp serve` only when invoked from an installed standalone version directory or the persistent uv tool environment. |
+
+The fixture builder derives rehearsal versions from `pyproject.toml`. Both
+workflows build the wheels locally and run the compatibility checks with
+real uv launchers. Native MCP startup is an
+expected failure when a build from before PR #120 reports a missing command.
 
 ## Auth Argument Privacy Reference
 
