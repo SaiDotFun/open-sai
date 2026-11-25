@@ -238,6 +238,7 @@ impl Overview<'_> {
     }
 
     async fn scan(&self, query: &str, field: &str, id: &str) -> Result<Pages, SaiError> {
+        let keep_malformed_rows = query == keeper::PENDING_MARKET_ORDERS;
         let mut rows = Vec::new();
         let mut seen = HashSet::new();
         for page in 0..MAX_PAGES {
@@ -253,11 +254,17 @@ impl Overview<'_> {
                         .ok_or_else(invalid)?
                         .iter()
                         .map(|row| {
-                            let row = row.as_object().ok_or_else(invalid)?;
-                            Ok((
-                                row.get(id).and_then(Value::as_u64).ok_or_else(invalid)?,
-                                row.clone(),
-                            ))
+                            let key = row[id].as_u64();
+                            if keep_malformed_rows && (key.is_none() || !valid_queued_order(row)) {
+                                // Keep one slot per response row so offset pagination
+                                // advances past malformed queued orders.
+                                return Ok((None, Object::new()));
+                            }
+                            let fields = row
+                                .as_object()
+                                .filter(|_| key.is_some())
+                                .ok_or_else(invalid)?;
+                            Ok((key, fields.clone()))
                         })
                         .collect::<Result<Vec<_>, SaiError>>()
                 });
@@ -276,7 +283,7 @@ impl Overview<'_> {
             let count = entries.len();
             let fetched = json!(iso(now()));
             for (key, mut row) in entries {
-                if !seen.insert(key) {
+                if key.is_some_and(|key| !seen.insert(key)) {
                     return Ok(Pages {
                         rows,
                         complete: false,
@@ -312,7 +319,7 @@ impl Overview<'_> {
         let ids = |scan: &Pages| {
             scan.rows
                 .iter()
-                .map(|row| row[id].as_u64().expect("scan validated IDs"))
+                .map(|row| row[id].as_u64())
                 .collect::<Vec<_>>()
         };
         let mut previous_ids = ids(&first);
@@ -361,35 +368,23 @@ impl Overview<'_> {
             ("fetchedAt", "fetchedAt"),
         ];
         let mut rows = Vec::new();
+        let mut malformed = false;
         for row in &pages.rows {
             let Some(mapped) = fields
                 .iter()
                 .map(|(out, key)| Some((out.to_string(), row.get(*key)?.clone())))
                 .collect::<Option<Object>>()
             else {
-                return failed(invalid());
+                malformed = true;
+                continue;
             };
-            let optional_id = |value: &Value| value.is_null() || value.as_u64().is_some();
-            let valid_hash = |value: &Value| !keeper::request_hash(value).1;
-            if !row.contains_key("orderReqBlock")
-                || !row.contains_key("orderReqBlockTs")
-                || !optional_id(&row["tradeId"])
-                || row["perpMarketId"].as_u64().is_none()
-                || !matches!(row["side"].as_str(), Some("open" | "close"))
-                || row["status"] != "pending_exec"
-                || !valid_base_units(&row["collateralAmount"])
-                || !valid_hash(&row["orderReqTxHash"])
-                || !valid_hash(&row["orderReqEvmTxHash"])
-                || !valid_block(&row["orderReqBlock"], &row["orderReqBlockTs"])
-            {
-                return failed(invalid());
-            }
-            rows.push(Value::Object(mapped));
+            rows.push((Value::Object(mapped), row));
         }
         let fetched = now();
-        for (mapped, raw) in rows.iter_mut().zip(pages.rows) {
+        let mut projected = Vec::with_capacity(rows.len());
+        for (mut mapped, raw) in rows {
             merge(
-                mapped,
+                &mut mapped,
                 self.block_source(
                     &raw["orderReqBlock"],
                     &raw["orderReqBlockTs"],
@@ -398,13 +393,43 @@ impl Overview<'_> {
                 )
                 .await,
             );
+            projected.push(mapped);
         }
-        let mut section = success(json!(rows), fetched);
-        if !pages.complete {
-            section["error"] = error_value(incomplete(PAGINATION_ERROR));
+        let mut section = success(json!(projected), fetched);
+        const MALFORMED_ROWS: &str =
+            "Keeper returned invalid queued orders. Invalid rows were omitted.";
+        let error = match (malformed, pages.complete) {
+            (true, true) => Some(incomplete(MALFORMED_ROWS)),
+            (true, false) => Some(incomplete(format!("{MALFORMED_ROWS} {PAGINATION_ERROR}"))),
+            (false, false) => Some(incomplete(PAGINATION_ERROR)),
+            (false, true) => None,
+        };
+        if let Some(error) = error {
+            section["error"] = error_value(error);
         }
         section
     }
+}
+
+fn valid_queued_order(row: &Value) -> bool {
+    let valid_hash = |key| {
+        row.get(key)
+            .is_some_and(|value| !keeper::request_hash(value).1)
+    };
+    row["tradeId"].as_u64().is_some()
+        && row["perpMarketId"].as_u64().is_some()
+        && matches!(
+            row["side"].as_str(),
+            Some("open" | "close" | "increase" | "decrease" | "update_leverage")
+        )
+        && row["status"] == "pending_exec"
+        && row
+            .get("collateralAmount")
+            .is_some_and(|value| value.is_null() || valid_base_units(value))
+        && valid_hash("orderReqTxHash")
+        && valid_hash("orderReqEvmTxHash")
+        && row["orderReqBlock"].as_u64().is_some()
+        && instant(&row["orderReqBlockTs"]).is_some()
 }
 
 fn parse_balances(payload: Value) -> Result<Value, SaiError> {

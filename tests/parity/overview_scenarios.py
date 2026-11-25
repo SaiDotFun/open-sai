@@ -89,6 +89,36 @@ class OverviewReplay:
             self.state["contractTrades"].clear()
         queued = self.orders["data"]["perp"]["marketOrders"][0]
         queued["orderReqTxHash"] = "A" * 64
+        if scenario in {
+            "overview-queue-valid",
+            "overview-queue-mixed",
+            "overview-queue-paged",
+        }:
+            orders = self.orders["data"]["perp"]["marketOrders"]
+            for sequence, (side, collateral) in enumerate(
+                [
+                    ("close", None),
+                    ("increase", 42),
+                    ("decrease", None),
+                    ("update_leverage", None),
+                ],
+                start=queued["sequence"] + 1,
+            ):
+                orders.append(
+                    {
+                        **queued,
+                        "sequence": sequence,
+                        "side": side,
+                        "collateralAmount": collateral,
+                    }
+                )
+            if scenario != "overview-queue-valid":
+                orders.insert(1, {**queued, "sequence": "bad sequence"})
+                orders.insert(2, {**queued, "sequence": 401, "side": PRIVATE_URL})
+            if scenario == "overview-queue-paged":
+                orders[3:3] = [
+                    {**queued, "sequence": sequence} for sequence in range(501, 599)
+                ]
         if scenario == "overview-tainted":
             self.balances["data"]["userBalances"][-1]["lastUpdatedBlock"] = {
                 "nested": PRIVATE_URL
@@ -106,6 +136,14 @@ class OverviewReplay:
     def keeper(
         self, name: str, variables: Any, requests: list[WireRequest]
     ) -> dict[str, Any] | None:
+        if name == "pendingMarketOrders" and self.scenario == "overview-queue-paged":
+            calls = sum(request.label == name for request in requests)
+            offset = 0 if calls in (1, 3) else 100
+            expected = {"trader": self.addr, "limit": 100, "offset": offset}
+            if calls not in (1, 2, 3, 4) or not same_variables(variables, expected):
+                raise ValueError("Unexpected queued-order pagination request")
+            rows = self.orders["data"]["perp"]["marketOrders"]
+            return {"data": {"perp": {"marketOrders": rows[offset : offset + 100]}}}
         if name == "overviewTrades" and self.scenario in PAGINATED:
             calls = sum(request.label == name for request in requests)
             # First scan and confirmation each require offsets 0 and 100.

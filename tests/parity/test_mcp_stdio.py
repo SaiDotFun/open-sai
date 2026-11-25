@@ -953,6 +953,73 @@ def test_overview_balance_snapshot_deadline_survives_pings(
         assert not endpoints.errors
 
 
+def assert_queued_order_shapes(section: dict[str, Any]) -> None:
+    assert [(row["action"], row["collateralBaseUnits"]) for row in section["data"]] == [
+        ("open", 5_000_000),
+        ("close", None),
+        ("increase", 42),
+        ("decrease", None),
+        ("update_leverage", None),
+    ]
+
+
+def test_overview_v013_valid_queued_order_shapes(
+    native: Path, python_v013: Path, tmp_path: Path
+) -> None:
+    for executable, label in ((python_v013, "python"), (native, "rust")):
+        with (
+            loopback("overview-queue-valid") as endpoints,
+            server(
+                executable, tmp_path / label, endpoints, receive_timeout=20
+            ) as stdio,
+        ):
+            section = json.loads(
+                tool_text(stdio.call(2, "account_overview", addr=ADDRESS))
+            )["queuedMarketOrders"]
+            assert_queued_order_shapes(section)
+            assert "error" not in section
+            assert not endpoints.errors
+
+
+def test_overview_keeps_valid_queued_orders(native: Path, tmp_path: Path) -> None:
+    with (
+        loopback("overview-queue-mixed") as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=20) as stdio,
+    ):
+        text = tool_text(stdio.call(2, "account_overview", addr=ADDRESS))
+        assert PRIVATE_URL not in text
+        section = json.loads(text)["queuedMarketOrders"]
+        assert_queued_order_shapes(section)
+        assert section["error"]["code"] == "INCOMPLETE_DATA"
+        assert not endpoints.errors
+
+
+def test_overview_queue_offsets_include_invalid_rows(
+    native: Path, tmp_path: Path
+) -> None:
+    with (
+        loopback("overview-queue-paged") as endpoints,
+        server(native, tmp_path / "home", endpoints, receive_timeout=20) as stdio,
+    ):
+        result = json.loads(tool_text(stdio.call(2, "account_overview", addr=ADDRESS)))
+        section = result["queuedMarketOrders"]
+        assert [row["sequence"] for row in section["data"]] == [
+            400,
+            *range(501, 599),
+            401,
+            402,
+            403,
+            404,
+        ]
+        assert section["error"]["code"] == "INCOMPLETE_DATA"
+        assert [
+            item.variables["offset"]
+            for item in endpoints.wire
+            if item.label == "pendingMarketOrders"
+        ] == [0, 100, 0, 100]
+        assert not endpoints.errors
+
+
 @pytest.mark.parametrize(
     ("scenario", "items", "fill_failed", "lcd_failed"),
     [
