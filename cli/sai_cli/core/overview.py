@@ -43,6 +43,20 @@ COLLATERAL_SCALE = {"USDC": 1_000_000, "stNIBI": 1_000_000}
 # contracts/perp/src/constants.rs defines MAX_PNL_P as a fraction.
 MAX_GROSS_PNL = Decimal(9)
 USD_TOKEN_ID = 0
+# Built-in Keeper token labels. Other labels are displayed by numeric ID.
+TOKEN_LABELS = {
+    USD_TOKEN_ID: "uusd",
+    1: "USDC",
+    2: "stNIBI",
+    3: "BTC",
+    4: "ETH",
+    5: "ATOM",
+    17: "SOL",
+    18: "XRP",
+    19: "SUI",
+    20: "ENA",
+    21: "ARB",
+}
 
 
 class AccountUnavailable(ValueError):
@@ -115,6 +129,11 @@ def _optional_text(value: Any) -> str | None:
 def _token_name(token: Mapping[str, Any]) -> str:
     symbol = token["symbol"]
     return (_text(symbol) if symbol is not None else "") or _text(token["name"])
+
+
+def _display_label(token_id: int, label: str | None) -> str | None:
+    known = TOKEN_LABELS.get(token_id)
+    return known if known == label else None
 
 
 def _check_block(block: Any) -> None:
@@ -380,10 +399,11 @@ def _prices(endpoint: str) -> dict[int, dict[str, Any]]:
         if price > 0:
             token, block = row["token"], row["lastUpdatedBlock"]
             _check_block(block)
-            prices[_uint(token["id"])] = {
+            token_id = _uint(token["id"])
+            prices[token_id] = {
                 "usd": price,
                 "block": block,
-                "token": _token_name(token),
+                "token": _display_label(token_id, _token_name(token)),
             }
     return prices
 
@@ -721,7 +741,7 @@ def _trade_row(
     collateral, quote = market["collateralToken"], market["quoteToken"]
     symbol = _optional_text(collateral["symbol"])
     collateral_id, quote_id = _uint(collateral["id"]), _uint(quote["id"])
-    _uint(market["baseToken"]["id"])
+    base_id = _uint(market["baseToken"]["id"])
     _check_block(trade["lastUpdatedBlock"])
     if not isinstance(trade["isLong"], bool):
         raise TypeError("Expected a boolean trade side")
@@ -743,15 +763,17 @@ def _trade_row(
     row = {
         "id": trade["id"],
         "marketId": _uint(market["marketId"]),
-        "market": _optional_text(market["baseToken"]["symbol"]),
+        "market": _display_label(
+            base_id, _optional_text(market["baseToken"]["symbol"])
+        ),
         "side": "long" if trade["isLong"] else "short",
-        "collateralToken": symbol,
+        "collateralToken": _display_label(collateral_id, symbol),
         "collateralTokenId": collateral_id,
         "collateralBaseUnits": trade["collateralAmount"],
         "collateralUsd": _usd(amount, conversion),
         "leverage": _number(float(leverage)),
         "sizeUsd": _usd(amount * leverage, conversion),
-        "quoteToken": _token_name(quote),
+        "quoteToken": _display_label(quote_id, _token_name(quote)),
         "quoteTokenId": quote_id,
         "takeProfitPriceUsd": _usd(tp, quote_usd),
         "stopLossPriceUsd": _usd(sl, quote_usd),
@@ -1128,24 +1150,15 @@ def _session_info(
     }
 
 
-def _clean_section(
-    value: Any, tokens: tuple[str, ...], *, display: bool = False
-) -> Any:
+def _clean_section(value: Any, tokens: tuple[str, ...]) -> Any:
     if isinstance(value, str):
         if "//" in value:
             return log.REDACTED_URL
-        return log.scrub(log.Untrusted(value) if display else value, tokens)
+        return log.scrub(value, tokens)
     if isinstance(value, list):
         return [_clean_section(item, tokens) for item in value]
     if isinstance(value, dict):
-        return {
-            key: _clean_section(
-                item,
-                tokens,
-                display=key in ("market", "collateralToken", "quoteToken", "token"),
-            )
-            for key, item in value.items()
-        }
+        return {key: _clean_section(item, tokens) for key, item in value.items()}
     return value
 
 

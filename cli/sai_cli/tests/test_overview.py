@@ -780,13 +780,43 @@ def test_overview_validates_keeper_fields_and_cleans_display_text(replay):
         assert report["queuedMarketOrders"]["error"]["code"] == "INCOMPLETE_DATA"
         positions = report["positions"]["data"]["items"]
         assert len(positions) == 2
-        assert positions[0]["market"] == "[redacted session token]"
-        assert positions[0]["quoteToken"] == "[redacted hex]"
-        assert positions[1]["market"] == "[redacted url]"
+        assert positions[0]["market"] is None
+        assert positions[0]["quoteToken"] is None
+        assert positions[1]["market"] is None
         assert all(
             text not in json.dumps(report)
             for text in (url, relative_url, token, hex_text)
         )
+
+
+def test_overview_displays_only_known_keeper_labels(replay):
+    long, _ = populate_trades(replay)
+    market = long["perpBorrowing"]
+    marker = "SyntheticFixtureLabel"
+    market["baseToken"]["symbol"] = marker
+    market["quoteToken"].update(symbol=None, name=f"Fixture label {marker}")
+    market["collateralToken"] = {"id": 2, "symbol": marker}
+    rows = replay["http"][keeper.PRICES]["data"]["oracle"]["tokenPricesUsd"]
+    next(row for row in rows if row["token"]["id"] == 2)["token"]["symbol"] = marker
+    install_contract_trade(replay, long, mark=100, liquidation=50)
+
+    result = cli(replay, "account", "overview", "--json", "--as", ADDR)
+    assert result.exit_code == 0, result.output
+    for report in (json.loads(result.stdout), mcp(replay, addr=ADDR)):
+        first, second = report["positions"]["data"]["items"]
+        assert marker not in json.dumps(report)
+        assert (
+            first["market"] is first["collateralToken"] is first["quoteToken"] is None
+        )
+        assert (
+            first["marketId"],
+            first["collateralTokenId"],
+            first["quoteTokenId"],
+        ) == (0, 2, 0)
+        assert second["market"] == "ARB"
+        assert [(row["tokenId"], row["token"]) for row in report["prices"]["data"]] == [
+            (2, None)
+        ]
 
 
 @pytest.mark.parametrize("invalid_field", ["trade_side", "price_block", "lcd_stamp"])
