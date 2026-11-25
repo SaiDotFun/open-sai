@@ -460,10 +460,7 @@ impl SaiMcp {
         };
         // FastMCP checks the session even for missing or malformed trade arguments.
         if name.starts_with("trade_") {
-            let addr = args
-                .get("addr")
-                .and_then(Value::as_str)
-                .filter(|addr| !addr.is_empty());
+            let addr = args.get("addr").and_then(Value::as_str);
             let state = session::StoredSession::load(
                 &Storage::new(&self.env.home),
                 self.settings.endpoint(),

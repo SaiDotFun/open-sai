@@ -47,8 +47,8 @@ impl<'a> Action<'a> {
                 .as_str()
         };
         let flag = |key: &str| args.get(key).and_then(Value::as_bool).unwrap_or(false);
-        let addr = text("addr").filter(|addr| !addr.is_empty());
-        let signed_out_open = !self.submit && self.kind == "open" && addr.is_none();
+        let addr = text("addr");
+        let signed_out_open = !self.submit && self.kind == "open" && addr.is_none_or(str::is_empty);
         let session =
             StoredSession::load(storage, endpoint, addr).into_trade_session(signed_out_open)?;
         let addr = session.as_ref().map(|session| session.addr());

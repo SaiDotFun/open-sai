@@ -266,6 +266,9 @@ def test_mcp_open_binds_the_selected_account(
             assert refused["code"] == "PREVIEW_MISMATCH"
             assert refused["preview"]["addr"] == OTHER_ADDRESS
             assert refused["preview"]["previewDigest"] != preview["previewDigest"]
+            active_terms = trade_args(refused["preview"], OPEN)
+            missing = result(stdio.call(4, "trade_open", **active_terms, addr=""))
+            assert missing["code"] == "SESSION_UNAVAILABLE"
             assert not any(item.label == "recordUserIntent" for item in endpoints.wire)
             assert not rows(home)
             assert not endpoints.errors
