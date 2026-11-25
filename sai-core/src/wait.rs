@@ -3,7 +3,7 @@
 use std::time::{Duration, Instant};
 
 use rusqlite::ErrorCode;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use crate::{
     errors::{Code, SaiError},
@@ -279,11 +279,10 @@ pub async fn for_intent(
         && let Ok(position) = keeper
             .wait_request(
                 keeper::FILL_POSITION,
-                [
+                Map::from_iter([
                     ("trader".into(), json!(addr)),
                     ("id".into(), json!(trade_id)),
-                ]
-                .into(),
+                ]),
                 remaining,
             )
             .await
