@@ -271,7 +271,16 @@ class Normalize:
         if result.get("event") == "command.end" and isinstance(
             result.get("error"), str
         ):
-            result["error"] = self.intent_refs(result["error"])
+            error = result["error"]
+            # A command hint can be clipped by logging midway through a
+            # fixture path, before the full home can be normalized.
+            message, separator, omitted = error.rpartition("... [")
+            if separator and re.fullmatch(r"[0-9]+ more characters\]", omitted):
+                parent = f"{Path(self.home).parent}/"
+                index = message.rfind(parent)
+                if index >= 0 and self.home.startswith(message[index:]):
+                    error = f"{message[:index]}<HOME>{separator}{omitted}"
+            result["error"] = self.intent_refs(error)
         return result
 
     def log_records(self, records: list[dict[str, Any]]) -> list[dict[str, Any]]:
