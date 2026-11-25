@@ -324,10 +324,14 @@ impl SaiMcp {
         &self,
         name: &str,
         tool: Option<&Tool>,
-        args: Map<String, Value>,
+        mut args: Map<String, Value>,
         call_id: &str,
+        events: EventContext<'_>,
     ) -> Result<Value, String> {
-        let tool = tool.ok_or_else(|| format!("Unknown tool: {name}"))?;
+        let Some(tool) = tool else {
+            log_call(events, None, &args, |_| false);
+            return Err(format!("Unknown tool: {name}"));
+        };
         // FastMCP checks the session even for missing or malformed trade arguments.
         if name.starts_with("trade_") {
             let addr = args.get("addr").and_then(Value::as_str);
@@ -337,10 +341,18 @@ impl SaiMcp {
                 addr,
             );
             if let Some(error) = state.refusal() {
+                log_call(events, Some(tool), &args, |_| false);
                 return Ok(self.error(error));
             }
         }
-        let args = validation::arguments(tool, args)?;
+        let checked = validation::arguments(tool, &args);
+        log_call(events, Some(tool), &args, |name| {
+            checked
+                .as_ref()
+                .err()
+                .is_none_or(|error| !error.field(name))
+        });
+        args.extend(checked.map_err(|error| error.message(tool))?);
         Ok(self
             .run_tool(name, &args, call_id)
             .await
@@ -412,15 +424,12 @@ impl ServerHandler for SaiMcp {
             if tool.is_some() { name } else { "unknown" },
             &call_id[..12],
         );
-        if self.writer.is_some() {
-            log_call(events, tool, &args);
-        }
         let duration =
             || json!((started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64).into();
         let call = tokio::select! {
             biased;
             _ = context.ct.cancelled() => return Err(stdio::cancelled()),
-            result = self.checked_call(name, tool, args, &call_id[..12]) => result,
+            result = self.checked_call(name, tool, args, &call_id[..12], events) => result,
         };
         let result = match call {
             Ok(value) => {
@@ -481,27 +490,38 @@ impl ServerHandler for SaiMcp {
     }
 }
 
-fn log_call(events: EventContext<'_>, tool: Option<&Tool>, args: &Map<String, Value>) {
+fn log_call(
+    events: EventContext<'_>,
+    tool: Option<&Tool>,
+    args: &Map<String, Value>,
+    validated: impl Fn(&str) -> bool,
+) {
+    if events.writer.is_none() {
+        return;
+    }
+    let properties = tool.map(|tool| {
+        tool.input_schema["properties"]
+            .as_object()
+            .expect("tool properties")
+    });
     let mut known = Vec::new();
     let mut unknown = 0;
-    if let Some(tool) = tool {
-        let properties = tool.input_schema["properties"]
-            .as_object()
-            .expect("tool properties");
-        unknown = args
-            .keys()
-            .filter(|key| !properties.contains_key(*key))
-            .count();
-        if tool.name != "logs_intent" {
-            known.extend(properties.keys().filter_map(|key| {
-                let field = match args.get(key)? {
-                    Value::String(text) => Field::Arg(text.clone()),
-                    Value::Array(items) => Field::Text(format!("[list of {}]", items.len())),
-                    Value::Object(items) => Field::Text(format!("[dict of {}]", items.len())),
-                    value => Field::Scalar(value.clone()),
-                };
-                Some((key.clone(), field))
-            }));
+    let mut unknown_metadata = Vec::new();
+    for (key, value) in args {
+        if !properties.is_some_and(|properties| properties.contains_key(key)) {
+            unknown += 1;
+            if unknown_metadata.len() < 64 {
+                unknown_metadata.push(argument_metadata(value));
+            }
+        } else if tool.is_some_and(|tool| tool.name != "logs_intent") {
+            let field = match value {
+                Value::String(text) if validated(key) => Field::Arg(text.clone()),
+                Value::Number(_) | Value::Bool(_) | Value::Null if validated(key) => {
+                    Field::Scalar(value.clone())
+                }
+                _ => argument_metadata(value),
+            };
+            known.push((key.clone(), field));
         }
     }
     events.event(
@@ -513,8 +533,24 @@ fn log_call(events: EventContext<'_>, tool: Option<&Tool>, args: &Map<String, Va
                 "unknownArguments",
                 json!((unknown > 0).then_some(unknown)).into(),
             ),
-        ],
+        ]
+        .into_iter()
+        .chain(
+            (unknown > 0).then_some(("unknownArgumentMetadata", Field::Array(unknown_metadata))),
+        ),
     );
+}
+
+fn argument_metadata(value: &Value) -> Field {
+    let (kind, length) = match value {
+        Value::String(text) => ("string", text.len()),
+        Value::Array(items) => ("array", items.len()),
+        Value::Object(items) => ("object", items.len()),
+        Value::Number(_) => ("number", 1),
+        Value::Bool(_) => ("boolean", 1),
+        Value::Null => ("null", 1),
+    };
+    json!({"type": kind, "length": length}).into()
 }
 
 fn tool_result(value: Value) -> CallToolResult {
