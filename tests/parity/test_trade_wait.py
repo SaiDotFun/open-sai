@@ -58,17 +58,40 @@ OPEN = (
 CLOSE = ("close", "17")
 CANCEL = (*CLOSE, "--cancel-order")
 TPSL = ("tpsl", "17", "--take-profit", "110.0100", "--clear-stop-loss")
-LEVERAGE = ("leverage", "17", "--leverage", "5.00")
+TP = ("tpsl", "17", "--take-profit", "110.0100")
+SL = ("tpsl", "17", "--stop-loss", "89.2500")
+CLEAR_SL = ("tpsl", "17", "--clear-stop-loss")
+LEVERAGE = ("leverage", "17", "--leverage", "5.2500")
 UPDATES = {
     TPSL: {
         "takeProfit": {"operation": "set", "value": "110.0100"},
         "stopLoss": {"operation": "clear"},
     },
+    TP: {
+        "takeProfit": {"operation": "set", "value": "110.0100"},
+        "stopLoss": {"operation": "keep"},
+    },
+    SL: {
+        "takeProfit": {"operation": "keep"},
+        "stopLoss": {"operation": "set", "value": "89.2500"},
+    },
+    CLEAR_SL: {
+        "takeProfit": {"operation": "keep"},
+        "stopLoss": {"operation": "clear"},
+    },
     LEVERAGE: {
         "takeProfit": {"operation": "keep"},
         "stopLoss": {"operation": "keep"},
-        "requestedLeverage": "5.00",
+        "requestedLeverage": "5.2500",
     },
+}
+POSITION_ACTIONS = (TPSL, LEVERAGE)
+INDEXED_POSITIONS = {
+    TPSL: {"tp": "110.0100", "sl": "0", "leverage": "2.5000"},
+    TP: {"tp": "110.0100", "sl": "85.5000", "leverage": "2.5000"},
+    SL: {"tp": "115.1250", "sl": "89.2500", "leverage": "2.5000"},
+    CLEAR_SL: {"tp": "115.1250", "sl": "0", "leverage": "2.5000"},
+    LEVERAGE: {"tp": "115.1250", "sl": "85.5000", "leverage": "5.2500"},
 }
 CONTRACT = "nibi1contract"
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
@@ -99,6 +122,7 @@ class Case:
     outcome: str = "filled"
     admission: str = "accepted"
     alternate_rust_args: tuple[str, ...] = ()
+    direct_update: bool = False
 
 
 CASES = (
@@ -138,7 +162,24 @@ CASES = (
         "failed",
     ),
     Case("tpsl", TPSL, "UPDATE_TRADE", "tpsl_updated", "succeeded"),
-    Case("leverage", LEVERAGE, "UPDATE_TRADE", "leverage_updated", "succeeded"),
+    Case("tp-set", TP, "UPDATE_TRADE", "tp_updated", "succeeded", direct_update=True),
+    Case("sl-set", SL, "UPDATE_TRADE", "sl_updated", "succeeded", direct_update=True),
+    Case(
+        "sl-clear",
+        CLEAR_SL,
+        "UPDATE_TRADE",
+        "sl_updated",
+        "succeeded",
+        direct_update=True,
+    ),
+    Case(
+        "leverage",
+        LEVERAGE,
+        "UPDATE_TRADE",
+        "leverage_updated",
+        "succeeded",
+        direct_update=True,
+    ),
     Case("tpsl-lost-ack", TPSL, "UPDATE_TRADE", "tpsl_updated", "succeeded", "lost"),
     Case(
         "leverage-lost-ack",
@@ -258,6 +299,18 @@ def normalized(document: Any, key: str) -> Any:
     return document.replace(key, "<intent>") if isinstance(document, str) else document
 
 
+def indexed_update(change: str, key: str, args: tuple[str, ...]) -> dict[str, Any]:
+    row = indexed(change, intentKey=key)
+    row.pop("marketOrder")
+    row["trade"].update(
+        id=17,
+        openBlock={"block": REQUEST_BLOCK - 100},
+        openPrice="100.1250",
+        **INDEXED_POSITIONS[args],
+    )
+    return row
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 def test_trade_wait(
     request: pytest.FixtureRequest,
@@ -335,7 +388,12 @@ def test_trade_wait(
                     "limit": 25,
                     "offset": 0,
                 }
-                return response(history(indexed(case.change, intentKey=keys[0])))
+                row = (
+                    indexed_update(case.change, keys[0], case.args)
+                    if case.direct_update
+                    else indexed(case.change, intentKey=keys[0])
+                )
+                return response(history(row))
 
             if case.args == OPEN:
                 replies.append(response(MARKETS))
@@ -409,6 +467,14 @@ def test_trade_wait(
                     if update:
                         assert receipt["execution"]["tradeChangeType"] == case.change
                         assert receipt["fill"] is None
+                    if case.direct_update:
+                        position = receipt["positionNow"]
+                        assert receipt["execution"]["marketOrderSequence"] is None
+                        assert position["id"] == 17
+                        assert position["openPrice"] == "100.1250"
+                        assert {
+                            field: position[field] for field in ("tp", "sl", "leverage")
+                        } == INDEXED_POSITIONS[case.args]
             if update and expected_exit:
                 assert (
                     document["error"]["code"]
@@ -712,7 +778,7 @@ def test_position_trade_wait_times_out(
     # Both commands and runtimes exercise the real 30-second deadline concurrently.
     with ExitStack() as servers, ThreadPoolExecutor(max_workers=4) as batch:
         pairs = []
-        for args in UPDATES:
+        for args in POSITION_ACTIONS:
             pending = []
             for index, cli in enumerate(position_wait_cli_pair):
                 endpoint, replies, requests = servers.enter_context(
