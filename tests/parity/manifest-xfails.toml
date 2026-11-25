@@ -247,7 +247,7 @@ signature = "866e192520eeeb1c7bc98f00573be7158e9f797c43a29d596c42d42fa157aa95"
 
 [gap."case:trade-concurrent-close"]
 owner = "#174"
-signature = "f90924e0a25b54bc5dcca65818e4f69f99fe9dc8aa523355772b94afec0351e5"
+signature = "82b0fe8534c41160c7231a27781179c0d0934311d6a49fc8c30e3d51f53047bd"
 
 [gap."case:trade-leverage"]
 owner = "#173"
@@ -259,7 +259,7 @@ signature = "e659a3d9aa1f2fe43b0dedf5f76ff7f4e781ecffdddf0f91605d9e095b41efc6"
 
 [gap."case:trade-partial-close"]
 owner = "#118"
-signature = "d25ffce6d773ea478f96d0cc8fe7818c9b4e3fe7bd69ba7e2b05ebaea7f87872"
+signature = "bb8b59cb3eb3cfc82051a90e61391c815aefeda0df92b2d7511f5b96f61ab09c"
 
 [gap."case:trade-tpsl"]
 owner = "#173"
@@ -455,3 +455,18 @@ title = "Track Codex read-only uninstall behavior against v0.1.2"
 owner = "M2-unassigned"
 signature = "d54ebf40d72168dc7f625be654d4231314fc1388b3c43b1462799602f3d4f607"
 title = "Track Cursor read-only uninstall behavior against v0.1.2"
+
+[gap."case:market-prices"]
+owner = "M2-unassigned"
+signature = "60acb316c3b0fbbe342e7a98471255fefe279dfb616d7ec1df43f4927db34539"
+title = "Track null oracle timestamps against Python v0.1.2"
+
+[gap."case:market-prices-epoch-spellings"]
+owner = "M2-unassigned"
+signature = "258dd637a6103ffd988c3283565fdac7c7bd81e6997d45f129b1eb7d05cc85c1"
+title = "Track null oracle timestamps against Python v0.1.2"
+
+[gap."case:market-prices-text"]
+owner = "M2-unassigned"
+signature = "98f5dd7492def77fb178c16399871c092f2d154949da608c1a8aa1bd9b9e86f3"
+title = "Track null oracle timestamps against Python v0.1.2"
