@@ -12,6 +12,7 @@ import pytest
 from release_mismatch import ExpectedReleaseMismatch, ReleaseMismatch
 
 RELEASE_SIGNATURE = pytest.StashKey[str]()
+PENDING_RELEASE_RESULTS = pytest.StashKey[set[str]]()
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -38,6 +39,7 @@ def pytest_collection_modifyitems(
             if nodeid in reasons:
                 raise pytest.UsageError(f"Multiple release owners for {nodeid}")
             reasons[nodeid] = (pr, signature)
+    config.stash[PENDING_RELEASE_RESULTS] = set(reasons)
     for item in items:
         if entry := reasons.pop(item.nodeid, None):
             pr, signature = entry
@@ -61,8 +63,22 @@ def pytest_runtest_call(item: pytest.Item):
         return (yield)
     except ReleaseMismatch as error:
         if error.signature == item.stash.get(RELEASE_SIGNATURE, None):
+            item.config.stash[PENDING_RELEASE_RESULTS].remove(item.nodeid)
             raise ExpectedReleaseMismatch(error.differences) from None
         raise
+
+
+def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
+    if not (pending := session.config.stash.get(PENDING_RELEASE_RESULTS, None)):
+        return
+    if terminal := session.config.pluginmanager.get_plugin("terminalreporter"):
+        terminal.write_line(
+            "Required release comparisons did not report their expected mismatch:"
+        )
+        for nodeid in sorted(pending):
+            terminal.write_line(f"  {nodeid}")
+    if exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 @pytest.fixture
