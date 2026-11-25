@@ -105,6 +105,7 @@ market-keeper-echo-error
 market-keeper-error
 market-list
 market-prices
+market-prices-epoch-spellings
 market-prices-interrupt
 market-prices-partial-error
 market-prices-raw-numbers
