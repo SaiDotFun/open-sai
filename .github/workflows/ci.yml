@@ -190,6 +190,14 @@ jobs:
           path: .parity-mcp-python
           persist-credentials: false
 
+      - name: Check out Python v0.1.3 for MCP trade parity
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/sai-cli/v0.1.3
+          path: .parity-mcp-trade-python
+          persist-credentials: false
+
       - name: Check out Python main for auth parity
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -260,6 +268,7 @@ jobs:
           uv sync --project .parity-python-v011 --locked
           uv sync --project .parity-overview-python --locked --all-groups --python 3.13
           uv sync --project .parity-mcp-python --python 3.12 --locked --all-groups
+          uv sync --project .parity-mcp-trade-python --locked --all-groups
           uv sync --project .parity-python-c7 --locked --all-groups
           uv sync --project .parity-python-wait --locked --all-groups
           uv sync --project .parity-auth-python --locked --all-groups
@@ -346,6 +355,7 @@ jobs:
           SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-python/.venv/bin/sai
           SAI_PARITY_TRADE_MAIN_PYTHON: ${{ github.workspace }}/.parity-trade-main/.venv/bin/sai
           SAI_MCP_PARITY_PYTHON: ${{ github.workspace }}/.parity-mcp-python/.venv/bin/sai
+          SAI_PARITY_MCP_TRADE_PYTHON: ${{ github.workspace }}/.parity-mcp-trade-python/.venv/bin/sai
           SAI_PARITY_C7_PYTHON: ${{ github.workspace }}/.parity-python-c7/.venv/bin/sai
           SAI_PARITY_WAIT_PYTHON: ${{ github.workspace }}/.parity-python-wait/.venv/bin/sai
           SAI_PARITY_AUTH_PRIVACY_PYTHON: ${{ github.workspace }}/.parity-auth-privacy-python/.venv/bin/sai
