@@ -183,6 +183,15 @@ impl UpdateCommand {
         // launcher and any pending transaction for an authorized update.
         let opted_in = allowed();
         let allowed = || opted_in && allowed();
+        let recovery_lock =
+            if !self.source && opted_in && install.require_pending_uv_recovery().is_ok() {
+                match self.lock_uv_launcher(install, wait, RUNNING).await {
+                    Ok(lock) => lock,
+                    Err(outcome) => return outcome,
+                }
+            } else {
+                None
+            };
         let recovery_error = |reason| {
             Outcome::new(
                 "failed",
@@ -301,9 +310,12 @@ impl UpdateCommand {
                     to,
                 );
             }
-            let _launcher_lock = match self.lock_uv_launcher(install, wait, &before).await {
-                Ok(lock) => lock,
-                Err(outcome) => return outcome,
+            let _launcher_lock = match recovery_lock {
+                Some(lock) => Some(lock),
+                None => match self.lock_uv_launcher(install, wait, &before).await {
+                    Ok(lock) => lock,
+                    Err(outcome) => return outcome,
+                },
             };
             match install
                 .change(&releases, &installed, &target, home, allowed)

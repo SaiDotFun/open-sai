@@ -4,8 +4,8 @@ use std::{
     env,
     ffi::OsStr,
     fs,
-    io::{self, Read},
-    os::unix::fs::PermissionsExt,
+    io::{self, Read, Write},
+    os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::{Path, PathBuf},
 };
 
@@ -13,7 +13,7 @@ use semver::Version;
 use serde::{Deserialize, Serialize};
 use tempfile::{NamedTempFile, TempDir};
 use tokio::process::Command;
-use toml_edit::DocumentMut;
+use toml_edit::{DocumentMut, InlineTable};
 
 use crate::update::{
     release::{self, Releases},
@@ -27,6 +27,11 @@ const TOOL: &str = "sai-cli";
 const LOCK: &str = ".sai-cli-update.lock";
 const CACHE: &str = ".sai-cli-native-wheels";
 const RECORD: &str = ".sai-cli-native-pending.json";
+const RECEIPT: &str = "uv-receipt.toml";
+
+fn recovery_bin(tools: &Path) -> PathBuf {
+    tools.join(CACHE).join("restore-bin")
+}
 
 pub(in crate::update) struct Uv {
     prefix: PathBuf,
@@ -84,11 +89,13 @@ impl Uv {
         if prefix.symlink_metadata().is_ok() && prefix.canonicalize().ok()? != prefix {
             return None;
         }
-        let launcher = registered_launcher(&prefix).or_else(|| {
-            let pending: Pending =
-                serde_json::from_slice(&fs::read(tools.join(RECORD)).ok()?).ok()?;
-            pending_launcher(&pending)
-        })?;
+        let launcher = registered_launcher(&prefix)
+            .filter(|path| path != &recovery_bin(tools).join("sai"))
+            .or_else(|| {
+                let pending: Pending =
+                    serde_json::from_slice(&fs::read(tools.join(RECORD)).ok()?).ok()?;
+                pending_launcher(&pending)
+            })?;
         Some(Self {
             prefix,
             launcher,
@@ -179,7 +186,12 @@ impl Uv {
                 .as_ref()
                 .is_some_and(|version| version.to_string() == wheel.version)
         };
-        let incomplete = !self.prefix.join("uv-receipt.toml").is_file()
+        // Recovery may itself stop after uv writes a receipt for the
+        // private staging bin, before we bind the public launcher.
+        let registered = registered_launcher(&self.prefix);
+        let staged = recovery_bin(self.tools()).join("sai");
+        let incomplete = (!self.prefix.join(RECEIPT).is_file()
+            || registered.as_ref() == Some(&staged))
             && !provenance::has_origin(&self.prefix)
             && (current.is_none() || expected().any(matches_version));
         // The Python bridge replaces the package in place and leaves uv's
@@ -187,8 +199,8 @@ impl Uv {
         let interrupted_in_place = record
             .original_record
             .as_deref()
-            .is_some_and(release::valid_digest)
-            && registered_launcher(&self.prefix).as_deref() == Some(self.launcher())
+            .is_none_or(release::valid_digest)
+            && registered.as_deref() == Some(self.launcher())
             && self.python().is_ok_and(|python| python == record.python)
             && provenance::dist_info(&self.prefix).is_none()
             && self
@@ -373,23 +385,121 @@ impl Uv {
             .ok_or_else(|| "the rollback wheel record has an invalid version".to_owned())?;
         self.owner(true)?;
         self.check_recoverable_package(pending)?;
-        let path = self.wheel_path(wheel)?;
-        Self::install(
-            uv,
-            python,
-            wheel,
-            &path,
-            home,
-            (self.tools(), self.bin_dir()),
-        )
-        .await?;
+        let path = self.verify_wheel(wheel)?;
+        let receipt = registered_launcher(&self.prefix);
+        let staged = if receipt.as_deref() == Some(self.launcher())
+            && self.python().is_ok_and(|current| current == python)
+        {
+            let mut command = Command::new(uv);
+            command
+                .current_dir(home)
+                .args([
+                    "pip",
+                    "install",
+                    "--reinstall-package",
+                    TOOL,
+                    "--offline",
+                    "--python",
+                ])
+                .arg(self.prefix.join("bin/python"))
+                .arg(&path);
+            smoke::uv_output(command, "`uv pip install`").await?;
+            None
+        } else {
+            Some(
+                self.stage_restored_tool(uv, python, wheel, &path, home, receipt.as_deref())
+                    .await?,
+            )
+        };
+        self.owner(true)?;
+        if self
+            .launcher
+            .symlink_metadata()
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            symlink(self.prefix.join("bin/sai"), &self.launcher).map_err(io_error)?;
+            state::sync_dir(self.bin_dir()).map_err(io_error)?;
+        }
         self.owner(false)?;
-        if smoke::version(&self.launcher, home, shim_base).await? != version {
+        if smoke::version(&self.prefix.join("bin/sai"), home, shim_base).await? != version {
             return Err(format!("the restored launcher did not report {version}"));
+        }
+        self.owner(false)?;
+        if let Some(staged) = staged {
+            self.bind_restored_receipt(&staged)?;
         }
         provenance::record(&self.prefix, wheel, &self.wheel_path(wheel)?)?;
         remove_record(&self.pending_path())?;
         Ok(version)
+    }
+
+    async fn stage_restored_tool(
+        &self,
+        uv: &Path,
+        python: &Path,
+        wheel: &Wheel,
+        path: &Path,
+        home: &Path,
+        registered: Option<&Path>,
+    ) -> Result<PathBuf> {
+        let bin = recovery_bin(self.tools());
+        let staged = bin.join("sai");
+        let receipt = self.prefix.join(RECEIPT);
+        // uv's forced installation may replace an entry from its prior
+        // receipt. Keep it off the public path even when rebuilding the tool.
+        if registered == Some(self.launcher()) || registered == Some(staged.as_path()) {
+            // Retire the owned receipt before invoking uv so it cannot act
+            // on entry points from the previous install attempt.
+            fs::remove_file(&receipt).map_err(io_error)?;
+            state::sync_dir(&self.prefix).map_err(io_error)?;
+        } else if !receipt
+            .symlink_metadata()
+            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        {
+            return Err("could not safely recreate the uv tool with an existing receipt".into());
+        }
+        state::private_dir(&bin).map_err(io_error)?;
+        let info = bin.symlink_metadata().map_err(io_error)?;
+        if bin.canonicalize().map_err(io_error)? != bin
+            || !info.is_dir()
+            || info.uid() != rustix::process::geteuid().as_raw()
+            || info.mode() & 0o077 != 0
+        {
+            return Err("the uv recovery bin must be a private directory".into());
+        }
+        Self::install(uv, python, wheel, path, home, (self.tools(), &bin)).await?;
+        Ok(staged)
+    }
+
+    fn bind_restored_receipt(&self, staged: &Path) -> Result<()> {
+        let receipt = self.prefix.join(RECEIPT);
+        let mut document: DocumentMut = fs::read_to_string(&receipt)
+            .map_err(io_error)?
+            .parse()
+            .map_err(|_| "could not read the restored uv receipt".to_owned())?;
+        let entry = document
+            .get_mut("tool")
+            .and_then(|tool| tool.get_mut("entrypoints"))
+            .and_then(toml_edit::Item::as_array_mut)
+            .and_then(|entries| {
+                entries
+                    .iter_mut()
+                    .filter_map(toml_edit::Value::as_inline_table_mut)
+                    .find(|entry| receipt_entry(entry) == Some(staged))
+            })
+            .ok_or_else(|| "uv did not register the staged Sai launcher".to_owned())?;
+        let public = self
+            .launcher
+            .to_str()
+            .ok_or_else(|| "the uv launcher path is not valid UTF-8".to_owned())?;
+        entry.insert("install-path", public.into());
+        let mut file = NamedTempFile::new_in(&self.prefix).map_err(io_error)?;
+        file.write_all(document.to_string().as_bytes())
+            .map_err(io_error)?;
+        file.as_file().sync_all().map_err(io_error)?;
+        file.persist(&receipt)
+            .map_err(|error| io_error(error.error))?;
+        state::sync_dir(&self.prefix).map_err(io_error)
     }
 
     pub(super) async fn recover(&self, home: &Path, allowed: impl Fn() -> bool) -> Result<Version> {
@@ -574,22 +684,26 @@ fn pending_launcher(record: &Pending) -> Option<PathBuf> {
 }
 
 fn registered_launcher(prefix: &Path) -> Option<PathBuf> {
-    let receipt = fs::read_to_string(prefix.join("uv-receipt.toml")).ok()?;
+    let receipt = fs::read_to_string(prefix.join(RECEIPT)).ok()?;
     let receipt: DocumentMut = receipt.parse().ok()?;
     let tool = receipt.get("tool")?;
     for entry in tool.get("entrypoints")?.as_array()?.iter() {
         let Some(entry) = entry.as_inline_table() else {
             continue;
         };
-        if entry.get("name").and_then(toml_edit::Value::as_str) != Some("sai") {
-            continue;
-        }
-        let path = Path::new(entry.get("install-path")?.as_str()?);
-        if path.is_absolute() && path.file_name()? == "sai" {
+        if let Some(path) = receipt_entry(entry) {
             return launcher_path(path);
         }
     }
     None
+}
+
+fn receipt_entry(entry: &InlineTable) -> Option<&Path> {
+    if entry.get("name")?.as_str()? != "sai" {
+        return None;
+    }
+    let path = Path::new(entry.get("install-path")?.as_str()?);
+    (path.is_absolute() && path.file_name()? == "sai").then_some(path)
 }
 
 async fn uv_directory(uv: &Path, cwd: &Path, extra: &[&str]) -> Result<(String, Option<PathBuf>)> {

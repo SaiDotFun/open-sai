@@ -15,6 +15,7 @@ import sys
 import tarfile
 import threading
 import time
+import tomllib
 import zipfile
 from collections.abc import Generator, Mapping
 from contextlib import contextmanager
@@ -1066,8 +1067,9 @@ def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("legacy_record", [False, True])
 def test_uv_recovers_an_interrupted_in_place_bridge_install(
-    standalone: NativeInstall, tmp_path: Path
+    standalone: NativeInstall, tmp_path: Path, legacy_record: bool
 ) -> None:
     install, initial = uv_install(standalone, tmp_path)
     prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
@@ -1076,9 +1078,10 @@ def test_uv_recovers_an_interrupted_in_place_bridge_install(
     (installed_record,) = prefix.glob(
         "lib/python*/site-packages/sai_cli-*.dist-info/RECORD"
     )
-    record["original_record"] = hashlib.sha256(
-        installed_record.read_bytes()
-    ).hexdigest()
+    if not legacy_record:
+        record["original_record"] = hashlib.sha256(
+            installed_record.read_bytes()
+        ).hexdigest()
     pending.write_text(json.dumps(record), encoding="utf-8")
     receipt = prefix / "uv-receipt.toml"
     receipt_bytes = receipt.read_bytes()
@@ -1108,6 +1111,71 @@ def test_uv_recovers_an_interrupted_in_place_bridge_install(
     assert recovered.returncode == 0, recovered.stdout + recovered.stderr
     assert json.loads(recovered.stdout)["status"] == "recovered"
     assert install.launcher.readlink() == link
+    assert not pending.exists()
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("cooperative", [True, False])
+def test_uv_recovery_preserves_a_competing_public_launcher(
+    standalone: NativeInstall, tmp_path: Path, cooperative: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
+    pending = interrupted_uv_install(install, initial)
+    install.launcher.unlink()
+    shutil.rmtree(prefix)
+    lock = install.launcher.with_name(".sai-update.lock")
+    lock.touch(mode=0o600)
+    wrapper = install.launcher.with_name("uv")
+    real_uv = wrapper.resolve()
+    wrapper.unlink()
+    attempted = tmp_path / "publication-attempt"
+    wrapper.write_text(
+        f"""#!{sys.executable}
+import fcntl
+import os
+import sys
+from pathlib import Path
+
+if sys.argv[1:3] == ["tool", "install"] and not Path({str(attempted)!r}).exists():
+    with Path({str(lock)!r}).open("rb") as held:
+        try:
+            if {cooperative!r}:
+                fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            Path({str(attempted)!r}).write_text("locked")
+        else:
+            Path({str(install.launcher)!r}).symlink_to({str(standalone.executable)!r})
+            Path({str(attempted)!r}).write_text("published")
+os.execv({str(real_uv)!r}, [{str(real_uv)!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+
+    recovered = install.invoke("--json", "update", "--recover", exe=install.executable)
+    assert attempted.read_text(encoding="utf-8") == (
+        "locked" if cooperative else "published"
+    )
+    if cooperative:
+        assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    else:
+        assert recovered.returncode == 1, recovered.stdout + recovered.stderr
+        assert install.launcher.readlink() == standalone.executable
+        assert pending.exists()
+        receipt = tomllib.loads(
+            (prefix / "uv-receipt.toml").read_text(encoding="utf-8")
+        )
+        assert receipt["tool"]["entrypoints"][0]["install-path"] != str(
+            install.launcher
+        )
+        install.launcher.unlink()
+        retried = install.invoke(
+            "--json", "update", "--recover", exe=install.executable
+        )
+        assert retried.returncode == 0, retried.stdout + retried.stderr
+    assert install.launcher.readlink() == prefix / "bin/sai"
     assert not pending.exists()
     assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
 
@@ -1357,6 +1425,7 @@ def test_background_uv_optout_during_download_discards_staged_wheels(
     [
         "launcher",
         "receipt",
+        "interpreter",
         "environment",
         "dangling-with-path-fallback",
         "foreign-launcher",
@@ -1373,6 +1442,8 @@ def test_uv_recovers_an_interrupted_install(
         install.launcher.unlink()
     if interrupted == "receipt":
         (prefix / "uv-receipt.toml").unlink()
+    if interrupted == "interpreter":
+        (prefix / "bin/python").unlink()
     if interrupted in {"environment", "dangling-with-path-fallback"}:
         shutil.rmtree(prefix)
     if interrupted == "foreign-launcher":
