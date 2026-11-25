@@ -47,7 +47,7 @@ fn resolves_all_layers_and_uses_websocket_from_the_same_or_higher_layer() {
 }
 
 #[test]
-fn file_type_errors_are_reported_before_overrides_except_for_logging() {
+fn file_type_errors_are_skipped_for_overrides_and_reported_for_diagnostics() {
     let home = tempdir().unwrap();
     let env = fixture(
         home.path(),
@@ -57,7 +57,10 @@ fn file_type_errors_are_reported_before_overrides_except_for_logging() {
         ],
     );
     fs::write(env.path(), "[keeper]\nendpoint = 42\n").unwrap();
-    let error = Settings::load(&Flags::default(), &env).unwrap_err();
+    let resolved = Settings::load(&Flags::default(), &env).unwrap();
+    assert_eq!(resolved.endpoint(), "https://env.example");
+    assert_eq!(resolved.source(Key::KeeperEndpoint), Source::Env);
+    let error = Settings::for_doctor(&Flags::default(), &env).unwrap_err();
     assert_eq!(
         error.to_string(),
         format!(
