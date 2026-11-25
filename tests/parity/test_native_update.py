@@ -1601,7 +1601,55 @@ def test_uv_recovers_an_interrupted_install(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
-@pytest.mark.parametrize("fail", ["", "installed"])
+@pytest.mark.parametrize("same_target", [False, True])
+def test_uv_update_preserves_a_competing_public_launcher(
+    standalone: NativeInstall, tmp_path: Path, same_target: bool
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    tools = Path(install.env["UV_TOOL_DIR"])
+    replacement = wheel(tmp_path, NEW)
+    link = install.launcher.readlink() if same_target else standalone.executable
+    wrapper = install.launcher.with_name("uv")
+    real_uv = wrapper.resolve()
+    wrapper.unlink()
+    claimed = tmp_path / "competing-inode"
+    wrapper.write_text(
+        f"""#!{sys.executable}
+import os
+import sys
+from pathlib import Path
+
+if sys.argv[1:3] == ["tool", "install"] and os.environ.get("UV_TOOL_DIR") == {str(tools)!r}:
+    claimed = Path({str(claimed)!r})
+    if not claimed.exists():
+        public = Path({str(install.launcher)!r})
+        replacement = public.with_name("competitor")
+        replacement.symlink_to({str(link)!r})
+        claimed.write_text(str(replacement.lstat().st_ino))
+        replacement.replace(public)
+os.execv({str(real_uv)!r}, [{str(real_uv)!r}, *sys.argv[1:]])
+""",
+        encoding="utf-8",
+    )
+    wrapper.chmod(0o700)
+    local_assets = {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **assets(NEW, replacement.name, replacement.read_bytes()),
+    }
+    with releases(local_assets) as server:
+        changed = install.update(server, "--to", NEW)
+
+    assert changed.returncode == 1, changed.stdout + changed.stderr
+    assert install.launcher.readlink() == link
+    assert install.launcher.lstat().st_ino == int(claimed.read_text(encoding="utf-8"))
+    receipt = tomllib.loads((tools / "sai-cli/uv-receipt.toml").read_text())
+    assert receipt["tool"]["entrypoints"][0]["install-path"] != str(install.launcher)
+    assert (tools / ".sai-cli-native-pending.json").exists()
+    assert install.state()["result"]["rolledBack"] is False
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+@pytest.mark.parametrize("fail", ["", "installed", "staging"])
 def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
     standalone: NativeInstall, tmp_path: Path, fail: str
 ) -> None:
@@ -1611,6 +1659,11 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
     tools = Path(env["UV_TOOL_DIR"])
     replacement = wheel(tmp_path, NEW, fail=fail)
     link = launcher.readlink()
+    inode = launcher.lstat().st_ino
+    if fail == "staging":
+        unsafe_bin = tools / ".sai-cli-native-wheels/restore-bin"
+        unsafe_bin.mkdir(parents=True)
+        unsafe_bin.chmod(0o770)
     local_assets = {
         **assets(standalone.installed, initial.name, initial.read_bytes()),
         **assets(NEW, replacement.name, replacement.read_bytes()),
@@ -1659,6 +1712,7 @@ def test_uv_owned_launcher_is_reinstalled_or_restored_by_uv(
         )
         assert server.reads.count(asset_key(NEW, replacement.name)) == 1
     assert launcher.is_symlink() and launcher.readlink() == link
+    assert launcher.lstat().st_ino == inode
     assert (tools / "sai-cli" / "uv-receipt.toml").is_file()
     assert not (tools / ".sai-cli-native-pending.json").exists()
     assert python_update.install_kind(tools / "sai-cli").kind == "uv-tool-release"

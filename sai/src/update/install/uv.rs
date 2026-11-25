@@ -287,6 +287,26 @@ impl Uv {
         }
     }
 
+    fn launcher_identity(&self) -> Result<(u64, u64)> {
+        let before = self.launcher.symlink_metadata().map_err(io_error)?;
+        self.owner(false)?;
+        let after = self.launcher.symlink_metadata().map_err(io_error)?;
+        if (before.dev(), before.ino()) != (after.dev(), after.ino()) {
+            return Err("the public uv launcher changed during the update".into());
+        }
+        Ok((after.dev(), after.ino()))
+    }
+
+    fn check_launcher(&self, expected: Option<(u64, u64)>, allow_missing: bool) -> Result<()> {
+        let Some(expected) = expected else {
+            return self.owner(allow_missing);
+        };
+        if self.launcher_identity()? != expected {
+            return Err("the public uv launcher changed during the update".into());
+        }
+        Ok(())
+    }
+
     async fn check_destination(&self, uv: &Path, cwd: &Path) -> Result<()> {
         for (extra, expected) in [(&[][..], self.tools()), (&["--bin"][..], self.bin_dir())] {
             let (output, found) = uv_directory(uv, cwd, extra).await?;
@@ -410,11 +430,12 @@ impl Uv {
         pending: &Pending,
         home: &Path,
         shim_base: Option<&str>,
+        launcher: Option<(u64, u64)>,
     ) -> Result<Version> {
         let wheel = &pending.wheel;
         let version = release::version(&wheel.version)
             .ok_or_else(|| "the rollback wheel record has an invalid version".to_owned())?;
-        self.owner(true)?;
+        self.check_launcher(launcher, true)?;
         self.check_recoverable_package(pending)?;
         let path = self.verify_wheel(wheel)?;
         let receipt = registered_launcher(&self.prefix);
@@ -437,27 +458,25 @@ impl Uv {
             smoke::uv_output(command, "`uv pip install`").await?;
             None
         } else {
-            Some(
-                self.stage_restored_tool(uv, python, wheel, &path, home, receipt.as_deref())
-                    .await?,
-            )
+            Some(self.stage_tool(uv, python, wheel, &path, home).await?)
         };
-        self.owner(true)?;
-        if self
-            .launcher
-            .symlink_metadata()
-            .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        self.check_launcher(launcher, true)?;
+        if launcher.is_none()
+            && self
+                .launcher
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
         {
             symlink(self.prefix.join("bin/sai"), &self.launcher).map_err(io_error)?;
             state::sync_dir(self.bin_dir()).map_err(io_error)?;
         }
-        self.owner(false)?;
+        self.check_launcher(launcher, false)?;
         if smoke::version(&self.prefix.join("bin/sai"), home, shim_base).await? != version {
             return Err(format!("the restored launcher did not report {version}"));
         }
-        self.owner(false)?;
+        self.check_launcher(launcher, false)?;
         if let Some(staged) = staged {
-            self.bind_restored_receipt(&staged)?;
+            self.bind_staged_receipt(&staged, launcher)?;
         } else {
             self.pin_rollback_receipt(&path)?;
         }
@@ -466,21 +485,30 @@ impl Uv {
         Ok(version)
     }
 
-    async fn stage_restored_tool(
+    async fn stage_tool(
         &self,
         uv: &Path,
         python: &Path,
         wheel: &Wheel,
         path: &Path,
         home: &Path,
-        registered: Option<&Path>,
     ) -> Result<PathBuf> {
         let bin = recovery_bin(self.tools());
         let staged = bin.join("sai");
+        state::private_dir(&bin).map_err(io_error)?;
+        let info = bin.symlink_metadata().map_err(io_error)?;
+        if bin.canonicalize().map_err(io_error)? != bin
+            || !info.is_dir()
+            || info.uid() != rustix::process::geteuid().as_raw()
+            || info.mode() & 0o077 != 0
+        {
+            return Err("the uv staging bin must be a private directory".into());
+        }
         let receipt = self.prefix.join(RECEIPT);
+        let registered = registered_launcher(&self.prefix);
         // uv's forced installation may replace an entry from its prior
         // receipt. Keep it off the public path even when rebuilding the tool.
-        if registered == Some(self.launcher()) || registered == Some(staged.as_path()) {
+        if registered.as_deref() == Some(self.launcher()) || registered.as_ref() == Some(&staged) {
             // Retire the owned receipt before invoking uv so it cannot act
             // on entry points from the previous install attempt.
             fs::remove_file(&receipt).map_err(io_error)?;
@@ -491,21 +519,13 @@ impl Uv {
         {
             return Err("could not safely recreate the uv tool with an existing receipt".into());
         }
-        state::private_dir(&bin).map_err(io_error)?;
-        let info = bin.symlink_metadata().map_err(io_error)?;
-        if bin.canonicalize().map_err(io_error)? != bin
-            || !info.is_dir()
-            || info.uid() != rustix::process::geteuid().as_raw()
-            || info.mode() & 0o077 != 0
-        {
-            return Err("the uv recovery bin must be a private directory".into());
-        }
         Self::install(uv, python, wheel, path, home, (self.tools(), &bin)).await?;
         Ok(staged)
     }
 
-    fn bind_restored_receipt(&self, staged: &Path) -> Result<()> {
-        let mut document = self.read_receipt()?;
+    fn bind_staged_receipt(&self, staged: &Path, launcher: Option<(u64, u64)>) -> Result<()> {
+        let original = self.read_receipt()?;
+        let mut document = original.clone();
         let entry = document
             .get_mut("tool")
             .and_then(|tool| tool.get_mut("entrypoints"))
@@ -522,7 +542,13 @@ impl Uv {
             .to_str()
             .ok_or_else(|| "the uv launcher path is not valid UTF-8".to_owned())?;
         entry.insert("install-path", public.into());
-        self.write_receipt(&document)
+        self.check_launcher(launcher, false)?;
+        self.write_receipt(&document)?;
+        if let Err(reason) = self.check_launcher(launcher, false) {
+            self.write_receipt(&original)?;
+            return Err(reason);
+        }
+        Ok(())
     }
 
     fn pin_rollback_receipt(&self, wheel: &Path) -> Result<()> {
@@ -583,7 +609,7 @@ impl Uv {
             if !allowed() {
                 return Ok(self.version());
             }
-            self.restore(&uv, &pending.python, &pending, home, None)
+            self.restore(&uv, &pending.python, &pending, home, None, None)
                 .await
         } else {
             smoke::version(&self.launcher, home, None).await
@@ -611,6 +637,7 @@ impl Uv {
             if let Err(reason) = self.check_destination(&uv, &cwd).await {
                 return Ok(Change::Unsupported(reason));
             }
+            let launcher = Some(self.launcher_identity()?);
             let python = self.python()?;
             let trial_tools = trial.path().join("tools");
             let trial_bin = trial.path().join("bin");
@@ -656,7 +683,7 @@ impl Uv {
             if !allowed() {
                 return Ok(Change::Available);
             }
-            self.owner(false)?;
+            self.check_launcher(launcher, false)?;
             if let Err(reason) = self.authorized(false) {
                 return Ok(Change::Unsupported(reason));
             }
@@ -673,40 +700,29 @@ impl Uv {
             };
             state::atomic_json(&record, &pending).map_err(io_error)?;
             let changed = async {
-                Self::install(
-                    &uv,
-                    &python,
-                    &next,
-                    &published_next,
-                    home.path(),
-                    (self.tools(), self.bin_dir()),
-                )
-                .await?;
-                self.owner(false)?;
-                smoke::verify(&self.launcher, home.path(), target, shim_base).await?;
+                self.check_launcher(launcher, false)?;
+                let staged = self
+                    .stage_tool(&uv, &python, &next, &published_next, home.path())
+                    .await?;
+                self.check_launcher(launcher, false)?;
+                let executable = self.prefix.join("bin/sai");
+                smoke::verify(&executable, home.path(), target, shim_base).await?;
                 // Let the shim verify and cache its binary in the invoking profile.
-                if smoke::version(&self.launcher, profile, shim_base).await? != *target {
+                if smoke::version(&executable, profile, shim_base).await? != *target {
                     return Err(format!(
                         "the updated launcher did not report {target} in this profile"
                     ));
                 }
-                provenance::record(&self.prefix, &next, &self.wheel_path(&next)?)?;
+                provenance::record(&self.prefix, &next, &published_next)?;
+                self.bind_staged_receipt(&staged, launcher)?;
                 remove_record(&record)
             }
             .await;
             match changed {
                 Ok(()) => Ok(Change::Updated),
                 Err(reason) => {
-                    if self.owner(false).is_ok()
-                        && smoke::verify(&self.launcher, home.path(), installed, shim_base)
-                            .await
-                            .is_ok()
-                    {
-                        let _ = remove_record(&record);
-                        return Ok(Change::unchanged(reason, installed));
-                    }
                     let (reason, rolled_back) = match self
-                        .restore(&uv, &python, &pending, home.path(), shim_base)
+                        .restore(&uv, &python, &pending, home.path(), shim_base, launcher)
                         .await
                     {
                         Ok(_) => (format!("{reason}. Rolled back to sai {installed}."), true),
