@@ -476,7 +476,7 @@ def position_unchanged(
     latest, height = _latest_position(lcd, state, trade_id)
     if not _same_position(state.raw, latest):
         return False
-    _, inputs = leverage_inputs(lcd, state, trade_id, height=height)
+    effective_leverage, inputs = leverage_inputs(lcd, state, trade_id, height=height)
     quoted_leverage = {
         key: value
         for key, value in quoted_inputs.items()
@@ -488,6 +488,11 @@ def position_unchanged(
         raise ValueError(
             "Cannot confirm the position and leverage at the same block."
             " Retry with an LCD that reports the contract query height."
+        )
+    if effective_leverage is None:
+        raise PositionChanged(
+            "Cannot verify effective leverage at the position's block."
+            " Request a new preview once the leverage inputs are readable."
         )
     if "collateralPriceUsd" not in quoted_inputs:
         return True
