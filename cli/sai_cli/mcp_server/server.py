@@ -353,6 +353,9 @@ async def preview_open(
     referencePrice. Submit refreshes the price and checks it against the
     referencePrice from the preview.
 
+    If recovery.action is connect_and_preview, connect a Sai account
+    and call preview_open again before asking for confirmation.
+
     Args:
         market_id: Market id from market_list.
         side: long or short.
@@ -655,9 +658,13 @@ async def trade_margin(
     """Submit a margin change. Call preview_margin, show the user the quote,
     and get confirmation first.
 
-    The digest covers the intent and the quote, so it refuses with
-    PREVIEW_MISMATCH and a new preview if the position changed since the
-    confirmed quote. The amount is a quote, not a cap.
+    The digest covers the intent and the quote. The actual margin change
+    can exceed the quoted amount.
+
+    On PREVIEW_MISMATCH, follow recovery.action. With quoteStatus=available,
+    show the replacement preview and get confirmation. With
+    quoteStatus=unavailable, request a fresh preview before asking for
+    confirmation.
 
     Args:
         trade_id: Trade id from account_positions.
@@ -713,8 +720,10 @@ async def trade_partial_close(
     """Submit a partial close. Call preview_partial_close, show the user the
     preview, and get confirmation first.
 
-    Refuses with PREVIEW_MISMATCH and a new preview if the position changed
-    since the confirmed reduction was sized.
+    On PREVIEW_MISMATCH, follow recovery.action. With quoteStatus=available,
+    show the replacement preview and get confirmation. With
+    quoteStatus=unavailable, request a fresh preview before asking for
+    confirmation.
 
     Args:
         trade_id: Trade id from account_positions.
