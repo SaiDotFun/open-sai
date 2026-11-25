@@ -1500,6 +1500,31 @@ def test_cli_wait_budgets_initial_locked_ledger_lookup(keeper_replay):
     assert status(endpoint) == "unknown"
 
 
+def test_cli_wait_recovery_hint_names_the_public_keeper():
+    endpoint = keeper.MAINNET_HTTP
+    reserve(endpoint)
+    with closing(storage.db()) as connection:
+        connection.execute("BEGIN EXCLUSIVE")
+        command = CliRunner().invoke(
+            main,
+            [
+                "--endpoint",
+                endpoint,
+                "--json",
+                "intent",
+                "wait",
+                KEY,
+                "--timeout",
+                "0.02",
+            ],
+        )
+
+    assert command.exit_code == 5, command.output
+    error = json.loads(command.stdout)["error"]
+    assert error["code"] == "OUTCOME_UNKNOWN"
+    assert error["hint"] == f"sai --endpoint {endpoint} intent wait {KEY}"
+
+
 def test_wait_keeps_resized_position_out_of_original_fill(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)

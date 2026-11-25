@@ -24,7 +24,7 @@ from typing import Any
 from cryptography.exceptions import InvalidTag
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from . import log, paths
+from . import keeper, log, paths
 from .errors import Code, SaiError, SessionError, describe
 
 
@@ -523,7 +523,11 @@ def keeper_command_hint(endpoint: str, *args: str) -> str:
     Ask the caller to supply the original URL when the origin is insufficient.
     """
     origin = log.origin(endpoint)
-    if origin != log.REDACTED_URL and origin == endpoint == log.redact(endpoint):
+    if (
+        origin != log.REDACTED_URL
+        and endpoint in (origin, keeper.MAINNET_HTTP)
+        and endpoint == log.redact(endpoint)
+    ):
         flag = shlex.quote(endpoint)
     else:
         flag = (
