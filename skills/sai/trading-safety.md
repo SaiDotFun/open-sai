@@ -215,7 +215,7 @@ sai --as 0xYOUR_ADDR --json trade leverage 42 --leverage 5 --dry-run
 sai --as 0xYOUR_ADDR --json trade margin 42 --direction add --amount 5 \
   --dry-run
 sai --as 0xYOUR_ADDR --json trade close 42 --dry-run
-sai --as 0xYOUR_ADDR --json trade close 43 --cancel-order --dry-run
+sai --as 0xYOUR_ADDR --json trade cancel 43 --dry-run
 sai --json intent local 0xYOUR_ADDR
 sai --json intent wait INTENT_KEY --addr 0xYOUR_ADDR --timeout 30
 ```
@@ -298,7 +298,8 @@ What each command checks:
   index and the contract disagree, the CLI refuses and submits nothing. Wait
   and retry.
 - **Close and cancel.** `trade close ID` closes an open position. To cancel a
-  pending limit or stop order, add `--cancel-order`. The CLI checks that the
+  pending limit or stop order, use `trade cancel ID`. The alias is
+  `trade close ID --cancel-order`. The CLI checks that the
   order is pending before preview and submit. If it fills after the check,
   Perp can close the filled position at market.
 

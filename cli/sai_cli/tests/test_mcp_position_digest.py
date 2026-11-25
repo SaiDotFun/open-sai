@@ -3593,3 +3593,31 @@ def test_cli_market_symbol_and_compact_market_list(position_service):
     assert unknown.exit_code == 1, unknown.output
     assert "Unknown market symbol 'ETH'. Run sai market list." in unknown.stdout
     assert not position.submitted
+
+
+def test_cli_cancel_reuses_close_confirmation_and_pending_order_check(position_service):
+    position, base_url = position_service
+    position.trade_type = "limit"
+    save_session(f"{base_url}/query")
+    cancel = position_cli_args(base_url, ["cancel", "7"])
+    legacy = position_cli_args(base_url, ["close", "7", "--cancel-order"])
+    cli = CliRunner()
+    current = cli.invoke(main, [*cancel, "--dry-run"])
+    old = cli.invoke(main, [*legacy, "--dry-run"])
+    assert current.exit_code == old.exit_code == 0, current.output
+    preview = json.loads(current.stdout)
+    assert json.loads(old.stdout) == preview
+    assert preview["intent"]["kind"] == "CANCEL_PENDING_TRADE"
+    submit = [*cancel, "--preview-digest", preview["previewDigest"]]
+
+    position.trade_type = "trade"
+    filled = cli.invoke(main, submit)
+    assert filled.exit_code == 1, filled.output
+    assert "pending order" in filled.stdout
+    assert not position.submitted
+
+    position.trade_type = "limit"
+    accepted = cli.invoke(main, submit)
+    assert accepted.exit_code == 0, accepted.output
+    (submitted,) = position.submitted
+    assert {key: submitted[key] for key in preview["intent"]} == preview["intent"]

@@ -451,11 +451,15 @@ requires a new preview and confirmation. A position preview with
 
 Commands include `market list`, `market prices`, `account positions ADDR`,
 `account balances ADDR`, `account history ADDR`, `trade open`, `trade
-close`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
+close`, `trade cancel`, `trade partial-close`, `trade tpsl`, `intent wait KEY`,
 and live `watch` streams. Run any command with `--help` for details. Fund
 your Sai account in Sai Web before trading. Use `--dry-run` to inspect
 the intent and any available estimates. Some previews need a session and
 live position data. To preview an open without signing in, omit `--as`.
+
+Use `sai trade cancel ID --dry-run` to preview a pending order cancellation.
+The command accepts `--preview-digest` and `--wait` on submission. Existing
+scripts can still use `sai trade close ID --cancel-order`.
 
 On `main`, Sai refuses a position preview or submission if the position
 belongs to another account. A dry run with `positionOwnerVerified: false`

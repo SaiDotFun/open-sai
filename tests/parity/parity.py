@@ -105,6 +105,7 @@ class Case:
     interrupt_on_request: bool = False
     overview_expected: dict[str, Any] | None = None
     exact_output: bool = False
+    current_only: bool = False
 
     @property
     def command(self) -> str:
@@ -1410,7 +1411,8 @@ def main() -> int:
     selected = [
         case
         for case in cases
-        if (
+        if not (args.reference is not None and case.current_only)
+        and (
             case.name in C2_CONFIG_CASE_IDS
             if args.c2_v011
             else not args.case

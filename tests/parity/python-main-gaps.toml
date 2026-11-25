@@ -7,3 +7,7 @@ difference = "Leverage and margin dry runs show before and after collateral in U
 [gap.market-symbol-and-table]
 owner = "#231"
 difference = "Trade open accepts case-insensitive market symbols and reports ambiguous IDs. Market list prints a symbol, ID, collateral, and price table in text mode."
+
+[gap.cancel-command]
+owner = "#231"
+difference = "Trade cancel and close --cancel-order share the dry run, digest confirmation, pending-order check, and wait path. Rust cancel already exists and still needs --preview-digest and matching help."

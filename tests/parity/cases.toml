@@ -1234,6 +1234,7 @@ expect = 2
 
 [[case]]
 name = "trade-bare-group-text"
+accepted_difference = "Issue #231 lists cancel in bare Python trade help."
 args = ["trade"]
 mode = "text"
 expect = 2
@@ -1241,7 +1242,17 @@ exact_output = true
 
 [[case]]
 name = "trade-bare-group-json"
+accepted_difference = "Issue #231 lists cancel in bare Python trade help."
 args = ["--json", "trade"]
+expect = 2
+exact_output = true
+
+[[case]]
+name = "bare-help-trade-cancel"
+current_only = true
+accepted_difference = "Issue #231 adds Click help and --preview-digest for cancel."
+args = ["trade", "cancel"]
+mode = "text"
 expect = 2
 exact_output = true
 

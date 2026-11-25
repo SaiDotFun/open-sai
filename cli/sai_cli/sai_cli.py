@@ -1580,6 +1580,32 @@ def trade_close(
     preview_digest: str | None,
 ) -> None:
     """Close a position or cancel a pending order."""
+    close_or_cancel(ctx, trade_id, cancel_order, dry_run, preview_digest)
+
+
+@trade.command("cancel")
+@click.argument("trade_id", type=TRADE_INT)
+@click.option("--dry-run", is_flag=True)
+@preview_digest_option
+@wait_option
+@click.pass_context
+def trade_cancel(
+    ctx: click.Context,
+    trade_id: int,
+    dry_run: bool,
+    preview_digest: str | None,
+) -> None:
+    """Cancel a pending order."""
+    close_or_cancel(ctx, trade_id, True, dry_run, preview_digest)
+
+
+def close_or_cancel(
+    ctx: click.Context,
+    trade_id: int,
+    cancel_order: bool,
+    dry_run: bool,
+    preview_digest: str | None,
+) -> None:
     try:
         emit_trade(
             ctx,
