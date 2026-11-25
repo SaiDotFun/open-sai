@@ -98,7 +98,13 @@ fn update_override_wins_for_runtime_but_doctor_checks_the_stored_value() {
         "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
     );
 
-    let stored = Settings::for_doctor(&Flags::default(), &env).unwrap_err();
+    let (diagnostic, _) = Settings::for_doctor(&Flags::default(), &env).unwrap();
+    let diagnostic = diagnostic.unwrap_err();
+    assert!(diagnostic.is_invalid_setting());
+    assert_eq!(diagnostic.to_string(), effective.to_string());
+
+    let valid_env = fixture(home.path(), &[("SAI_UPDATE_AUTO", "false")]);
+    let stored = Settings::for_doctor(&Flags::default(), &valid_env).unwrap_err();
     assert_eq!(
         stored.to_string(),
         format!(
@@ -106,6 +112,10 @@ fn update_override_wins_for_runtime_but_doctor_checks_the_stored_value() {
             env.path().display()
         )
     );
+
+    fs::write(env.path(), "[update]\nauto = \n").unwrap();
+    let syntax = Settings::for_doctor(&Flags::default(), &env).unwrap_err();
+    assert!(syntax.is_malformed_toml());
 }
 
 #[test]

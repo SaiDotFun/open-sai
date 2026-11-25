@@ -378,6 +378,32 @@ def test_invalid_update_override_wins_over_invalid_file_value(
         assert valid.returncode == 0
 
 
+def test_doctor_reports_invalid_update_override_before_invalid_file_value(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        (home / "sai").mkdir(parents=True)
+        config = home / "sai/config.toml"
+        invalid_file = '[update]\nauto = "bad-file-value"\n'
+        config.write_text(invalid_file)
+
+        command = ("--json", "doctor", "--offline", "--no-fix")
+        result = run_cli(
+            binary, home, *command, overrides={"SAI_UPDATE_AUTO": "bad-override"}
+        )
+        assert result.returncode == 2
+        [check] = [
+            check
+            for check in json.loads(result.stdout)["error"]["details"]["checks"]
+            if check["id"] == "config"
+        ]
+        assert check["summary"] == (
+            "SAI_UPDATE_AUTO: Invalid value for update.auto: expected true or false"
+        )
+        assert config.read_text() == invalid_file
+
+
 def test_repl_omits_rejected_auth_and_imports_from_history(
     wave_clis: tuple[str, str], tmp_path: Path
 ) -> None:

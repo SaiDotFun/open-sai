@@ -476,7 +476,11 @@ impl Settings {
         flags: &Flags,
         env: &Environment,
     ) -> Result<(Result<Self, SettingsError>, Vec<&'static str>), SettingsError> {
-        let file = FileSettings::read_for_diagnostics(&env.path())?;
+        let invalid_update_override = matches!(
+            pick(Key::UpdateAuto, flags, env, None),
+            (Err(_), Source::Env)
+        );
+        let file = FileSettings::read_for_diagnostics(&env.path(), invalid_update_override)?;
         let invalid = KEYS
             .into_iter()
             .filter(|key| {
@@ -592,7 +596,7 @@ impl Settings {
 /// Effective logging settings, including the default when config cannot load.
 pub fn doctor_log_settings(env: &Environment) -> (bool, Value) {
     let flags = Flags::default();
-    let selected = FileSettings::read_for_diagnostics(&env.path())
+    let selected = FileSettings::read_for_diagnostics(&env.path(), false)
         .ok()
         .and_then(|file| {
             let value = |key: Key| {
@@ -619,8 +623,8 @@ struct FileSettings {
 }
 
 impl FileSettings {
-    fn read_for_diagnostics(path: &Path) -> Result<Self, SettingsError> {
-        let file = Self::read(path, false)?;
+    fn read_for_diagnostics(path: &Path, update_overridden: bool) -> Result<Self, SettingsError> {
+        let file = Self::read(path, update_overridden)?;
         for key in KEYS {
             if let Some(Ok(value)) = &file.entries[key as usize]
                 && let Some(url) = value.as_str()
