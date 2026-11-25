@@ -43,6 +43,13 @@ static TOOLS: LazyLock<Vec<Tool>> = LazyLock::new(|| {
     serde_json::from_str(include_str!("mcp/tools.json")).expect("valid Python tool inventory")
 });
 
+pub(crate) fn argument_schema(name: &str) -> Option<&'static Map<String, Value>> {
+    let tool = TOOLS.iter().find(|tool| tool.name == name)?;
+    tool.input_schema
+        .get("properties")
+        .and_then(Value::as_object)
+}
+
 #[derive(Args)]
 pub(crate) struct ServeArgs {
     #[arg(long, help = "Override the Keeper GraphQL HTTP endpoint")]

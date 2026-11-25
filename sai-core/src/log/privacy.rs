@@ -469,25 +469,37 @@ fn redact_url_text(text: String, url: &Regex) -> String {
     }
 }
 
-fn redact_retained_value(value: Value, url: &Regex) -> Value {
+type McpArgumentSchema = fn(&str) -> Option<&'static Map<String, Value>>;
+
+fn redact_retained_value(value: Value, mcp_argument_schema: McpArgumentSchema) -> Value {
     match value {
-        Value::String(text) => Value::String(redact_url_text(text, url)),
+        Value::String(text) => Value::String(redact_url_text(text, &URL)),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
-                .map(|value| redact_retained_value(value, url))
+                .map(|value| redact_retained_value(value, mcp_argument_schema))
                 .collect(),
         ),
         Value::Object(mut row) => {
-            redact_retained_urls(&mut row);
+            redact_retained_urls(&mut row, mcp_argument_schema);
             Value::Object(row)
         }
         value => value,
     }
 }
 
-pub(super) fn redact_retained_urls(row: &mut Map<String, Value>) {
+pub(super) fn redact_retained_urls(
+    row: &mut Map<String, Value>,
+    mcp_argument_schema: McpArgumentSchema,
+) {
     let mcp_call = row.get("event").and_then(Value::as_str) == Some("mcp.tool_call");
+    let properties = if mcp_call {
+        row.get("tool")
+            .and_then(Value::as_str)
+            .and_then(mcp_argument_schema)
+    } else {
+        None
+    };
     *row = std::mem::take(row)
         .into_iter()
         .map(|(key, value)| {
@@ -495,6 +507,9 @@ pub(super) fn redact_retained_urls(row: &mut Map<String, Value>) {
                 ("arguments", Value::Object(args)) if mcp_call => Value::Object(
                     args.into_iter()
                         .map(|(key, value)| {
+                            if !properties.is_some_and(|known| known.contains_key(&key)) {
+                                return (REDACTED_INPUT.into(), REDACTED_INPUT.into());
+                            }
                             let value = match value {
                                 Value::Null | Value::Bool(_) | Value::Number(_) => value,
                                 _ => REDACTED_INPUT.into(),
@@ -514,7 +529,7 @@ pub(super) fn redact_retained_urls(row: &mut Map<String, Value>) {
                     public_endpoint(&endpoint).into()
                 }
                 (key, value) if endpoint_field(key) && !value.is_object() => REDACTED_INPUT.into(),
-                (_, value) => redact_retained_value(value, &URL),
+                (_, value) => redact_retained_value(value, mcp_argument_schema),
             };
             (redact_url_text(key, &URL), value)
         })

@@ -460,11 +460,11 @@ def test_logs_tail_masks_retained_mcp_arguments(
                     "mcp.tool_call",
                     2,
                     surface="mcp",
-                    tool="intent_wait",
+                    tool="preview_close",
                     arguments={
-                        "key": {"nested": [private]},
-                        "timeout": 5,
-                        "rich": True,
+                        "addr": {"nested": [private]},
+                        "trade_id": 5,
+                        "cancel_order": True,
                     },
                 ),
             ],
@@ -481,12 +481,60 @@ def test_logs_tail_masks_retained_mcp_arguments(
             json.loads(line)["arguments"] for line in result.stdout.splitlines()
         ] == [
             {"addr": "[redacted]"},
-            {"key": "[redacted]", "timeout": 5, "rich": True},
+            {"addr": "[redacted]", "trade_id": 5, "cancel_order": True},
         ]
     else:
         assert b'arguments={"addr":"[redacted]"}' in result.stdout
-        assert b'"timeout":5' in result.stdout
-        assert b'"rich":true' in result.stdout
+        assert b'"trade_id":5' in result.stdout
+        assert b'"cancel_order":true' in result.stdout
+
+
+@pytest.mark.parametrize("flags", [(), ("--json",)], ids=["text", "json"])
+def test_logs_tail_masks_unknown_retained_mcp_argument_names(
+    local_pair: tuple[tuple[str, ...], tuple[str, ...]],
+    tmp_path: Path,
+    flags: tuple[str, ...],
+) -> None:
+    _, rust = local_pair
+    secret = "fixture-retained-mcp-member-key"
+    private = f"https://127.0.0.1/private?key={secret}"
+    seed_logs(
+        tmp_path,
+        {
+            "mcp": [
+                event(
+                    "mcp.tool_call",
+                    1,
+                    surface="mcp",
+                    tool="account_positions",
+                    arguments={"addr": None, "trade_id": 17, private: 29},
+                ),
+                event(
+                    "mcp.tool_call",
+                    2,
+                    surface="mcp",
+                    tool="unknown_tool",
+                    arguments={"addr": True},
+                ),
+            ],
+        },
+    )
+    result = invoke(rust, tmp_path, *flags, "logs", "tail", "--surface", "mcp")
+    assert result.returncode == 0 and not result.stderr
+    assert secret.encode() not in result.stdout
+    if flags:
+        arguments = [
+            json.loads(line)["arguments"] for line in result.stdout.splitlines()
+        ]
+    else:
+        arguments = [
+            json.JSONDecoder().raw_decode(line.split("arguments=", 1)[1])[0]
+            for line in result.stdout.decode().splitlines()
+        ]
+    assert arguments == [
+        {"addr": None, "[redacted]": "[redacted]"},
+        {"[redacted]": "[redacted]"},
+    ]
 
 
 def test_logs_run_keeps_events_with_non_utf8_argv(

@@ -289,7 +289,13 @@ pub fn path(env: &Environment) -> Value {
     })
 }
 
-pub fn tail(root: &Path, count: usize, surface: Option<&str>, name: Option<&str>) -> Vec<Row> {
+pub fn tail(
+    root: &Path,
+    count: usize,
+    surface: Option<&str>,
+    name: Option<&str>,
+    mcp_argument_schema: fn(&str) -> Option<&'static Map<String, Value>>,
+) -> Vec<Row> {
     let Ok(directory) = LogDir::read_only(root) else {
         return Vec::new();
     };
@@ -324,7 +330,7 @@ pub fn tail(root: &Path, count: usize, surface: Option<&str>, name: Option<&str>
     lines.sort_by_cached_key(order);
     lines.drain(..lines.len().saturating_sub(count));
     for row in &mut lines {
-        super::privacy::redact_retained_urls(row);
+        super::privacy::redact_retained_urls(row, mcp_argument_schema);
     }
     lines
 }

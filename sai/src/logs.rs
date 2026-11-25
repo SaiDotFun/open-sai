@@ -8,7 +8,7 @@ use sai_core::{
 };
 use serde_json::Value;
 
-use crate::{load_settings, local};
+use crate::{load_settings, local, mcp};
 
 #[derive(Subcommand)]
 pub enum LogsCommand {
@@ -80,7 +80,13 @@ impl LogsCommand {
                 surface,
                 event,
             } => {
-                for row in query::tail(&root, count, surface.as_deref(), event.as_deref()) {
+                for row in query::tail(
+                    &root,
+                    count,
+                    surface.as_deref(),
+                    event.as_deref(),
+                    mcp::argument_schema,
+                ) {
                     if json_output {
                         println!("{}", local::ascii_json(&Value::Object(row).to_string()));
                     } else {
