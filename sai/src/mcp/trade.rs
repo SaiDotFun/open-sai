@@ -53,18 +53,29 @@ impl<'a> Action<'a> {
             StoredSession::load(storage, endpoint, addr).into_trade_session(signed_out_open)?;
         let addr = session.as_ref().map(|session| session.addr());
         let trading = Trading::new(endpoint, storage, events).with_lcd_endpoint(lcd);
-        let options = |confirmation| SubmitOptions {
-            allow_concurrent_open: flag("allow_concurrent_open"),
-            confirmation: Some(confirmation),
-            ..SubmitOptions::default()
-        };
-        let confirmation = || Confirmation::for_mcp(required("preview_digest"), None);
-        if matches!(self.kind, "margin" | "partial_close") {
-            let mode = if self.submit {
-                PositionMode::Submit(options(confirmation()?))
+        let order_type = (self.kind == "open").then(|| match required("order_type") {
+            "market" => OrderType::Market,
+            "limit" => OrderType::Limit,
+            "stop" => OrderType::Stop,
+            _ => unreachable!("validated order type"),
+        });
+        let options = if self.submit {
+            let digest = required("preview_digest");
+            let confirmation = if let Some(order_type) = order_type {
+                Confirmation::for_mcp_open(order_type, digest, text("reference_price"))?
             } else {
-                PositionMode::Preview
+                Confirmation::for_mcp(digest, None)?
             };
+            Some(SubmitOptions {
+                allow_concurrent_open: flag("allow_concurrent_open"),
+                confirmation: Some(confirmation),
+                ..SubmitOptions::default()
+            })
+        } else {
+            None
+        };
+        if matches!(self.kind, "margin" | "partial_close") {
+            let mode = options.map_or(PositionMode::Preview, PositionMode::Submit);
             let action = if self.kind == "margin" {
                 PositionAction::Margin {
                     direction: match required("direction") {
@@ -100,12 +111,7 @@ impl<'a> Action<'a> {
                     "short" => Side::Short,
                     _ => unreachable!("validated side"),
                 },
-                order_type: match required("order_type") {
-                    "market" => OrderType::Market,
-                    "limit" => OrderType::Limit,
-                    "stop" => OrderType::Stop,
-                    _ => unreachable!("validated order type"),
-                },
+                order_type: order_type.expect("validated open order type"),
                 amount: required("amount"),
                 leverage: required("leverage"),
                 price: text("price"),
@@ -125,7 +131,7 @@ impl<'a> Action<'a> {
             "leverage" => leverage_preview(integer("trade_id"), required("leverage"))?,
             _ => unreachable!("known trade tool"),
         };
-        if !self.submit {
+        let Some(options) = options else {
             if preview.is_standalone_position_update() {
                 return trading
                     .position_update_preview(preview, session.as_ref(), false)
@@ -135,21 +141,12 @@ impl<'a> Action<'a> {
                 .prepare_preview(preview, session.as_ref(), PreviewMode::Mcp)
                 .await?;
             return Ok(preview.mcp_preview_output(addr));
-        }
+        };
 
         let session = session.as_ref().expect("submit requires a session");
-        let confirmation = if self.kind == "open" {
-            Confirmation::for_mcp_open(
-                &preview,
-                required("preview_digest"),
-                text("reference_price"),
-            )?
-        } else {
-            confirmation()?
-        };
         let notice = preview.requires_market_price_refresh() && text("price").is_some();
         let (accepted, price) = trading
-            .submit_with_reference_price(session, &preview, options(confirmation), pending())
+            .submit_with_reference_price(session, &preview, options, pending())
             .await?;
         let mut result = json!(accepted);
         if let Some(price) = price {

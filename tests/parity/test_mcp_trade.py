@@ -303,6 +303,32 @@ def test_mcp_signed_out_open_is_informational(
             assert not endpoints.errors
 
 
+def test_mcp_open_checks_confirmation_before_building_an_intent(
+    mcp_pair: tuple[Path, Path], tmp_path: Path
+) -> None:
+    args = {**OPEN, "amount": "invalid"}
+    for i, executable in enumerate(mcp_pair):
+        home = tmp_path / str(i)
+        with (
+            loopback("quote-market") as endpoints,
+            server(executable, home, endpoints, seed="session") as stdio,
+        ):
+            no_reference = result(
+                stdio.call(2, "trade_open", **args, preview_digest="fixture")
+            )
+            assert no_reference["code"] == "INVALID_REQUEST"
+            assert no_reference["error"].startswith("reference_price is required")
+            no_digest = result(
+                stdio.call(
+                    3, "trade_open", **args, reference_price="100", preview_digest=""
+                )
+            )
+            assert no_digest["code"] == "INVALID_REQUEST"
+            assert no_digest["error"].startswith("preview_digest is required")
+            assert not endpoints.wire
+            assert not rows(home)
+
+
 @pytest.mark.parametrize("lose_reply", [False, True], ids=["accepted", "unknown"])
 def test_mcp_open_confirmation_reserves_once_until_overridden(
     mcp_pair: tuple[Path, Path], tmp_path: Path, lose_reply: bool

@@ -6,7 +6,7 @@ use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 
 use super::{
-    PreviewMode, TradePreview, Trading,
+    OrderType, PreviewMode, TradePreview, Trading,
     actions::invalid,
     position::{Lcd, PositionRoute},
 };
@@ -101,11 +101,11 @@ impl<'a> Confirmation<'a> {
     }
 
     pub fn for_mcp_open(
-        preview: &TradePreview,
+        order_type: OrderType,
         digest: &'a str,
         reference_price: Option<&'a str>,
     ) -> Result<Self, SaiError> {
-        match (preview.requires_market_price_refresh(), reference_price) {
+        match (order_type == OrderType::Market, reference_price) {
             (true, None) => return Err(invalid(NEEDS_REFERENCE)),
             (false, Some(_)) => return Err(invalid(MARKET_ONLY_REFERENCE)),
             _ => {}
