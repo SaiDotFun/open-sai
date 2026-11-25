@@ -381,3 +381,38 @@ also adopts and stops orphaned helpers that started a separate session.
 Run `python3 scripts/release-rehearsal.py --self-test` for the local script
 checks. Add `--verbose` to a rehearsal to keep child output in a private
 scratch log. The script prints the log path and removes the temporary home.
+
+### Rehearse the Native Cutover and Rollback
+
+On Linux, use the published Python 0.1.3 wheel and its `SHA256SUMS`, a
+full Python bridge wheel, and the native candidate archive for your
+architecture. Pair the archive with a shim built at the same version by
+`scripts/native-dist.py rehearsal-wheel`. That wheel can fetch only from the
+loopback release server. Keep the archive's source revision and digest with
+the results. The run also needs `cursor-agent` and a Codex build with
+`app-server` on `PATH`.
+
+```bash
+gh release download sai-cli/v0.1.3 --repo SaiDotFun/open-sai \
+  --pattern '*.whl' --pattern SHA256SUMS --dir dist/published
+python3 scripts/build-bridge.py --version 0.1.4 --out-dir dist/bridge
+python3 scripts/release-rehearsal.py --verbose \
+  --published-assets dist/published \
+  --bridge-wheel dist/bridge/sai_cli-0.1.4-py3-none-any.whl \
+  --native-archive dist/sai-X.Y.Z-aarch64-unknown-linux-gnu.tar.gz \
+  dist/rehearsal-shim/sai_cli-X.Y.Z-py3-none-any.whl
+```
+
+Replace `X.Y.Z` and the archive architecture with the candidate values.
+The script prefetches Python dependencies before entering the required
+loopback-only namespace. All installs and all CLI and MCP checks run inside
+it. The script installs the published wheel with uv, updates to the bridge
+and then to the native shim, and rolls back using the native updater.
+The same uv launcher and temporary profile are used throughout.
+
+The rehearsal checks the selected account, saved config, pending open,
+retained logs, and MCP registrations. It starts Sai through Claude Code,
+Codex, and Cursor, and checks stale registrations during cutover and
+rollback. The loopback Keeper drops the first acknowledgement and reports the
+open as pending. A retry must reference that intent and leave the submission
+count at one. The script reports failed checks and exits nonzero.
