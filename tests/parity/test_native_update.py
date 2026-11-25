@@ -928,6 +928,26 @@ def cached_shim_release(
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_background_uv_update_respects_the_shared_launcher_lock(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    replacement = wheel(tmp_path, NEW)
+    local_assets = {
+        **assets(install.installed, initial.name, initial.read_bytes()),
+        **assets(NEW, replacement.name, replacement.read_bytes()),
+    }
+    lock = install.launcher.with_name(".sai-update.lock")
+    lock.touch(mode=0o600)
+    with lock.open("rb") as held, releases(local_assets) as server:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = install.update(server, "--background", "--to", NEW)
+        assert not server.reads
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
 def test_uv_trial_home_is_private_under_a_group_writable_umask(
     standalone: NativeInstall, tmp_path: Path
 ) -> None:

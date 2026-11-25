@@ -108,6 +108,13 @@ impl Install {
         }
     }
 
+    pub(super) fn uv_launcher_lock_path(&self) -> Option<PathBuf> {
+        match self {
+            Self::Uv(install) => Some(install.launcher().with_file_name(state::LAUNCHER_LOCK)),
+            _ => None,
+        }
+    }
+
     pub(super) fn recover_staged_launcher(&self) -> Result<()> {
         match self {
             Self::Standalone(install) => install.recover_staged_launcher(),

@@ -5,6 +5,7 @@ mod state;
 
 use std::{
     env,
+    fs::File,
     io::IsTerminal,
     os::unix::process::CommandExt,
     path::Path,
@@ -300,6 +301,10 @@ impl UpdateCommand {
                     to,
                 );
             }
+            let _launcher_lock = match self.lock_uv_launcher(install, wait, &before).await {
+                Ok(lock) => lock,
+                Err(outcome) => return outcome,
+            };
             match install
                 .change(&releases, &installed, &target, home, allowed)
                 .await
@@ -333,6 +338,32 @@ impl UpdateCommand {
         out.message = log::redact(home, &out.message);
         out.save(home, &before, !self.background).await;
         out
+    }
+
+    async fn lock_uv_launcher(
+        &self,
+        install: &Install,
+        wait: Duration,
+        installed: &str,
+    ) -> Result<Option<File>, Outcome> {
+        let Some(path) = install.uv_launcher_lock_path() else {
+            return Ok(None);
+        };
+        match state::launcher_lock(&path, wait).await {
+            Ok(Some(lock)) => Ok(Some(lock)),
+            Ok(None) => Err(Outcome::new(
+                if self.background { "busy" } else { "failed" },
+                "Another Sai install or update is using this launcher.",
+                installed,
+                None,
+            )),
+            Err(error) => Err(Outcome::new(
+                "failed",
+                format!("Could not lock the Sai launcher: {error}"),
+                installed,
+                None,
+            )),
+        }
     }
 }
 

@@ -1,7 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt},
     path::Path,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -13,6 +13,7 @@ use tempfile::NamedTempFile;
 
 const STATE: &str = "update.json";
 const STATE_LOCK: &str = "update.lock";
+pub(super) const LAUNCHER_LOCK: &str = ".sai-update.lock";
 const CHECK_INTERVAL: f64 = 24.0 * 60.0 * 60.0;
 const RETRY_INTERVAL: f64 = 15.0 * 60.0;
 
@@ -24,13 +25,30 @@ pub(super) fn private_dir(path: &Path) -> io::Result<()> {
 }
 
 pub(super) fn try_lock(path: &Path) -> io::Result<Option<File>> {
-    let file = OpenOptions::new()
+    try_lock_with(path, false)
+}
+
+fn try_lock_with(path: &Path, private: bool) -> io::Result<Option<File>> {
+    let mut options = OpenOptions::new();
+    options
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .mode(0o600)
-        .open(path)?;
+        .mode(0o600);
+    if private {
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    if private {
+        let info = file.metadata()?;
+        if !info.is_file()
+            || info.uid() != rustix::process::getuid().as_raw()
+            || info.mode() & 0o077 != 0
+        {
+            return Err(io::Error::other("the launcher lock must be a private file"));
+        }
+    }
     match file.try_lock() {
         Ok(()) => Ok(Some(file)),
         Err(std::fs::TryLockError::WouldBlock) => Ok(None),
@@ -39,9 +57,17 @@ pub(super) fn try_lock(path: &Path) -> io::Result<Option<File>> {
 }
 
 pub(super) async fn lock(path: &Path, wait: Duration) -> io::Result<Option<File>> {
+    lock_with(path, wait, false).await
+}
+
+pub(super) async fn launcher_lock(path: &Path, wait: Duration) -> io::Result<Option<File>> {
+    lock_with(path, wait, true).await
+}
+
+async fn lock_with(path: &Path, wait: Duration, private: bool) -> io::Result<Option<File>> {
     let deadline = tokio::time::Instant::now() + wait;
     loop {
-        if let Some(file) = try_lock(path)? {
+        if let Some(file) = try_lock_with(path, private)? {
             return Ok(Some(file));
         }
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());

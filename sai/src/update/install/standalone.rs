@@ -24,7 +24,6 @@ const ROOT: &str = ".sai-native";
 const SELECTOR: &str = "current";
 const RECORD: &str = "pending.json";
 const LAUNCHER_STAGE: &str = ".launcher-switch/sai";
-const LOCK: &str = ".sai-update.lock";
 const MAX_BINARY: usize = 96 << 20;
 const MAX_TAR: usize = MAX_BINARY + (1 << 20);
 
@@ -154,7 +153,7 @@ impl Standalone {
     }
 
     pub(super) fn lock_path(&self) -> PathBuf {
-        self.root.with_file_name(LOCK)
+        self.root.with_file_name(state::LAUNCHER_LOCK)
     }
 
     fn target(&self, dir: &str) -> Option<PathBuf> {
