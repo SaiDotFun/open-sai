@@ -43,11 +43,11 @@ from compare import (
     stdout,
 )
 from manifest_gaps import ManifestGaps
-from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, handshake
+from mcp_cases import CALLS, DEFERRED_TRADE_PROBE, RELEASE_MCP_TOOL_NAMES, handshake
 from mcp_clients import SECRET, client_state, seed_clients
 from network import enter_loopback, restricted, unroutable_packets
 from reference_uv import resolve_uv
-from release_mismatch import differing_paths
+from release_mismatch import differing_paths, value_fingerprint
 from sai_cli.sai_cli import command_path
 from sai_cli.sai_cli import main as python_cli
 from scenarios import (
@@ -582,6 +582,8 @@ def mcp_tools(output: Any) -> dict[str, dict[str, Any]]:
         inventory = {tool["name"]: tool for tool in tools}
         if not inventory or len(inventory) != len(tools):
             raise ValueError("MCP tools/list gave an empty or duplicate inventory")
+        if any(not isinstance(name, str) for name in inventory):
+            raise ValueError("MCP tools/list gave a non-string tool name")
         return inventory
     except (KeyError, TypeError):
         raise ValueError(
@@ -933,6 +935,30 @@ def row(command: str, status: str, detail: str = "") -> None:
     print("| " + " | ".join(escaped) + " |", flush=True)
 
 
+def report_mcp_tools(
+    tools: dict[str, str], evidence: dict[str, list[str]], gaps: ManifestGaps | None
+) -> None:
+    print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
+    for name in sorted(tools.keys() | evidence.keys()):
+        status = tools.get(name, "MISSING")
+        label = (
+            name
+            if name in RELEASE_MCP_TOOL_NAMES
+            else f"unexpected-sha256:{value_fingerprint(name)}"
+        )
+        if gaps:
+            diffs = sorted(evidence.get(name, []))
+            if status != "PASS":
+                diffs.append(
+                    f"tools/list or tools/call: {status}; no passing transcript"
+                )
+            row(f"`{label}`", *gaps.result(f"mcp:{label}", diffs))
+        else:
+            row(
+                f"`{label}`", status, "tools/call" if status == "PASS" else "tools/list"
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -1120,22 +1146,7 @@ def main() -> int:
             else:
                 row(f"`sai {name}`", "DEFERRED", reason)
     if tools:
-        print("\n| MCP tool | Status | Diff summary |\n| --- | --- | --- |")
-        for name in sorted(tools.keys() | evidence.keys()):
-            status = tools.get(name, "MISSING")
-            if gaps:
-                diffs = sorted(evidence.get(name, []))
-                if status != "PASS":
-                    diffs.append(
-                        f"tools/list or tools/call: {status}; no passing transcript"
-                    )
-                row(f"`{name}`", *gaps.result(f"mcp:{name}", diffs))
-            else:
-                row(
-                    f"`{name}`",
-                    status,
-                    "tools/call" if status == "PASS" else "tools/list",
-                )
+        report_mcp_tools(tools, evidence, gaps)
     passed = len(selected) - mismatches - expected_differences
     print(f"\n{passed}/{len(selected)} cases passed.")
     if expected_differences:
