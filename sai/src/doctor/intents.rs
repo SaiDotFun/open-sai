@@ -76,10 +76,16 @@ fn fingerprint(root: &Path) -> io::Result<Vec<Option<Mark>>> {
         .collect()
 }
 
-fn copy_snapshot(root: &Path) -> Result<tempfile::TempDir, SnapshotError> {
+fn copy_snapshot(
+    root: &Path,
+    expected: Option<&Metadata>,
+) -> Result<tempfile::TempDir, SnapshotError> {
     for _ in 0..3 {
         let dir = tempfile::tempdir().map_err(|_| SnapshotError::Unreadable)?;
         let before = fingerprint(root).map_err(|_| SnapshotError::Unreadable)?;
+        if expected.is_some_and(|info| before[0].as_ref() != Some(&Mark::from(info.clone()))) {
+            return Err(SnapshotError::Changed);
+        }
         for (name, mark) in [FILES[0], FILES[1], FILES[3]].into_iter().zip(&before) {
             if let Some(mark) = mark {
                 let source = match files::open_regular(&root.join(name)) {
@@ -151,9 +157,9 @@ fn matches_ledger_schema(db: &Connection, version: i64) -> rusqlite::Result<bool
     Ok(required.len() == if version == 0 { 6 } else { 7 })
 }
 
-pub(super) fn has_ledger_schema(root: &Path) -> bool {
+pub(super) fn has_ledger_schema(root: &Path, expected: &Metadata) -> bool {
     let has_schema = || {
-        let private = copy_snapshot(root).ok()?;
+        let private = copy_snapshot(root, Some(expected)).ok()?;
         let db = Connection::open(private.path().join(FILES[0])).ok()?;
         db.busy_timeout(TIMEOUT).ok()?;
         let version = db
@@ -165,7 +171,7 @@ pub(super) fn has_ledger_schema(root: &Path) -> bool {
 }
 
 fn read(root: &Path) -> Result<Snapshot, SnapshotError> {
-    let private = copy_snapshot(root)?;
+    let private = copy_snapshot(root, None)?;
     let run = || -> rusqlite::Result<Snapshot> {
         let db = Connection::open(private.path().join(FILES[0]))?;
         db.busy_timeout(TIMEOUT)?;

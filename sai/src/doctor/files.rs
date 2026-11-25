@@ -124,11 +124,16 @@ fn chmod(path: &Path, file: &File, info: &Metadata) -> io::Result<Option<String>
     )))
 }
 
-fn tighten(root: &Path, names: &[&str], apply: bool, eligible: bool) -> (Vec<String>, Vec<String>) {
+fn tighten(
+    root: &Path,
+    names: &[&str],
+    apply: bool,
+    eligible: impl FnOnce(&Metadata) -> bool,
+) -> (Vec<String>, Vec<String>, bool) {
     let mut changes = Vec::new();
     let mut failed = Vec::new();
     let fix = |path: &Path| format!("chmod go-rwx {}", shell_quote(&path.to_string_lossy()));
-    let repair = |path: &Path, file: &File, info: &Metadata| {
+    let repair = |path: &Path, file: &File, info: &Metadata, eligible: bool| {
         if !eligible || info.mode() & GROUP_OR_OTHER == 0 {
             Ok(None)
         } else if apply {
@@ -150,10 +155,10 @@ fn tighten(root: &Path, names: &[&str], apply: bool, eligible: bool) -> (Vec<Str
         )?))
     };
     let Ok(dir) = open() else {
-        return (changes, vec![fix(root)]);
+        return (changes, vec![fix(root)], false);
     };
     let Ok(info) = dir.metadata() else {
-        return (changes, vec![fix(root)]);
+        return (changes, vec![fix(root)], false);
     };
     if info.uid() != getuid().as_raw() {
         return (
@@ -162,9 +167,24 @@ fn tighten(root: &Path, names: &[&str], apply: bool, eligible: bool) -> (Vec<Str
                 "{} belongs to another user; fix by hand",
                 root.display()
             )],
+            false,
         );
     }
-    match repair(root, &dir, &info) {
+    let eligible = eligible(&info);
+    if !root
+        .symlink_metadata()
+        .is_ok_and(|current| same_file(&current, &info))
+    {
+        return (
+            changes,
+            vec![format!(
+                "{} changed during the check; run sai doctor again",
+                root.display()
+            )],
+            false,
+        );
+    }
+    match repair(root, &dir, &info, eligible) {
         Ok(change) => changes.extend(change),
         Err(_) => failed.push(fix(root)),
     }
@@ -188,14 +208,18 @@ fn tighten(root: &Path, names: &[&str], apply: bool, eligible: bool) -> (Vec<Str
                 "{} has other hard links; fix by hand",
                 path.display()
             )),
-            Ok(info) if info.is_file() => match repair(&path, &file, &info) {
+            Ok(info) if info.is_file() => match repair(&path, &file, &info, eligible) {
                 Ok(change) => changes.extend(change),
                 Err(_) => failed.push(fix(&path)),
             },
             _ => failed.push(fix(&path)),
         }
     }
-    (changes, failed)
+    (changes, failed, eligible)
+}
+
+fn same_file(left: &Metadata, right: &Metadata) -> bool {
+    left.dev() == right.dev() && left.ino() == right.ino()
 }
 
 #[derive(Clone, Copy)]
@@ -242,8 +266,16 @@ impl ProfileDir {
         }
     }
 
-    fn has_data(self, dir: &File, path: &Path, uid: u32, allow_loose_trader: bool) -> Option<bool> {
+    fn has_data(
+        self,
+        dir: &File,
+        path: &Path,
+        uid: u32,
+        allow_loose_trader: bool,
+        expected_child: Option<(&str, &Metadata)>,
+    ) -> Option<bool> {
         let mut has_data = false;
+        let mut matched_child = expected_child.is_none();
         for item in Dir::read_from(dir).ok()? {
             let item = item.ok()?;
             let name = item.file_name();
@@ -268,7 +300,15 @@ impl ProfileDir {
                     if device != opened.dev() || info.st_ino != opened.ino() {
                         return None;
                     }
-                    has_data |= child.has_data(&fd, &path.join(text), uid, false)?;
+                    if let Some((name, expected)) = expected_child
+                        && text == name
+                    {
+                        if !same_file(&opened, expected) {
+                            return None;
+                        }
+                        matched_child = true;
+                    }
+                    has_data |= child.has_data(&fd, &path.join(text), uid, false, None)?;
                 }
                 FileType::RegularFile if self.file(text) => {
                     if matches!(self, Self::Trader)
@@ -287,7 +327,7 @@ impl ProfileDir {
                             return None;
                         }
                         let evidence = if text == "intents.sqlite3" {
-                            intents::has_ledger_schema(path)
+                            intents::has_ledger_schema(path, &opened)
                         } else {
                             let envelope: Value = serde_json::from_reader(file).ok()?;
                             sai_core::storage::is_session_envelope(text, &envelope)
@@ -302,27 +342,31 @@ impl ProfileDir {
                 _ => return None,
             }
         }
-        Some(has_data)
+        matched_child.then_some(has_data)
     }
 }
 
-fn dedicated_profile(path: &Path, allow_loose_trader: bool) -> Option<(File, Metadata)> {
+fn dedicated_profile(
+    path: &Path,
+    allow_loose_trader: bool,
+    expected_child: Option<(&str, &Metadata)>,
+) -> Option<(File, Metadata)> {
     let dir = open_directory(path).ok()?;
     let info = dir.metadata().ok()?;
     let mode = info.mode();
     if info.uid() != getuid().as_raw()
         || mode & SHARED != 0
-        || !ProfileDir::Root.has_data(&dir, path, info.uid(), allow_loose_trader)?
+        || !ProfileDir::Root.has_data(&dir, path, info.uid(), allow_loose_trader, expected_child)?
         || dir.metadata().ok()?.mode() != mode
     {
         return None;
     }
     let current = path.symlink_metadata().ok()?;
-    (info.dev() == current.dev() && info.ino() == current.ino()).then_some((dir, info))
+    same_file(&info, &current).then_some((dir, info))
 }
 
 fn repair_profile_root(path: &Path, apply: bool) -> Option<String> {
-    let (dir, info) = dedicated_profile(path, !apply)?;
+    let (dir, info) = dedicated_profile(path, !apply, None)?;
     if info.mode() & GROUP_OR_OTHER == 0 {
         return None;
     }
@@ -381,8 +425,10 @@ pub(super) fn home_check(home: &Path, fix: bool) -> Check {
     let mut changes = Vec::new();
     let mut failed = Vec::new();
     if exists && !trader_loose.is_empty() {
-        let eligible = dedicated_profile(home, true).is_some();
-        (changes, failed) = tighten(&root, TRADER_FILES, fix, eligible);
+        let eligible;
+        (changes, failed, eligible) = tighten(&root, TRADER_FILES, fix, |opened| {
+            dedicated_profile(home, true, Some(("trader", opened))).is_some()
+        });
         if !eligible && failed.is_empty() {
             home_fix = SHARED_HOME_FIX;
         }
@@ -666,7 +712,7 @@ pub(super) fn logs_check(env: &Environment, fix: bool, (on, keep_days): (bool, V
         .fix(loose.iter().map(Loose::fix).collect::<Vec<_>>().join("; "))
     } else {
         let failed;
-        (changes, failed) = tighten(&root, &names, true, true);
+        (changes, failed, _) = tighten(&root, &names, true, |_| true);
         if !failed.is_empty() {
             Check::new(
                 "logs",
@@ -698,4 +744,52 @@ pub(super) fn open_regular(path: &Path) -> io::Result<File> {
         return Err(io::ErrorKind::InvalidData.into());
     }
     Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, Permissions};
+
+    #[test]
+    fn trader_repair_refuses_a_replacement_after_profile_validation() {
+        use std::os::unix::fs::PermissionsExt;
+
+        for apply in [false, true] {
+            let sandbox = tempfile::tempdir().unwrap();
+            let home = sandbox.path().join("sai");
+            let root = home.join("trader");
+            let previous = sandbox.path().join("previous");
+            fs::create_dir(&home).unwrap();
+            fs::set_permissions(&home, Permissions::from_mode(0o700)).unwrap();
+            let create_trader = || {
+                fs::create_dir(&root).unwrap();
+                fs::set_permissions(&root, Permissions::from_mode(0o755)).unwrap();
+                fs::write(
+                    root.join("sessions.json"),
+                    serde_json::json!({
+                        "version": 3,
+                        "nonce": "AAAAAAAAAAAAAAAA",
+                        "ciphertext": "AAAAAAAAAAAAAAAAAAAAAAA=",
+                    })
+                    .to_string(),
+                )
+                .unwrap();
+            };
+            create_trader();
+            let (changes, failed, eligible) = tighten(&root, TRADER_FILES, apply, |opened| {
+                assert!(dedicated_profile(&home, true, Some(("trader", opened))).is_some());
+                fs::rename(&root, &previous).unwrap();
+                create_trader();
+                assert!(dedicated_profile(&home, true, None).is_some());
+                assert!(dedicated_profile(&home, true, Some(("trader", opened))).is_none());
+                true
+            });
+            assert!(!eligible);
+            assert!(changes.is_empty());
+            assert_eq!(failed.len(), 1);
+            assert_eq!(root.metadata().unwrap().mode() & 0o777, 0o755);
+            assert_eq!(previous.metadata().unwrap().mode() & 0o777, 0o755);
+        }
+    }
 }
