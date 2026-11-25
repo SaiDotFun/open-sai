@@ -14,7 +14,7 @@ use crate::update::install::{Result, io as io_error};
 const RELEASE_RECORD: &str = ".sai-cli-release.json";
 const RELEASE_PATH: &str = "/SaiDotFun/open-sai/releases/download/sai-cli/v";
 
-fn dist_info(prefix: &Path) -> Option<PathBuf> {
+pub(super) fn dist_info(prefix: &Path) -> Option<PathBuf> {
     let mut packages = fs::read_dir(prefix.join("lib"))
         .into_iter()
         .flatten()

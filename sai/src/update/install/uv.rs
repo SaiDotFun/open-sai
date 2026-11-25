@@ -182,7 +182,21 @@ impl Uv {
         let incomplete = !self.prefix.join("uv-receipt.toml").is_file()
             && !provenance::has_origin(&self.prefix)
             && (current.is_none() || expected().any(matches_version));
-        if original || incomplete {
+        // The Python bridge replaces the package in place and leaves uv's
+        // receipt and public symlink intact even if uninstall was interrupted.
+        let interrupted_in_place = record
+            .original_record
+            .as_deref()
+            .is_some_and(release::valid_digest)
+            && registered_launcher(&self.prefix).as_deref() == Some(self.launcher())
+            && self.python().is_ok_and(|python| python == record.python)
+            && provenance::dist_info(&self.prefix).is_none()
+            && self
+                .prefix
+                .join("bin/sai")
+                .symlink_metadata()
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound);
+        if original || incomplete || interrupted_in_place {
             return Ok(());
         }
         let file = provenance::file_origin(&self.prefix);

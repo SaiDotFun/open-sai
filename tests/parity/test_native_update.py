@@ -1066,6 +1066,53 @@ def interrupted_uv_install(install: NativeInstall, initial: Path) -> Path:
 
 
 @pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
+def test_uv_recovers_an_interrupted_in_place_bridge_install(
+    standalone: NativeInstall, tmp_path: Path
+) -> None:
+    install, initial = uv_install(standalone, tmp_path)
+    prefix = Path(install.env["FIXTURE_STABLE_UV_PREFIX"])
+    pending = interrupted_uv_install(install, initial)
+    record = json.loads(pending.read_text(encoding="utf-8"))
+    (installed_record,) = prefix.glob(
+        "lib/python*/site-packages/sai_cli-*.dist-info/RECORD"
+    )
+    record["original_record"] = hashlib.sha256(
+        installed_record.read_bytes()
+    ).hexdigest()
+    pending.write_text(json.dumps(record), encoding="utf-8")
+    receipt = prefix / "uv-receipt.toml"
+    receipt_bytes = receipt.read_bytes()
+    link = install.launcher.readlink()
+    removed = subprocess.run(
+        [
+            install.launcher.with_name("uv"),
+            "pip",
+            "uninstall",
+            "--python",
+            prefix / "bin/python",
+            "sai-cli",
+        ],
+        env=install.env,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    assert removed.returncode == 0, removed.stderr
+    assert receipt.read_bytes() == receipt_bytes
+    assert install.launcher.readlink() == link
+    assert not install.launcher.exists()
+    assert not installed_record.exists()
+
+    recovered = install.invoke("--json", "update", "--recover", exe=install.executable)
+    assert recovered.returncode == 0, recovered.stdout + recovered.stderr
+    assert json.loads(recovered.stdout)["status"] == "recovered"
+    assert install.launcher.readlink() == link
+    assert not pending.exists()
+    assert install.invoke("--version").stdout.strip() == f"sai {install.installed}"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="parity uv resolver requires ELF")
 @pytest.mark.parametrize("environment_missing", [False, True])
 def test_uv_recovery_entry_point_does_not_need_a_shim_prefix(
     standalone: NativeInstall, tmp_path: Path, environment_missing: bool
