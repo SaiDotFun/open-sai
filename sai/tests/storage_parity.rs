@@ -421,6 +421,7 @@ Path(os.environ["SAI_HOME"], "clipboard-tools", "contents").write_bytes(
 }
 
 #[test]
+#[ignore = "requires uv and a Python reference checkout"]
 fn rust_saved_session_round_trips_in_python() {
     let home = tempdir().unwrap();
     Storage::new(home.path())

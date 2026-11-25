@@ -55,9 +55,14 @@ def test_ci_checks_shared_storage_with_both_releases() -> None:
         )
         assert f"/{checkout}\n" in step
         assert "cargo test --locked -p sai --test storage_parity" in step
+        assert "--include-ignored" in step
         assert "rust_saved_session_round_trips_in_python" in step
         assert "rust_reads_and_migrates_python_v2_session" in step
         assert "python_and_rust_share_ledger_reservations_and_rows" in step
     tests = (root / "sai/tests/storage_parity.rs").read_text()
     attributes = tests.split("fn rust_saved_session_round_trips_in_python", 1)[0]
-    assert attributes.endswith("#[test]\n")
+    assert attributes.endswith(
+        '#[test]\n#[ignore = "requires uv and a Python reference checkout"]\n'
+    )
+    rust = workflow.split("\n  rust:\n", 1)[1]
+    assert rust.index("cargo test --locked --workspace") < rust.index("setup-uv@")

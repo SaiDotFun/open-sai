@@ -147,6 +147,8 @@ jobs:
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+      - run: cargo test --locked --workspace
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
       # Use the published Python reference on both PR and push runs.
       - name: Check out the Python parity reference
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
@@ -280,10 +282,6 @@ jobs:
           printf 'C8 Python reference '
           git -C .parity-mcp-python rev-parse HEAD
           uv run --locked python tests/parity/parity.py --case 'mcp-*-*'
-      - run: cargo test --locked --workspace
-        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
-        env:
-          SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-python
       - name: Compare C3 shared storage against Python v0.1.2
         if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false') }}
         env:
