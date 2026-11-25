@@ -125,10 +125,13 @@ it. Section fields are `balances`, `positions`, `pendingOrders`,
 - **Session.** The overview shows the expiry of a stored session for the
   selected account and warns in its last three days.
 
-Each section's `fetchedAt` records when the client read it, in UTC. Source
-timestamps and `sourceAgeSeconds` describe the data at fetch time. A
-position's indexed trade record, contract threshold, and oracle mark carry
-separate source times. Oracle metadata shows the publish block separately
+Each loaded section's `sourceAt` and `fetchedAt` record when the client read
+it, in UTC. A skipped section carries `status: "skipped"` and explains why
+in `skipReason`. Row-level timestamps and `sourceAgeSeconds` describe the
+data at fetch time. If a balance's block time is unavailable, its `sourceAt`
+records the read time, `sourceAtBasis` is `"fetchedAt"`, and `sourceAgeSeconds`
+is null. A position's indexed trade record, contract threshold, and oracle
+mark carry separate source times. Oracle metadata shows the publish block separately
 from the LCD read block. The estimate from Keeper has an unknown source time.
 The LCD supplies missing block times after its chain matches Keeper's. A
 custom Keeper requires an explicit LCD for that chain. An independently

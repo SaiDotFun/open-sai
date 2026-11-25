@@ -40,6 +40,50 @@ HISTORY_SESSION_TOKEN = "e7" * 32
 CONTRACT = "nibi1syntheticfixture"
 TRADE_REQUEST_HASH = "AB" * 32
 NODE_INFO = "/cosmos/base/tendermint/v1beta1/node_info"
+HEIGHT_HEADER = "x-cosmos-block-height"
+POSITION_HEIGHT = "120"
+POSITION_SCENARIOS = {
+    "position-default",
+    "position-precision",
+    "position-after-hours",
+    "position-index-lag",
+    "position-wrong-chain",
+    "position-foreign-trader",
+    "position-foreign-contract-owner",
+    "position-equivalent-owner",
+    "position-wrong-index",
+    "position-wrong-contract-index",
+    "position-chain-changed",
+    "position-contract-changed",
+    "position-scientific-reduction",
+    "position-no-oracle",
+    "position-wrong-height",
+    "partial-preview-changed",
+    "margin-accepted",
+    "margin-interrupted",
+    "margin-rejected",
+    "margin-unknown",
+    "partial-accepted",
+    "partial-interrupted",
+    "partial-unknown",
+}
+MARGIN_INTENT = {
+    "kind": "UPDATE_TRADE",
+    "target": {"userTradeId": "7"},
+    "body": {
+        "takeProfit": {"operation": "keep"},
+        "stopLoss": {"operation": "keep"},
+        "requestedLeverage": "1.818181818181818182",
+    },
+}
+PARTIAL_INTENT = {
+    "kind": "DECREASE_POSITION_SIZE",
+    "target": {"userTradeId": "7"},
+    "body": {
+        "collateral": {"amountUsdc": "5000000", "amountUsd": "5"},
+        "leverageDelta": "0",
+    },
+}
 RELEASES = "/repos/SaiDotFun/open-sai/releases"
 CONFIG = """# Keep this comment when editing
 [update]
@@ -188,6 +232,21 @@ def seed_home(home: Path, endpoints: Endpoints, seed: str) -> None:
         (sai_home / "trader").chmod(0o700)
         for name in ("config.toml", "trader/sessions.json"):
             (sai_home / name).chmod(0o600)
+        return
+    if seed == "update-state":
+        path = sai_home / "update.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "latest": "sai-cli/v0.88.0",
+                    "result": {"status": "failed", "to": "0.88.0", "rolledBack": True},
+                    "notified": "failed:0.88.0",
+                }
+            ),
+            encoding="utf-8",
+        )
+        path.chmod(0o600)
         return
     if seed in {"config", "config-logs-disabled", "invalid-expiry"}:
         path = sai_home / "config.toml"
@@ -371,6 +430,16 @@ def loopback(
     )
     markets = fixture("mainnet_markets_http.json")
     prices = fixture("mainnet_prices_http.json")
+    if scenario == "read-price-epoch-spellings":
+        rows = prices["data"]["oracle"]["tokenPricesUsd"]
+        stamps = (
+            "1970-01-01t00:00:00z",
+            "1970-01-01 01:00:00.0000000000+01:00",
+            "1969-12-31T23:00:00−01:00",
+            "1970-01-01t00:00:00.0000000001z",
+        )
+        for row, stamp in zip(rows[: len(stamps)], stamps, strict=True):
+            row["lastUpdatedBlock"]["block_ts"] = stamp
     position = PROTOCOL["account_positions_response"]["data"]["perp"]["trades"][0]
     borrowing = position["perpBorrowing"]
     recorded_markets = markets["data"]["perp"]["borrowings"]
@@ -381,10 +450,22 @@ def loopback(
         market["price"] = None
     recorded_markets.append(market)
     collateral = market["collateralToken"]
-    trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
-    if close_target == "keeper-owner" or scenario == "quote-foreign-keeper-owner":
-        trade["trader"] = OTHER_ADDRESS
-    if close_target == "keeper-index" or scenario == "quote-wrong-position-index":
+    trader = {
+        "position-foreign-trader": OTHER_ADDRESS,
+        "position-equivalent-owner": ADDRESS.upper(),
+        "quote-foreign-keeper-owner": OTHER_ADDRESS,
+    }.get(scenario, position["trader"])
+    if close_target == "keeper-owner":
+        trader = OTHER_ADDRESS
+    trade = {
+        **position,
+        "trader": trader,
+        "perpBorrowing": {**borrowing, "collateralToken": collateral},
+    }
+    if close_target == "keeper-index" or scenario in {
+        "position-wrong-index",
+        "quote-wrong-position-index",
+    }:
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
     if scenario in {"mcp-reads", "mcp-wait-final"}:
@@ -402,10 +483,20 @@ def loopback(
         "trade": {"id": 7, "trader": ADDRESS},
     }
     chains = {"unknown-chain": None, "empty-chain": ""}
-    chain = chains.get(cancel_target, "cataclysm-1")
+    chain = (
+        "fixture-chain-2"
+        if scenario == "position-chain-changed"
+        else chains.get(cancel_target, "cataclysm-1")
+    )
+    contract = (
+        "nibi1replacementfixture"
+        if scenario == "position-contract-changed"
+        else ""
+        if cancel_target == "missing-contract"
+        else CONTRACT
+    )
     network = "different-chain" if cancel_target == "missing-contract" else chain
     enabled = 1 if cancel_target == "non-boolean-route" else True
-    contract = "" if cancel_target == "missing-contract" else CONTRACT
     responses = {
         "oneClickTrading": {
             "data": {
@@ -529,7 +620,7 @@ def loopback(
                 or close_target == "contract-owner"
                 else ADDRESS
                 if cancel_target is not None or pending_order
-                else position["trader"]
+                else trader
             ),
             "user_trade_index": (
                 "UserTradeIndex(8)"
@@ -571,6 +662,35 @@ def loopback(
             "trigger_order_fee_p": "0",
         },
     }
+    if scenario == "partial-preview":
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["market_order_config"]["fill_at_next_oracle_price"] = True
+    if scenario in {"position-precision", "position-after-hours"}:
+        trade.update(collateralAmount=10000003, leverage=2.1234567890123457)
+        contracts["get_trade_raw"].update(
+            collateral_amount="10000003", leverage="2.123456789012345678"
+        )
+        contracts["get_collateral_price"] = "0.987654321098765432"
+    if scenario == "position-index-lag":
+        contracts["get_trade_raw"]["collateral_amount"] = "10000001"
+    if scenario in POSITION_SCENARIOS:
+        contracts["get_trade_raw"].pop("long", None)
+    if scenario in {"position-foreign-contract-owner", "quote-foreign-contract-owner"}:
+        contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
+    if scenario == "position-wrong-contract-index":
+        contracts["get_trade_raw"]["user_trade_index"] = "UserTradeIndex(8)"
+    if scenario == "position-equivalent-owner":
+        contracts["get_trade_raw"]["user"] = position["trader"]
+    if scenario == "position-scientific-reduction":
+        trade["collateralAmount"] = 10**29
+        contracts["get_trade_raw"]["collateral_amount"] = str(10**29)
+    if scenario == "position-after-hours":
+        contracts.update(
+            is_after_hours_market=True,
+            get_market={"block_last_opened": 110, "block_last_closed": 100},
+            get_trade_infos=[{"created_block": 90}],
+            get_after_hours_leverage="1.234567890123456789",
+        )
     if scenario == "quote-close-only":
         contracts["get_market"]["market_trading_state"] = "close_only"
     if scenario == "quote-pair-cap":
@@ -592,8 +712,6 @@ def loopback(
         contracts["get_market"].update(block_last_opened=50, block_last_closed=100)
     if scenario == "quote-close-fee-cap":
         contracts["get_fees"]["close_fee_p"] = "2"
-    if scenario == "quote-foreign-contract-owner":
-        contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
     contract_args = {
         "get_trade_raw": {
             "trader": (
@@ -601,18 +719,24 @@ def loopback(
                 if scenario in {"pending-order", "concurrent-close"}
                 or cancel_target is not None
                 or close_target is not None
-                else position["trader"]
+                else trader
             ),
             "index": 7,
         },
         "get_exchange_balance": {
-            "user": position["trader"],
+            "user": trader,
             "collateral_index": token_index,
         },
         "is_after_hours_market": {"market_index": market_index},
         "market_order_config": {},
         "get_collateral_price": {"collateral_index": token_index},
         "get_market": {"index": market_index},
+        "get_trade_infos": {
+            "trader": trader,
+            "start_idx": 7,
+            "scan_limit": 1,
+        },
+        "get_after_hours_leverage": {},
         "get_group": {"index": "GroupIndex(0)"},
         "get_pair_custom_max_leverage": {"index": borrowing["marketId"]},
         "get_perp_prices": {
@@ -635,8 +759,19 @@ def loopback(
             },
         },
         "get_fees": {"index": "FeeIndex(0)"},
-        "get_after_hours_leverage": {},
     }
+    close_admission = PROTOCOL["close_admission_request"]
+    expected_intent = {
+        "concurrent-close": close_admission["intent"],
+        "margin-accepted": MARGIN_INTENT,
+        "margin-interrupted": MARGIN_INTENT,
+        "margin-rejected": MARGIN_INTENT,
+        "margin-unknown": MARGIN_INTENT,
+        "position-equivalent-owner": MARGIN_INTENT,
+        "partial-accepted": PARTIAL_INTENT,
+        "partial-interrupted": PARTIAL_INTENT,
+        "partial-unknown": PARTIAL_INTENT,
+    }.get(scenario)
 
     class Handler(BaseHTTPRequestHandler):
         def reply(
@@ -645,23 +780,29 @@ def loopback(
             status_code: int = 200,
             *,
             lcd: bool = False,
-            height: int = 120,
+            height: str | int | None = None,
             duplicate_height: int | None = None,
+            next_page: bool = False,
         ) -> None:
             body = value if isinstance(value, bytes) else json.dumps(value).encode()
             self.send_response(status_code)
             self.send_header("Content-Type", "application/json")
             if lcd:
                 if scenario == "quote-height-mismatch" and self.headers.get(
-                    "x-cosmos-block-height"
+                    HEIGHT_HEADER
                 ):
                     height = 121
-                self.send_header("grpc-metadata-x-cosmos-block-height", str(height))
+                elif height is None:
+                    height = 120
+            if height is not None:
+                self.send_header(f"grpc-metadata-{HEIGHT_HEADER}", str(height))
             if duplicate_height is not None:
                 self.send_header(
-                    "grpc-metadata-x-cosmos-block-height", str(duplicate_height)
+                    f"grpc-metadata-{HEIGHT_HEADER}", str(duplicate_height)
                 )
             self.send_header("Content-Length", str(len(body)))
+            if next_page:
+                self.send_header("Link", '<ignored>; rel="next"')
             self.end_headers()
             self.wfile.write(body)
 
@@ -672,17 +813,20 @@ def loopback(
         def do_CONNECT(self) -> None:
             self.reject("Unexpected external HTTP connection")
 
-        def admit_close(self, variables: Any) -> None:
+        def admit(self, variables: Any, intent: dict[str, Any]) -> None:
             envelope = variables["input"]
             key = envelope["intentKey"]
             intent_stamp = envelope["intent"]["tsIntentInit"]
             lifecycle_stamp = envelope["lifecycle"]["tsLifecycleStep"]
-            expected = PROTOCOL["close_admission_request"]
             expected = {
                 "intentKey": key,
-                "intent": {**expected["intent"], "tsIntentInit": intent_stamp},
+                "intent": {
+                    "intentSchemaVersion": "v0",
+                    **intent,
+                    "tsIntentInit": intent_stamp,
+                },
                 "lifecycle": {
-                    **expected["lifecycle"],
+                    **close_admission["lifecycle"],
                     "tsLifecycleStep": lifecycle_stamp,
                 },
             }
@@ -701,11 +845,46 @@ def loopback(
                 return
             admission.key = key
             admission.arrived.set()
-            if not admission.release.wait(15):
-                self.reject("Synthetic admission gate timed out")
+            if scenario in {
+                "concurrent-close",
+                "margin-interrupted",
+                "partial-interrupted",
+            }:
+                if not admission.release.wait(15):
+                    self.reject("Synthetic admission gate timed out")
+                    return
+                if scenario.endswith("-interrupted"):
+                    self.close_connection = True
+                    return
+            if scenario == "margin-rejected":
+                self.reply(
+                    {
+                        "errors": [
+                            {
+                                "message": "fixture rejected",
+                                "extensions": {"code": "INTENT_NOT_ACCEPTED"},
+                            }
+                        ]
+                    }
+                )
                 return
             ack = PROTOCOL["admission_ack"]["data"]["recordUserIntent"]
-            self.reply({"data": {"recordUserIntent": {**ack, "intentKey": key}}})
+            self.reply(
+                {
+                    "data": {
+                        "recordUserIntent": {
+                            **ack,
+                            "intentKey": "wrong-fixture-key"
+                            if scenario.endswith("-unknown")
+                            else key,
+                            "kind": intent["kind"],
+                            "txHash": "A" * 64
+                            if scenario.endswith("-accepted")
+                            else None,
+                        }
+                    }
+                }
+            )
 
         def admit_trade(self, variables: Any) -> None:
             session = PROTOCOL["session_response"]["data"]["createUserIntentSession"]
@@ -783,8 +962,8 @@ def loopback(
                             with suppress(BrokenPipeError, ConnectionResetError):
                                 self.reply(reply)
                     return
-                if name == "recordUserIntent" and scenario == "concurrent-close":
-                    self.admit_close(request.variables)
+                if name == "recordUserIntent" and expected_intent is not None:
+                    self.admit(request.variables, expected_intent)
                     return
                 if (
                     scenario == "confirmation-account-change"
@@ -861,6 +1040,19 @@ def loopback(
                         interrupt_closed.wait(8)
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif name == "trade" and scenario == "partial-preview-changed":
+                        self.reply(
+                            {
+                                "data": {
+                                    "perp": {
+                                        "trade": {
+                                            **trade,
+                                            "leverage": self.position_leverage(),
+                                        }
+                                    }
+                                }
+                            }
+                        )
                     elif scenario == "keeper-echo-error":
                         self.reply(
                             {
@@ -936,6 +1128,56 @@ def loopback(
                 pass
             self.reject("Unsupported Keeper request")
 
+        def do_HEAD(self) -> None:
+            if (
+                urlsplit(self.path).path
+                != f"{scope}/SaiDotFun/open-sai/releases/latest"
+            ):
+                self.reject("Unsupported release redirect request")
+                return
+            wire.append(WireRequest("release-redirect"))
+            path = f"{scope}/SaiDotFun/open-sai/releases"
+            if scenario == "update-rate-limit-tag":
+                path += "/tag/sai-cli/v0.99.0"
+            self.send_response(302)
+            self.send_header("Location", path)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def releases(self) -> None:
+            query = parse_qs(urlsplit(self.path).query)
+            if (
+                query == {"per_page": ["100"], "page": ["2"]}
+                and scenario == "update-pages"
+            ):
+                wire.append(WireRequest("releases-page-2"))
+                self.reply([{"tag_name": "sai-cli/v0.99.0"}])
+                return
+            if query != {"per_page": ["100"], "page": ["1"]}:
+                self.reject("Unexpected release-list page")
+                return
+            wire.append(WireRequest("releases"))
+            if scenario.startswith("update-rate-limit-"):
+                self.reply({}, 429)
+            elif scenario == "update-bad-json":
+                self.reply({"not": "a list"})
+            elif scenario == "update-no-release":
+                self.reply([{"tag_name": "docs/v99.0.0"}])
+            elif scenario == "update-pages":
+                self.reply(
+                    [
+                        {"tag_name": "sai-cli/v0.9.0"},
+                        {"tag_name": "sai-cli/v9.0.0", "draft": True},
+                        {"tag_name": "sai-cli/v8.0.0", "prerelease": True},
+                        {"tag_name": "sai-cli/v7.0.0-rc.1"},
+                        {"tag_name": "sai-cli/v06.0.0"},
+                        {"tag_name": "other/v100.0.0"},
+                    ],
+                    next_page=True,
+                )
+            else:
+                self.reply([{"tag_name": "sai-cli/v0.99.0"}])
+
         def drip_lcd(self) -> None:
             started = time.monotonic()
             try:
@@ -1000,7 +1242,7 @@ def loopback(
                         self.reply(
                             response,
                             lcd=height is not None,
-                            height=height or 0,
+                            height=height,
                             duplicate_height=duplicate_height,
                         )
                         return
@@ -1019,6 +1261,11 @@ def loopback(
                         return
                 if path == NODE_INFO:
                     wire.append(WireRequest("node_info"))
+                    if scenario == "position-wrong-chain":
+                        self.reply(
+                            {"default_node_info": {"network": "wrong-fixture-chain"}}
+                        )
+                        return
                     self.reply(
                         {
                             "default_node_info": {}
@@ -1045,25 +1292,23 @@ def loopback(
                     )
                     return
                 if path == RELEASES:
-                    wire.append(WireRequest("releases"))
-                    self.reply(
-                        [
-                            {
-                                "tag_name": "sai-cli/v0.99.0",
-                                "draft": False,
-                                "prerelease": False,
-                            }
-                        ]
-                    )
+                    self.releases()
                     return
-                prefix = f"/cosmwasm/wasm/v1/contract/{CONTRACT}/smart/"
+                prefix = f"/cosmwasm/wasm/v1/contract/{contract}/smart/"
                 if path.startswith(prefix):
                     try:
                         query = json.loads(
                             base64.b64decode(unquote(path.removeprefix(prefix)))
                         )
                         [name] = query
-                        expected = [{name: contract_args[name]}]
+                        expected = contract_args[name]
+                        if (
+                            scenario == "position-equivalent-owner"
+                            and name == "get_trade_raw"
+                            and "_sai_query" in parse_qs(request_url.query)
+                        ):
+                            expected = {**expected, "trader": position["trader"]}
+                        allowed = [{name: expected}]
                         # Ownership uses the account address. The next read
                         # uses Perp's stored owner to pin the quote.
                         owner_read = (
@@ -1073,12 +1318,12 @@ def loopback(
                         )
                         if name == "get_trade_raw":
                             if scenario == "concurrent-close":
-                                expected.append(
+                                allowed.append(
                                     {name: {"trader": position["trader"], "index": 7}}
                                 )
                             if trade_replay is not None or owner_read:
-                                expected.append({name: {"trader": ADDRESS, "index": 7}})
-                        if not any(same_variables(query, args) for args in expected):
+                                allowed.append({name: {"trader": ADDRESS, "index": 7}})
+                        if not any(same_variables(query, args) for args in allowed):
                             self.reject(f"Wrong LCD variables for {name}")
                             return
                         if scenario.startswith("quote-"):
@@ -1103,6 +1348,9 @@ def loopback(
                                 self.reject(f"Expected a fresh {name} query")
                                 return
                         wire.append(WireRequest(name, variables=query))
+                        if scenario in POSITION_SCENARIOS:
+                            self.position_query(name, request_url.query)
+                            return
                         if (
                             name == "get_pair_custom_max_leverage"
                             and scenario == "quote-absent-cap"
@@ -1153,6 +1401,41 @@ def loopback(
 
         def log_message(self, format: str, *args: object) -> None:
             pass
+
+        def position_leverage(self) -> float:
+            return 3.0 if sum(request.label == "trade" for request in wire) > 1 else 2.0
+
+        def position_query(self, name: str, query: str) -> None:
+            latest = max(i for i, item in enumerate(wire) if item.label == "trade")
+            snapshot = [item.label for item in wire[latest + 1 :]]
+            final_position = snapshot.count("get_trade_raw") >= 2
+            pinned = final_position and name != "get_trade_raw"
+            fresh = pinned or final_position or name == "get_collateral_price"
+            height = self.headers.get(HEIGHT_HEADER)
+            if height != (POSITION_HEIGHT if pinned else None):
+                self.reject(f"Wrong LCD height for {name}")
+                return
+            if ("_sai_query" in parse_qs(query)) != fresh:
+                self.reject(f"Wrong LCD cache-busting query for {name}")
+                return
+            if scenario == "position-no-oracle" and name == "get_collateral_price":
+                self.reply({}, 503)
+                return
+            data = contracts[name]
+            if (
+                scenario == "position-equivalent-owner"
+                and name == "get_trade_raw"
+                and final_position
+            ):
+                data = {**data, "user": ADDRESS}
+            if scenario == "partial-preview-changed" and name == "get_trade_raw":
+                data = {**data, "leverage": str(self.position_leverage())}
+            served = (
+                "121"
+                if scenario == "position-wrong-height" and pinned
+                else POSITION_HEIGHT
+            )
+            self.reply({"data": data}, height=served)
 
     redirect_path = f"{scope}/subscriptions?moved=1"
 

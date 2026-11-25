@@ -127,6 +127,48 @@ for the existing uv-owned launcher. Fresh native installs use a standalone
 launcher. The installer checks ownership and reports PATH shadowing.
 Windows stays on Python until native support passes.
 
+The native updater uses the C10 archive name `sai-<version>-<target>.tar.gz`
+and verifies it against `SHA256SUMS`. A standalone launcher is a symlink
+named `sai` beside a private `.sai-native` directory. Its target is
+`.sai-native/current`, which selects `<version>-<archive-sha256>/sai`
+inside the private directory. The updater holds `.sai-update.lock`
+beside the launcher and changes only the private selector during
+updates and ordinary rollback. Earlier launchers that link directly to
+a versioned binary need their original installer for updates.
+
+For uv installs, the shim passes its own `sys.prefix` as
+`SAI_NATIVE_UV_PREFIX` when it execs the cached binary. Rust checks that
+prefix's uv receipt, the registered launcher, and the current uv tool
+directories before asking uv to install a verified wheel. A pinned
+`uvx` environment has no matching tool receipt, so its version stays pinned.
+
+If an interrupted update leaves the uv launcher missing, run
+`sai update --recover` from the same profile using a trusted native Sai
+binary. If `sai` is unavailable on PATH, use the absolute path to the
+retained binary in the profile's verified shim cache:
+
+```sh
+"/absolute/path/to/profile/bin/shim/<version>/<target>/<archive-sha256>/sai" update --recover
+```
+
+Use the original profile. Set `SAI_HOME` to its absolute path if you
+change directories. Use the uv settings that selected the interrupted install. For relative uv directories, start from the original
+working directory or give `UV_TOOL_DIR` and `UV_TOOL_BIN_DIR` their absolute
+paths. If the launcher directory itself was removed, recreate it at its
+original path and retry. Recovery uses the pending record in `uv tool dir`
+and its cached rollback wheel. If the pending record or wheel is missing,
+reinstall a known good, verified wheel through uv using those same directories:
+
+```sh
+uv tool install --offline --force "/absolute/path/to/sai_cli-<version>-py3-none-any.whl"
+```
+
+C9c compares `sai update --check` with Python commit
+`ea09f0d417a53a71079bb8c5e426005fa29051a4`. Run the `update-*` cases in
+the parity driver and `tests/parity/test_native_update.py` with `SAI_PARITY_BIN`
+pointing to the Rust build. The native install tests serve fixture
+archives and wheels on loopback and run real uv tools in temporary homes.
+
 Updates and `sai doctor` keep valid MCP registrations and repair only
 recognized stale Sai entries after the launcher passes its health checks.
 [MCP registration repair #46](https://github.com/SaiDotFun/open-sai/issues/46).

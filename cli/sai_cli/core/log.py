@@ -852,6 +852,29 @@ class LogDir:
                 raise stale_snapshot()
         return fd
 
+    @contextmanager
+    def scan_file(
+        self, name: str, extent: FileExtent | None
+    ) -> Generator[tuple[int, int]]:
+        fd = self.read_fd(name, extent)
+        try:
+            size = extent.size if extent is not None else os.fstat(fd).st_size
+            try:
+                yield fd, size
+            finally:
+                info = os.fstat(fd)
+                named = self.file_info(name)
+                if (
+                    named is None
+                    or (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino)
+                    or named.st_size < info.st_size
+                    or info.st_size < size
+                    or (extent is not None and not extent.matches(named))
+                ):
+                    raise stale_snapshot(intent=extent is not None)
+        finally:
+            os.close(fd)
+
     def modified(self, name: str) -> float | None:
         target, extra = self._target(name)
         try:
@@ -1440,8 +1463,11 @@ class ScanBudget:
     rows_left: int = MAX_SCAN_ROWS
     files_left: int = MAX_SCAN_FILES
 
-    def read(self, fd: int, size: int) -> bytes:
-        data = os.read(fd, min(size, self.bytes_left))
+    def read(self, fd: int, size: int, *, intent: bool) -> bytes:
+        size = min(size, self.bytes_left)
+        data = os.read(fd, size)
+        if len(data) != size:
+            raise stale_snapshot(intent=intent)
         self.bytes_left -= len(data)
         return data
 
@@ -1487,9 +1513,11 @@ class FileExtent:
 FileSnapshot = dict[tuple[date, int], FileExtent]
 
 
-def stale_snapshot() -> SaiError:
+def stale_snapshot(*, intent: bool = True) -> SaiError:
     return SaiError(
-        "Retained log files changed. Start a new intent log query.",
+        "Retained log files changed. Start a new intent log query."
+        if intent
+        else "Retained log files changed. Start a new log query.",
         Code.INVALID_REQUEST,
         exit_code=ExitCode.USAGE,
     )
@@ -1548,6 +1576,8 @@ def read_rows_at(
     positions: list[RowPosition],
     snapshot: FileSnapshot,
     budget: ScanBudget,
+    *,
+    until: Callable[[dict[str, Any]], bool] | None = None,
 ) -> tuple[list[tuple[RowPosition, dict[str, Any]]], bool]:
     """Read the individual lines that supplied attribution on earlier pages."""
     rows: list[tuple[RowPosition, dict[str, Any]]] = []
@@ -1567,30 +1597,34 @@ def read_rows_at(
                 return rows, True
             budget.files_left -= 1
             try:
-                fd = opened.read_fd(file_name(SURFACES[slot], day), extent)
+                with opened.scan_file(file_name(SURFACES[slot], day), extent) as (
+                    fd,
+                    size,
+                ):
+                    for position in group:
+                        if position.offset + position.size > size:
+                            continue
+                        if position.size > budget.bytes_left or budget.rows_left == 0:
+                            return rows, True
+                        os.lseek(fd, position.offset, os.SEEK_SET)
+                        raw = budget.read(fd, position.size, intent=True)
+                        budget.rows_left -= 1
+                        if not raw.endswith(b"\n"):
+                            continue
+                        try:
+                            line = decode_row(raw)
+                        except (ValueError, RecursionError):
+                            continue
+                        if isinstance(line, dict):
+                            rows.append((position, line))
+                            if until is not None and until(line):
+                                return rows, False
             except OSError:
-                continue
-            try:
-                for position in group:
-                    if position.offset + position.size > extent.size:
-                        continue
-                    if position.size > budget.bytes_left or budget.rows_left == 0:
-                        return rows, True
-                    os.lseek(fd, position.offset, os.SEEK_SET)
-                    raw = budget.read(fd, position.size)
-                    budget.rows_left -= 1
-                    if len(raw) != position.size or not raw.endswith(b"\n"):
-                        continue
-                    try:
-                        line = decode_row(raw)
-                    except (ValueError, RecursionError):
-                        continue
-                    if isinstance(line, dict):
-                        rows.append((position, line))
-            except OSError:
-                continue
-            finally:
-                os.close(fd)
+                raise SaiError(
+                    "Could not read saved intent log evidence. "
+                    "Retry this page or start a new intent log query.",
+                    Code.INCOMPLETE_DATA,
+                ) from None
     return rows, False
 
 
@@ -1629,13 +1663,13 @@ def read_prefix(
             budget.files_left -= 1
             try:
                 extent = snapshot[day, slot] if snapshot is not None else None
-                fd = opened.read_fd(name, extent)
-                try:
-                    size = extent.size if extent is not None else os.fstat(fd).st_size
-                    data = budget.read(fd, min(size, max_bytes // len(files)))
+                with opened.scan_file(name, extent) as (fd, size):
+                    data = budget.read(
+                        fd,
+                        min(size, max_bytes // len(files)),
+                        intent=extent is not None,
+                    )
                     truncated |= len(data) < size
-                finally:
-                    os.close(fd)
             except OSError:
                 truncated = True
                 continue
@@ -1697,7 +1731,7 @@ class PageScan:
             if size > read_budget.bytes_left - reserved.bytes_left:
                 self.truncated = byte_limit = True
                 return b""
-            return read_budget.read(fd, size)
+            return read_budget.read(fd, size, intent=snapshot is not None)
 
         def decode_block(
             day: date,
@@ -1802,12 +1836,8 @@ class PageScan:
                             extent = (
                                 snapshot[day, slot] if snapshot is not None else None
                             )
-                            fd = opened.read_fd(name, extent)
-                            active.callback(os.close, fd)
-                            end = (
-                                extent.size
-                                if extent is not None
-                                else os.fstat(fd).st_size
+                            fd, end = active.enter_context(
+                                opened.scan_file(name, extent)
                             )
                             if (
                                 start is not None

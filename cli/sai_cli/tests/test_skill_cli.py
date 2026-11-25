@@ -106,6 +106,16 @@ def test_show_page(name, path):
     assert result.stdout_bytes == (REPO_SKILL / path).read_bytes()
 
 
+def test_cli_skill_documents_nullable_market_price_timestamp():
+    result = invoke("skill", "show", "--page", "cli")
+    assert result.exit_code == 0, result.output
+    page = " ".join(result.stdout.split())
+    assert "MCP tool `market_prices`" in page
+    assert "`lastUpdatedBlock.block_ts` field is `string | null`" in page
+    assert "A `null` timestamp means the block time is unknown" in page
+    assert "`lastUpdatedBlock.block` field still reports the height" in page
+
+
 def test_show_unknown_page_lists_pages():
     result = invoke("skill", "show", "--page", "nope")
     assert result.exit_code == 1

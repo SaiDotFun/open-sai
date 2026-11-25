@@ -8,10 +8,7 @@ mod queries;
 pub mod stream;
 mod transport;
 
-use std::{
-    sync::LazyLock,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use bech32::{Bech32, primitives::decode::CheckedHrpstring};
 use serde_json::{Map, Value, json};
@@ -24,9 +21,10 @@ use crate::{
 
 pub use diagnostics::{lcd_network, websocket_handshake};
 pub(crate) use public::{
-    intent_history, intent_log_fields, intent_record, request_hash, wait_error_code,
+    intent_history, intent_log_fields, intent_record, known_intent_field, log_intent_record,
+    request_hash, wait_error_code,
 };
-pub use public::{public_account_history, public_intent_status};
+pub use public::{normalize_market_price_timestamps, public_account_history, public_intent_status};
 pub use queries::*;
 pub(crate) use transport::get as lcd_get;
 
@@ -47,8 +45,7 @@ enum RequestMode {
 #[derive(Default)]
 struct ResponseLog {
     http_status: Option<u16>,
-    errors: Option<Field>,
-    error_count: Option<usize>,
+    errors: Option<(Value, Value)>,
 }
 
 type RequestOutcome<'a> = (&'static str, Level, Option<Code>, Option<&'a str>);
@@ -69,6 +66,7 @@ struct RequestEvent<'a> {
 impl RequestEvent<'_> {
     fn emit(&self, (status, level, code, error): RequestOutcome<'_>, response: ResponseLog) {
         let duration = (self.started.elapsed().as_secs_f64() * 1_000.0).round_ties_even() as u64;
+        let (errors, count) = response.errors.unwrap_or_default();
         self.events.event(
             "keeper.request",
             level,
@@ -84,11 +82,8 @@ impl RequestEvent<'_> {
                 ("code", json!(code).into()),
                 ("error", json!(error).into()),
                 ("httpStatus", json!(response.http_status).into()),
-                (
-                    "keeperErrors",
-                    response.errors.unwrap_or(Field::Scalar(Value::Null)),
-                ),
-                ("keeperErrorCount", json!(response.error_count).into()),
+                ("keeperErrors", errors.into()),
+                ("keeperErrorCount", count.into()),
             ],
         );
     }
@@ -185,13 +180,14 @@ impl<'a> Keeper<'a> {
             .into_iter()
             .filter_map(|key| variables.get(key).and_then(Value::as_str))
             .find(|value| is_evm_address(value));
-        static INTENT_KEY: LazyLock<regex::Regex> = LazyLock::new(|| {
-            regex::Regex::new(r"\A[A-Za-z0-9_-]{1,128}\z").expect("Keeper log key pattern")
-        });
-        let intent_key = matches!(query, INTENTS | WAIT_INTENTS)
-            .then(|| variables.get("key").and_then(Value::as_str))
-            .flatten()
-            .filter(|key| INTENT_KEY.is_match(key));
+        let intent_key = if matches!(query, INTENTS | WAIT_INTENTS) {
+            variables
+                .get("key")
+                .and_then(Value::as_str)
+                .filter(|key| log::valid_identifier(key))
+        } else {
+            None
+        };
         let mut event = RequestEvent {
             endpoint: self.endpoint,
             events: self.events,
@@ -262,12 +258,7 @@ impl<'a> Keeper<'a> {
             return Err(keeper_error("Keeper returned an invalid response"));
         };
         if let Some(errors) = result.get("errors").filter(|value| truthy(value)) {
-            log.error_count = Some(errors.as_array().map_or(1, Vec::len));
-            log.errors = if matches!(query, WAIT_INTENTS | INTENT_HISTORY) {
-                Some(wait_graphql_errors(errors))
-            } else {
-                Some(graphql_errors(errors))
-            };
+            log.errors = Some(graphql_error_fields(errors, false, None));
             if query == SUBMIT
                 && !result.get("data").is_some_and(truthy)
                 && errors.as_array().is_some_and(|items| {
@@ -360,59 +351,14 @@ fn not_sent() -> SaiError {
     )
 }
 
-const GRAPHQL_ERROR_CODES: &[&str] = &[
-    "GRAPHQL_PARSE_FAILED",
-    "GRAPHQL_VALIDATION_FAILED",
-    "INTENT_NOT_ACCEPTED",
-    "BAD_USER_INPUT",
-    "FORBIDDEN",
-    "INTERNAL_SERVER_ERROR",
-    "UNAUTHENTICATED",
-];
-
-fn graphql_errors(errors: &Value) -> Field {
-    let entries = errors.as_array().into_iter().flatten().take(3);
-    Field::Array(
-        entries
-            .filter_map(Value::as_object)
-            .map(|item| {
-                let code = item
-                    .get("extensions")
-                    .and_then(|value| value.get("code"))
-                    .and_then(Value::as_str)
-                    .filter(|value| GRAPHQL_ERROR_CODES.contains(value))
-                    .map_or_else(|| json!(Code::KeeperError), |value| json!(value));
-                json!({"code": code}).into()
-            })
-            .collect(),
-    )
-}
-
-fn wait_graphql_errors(errors: &Value) -> Field {
-    const CODES: &[&str] = &[
-        "GRAPHQL_PARSE_FAILED",
-        "GRAPHQL_VALIDATION_FAILED",
-        "INTENT_NOT_ACCEPTED",
-        "BAD_USER_INPUT",
-        "FORBIDDEN",
-        "INTERNAL_SERVER_ERROR",
-        "UNAUTHENTICATED",
-    ];
-    let codes: Vec<_> = errors
-        .as_array()
-        .into_iter()
-        .flatten()
-        .take(3)
-        .filter(|item| item.is_object())
-        .map(|item| {
-            let code = item["extensions"]["code"]
-                .as_str()
-                .filter(|code| CODES.contains(code))
-                .unwrap_or("KEEPER_ERROR");
-            json!({"code": code})
-        })
-        .collect();
-    json!(codes).into()
+pub(crate) fn stringify(value: &Value) -> String {
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Null => "None".into(),
+        Value::Bool(true) => "True".into(),
+        Value::Bool(false) => "False".into(),
+        _ => value.to_string(),
+    }
 }
 
 pub(crate) fn truthy(value: &Value) -> bool {
@@ -424,6 +370,42 @@ pub(crate) fn truthy(value: &Value) -> bool {
         Value::Array(value) => !value.is_empty(),
         Value::Object(value) => !value.is_empty(),
     }
+}
+
+pub(crate) fn graphql_error_fields(
+    errors: &Value,
+    retained: bool,
+    total: Option<&Value>,
+) -> (Value, Value) {
+    let codes: Vec<_> = errors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(3)
+        .filter(|item| item.is_object())
+        .map(|item| {
+            let field = if retained { item } else { &item["extensions"] };
+            let code = field["code"]
+                .as_str()
+                .filter(|code| {
+                    matches!(
+                        *code,
+                        "GRAPHQL_PARSE_FAILED"
+                            | "GRAPHQL_VALIDATION_FAILED"
+                            | "INTENT_NOT_ACCEPTED"
+                            | "BAD_USER_INPUT"
+                            | "FORBIDDEN"
+                            | "INTERNAL_SERVER_ERROR"
+                            | "UNAUTHENTICATED"
+                    )
+                })
+                .unwrap_or("KEEPER_ERROR");
+            json!({"code": code})
+        })
+        .collect();
+    let count = errors.as_array().map_or(1, Vec::len) as u64;
+    let total = total.and_then(Value::as_u64).unwrap_or(count).max(count);
+    (json!(codes), json!(total))
 }
 
 pub(crate) fn is_evm_address(value: &str) -> bool {

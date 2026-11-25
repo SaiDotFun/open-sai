@@ -5,6 +5,7 @@ mod cancel;
 mod confirmation;
 mod estimates;
 mod position;
+mod position_change;
 mod update;
 
 use std::future::{Future, pending};
@@ -24,6 +25,9 @@ use crate::{
 pub use actions::{MARKET_PRICE_NOTICE, OpenTrade, OrderType, Side, close_preview};
 pub use confirmation::{Confirmation, digest_bytes, positive_decimal, preview_digest};
 pub use estimates::PreviewMode;
+pub use position_change::{
+    MarginDirection, PositionAction, PositionMode, parse_partial_close_percent,
+};
 pub use update::{leverage_preview, tpsl_preview};
 
 #[derive(Clone, Debug, Serialize)]
@@ -61,8 +65,9 @@ pub struct TradePreview {
     pub quote: Option<Value>,
     pub warning: Option<&'static str>,
     position_route: Option<position::PositionRoute>,
-    close_owner_verified: Option<bool>,
+    position_owner_verified: Option<bool>,
     estimates: Option<Value>,
+    margin_change: bool,
 }
 
 impl TradePreview {
@@ -73,8 +78,9 @@ impl TradePreview {
             quote: None,
             warning: None,
             position_route: None,
-            close_owner_verified: None,
+            position_owner_verified: None,
             estimates: None,
+            margin_change: false,
         }
     }
 
@@ -87,7 +93,7 @@ impl TradePreview {
             output["quote"] = quote.clone();
         }
         output["intent"] = json!(self.intent);
-        if self.close_owner_verified == Some(false) {
+        if self.position_owner_verified == Some(false) {
             output["positionOwnerVerified"] = json!(false);
         }
         if let Some(estimates) = &self.estimates {
@@ -106,7 +112,7 @@ impl TradePreview {
 
     pub fn confirmed_output(&self, account: Option<&str>) -> Value {
         let mut output = self.output(account);
-        if self.intent.kind == "CLOSE_POSITION" && self.close_owner_verified != Some(true) {
+        if self.intent.kind == "CLOSE_POSITION" && self.position_owner_verified != Some(true) {
             return output;
         }
         if let Some(route) = &self.position_route {

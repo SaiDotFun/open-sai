@@ -1,7 +1,8 @@
-//! Public intent records use the same field allowlists as the Python Keeper client.
+//! Public Keeper reads use the same field rules as the Python client.
 
 use std::{path::Path, sync::LazyLock};
 
+use chrono::{DateTime, Datelike, Timelike};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
@@ -16,6 +17,13 @@ static INTENT_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 static ROW_ID: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\A[0-9]{1,24}(?:[-_:][0-9]{1,24}){0,3}\z").expect("row ID pattern")
+});
+static BLOCK_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(concat!(
+        r"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}",
+        r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])\z"
+    ))
+    .expect("Keeper block timestamp pattern")
 });
 
 static HISTORY_TIMESTAMP: LazyLock<Regex> = LazyLock::new(|| {
@@ -161,6 +169,44 @@ fn keep_timestamp(out: &mut Map<String, Value>, key: &str, timestamp: &Value) {
     }
 }
 
+/// Keeper uses the Unix epoch when it has a block height without a timestamp.
+pub fn normalize_market_price_timestamps(data: &mut Map<String, Value>) {
+    let Some(rows) = data
+        .get_mut("oracle")
+        .and_then(|oracle| oracle.get_mut("tokenPricesUsd"))
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for row in rows {
+        if let Some(block) = row
+            .get_mut("lastUpdatedBlock")
+            .and_then(Value::as_object_mut)
+        {
+            let timestamp = block.entry("block_ts").or_insert(Value::Null);
+            if timestamp.as_f64() == Some(0.0) || timestamp.as_str().is_some_and(zero_price_time) {
+                *timestamp = Value::Null;
+            }
+        }
+    }
+}
+
+fn zero_price_time(value: &str) -> bool {
+    if value == "0" {
+        return true;
+    }
+    // Chrono truncates fractional seconds beyond nanoseconds.
+    let zero_fraction = value.split_once('.').is_none_or(|(_, fraction)| {
+        fraction
+            .bytes()
+            .take_while(u8::is_ascii_digit)
+            .all(|digit| digit == b'0')
+    });
+    zero_fraction
+        && chrono::DateTime::parse_from_rfc3339(value)
+            .is_ok_and(|at| at.timestamp() == 0 && at.timestamp_subsec_nanos() == 0)
+}
+
 fn keep(out: &mut Map<String, Value>, key: &str, value: &Value, valid: bool) {
     if valid {
         out.insert(key.into(), value.clone());
@@ -203,6 +249,16 @@ pub(crate) fn request_hash(value: &Value) -> (Option<String>, bool) {
         }
     }
     (None, true)
+}
+
+pub(crate) fn known_intent_field(field: &str, value: &Value) -> bool {
+    match field {
+        "kind" => known(value, KINDS),
+        "lifecycleStep" => known(value, STEPS),
+        "execActor" => known(value, &["client", "server", "user"]),
+        "errorCode" => known(value, ERROR_CODES) || value == "KEEPER_ERROR",
+        _ => false,
+    }
 }
 
 fn reconcile_fields(out: &mut Map<String, Value>, source: &Map<String, Value>) {
@@ -300,6 +356,14 @@ pub(crate) fn intent_log_fields(row: &Map<String, Value>) -> Map<String, Value> 
 }
 
 pub(crate) fn intent_record(row: &Map<String, Value>) -> Value {
+    project_intent_record(row, false)
+}
+
+pub(crate) fn log_intent_record(row: &Map<String, Value>) -> Value {
+    project_intent_record(row, true)
+}
+
+fn project_intent_record(row: &Map<String, Value>, logging: bool) -> Value {
     let value = |key| row.get(key).unwrap_or(&Value::Null);
     let mut record = Map::new();
     keep_intent_key(&mut record, value("intentKey"));
@@ -327,14 +391,29 @@ pub(crate) fn intent_record(row: &Map<String, Value>) -> Value {
         value("execBlock"),
         number(value("execBlock")),
     );
-    keep_timestamp(&mut record, "execBlockTs", value("execBlockTs"));
+    let timestamp = value("execBlockTs");
+    if logging {
+        let valid = timestamp.as_str().is_some_and(|ts| {
+            BLOCK_TIMESTAMP.is_match(ts)
+                && DateTime::parse_from_rfc3339(ts)
+                    .is_ok_and(|ts| ts.year() > 0 && ts.nanosecond() < 1_000_000_000)
+        });
+        keep(&mut record, "execBlockTs", timestamp, valid);
+        if !timestamp.is_null() && !valid {
+            record.insert("execBlockTsInvalid".into(), json!(true));
+        }
+    } else {
+        keep_timestamp(&mut record, "execBlockTs", timestamp);
+    }
     keep_hash(&mut record, "txHash", value("txHash"));
     if let Some(code) = intent_error_code(row) {
         record.insert("errorCode".into(), json!(code));
         // This fixed message is shorter than the untrusted-text limit.
         record.insert("errorMsg".into(), json!("Keeper reported an intent error."));
     }
-    reconcile_fields(&mut record, row);
+    if !logging {
+        reconcile_fields(&mut record, row);
+    }
     Value::Object(record)
 }
 

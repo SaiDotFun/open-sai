@@ -259,6 +259,7 @@ class Normalize:
                 result[field] = self.identity(rule, item)
         if result.get("event") == "update.check":
             replace_if(result, "installed", is_version)
+            replace_if(result, "installKind", development_install)
         if result.get("event") == "doctor.result":
             doctor_checks(result.get("checks"))
         if (
@@ -485,7 +486,16 @@ def normalize_overview_table(match: re.Match[str]) -> str:
 def mask_overview_stdout(raw: str, mode: str) -> str:
     """Mask clock values in place so serialization and table layout stay comparable."""
     if mode == "json":
-        raw = re.sub(r'(?<!\\)("fetchedAt"\s*:\s*)"[^"]+"', r'\1"<fetchedAt>"', raw)
+        fetch_pattern = r'(?<!\\)("fetchedAt"\s*:\s*)"([^"]+)"'
+        fetched = {stamp for _, stamp in re.findall(fetch_pattern, raw)}
+        raw = re.sub(fetch_pattern, r'\1"<fetchedAt>"', raw)
+        raw = re.sub(
+            r'(?<!\\)("sourceAt"\s*:\s*)"([^"]+)"',
+            lambda match: (
+                f'{match[1]}"<fetchedAt>"' if match[2] in fetched else match[0]
+            ),
+            raw,
+        )
         return re.sub(
             r'(?<!\\)("sourceAgeSeconds"\s*:\s*)-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?',
             r'\1"<sourceAgeSeconds>"',
@@ -525,9 +535,24 @@ def overview_clocks(
             ):
                 raise ValueError("Overview fetch timestamp is outside the invocation")
             value["fetchedAt"] = "<fetchedAt>"
+            if "sourceAt" in value and "sourceAgeSeconds" not in value:
+                if value["sourceAt"] != stamp:
+                    raise ValueError(
+                        "Overview section source time differs from its fetch"
+                    )
+                value["sourceAt"] = "<fetchedAt>"
     if "sourceAgeSeconds" in value:
         source, age = value["sourceAt"], value["sourceAgeSeconds"]
-        if source is None:
+        if value.get("sourceAtBasis") == "fetchedAt":
+            if (
+                age is not None
+                or fetched is None
+                or not timestamp(source)
+                or datetime.fromisoformat(source) != fetched
+            ):
+                raise ValueError("Invalid overview fetch-time source")
+            value["sourceAt"] = "<fetchedAt>"
+        elif source is None:
             if age is not None:
                 raise ValueError("Overview reported an age without a source timestamp")
         else:
@@ -600,6 +625,10 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
                 replace_if(source, "observedAt", timestamp)
     if command == "skill source" and isinstance(value, dict):
         replace_if(value, "cliVersion", is_version)
+        if isinstance(path := value.get("path"), str) and (
+            Path(path).is_absolute() or path.startswith("<HOME>/")
+        ):
+            value["path"] = "<package-location>"
     if (
         command == "logs path"
         and isinstance(value, dict)
@@ -617,7 +646,36 @@ def stdout(raw: str, mode: str, command: str, normalize: Normalize) -> Any:
         )
     if command == "update" and isinstance(value, dict):
         replace_if(value, "installed", is_version)
+        install = value.get("install")
+        if (
+            isinstance(install, dict)
+            and development_install(install.get("kind"))
+            and isinstance(install.get("prefix"), str)
+            and Path(install["prefix"]).is_absolute()
+        ):
+            kind, url = install["kind"], install.get("url")
+            install.update({"kind": "<development install>", "prefix": "<prefix>"})
+            if (
+                kind == "checkout"
+                and isinstance(url, str)
+                and url.startswith("file:///")
+                or kind == "other"
+                and "url" in install
+                and url is None
+            ):
+                install["url"] = "<development origin>"
+            update = value.get("update")
+            if isinstance(update, dict) and update.get("note") in {
+                "This is a source checkout; pull, then run `uv sync`.",
+                "This launcher is managed outside sai. Use its installer to update.",
+            }:
+                update["note"] = "<development install guidance>"
     return value
+
+
+def development_install(kind: object) -> bool:
+    # The Python checkout and the unregistered Rust build have different owners.
+    return kind in ("checkout", "other")
 
 
 def stderr_category(raw: str) -> tuple[str, ...]:

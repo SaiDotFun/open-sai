@@ -464,7 +464,7 @@ def cli_version(cli: CLI) -> str:
 
 
 def read_events(
-    home: Path, cli: CLI, *, c4_reference: bool = False
+    home: Path, cli: CLI, *, c4_reference: bool = False, rust: bool = False
 ) -> list[dict[str, Any]]:
     events = [
         json.loads(line)
@@ -476,6 +476,17 @@ def read_events(
     for event in events:
         assert event["version"] == version
         event["version"] = "<version>"
+        if isinstance(argv := event.get("argv"), list):
+            # These cases invoke intent status and auth status only. Compare
+            # the safe words and preserve argument count after projection.
+            safe = {"--json", "--endpoint", "intent", "auth", "status", "--key"}
+            if rust:
+                assert all(arg in safe or arg == "[redacted]" for arg in argv)
+            event["argv"] = [arg if arg in safe else "[redacted]" for arg in argv]
+        if "error" in event:
+            if rust:
+                assert event["error"] == "[redacted]"
+            event["error"] = "[redacted]"
         if c4_reference:
             # The C4 pin predates the v2 envelope and keyed endpoint identity.
             for field in ("schema", "commandId", "endpointId"):
@@ -488,6 +499,38 @@ def read_events(
             if dynamic in event:
                 assert isinstance(event[dynamic], str if dynamic == "ts" else int)
                 event[dynamic] = "<dynamic>"
+        # C4's Python reference wrote v1 rows. The C9b cases compare
+        # these v2 fields directly against the newer Python writer.
+        for field in ("schema", "commandId", "endpointId"):
+            event.pop(field, None)
+        if c4_reference and event["event"] == "keeper.request":
+            event.pop("intentKey", None)
+            if "keeperErrors" in event:
+                event.update(
+                    log.keeper_error_fields(
+                        event["keeperErrors"],
+                        retained=True,
+                        total=event.get("keeperErrorCount"),
+                    )
+                )
+        if c4_reference and event["event"] == "intent.keeper":
+            if not rust:
+                event["addr"] = keeper.canonical_account(event["addr"])
+            if (code := keeper.intent_error_code(event)) is not None:
+                event["errorCode"] = code
+            event.pop("errorMsg", None)
+            for field, allowed in (
+                ("kind", keeper.INTENT_KINDS),
+                ("lifecycleStep", keeper.INTENT_STEPS),
+                ("execActor", keeper.INTENT_ACTORS),
+            ):
+                if event.get(field) not in allowed:
+                    event.pop(field, None)
+            tx, invalid = keeper.request_hash(event.pop("txHash", None))
+            if tx is not None:
+                event["txHash"] = tx
+            if invalid:
+                event["txHashInvalid"] = True
     assert all(seq == list(range(1, len(seq) + 1)) for seq in groups.values())
     return events
 
@@ -499,6 +542,9 @@ def read_state(home: Path) -> tuple[Any, ...]:
         if path.relative_to(home).as_posix()
         not in {"logs/.endpoint-key", "logs/.endpoint-key.lock"}
     }
+    for name in ("logs/.endpoint-key", "logs/.endpoint-key.lock"):
+        if name in files:
+            assert files.pop(name) & 0o777 == 0o600
     db = home / "trader/intents.sqlite3"
     if not db.exists():
         return (files,)
@@ -562,27 +608,6 @@ def public_intent_output(output: bytes, *, compact: bool) -> bytes:
     return (
         json.dumps(log.clean(public), indent=None if compact else 2) + "\n"
     ).encode()
-
-
-def legacy_status_events(
-    home: Path, cli: CLI, *, reference: bool
-) -> list[dict[str, Any]]:
-    """Compare event payloads across the two reference versions."""
-    events = read_events(home, cli, c4_reference=True)
-    for event in events:
-        if event["event"] == "keeper.request":
-            event.pop("intentKey", None)
-        elif reference and event["event"] == "intent.keeper":
-            public = keeper.safe_intent_record(event)
-            for field in ("kind", "lifecycleStep", "execActor", "errorCode", "txHash"):
-                event.pop(field, None)
-                if field in public:
-                    event[field] = public[field]
-            event.pop("errorMsg", None)
-            if public.get("txHashInvalid"):
-                event["txHashInvalid"] = True
-            event["addr"] = keeper.canonical_account(event["addr"])
-    return events
 
 
 def compare(
@@ -668,7 +693,7 @@ def compare(
                     )
                 )
             observed.append(
-                (runs, legacy_status_events(home, cli, reference=index == 0))
+                (runs, read_events(home, cli, c4_reference=True, rust=index == 1))
             )
         assert observed[0] == observed[1]
 
@@ -1025,7 +1050,10 @@ def test_connection_refused(cli_pair: tuple[CLI, CLI], tmp_path: Path) -> None:
             assert json.loads(result.stdout)["error"]["code"] == "NOT_SENT"
             assert not (home / "trader").exists()
             outputs.append(
-                (result.stdout, legacy_status_events(home, cli, reference=index == 0))
+                (
+                    result.stdout,
+                    read_events(home, cli, c4_reference=True, rust=index == 1),
+                )
             )
         assert outputs[0] == outputs[1]
 
@@ -1094,6 +1122,20 @@ def test_cli_errors_share_one_envelope(
             )
             assert payload["error"].pop("hint") == expected_hint
             outputs.append(payload)
+        elif args[0] == "--bad-option":
+            if index == 0:
+                assert "--bad-option" in payload["error"]["message"]
+                payload["error"]["message"] = "No such option."
+            outputs.append(payload)
+        elif args[1:] == ("config", "get", "invalid"):
+            if index == 0:
+                message = payload["error"]["message"]
+                assert "Valid keys: " in message
+                payload["error"]["message"] = (
+                    "Invalid value for 'KEY': unknown setting. Valid keys: "
+                    + message.split("Valid keys: ", 1)[1]
+                )
+            outputs.append(payload)
         else:
             outputs.append(result.stdout)
     assert outputs[0] == outputs[1]
@@ -1158,13 +1200,13 @@ def test_expired_auth_status(
                 'Set SAI_RECONCILE_ENDPOINT to the original Keeper URL}" auth login NAME'
             )
         assert payload["error"].pop("hint") == f"{login} --addr {ADDR}"
-        events = read_events(home, cli)
+        events = read_events(home, cli, rust=index == 1)
         [start] = [event for event in events if event["event"] == "command.start"]
         command_words = ["auth", "status"]
         # The C4 reference predates auth argument privacy. Assert each form
         # before comparing the remaining fields and expiry events.
         expected_argv = (
-            ["--json", "--endpoint", origin, *command_words]
+            ["--json", "--endpoint", "[redacted]", *command_words]
             if index == 0
             else command_words
         )

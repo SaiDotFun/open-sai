@@ -2,6 +2,7 @@
 
 mod files;
 mod privacy;
+pub mod query;
 mod session_tokens;
 
 use std::{
@@ -155,6 +156,32 @@ pub struct LogWriter {
     command_schema: bool,
 }
 
+pub(crate) fn valid_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn keyed_endpoint(digest: &[u8; 32], key: &[u8; 32]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, key);
+    let tag = ring::hmac::sign(&key, digest);
+    let mut result = String::from("h1_");
+    for byte in tag.as_ref() {
+        let _ = write!(result, "{byte:02x}");
+    }
+    result
+}
+
+fn endpoint_id(root: &std::path::Path, endpoint: &str) -> Option<String> {
+    let Field::EndpointIdentity(digest) = Field::endpoint_identity(endpoint) else {
+        return None;
+    };
+    let key = LogDir::read_only(root).ok()?.read_endpoint_key().ok()?;
+    Some(keyed_endpoint(&digest, &key))
+}
+
 /// Log events that occur while handling a CLI command or an MCP call.
 #[derive(Clone, Copy)]
 pub struct EventContext<'a> {
@@ -165,6 +192,10 @@ pub struct EventContext<'a> {
 }
 
 impl<'a> EventContext<'a> {
+    pub const fn quiet() -> Self {
+        Self::new(None, Surface::Cli, None)
+    }
+
     pub const fn new(
         writer: Option<&'a LogWriter>,
         surface: Surface,
@@ -276,7 +307,7 @@ impl LogWriter {
         let known = KNOWN.try_lock().ok().map(|value| Arc::clone(&value));
         let mut budget = Budget::new();
         let mut endpoint_digest = None;
-        let mut command_bound = false;
+        let mut command_bound = matches!(name, "command.start" | "command.end");
         let fields = Field::Object(
             fields
                 .into_iter()
@@ -291,7 +322,6 @@ impl LogWriter {
                 .inspect(|(key, field)| {
                     command_bound |= *key == "command";
                     if self.command_schema
-                        && matches!(name, "keeper.request" | "intent.keeper")
                         && *key == "endpoint"
                         && let Field::Endpoint(url) = field
                         && let Field::EndpointIdentity(digest) = Field::endpoint_identity(url)
@@ -448,13 +478,7 @@ fn write(
     if let Some(digest) = event.endpoint_digest
         && let Ok(key) = directory.endpoint_key()
     {
-        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &key);
-        let signature = ring::hmac::sign(&key, &digest);
-        let mut encoded = String::from("h1_");
-        for byte in signature.as_ref() {
-            let _ = write!(encoded, "{byte:02x}");
-        }
-        line.insert("endpointId".into(), json!(encoded));
+        line.insert("endpointId".into(), json!(keyed_endpoint(&digest, &key)));
     }
     if let Value::Object(fields) = event.fields.clean(tokens) {
         for (key, field) in fields {
@@ -480,7 +504,7 @@ fn write(
     let _ = directory.append(&name, &data);
 }
 
-fn json_ascii(value: &Map<String, Value>) -> String {
+fn json_ascii_value(value: &impl serde::Serialize) -> String {
     let encoded = serde_json::to_string(value).expect("serializing JSON to a buffer");
     let mut escaped = String::with_capacity(encoded.len());
     for c in encoded.chars() {
@@ -496,7 +520,7 @@ fn json_ascii(value: &Map<String, Value>) -> String {
 }
 
 fn encode(line: &Map<String, Value>) -> Vec<u8> {
-    let mut encoded = json_ascii(line);
+    let mut encoded = json_ascii_value(line);
     if encoded.len() > MAX_LINE {
         let mut kept = Map::new();
         let mut truncated = Vec::new();
@@ -509,11 +533,11 @@ fn encode(line: &Map<String, Value>) -> Vec<u8> {
         }
         truncated.sort();
         kept.insert("truncated".into(), json!(truncated));
-        encoded = json_ascii(&kept);
+        encoded = json_ascii_value(&kept);
         // Long field names can otherwise make the fallback line oversized.
         if encoded.len() > MAX_LINE {
             kept.insert("truncated".into(), json!(["[cut]"]));
-            encoded = json_ascii(&kept);
+            encoded = json_ascii_value(&kept);
         }
     }
     encoded.push('\n');

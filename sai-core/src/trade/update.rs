@@ -80,7 +80,8 @@ pub(super) struct PositionUpdate {
 
 impl TradePreview {
     pub fn is_standalone_position_update(&self) -> bool {
-        self.intent.kind == "UPDATE_TRADE"
+        // Margin has already quoted and rechecked its own position.
+        self.intent.kind == "UPDATE_TRADE" && !self.margin_change
     }
 
     fn update_id(&self) -> Result<Value, SaiError> {
@@ -116,20 +117,22 @@ impl Trading<'_> {
             .check_active_trade(session, self.keeper.endpoint())?;
         let addr = session.addr();
         let indexed = self.indexed_position(addr, &id, TIMEOUT).await?;
-        let route = if let Some(endpoint) = self.lcd_endpoint {
+        let verified = if let Some(endpoint) = self.lcd_endpoint {
             let lcd = Lcd(endpoint);
-            if confirmed {
-                Some(self.verify_position_owner(&lcd, addr, &id, false).await?)
-            } else {
-                self.position_route(&lcd, false).await.ok()
+            match self.verify_position_owner(&lcd, addr, &id, false).await {
+                Ok(position) => Some(position),
+                Err(error) if confirmed => return Err(error),
+                Err(_) => None,
             }
         } else {
             None
         };
-        if confirmed && route.is_none() {
+        if confirmed && verified.is_none() {
             return Err(invalid("Cannot verify the position without an LCD"));
         }
-        self.estimate_position_update(&mut preview, addr, &id, route.clone(), indexed)
+        let (route, raw) = verified.unzip();
+        preview.position_owner_verified = Some(route.is_some());
+        self.estimate_position_update(&mut preview, addr, &id, route.clone(), indexed, raw)
             .await?;
         preview.position_route = route;
         Ok(if confirmed {
@@ -152,10 +155,10 @@ impl Trading<'_> {
             .map(Lcd)
             .ok_or_else(|| invalid("Cannot verify the position without an LCD"))?;
         let mut preview = preview.clone();
-        preview.position_route = Some(
-            self.verify_position_owner(&lcd, addr, &id, confirming)
-                .await?,
-        );
+        let (route, _) = self
+            .verify_position_owner(&lcd, addr, &id, confirming)
+            .await?;
+        preview.position_route = Some(route);
         Ok(PositionUpdate { preview, indexed })
     }
 
@@ -171,7 +174,14 @@ impl Trading<'_> {
             };
             let route = update.preview.position_route.clone();
             if let Err(ownership) = self
-                .estimate_position_update(&mut update.preview, addr, &id, route, update.indexed)
+                .estimate_position_update(
+                    &mut update.preview,
+                    addr,
+                    &id,
+                    route,
+                    update.indexed,
+                    None,
+                )
                 .await
             {
                 return ownership;
