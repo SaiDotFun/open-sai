@@ -59,6 +59,7 @@ POSITION_SCENARIOS = {
     "position-no-oracle",
     "position-wrong-height",
     "partial-preview-changed",
+    "partial-price-changed",
     "margin-accepted",
     "margin-interrupted",
     "margin-rejected",
@@ -603,7 +604,7 @@ def loopback(
             "trigger_order_fee_p": "0",
         },
     }
-    if scenario == "partial-preview":
+    if scenario in {"partial-preview", "partial-price-changed"}:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["market_order_config"]["fill_at_next_oracle_price"] = True
     if scenario in {"position-precision", "position-after-hours"}:
@@ -710,6 +711,7 @@ def loopback(
         "margin-unknown": MARGIN_INTENT,
         "position-equivalent-owner": MARGIN_INTENT,
         "partial-accepted": PARTIAL_INTENT,
+        "partial-price-changed": PARTIAL_INTENT,
         "partial-interrupted": PARTIAL_INTENT,
         "partial-unknown": PARTIAL_INTENT,
     }.get(scenario)
@@ -1371,6 +1373,16 @@ def loopback(
                 data = {**data, "user": ADDRESS}
             if scenario == "partial-preview-changed" and name == "get_trade_raw":
                 data = {**data, "leverage": str(self.position_leverage())}
+            if scenario == "partial-price-changed" and name in {
+                "get_collateral_price",
+                "get_perp_prices",
+            }:
+                # Tick on the quote reads and again at the final pinned read.
+                ticks = sum(item.label == "get_collateral_price" for item in wire)
+                if name == "get_perp_prices":
+                    data = {**data, "collateral": f"1.{ticks + 1:05d}"}
+                else:
+                    data = f"1.{ticks:05d}"
             served = (
                 "121"
                 if scenario == "position-wrong-height" and pinned

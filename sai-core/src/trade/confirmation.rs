@@ -254,7 +254,20 @@ pub fn digest_bytes(preview: &TradePreview, account: Option<&str>) -> Vec<u8> {
         material["referencePrice"] = json!(preview.reference_price.as_deref().map(canonical_price));
     }
     if let Some(quote) = &preview.quote {
-        material["quote"] = quote.clone();
+        let mut quote = quote.clone();
+        if preview.intent.kind == "DECREASE_POSITION_SIZE"
+            && let Some(fields) = quote.as_object_mut()
+        {
+            // The estimate flag also depends on price availability.
+            for key in [
+                "collateralPriceUsd",
+                "closedNotionalUsd",
+                "closedNotionalIsEstimate",
+            ] {
+                fields.shift_remove(key);
+            }
+        }
+        material["quote"] = quote;
     }
     if let Some(route) = &preview.position_route {
         material["positionRoute"] = json!(route);

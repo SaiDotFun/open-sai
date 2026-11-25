@@ -18,7 +18,7 @@ use crate::{
 };
 
 use super::position::{Lcd, PositionRoute, Read, height_error, same_account};
-use super::{Confirmation, SubmitOptions, TradePreview, Trading, actions::id};
+use super::{Confirmation, SubmitOptions, TradePreview, Trading, actions::id, digest_bytes};
 use quote::ContractDecimal;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -166,10 +166,7 @@ impl Trading<'_> {
             .quote_for_position(&lcd, addr, &id, action, confirming)
             .await?;
         let changed = !current.unchanged(&lcd, &id).await?;
-        if changed
-            || current.snapshot.route != first.snapshot.route
-            || current.preview.output(None) != first.preview.output(None)
-        {
+        if changed || digest_bytes(&current.preview, None) != digest_bytes(&first.preview, None) {
             let latest = if changed {
                 self.quote_for_position(&lcd, addr, &id, action, confirming)
                     .await
@@ -468,7 +465,7 @@ impl PositionQuote {
                 return Ok(false);
             }
         }
-        let (_, mut current_inputs) = snapshot.leverage(lcd, trade_id, height.as_deref()).await?;
+        let (_, current_inputs) = snapshot.leverage(lcd, trade_id, height.as_deref()).await?;
         let mut quoted = self.inputs.clone();
         let price = quoted
             .as_object_mut()
@@ -479,11 +476,11 @@ impl PositionQuote {
         let height = height.as_deref().ok_or_else(|| invalid(
             "Cannot confirm the position and leverage at the same block. Retry with an LCD that reports the contract query height."
         ))?;
-        if price.is_some() {
-            current_inputs["collateralPriceUsd"] =
-                json!(snapshot.price(lcd, Some(height)).await?.display());
+        if let Some(quoted_price) = price {
+            snapshot.price(lcd, Some(height)).await?;
+            return Ok(!quoted_price.is_null());
         }
-        Ok(current_inputs == self.inputs)
+        Ok(true)
     }
 }
 
