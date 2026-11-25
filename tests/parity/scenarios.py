@@ -1057,6 +1057,22 @@ def loopback(
                         interrupt_closed.wait(8)
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif (
+                        scenario == "quote-route-changed"
+                        and name == "oneClickTrading"
+                        and sum(entry.label == name for entry in wire) > 1
+                    ):
+                        self.reply(
+                            {
+                                "data": {
+                                    "oneClickTrading": {
+                                        "enabled": True,
+                                        "chainId": chain,
+                                        "contractAddress": "nibi1replacement",
+                                    }
+                                },
+                            }
+                        )
                     elif name == "trade" and scenario == "partial-preview-changed":
                         self.reply(
                             {
