@@ -17,6 +17,7 @@ use crate::{
 pub const DEFAULT_TIMEOUT: f64 = 30.0;
 const INITIAL_DELAY: Duration = Duration::from_millis(250);
 const MAX_DELAY: Duration = Duration::from_secs(2);
+const FILL_POSITION_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Eq, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -154,12 +155,12 @@ pub async fn for_intent(
     storage: &Storage<'_>,
     events: EventContext<'_>,
 ) -> Result<ResultReceipt, SaiError> {
-    if keeper::canonical_account(addr).is_none() {
+    let Some(account) = keeper::canonical_account(addr) else {
         return Err(SaiError::new(
             Code::InvalidRequest,
             "Pass a valid EVM or Nibiru account address",
         ));
-    }
+    };
     let budget = WaitBudget { started, timeout };
     let storage = storage.clone().with_busy_timeout(Duration::ZERO);
     let recorded = || -> Result<Outcome, StorageError> {
@@ -269,10 +270,31 @@ pub async fn for_intent(
         .parent()
         .expect("trader directory has a parent");
     let scrub = log::scrubber(home);
-    let receipt = Evidence::new(&row, &history).build(
+    let evidence = Evidence::new(&row, &history);
+    let mut fill_values = (Value::Null, None);
+    let remaining = budget.remaining().min(FILL_POSITION_TIMEOUT);
+    if wait_log.outcome == Outcome::Filled
+        && !remaining.is_zero()
+        && let Some((trade_id, block)) = evidence.opening_fill_position()
+        && let Ok(position) = keeper
+            .wait_request(
+                keeper::FILL_POSITION,
+                [
+                    ("trader".into(), json!(addr)),
+                    ("id".into(), json!(trade_id)),
+                ]
+                .into(),
+                remaining,
+            )
+            .await
+    {
+        fill_values = evidence.opening_fill(&position, trade_id, block, &account);
+    }
+    let receipt = evidence.build(
         wait_log.outcome,
         &request_hash,
         &request_block,
+        fill_values,
         |value| scrub(value.into()),
     );
     Ok(result(key, Some(addr), wait_log.outcome, &row, receipt))
@@ -301,7 +323,13 @@ pub fn rejected_result(key: &str, addr: &str, message: &str) -> ResultReceipt {
 }
 
 fn empty_receipt(outcome: Outcome) -> Value {
-    Evidence::new(&Value::Null, &[]).build(outcome, &Value::Null, &Value::Null, |value| value)
+    Evidence::new(&Value::Null, &[]).build(
+        outcome,
+        &Value::Null,
+        &Value::Null,
+        (Value::Null, None),
+        |value| value,
+    )
 }
 
 fn result(

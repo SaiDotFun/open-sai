@@ -1309,14 +1309,32 @@ def fill_history() -> dict:
 def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     endpoint, replies = keeper_replay
     reserve(endpoint)
+    filled = fill_history()
+    position = filled["data"]["perp"]["tradeHistory"][0]["trade"]
+    completed = deepcopy(RESPONSES["filled"])
+    completed["data"]["userIntents"][0]["body"] = {
+        "orderType": "market",
+        "leverage": "2",
+    }
     replies.extend(
         (
             "pending_exec",
             "outcome_not_indexed",
             "not_yet_in_history",
             "not_yet_in_history",
-            "filled",
-            fill_history(),
+            completed,
+            filled,
+            {
+                "data": {
+                    "perp": {
+                        "trade": {
+                            **position,
+                            "tradeType": "trade",
+                            "lastUpdatedBlock": {"block": 50109596},
+                        }
+                    }
+                }
+            },
         )
     )
     clock = FakeClock()
@@ -1332,8 +1350,8 @@ def test_wait_retries_provisional_sweep_and_returns_fill_receipt(keeper_replay):
     assert receipt["execution"]["historyId"] == 1007
     assert receipt["execution"]["marketOrderSequence"] == 49
     assert receipt["fill"] == {
-        "price": None,
-        "sizeCollateralBaseUnits": None,
+        "price": 81001.25,
+        "sizeCollateralBaseUnits": 7900000,
         "oraclePrice": 81000.5,
         "escrowedCollateralBaseUnits": 4000000,
     }
@@ -1359,7 +1377,7 @@ def test_wait_projects_receipt_fields_from_keeper(keeper_replay):
     row["marketOrder"]["execPrice"] = opaque
     row["trade"].update(openPrice=opaque, unrelated=opaque)
     row["openingFeeUsd"] = opaque
-    replies.extend(("filled", history))
+    replies.extend(("filled", history, {"data": {"perp": {"trade": None}}}))
 
     outcome = wait.for_intent(endpoint, ADDR, KEY)
     assert outcome["outcome"] == "filled"

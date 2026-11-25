@@ -328,6 +328,100 @@ def test_wait_scrubs_a_stored_token_shaped_like_a_history_hash(
             assert all("authorization" not in request.headers for request in requests)
 
 
+@pytest.mark.parametrize(
+    ("snapshot", "requested_leverage", "price", "size"),
+    [
+        ({}, "2", 81001.25, 7_900_000),
+        ({}, "1.999999999999999999", 81001.25, 7_899_999),
+        ({"lastUpdatedBlock": {"block": FILL_BLOCK + 1}}, "2", None, None),
+        ({"trader": OTHER}, "2", None, None),
+        ({"openPrice": OPAQUE}, "2", None, 7_900_000),
+        ({}, None, 81001.25, None),
+        ({}, "3", 81001.25, None),
+        (None, "2", None, None),
+        (response({"errors": [{"message": OPAQUE}]}), "2", None, None),
+    ],
+    ids=[
+        "opening-fill",
+        "floor-exact-leverage",
+        "updated-since-fill",
+        "wrong-owner",
+        "missing-price",
+        "missing-exact-leverage",
+        "inconsistent-leverage",
+        "missing-position",
+        "lookup-error",
+    ],
+)
+def test_wait_requires_execution_block_position_for_fill(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    snapshot: dict[str, Any] | Reply | None,
+    requested_leverage: str | None,
+    price: float | None,
+    size: int | None,
+) -> None:
+    monkeypatch.delenv("SAI_PARITY_PYTHON", raising=False)
+    clis: tuple[CLI, CLI] = request.getfixturevalue("cli_pair")
+    fill = indexed()
+    fill["trade"].update(
+        openPrice=81001.25, openCollateralAmount=3_950_000, collateralAmount=3_950_000
+    )
+    if isinstance(snapshot, Reply):
+        lookup = snapshot
+    else:
+        position = (
+            None
+            if snapshot is None
+            else {
+                **fill["trade"],
+                "lastUpdatedBlock": {"block": FILL_BLOCK},
+                **snapshot,
+            }
+        )
+        lookup = response({"data": {"perp": {"trade": position}}})
+    for index, cli in enumerate(clis):
+        with replay() as (endpoint, replies, requests):
+            home = tmp_path / str(index) / "sai"
+            seed(home, endpoint, monkeypatch, "unknown")
+            replies.extend(
+                map(
+                    response,
+                    (
+                        intent(
+                            "filled",
+                            body={
+                                "orderType": "market",
+                                "leverage": requested_leverage,
+                            },
+                        ),
+                        history(fill),
+                        lookup,
+                    ),
+                )
+            )
+            result = invoke(
+                cli, home, "--endpoint", endpoint, "--json", "intent", "wait", KEY
+            )
+            assert (result.returncode, result.stderr) == (0, b"")
+            assert OPAQUE.encode() not in result.stdout
+            document = json.loads(result.stdout)
+            assert document["outcome"] == "filled"
+            assert document["receipt"]["fill"] == {
+                "price": price,
+                "sizeCollateralBaseUnits": size,
+                "oraclePrice": "81000.50",
+                "escrowedCollateralBaseUnits": 4_000_000,
+            }
+            assert len(requests) == 3
+            query = json.loads(requests[-1].body)
+            assert "lastUpdatedBlock { block }" in query["query"]
+            assert query["variables"] == {"trader": ADDR, "id": fill["trade"]["id"]}
+            assert "authorization" not in requests[-1].headers
+            assert not replies
+
+
 @pytest.mark.parametrize("case", CASES, ids=lambda case: case.name)
 def test_intent_wait(
     wait_cli_pair: tuple[CLI, CLI],
