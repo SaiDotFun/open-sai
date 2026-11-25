@@ -720,7 +720,9 @@ impl Position {
                 .map_err(|mut error| {
                     if !waiting.json
                         && error.code == Code::PreviewMismatch
-                        && error.details.is_some()
+                        && error.details.as_ref().is_some_and(|details| {
+                            details["preview"]["estimates"]["execution"]["reason"] != error.message
+                        })
                     {
                         error
                             .message

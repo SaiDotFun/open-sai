@@ -1,4 +1,4 @@
-"""Compare CLI confirmations with Python main at 62b798e and a loopback Keeper."""
+"""Compare CLI confirmations with Python main at 7c7b00d and a loopback Keeper."""
 
 from __future__ import annotations
 
@@ -16,11 +16,105 @@ LIMIT = (*OPEN, "--type", "limit")
 TPSL = ("trade", "tpsl", "7", "--take-profit", "110")
 LEVERAGE = ("trade", "leverage", "7", "--leverage", "1.818181818181818182")
 CANCEL_ORDER = (*CLOSE, "--cancel-order")
+MARGIN = ("trade", "margin", "7", "--direction", "add", "--amount", "1")
+PARTIAL = ("trade", "partial-close", "7", "--percent", "50")
 
 
 @pytest.fixture
 def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     return (str(Path(sys.executable).with_name("sai")),), cli_pair[1]
+
+
+@pytest.mark.parametrize(
+    ("command", "scenario", "kind", "execution_code"),
+    [
+        (MARGIN, "position-execution-close-only", "UPDATE_TRADE", "MarketClosed"),
+        (
+            MARGIN,
+            "position-execution-unfunded",
+            "UPDATE_TRADE",
+            "InsufficientDepositBalance",
+        ),
+        (
+            MARGIN,
+            "position-execution-quote-liquidates",
+            "UPDATE_TRADE",
+            "LiquidationReached",
+        ),
+        (
+            PARTIAL,
+            "position-execution-no-oracle-time",
+            "DECREASE_POSITION_SIZE",
+            "OraclePublicationTimeUnknown",
+        ),
+        (
+            PARTIAL,
+            "position-execution-stale",
+            "DECREASE_POSITION_SIZE",
+            "OraclePriceStale",
+        ),
+    ],
+    ids=[
+        "margin-close-only",
+        "margin-unfunded",
+        "margin-liquidates-with-borrowing",
+        "partial-no-oracle-time",
+        "partial-stale",
+    ],
+)
+def test_position_size_execution_refuses_before_reserving(
+    pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    command: CLI,
+    scenario: str,
+    kind: str,
+    execution_code: str,
+) -> None:
+    documents = []
+    for index, cli in enumerate(pair):
+        with loopback("position-execution-ready") as endpoints:
+            home = tmp_path / f"preview-{index}"
+            seed_home(home, endpoints, "session")
+            code, preview, stderr = run(
+                cli, home, endpoints, (*command, "--dry-run"), python=index == 0
+            )
+            assert (code, stderr) == (0, ""), preview
+            digest = preview["previewDigest"]
+            assert digest == preview_digest(preview)
+            assert not endpoints.errors
+        with loopback(scenario) as endpoints:
+            home = tmp_path / f"blocked-preview-{index}"
+            seed_home(home, endpoints, "session")
+            code, blocked, stderr = run(
+                cli, home, endpoints, (*command, "--dry-run"), python=index == 0
+            )
+            assert (code, stderr) == (0, ""), blocked
+            assert not endpoints.errors
+            assert "previewDigest" not in blocked
+            assert blocked["estimates"]["execution"]["code"] == execution_code
+        replay = TradeReplay(kind)
+        with loopback(scenario, trade_replay=replay) as endpoints:
+            home = tmp_path / f"submit-{index}"
+            seed_home(home, endpoints, "session")
+            code, document, stderr = run(
+                cli,
+                home,
+                endpoints,
+                (*command, "--preview-digest", digest),
+                python=index == 0,
+            )
+            assert not endpoints.errors
+            assert not replay.attempts()
+            assert not (home / "sai/trader/intents.sqlite3").exists()
+            error = document["error"]
+            assert (code, error["code"], stderr) == (4, "PREVIEW_MISMATCH", "")
+            assert (
+                error["details"]["preview"]["estimates"]["execution"]["code"]
+                == execution_code
+            )
+            assert "previewDigest" not in error["details"]["preview"]
+            documents.append(document)
+    assert documents[0] == documents[1]
 
 
 @pytest.mark.parametrize(

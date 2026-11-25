@@ -1,6 +1,7 @@
 //! Standalone TP/SL and target-leverage intents.
 
 mod estimates;
+pub(super) use estimates::{leverage_execution_estimates, unknown_execution_inputs};
 
 use serde_json::{Value, json};
 

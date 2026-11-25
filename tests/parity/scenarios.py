@@ -681,6 +681,14 @@ def loopback(
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
     if scenario in POSITION_SCENARIOS:
         contracts["get_trade_raw"].pop("long", None)
+    if scenario.startswith("position-execution-"):
+        contracts["get_group"]["stale_price_expiration_secs"] = 0
+        if scenario != "position-execution-no-oracle-time":
+            contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        if scenario == "position-execution-close-only":
+            contracts["get_market"]["market_trading_state"] = "close_only"
+        if scenario == "position-execution-stale":
+            contracts["get_group"]["stale_price_expiration_secs"] = 30
     if scenario in {"position-foreign-contract-owner", "quote-foreign-contract-owner"}:
         contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
     if scenario == "position-wrong-contract-index":
@@ -1381,7 +1389,9 @@ def loopback(
                                 self.reject(f"Expected a fresh {name} query")
                                 return
                         wire.append(WireRequest(name, variables=query))
-                        if scenario in POSITION_SCENARIOS:
+                        if scenario in POSITION_SCENARIOS or scenario.startswith(
+                            "position-execution-"
+                        ):
                             self.position_query(name, request_url.query)
                             return
                         if (
@@ -1455,6 +1465,18 @@ def loopback(
                 self.reply({}, 503)
                 return
             if (
+                scenario == "position-execution-quote-liquidates"
+                and name == "quote_trade"
+            ):
+                self.reply(
+                    {
+                        "message": "liquidation price reached. Liq price 90, current price 100"
+                    },
+                    400,
+                    height=POSITION_HEIGHT,
+                )
+                return
+            if (
                 scenario == "partial-price-recovers"
                 and name == "get_collateral_price"
                 and sum(item.label == name for item in wire) == 1
@@ -1462,6 +1484,12 @@ def loopback(
                 self.reply({}, 503)
                 return
             data = contracts[name]
+            if (
+                scenario == "position-execution-unfunded"
+                and name == "get_exchange_balance"
+                and pinned
+            ):
+                data = {**data, "available_to_trade": "0"}
             if (
                 scenario == "position-equivalent-owner"
                 and name == "get_trade_raw"

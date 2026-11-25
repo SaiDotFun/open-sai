@@ -2,6 +2,7 @@
 
 mod close;
 mod lcd;
+pub(super) use close::PartialCloseQuote;
 
 use std::time::Duration;
 
@@ -238,7 +239,7 @@ impl Price {
     }
 }
 
-fn now() -> String {
+pub(super) fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
 }
 
@@ -278,12 +279,24 @@ fn all_unavailable(reason: &str) -> Value {
     json!({"fees": field, "liquidationPrice": field, "worstCaseFill": field})
 }
 
-fn market_rejection(pair: &Value, market: bool) -> Option<&'static str> {
+pub(super) fn market_rejection(pair: &Value, market: bool) -> Option<&'static str> {
     match pair["market_trading_state"].as_str()? {
         "close_only" => Some("Perp rejects this request in a close-only market."),
         "closed" if market => Some("Perp rejects this request in a closed market."),
         _ => None,
     }
+}
+
+pub(super) fn oracle_publication_time(oracle: &Value) -> Option<Option<u64>> {
+    let oracle = oracle.as_object()?;
+    let mut published = None;
+    for key in ["base_last_update_time", "quote_last_update_time"] {
+        if let Some(value) = oracle.get(key).filter(|value| !value.is_null()) {
+            let time = value.as_u64()?;
+            published = Some(published.map_or(time, |prior: u64| prior.min(time)));
+        }
+    }
+    Some(published)
 }
 
 fn worst_case_fill(

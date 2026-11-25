@@ -128,10 +128,15 @@ impl TradePreview {
         if let Some(route) = &self.position_route {
             output["positionRoute"] = json!(route);
             let execution = &output["estimates"]["execution"];
+            let rejected = execution["status"] == "would_be_rejected";
+            let missing_oracle = execution["code"] == "OraclePublicationTimeUnknown";
+            if rejected && let Some(fields) = output.as_object_mut() {
+                fields.shift_remove("quote");
+            }
             if self.position_owner_verified != Some(false)
                 && (!self.requires_market_price_refresh() || self.reference_price.is_some())
-                && execution["status"] != "would_be_rejected"
-                && execution["code"] != "OraclePublicationTimeUnknown"
+                && !rejected
+                && !missing_oracle
             {
                 output["previewDigest"] = json!(preview_digest(self, account));
             }
@@ -433,8 +438,11 @@ impl<'a> Trading<'a> {
             }
             return Err(error);
         }
-        if cli_preview.is_some() {
-            preview.check_cli_execution(account)?;
+        if cli_preview.is_some()
+            || preview.margin_change
+            || preview.intent.kind == "DECREASE_POSITION_SIZE"
+        {
+            preview.check_cli_execution(account, confirming)?;
         }
 
         let (key, stamp) = intent_identity();

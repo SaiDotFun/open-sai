@@ -306,7 +306,7 @@ impl Trading<'_> {
                 self.estimate_preview(preview, Some(session), PreviewMode::CliSubmission, None)
                     .await?;
                 self.recheck_open_route(lcd, route).await?;
-                preview.check_cli_execution(session.addr())?;
+                preview.check_cli_execution(session.addr(), false)?;
                 Err(error)
             }
         }
@@ -328,17 +328,18 @@ impl Trading<'_> {
 }
 
 impl TradePreview {
-    pub(super) fn check_cli_execution(&self, account: &str) -> Result<(), SaiError> {
+    pub(super) fn check_cli_execution(
+        &self,
+        account: &str,
+        require_oracle_time: bool,
+    ) -> Result<(), SaiError> {
         if let Some(estimates) = &self.estimates {
             let execution = &estimates["execution"];
             if (execution["status"] == "would_be_rejected"
-                || execution["code"] == "OraclePublicationTimeUnknown")
+                || (require_oracle_time && execution["code"] == "OraclePublicationTimeUnknown"))
                 && let Some(reason) = execution["reason"].as_str()
             {
-                let mut preview = self.cli_preview_output(Some(account));
-                if let Some(fields) = preview.as_object_mut() {
-                    fields.shift_remove("quote");
-                }
+                let preview = self.cli_preview_output(Some(account));
                 return Err(SaiError {
                     details: Some(Box::new(Map::from_iter([("preview".into(), preview)]))),
                     ..SaiError::new(Code::PreviewMismatch, reason)

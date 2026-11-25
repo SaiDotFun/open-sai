@@ -301,6 +301,7 @@ async fn position_confirmation_rejects_a_new_contract_on_the_same_chain() {
                         "get_exchange_balance" => json!({"collateral_index": "TokenIndex(1)"}),
                         "is_after_hours_market" => json!(false),
                         "get_collateral_price" => json!("1"),
+                        "get_perp_prices" => json!({"collateral": "1"}),
                         other => panic!("Unexpected LCD query: {other}"),
                     };
                     json!({"data": result})

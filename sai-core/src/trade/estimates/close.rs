@@ -1,3 +1,4 @@
+use num_bigint::BigUint;
 use serde_json::{Value, json};
 
 use crate::{
@@ -13,18 +14,23 @@ use crate::{
 
 use super::{
     COLLATERAL_ORACLE, FEE_UNAVAILABLE, Price, SCALE, base_fees, decimal, integer, lcd::QuoteLcd,
-    liquidation_fee, not_applicable, now, unavailable,
+    liquidation_fee, not_applicable, now, oracle_publication_time, unavailable,
 };
 
 const UNKNOWN: &str = "Cannot verify the position and Perp liquidation inputs at one block.";
 const GUARDED: &str = "The after-hours guard can change or close this position.";
 const UNKNOWN_ORACLE_TIME: &str = "The oracle price publication time is unknown.";
 
-fn unavailable_close() -> Value {
+pub(in crate::trade) struct PartialCloseQuote<'a> {
+    pub(in crate::trade) amount: &'a BigUint,
+    pub(in crate::trade) rechecked: Option<(u128, &'a Value)>,
+}
+
+fn unavailable_close(partial: bool) -> Value {
     json!({
         "execution": unavailable(UNKNOWN),
         "fees": unavailable(UNKNOWN),
-        "liquidationPrice": not_applicable("A full close leaves no position."),
+        "liquidationPrice": if partial { unavailable(UNKNOWN) } else { not_applicable("A full close leaves no position.") },
         "worstCaseFill": {
             "status": "unbounded",
             "reason": "This Keeper intent carries no slippage limit.",
@@ -38,7 +44,7 @@ impl Trading<'_> {
         preview: &mut TradePreview,
         session: Option<&Session>,
     ) -> Result<Value, SaiError> {
-        let result = unavailable_close();
+        let result = unavailable_close(false);
         preview.position_owner_verified = session.map(|_| false);
         preview.position_route = None;
         let (Some(endpoint), Some(session), Some(target)) =
@@ -77,14 +83,14 @@ impl Trading<'_> {
         indexed: Value,
         (route, raw): (PositionRoute, Value),
     ) -> Result<(bool, Value), SaiError> {
-        let mut result = unavailable_close();
+        let mut result = unavailable_close(false);
         let quote = async {
             let state = self
                 .position_snapshot(lcd, account, id, route, indexed, Some(raw))
                 .await?;
             if let Some(height) = state.verified_height(lcd, id).await? {
                 let quote_lcd = QuoteLcd::new(lcd.0, state.route.contract_address.clone());
-                Self::quote_close(&quote_lcd, lcd, &state, id, &height, &mut result).await;
+                Self::quote_close(&quote_lcd, lcd, &state, id, &height, None, &mut result).await;
             } else {
                 unknown_oracle_time(&mut result);
             }
@@ -100,12 +106,42 @@ impl Trading<'_> {
         }
     }
 
+    pub(in crate::trade) async fn partial_close_estimates(
+        lcd: &Lcd<'_>,
+        state: &Snapshot,
+        id: &Value,
+        height: Option<&str>,
+        partial: PartialCloseQuote<'_>,
+    ) -> Value {
+        let mut result = unavailable_close(true);
+        if !state.raw["long"].is_boolean() {
+            return result;
+        }
+        if let Some(height) = height {
+            let quote_lcd = QuoteLcd::new(lcd.0, state.route.contract_address.clone());
+            Self::quote_close(
+                &quote_lcd,
+                lcd,
+                state,
+                id,
+                height,
+                Some(partial),
+                &mut result,
+            )
+            .await;
+        } else {
+            unknown_oracle_time(&mut result);
+        }
+        result
+    }
+
     async fn quote_close(
         lcd: &QuoteLcd<'_>,
         position_lcd: &Lcd<'_>,
         state: &Snapshot,
         id: &Value,
         height: &str,
+        partial: Option<PartialCloseQuote<'_>>,
         result: &mut Value,
     ) -> Option<()> {
         let raw = &state.raw;
@@ -113,21 +149,27 @@ impl Trading<'_> {
         let trade = raw.get("user")?;
         let height = Some(height);
 
-        let prices = lcd
-            .smart(
-                json!({"get_perp_prices": {
-                    "market_index": raw.get("market_index")?,
-                    "collateral_index": raw.get("collateral_index")?,
-                }}),
-                height,
-            )
-            .await;
-        let prices = match prices {
-            Ok(prices) => prices,
-            Err(_) => return unknown_oracle_time(result),
+        let prices;
+        let row = if let Some((_, prices)) = partial.as_ref().and_then(|quote| quote.rechecked) {
+            prices
+        } else {
+            let read = lcd
+                .smart(
+                    json!({"get_perp_prices": {
+                        "market_index": raw.get("market_index")?,
+                        "collateral_index": raw.get("collateral_index")?,
+                    }}),
+                    height,
+                )
+                .await;
+            prices = match read {
+                Ok(prices) => prices,
+                Err(_) => return unknown_oracle_time(result),
+            };
+            &prices
         };
-        let oracle = &prices["market"];
-        let Some(published_at) = publication_time(oracle) else {
+        let oracle = &row["market"];
+        let Some(Some(published_at)) = oracle_publication_time(oracle) else {
             return unknown_oracle_time(result);
         };
         let config = lcd
@@ -193,8 +235,18 @@ impl Trading<'_> {
             return Some(());
         }
 
-        decimal(&raw["leverage"])?;
-        let effective = match state.effective_leverage(position_lcd, id, height?).await {
+        let stored = decimal(&raw["leverage"])?;
+        let effective = match partial.as_ref().and_then(|quote| quote.rechecked) {
+            Some((effective, _)) => Ok(effective),
+            None => state.effective_leverage(position_lcd, id, height?).await,
+        };
+        let effective = match effective {
+            Ok(effective) if partial.is_some() && effective != stored => {
+                result["execution"] = unavailable(GUARDED);
+                result["fees"] = unavailable(GUARDED);
+                result["liquidationPrice"] = unavailable(GUARDED);
+                return Some(());
+            }
             Ok(leverage) => leverage,
             Err(error) if error.code == Code::PreviewMismatch => return None,
             Err(_) => {
@@ -204,27 +256,35 @@ impl Trading<'_> {
                 return Some(());
             }
         };
-        result["execution"] = json!({"status": "voluntary_close"});
+        if partial.is_some() {
+            let settlement = unavailable(
+                "Partial-close settlement can draw on the remaining collateral. Execution may be rejected if the resulting leverage exceeds the market cap.",
+            );
+            result["execution"] = settlement.clone();
+            result["liquidationPrice"] = settlement;
+        } else {
+            result["execution"] = json!({"status": "voluntary_close"});
+        }
         result["fees"] = unavailable(FEE_UNAVAILABLE);
         let price = Price::new(
-            prices["collateral"].as_str()?,
+            row["collateral"].as_str()?,
             COLLATERAL_ORACLE,
             Some(observed_at),
         )?;
         let schedule = lcd.fees(&pair, height).await?;
-        let notional = &collateral * effective / SCALE;
-        let (_, fees) = base_fees(&schedule, &price, notional, false, false, Some(&collateral))?;
+        let reduced = partial.as_ref().map_or(&collateral, |quote| quote.amount);
+        let notional = reduced * effective / SCALE;
+        let (_, fees) = base_fees(
+            &schedule,
+            &price,
+            notional,
+            false,
+            partial.is_some(),
+            Some(&collateral),
+        )?;
         result["fees"] = fees;
         Some(())
     }
-}
-
-fn publication_time(oracle: &Value) -> Option<u64> {
-    let times = ["base_last_update_time", "quote_last_update_time"]
-        .into_iter()
-        .filter_map(|key| oracle.get(key).filter(|value| !value.is_null()))
-        .map(Value::as_u64);
-    times.collect::<Option<Vec<_>>>()?.into_iter().min()
 }
 
 fn unknown_oracle_time(result: &mut Value) -> Option<()> {

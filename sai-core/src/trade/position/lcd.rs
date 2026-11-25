@@ -2,7 +2,7 @@ use std::sync::LazyLock;
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use chrono::DateTime;
-use hyper::{HeaderMap, header::HeaderValue};
+use hyper::{HeaderMap, StatusCode, header::HeaderValue};
 use regex::Regex;
 use serde_json::{Value, json};
 use url::form_urlencoded::byte_serialize;
@@ -50,14 +50,46 @@ impl Lcd<'_> {
         message: Value,
         read: Read<'_>,
     ) -> Result<(Value, Option<String>), SaiError> {
-        let encoded = STANDARD.encode(message.to_string());
-        let query: String = byte_serialize(encoded.as_bytes()).collect();
-        let contract: String = byte_serialize(contract.as_bytes()).collect();
-        let path = format!("/cosmwasm/wasm/v1/contract/{contract}/smart/{query}");
+        let path = smart_path(contract, &message);
         let missing_cap = message.get("get_pair_custom_max_leverage").is_some();
         self.get(&path, read, missing_cap)
             .await
             .map(|(mut response, height)| (response["data"].take(), height))
+    }
+
+    pub(in crate::trade) async fn leverage_quote_liquidates(
+        &self,
+        contract: &str,
+        message: Value,
+        height: &str,
+    ) -> bool {
+        static LIQUIDATION: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"\bliquidation price reached\. Liq price \d+(?:\.\d+)?, current price \d+(?:\.\d+)?\b")
+                .expect("valid liquidation pattern")
+        });
+        let Ok((status, headers, bytes)) = self
+            .request(&smart_path(contract, &message), Read::At(height))
+            .await
+        else {
+            return false;
+        };
+        if status.is_success()
+            || [HEIGHT, SERVED_HEIGHT].iter().any(|key| {
+                headers
+                    .get(*key)
+                    .is_some_and(|value| value.as_bytes() != height.as_bytes())
+            })
+        {
+            return false;
+        }
+        serde_json::from_slice::<Value>(&bytes)
+            .ok()
+            .and_then(|value| {
+                value["message"]
+                    .as_str()
+                    .map(|message| LIQUIDATION.is_match(message))
+            })
+            .unwrap_or(false)
     }
 
     pub(in crate::trade) async fn position(
@@ -99,21 +131,7 @@ impl Lcd<'_> {
             Regex::new(r"type: cosmwasm_std::math::decimal::Decimal; key: \[[^\]]*\] not found")
                 .expect("valid missing-cap pattern")
         });
-        let mut url = lcd_url(self.0, path)?;
-        if !matches!(read, Read::Snapshot) {
-            url.query_pairs_mut()
-                .append_pair("_sai_query", &Uuid::new_v4().simple().to_string());
-        }
-        let mut headers = HeaderMap::new();
-        if let Read::At(height) = read {
-            headers.insert(
-                HEIGHT,
-                HeaderValue::from_str(height).map_err(|_| read.failure())?,
-            );
-        }
-        let (status, headers, bytes) = keeper::lcd_get(url.as_str(), headers, TIMEOUT)
-            .await
-            .map_err(|_| read.failure())?;
+        let (status, headers, bytes) = self.request(path, read).await?;
         let missing_cap = !status.is_success()
             && missing_cap_is_zero
             && ABSENT_CAP.is_match(&String::from_utf8_lossy(&bytes));
@@ -130,7 +148,6 @@ impl Lcd<'_> {
                 "LCD did not serve the requested contract query height.",
             ));
         }
-        // Apply the group cap only after verifying the block served for the miss.
         if missing_cap {
             return Ok((json!({"data": "0"}), height));
         }
@@ -140,6 +157,35 @@ impl Lcd<'_> {
         }
         Ok((data, height))
     }
+
+    async fn request(
+        &self,
+        path: &str,
+        read: Read<'_>,
+    ) -> Result<(StatusCode, HeaderMap, Vec<u8>), SaiError> {
+        let mut url = lcd_url(self.0, path)?;
+        if !matches!(read, Read::Snapshot) {
+            url.query_pairs_mut()
+                .append_pair("_sai_query", &Uuid::new_v4().simple().to_string());
+        }
+        let mut headers = HeaderMap::new();
+        if let Read::At(height) = read {
+            headers.insert(
+                HEIGHT,
+                HeaderValue::from_str(height).map_err(|_| read.failure())?,
+            );
+        }
+        keeper::lcd_get(url.as_str(), headers, TIMEOUT)
+            .await
+            .map_err(|_| read.failure())
+    }
+}
+
+fn smart_path(contract: &str, message: &Value) -> String {
+    let encoded = STANDARD.encode(message.to_string());
+    let query: String = byte_serialize(encoded.as_bytes()).collect();
+    let contract: String = byte_serialize(contract.as_bytes()).collect();
+    format!("/cosmwasm/wasm/v1/contract/{contract}/smart/{query}")
 }
 
 impl Read<'_> {
