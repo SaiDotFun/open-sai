@@ -319,6 +319,8 @@ def loopback(
     | None = None,
     market_price: float | None = None,
     cancel_target: str | None = None,
+    close_target: str | None = None,
+    lcd_query: bool = False,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -348,9 +350,9 @@ def loopback(
     recorded_markets.append(market)
     collateral = market["collateralToken"]
     trade = {**position, "perpBorrowing": {**borrowing, "collateralToken": collateral}}
-    if scenario == "quote-foreign-keeper-owner":
+    if close_target == "keeper-owner" or scenario == "quote-foreign-keeper-owner":
         trade["trader"] = OTHER_ADDRESS
-    if scenario == "quote-wrong-position-index":
+    if close_target == "keeper-index" or scenario == "quote-wrong-position-index":
         trade["id"] = 8
     status = PROTOCOL["intent_status_response"]["data"]["userIntents"][0]
     if scenario == "mcp-reads":
@@ -369,13 +371,16 @@ def loopback(
     }
     chains = {"unknown-chain": None, "empty-chain": ""}
     chain = chains.get(cancel_target, "cataclysm-1")
+    network = "different-chain" if cancel_target == "missing-contract" else chain
+    enabled = 1 if cancel_target == "non-boolean-route" else True
+    contract = "" if cancel_target == "missing-contract" else CONTRACT
     responses = {
         "oneClickTrading": {
             "data": {
                 "oneClickTrading": {
-                    "enabled": True,
+                    "enabled": enabled,
                     "chainId": chain,
-                    "contractAddress": CONTRACT,
+                    "contractAddress": contract,
                 }
             }
         },
@@ -474,12 +479,17 @@ def loopback(
         "get_trade_raw": {
             "user": (
                 OTHER_ADDRESS
-                if cancel_target == "foreign-owner"
+                if cancel_target in {"foreign-owner", "filled-foreign-owner"}
+                or close_target == "contract-owner"
                 else ADDRESS
                 if cancel_target is not None or pending_order
                 else position["trader"]
             ),
-            "user_trade_index": "UserTradeIndex(7)",
+            "user_trade_index": (
+                "UserTradeIndex(8)"
+                if close_target == "contract-index"
+                else "UserTradeIndex(7)"
+            ),
             "market_index": market_index,
             "collateral_index": token_index,
             "is_open": True,
@@ -544,6 +554,7 @@ def loopback(
                 cancel_trader
                 if scenario in {"pending-order", "concurrent-close"}
                 or cancel_target is not None
+                or close_target is not None
                 else position["trader"]
             ),
             "index": 7,
@@ -957,8 +968,14 @@ def loopback(
             if not self.path.startswith("/"):
                 self.reject("Unexpected external HTTP GET")
                 return
-            path = urlsplit(self.path).path
+            request_url = urlsplit(self.path)
+            path = request_url.path
             if path.startswith(scope):
+                if lcd_query and parse_qs(request_url.query).get("project") != [
+                    "fixture"
+                ]:
+                    self.reject("Missing LCD project query parameter")
+                    return
                 path = path.removeprefix(scope)
                 if overview is not None:
                     try:
@@ -1006,8 +1023,8 @@ def loopback(
                     self.reply(
                         {
                             "default_node_info": {}
-                            if chain is None
-                            else {"network": chain}
+                            if network is None
+                            else {"network": network}
                         }
                     )
                     return
