@@ -135,6 +135,9 @@ fn reported_argv(args: &[String]) -> Vec<String> {
     let mut redact_next = false;
     args.iter()
         .map(|arg| {
+            if std::mem::take(&mut redact_next) {
+                return "[redacted]".into();
+            }
             let (flag, value) = arg
                 .split_once('=')
                 .filter(|(flag, _)| flag.starts_with('-'))
@@ -166,9 +169,7 @@ fn reported_argv(args: &[String]) -> Vec<String> {
                         .iter()
                         .any(|suffix| part.ends_with(suffix))
                 });
-            if std::mem::replace(&mut redact_next, credential && flag.is_none()) {
-                return "[redacted]".into();
-            }
+            redact_next = credential && flag.is_none();
             if credential && let Some(flag) = flag {
                 return format!("{flag}=[redacted]");
             }
