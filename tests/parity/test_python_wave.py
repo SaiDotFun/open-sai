@@ -272,3 +272,36 @@ def test_doctor_lcd_keeps_the_query_after_the_node_info_path(
             assert sum(request.label == "node_info" for request in endpoints.wire) == 1
             assert not endpoints.errors
             assert "project=fixture" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("logging", ["true", "false"])
+@pytest.mark.parametrize("no_fix", [(), ("--no-fix",)], ids=["apply", "no-fix"])
+def test_doctor_preserves_foreign_logs(
+    wave_clis: tuple[str, str], tmp_path: Path, logging: str, no_fix: tuple[str, ...]
+) -> None:
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        root = home / "sai/logs"
+        root.mkdir(parents=True, mode=0o755)
+        (root.parent / "config.toml").write_text('[unrelated]\napp = "notes"\n')
+        notes = root / "notes.txt"
+        notes.write_text("Other application data\n")
+        result = run_cli(
+            binary,
+            home,
+            "--json",
+            "doctor",
+            "--offline",
+            *no_fix,
+            overrides={"SAI_LOG": logging},
+        )
+        assert result.returncode == 0
+        assert stat.S_IMODE(root.stat().st_mode) == 0o755
+        assert list(root.iterdir()) == [notes]
+        [logs] = [
+            check
+            for check in json.loads(result.stdout)["checks"]
+            if check["id"] == "logs"
+        ]
+        assert logs["status"] == "warn"
+        assert "moving the profile to a dedicated directory" in logs["fix"]

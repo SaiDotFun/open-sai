@@ -1,6 +1,6 @@
 use std::{
     fs::{DirBuilder, File, Metadata},
-    io,
+    io::{self, BufRead, BufReader, Read},
     os::unix::fs::{DirBuilderExt, MetadataExt},
     path::{Path, PathBuf},
 };
@@ -311,6 +311,26 @@ impl ProfileDir {
                     has_data |= child.has_data(&fd, &path.join(text), uid, false, None)?;
                 }
                 FileType::RegularFile if self.file(text) => {
+                    if matches!(self, Self::Logs)
+                        && let Some((_, surface)) = log_name(text)
+                    {
+                        let file = open_regular_at(dir, name)?;
+                        let opened = file.metadata().ok()?;
+                        let device: u64 = info.st_dev as _;
+                        if opened.nlink() != 1
+                            || device != opened.dev()
+                            || info.st_ino != opened.ino()
+                        {
+                            return None;
+                        }
+                        let mut line = Vec::new();
+                        BufReader::new(file.take((sai_core::log::MAX_LINE + 1) as u64))
+                            .read_until(b'\n', &mut line)
+                            .ok()?;
+                        if !sai_core::log::recognizes_line(&line, surface) {
+                            return None;
+                        }
+                    }
                     if matches!(self, Self::Trader)
                         && matches!(text, "sessions.json" | "session.json" | "intents.sqlite3")
                     {
@@ -363,6 +383,52 @@ fn dedicated_profile(
     }
     let current = path.symlink_metadata().ok()?;
     same_file(&info, &current).then_some((dir, info))
+}
+
+pub(super) fn diagnostic_log_dir(home: &Path) -> io::Result<Option<File>> {
+    verify_profile_owner(home)?;
+    let root = home.join("logs");
+    let dir = match open_directory(&root) {
+        Ok(dir) => dir,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && matches!(root.symlink_metadata(), Err(error) if error.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let info = dir.metadata()?;
+    require_owner(&dir, &root)?;
+    let private = info.mode() & GROUP_OR_OTHER == 0
+        && Dir::read_from(&dir).is_ok_and(|mut entries| {
+            entries.all(|item| {
+                item.is_ok_and(|item| {
+                    let name = item.file_name();
+                    name.to_str().is_ok_and(|text| {
+                        log_name(text).is_none()
+                            || unix::statat(&dir, name, AtFlags::SYMLINK_NOFOLLOW).is_ok_and(
+                                |stat| {
+                                    !Mode::from_raw_mode(stat.st_mode)
+                                        .intersects(Mode::RWXG | Mode::RWXO)
+                                },
+                            )
+                    })
+                })
+            })
+        })
+        && ProfileDir::Logs
+            .has_data(&dir, &root, info.uid(), false, None)
+            .is_some()
+        && !home.is_symlink()
+        && root
+            .symlink_metadata()
+            .is_ok_and(|current| same_file(&info, &current));
+    if private || dedicated_profile(home, true, Some(("logs", &info))).is_some() {
+        Ok(Some(dir))
+    } else {
+        Err(io::ErrorKind::PermissionDenied.into())
+    }
 }
 
 fn repair_profile_root(path: &Path, apply: bool) -> Option<String> {
@@ -549,6 +615,12 @@ fn io_class(error: &io::Error) -> &'static str {
     }
 }
 
+fn open_regular_at(dir: &File, name: &std::ffi::CStr) -> Option<File> {
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
+    let file = File::from(unix::openat(dir, name, flags, Mode::empty()).ok()?);
+    file.metadata().ok()?.is_file().then_some(file)
+}
+
 fn log_name(name: &str) -> Option<(NaiveDate, &str)> {
     let (surface, date) = name.strip_suffix(".jsonl")?.split_once('-')?;
     if !matches!(surface, "cli" | "mcp" | "update") || date.len() != 10 {
@@ -699,27 +771,41 @@ pub(super) fn logs_check(env: &Environment, fix: bool, (on, keep_days): (bool, V
     let mut changes = Vec::new();
     let check = if loose.is_empty() {
         private()
-    } else if !fix {
-        Check::new(
-            "logs",
-            "warn",
-            format!(
-                "{} under {} readable by other users",
-                plural(loose.len(), "path"),
-                root.display()
-            ),
-        )
-        .fix(loose.iter().map(Loose::fix).collect::<Vec<_>>().join("; "))
     } else {
-        let failed;
-        (changes, failed, _) = tighten(&root, &names, true, |_| true);
+        let (repairs, failed, eligible) = tighten(&root, &names, fix, |opened| {
+            dedicated_profile(&env.home, true, Some(("logs", opened))).is_some()
+        });
+        if fix {
+            changes = repairs.clone();
+        }
         if !failed.is_empty() {
+            let count = failed.len();
+            let guidance = if fix {
+                failed
+            } else {
+                [failed, repairs].concat()
+            };
             Check::new(
                 "logs",
                 "fail",
-                format!("Could not make {} private", plural(failed.len(), "path")),
+                format!("Could not make {} private", plural(count, "path")),
             )
-            .fix(failed.join("; "))
+            .fix(guidance.join("; "))
+        } else if !eligible || !fix {
+            Check::new(
+                "logs",
+                "warn",
+                format!(
+                    "{} under {} readable by other users",
+                    plural(loose.len(), "path"),
+                    root.display()
+                ),
+            )
+            .fix(if eligible {
+                repairs.join("; ")
+            } else {
+                SHARED_HOME_FIX.into()
+            })
         } else if changes.is_empty() {
             private()
         } else {

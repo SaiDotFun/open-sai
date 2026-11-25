@@ -139,10 +139,9 @@ fn short(addr: &str) -> String {
         .map_or_else(|| addr.into(), |(index, _)| format!("{}…", &addr[..index]))
 }
 
-pub(crate) fn safe_log_path(env: &Environment) -> bool {
-    !env.home.is_symlink()
-        && !env.home.join("logs").is_symlink()
-        && files::verify_profile_owner(&env.home).is_ok()
+pub(crate) fn start_log_writer(env: Environment) -> Option<sai_core::log::LogWriter> {
+    let approved = files::diagnostic_log_dir(&env.home).ok()?;
+    sai_core::log::LogWriter::start_doctor_command(env, approved)
 }
 
 impl DoctorArgs {

@@ -224,11 +224,7 @@ fn execute(
     let writer = if command == "logs"
         || command.starts_with("logs ")
         || command == "skill show"
-        || command == "doctor"
-            && (operands.iter().any(|arg| arg == "--no-fix")
-                || environment
-                    .as_ref()
-                    .is_ok_and(|env| !doctor::safe_log_path(env)))
+        || command == "doctor" && operands.iter().any(|arg| arg == "--no-fix")
         || argv
             .iter()
             .any(|flag| matches!(flag.as_str(), "--help" | "--version" | "--skill"))
@@ -236,9 +232,8 @@ fn execute(
         None
     } else {
         let start = match command {
-            "doctor" | "mcp install" | "mcp list" | "mcp uninstall" => {
-                LogWriter::start_diagnostic_command
-            }
+            "doctor" => doctor::start_log_writer,
+            "mcp install" | "mcp list" | "mcp uninstall" => LogWriter::start_diagnostic_command,
             _ => LogWriter::start_command,
         };
         environment
