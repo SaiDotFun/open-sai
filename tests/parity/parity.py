@@ -529,6 +529,14 @@ def observe(
             endpoints.near_expiry: "<fixture-near-expiry>",
             endpoints.overview_expiry: "<fixture-overview-expiry>",
         }
+    if fixture_values is not None and case.command == "doctor":
+        # Doctor reports both its own checkout and the launcher found on PATH.
+        # Match the known fixture paths before the enclosing checkout path.
+        fixture_values[str(Path(sys.executable).with_name("sai"))] = "<fixture-sai>"
+        checkout = Path(binary[0]).parent.parent.parent
+        if (checkout / ".git").exists():
+            fixture_values[str(checkout)] = "<checkout>"
+        fixture_values[str(ROOT)] = "<checkout>"
     normalize = Normalize(
         home,
         concurrent=concurrent,

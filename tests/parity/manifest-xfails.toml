@@ -115,31 +115,31 @@ signature = "078abdf11a54e0c206de0e3b0bde8f5b154dee3320655fefeda9170917697233"
 
 [gap."case:doctor-lcd-chain-mismatch"]
 owner = "#211"
-signature = "0c0f85f4820fd9d394dff28d62256abbabe8fb67bea82b3599be93bdcf38de6d"
+signature = "2082573983cff770794cb60ce57e2dababd318a74693e293178dc4cc352b2926"
 
 [gap."case:doctor-lcd-chain-mismatch-text"]
 owner = "#211"
-signature = "b09f6066667a36ff4e0431c13330d86dcf969455e7915c5b84f70dbba846ed19"
+signature = "f09702091699be1f947c44c19522c39dc45bf167a71635c00ce0014f2f5bf47c"
 
 [gap."case:doctor-lcd-invalid-chain"]
 owner = "#211"
-signature = "0a354645903e0f34a1d63c94f765515570bb86123627a6e9967de369c672e33c"
+signature = "ef74f114f6b10c758c1f40a90e3896ce0f52851fe0de807a6ce871cde59792ad"
 
 [gap."case:doctor-lcd-invalid-chain-text"]
 owner = "#211"
-signature = "d704a23ec577c288adb7605eac8de0704e37909922f1934d7ec697aa95eaf635"
+signature = "73798d5a2488dbde76b7330ef883b477219b1a0ea7cb4a578815e57f5d62e1e7"
 
 [gap."case:doctor-lcd-unknown-keeper-chain"]
 owner = "#211"
-signature = "46b638d18554b143f596a479d36d5fd6a2a42afbaa4dc9c68167c007ad4490df"
+signature = "5516cd5c6a3f5ef6737d30587ee031d41e8b9a75f85abc812b4b09854024fd93"
 
 [gap."case:doctor-lcd-unreachable"]
 owner = "#211"
-signature = "a8fd22dc523fc7087c90ddced080ea18d1f840ecf235f3be47f73d523b08b813"
+signature = "e89776421542f4ddf2a48f6a82e20cab76fb1e93c29a3892bd4a0debe510699c"
 
 [gap."case:doctor-lcd-unreachable-text"]
 owner = "#211"
-signature = "ce938f78447602c91a97a663a581b0de6da9ed306203a4675b0f476ee0cb5bd2"
+signature = "3e476fa3f4019263ec8af793a32071bcba49c304cd80814f359fd10cbf5a0262"
 
 [gap."case:doctor-mcp-codex-shadow"]
 owner = "#211"
@@ -167,7 +167,7 @@ signature = "c7f7cd648cd9c16a4553258622452ee81e30b34945a0f4a354827aad7f1c7286"
 
 [gap."case:doctor-network"]
 owner = "#211"
-signature = "74ff1c775646eac26bf6c5b921b0c448912a0d1f39f4580a2ec3dc1879753336"
+signature = "49dce87a5337cafea1d023ac1e771bfba56cf969dde7017e9150c2263ee34e4c"
 
 [gap."case:doctor-network-with-logging"]
 owner = "#211"
