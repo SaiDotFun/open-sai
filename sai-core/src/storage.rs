@@ -1,8 +1,6 @@
 use std::{
-    fs::{self, File, OpenOptions},
-    io,
+    fs, io,
     net::Ipv6Addr,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -255,18 +253,6 @@ impl<'a> Storage<'a> {
         paths::managed(&self.trader)?;
         Ok(&self.trader)
     }
-}
-
-fn private_file(path: &Path) -> io::Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .mode(0o600)
-        .open(path)?;
-    file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    Ok(file)
 }
 
 fn remove_if_exists(path: &Path) -> io::Result<()> {
