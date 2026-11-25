@@ -19,16 +19,6 @@ with Path(__file__).with_name("cases.toml").open("rb") as manifest:
         or case["name"] == "account-balances-missing-address"
     ]
 
-# Remove these exceptions when the underlying Rust commands land.
-UNPORTED = {
-    ("logs",): 126,
-    ("skill",): 126,
-    ("logs", "intent"): 126,
-    ("logs", "run"): 126,
-    ("trade", "margin"): 118,
-    ("trade", "partial-close"): 118,
-}
-
 
 def invoke(binary: str, home: Path, *args: str) -> subprocess.CompletedProcess[str]:
     home.mkdir(exist_ok=True)
@@ -72,8 +62,6 @@ def test_bare_leaf_prints_full_help_and_json_usage(
     for label, binary in zip(("python", "rust"), binaries, strict=True):
         home = tmp_path / label
         help_result = invoke(binary, home, *args, "--help")
-        if label == "rust" and args in UNPORTED and help_result.returncode == 2:
-            pytest.skip(f"Requires Rust PR #{UNPORTED[args]}")
         bare = invoke(binary, home, *args)
         machine = invoke(binary, home, "--json", *args)
 
@@ -109,8 +97,6 @@ def test_bare_group(binaries: tuple[str, str], tmp_path: Path, group: str) -> No
     for label, binary in zip(("python", "rust"), binaries, strict=True):
         home = tmp_path / label
         help_result = invoke(binary, home, group, "--help")
-        if label == "rust" and (group,) in UNPORTED and help_result.returncode == 2:
-            pytest.skip(f"Requires Rust PR #{UNPORTED[group,]}")
         assert help_result.returncode == 0
         assert help_result.stderr == "" and f"Usage: sai {group}" in help_result.stdout
 
@@ -149,8 +135,6 @@ def test_root_help_and_json_usage(binaries: tuple[str, str], tmp_path: Path) -> 
 def test_bare_root_starts_repl(binaries: tuple[str, str], tmp_path: Path) -> None:
     for label, binary in zip(("python", "rust"), binaries, strict=True):
         home = tmp_path / label
-        if label == "rust" and invoke(binary, home, "logs", "--help").returncode == 2:
-            pytest.skip("Requires Rust REPL PR #126")
         bare = invoke(binary, home)
         assert bare.returncode == 0
         assert bare.stderr == ""
