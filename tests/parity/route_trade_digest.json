@@ -1,0 +1,23 @@
+{
+  "pythonReference": "b777fe836d1ac57148606edb2c97177b66543b7a",
+  "cases": [
+    {
+      "kind": "OPEN_TRADE",
+      "original": "7675ab21f46aba3ca98861fbeb7458fd2b29dccb060da81cd1f7a0357596571e",
+      "chain": "b777e986892e1931b84f2f2224f65c72f96d06519e82b75ecbb192ab2e64cf5c",
+      "contract": "2cf4fc6243682297d91b3cba150281b086c831e5fff47bc8996831a79d0b6ff6"
+    },
+    {
+      "kind": "CLOSE_POSITION",
+      "original": "1c0011c3e387248d4a3908c36817b5f5f047593e6de7b848bd428c5357e0fbab",
+      "chain": "4ebf13aaaab2e1b1fa8daeee3e46ce4aa0ed85c68d4ba87376e496413a64701a",
+      "contract": "32dfcd5e0f1e64593ae44bc3ba2aaa85fd48a66c5729270169551d3ea76b44ed"
+    },
+    {
+      "kind": "CANCEL_PENDING_TRADE",
+      "original": "efd93f5418f195be7f3a2ce6436a04a7bab74fa2f0e6caae0319bdc4dcf9a622",
+      "chain": "487331d844229b445704c0e5b5a96d693669cfe9ccff50719dad370cb1469172",
+      "contract": "af7510fb53573f31fbc54785c830ad5dd89ff4476bb699dd9244bf2562f882df"
+    }
+  ]
+}

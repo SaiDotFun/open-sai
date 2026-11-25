@@ -14,6 +14,8 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+use crate::endpoint::append_path;
+
 use super::{
     ProbeEndpoint, check_transport,
     stream::{
@@ -31,8 +33,9 @@ pub async fn lcd_network(
     const NODE_INFO: &str = "/cosmos/base/tendermint/v1beta1/node_info";
     const UNREADABLE: &str = "Unable to read contract state";
     check_transport(endpoint, ProbeEndpoint::Lcd)?;
-    let url = format!("{}{NODE_INFO}", endpoint.trim_end_matches('/'));
-    let (status, _, bytes) = transport::get(&url, hyper::HeaderMap::new(), timeout)
+    let mut url = Url::parse(endpoint).map_err(|_| UNREADABLE)?;
+    append_path(&mut url, NODE_INFO);
+    let (status, _, bytes) = transport::get(url.as_str(), hyper::HeaderMap::new(), timeout)
         .await
         .map_err(|_| UNREADABLE)?;
     if !status.is_success() {
