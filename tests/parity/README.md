@@ -248,6 +248,19 @@ before skipping. For the same check locally, set `SAI_PARITY_MAIN_BIN` to
 the executable built from `main`. A missing shipped adapter or an MCP
 stub that changes the ledger or touches Keeper's mutation fails the case.
 
+## Bare Command Help
+
+`test_bare_command_parity.py` uses the checkout's Python launcher. The
+reference is Python main at `b1f25029d5bb11182a3d7ccfb9f3dfa206b57bed`.
+The manifest covers every leaf reported by Python's `required_commands`
+helper. The test checks that bare text matches the same executable's
+`--help`, with stderr and exit 2, and that both executables return the same
+JSON usage error.
+
+Run `uv run --locked pytest tests/parity/test_bare_command_parity.py` with
+`SAI_PARITY_BIN` set to the Rust binary. The REPL, logs, and skill cases
+require PR #126. The margin and partial-close cases require PR #118.
+
 ## Doctor and MCP Registration Reference
 
 The C9a cases compare against Python main at

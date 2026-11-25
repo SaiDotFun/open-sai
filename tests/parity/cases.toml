@@ -1097,6 +1097,132 @@ args = ["watch","--help"]
 mode = "text"
 
 [[case]]
+name = "bare-help-account-history"
+args = ["account", "history"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-account-positions"
+args = ["account", "positions"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-auth-login"
+args = ["auth", "login"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-auth-use"
+args = ["auth", "use"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-config-get"
+args = ["config", "get"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-config-set"
+args = ["config", "set"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-config-unset"
+args = ["config", "unset"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-intent-local"
+args = ["intent", "local"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-intent-status"
+args = ["intent", "status"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-intent-wait"
+args = ["intent", "wait"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-logs-intent"
+args = ["logs", "intent"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-logs-run"
+args = ["logs", "run"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-trade-close"
+args = ["trade", "close"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-trade-leverage"
+args = ["trade", "leverage"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-trade-margin"
+args = ["trade", "margin"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-trade-open"
+args = ["trade", "open"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-trade-partial-close"
+args = ["trade", "partial-close"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-trade-tpsl"
+args = ["trade", "tpsl"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-watch-balances"
+args = ["watch", "balances"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-watch-positions"
+args = ["watch", "positions"]
+mode = "text"
+expect = 2
+
+[[case]]
+name = "bare-help-watch-price"
+args = ["watch", "price"]
+mode = "text"
+expect = 2
+
+[[case]]
 name = "account-balances-missing-address"
 args = ["account","balances"]
 mode = "text"

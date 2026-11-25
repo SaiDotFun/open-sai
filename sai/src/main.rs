@@ -348,7 +348,7 @@ fn usage(command: &str) -> String {
         "intent status" | "intent local" | "auth use" | "account positions" | "account history"
         | "account balances" | "watch positions" | "watch balances" => " ADDR",
         "watch price" => " TOKEN_ID",
-        "trade close" | "trade cancel" => " TRADE_ID",
+        "trade close" | "trade cancel" | "trade leverage" | "trade tpsl" => " TRADE_ID",
         "intent wait" => " KEY",
         "auth logout" | "auth renew" => " [ADDR]",
         "" => " [COMMAND] [ARGS]...",
@@ -510,8 +510,16 @@ fn usage_error(error: &clap::Error, command: &str, operands: &[String]) -> Optio
             let Some(ContextValue::Strings(args)) = error.get(ContextKind::InvalidArg) else {
                 return None;
             };
-            let first = args.first()?.trim_matches(['<', '>']);
-            format!("Missing argument {}.", repr(first))
+            // Click reports an omitted positional argument before defaulted options.
+            if let Some(positional) = args.iter().find(|arg| arg.starts_with('<')) {
+                format!(
+                    "Missing argument {}.",
+                    repr(positional.trim_matches(['<', '>']))
+                )
+            } else {
+                let option = args.first()?.split_whitespace().next()?;
+                format!("Missing option {}.", repr(option))
+            }
         }
         ErrorKind::InvalidValue => {
             let argument = arg?.split(' ').next()?;
@@ -562,6 +570,14 @@ fn positional<'a>(operands: &'a [String], command: &str) -> Vec<&'a str> {
     positional
 }
 
+fn clap_help(command: &str) -> Option<String> {
+    let args = std::iter::once("sai")
+        .chain(command.split_whitespace())
+        .chain(std::iter::once("--help"));
+    let help = Cli::command().try_get_matches_from(args).err()?;
+    (help.kind() == ErrorKind::DisplayHelp).then(|| help.to_string().trim_end_matches('\n').into())
+}
+
 fn print_parse_error(
     error: &clap::Error,
     command: &str,
@@ -588,35 +604,18 @@ fn print_parse_error(
             let _ = error.print();
             return (ExitCode::Ok, None);
         }
-        ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand | ErrorKind::MissingSubcommand => {
-            if command == "intent wait" && json {
-                return complete(
-                    Err(SaiError::usage("Missing argument 'KEY'.")),
-                    Some(command),
-                    true,
-                    home,
-                );
-            }
-            if matches!(
-                command,
-                "config" | "intent" | "intent wait" | "auth" | "market" | "account" | "watch"
-            ) && let Some(help) = help()
-            {
-                let error = SaiError::usage(help);
-                if json || matches!(command, "market" | "account" | "watch") {
-                    return complete(Err(error), Some(command), json, home);
-                }
-                eprintln!("{}", error.message);
-                return (ExitCode::Usage, Some(error));
+        ErrorKind::MissingSubcommand if !command.is_empty() && operands.is_empty() => {
+            let message = if command == "auth" {
+                Some("Invalid arguments to auth.".into())
+            } else {
+                help().or_else(|| clap_help(command))
+            };
+            if let Some(message) = message {
+                return complete(Err(SaiError::usage(message)), Some(command), json, home);
             }
         }
         ErrorKind::MissingRequiredArgument if !json && operands.is_empty() => {
-            let command_help = if matches!(command, "auth login" | "auth use") {
-                auth::help(command)
-            } else {
-                reads::help(command)
-            };
-            if let Some(help) = command_help {
+            if let Some(help) = help().or_else(|| clap_help(command)) {
                 eprintln!("{help}");
                 return (ExitCode::Usage, None);
             }
