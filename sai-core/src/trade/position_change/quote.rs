@@ -335,7 +335,7 @@ mod tests {
         let confirmation = |leverage| {
             let raw = json!({"collateral_amount": "10000000", "leverage": leverage});
             let effective = ContractDecimal::parse(&raw["leverage"]).unwrap();
-            let delta = reduction(&raw, 50, &json!(1)).unwrap();
+            let delta = reduction(&raw, 50).unwrap();
             let inputs = json!({
                 "marketIndex": "MarketIndex(3)",
                 "collateralIndex": "TokenIndex(1)",
