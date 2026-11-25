@@ -10,6 +10,12 @@ from typing import Any
 
 from .preview import close_oracle_time_unknown, rejection_reason
 
+PARTIAL_CLOSE_PRICE_FIELDS = {
+    "collateralPriceUsd",
+    "closedNotionalUsd",
+    "closedNotionalIsEstimate",
+}
+
 
 def canonical_price(value: object) -> str:
     """Write numerically equal prices as equal text."""
@@ -37,7 +43,16 @@ def digest_material(preview: dict[str, Any]) -> dict[str, Any]:
             canonical_price(reference) if reference is not None else None
         )
     if "quote" in preview:
-        material["quote"] = preview["quote"]
+        quote = preview["quote"]
+        if intent.get("kind") == "DECREASE_POSITION_SIZE":
+            # The estimate flag also depends on price availability. The
+            # effective leverage is bound separately.
+            quote = {
+                key: value
+                for key, value in quote.items()
+                if key not in PARTIAL_CLOSE_PRICE_FIELDS
+            }
+        material["quote"] = quote
     if "positionRoute" in preview:
         material["positionRoute"] = preview["positionRoute"]
     return material

@@ -14,6 +14,7 @@ from typing import Any
 
 from . import intents, keeper, margin, partial
 from . import preview as estimates
+from .confirmation import digest_material
 from .errors import Code, SaiError
 
 SessionLoader = Callable[[], dict[str, str]]
@@ -623,7 +624,7 @@ def _position_preview(
                 f"{changed_message}. Could not quote the latest position. {exc}"
             ) from exc
         rechecked = verify_replacement(state, inputs)
-    if changed or fresh != preview:
+    if changed or digest_material(fresh) != digest_material(preview):
         _attach_estimates(fresh, estimate(state, inputs, fresh, rechecked))
         raise PositionChanged(changed_message, {**fresh, "addr": addr})
     _checked(
