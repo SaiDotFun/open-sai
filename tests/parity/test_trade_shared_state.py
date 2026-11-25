@@ -444,6 +444,24 @@ def trade_help(home: Home, runner: Runtime, action_name: str) -> str:
     return help_text
 
 
+def supports_trade_wait(home: Home, runner: Runtime, command: str) -> bool:
+    # Shared help follows Python. Probe the parser without supplying a trade.
+    error = home.json(runner, "trade", command, "--wait", code=2)["error"]
+    if runner.rust and error["message"] == "No such option.":
+        if (main := runner.main) is not None:
+            assert not supports_trade_wait(home, main, command), (
+                f"Rust candidate dropped shipped trade {command} --wait"
+            )
+        return False
+    missing = (
+        "Missing option '--market'."
+        if command == "open"
+        else "Missing argument 'TRADE_ID'."
+    )
+    assert error["message"] == missing, error
+    return True
+
+
 def assert_blocked(result: subprocess.CompletedProcess[str], key: str) -> None:
     assert result.returncode == 1 and not result.stderr, result
     failure = json.loads(result.stdout)["error"]
@@ -538,7 +556,7 @@ def test_trade_wait_replays_pending_then_receipt(
         required_wait = action_name in ("tpsl", "leverage")
         if not required_wait:
             trade_help(home, writer, action_name)
-        if command_help(home, writer, "trade", action.args[0], "--wait") is None:
+        if not supports_trade_wait(home, writer, action.args[0]):
             reference = f"{REPO_URL}/{WAIT_REASONS[action_name]}"
             if required_wait:
                 pytest.fail(
