@@ -446,19 +446,35 @@ assert session["expiresAt"] == "2000-01-01T00:00:00+00:00"
     let damaged_home = tempdir().unwrap();
     let damaged_trader = damaged_home.path().join("trader");
     fs::create_dir(&damaged_trader).unwrap();
-    let envelope = home.path().join("trader/sessions.json");
-    let mut damaged: Value = serde_json::from_slice(&fs::read(envelope).unwrap()).unwrap();
-    damaged["ciphertext"] = Value::String("AAAA".into());
-    let damaged_envelope = damaged_trader.join("sessions.json");
-    fs::write(&damaged_envelope, serde_json::to_vec(&damaged).unwrap()).unwrap();
-    fs::set_permissions(damaged_envelope, fs::Permissions::from_mode(0o600)).unwrap();
-    let result = uv(damaged_home.path())
-        .args(["python", "-c", read_session, ADDR, ENDPOINT])
-        .output()
-        .unwrap();
-    assert!(
-        !result.status.success(),
-        "Python accepted a damaged session"
+    fs::copy(
+        home.path().join("trader/sessions.json"),
+        damaged_trader.join("sessions.json"),
+    )
+    .unwrap();
+    write_cli_fixture(
+        damaged_home.path(),
+        r#"
+import base64
+import json
+from cryptography.exceptions import InvalidTag
+from sai_cli.core.storage import SIGN_IN_AGAIN, directory, load_session
+
+path = directory() / "sessions.json"
+envelope = json.loads(path.read_text())
+ciphertext = bytearray(base64.b64decode(envelope["ciphertext"], validate=True))
+ciphertext[-1] ^= 1
+envelope["ciphertext"] = base64.b64encode(ciphertext).decode()
+path.write_text(json.dumps(envelope))
+
+try:
+    load_session()
+except ValueError as exc:
+    assert str(exc) == f"Cannot unlock session; {SIGN_IN_AGAIN}"
+    assert isinstance(exc.__cause__, InvalidTag)
+else:
+    raise AssertionError("Python accepted a damaged session")
+"#,
+        &[],
     );
     let mut python = uv(home.path());
     python.arg("sai");
