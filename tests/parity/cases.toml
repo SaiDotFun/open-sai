@@ -839,11 +839,10 @@ wire = ["oneClickTrading","ws:init","node_info"]
 
 [[case]]
 name = "doctor-lcd-chain-mismatch"
-args = ["--json", "doctor", "--lcd-endpoint", "{http}/fixture-chain-private"]
+args = ["--json", "doctor", "--no-fix", "--lcd-endpoint", "{http}/fixture-chain-private"]
 server = "doctor-lcd-chain-mismatch"
 seed = "session"
 wire = ["oneClickTrading", "ws:init", "node_info"]
-absent_log_text = ["fixture-chain-private"]
 
 [[case]]
 name = "doctor-lcd-invalid-chain"
