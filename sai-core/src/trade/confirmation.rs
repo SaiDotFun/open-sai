@@ -5,7 +5,7 @@ use regex::Regex;
 use serde_json::{Map, json};
 use sha2::{Digest, Sha256};
 
-use super::TradePreview;
+use super::{TradePreview, position::PositionRoute};
 use crate::errors::{Code, SaiError};
 
 const NEEDS_DIGEST: &str = "preview_digest is required: call the matching preview_* tool, show the user the preview, get confirmation, then pass its previewDigest";
@@ -14,7 +14,7 @@ const MISMATCH: &str = "The trade no longer matches the preview the user confirm
 /// Preview confirmation supplied by a caller that requires an explicit digest.
 pub struct Confirmation<'a> {
     digest: &'a str,
-    reference_price: Option<(&'a str, u128)>,
+    reference_price: Option<(&'a str, BigUint)>,
 }
 
 impl<'a> Confirmation<'a> {
@@ -23,7 +23,9 @@ impl<'a> Confirmation<'a> {
             return Err(SaiError::new(Code::InvalidRequest, NEEDS_DIGEST));
         }
         let reference_price = reference_price
-            .map(|price| positive_decimal(price, "Reference price").map(|units| (price, units)))
+            .map(|price| {
+                reference_price_units(price, "Reference price").map(|units| (price, units))
+            })
             .transpose()?;
         Ok(Self {
             digest,
@@ -31,10 +33,39 @@ impl<'a> Confirmation<'a> {
         })
     }
 
-    pub(super) fn verify(self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
+    fn verify_digest(&self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
+        if !self.digest_matches(preview, account)? {
+            return Err(refusal(
+                preview,
+                account,
+                Code::PreviewMismatch,
+                MISMATCH.into(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_route_digest(
+        &self,
+        preview: &TradePreview,
+        account: &str,
+        route: &PositionRoute,
+    ) -> Result<(), SaiError> {
+        let mut current = preview.clone();
+        current.position_route = Some(route.clone());
+        if self.digest_matches(&current, account)? {
+            return Ok(());
+        }
+        Err(SaiError::new(
+            Code::PreviewMismatch,
+            "The trade no longer matches the preview the user confirmed. Request a fresh preview before submitting.",
+        ))
+    }
+
+    fn digest_matches(&self, preview: &TradePreview, account: &str) -> Result<bool, SaiError> {
         match (
             preview.requires_market_price_refresh(),
-            self.reference_price,
+            self.reference_price.as_ref(),
         ) {
             (true, None) => {
                 return Err(SaiError::new(
@@ -51,23 +82,18 @@ impl<'a> Confirmation<'a> {
             _ => {}
         }
         let mut confirmed = preview.clone();
-        if let Some((reference, _)) = self.reference_price {
-            confirmed.reference_price = Some(reference.into());
+        if let Some((reference, _)) = &self.reference_price {
+            confirmed.reference_price = Some((*reference).into());
         }
-        let refusal = |code, message: String| SaiError {
-            details: Some(Box::new(Map::from_iter([(
-                "preview".into(),
-                preview.confirmed_output(Some(account)),
-            )]))),
-            ..SaiError::new(code, message)
-        };
-        if preview_digest(&confirmed, Some(account)) != self.digest {
-            return Err(refusal(Code::PreviewMismatch, MISMATCH.into()));
-        }
+        Ok(preview_digest(&confirmed, Some(account)) == self.digest)
+    }
+
+    pub(super) fn verify(self, preview: &TradePreview, account: &str) -> Result<(), SaiError> {
+        self.verify_digest(preview, account)?;
         if let (Some((_, reference)), Some(current)) =
-            (self.reference_price, &preview.reference_price)
+            (&self.reference_price, &preview.reference_price)
         {
-            let current = positive_decimal(current, "Current price")?;
+            let current = reference_price_units(current, "Current price")?;
             let slippage = preview.intent.body["maxSlippagePct"]
                 .as_str()
                 .ok_or_else(SaiError::internal)?;
@@ -76,11 +102,17 @@ impl<'a> Confirmation<'a> {
             } else {
                 positive_decimal(slippage, "Slippage")?
             };
-            let moved = BigUint::from(current.abs_diff(reference)) * 100u32;
-            let reference = BigUint::from(reference);
-            if &moved * SCALE > &reference * allowed {
-                let moved = display_movement(moved, reference);
+            let distance = if &current >= reference {
+                current - reference
+            } else {
+                reference - current
+            };
+            let moved = distance * 100u32;
+            if &moved * SCALE > reference * allowed {
+                let moved = display_movement(moved, reference.clone());
                 return Err(refusal(
+                    preview,
+                    account,
                     Code::PriceMoved,
                     format!(
                         "The market price moved {moved}% from the confirmed referencePrice, more than the {slippage}% slippage, so nothing was submitted. Show the user this new preview, get their confirmation again, then retry with its previewDigest and referencePrice."
@@ -92,23 +124,53 @@ impl<'a> Confirmation<'a> {
     }
 }
 
+fn refusal(preview: &TradePreview, account: &str, code: Code, message: String) -> SaiError {
+    SaiError {
+        details: Some(Box::new(Map::from_iter([(
+            "preview".into(),
+            preview.confirmed_output(Some(account)),
+        )]))),
+        ..SaiError::new(code, message)
+    }
+}
+
 const SCALE: u128 = 10u128.pow(18);
 
-/// Parse a positive plain decimal into contract units with 18 fractional digits.
-pub fn positive_decimal(value: &str, name: &str) -> Result<u128, SaiError> {
+fn decimal_parts(value: &str) -> Option<(&str, &str)> {
     static PLAIN: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"\A(?:0|[1-9][0-9]*)(?:\.[0-9]{1,18})?\z").expect("valid decimal pattern")
     });
-    let invalid = || {
-        SaiError::new(
-            Code::InvalidRequest,
-            format!("{name} must be a positive finite decimal"),
-        )
-    };
-    if !PLAIN.is_match(value) {
-        return Err(invalid());
-    }
-    let (whole, fraction) = value.split_once('.').unwrap_or((value, ""));
+    PLAIN
+        .is_match(value)
+        .then(|| value.split_once('.').unwrap_or((value, "")))
+}
+
+fn invalid_price(name: &str) -> SaiError {
+    SaiError::new(
+        Code::InvalidRequest,
+        format!("{name} must be a positive finite decimal"),
+    )
+}
+
+pub(super) fn reference_price_units(value: &str, name: &str) -> Result<BigUint, SaiError> {
+    // Python checks Decimal(price) * 10**18 with 28 significant digits and
+    // round-half-even. This is the last integer that rounds within u128::MAX.
+    static PYTHON_REFERENCE_MAX: LazyLock<BigUint> = LazyLock::new(|| {
+        BigUint::parse_bytes(b"340282366920938463463374607450000000000", 10)
+            .expect("valid reference price limit")
+    });
+    let (whole, fraction) = decimal_parts(value)
+        .filter(|(whole, _)| whole.len() <= 21)
+        .ok_or_else(|| invalid_price(name))?;
+    let units = format!("{whole}{fraction:0<18}");
+    BigUint::parse_bytes(units.as_bytes(), 10)
+        .filter(|units| units.bits() != 0 && units <= &*PYTHON_REFERENCE_MAX)
+        .ok_or_else(|| invalid_price(name))
+}
+
+/// Parse a positive plain decimal into contract units with 18 fractional digits.
+pub fn positive_decimal(value: &str, name: &str) -> Result<u128, SaiError> {
+    let (whole, fraction) = decimal_parts(value).ok_or_else(|| invalid_price(name))?;
     let whole = whole
         .parse::<u128>()
         .ok()
@@ -117,7 +179,7 @@ pub fn positive_decimal(value: &str, name: &str) -> Result<u128, SaiError> {
     whole
         .and_then(|whole| whole.checked_add(fraction))
         .filter(|&units| units != 0)
-        .ok_or_else(invalid)
+        .ok_or_else(|| invalid_price(name))
 }
 
 fn display_movement(moved: BigUint, reference: BigUint) -> String {
@@ -132,12 +194,18 @@ fn display_movement(moved: BigUint, reference: BigUint) -> String {
     format!("{whole}.{fraction}")
 }
 
-fn canonical_price(price: &str) -> &str {
-    if price.contains('.') {
-        price.trim_end_matches('0').trim_end_matches('.')
-    } else {
-        price
+fn canonical_price(price: &str) -> String {
+    let (whole, fraction) = price.split_once('.').unwrap_or((price, ""));
+    let digits = format!("{whole}{fraction}");
+    let significant = digits.trim_start_matches('0');
+    let point = significant.len() as i64 - fraction.len() as i64;
+    if significant.is_empty() {
+        return "0".into();
     }
+    if !significant.bytes().all(|byte| byte.is_ascii_digit()) {
+        return price.into();
+    }
+    plain_decimal(significant.trim_end_matches('0'), point)
 }
 
 pub(super) fn plain_decimal(significant: &str, point: i64) -> String {
@@ -219,16 +287,31 @@ mod tests {
             if kind == "CLOSE_POSITION" {
                 preview.close_owner_verified = Some(true);
             }
+            if let Some(route) = input.get("positionRoute") {
+                preview.position_route = Some(crate::trade::position::PositionRoute {
+                    chain_id: route["chainId"].as_str().unwrap().into(),
+                    contract_address: route["contractAddress"].as_str().unwrap().into(),
+                });
+            }
             let account = input["addr"].as_str();
             assert_eq!(
                 digest_bytes(&preview, account),
                 case["canonical"].as_str().unwrap().as_bytes()
             );
             assert_eq!(
-                preview.confirmed_output(account)["previewDigest"],
-                case["digest"]
+                preview_digest(&preview, account),
+                case["digest"].as_str().unwrap()
             );
         }
+    }
+
+    #[test]
+    fn confirmation_reference_matches_python_at_the_decimal_limit() {
+        let accepted = "340282366920938463463.374607450000000000";
+        let rejected = "340282366920938463463.374607450000000001";
+        assert!(Confirmation::new("fixture", Some(accepted)).is_ok());
+        assert!(Confirmation::new("fixture", Some(rejected)).is_err());
+        assert!(positive_decimal(accepted, "Price").is_err());
     }
 
     #[test]

@@ -50,7 +50,7 @@ impl Trading<'_> {
             match quote.await {
                 Ok(result) => result.unwrap_or_else(unknown),
                 Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
-                Err(SnapshotError::Unavailable) => unknown(),
+                Err(SnapshotError::IndexMismatch | SnapshotError::Unavailable) => unknown(),
             }
         } else {
             unknown()
