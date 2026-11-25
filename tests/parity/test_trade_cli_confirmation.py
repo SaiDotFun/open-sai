@@ -562,7 +562,8 @@ def test_verified_close_refuses_unconfirmable_oracle(
             assert (code, stderr) == (0, "")
             assert "previewDigest" not in preview
             assert not endpoints.errors
-        with loopback(scenario) as endpoints:
+        replay = TradeReplay()
+        with loopback(scenario, trade_replay=replay) as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
             code, result, stderr = run(
@@ -578,7 +579,8 @@ def test_verified_close_refuses_unconfirmable_oracle(
                 "",
             )
             assert "previewDigest" not in result["error"]["details"]["preview"]
-            assert not (home / "sai/trader/intents.sqlite3").exists()
+            assert not replay.attempts()
+            assert not rows(home)
             assert not endpoints.errors
             refusals.append(result)
     assert refusals[0] == refusals[1]

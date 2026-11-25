@@ -708,6 +708,13 @@ async fn confirmed_core_close_checks_oracle_age_before_reserving() {
         state.stale_oracle = true;
     }
 
+    let stale = trading
+        .confirmed_trade_preview(&session, preview.clone())
+        .await
+        .unwrap();
+    assert_eq!(stale["estimates"]["execution"]["code"], "OraclePriceStale");
+    assert!(stale.get("previewDigest").is_none());
+
     let error = trading
         .submit(
             &session,
@@ -727,6 +734,27 @@ async fn confirmed_core_close_checks_oracle_age_before_reserving() {
         error.details.unwrap()["preview"]["estimates"]["execution"]["code"],
         "OraclePriceStale"
     );
+
+    let mismatch = trading
+        .submit(
+            &session,
+            &preview,
+            SubmitOptions {
+                confirmation: Some(Confirmation::new(&"0".repeat(64), None).unwrap()),
+                ..Default::default()
+            },
+        )
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(mismatch.code, Code::PreviewMismatch);
+    let details = mismatch.details.unwrap();
+    let replacement = &details["preview"];
+    assert_eq!(
+        replacement["estimates"]["execution"]["code"],
+        "OraclePriceStale"
+    );
+    assert!(replacement.get("previewDigest").is_none());
     assert!(!server.requests().iter().any(|label| label == "admission"));
     assert!(!home.path().join("trader/intents.sqlite3").exists());
 }
