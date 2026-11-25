@@ -44,6 +44,33 @@ def run_cli(
     )
 
 
+def test_auth_logs_omit_rejected_root_operands(
+    wave_clis: tuple[str, str], tmp_path: Path
+) -> None:
+    marker = "synthetic-rejected-auth-operand"
+    for index, binary in enumerate(wave_clis):
+        home = tmp_path / str(index)
+        home.mkdir()
+        result = run_cli(
+            binary,
+            home,
+            "--",
+            "--as",
+            marker,
+            "auth",
+            "use",
+            overrides={"SAI_LOG": "true"},
+        )
+        assert result.returncode == 2
+        assert not result.stdout
+        assert "Invalid arguments to auth." in result.stderr
+        log = "".join(path.read_text() for path in (home / "sai/logs").glob("*.jsonl"))
+        assert marker not in result.stderr + log
+        events = [json.loads(line) for line in log.splitlines()]
+        [start] = [event for event in events if event["event"] == "command.start"]
+        assert start["argv"] == []
+
+
 @pytest.mark.parametrize(
     "command",
     [("config", "list"), ("mcp", "serve"), ("doctor", "--offline", "--no-fix")],
