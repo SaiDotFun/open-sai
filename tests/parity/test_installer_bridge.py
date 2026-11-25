@@ -114,7 +114,7 @@ class Replay:
                             {"tag_name": "other/v99.0.0"},
                             {"tag_name": "sai-cli/v99.0.0-rc.1", "prerelease": True},
                             *(
-                                {"tag_name": f"sai-cli/v{version}"}
+                                replay.details(version)
                                 for version in reversed(replay.releases)
                             ),
                             {"tag_name": "sai-cli/v0.0.1"},
@@ -142,6 +142,17 @@ class Replay:
         )
         self.assets.update({f"{folder}/{name}": data for name, data in files.items()})
         self.assets[f"{folder}/SHA256SUMS"] = manifest.encode()
+
+    def details(self, version: str) -> dict[str, object]:
+        folder = f"{REPO}/releases/download/sai-cli/v{version}/"
+        return {
+            "tag_name": f"sai-cli/v{version}",
+            "assets": [
+                {"name": path[len(folder) :], "state": "uploaded"}
+                for path in self.assets
+                if path.startswith(folder)
+            ],
+        }
 
 
 @pytest.fixture
@@ -396,6 +407,45 @@ def test_native_dry_run_selects_an_explicit_prerelease(
 
 
 @pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
+def test_native_selection_skips_releases_without_a_platform_archive_and_checksum(
+    install: Install, replay: Replay
+) -> None:
+    native, unlisted, other_platform, python = "0.1.4", "0.1.5", "0.1.6", "0.1.7"
+    unavailable, malformed = "0.1.8", "0.1.9"
+    replay.add(native, {asset_name(native): archive()})
+    replay.add(unlisted, {asset_name(unlisted): archive()})
+    replay.assets[f"{REPO}/releases/download/sai-cli/v{unlisted}/SHA256SUMS"] = b""
+    replay.add(other_platform, {f"sai-{other_platform}-other.tar.gz": archive()})
+    replay.add(python, {f"sai_cli-{python}-py3-none-any.whl": b"full Python"})
+    replay.add(unavailable, {asset_name(unavailable): archive()})
+    replay.redirects[f"{REPO}/releases/download/sai-cli/v{unavailable}/SHA256SUMS"] = (
+        "/missing-checksum"
+    )
+    replay.add(malformed, {asset_name(malformed): archive()})
+    replay.assets[f"{REPO}/releases/download/sai-cli/v{malformed}/SHA256SUMS"] = b"\xff"
+
+    preview = install.install(replay, "--native", "--dry-run")
+    assert asset_name(native) in ok(preview)
+    assert replay.requests == [
+        f"/repos{REPO}/releases",
+        f"{REPO}/releases/download/sai-cli/v{malformed}/SHA256SUMS",
+        f"{REPO}/releases/download/sai-cli/v{unavailable}/SHA256SUMS",
+        "/missing-checksum",
+        f"{REPO}/releases/download/sai-cli/v{unlisted}/SHA256SUMS",
+        f"{REPO}/releases/download/sai-cli/v{native}/SHA256SUMS",
+    ]
+    assert not install.launcher.parent.exists()
+
+    replay.requests.clear()
+    pinned = install.install(replay, "--native", "--version", python)
+    assert pinned.returncode == 1, pinned.stdout
+    assert asset_name(python) in pinned.stderr
+    assert all(f"/sai-cli/v{python}/" in path for path in replay.requests)
+    assert replay.requests
+    assert not install.launcher.exists()
+
+
+@pytest.mark.skipif(WINDOWS, reason="standalone targets are Linux and macOS")
 def test_standalone_reports_both_paths_for_uv_owned_launcher(
     install: Install, replay: Replay
 ) -> None:
@@ -600,7 +650,12 @@ def test_native_rejects_invalid_assets(
             expected = "must contain one checksum"
         else:
             expected = "one regular file named sai"
-    result = install.install(replay, "--native")
+    target = (
+        ("--version", version)
+        if fault in ("wrong target", "duplicate manifest")
+        else ()
+    )
+    result = install.install(replay, "--native", *target)
     assert result.returncode == 1
     assert expected in result.stderr
     assert not install.launcher.is_symlink()

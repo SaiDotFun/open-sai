@@ -90,6 +90,10 @@ class LookupFailed(Exception):
     """The latest release could not be determined or downloaded."""
 
 
+class MissingAsset(LookupFailed):
+    """The release download returned a definitive not-found status."""
+
+
 class LauncherChanged(LookupFailed):
     """A different install now owns the launcher."""
 
@@ -104,16 +108,22 @@ def parse_tag(tag: str) -> tuple[int, int, int] | None:
     return int(major), int(minor), int(patch)
 
 
-def latest_tag(releases: list[Any]) -> str | None:
-    """Return the highest sai-cli release tag in RELEASES, or None."""
-    best: tuple[tuple[int, int, int], str] | None = None
+def stable_releases(
+    releases: list[Any],
+) -> Generator[tuple[tuple[int, int, int], str, dict[str, Any]]]:
     for item in releases:
         if not isinstance(item, dict) or item.get("draft") or item.get("prerelease"):
             continue
         tag = item.get("tag_name")
-        version = parse_tag(tag) if isinstance(tag, str) else None
-        if version is not None and (best is None or version > best[0]):
-            best = (version, tag)
+        if isinstance(tag, str) and (version := parse_tag(tag)) is not None:
+            yield version, tag, item
+
+
+def latest_tag(releases: list[Any]) -> str | None:
+    """Return the highest sai-cli release tag in RELEASES, or None."""
+    best = max(
+        stable_releases(releases), key=lambda candidate: candidate[0], default=None
+    )
     return best[1] if best else None
 
 
@@ -204,12 +214,10 @@ RATE_LIMITED = (
 )
 
 
-def from_api(api_base: str, deadline: float) -> tuple[bool, str | None]:
-    """Return (answered, tag) after reading every page of the release list.
+def from_api(api_base: str, deadline: float) -> list[Any] | None:
+    """Return every page of releases or None if the API is unavailable.
 
-    `answered` is False when the API is rate limited or failing. The list is
-    ordered by date, not version, so no page is skipped, and only the last
-    page proves that sai-cli has no release.
+    The list is ordered by date, so read every page before ranking versions.
     """
     releases: list[Any] = []
     for page in range(1, MAX_PAGES + 1):
@@ -219,7 +227,7 @@ def from_api(api_base: str, deadline: float) -> tuple[bool, str | None]:
         )
         status, headers, body = request(url, "GET", deadline)
         if status in FALLBACK_STATUSES or status >= 500:
-            return False, None
+            return None
         if status != 200:
             raise LookupFailed(f"GitHub API answered HTTP {status}")
         if len(body) > MAX_BODY:
@@ -232,7 +240,7 @@ def from_api(api_base: str, deadline: float) -> tuple[bool, str | None]:
             raise LookupFailed("GitHub API answered with malformed JSON")
         releases.extend(found)
         if 'rel="next"' not in headers.get("link", ""):
-            return True, latest_tag(releases)
+            return releases
     raise LookupFailed(
         f"the release list is longer than {MAX_PAGES} pages; the lookup is incomplete"
     )
@@ -262,13 +270,18 @@ def find_latest(
     timeout: float = TOTAL_TIMEOUT,
     *,
     check_cancelled: Callable[[], None] | None = None,
+    native: bool = False,
 ) -> str | None:
-    """Return the latest sai-cli release tag, or None when there is none yet."""
+    """Return the latest stable tag, requiring a platform archive in native mode."""
 
     def work(deadline: float) -> str | None:
-        answered, tag = from_api(api_base, deadline)
-        if answered:
-            return tag
+        releases = from_api(api_base, deadline)
+        if releases is not None:
+            return (
+                latest_native_tag(releases, web_base, deadline)
+                if native
+                else latest_tag(releases)
+            )
         if any_release(web_base, deadline):
             raise LookupFailed(RATE_LIMITED)
         return None
@@ -346,6 +359,8 @@ def download(
                     raise LookupFailed(f"{name} is larger than expected")
                 handle.write(chunk)
     except urllib.error.HTTPError as error:
+        if error.code in (404, 410):
+            raise MissingAsset(f"{what} answered HTTP {error.code}") from error
         raise LookupFailed(f"{what} answered HTTP {error.code}") from error
     except (OSError, ValueError) as error:
         raise LookupFailed(f"{what} failed: {type(error).__name__}") from error
@@ -536,6 +551,56 @@ def file_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
+def native_digest(sums: str, name: str) -> str | None:
+    entries = [
+        fields[0].lower()
+        for line in sums.splitlines()
+        if len(fields := line.split(maxsplit=1)) == 2 and fields[1].lstrip("*") == name
+    ]
+    return (
+        entries[0] if len(entries) == 1 and re.fullmatch(DIGEST, entries[0]) else None
+    )
+
+
+def latest_native_tag(
+    releases: list[Any], web_base: str, deadline: float
+) -> str | None:
+    candidates = []
+    for version, tag, item in stable_releases(releases):
+        assets = item.get("assets")
+        if not isinstance(assets, list):
+            continue
+        names = {
+            asset["name"]
+            for asset in assets
+            if isinstance(asset, dict)
+            and asset.get("state") == "uploaded"
+            and isinstance(asset.get("name"), str)
+        }
+        name = native_asset(version_of(tag))
+        if {name, "SHA256SUMS"} <= names:
+            candidates.append((version, tag, name))
+    if not candidates:
+        return None
+    with tempfile.TemporaryDirectory(prefix="sai-native-lookup-") as scratch:
+        manifest = Path(scratch) / "SHA256SUMS"
+        for _, tag, name in sorted(candidates, reverse=True):
+            try:
+                download(
+                    f"{download_base(tag, web_base)}/SHA256SUMS",
+                    manifest,
+                    MAX_SUMS,
+                    deadline,
+                    origin=web_base,
+                )
+                sums = manifest.read_text(encoding="utf-8")
+            except (MissingAsset, UnicodeDecodeError):
+                continue
+            if native_digest(sums, name) is not None:
+                return tag
+    return None
+
+
 def fetch_native(
     tag: str, name: str, stage: Path, web_base: str, timeout: float
 ) -> str:
@@ -547,19 +612,15 @@ def fetch_native(
         download(f"{base}/{name}", archive, MAX_WHEEL, deadline, origin=web_base)
 
     within(timeout, "downloading the native release", work)
-    matches = [
-        fields[0].lower()
-        for line in manifest.read_text(errors="replace").splitlines()
-        if len(fields := line.split(maxsplit=1)) == 2 and fields[1].lstrip("*") == name
-    ]
-    if len(matches) != 1 or re.fullmatch(DIGEST, matches[0]) is None:
+    expected = native_digest(manifest.read_text(errors="replace"), name)
+    if expected is None:
         raise LookupFailed(f"SHA256SUMS must contain one checksum for {name}")
-    if file_digest(archive) != matches[0]:
+    if file_digest(archive) != expected:
         raise LookupFailed(f"{name} does not match its SHA256SUMS entry")
     unpack_native(archive, stage / "sai")
     archive.unlink()
     manifest.unlink()
-    return matches[0]
+    return expected
 
 
 def unpack_native(archive: Path, binary: Path) -> None:
@@ -981,10 +1042,12 @@ def native_release(args: argparse.Namespace) -> tuple[str, str, str]:
     tag = (
         TAG_PREFIX + args.version
         if args.version
-        else find_latest(args.api_base, args.web_base, args.timeout)
+        else find_latest(args.api_base, args.web_base, args.timeout, native=True)
     )
     if tag is None:
-        raise LookupFailed("no stable Sai release was found")
+        raise LookupFailed(
+            "no stable Sai release lists a checksum for this platform archive"
+        )
     version = version_of(tag)
     return tag, version, native_asset(version)
 
