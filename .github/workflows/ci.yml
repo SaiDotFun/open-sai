@@ -189,6 +189,15 @@ jobs:
           path: .parity-auth-python
           persist-credentials: false
 
+      - name: Check out the Python auth privacy reference
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # PR 152 changes how Python reports and logs rejected auth operands.
+          ref: 3725b66446da215f3e84e65ad9fce36679b80c20
+          path: .parity-auth-privacy-python
+          persist-credentials: false
+
       - name: Check out Python v0.1.2 for intent status parity
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -244,6 +253,7 @@ jobs:
           uv sync --project .parity-python-c7 --locked --all-groups
           uv sync --project .parity-python-wait --locked --all-groups
           uv sync --project .parity-auth-python --locked --all-groups
+          uv sync --project .parity-auth-privacy-python --locked --all-groups
           uv sync --project .parity-intent-python --locked --all-groups
           uv sync --project .parity-position-v012 --locked --all-groups
           uv sync --project .parity-position-owner --locked --all-groups
@@ -274,6 +284,15 @@ jobs:
         env:
           SAI_PYTHON_REFERENCE: ${{ github.workspace }}/.parity-python-c7
         run: cargo test --locked -p sai --test storage_parity -- --ignored python_and_rust_can_only_reserve_one_intent_at_a_time opening_a_second_rust_connection_keeps_the_reservation_locked
+      - name: Compare C11 and config regressions against Python v0.1.2
+        if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
+        env:
+          SAI_PARITY_BIN: ${{ github.workspace }}/target/debug/sai
+          SAI_PARITY_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
+        run: |
+          test "$("$SAI_PARITY_PYTHON" --version)" = 'sai, version 0.1.2'
+          uv run --locked pytest tests/parity/test_intent_status.py tests/parity/test_config_regressions.py \
+            -k 'c11 or watch_reports_rejected_upgrade or non_utf8_home_json or undecodable_environment'
       - name: Compare the Rust and Python CLIs
         if: needs.changes.result != 'success' || needs.changes.outputs.rust != 'false' || needs.changes.outputs.python != 'false'
         env:
@@ -283,6 +302,7 @@ jobs:
           SAI_MCP_PARITY_PYTHON: ${{ github.workspace }}/.parity-mcp-python/.venv/bin/sai
           SAI_PARITY_C7_PYTHON: ${{ github.workspace }}/.parity-python-c7/.venv/bin/sai
           SAI_PARITY_WAIT_PYTHON: ${{ github.workspace }}/.parity-python-wait/.venv/bin/sai
+          SAI_PARITY_AUTH_PRIVACY_PYTHON: ${{ github.workspace }}/.parity-auth-privacy-python/.venv/bin/sai
           SAI_PARITY_AUTH_PYTHON: ${{ github.workspace }}/.parity-auth-python/.venv/bin/sai
           SAI_PARITY_POSITION_V012_PYTHON: ${{ github.workspace }}/.parity-position-v012/.venv/bin/sai
           SAI_PARITY_POSITION_OWNER_PYTHON: ${{ github.workspace }}/.parity-position-owner/.venv/bin/sai
