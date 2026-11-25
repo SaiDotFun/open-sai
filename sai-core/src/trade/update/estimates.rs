@@ -8,7 +8,10 @@ use crate::trade::{
     actions::invalid,
     confirmation::{plain_decimal, positive_decimal},
     estimates::{market_rejection, oracle_publication_time},
-    position::{Lcd, PositionRoute, Snapshot, SnapshotError, contract_decimal, number_text},
+    position::{
+        Lcd, PositionRoute, Snapshot, SnapshotError, contract_decimal, number_text,
+        position_mismatch,
+    },
 };
 
 const SCALE: u128 = 10u128.pow(18);
@@ -42,10 +45,11 @@ pub(in crate::trade) async fn leverage_execution_estimates(
     height: &str,
     target: &str,
     quoted_effective: Option<u128>,
-) -> Value {
+) -> Result<Value, SnapshotError> {
     leverage_execution(lcd, state, id, height, target, quoted_effective)
         .await
-        .unwrap_or_else(unknown_execution_inputs)
+        .transpose()
+        .map(|estimates| estimates.unwrap_or_else(unknown_execution_inputs))
 }
 
 async fn leverage_execution(
@@ -55,14 +59,15 @@ async fn leverage_execution(
     height: &str,
     target: &str,
     quoted_effective: Option<u128>,
-) -> Option<Value> {
+) -> Option<Result<Value, SnapshotError>> {
+    let estimated = |value| Some(Ok(value));
     let raw = &state.raw;
     let read = |query| state.smart(lcd, query, height);
     let pair = read(json!({"get_market": {"index": raw.get("market_index")?}}))
         .await
         .ok()?;
     if let Some(reason) = market_rejection(&pair, true) {
-        return Some(rejected("MarketClosed", reason));
+        return estimated(rejected("MarketClosed", reason));
     }
     let queued = read(json!({"market_order_config": {}})).await.ok()?["fill_at_next_oracle_price"]
         .as_bool()?;
@@ -83,7 +88,7 @@ async fn leverage_execution(
                 && i128::from(lcd.block_timestamp(height).await.ok()?) - i128::from(published)
                     > i128::from(ttl)
             {
-                return Some(rejected("OraclePriceStale", STALE));
+                return estimated(rejected("OraclePriceStale", STALE));
             }
         }
         let price = contract_decimal(oracle.get("base_per_quote")?).ok()?;
@@ -106,16 +111,16 @@ async fn leverage_execution(
             .ok()?;
             let threshold = contract_decimal(threshold.get("liquidation_price")?).ok()?;
             if past_liquidation(&price, &threshold, long) {
-                return Some(rejected(
+                return estimated(rejected(
                     "LiquidationReached",
                     "The after-hours guard reaches liquidation at the stored leverage.",
                 ));
             }
         }
-        return Some(all_unavailable(GUARDED));
+        return estimated(all_unavailable(GUARDED));
     }
     if quoted_effective.is_some_and(|quoted| quoted != effective) {
-        return Some(all_unavailable(
+        return estimated(all_unavailable(
             "Effective leverage changed while quoting margin.",
         ));
     }
@@ -132,7 +137,7 @@ async fn leverage_execution(
     let max = if cap == 0 { max } else { max.min(cap) };
     let leverage = positive_decimal(target, "Leverage").ok()?;
     if leverage == effective || leverage > max || (leverage < min && leverage <= effective) {
-        return Some(position_change_estimates(unavailable(OUTSIDE)));
+        return estimated(position_change_estimates(unavailable(OUTSIDE)));
     }
     let schedule = read(json!({"get_fees": {"index": pair.get("fee_index")?}}))
         .await
@@ -145,7 +150,7 @@ async fn leverage_execution(
     let notional = &before * effective / SCALE;
     let collateral = &before * effective / leverage;
     if collateral <= notional * open_rate / SCALE {
-        return Some(position_change_estimates(unavailable(OUTSIDE)));
+        return estimated(position_change_estimates(unavailable(OUTSIDE)));
     }
     let long = raw.get("long")?.as_bool()?;
     let entry = raw.get("open_price")?.as_str()?;
@@ -168,7 +173,7 @@ async fn leverage_execution(
                 )
                 .await)
     {
-        return Some(rejected("LiquidationReached", PROSPECTIVE_LIQUIDATION));
+        return estimated(rejected("LiquidationReached", PROSPECTIVE_LIQUIDATION));
     }
     let mut estimates = position_change_estimates(json!({
         "status": "estimate",
@@ -187,6 +192,9 @@ async fn leverage_execution(
         }}))
         .await
         .ok()?;
+        if funds["collateral_index"] != raw["collateral_index"] {
+            return Some(Err(SnapshotError::CollateralMismatch));
+        }
         let available: BigUint = number_text(funds.get("available_to_trade")?)
             .ok()?
             .parse()
@@ -199,13 +207,13 @@ async fn leverage_execution(
                 usdc(&available),
             );
             if !queued {
-                return Some(rejected("InsufficientDepositBalance", &funding));
+                return estimated(rejected("InsufficientDepositBalance", &funding));
             }
             estimates["execution"]["warning"] =
                 json!(format!("{funding} Perp checks funding at fill."));
         }
     }
-    Some(estimates)
+    estimated(estimates)
 }
 
 fn past_liquidation<T: Ord>(price: &T, threshold: &T, long: bool) -> bool {
@@ -242,9 +250,9 @@ impl Trading<'_> {
         preview: &mut TradePreview,
         addr: &str,
         id: &Value,
-        route: Option<PositionRoute>,
+        verified: Option<(PositionRoute, Option<Value>)>,
         indexed: Value,
-        verified_raw: Option<Value>,
+        require_unchanged: bool,
     ) -> Result<(), SaiError> {
         let target = preview.intent.body["requestedLeverage"].as_str();
         let unavailable = if target.is_some() {
@@ -252,38 +260,47 @@ impl Trading<'_> {
         } else {
             unknown
         };
-        let result = if let (Some(endpoint), Some(route)) = (self.lcd_endpoint, route) {
-            let lcd = Lcd(endpoint);
-            let quote = async {
-                let snapshot = self
-                    .position_snapshot(
-                        &lcd,
-                        addr,
-                        id,
-                        route,
-                        (indexed, verified_raw),
-                        target.is_none(),
-                    )
-                    .await?;
-                let Some(height) = snapshot.verified_height(&lcd, id).await? else {
-                    return Ok(None);
+        let result =
+            if let (Some(endpoint), Some((route, verified_raw))) = (self.lcd_endpoint, verified) {
+                let lcd = Lcd(endpoint);
+                let quote = async {
+                    let snapshot = self
+                        .position_snapshot(
+                            &lcd,
+                            addr,
+                            id,
+                            route,
+                            (indexed, verified_raw),
+                            target.is_none(),
+                        )
+                        .await?;
+                    let Some(height) = snapshot.verified_height(&lcd, id).await? else {
+                        return Ok(None);
+                    };
+                    if let Some(target) = target {
+                        return leverage_execution_estimates(
+                            &lcd, &snapshot, id, &height, target, None,
+                        )
+                        .await
+                        .map(Some);
+                    }
+                    Ok(trigger_estimates(&lcd, &snapshot, id, &height).await)
                 };
-                if let Some(target) = target {
-                    return Ok(Some(
-                        leverage_execution_estimates(&lcd, &snapshot, id, &height, target, None)
-                            .await,
-                    ));
+                match quote.await {
+                    Ok(result) => result.unwrap_or_else(unavailable),
+                    Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
+                    Err(SnapshotError::CollateralMismatch) if require_unchanged => {
+                        return Err(position_mismatch());
+                    }
+                    Err(
+                        SnapshotError::CollateralMismatch
+                        | SnapshotError::IndexMismatch
+                        | SnapshotError::Unavailable,
+                    ) => unavailable(),
                 }
-                Ok(trigger_estimates(&lcd, &snapshot, id, &height).await)
+            } else {
+                unavailable()
             };
-            match quote.await {
-                Ok(result) => result.unwrap_or_else(unavailable),
-                Err(SnapshotError::Owner(message)) => return Err(invalid(message)),
-                Err(SnapshotError::IndexMismatch | SnapshotError::Unavailable) => unavailable(),
-            }
-        } else {
-            unavailable()
-        };
         preview.estimates = Some(result);
         Ok(())
     }

@@ -264,9 +264,9 @@ impl Trading<'_> {
                         &mut prepared,
                         addr,
                         &id,
-                        Some(verified.0),
+                        Some((verified.0, Some(verified.1))),
                         indexed,
-                        Some(verified.1),
+                        true,
                     )
                     .await?;
                 }

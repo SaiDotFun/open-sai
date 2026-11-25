@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import pytest
 from sai_cli.core.confirmation import preview_digest
@@ -127,6 +127,65 @@ def test_position_execution_refuses_before_reserving(
             assert "previewDigest" not in blocked
             assert blocked["estimates"]["execution"]["code"] == execution_code
     assert documents[0] == documents[1]
+
+
+@pytest.mark.parametrize(
+    ("command", "scenario", "wrong_balance_at"),
+    [
+        (MARGIN, "position-execution-ready", "pinned"),
+        (LEVERAGE, "quote-close", "snapshot"),
+        (LEVERAGE, "quote-close", "pinned"),
+    ],
+    ids=["margin-pinned", "leverage-snapshot", "leverage-pinned"],
+)
+def test_confirmed_trade_refuses_funding_for_another_collateral(
+    pair: tuple[CLI, CLI],
+    tmp_path: Path,
+    command: CLI,
+    scenario: str,
+    wrong_balance_at: Literal["snapshot", "pinned"],
+) -> None:
+    python, _ = pair
+    with loopback(scenario) as endpoints:
+        home = tmp_path / "preview"
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            python, home, endpoints, (*command, "--dry-run"), python=True
+        )
+        assert (code, stderr) == (0, "")
+        assert not endpoints.errors
+
+    for index, cli in enumerate(pair):
+        # Python treats a failed standalone leverage estimate as advisory.
+        if index == 0 and command == LEVERAGE:
+            continue
+        replay = TradeReplay("UPDATE_TRADE")
+        with loopback(
+            scenario, trade_replay=replay, wrong_balance_at=wrong_balance_at
+        ) as endpoints:
+            home = tmp_path / f"submit-{index}"
+            seed_home(home, endpoints, "session")
+            refusal = run(
+                cli,
+                home,
+                endpoints,
+                (*command, "--preview-digest", preview["previewDigest"]),
+                python=index == 0,
+            )
+            assert not endpoints.errors
+            assert not replay.attempts()
+            assert not (home / "sai/trader/intents.sqlite3").exists()
+            assert refusal == (
+                4,
+                {
+                    "error": {
+                        "code": "PREVIEW_MISMATCH",
+                        "message": "Position changed. Review the margin change again.",
+                        "retryable": True,
+                    }
+                },
+                "",
+            )
 
 
 @pytest.mark.parametrize(

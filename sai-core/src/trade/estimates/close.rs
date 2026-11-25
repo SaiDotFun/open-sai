@@ -99,7 +99,7 @@ impl Trading<'_> {
         match quote.await {
             Err(SnapshotError::Owner(message)) => Err(invalid(message)),
             Err(SnapshotError::IndexMismatch) => Ok((false, result)),
-            Ok(()) | Err(SnapshotError::Unavailable) => {
+            Ok(()) | Err(SnapshotError::CollateralMismatch | SnapshotError::Unavailable) => {
                 // Missing estimate inputs do not invalidate the verified owner and index.
                 Ok((true, result))
             }

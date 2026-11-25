@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
@@ -415,6 +415,7 @@ def loopback(
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
+    wrong_balance_at: Literal["snapshot", "pinned"] | None = None,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -798,6 +799,14 @@ def loopback(
         "partial-interrupted": PARTIAL_INTENT,
         "partial-unknown": PARTIAL_INTENT,
     }.get(scenario)
+
+    def contract_data(name: str, *, pinned: bool) -> Any:
+        data = contracts[name]
+        if name == "get_exchange_balance" and wrong_balance_at == (
+            "pinned" if pinned else "snapshot"
+        ):
+            return {**data, "collateral_index": "TokenIndex(999)"}
+        return data
 
     class Handler(BaseHTTPRequestHandler):
         def reply(
@@ -1434,7 +1443,8 @@ def loopback(
                                 if not admission.release.wait(5):
                                     self.reject("Cancellation session gate timed out")
                                     return
-                        self.reply({"data": contracts[name]}, lcd=True)
+                        data = contract_data(name, pinned=HEIGHT_HEADER in self.headers)
+                        self.reply({"data": data}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):
                         pass
@@ -1484,7 +1494,7 @@ def loopback(
             ):
                 self.reply({}, 503)
                 return
-            data = contracts[name]
+            data = contract_data(name, pinned=pinned)
             if name == "get_exchange_balance" and (
                 scenario == "position-execution-unfunded"
                 or (scenario == "position-execution-pinned-unfunded" and pinned)

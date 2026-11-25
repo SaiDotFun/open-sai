@@ -8,7 +8,6 @@ use std::future::{Future, pending};
 const KEEPER_OWNER_MISMATCH: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER_MISMATCH: &str = "Contract position belongs to a different account";
 const NETWORK_MISMATCH: &str = "Keeper trading route and LCD network do not match";
-const CONTRACT_POSITION_MISMATCH: &str = "Position changed. Review the margin change again.";
 
 use serde_json::{Map, Value, json};
 
@@ -20,7 +19,8 @@ use crate::{
 
 use super::estimates::{PartialCloseQuote, now};
 use super::position::{
-    Lcd, PositionRoute, Read, Snapshot as ExecutionSnapshot, height_error, same_account,
+    Lcd, PositionRoute, Read, Snapshot as ExecutionSnapshot, height_error, position_mismatch,
+    same_account,
 };
 use super::update::leverage_execution_estimates;
 use super::{Confirmation, SubmitOptions, TradePreview, Trading, actions::id, digest_bytes};
@@ -164,7 +164,7 @@ impl Trading<'_> {
             .quote_for_position(&lcd, addr, &id, action, confirming)
             .await?;
         let PositionMode::Submit(options) = mode else {
-            first.estimate_execution(&lcd, &id, action, None).await;
+            first.estimate_execution(&lcd, &id, action, None).await?;
             return Ok(match mode {
                 PositionMode::Preview => first.preview.cli_preview_output(Some(addr)),
                 _ => first.preview.output(Some(addr)),
@@ -185,14 +185,14 @@ impl Trading<'_> {
                 let checked = latest.recheck(&lcd, &id).await?.ok_or_else(|| {
                     SaiError::new(Code::PreviewMismatch, "The position quote changed again during verification. Request a new preview.")
                 })?;
-                latest.estimate_execution(&lcd, &id, action, Some(&checked)).await;
+                latest.estimate_execution(&lcd, &id, action, Some(&checked)).await?;
                 Ok(latest)
             }.await;
             return Err(position_changed(action, addr, latest, cli));
         };
         current
             .estimate_execution(&lcd, &id, action, Some(&rechecked))
-            .await;
+            .await?;
         if digest_bytes(&current.preview, None) != digest_bytes(&first.preview, None) {
             return Err(position_changed(action, addr, Ok(current), cli));
         }
@@ -235,7 +235,7 @@ impl Trading<'_> {
                     Code::PreviewMismatch,
                     "The position quote changed again during verification. Request a new preview.",
                 ))?;
-                fresh.estimate_execution(lcd, trade_id, action, Some(&checked)).await;
+                fresh.estimate_execution(lcd, trade_id, action, Some(&checked)).await?;
                 return Err(replacement_preview(
                     "Keeper trading route and LCD network differed during confirmation. Review the replacement preview before submitting.",
                     &fresh.preview, addr,
@@ -403,10 +403,7 @@ impl Trading<'_> {
             || raw["is_open"] != true
             || raw["trade_type"] != "trade"
         {
-            return Err(SaiError::new(
-                Code::PreviewMismatch,
-                CONTRACT_POSITION_MISMATCH,
-            ));
+            return Err(position_mismatch());
         }
         let (funds, _) = lcd
             .smart(
@@ -420,10 +417,7 @@ impl Trading<'_> {
         require_object(&funds)?;
 
         if funds["collateral_index"] != token {
-            return Err(SaiError::new(
-                Code::PreviewMismatch,
-                CONTRACT_POSITION_MISMATCH,
-            ));
+            return Err(position_mismatch());
         }
         if number_text(&raw["collateral_amount"])?
             != number_text(field(position, "collateralAmount")?)?
@@ -546,7 +540,7 @@ impl PositionQuote {
         id: &Value,
         action: PositionAction<'_>,
         rechecked: Option<&RecheckedPosition>,
-    ) {
+    ) -> Result<(), SaiError> {
         let state = ExecutionSnapshot {
             raw: self.snapshot.raw.clone(),
             market: self.snapshot.market.clone(),
@@ -563,13 +557,19 @@ impl PositionQuote {
         match action {
             PositionAction::Margin { .. } => {
                 let Some(target) = self.preview.intent.body["requestedLeverage"].as_str() else {
-                    return;
+                    return Ok(());
                 };
                 self.preview.estimates = Some(if let Some(height) = height {
                     let effective = ContractDecimal::parse(&self.inputs["effectiveLeverage"])
                         .ok()
                         .map(|value| value.units);
-                    leverage_execution_estimates(lcd, &state, id, height, target, effective).await
+                    match leverage_execution_estimates(lcd, &state, id, height, target, effective)
+                        .await
+                    {
+                        Ok(estimates) => estimates,
+                        Err(_) if rechecked.is_none() => super::update::unknown_execution_inputs(),
+                        Err(_) => return Err(position_mismatch()),
+                    }
                 } else {
                     super::update::unknown_execution_inputs()
                 });
@@ -579,7 +579,7 @@ impl PositionQuote {
                     .as_str()
                     .and_then(|amount| amount.parse::<BigUint>().ok())
                 else {
-                    return;
+                    return Ok(());
                 };
                 let rechecked = rechecked.and_then(|checked| {
                     checked
@@ -602,6 +602,7 @@ impl PositionQuote {
                 );
             }
         }
+        Ok(())
     }
 }
 

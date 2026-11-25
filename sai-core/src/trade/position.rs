@@ -38,6 +38,7 @@ pub(super) struct Snapshot {
 pub(super) enum SnapshotError {
     Owner(&'static str),
     IndexMismatch,
+    CollateralMismatch,
     Unavailable,
 }
 
@@ -64,6 +65,13 @@ impl From<ContractPositionError> for SaiError {
 const KEEPER_OWNER: &str = "Keeper position belongs to a different account";
 const CONTRACT_OWNER: &str = "Contract position belongs to a different account";
 const ROUTE_MISMATCH: &str = "Keeper trading route and LCD network do not match";
+
+pub(super) fn position_mismatch() -> SaiError {
+    SaiError::new(
+        Code::PreviewMismatch,
+        "Position changed. Review the margin change again.",
+    )
+}
 
 impl From<SaiError> for SnapshotError {
     fn from(_: SaiError) -> Self {
@@ -322,7 +330,7 @@ impl Trading<'_> {
             )
             .await?;
         if funds["collateral_index"] != token {
-            return Err(SnapshotError::Unavailable);
+            return Err(SnapshotError::CollateralMismatch);
         }
         Ok(Snapshot {
             raw,
