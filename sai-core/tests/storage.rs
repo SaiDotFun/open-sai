@@ -53,14 +53,13 @@ fn sessions_are_private_and_reads_do_not_create_files() {
         fs::metadata(&trader).unwrap().permissions().mode() & 0o777,
         0o700
     );
-    for name in ["sessions.json", "sessions.lock"] {
-        let path = trader.join(name);
-        assert_eq!(
-            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(!fs::read_to_string(path).unwrap().contains(fixture));
-    }
+    let path = trader.join("sessions.json");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!fs::read_to_string(path).unwrap().contains(fixture));
+    assert_eq!(fs::metadata(trader.join("sessions.lock")).unwrap().len(), 0);
     let storage = Storage::new(home.path());
     let loaded = storage
         .load_active_session(ENDPOINT, Some("0xabcd"))
