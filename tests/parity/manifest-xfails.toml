@@ -295,7 +295,7 @@ signature = "72813cb0759d60f8662b6c203b97583483a017891fc981c01a12243aec443d4c"
 
 [gap."case:mcp-intent-wait-final"]
 owner = "#175"
-signature = "b98b7d79420e0a6cd008e411a28720f6ff8cbc72bb8e58839a1380aacfab72b3"
+signature = "82723992c56757b1e055dc56cebd4e05265f69cd24382f2b29ef5eb8e2ebe513"
 
 [gap."case:mcp-intent-wait-pending"]
 owner = "#175"
@@ -663,7 +663,7 @@ signature = "f796d5fd0e7d5c0c32766ed61c1802a6fec907517ed4e9bc7f5f6758c32e25ad"
 
 [gap."mcp:intent_wait"]
 owner = "#175"
-signature = "c7b6297f0bae7d431708a75bc67401973eac5efb724871436a7c01c1baf2308d"
+signature = "2e958462f2dcaad316693682a9b78ddd30a54617318b27b15cf34a2a8bea4e8a"
 
 [gap."mcp:logs_intent"]
 owner = "#175"
