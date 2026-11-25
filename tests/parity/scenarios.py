@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from compare import INTENT_ID, timestamp
@@ -415,6 +415,7 @@ def loopback(
     cancel_target: str | None = None,
     close_target: str | None = None,
     lcd_query: bool = False,
+    wrong_balance_at: Literal["snapshot", "pinned"] | None = None,
 ) -> Generator[Endpoints]:
     errors: list[str] = []
     wire: list[WireRequest] = []
@@ -682,6 +683,14 @@ def loopback(
         contracts["get_trade_raw"]["collateral_amount"] = "10000001"
     if scenario in POSITION_SCENARIOS:
         contracts["get_trade_raw"].pop("long", None)
+    if scenario.startswith("position-execution-"):
+        contracts["get_group"]["stale_price_expiration_secs"] = 0
+        if scenario != "position-execution-no-oracle-time":
+            contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        if scenario == "position-execution-close-only":
+            contracts["get_market"]["market_trading_state"] = "close_only"
+        if scenario == "position-execution-stale":
+            contracts["get_group"]["stale_price_expiration_secs"] = 30
     if scenario in {"position-foreign-contract-owner", "quote-foreign-contract-owner"}:
         contracts["get_trade_raw"]["user"] = OTHER_ADDRESS
     if scenario == "position-wrong-contract-index":
@@ -708,6 +717,15 @@ def loopback(
         contracts["get_fees"]["trigger_order_fee_p"] = "0.0007"
     if scenario == "quote-liquidation":
         contracts["get_liquidation_price"]["liquidation_price"] = "100"
+    if scenario in {
+        "quote-close",
+        "quote-close-fee-cap",
+        "quote-fee-read-error",
+        "quote-liquidation",
+        "quote-after-hours",
+    }:
+        contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
+        contracts["get_group"]["stale_price_expiration_secs"] = 0
     if scenario in {"quote-stale", "quote-queued"}:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["get_group"]["stale_price_expiration_secs"] = 30
@@ -781,6 +799,14 @@ def loopback(
         "partial-interrupted": PARTIAL_INTENT,
         "partial-unknown": PARTIAL_INTENT,
     }.get(scenario)
+
+    def contract_data(name: str, *, pinned: bool) -> Any:
+        data = contracts[name]
+        if name == "get_exchange_balance" and wrong_balance_at == (
+            "pinned" if pinned else "snapshot"
+        ):
+            return {**data, "collateral_index": "TokenIndex(999)"}
+        return data
 
     class Handler(BaseHTTPRequestHandler):
         def reply(
@@ -1049,6 +1075,22 @@ def loopback(
                         interrupt_closed.wait(8)
                     elif scenario == "keeper-error":
                         self.reply({"errors": [{"message": "fixture unavailable"}]})
+                    elif (
+                        scenario == "quote-route-changed"
+                        and name == "oneClickTrading"
+                        and sum(entry.label == name for entry in wire) > 1
+                    ):
+                        self.reply(
+                            {
+                                "data": {
+                                    "oneClickTrading": {
+                                        "enabled": True,
+                                        "chainId": chain,
+                                        "contractAddress": "nibi1replacement",
+                                    }
+                                },
+                            }
+                        )
                     elif name == "trade" and scenario == "partial-preview-changed":
                         self.reply(
                             {
@@ -1357,7 +1399,9 @@ def loopback(
                                 self.reject(f"Expected a fresh {name} query")
                                 return
                         wire.append(WireRequest(name, variables=query))
-                        if scenario in POSITION_SCENARIOS:
+                        if scenario in POSITION_SCENARIOS or scenario.startswith(
+                            "position-execution-"
+                        ):
                             self.position_query(name, request_url.query)
                             return
                         if (
@@ -1399,7 +1443,8 @@ def loopback(
                                 if not admission.release.wait(5):
                                     self.reject("Cancellation session gate timed out")
                                     return
-                        self.reply({"data": contracts[name]}, lcd=True)
+                        data = contract_data(name, pinned=HEIGHT_HEADER in self.headers)
+                        self.reply({"data": data}, lcd=True)
                         return
                     except (ValueError, KeyError, TypeError):
                         pass
@@ -1431,13 +1476,30 @@ def loopback(
                 self.reply({}, 503)
                 return
             if (
+                scenario == "position-execution-quote-liquidates"
+                and name == "quote_trade"
+            ):
+                self.reply(
+                    {
+                        "message": "liquidation price reached. Liq price 90, current price 100"
+                    },
+                    400,
+                    height=POSITION_HEIGHT,
+                )
+                return
+            if (
                 scenario == "partial-price-recovers"
                 and name == "get_collateral_price"
                 and sum(item.label == name for item in wire) == 1
             ):
                 self.reply({}, 503)
                 return
-            data = contracts[name]
+            data = contract_data(name, pinned=pinned)
+            if name == "get_exchange_balance" and (
+                scenario == "position-execution-unfunded"
+                or (scenario == "position-execution-pinned-unfunded" and pinned)
+            ):
+                data = {**data, "available_to_trade": "0"}
             if (
                 scenario == "position-equivalent-owner"
                 and name == "get_trade_raw"
