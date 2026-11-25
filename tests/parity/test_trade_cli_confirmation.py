@@ -37,6 +37,12 @@ def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
         ),
         (
             MARGIN,
+            "position-execution-pinned-unfunded",
+            "UPDATE_TRADE",
+            "InsufficientDepositBalance",
+        ),
+        (
+            MARGIN,
             "position-execution-quote-liquidates",
             "UPDATE_TRADE",
             "LiquidationReached",
@@ -59,6 +65,7 @@ def pair(cli_pair: tuple[CLI, CLI]) -> tuple[CLI, CLI]:
     ids=[
         "margin-close-only",
         "margin-unfunded",
+        "margin-pinned-balance-unfunded",
         "margin-liquidates-with-borrowing",
         "partial-no-oracle-time",
         "partial-stale",

@@ -112,7 +112,6 @@ fn decimal_digit(digit: char) -> Option<char> {
 
 struct Snapshot {
     raw: Value,
-    funds: Value,
     market: Value,
     route: PositionRoute,
 }
@@ -436,7 +435,6 @@ impl Trading<'_> {
         }
         Ok(Snapshot {
             raw,
-            funds,
             market: market.clone(),
             route: PositionRoute {
                 chain_id: chain_id.into(),

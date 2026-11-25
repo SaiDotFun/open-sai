@@ -1484,10 +1484,9 @@ def loopback(
                 self.reply({}, 503)
                 return
             data = contracts[name]
-            if (
+            if name == "get_exchange_balance" and (
                 scenario == "position-execution-unfunded"
-                and name == "get_exchange_balance"
-                and pinned
+                or (scenario == "position-execution-pinned-unfunded" and pinned)
             ):
                 data = {**data, "available_to_trade": "0"}
             if (
