@@ -479,7 +479,7 @@ fn undecodable_environment_values_keep_their_precedence() {
         .args(["config", "get", "keeper.endpoint"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert!(output.stdout.is_empty());
     assert_eq!(output.stderr, b"Error: SAI_ENDPOINT: Invalid value for keeper.endpoint: expected a URL starting with https:// or http://\n");
 
@@ -501,7 +501,7 @@ fn undecodable_environment_values_keep_their_precedence() {
     assert_eq!(result["settings"]["logs.enabled"]["source"], "invalid");
     assert_eq!(
         output.stderr,
-        b"SAI_LOG: Invalid value for logs.enabled: expected true, false, yes, no, on, off, 1, or 0; logging is off until it is fixed\n",
+        b"SAI_LOG: invalid value for logs.enabled; logging is off until it is fixed\n",
     );
     assert!(!root.path().join("logs").exists());
 }
@@ -515,19 +515,19 @@ fn invalid_environment_settings_never_echo_values_to_stderr() {
             "SAI_ENDPOINT",
             "keeper.endpoint",
             "a URL starting with https:// or http://",
-            1,
+            2,
         ),
         (
             "SAI_WS_ENDPOINT",
             "keeper.ws_endpoint",
             "a URL starting with wss:// or ws://",
-            1,
+            2,
         ),
         (
             "SAI_LCD_ENDPOINT",
             "lcd.endpoint",
             "a URL starting with https:// or http://",
-            1,
+            2,
         ),
         (
             "SAI_UPDATE_AUTO",
