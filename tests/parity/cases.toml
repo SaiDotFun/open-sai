@@ -1617,7 +1617,7 @@ wire = [
 state = { "trader/intents.sqlite3" = "<absent>" }
 
 rust = { wire = ["oneClickTrading", "trade", "node_info", "borrowing", "get_trade_raw", "get_exchange_balance", "borrowings", "is_after_hours_market", "get_collateral_price"] }
-output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "6743ed7325fcfeea1ca1df385c07ff70c99e4995675ab397dbfc307f8cd1e9b1" }
+output = { "positionRoute.chainId" = "cataclysm-1", "positionRoute.contractAddress" = "nibi1syntheticfixture", "previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8" }
 
 # C7b position cases use the Python ownership and confirmation contracts from PRs 148 and 150.
 [[case]]
@@ -2063,7 +2063,7 @@ wire = [
 
 [[case]]
 name = "trade-partial-close-confirm-current-route"
-args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "6743ed7325fcfeea1ca1df385c07ff70c99e4995675ab397dbfc307f8cd1e9b1"]
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8"]
 seed = "session"
 server = "partial-accepted"
 wire = [
@@ -2087,7 +2087,7 @@ wire = [
 
 [[case]]
 name = "trade-partial-close-refuse-stale-chain"
-args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "6743ed7325fcfeea1ca1df385c07ff70c99e4995675ab397dbfc307f8cd1e9b1"]
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8"]
 seed = "session"
 server = "position-chain-changed"
 expect = 4
@@ -2112,7 +2112,7 @@ wire = [
 
 [[case]]
 name = "trade-partial-close-refuse-stale-contract"
-args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "6743ed7325fcfeea1ca1df385c07ff70c99e4995675ab397dbfc307f8cd1e9b1"]
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8"]
 seed = "session"
 server = "position-contract-changed"
 expect = 4
@@ -2137,7 +2137,7 @@ wire = [
 
 [[case]]
 name = "trade-partial-close-refuse-wrong-lcd-on-confirm"
-args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "6743ed7325fcfeea1ca1df385c07ff70c99e4995675ab397dbfc307f8cd1e9b1"]
+args = ["--json", "trade", "partial-close", "7", "--percent", "50", "--preview-digest", "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8"]
 seed = "session"
 server = "position-wrong-chain"
 expect = 4
@@ -2231,7 +2231,7 @@ args = ["mcp", "serve"]
 mode = "mcp"
 mcp_calls = [
     { name = "preview_partial_close", arguments = { trade_id = 7, percent = 50 } },
-    { name = "trade_partial_close", arguments = { trade_id = 7, percent = 50, preview_digest = "6743ed7325fcfeea1ca1df385c07ff70c99e4995675ab397dbfc307f8cd1e9b1" } },
+    { name = "trade_partial_close", arguments = { trade_id = 7, percent = 50, preview_digest = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8" } },
 ]
 seed = "session"
 server = "partial-preview-changed"
@@ -2244,7 +2244,7 @@ wire = [
     "is_after_hours_market", "get_collateral_price", "get_trade_raw", "is_after_hours_market", "get_perp_prices",
 ]
 state = { "trader/intents.sqlite3" = "<absent>" }
-output = { "1.result.content.0.text.previewDigest" = "6743ed7325fcfeea1ca1df385c07ff70c99e4995675ab397dbfc307f8cd1e9b1", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "70c61be377bcd0b3adbd824f5138a7c24f3b3e0ff907d249a62cc070af5c385b" }
+output = { "1.result.content.0.text.previewDigest" = "639610d6417d78b973fc2d64c56f2c15d6b17c0673cb02ea623ec85dfa7567e8", "2.result.content.0.text.code" = "PREVIEW_MISMATCH", "2.result.content.0.text.preview.previewDigest" = "31871b2aa39eb00c7d14021f2af5fb65ed5795a7125cc2f1d7ac924ae8a20176" }
 
 [[case]]
 name = "trade-concurrent-close"

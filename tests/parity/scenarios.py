@@ -60,6 +60,7 @@ POSITION_SCENARIOS = {
     "position-wrong-height",
     "partial-preview-changed",
     "partial-price-changed",
+    "partial-price-recovers",
     "margin-accepted",
     "margin-interrupted",
     "margin-rejected",
@@ -663,7 +664,11 @@ def loopback(
             "trigger_order_fee_p": "0",
         },
     }
-    if scenario in {"partial-preview", "partial-price-changed"}:
+    if scenario in {
+        "partial-preview",
+        "partial-price-changed",
+        "partial-price-recovers",
+    }:
         contracts["get_perp_prices"]["market"]["base_last_update_time"] = 1
         contracts["market_order_config"]["fill_at_next_oracle_price"] = True
     if scenario in {"position-precision", "position-after-hours"}:
@@ -771,6 +776,7 @@ def loopback(
         "position-equivalent-owner": MARGIN_INTENT,
         "partial-accepted": PARTIAL_INTENT,
         "partial-price-changed": PARTIAL_INTENT,
+        "partial-price-recovers": PARTIAL_INTENT,
         "partial-interrupted": PARTIAL_INTENT,
         "partial-unknown": PARTIAL_INTENT,
     }.get(scenario)
@@ -1421,6 +1427,13 @@ def loopback(
                 self.reject(f"Wrong LCD cache-busting query for {name}")
                 return
             if scenario == "position-no-oracle" and name == "get_collateral_price":
+                self.reply({}, 503)
+                return
+            if (
+                scenario == "partial-price-recovers"
+                and name == "get_collateral_price"
+                and sum(item.label == name for item in wire) == 1
+            ):
                 self.reply({}, 503)
                 return
             data = contracts[name]

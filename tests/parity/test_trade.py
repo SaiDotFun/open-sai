@@ -870,8 +870,11 @@ def test_connect_failure_releases_reservation(
     assert observations[1:] == observations[:1] * 3
 
 
-def test_confirmed_partial_close_accepts_collateral_price_ticks(
-    cli_pair: tuple[CLI, CLI], tmp_path: Path
+@pytest.mark.parametrize(
+    "scenario", ["partial-price-changed", "partial-price-recovers"]
+)
+def test_confirmed_partial_close_binds_collateral_price_availability(
+    cli_pair: tuple[CLI, CLI], tmp_path: Path, scenario: str
 ) -> None:
     # Both implementations at this checkout use the reduction digest.
     _, candidate = cli_pair
@@ -879,7 +882,7 @@ def test_confirmed_partial_close_accepts_collateral_price_ticks(
     args = ("trade", "partial-close", "7", "--percent", "50")
     digests = []
     for index, cli in enumerate((reference, candidate)):
-        with loopback("partial-price-changed") as endpoints:
+        with loopback(scenario) as endpoints:
             home = tmp_path / str(index)
             seed_home(home, endpoints, "session")
             code, preview, _ = run(
@@ -894,14 +897,34 @@ def test_confirmed_partial_close_accepts_collateral_price_ticks(
             assert fresh["intent"] == preview["intent"] == PARTIAL_INTENT
             for field in ("collateralPriceUsd", "closedNotionalUsd"):
                 assert fresh["quote"][field] != preview["quote"][field]
-            assert fresh["previewDigest"] == digest
             assert rows(home) == []
+
+            if scenario == "partial-price-recovers":
+                assert preview["quote"]["closedNotionalUsd"] is None
+                assert preview["quote"]["closedNotionalIsEstimate"] is True
+                assert fresh["quote"]["closedNotionalIsEstimate"] is False
+                code, refused, _ = run(
+                    cli,
+                    home,
+                    endpoints,
+                    (*args, "--preview-digest", digest),
+                    python=index == 0,
+                )
+                assert code == 4, refused
+                assert refused["error"]["code"] == "PREVIEW_MISMATCH"
+                assert rows(home) == []
+                assert not any(
+                    entry.label == "recordUserIntent" for entry in endpoints.wire
+                )
+                assert fresh["previewDigest"] != digest
+            else:
+                assert fresh["previewDigest"] == digest
 
             code, submitted, _ = run(
                 cli,
                 home,
                 endpoints,
-                (*args, "--preview-digest", digest),
+                (*args, "--preview-digest", fresh["previewDigest"]),
                 python=index == 0,
             )
             assert code == 0, submitted
@@ -911,7 +934,7 @@ def test_confirmed_partial_close_accepts_collateral_price_ticks(
                 "recordUserIntent"
             ) == 1
             assert not endpoints.errors
-            digests.append(digest)
+            digests.append((digest, fresh["previewDigest"]))
     assert digests[0] == digests[1]
 
 

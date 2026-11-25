@@ -1860,6 +1860,45 @@ def test_partial_close_marks_incomplete_quotes_as_estimates(
     asyncio.run(scenario())
 
 
+def test_partial_close_requires_fresh_confirmation_after_collateral_price_recovers(
+    position_service: tuple[Position, str],
+) -> None:
+    position, base_url = position_service
+    position.preview_inputs = True
+    position.collateral_price = None
+    args = {"trade_id": 7, "percent": 50}
+
+    async def scenario() -> None:
+        async with connected_client(base_url) as client:
+            outage = await call(client, "preview_partial_close", args)
+            assert outage["quote"]["effectiveLeverage"] == "2"
+            assert outage["quote"]["closedNotionalUsd"] is None
+            assert outage["quote"]["closedNotionalIsEstimate"] is True
+            position.collateral_price = "1.00119"
+            refused = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": outage["previewDigest"]},
+            )
+            assert refused.get("code") == "PREVIEW_MISMATCH", refused
+            assert position.submitted == []
+            fresh = refused["preview"]
+            assert fresh["quote"]["closedNotionalUsd"] == "4.00476"
+            assert fresh["quote"]["closedNotionalIsEstimate"] is False
+            assert fresh["intent"] == outage["intent"]
+            assert fresh["previewDigest"] != outage["previewDigest"]
+            accepted = await call(
+                client,
+                "trade_partial_close",
+                {**args, "preview_digest": fresh["previewDigest"]},
+            )
+            assert accepted["status"] == "accepted", accepted
+            (submitted,) = position.submitted
+            assert submitted["body"] == fresh["intent"]["body"]
+
+    asyncio.run(scenario())
+
+
 def test_partial_close_preview_omits_digest_until_effective_leverage_is_readable(
     position_service: tuple[Position, str],
 ) -> None:

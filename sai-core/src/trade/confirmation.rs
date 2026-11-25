@@ -258,14 +258,12 @@ pub fn digest_bytes(preview: &TradePreview, account: Option<&str>) -> Vec<u8> {
         if preview.intent.kind == "DECREASE_POSITION_SIZE"
             && let Some(fields) = quote.as_object_mut()
         {
-            // The estimate flag also depends on price availability.
-            for key in [
-                "collateralPriceUsd",
-                "closedNotionalUsd",
-                "closedNotionalIsEstimate",
-            ] {
-                fields.shift_remove(key);
-            }
+            // The user must confirm again once a USD estimate is available.
+            fields.shift_remove("collateralPriceUsd");
+            let usd_available = fields
+                .shift_remove("closedNotionalUsd")
+                .is_some_and(|value| !value.is_null());
+            fields.insert("closedNotionalUsdAvailable".into(), json!(usd_available));
         }
         material["quote"] = quote;
     }
@@ -295,6 +293,28 @@ mod tests {
     use super::*;
     use crate::trade::TradeIntent;
     use serde_json::Value;
+
+    #[test]
+    fn partial_close_digest_binds_usd_availability_and_estimate_status() {
+        let digest = |price: Option<&str>, usd: Option<&str>, estimated| {
+            let mut preview = TradePreview::new(TradeIntent::new(
+                "DECREASE_POSITION_SIZE",
+                Some("7".into()),
+                json!({"collateral": {"amountUsdc": "5000000"}, "leverageDelta": "0"}),
+            ));
+            preview.quote = Some(json!({
+                "collateralPriceUsd": price,
+                "closedNotionalUsd": usd,
+                "closedNotionalIsEstimate": estimated,
+            }));
+            preview_digest(&preview, None)
+        };
+        let priced_estimate = digest(Some("1"), Some("10"), true);
+        let priced = digest(Some("1"), Some("10"), false);
+        assert_ne!(digest(None, None, true), priced_estimate);
+        assert_ne!(priced_estimate, priced);
+        assert_eq!(priced, digest(Some("1.00119"), Some("10.0119"), false));
+    }
 
     #[test]
     fn canonical_bytes_and_digests_match_the_python_reference() {
