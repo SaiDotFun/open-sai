@@ -19,8 +19,19 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from compare import Normalize, mask_overview_stdout, overview_clocks
 from mcp_cases import REJECTED_AUTH_ADDRESS, TRADE_TOOLS
-from scenarios import ADDRESS, INTENT, Endpoints, child_env, loopback, seed_home
+from scenarios import (
+    ADDRESS,
+    INTENT,
+    OTHER_ADDRESS,
+    Endpoints,
+    child_env,
+    loopback,
+    seed_home,
+    session_fixture,
+    write_seed,
+)
 
 pytestmark = pytest.mark.skipif(os.name != "posix", reason="Uses POSIX stdio pipes")
 
@@ -44,6 +55,8 @@ def python_v013() -> Path:
 
 
 class Stdio:
+    initialize_result: dict[str, Any]
+
     def __init__(self, proc: subprocess.Popen[bytes]):
         self.proc = proc
         self.pending = bytearray()
@@ -113,7 +126,9 @@ def server(
                 capabilities={},
                 clientInfo={"name": "sai-regression", "version": "1"},
             )
-            assert stdio.receive()["id"] == 1
+            initialized = stdio.receive()
+            assert initialized["id"] == 1
+            stdio.initialize_result = initialized["result"]
             stdio.send("notifications/initialized")
             yield stdio
         finally:
@@ -793,6 +808,82 @@ def tool_text(result: dict[str, Any]) -> str:
     assert isinstance(text, str)
     assert result["structuredContent"] == {"result": text}
     return text
+
+
+def test_overview_v013_partial_response_and_session_reload(
+    native: Path, python_v013: Path, tmp_path: Path
+) -> None:
+    transcripts = []
+    with loopback("overview-partial") as endpoints:
+        for index, executable in enumerate((python_v013, native)):
+            home = tmp_path / str(index)
+            with server(executable, home, endpoints) as stdio:
+                initialize = stdio.initialize_result
+                assert initialize["serverInfo"].pop("version")
+                stdio.send("tools/list", id_=2)
+                [schema] = [
+                    tool
+                    for tool in stdio.receive()["result"]["tools"]
+                    if tool["name"] == "account_overview"
+                ]
+                missing = tool_text(stdio.call(3, "account_overview"))
+                assert json.loads(missing)["code"] == "SESSION_UNAVAILABLE"
+
+                expired = session_fixture(endpoints, "expired")
+                write_seed(home, endpoints, [expired])
+                started = time.time()
+                partial = tool_text(stdio.call(4, "account_overview"))
+                value = json.loads(partial)
+                assert value["addr"] == ADDRESS
+                assert value["addrSource"] == "session"
+                assert value["session"]["data"]["expired"] is True
+                assert value["positions"]["data"]["items"]
+                assert value["queuedMarketOrders"]["error"]["code"] == "KEEPER_ERROR"
+                assert value["prices"]["error"]["code"] == "KEEPER_ERROR"
+                overview_clocks(
+                    value, Normalize(home, started_at=started, ended_at=time.time())
+                )
+
+                other = {
+                    **session_fixture(endpoints, "other-endpoint"),
+                    "evmAddress": OTHER_ADDRESS,
+                }
+                write_seed(home, endpoints, [expired, other])
+                switched = tool_text(stdio.call(5, "account_overview"))
+                assert json.loads(switched)["code"] == "SESSION_UNAVAILABLE"
+                assert not (home / "sai/trader/intents.sqlite3").exists()
+                transcripts.append(
+                    (
+                        initialize,
+                        schema,
+                        missing,
+                        mask_overview_stdout(partial, "json"),
+                        switched,
+                    )
+                )
+            assert not endpoints.errors
+            assert [request.label for request in endpoints.wire] == [
+                "ws:init",
+                "ws:userBalancesWithBlock",
+                "overviewTrades",
+                "userIntents",
+                "tokenPricesUsd",
+                "oneClickTrading",
+                "lcd:latest",
+                "get_base_size_seed_status",
+                "live_trades_by_user",
+                "get_trade",
+                "get_market",
+                "get_oracle_address",
+                "get_exchange_rate_stamped",
+                "get_group",
+                "get_trade",
+                "get_market",
+                "get_exchange_rate_stamped",
+                "pendingMarketOrders",
+            ]
+            endpoints.wire.clear()
+    assert transcripts[0] == transcripts[1]
 
 
 def test_logs_intent_v013_offline_and_live(

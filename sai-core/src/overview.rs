@@ -51,12 +51,7 @@ pub async fn read(
     } else {
         "session"
     };
-    let unavailable = |message: &str| {
-        SaiError::new(
-            Code::SessionUnavailable,
-            format!("{message}. Pass --as ADDR explicitly."),
-        )
-    };
+    let unavailable = |message: &str| SaiError::new(Code::SessionUnavailable, message);
     let accounts = storage.load_accounts();
     let (addr, session) = match accounts {
         Ok(accounts) => {
@@ -409,8 +404,10 @@ fn parse_balances(payload: Value) -> Result<Value, SaiError> {
         let name = token.get("name").ok_or_else(invalid)?;
         if let Some((_, key)) = BALANCE_KEYS.iter().find(|(label, _)| name == *label) {
             let usd = number(&row["usd_value"]).ok_or_else(invalid)?;
-            let block = row.get("lastUpdatedBlock").ok_or_else(invalid)?;
-            selected.insert((*key).to_owned(), json!({"usd": usd, "block": block}));
+            selected.insert(
+                (*key).to_owned(),
+                json!({"usd": usd, "block": row["lastUpdatedBlock"]}),
+            );
         }
     }
     Ok(Value::Object(selected))
