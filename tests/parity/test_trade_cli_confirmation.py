@@ -638,3 +638,46 @@ def test_confirmed_close_rechecks_position_height(
                 ] == ("OraclePublicationTimeUnknown")
                 assert not replay.attempts()
                 assert not rows(home)
+
+
+@pytest.mark.parametrize(
+    ("scenario", "reopened"),
+    [("quote-cache-reopened", True), ("quote-cache-closed", False)],
+)
+def test_open_submission_uses_fresh_market_state(
+    tmp_path: Path, scenario: str, reopened: bool
+) -> None:
+    cli = (str(Path(sys.executable).with_name("sai")),)
+    replay = TradeReplay("OPEN_TRADE", "")
+    home = tmp_path / "home"
+    with loopback(scenario, trade_replay=replay, market_price=100) as endpoints:
+        seed_home(home, endpoints, "session")
+        code, preview, stderr = run(
+            cli, home, endpoints, (*OPEN, "--dry-run"), python=True
+        )
+        assert (code, stderr) == (0, "")
+        assert ("previewDigest" in preview) == (not reopened)
+        assert not replay.attempts()
+        assert not rows(home)
+
+        code, result, stderr = run(cli, home, endpoints, OPEN[:-2], python=True)
+        assert not endpoints.errors
+        assert [entry.label for entry in endpoints.wire].count("get_market") == 2
+        if reopened:
+            assert (code, stderr) == (0, "")
+            (key,) = replay.admitted_keys()
+            assert replay.attempts() == {key: 1}
+            assert replay.intent(key)["kind"] == "OPEN_TRADE"
+            assert replay.intent(key)["body"] == preview["intent"]["body"]
+            assert [row[:6] for row in rows(home)] == [
+                (key, "OPEN_TRADE", "accepted", "", preview["addr"], None)
+            ]
+        else:
+            assert (code, stderr) == (4, "")
+            error = result["error"]
+            assert error["code"] == "PREVIEW_MISMATCH"
+            assert error["details"]["preview"]["estimates"]["execution"]["code"] == (
+                "MarketClosed"
+            )
+            assert not replay.attempts()
+            assert not rows(home)

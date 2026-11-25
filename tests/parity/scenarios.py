@@ -1460,6 +1460,18 @@ def loopback(
                                     self.reject("Cancellation session gate timed out")
                                     return
                         data = contract_data(name, pinned=HEIGHT_HEADER in self.headers)
+                        if name == "get_market" and scenario in {
+                            "quote-cache-reopened",
+                            "quote-cache-closed",
+                        }:
+                            fresh = "_sai_query" in parse_qs(request_url.query)
+                            close_only = fresh == (scenario == "quote-cache-closed")
+                            data = {
+                                **data,
+                                "market_trading_state": "close_only"
+                                if close_only
+                                else "open",
+                            }
                         if (
                             scenario == "quote-close-collateral-changed"
                             and name == "get_trade_raw"

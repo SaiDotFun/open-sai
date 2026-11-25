@@ -241,6 +241,7 @@ def open_trade(
             row,
             market_reference,
             market_bound=mcp_market or "positionRoute" in preview,
+            fresh_market=not dry_run,
         )
         fill = quote["worstCaseFill"]
         if order_type == "market" and not mcp_market and fill["status"] == "bound":
