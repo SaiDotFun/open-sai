@@ -1107,25 +1107,22 @@ def test_position_trade_wait_deadlines(
             finally:
                 if process.poll() is None:
                     process.kill()
-        ended = time.monotonic()
         expected_exit = 0 if late_success else 5
         assert (process.returncode, stderr) == (expected_exit, b""), stdout
         document = json.loads(stdout)
         key = document["intentKey"]
         assert keys == [key]
         assert len(poll_times) >= 2
-        elapsed = ended - poll_times[0]
         assert document["receipt"]["requestBlock"] is None
         assert document["receipt"]["requestTxHash"] == "a" * 64
         if late_success:
-            assert elapsed >= 33, elapsed
+            assert poll_times[-1] - poll_times[0] >= 33
             assert document["outcome"] == document["status"] == "succeeded"
             execution = document["receipt"]["execution"]
             assert execution["block"] == FILL_BLOCK
             assert execution["tradeChangeType"] == "leverage_updated"
             assert ledger_state(home) == [(key, "terminal", "terminal")]
         else:
-            assert elapsed >= deadline_seconds - 1.5, elapsed
             assert document["outcome"] == document["status"] == "unknown"
             assert document["code"] == document["error"]["code"] == "OUTCOME_UNKNOWN"
             if native:
@@ -1135,16 +1132,21 @@ def test_position_trade_wait_deadlines(
             assert document["receipt"]["execution"] is None
             assert ledger_state(home) == [(key, "unknown", "pending")]
         waits = [
-            (event["event"], event.get("timeoutMs"), event.get("code"))
+            event
             for event in read_events(home, cli)
             if event.get("intentKey") == key
             and event["event"].startswith("intent.wait.")
         ]
-        assert waits == [
+        assert [
+            (event["event"], event.get("timeoutMs"), event.get("code"))
+            for event in waits
+        ] == [
             ("intent.wait.start", deadline_seconds * 1000, None),
             ("intent.wait.end", None, None if late_success else "OUTCOME_UNKNOWN"),
         ]
         if not late_success:
+            duration_ms = waits[-1]["durationMs"]
+            assert duration_ms >= deadline_seconds * 1000 - 1500
             replies.clear()
             queue_update_preflight(replies)
             again = invoke(cli, home, *command)
