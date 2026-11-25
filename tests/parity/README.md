@@ -95,11 +95,27 @@ expiry in text and JSON against the native auth implementation from
 disable logging. The auth regression tests check output and log redaction
 directly, including Python MCP stdio responses.
 
-The `auth-use-missing` case checks the fixed diagnostic for an
-unregistered account. The auth privacy comparison checks that command logs
-contain only the command words.
+The `auth-use-missing` case keeps its release exception because Rust uses
+the fixed diagnostic from Python main. Python v0.1.2 echoed the unregistered
+account operand in the error.
+
+For `auth use` and `auth logout`, the focused log tests compare each command
+start, session event, and command end against the release. Rust records only
+the command words in `argv`, following Python main's auth privacy behavior.
+Python v0.1.2 records the address operand and flags.
+
+Rust applies the process umask to mode `0644` when creating
+`trader/sessions.lock`. Python applies it to mode `0666`, so a permissive
+umask can give Python's new lock group or other write permissions. Both
+CLIs preserve the mode of an existing lock.
 
 ## Native Distribution
+
+The Linux installer rehearsal installs the published Python v0.1.3 wheel
+with uv, then runs `sai update` against the candidate shim and archive over
+loopback. The published updater checks for the `sai VERSION` banner during
+its trial. Rust keeps that banner for the handoff, and the manifest records
+the resulting difference from Python's `sai, version VERSION` banner.
 
 The Native Distribution workflow installs the built shim wheel with uv on
 each native target and serves the matching archive over loopback. Build the
