@@ -1208,9 +1208,10 @@ client_seed = "empty"
 state = { "clients/.cursor/mcp.json" = "<absent>", "clients/argv.jsonl" = "<absent>" }
 
 [[case]]
-name = "mcp-install-claude-repair"
-args = ["--json", "mcp", "install", "--client", "claude", "--repair-existing", "sai"]
-client_seed = "retired"
+name = "mcp-install-claude-repair-legacy"
+# The escaped name is the legacy alias accepted on both CLIs.
+args = ["--json", "mcp", "install", "--client", "claude", "--repair-existing", "sai\u002dmcp"]
+client_seed = "legacy-retired"
 state = { "clients/.claude.json#changed" = true, "clients/.codex/config.toml#changed" = false, "clients/.cursor/mcp.json#changed" = false, "clients/argv.jsonl" = "<absent>" }
 
 [[case]]
