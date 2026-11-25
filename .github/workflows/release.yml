@@ -1,44 +1,63 @@
 name: "Release"
 
-# `just release X.Y.Z --run` pushes the tag that starts this workflow.
+# `just release X.Y.Z --run` pushes the tag that starts publication.
 on:
   push:
     tags: ["sai-cli/v*"]
+  pull_request:
+    paths:
+      - '.github/workflows/release.yml'
+      - '.github/workflows/native-dist.yml'
+      - 'scripts/check_release.py'
+      - 'scripts/native-dist.py'
+      - 'tests/parity/test_native_release.py'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Planned tag (sai-cli/vX.Y.Z). This run only stages artifacts.'
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  release:
+  python:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-    permissions:
-      # Create the GitHub Release and upload its files.
-      contents: write
+    timeout-minutes: 20
     env:
-      # The tag contains a slash (sai-cli/vX.Y.Z); every step quotes it.
-      TAG: ${{ github.ref_name }}
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
     steps:
-      # Full history so the tag can be checked against origin/main.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-
-      - name: Check that the tag is on main
-        run: git merge-base --is-ancestor "$TAG^{commit}" origin/main
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           python-version: "3.11"
 
-      - name: Check that the tag matches pyproject.toml
-        run: uv run --no-project python scripts/check_release.py "$TAG"
+      - name: Check tag provenance
+        if: github.event_name == 'push'
+        shell: bash
+        run: |
+          built="$(git rev-parse HEAD)"
+          test "$built" = "$(git rev-parse "$GITHUB_SHA^{commit}")"
+          test "$built" = "$(git rev-parse "refs/tags/$TAG^{commit}")"
+          git rev-list --first-parent origin/main | grep -Fx "$built" >/dev/null
+          uv run --no-project python scripts/check_release.py "$TAG" \
+            --built "$built" --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+
+      - name: Check package versions
+        if: github.event_name != 'pull_request'
+        run: |
+          uv run --no-project python scripts/native-dist.py check-tag "$TAG"
 
       - name: Install dependencies from uv.lock
         run: uv sync --locked --all-groups
@@ -52,29 +71,130 @@ jobs:
       - name: Build the wheel and sdist
         run: uv build --out-dir dist
 
-      - name: Write SHA256SUMS
-        run: (cd dist && sha256sum -- *) > SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sai-full-python
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          compression-level: 0
 
-      # `gh release create --verify-tag` only checks that the tag exists. A
-      # tag moved after checkout must not get this build's files.
+  native:
+    needs: python
+    uses: ./.github/workflows/native-dist.yml
+
+  assemble:
+    name: Assemble release candidate
+    needs: [python, native]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sai-full-python
+          path: dist/python
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sai-native-ci
+          path: dist/native
+      - name: Verify artifacts and stage one release checksum manifest
+        shell: bash
+        run: |
+          args=()
+          if [[ "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            args+=(--tag "$TAG")
+          fi
+          uv run --no-project python scripts/native-dist.py stage-release \
+            dist/native dist/python dist/release "${args[@]}"
+      - name: Check release checksums
+        working-directory: dist/release
+        run: sha256sum --check --strict SHA256SUMS
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: sai-release-candidate
+          path: dist/release/
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish and verify immutable release
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: assemble
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          python-version: "3.11"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: sai-release-candidate
+          path: dist/release
+      - name: Verify staged release checksums
+        working-directory: dist/release
+        run: sha256sum --check --strict SHA256SUMS
+
+      # --verify-tag checks existence. Recheck the peeled remote commit before uploading.
       - name: Check that the remote tag is still the built commit
         run: |
           uv run --no-project python scripts/check_release.py "$TAG" \
-            --built "$(git rev-parse HEAD)" \
-            --remote "https://github.com/$GITHUB_REPOSITORY"
+            --built "$(git rev-parse HEAD)" --remote "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
 
-      # A version with a hyphen, such as sai-cli/v0.2.0-rc.1, is a pre-release.
-      # `sai update` picks the highest sai-cli/v* release that is not one, and
-      # does not use GitHub's single "latest" release.
+      # gh creates a draft, attaches every asset, then publishes it.
       - name: Create the GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
+          if draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)"; then
+            if [[ "$draft" == true ]]; then
+              echo "::error::A draft release already exists for $TAG"
+              exit 1
+            fi
+            echo "Release $TAG already exists. Verify its attestation against this candidate."
+            exit 0
+          fi
           version="${TAG#sai-cli/}"
           flags=()
           if [[ "$version" == *-* ]]; then
             flags+=(--prerelease)
           fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag \
-            --title "sai-cli $version" --generate-notes "${flags[@]}" \
-            dist/* SHA256SUMS
+            --title "sai-cli $version" --generate-notes "${flags[@]}" dist/release/*
+
+      - name: Verify the attestation for the tag and release files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          tag_object="$(git rev-parse "refs/tags/$TAG")"
+          # GitHub may take a few seconds to generate the release attestation.
+          for delay in 0 5 15 30; do
+            sleep "$delay"
+            if gh release verify "$TAG" --repo "$GITHUB_REPOSITORY" --format json \
+              > "$RUNNER_TEMP/sai-release-attestation.json"; then
+              uv run --no-project python scripts/native-dist.py check-attestation \
+                dist/release "$tag_object" < "$RUNNER_TEMP/sai-release-attestation.json"
+              exit 0
+            fi
+          done
+          exit 1
